@@ -1,0 +1,11 @@
+[package]
+name = "sush-server"
+description = "support shell server"
+version = "0.1.0"
+edition = "2024"
+
+[[bin]]
+name = "sush-server"
+path = "src/main.rs"
+
+[dependencies]
