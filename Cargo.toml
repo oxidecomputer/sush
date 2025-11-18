@@ -3,3 +3,15 @@ members = ["client", "common", "server"]
 resolver = "2"
 
 [workspace.dependencies]
+base64 = "0.22"
+chrono = "0.4"
+ed25519-dalek = { version = "2", features = ["rand_core"] }
+p256 = { version = "0.13", features = ["ecdsa"] }
+rand_core = "0.6"
+rusqlite = { version = "0.37", features = ["blob", "chrono", "modern_sqlite", "uuid"] }
+sha2 = "0.10"
+tempfile = "3"
+thiserror = "1"
+tokio = { version = "1", features = ["macros", "process", "rt", "sync", "time"] }
+uuid = { version = "1", features = ["v4"] }
+x509-cert = { version = "0.2", features = ["std"] }

@@ -9,3 +9,16 @@ name = "sush-server"
 path = "src/main.rs"
 
 [dependencies]
+base64.workspace = true
+chrono.workspace = true
+ed25519-dalek.workspace = true
+p256.workspace = true
+rand_core.workspace = true
+rusqlite.workspace = true
+sha2.workspace = true
+sush-common = { path = "../common" }
+tempfile.workspace = true
+thiserror.workspace = true
+tokio.workspace = true
+uuid.workspace = true
+x509-cert.workspace = true
