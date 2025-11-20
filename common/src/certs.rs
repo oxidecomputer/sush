@@ -1,14 +1,15 @@
 //! Public key and certificate management.
 
+use std::fmt;
 use std::ops::Deref;
+use std::str::FromStr;
 
 use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD as BASE64};
 use ed25519_dalek::{
     Signature as Ed25519Signature, Verifier as _, VerifyingKey as Ed25519VerifyingKey,
 };
 use p256::ecdsa;
-use rusqlite::Error as SqlError;
-use rusqlite::types::{FromSql, FromSqlError, ToSql, ToSqlOutput, ValueRef};
+use schemars::JsonSchema;
 use sha2::{Digest as _, Sha256};
 use thiserror::Error;
 use x509_cert::Certificate;
@@ -26,10 +27,14 @@ pub const ROOT_CERTS: &[&[u8]] = &[
 
 #[derive(Debug, Error)]
 pub enum CertError {
+    #[error("base64 decoding error: {0}")]
+    Base64(#[from] base64::DecodeError),
     #[error("DER encoding error: {0}")]
     Der(#[from] x509_cert::der::Error),
     #[error("Ed25519 error: {0}")]
     Ed25519(#[from] ed25519_dalek::ed25519::Error),
+    #[error("invalid key ID: should be 16 bytes")]
+    InvalidKeyId,
     #[error("invalid subject public key")]
     InvalidPublicKey,
     #[error("invalid signature")]
@@ -38,19 +43,10 @@ pub enum CertError {
     SelfSigned,
 }
 
-/// Upper half of the SHA-256 of a certificate subject.
-#[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
-pub struct KeyId([u8; 16]);
-
-/// Derive a key ID from a certificate subject/issuer.
-impl TryFrom<&Name> for KeyId {
-    type Error = CertError;
-
-    fn try_from(name: &Name) -> Result<KeyId, Self::Error> {
-        let hash = Sha256::digest(&name.to_der()?);
-        Ok(KeyId(hash[..16].try_into().unwrap()))
-    }
-}
+/// Upper half of the SHA-256 of a certificate subject,
+/// encoded with base64 for storage and transport.
+#[derive(Clone, Copy, Debug, Eq, JsonSchema, Ord, PartialEq, PartialOrd)]
+pub struct KeyId(#[schemars(with = "String")] [u8; 16]);
 
 impl Deref for KeyId {
     type Target = [u8; 16];
@@ -60,28 +56,73 @@ impl Deref for KeyId {
     }
 }
 
-impl ToSql for KeyId {
-    fn to_sql(&self) -> Result<ToSqlOutput<'_>, SqlError> {
-        Ok(ToSqlOutput::Owned(BASE64.encode(**self).into()))
+impl fmt::Display for KeyId {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "{}", BASE64.encode(**self))
     }
 }
 
-impl FromSql for KeyId {
-    fn column_result(value: ValueRef<'_>) -> Result<Self, FromSqlError> {
-        let string = <String>::column_result(value)?;
-        Ok(KeyId(
+impl FromStr for KeyId {
+    type Err = CertError;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        Ok(Self(
             BASE64
-                .decode(&string)
-                .map_err(FromSqlError::other)?
+                .decode(s)?
                 .try_into()
-                .expect("should decode to 16 bytes"),
+                .map_err(|_| CertError::InvalidKeyId)?,
         ))
     }
 }
 
+impl TryFrom<&Name> for KeyId {
+    type Error = CertError;
+
+    fn try_from(name: &Name) -> Result<KeyId, Self::Error> {
+        let hash = Sha256::digest(&name.to_der()?);
+        Ok(KeyId(hash[..16].try_into().unwrap()))
+    }
+}
+
+impl_to_from_sql_and_serde!(KeyId);
+
+/// Base64 encoded signature.
+#[derive(Clone, Debug, Eq, JsonSchema, Ord, PartialEq, PartialOrd)]
+pub struct Signature(#[schemars(with = "String")] Vec<u8>);
+
+impl Signature {
+    pub fn new(bytes: Vec<u8>) -> Self {
+        Self(bytes)
+    }
+}
+
+impl Deref for Signature {
+    type Target = [u8];
+
+    fn deref(&self) -> &Self::Target {
+        &self.0
+    }
+}
+
+impl fmt::Display for Signature {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "{}", BASE64.encode(&**self))
+    }
+}
+
+impl FromStr for Signature {
+    type Err = CertError;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        Ok(Self(BASE64.decode(s)?))
+    }
+}
+
+impl_to_from_sql_and_serde!(Signature);
+
 pub fn verify_signature(
     message: &[u8],
-    signature: &[u8],
+    signature: &Signature,
     cert: &Certificate,
 ) -> Result<(), CertError> {
     let spki = &cert.tbs_certificate.subject_public_key_info;
@@ -103,7 +144,7 @@ pub fn verify_signature(
             oid: ID_EC_PUBLIC_KEY,
             parameters: Some(parameters),
         } if *parameters == SECP_256_R_1.into() => {
-            let signature = ecdsa::Signature::from_bytes(signature.into())?;
+            let signature = ecdsa::Signature::from_bytes((&**signature).into())?;
             let public_key = ecdsa::VerifyingKey::from_sec1_bytes(public_key)?;
             public_key.verify(message, &signature)?;
         }

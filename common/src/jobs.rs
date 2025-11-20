@@ -1,17 +1,19 @@
 //! Signed job requests.
 
 use std::ops::Deref;
+use std::str::FromStr;
 
-use rusqlite::Error as SqlError;
-use rusqlite::types::{FromSql, FromSqlError, ToSql, ToSqlOutput, ValueRef};
+use chrono::{DateTime, Utc};
+use schemars::JsonSchema;
+use serde::{Deserialize, Serialize};
 use sha2::{Digest as _, Sha256};
 use thiserror::Error;
 use uuid::Uuid;
 use x509_cert::Certificate;
 
-use crate::certs::{CertError, KeyId, verify_signature};
+use crate::certs::{CertError, KeyId, Signature, verify_signature};
 
-#[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
+#[derive(Clone, Copy, Debug, Eq, JsonSchema, Ord, PartialEq, PartialOrd)]
 pub struct JobId(Uuid);
 
 impl JobId {
@@ -34,19 +36,27 @@ impl Deref for JobId {
     }
 }
 
-impl ToSql for JobId {
-    fn to_sql(&self) -> Result<ToSqlOutput<'_>, SqlError> {
-        Ok(ToSqlOutput::Owned(self.to_string().into()))
+impl FromStr for JobId {
+    type Err = uuid::Error;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        Ok(Self(Uuid::from_str(s)?))
     }
 }
 
-impl FromSql for JobId {
-    fn column_result(value: ValueRef<'_>) -> Result<Self, FromSqlError> {
-        let string = <String>::column_result(value)?;
-        Ok(JobId(string.parse::<Uuid>().map_err(FromSqlError::other)?))
-    }
+impl_to_from_sql_and_serde!(JobId);
+
+/// The response to a job reservation request.
+#[derive(Debug, Deserialize, JsonSchema, Serialize)]
+pub struct JobsReserved {
+    /// Fresh, globally unique job IDs.
+    pub job_ids: Vec<JobId>,
+
+    /// The server's idea of the time at which the job IDs were reserved.
+    pub time_reserved: DateTime<Utc>,
 }
 
+/// Internal representation of a job to be signed.
 struct UnsignedJob {
     job_id: JobId,
     key_id: KeyId,
@@ -90,12 +100,12 @@ pub enum SigningError {
     Generic(String),
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, Deserialize, JsonSchema, Serialize)]
 pub struct SignedJob {
     pub job_id: JobId,
     pub key_id: KeyId,
     pub command: String,
-    pub signature: Vec<u8>,
+    pub signature: Signature,
 }
 
 impl SignedJob {
@@ -115,9 +125,11 @@ impl SignedJob {
             job_id,
             key_id,
             command,
-            signature: signer
-                .sign(&unsigned.to_be_signed())
-                .map_err(|e| SigningError::Generic(e.to_string()))?,
+            signature: Signature::new(
+                signer
+                    .sign(&unsigned.to_be_signed())
+                    .map_err(|e| SigningError::Generic(e.to_string()))?,
+            ),
         })
     }
 
@@ -144,4 +156,27 @@ impl Deref for VerifiedJob {
     fn deref(&self) -> &Self::Target {
         &self.0
     }
+}
+
+#[derive(Debug, Deserialize, JsonSchema, Serialize)]
+pub enum JobStatus {
+    NotFound,
+    Reserved {
+        job_id: JobId,
+        time_reserved: DateTime<Utc>,
+    },
+    Started {
+        job: SignedJob,
+        time_reserved: DateTime<Utc>,
+        time_started: DateTime<Utc>,
+    },
+    Ended {
+        job: SignedJob,
+        time_reserved: DateTime<Utc>,
+        time_started: DateTime<Utc>,
+        time_ended: DateTime<Utc>,
+        status: Option<i32>,
+        stdout_len: i32,
+        stderr_len: i32,
+    },
 }

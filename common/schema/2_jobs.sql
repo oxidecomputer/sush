@@ -2,7 +2,7 @@ CREATE TABLE IF NOT EXISTS jobs(
   job_id TEXT PRIMARY KEY NOT NULL,
   key_id TEXT REFERENCES certs,
   command TEXT,
-  signature BLOB UNIQUE,
+  signature TEXT UNIQUE,
   time_reserved TEXT NOT NULL,
   time_started TEXT,
   time_ended TEXT,

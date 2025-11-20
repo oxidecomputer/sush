@@ -3,5 +3,20 @@ name = "sush-client"
 description = "support shell client"
 version = "0.1.0"
 edition = "2024"
+publish = false
+
+[[bin]]
+name = "sush"
+path = "src/main.rs"
 
 [dependencies]
+anyhow.workspace = true
+chrono.workspace = true
+clap.workspace = true
+progenitor.workspace = true
+reqwest.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+sush-common = { path = "../common" }
+tokio.workspace = true
+uuid.workspace = true

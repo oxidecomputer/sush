@@ -19,6 +19,7 @@ use std::process::{ExitStatus, Stdio};
 
 use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD as BASE64};
 use chrono::{DateTime, Utc};
+use dropshot::{ClientErrorStatusCode, HttpError};
 use rusqlite::{Connection, OptionalExtension as _, blob::ZeroBlob};
 use tempfile::tempfile;
 use thiserror::Error;
@@ -30,8 +31,8 @@ use x509_cert::Certificate;
 use x509_cert::der::{Decode as _, Encode as _};
 
 use sush_common::blob::{BlobError, file_len, get_blob, read_blob_chunk, read_blob_from_file};
-use sush_common::certs::{CertError, KeyId, ROOT_CERTS, verify_signature};
-use sush_common::jobs::{JobId, SignedJob, VerifiedJob};
+use sush_common::certs::{CertError, KeyId, ROOT_CERTS, Signature, verify_signature};
+use sush_common::jobs::{JobId, JobStatus, JobsReserved, SignedJob, VerifiedJob};
 
 #[derive(Debug, Error)]
 pub enum JobError {
@@ -61,10 +62,10 @@ pub enum JobError {
     Wait,
 }
 
-#[derive(Debug)]
-pub struct JobReserveResponse {
-    job_ids: Vec<JobId>,
-    time_reserved: DateTime<Utc>,
+impl From<JobError> for HttpError {
+    fn from(err: JobError) -> Self {
+        HttpError::for_client_error(None, ClientErrorStatusCode::BAD_REQUEST, err.to_string())
+    }
 }
 
 #[derive(Debug)]
@@ -164,7 +165,7 @@ pub enum JobRequest {
     // Job reservation requests.
     Reserve {
         number: u8,
-        response: oneshot::Sender<Result<JobReserveResponse, JobError>>,
+        response: oneshot::Sender<Result<JobsReserved, JobError>>,
     },
     GetReserved {
         response: oneshot::Sender<Result<BTreeMap<JobId, DateTime<Utc>>, JobError>>,
@@ -297,6 +298,10 @@ impl JobManager {
         Ok(Self { channel: tx, task })
     }
 
+    pub async fn wait(self) -> Result<(), JobError> {
+        self.task.await?
+    }
+
     async fn request(&self, request: JobRequest) -> Result<(), JobError> {
         self.channel
             .send(request)
@@ -304,7 +309,16 @@ impl JobManager {
             .map_err(|_| JobError::ChannelClosed)
     }
 
-    pub async fn import_cert(
+    pub async fn import_cert_bytes(&self, bytes: &[u8]) -> Result<KeyId, JobError> {
+        self.import_cert(
+            &Certificate::from_der(bytes)?,
+            #[cfg(test)]
+            false,
+        )
+        .await
+    }
+
+    async fn import_cert(
         &self,
         cert: &Certificate,
         #[cfg(test)] root: bool,
@@ -330,7 +344,7 @@ impl JobManager {
         rx.await?
     }
 
-    pub async fn reserve_jobs(&self, number: u8) -> Result<JobReserveResponse, JobError> {
+    pub async fn reserve_jobs(&self, number: u8) -> Result<JobsReserved, JobError> {
         let (tx, rx) = oneshot::channel();
         self.request(JobRequest::Reserve {
             number,
@@ -341,7 +355,7 @@ impl JobManager {
     }
 
     pub async fn reserve_one(&self) -> Result<(JobId, DateTime<Utc>), JobError> {
-        let JobReserveResponse {
+        let JobsReserved {
             mut job_ids,
             time_reserved,
         } = self.reserve_jobs(1).await?;
@@ -367,7 +381,7 @@ impl JobManager {
         rx.await?
     }
 
-    pub async fn start_job(
+    pub async fn job_start(
         &self,
         job: SignedJob,
     ) -> Result<oneshot::Receiver<Result<JobStatus, JobError>>, JobError> {
@@ -390,11 +404,11 @@ impl JobManager {
         rx.await?
     }
 
-    pub async fn abort_job(&self, job_id: JobId) -> Result<(), JobError> {
+    pub async fn job_abort(&self, job_id: JobId) -> Result<(), JobError> {
         self.request(JobRequest::Abort { job_id }).await
     }
 
-    pub async fn stdout(
+    pub async fn job_stdout(
         &self,
         job_id: JobId,
         range: Option<Range<i32>>,
@@ -409,7 +423,7 @@ impl JobManager {
         rx.await?
     }
 
-    pub async fn stderr(
+    pub async fn job_stderr(
         &self,
         job_id: JobId,
         range: Option<Range<i32>>,
@@ -458,11 +472,11 @@ fn start_job(
     Ok(tasks.spawn(async move {
         let end = with_err_response!(start.wait().await, JobError::Wait);
         assert_eq!(job_id, end.job_id());
-        let _ = response.send(Ok(JobStatus {
+        let _ = response.send(Ok(JobStatus::Ended {
             job: end.job.clone(),
             time_reserved,
-            time_started: Some(end.time_started),
-            time_ended: Some(end.time_ended),
+            time_started: end.time_started,
+            time_ended: end.time_ended,
             status: end.status.code(),
             stdout_len: file_len(&end.stdout)?,
             stderr_len: file_len(&end.stderr)?,
@@ -511,13 +525,13 @@ fn import_cert(db: &Connection, cert: &Certificate, root: bool) -> Result<KeyId,
         }
         verify_signature(
             &cert.tbs_certificate.to_der()?,
-            cert.signature.raw_bytes(),
+            &Signature::new(cert.signature.raw_bytes().to_vec()),
             cert,
         )?;
     } else {
         verify_signature(
             &cert.tbs_certificate.to_der()?,
-            cert.signature.raw_bytes(),
+            &Signature::new(cert.signature.raw_bytes().to_vec()),
             &get_cert(db, KeyId::try_from(issuer)?)?,
         )?;
     }
@@ -531,7 +545,7 @@ fn import_cert(db: &Connection, cert: &Certificate, root: bool) -> Result<KeyId,
     Ok(key_id)
 }
 
-fn reserve_jobs(db: &mut Connection, number: u8) -> Result<JobReserveResponse, JobError> {
+fn reserve_jobs(db: &mut Connection, number: u8) -> Result<JobsReserved, JobError> {
     let time_reserved = Utc::now();
     let txn = db.transaction()?;
     let mut job_ids = Vec::new();
@@ -546,7 +560,7 @@ fn reserve_jobs(db: &mut Connection, number: u8) -> Result<JobReserveResponse, J
     }
     stmt.finalize()?;
     txn.commit()?;
-    Ok(JobReserveResponse {
+    Ok(JobsReserved {
         job_ids,
         time_reserved,
     })
@@ -663,42 +677,59 @@ fn job_output(
     }
 }
 
-#[derive(Debug)]
-pub struct JobStatus {
-    pub job: SignedJob,
-    pub time_reserved: DateTime<Utc>,
-    pub time_started: Option<DateTime<Utc>>,
-    pub time_ended: Option<DateTime<Utc>>,
-    pub status: Option<i32>,
-    pub stdout_len: i32,
-    pub stderr_len: i32,
-}
-
 fn job_status(db: &Connection, job_id: JobId) -> Result<JobStatus, JobError> {
-    Ok(db.query_one(
-        "SELECT job_id, key_id, command, signature, \
+    if let Some(status) = db
+        .query_one(
+            "SELECT job_id, key_id, command, signature, \
                 time_reserved, time_started, time_ended, \
                 status, length(stdout), length(stderr) \
-         FROM jobs WHERE job_id = ?1",
-        // `--SEARCH jobs USING INDEX sqlite_autoindex_jobs_1 (job_id=?)
-        [job_id],
-        |row| {
-            Ok(JobStatus {
-                job: SignedJob {
-                    job_id: row.get("job_id")?,
-                    key_id: row.get("key_id")?,
-                    command: row.get("command")?,
-                    signature: row.get("signature")?,
-                },
-                time_reserved: row.get("time_reserved")?,
-                time_started: row.get("time_started")?,
-                time_ended: row.get("time_ended")?,
-                status: row.get("status")?,
-                stdout_len: row.get("length(stdout)")?,
-                stderr_len: row.get("length(stderr)")?,
-            })
-        },
-    )?)
+             FROM jobs WHERE job_id = ?1",
+            // `--SEARCH jobs USING INDEX sqlite_autoindex_jobs_1 (job_id=?)
+            [job_id],
+            |row| {
+                assert_eq!(row.get("job_id"), Ok(job_id));
+                if let Ok(time_ended) = row.get("time_ended") {
+                    Ok(JobStatus::Ended {
+                        job: SignedJob {
+                            job_id,
+                            key_id: row.get("key_id")?,
+                            command: row.get("command")?,
+                            signature: row.get("signature")?,
+                        },
+                        time_reserved: row.get("time_reserved")?,
+                        time_started: row.get("time_started")?,
+                        time_ended,
+                        status: row.get("status")?,
+                        stdout_len: row.get("length(stdout)")?,
+                        stderr_len: row.get("length(stderr)")?,
+                    })
+                } else if let Ok(time_started) = row.get("time_started") {
+                    Ok(JobStatus::Started {
+                        job: SignedJob {
+                            job_id,
+                            key_id: row.get("key_id")?,
+                            command: row.get("command")?,
+                            signature: row.get("signature")?,
+                        },
+                        time_reserved: row.get("time_reserved")?,
+                        time_started,
+                    })
+                } else if let Ok(time_reserved) = row.get("time_reserved") {
+                    Ok(JobStatus::Reserved {
+                        job_id,
+                        time_reserved,
+                    })
+                } else {
+                    unreachable!("time_reserved should be NOT NULL")
+                }
+            },
+        )
+        .optional()?
+    {
+        Ok(status)
+    } else {
+        Ok(JobStatus::NotFound)
+    }
 }
 
 fn job_ended(
@@ -835,7 +866,7 @@ mod test {
             let key_id = KeyId::try_from(&subject).unwrap();
             verify_signature(
                 &cert.tbs_certificate.to_der().unwrap(),
-                cert.signature.raw_bytes(),
+                &Signature::new(cert.signature.raw_bytes().to_vec()),
                 &cert,
             )
             .unwrap();
@@ -864,7 +895,7 @@ mod test {
             let cert = parent.sign_cert(tbs_certificate);
             verify_signature(
                 &cert.tbs_certificate.to_der().unwrap(),
-                cert.signature.raw_bytes(),
+                &Signature::new(cert.signature.raw_bytes().to_vec()),
                 &parent.cert,
             )
             .unwrap();
@@ -1009,7 +1040,28 @@ mod test {
         assert_eq!(end.stderr.metadata().unwrap().len(), 0);
     }
 
-    fn check_job_status(
+    fn check_status_started(
+        status: JobStatus,
+        cert: &Certificate,
+        expected_job_id: JobId,
+        expected_command: &str,
+    ) {
+        let JobStatus::Started {
+            job,
+            time_reserved,
+            time_started,
+        } = status
+        else {
+            panic!("expected job to be started");
+        };
+        assert_eq!(job.job_id, expected_job_id);
+        let job = job.verify(cert).unwrap();
+        assert_eq!(job.command, expected_command);
+        assert!(time_reserved < time_started);
+        assert!(time_started < Utc::now());
+    }
+
+    fn check_status_ended(
         status: JobStatus,
         cert: &Certificate,
         expected_job_id: JobId,
@@ -1018,7 +1070,7 @@ mod test {
         expected_stdout_len: i32,
         expected_stderr_len: i32,
     ) {
-        let JobStatus {
+        let JobStatus::Ended {
             job,
             time_reserved,
             time_started,
@@ -1026,27 +1078,38 @@ mod test {
             status,
             stdout_len,
             stderr_len,
-        } = status;
+        } = status
+        else {
+            panic!("expected job to be finished");
+        };
         assert_eq!(job.job_id, expected_job_id);
         let job = job.verify(cert).unwrap();
         assert_eq!(job.command, expected_command);
-        assert!(time_reserved < time_started.unwrap());
-        assert!(time_started.unwrap() < time_ended.unwrap());
-        assert!(time_ended.unwrap() < Utc::now());
+        assert!(time_reserved < time_started);
+        assert!(time_started < time_ended);
+        assert!(time_ended < Utc::now());
         assert_eq!(status, expected_status);
         assert_eq!(stdout_len, expected_stdout_len);
         assert_eq!(stderr_len, expected_stderr_len);
     }
 
-    #[tokio::test]
-    async fn jobs() {
-        let db = open_database_in_memory().unwrap();
+    async fn manager_and_root(db: Option<&str>) -> (JobManager, EphemeralKey) {
+        let db = if let Some(db) = db {
+            open_database(db).unwrap()
+        } else {
+            open_database_in_memory().unwrap()
+        };
         let mgr = JobManager::new(db).await.unwrap();
         let root = EphemeralKey::new_root();
         let key_id = mgr.import_cert(&root.cert, true).await.unwrap();
         assert_eq!(key_id, root.key_id);
+        (mgr, root)
+    }
 
-        let JobReserveResponse {
+    #[tokio::test]
+    async fn jobs() {
+        let (mgr, root) = manager_and_root(None).await;
+        let JobsReserved {
             mut job_ids,
             time_reserved,
         } = mgr.reserve_jobs(5).await.unwrap();
@@ -1060,36 +1123,38 @@ mod test {
 
         let job_id = job_ids.pop().unwrap();
         let job = SignedJob::new(job_id, &root, "true").unwrap();
-        let rx = mgr.start_job(job.clone()).await.unwrap();
-        let status = rx.await.unwrap().unwrap();
-        check_job_status(status, &root.cert, job_id, "true", Some(0), 0, 0);
+        assert!(matches!(
+            mgr.job_status(job_id).await.unwrap(),
+            JobStatus::Reserved { job_id: id, time_reserved }
+            if id == job_id && time_reserved < Utc::now(),
+        ));
 
+        let rx = mgr.job_start(job.clone()).await.unwrap();
+        let status = rx.await.unwrap().unwrap();
+        check_status_ended(status, &root.cert, job_id, "true", Some(0), 0, 0);
+
+        let rx = mgr.job_start(job).await.unwrap();
         assert!(
             matches!(
-                mgr.start_job(job)
-                    .await
-                    .unwrap()
-                    .await
-                    .unwrap()
-                    .unwrap_err(),
+                rx.await.unwrap().unwrap_err(),
                 JobError::InvalidJobId(id) if id == job_id
             ),
-            "should not be allowed to reuse job ID"
+            "should not be allowed to reuse a job ID"
         );
 
         let job_id = job_ids.pop().unwrap();
         let job = SignedJob::new(job_id, &root, "false").unwrap();
-        let rx = mgr.start_job(job).await.unwrap();
+        let rx = mgr.job_start(job).await.unwrap();
         let status = rx.await.unwrap().unwrap();
-        check_job_status(status, &root.cert, job_id, "false", Some(1), 0, 0);
+        check_status_ended(status, &root.cert, job_id, "false", Some(1), 0, 0);
 
         let job_id = job_ids.pop().unwrap();
         let job_id_string = job_id.to_string();
         let job_id_bytes = job_id_string.as_bytes();
         let job = SignedJob::new(job_id, &root, "echo -n $SUSH_JOB_ID").unwrap();
-        let rx = mgr.start_job(job).await.unwrap();
+        let rx = mgr.job_start(job).await.unwrap();
         let status = rx.await.unwrap().unwrap();
-        check_job_status(
+        check_status_ended(
             status,
             &root.cert,
             job_id,
@@ -1098,8 +1163,8 @@ mod test {
             job_id_bytes.len() as i32,
             0,
         );
-        assert_eq!(mgr.stdout(job_id, None).await.unwrap(), job_id_bytes);
-        assert!(mgr.stderr(job_id, None).await.unwrap().is_empty());
+        assert_eq!(mgr.job_stdout(job_id, None).await.unwrap(), job_id_bytes);
+        assert!(mgr.job_stderr(job_id, None).await.unwrap().is_empty());
 
         assert_eq!(
             mgr.revoke_reserved(job_ids).await.unwrap(),
@@ -1109,24 +1174,62 @@ mod test {
     }
 
     #[tokio::test]
-    async fn abort() {
-        let db = open_database_in_memory().unwrap();
-        let mgr = JobManager::new(db).await.unwrap();
-        let root = EphemeralKey::new_root();
-        let key_id = mgr.import_cert(&root.cert, true).await.unwrap();
-        assert_eq!(key_id, root.key_id);
-
+    async fn revoke() {
+        let (mgr, root) = manager_and_root(None).await;
         let (job_id, time_reserved) = mgr.reserve_one().await.unwrap();
+        assert_eq!(mgr.revoke_reserved(vec![job_id]).await.unwrap(), 1);
+        assert_eq!(mgr.revoke_reserved(vec![job_id]).await.unwrap(), 0);
+        assert_eq!(mgr.revoke_reserved(vec![job_id]).await.unwrap(), 0);
+
+        let job = SignedJob::new(job_id, &root, "false").unwrap();
+        let rx = mgr.job_start(job).await.unwrap();
+        assert!(
+            matches!(
+                rx.await.unwrap().unwrap_err(),
+                JobError::InvalidJobId(id) if id == job_id
+            ),
+            "should not be allowed to start a revoked job"
+        );
+
+        let status = mgr.job_status(job_id).await.unwrap();
+        assert!(matches!(status, JobStatus::NotFound));
+
+        let (new_job_id, new_time_reserved) = mgr.reserve_one().await.unwrap();
+        assert_ne!(new_job_id, job_id);
+        assert!(new_time_reserved > time_reserved);
+        let job_ids = vec![job_id, new_job_id];
+        assert_eq!(mgr.revoke_reserved(job_ids.clone()).await.unwrap(), 1);
+        assert_eq!(mgr.revoke_reserved(job_ids.clone()).await.unwrap(), 0);
+        assert_eq!(mgr.revoke_reserved(job_ids.clone()).await.unwrap(), 0);
+
+        let JobsReserved {
+            job_ids,
+            time_reserved: _,
+        } = mgr.reserve_jobs(100).await.unwrap();
+        assert_eq!(mgr.revoke_reserved(job_ids.clone()).await.unwrap(), 100);
+        assert_eq!(mgr.revoke_reserved(job_ids.clone()).await.unwrap(), 0);
+        assert_eq!(mgr.revoke_reserved(job_ids.clone()).await.unwrap(), 0);
+    }
+
+    #[tokio::test]
+    async fn abort() {
+        let (mgr, root) = manager_and_root(None).await;
+        let (job_id, time_reserved) = mgr.reserve_one().await.unwrap();
+
         let mark = Utc::now();
         assert!(time_reserved < mark);
         let job = SignedJob::new(job_id, &root, "yes").unwrap();
-        let rx = mgr.start_job(job).await.unwrap();
-        mgr.abort_job(job_id).await.unwrap();
+        let rx = mgr.job_start(job).await.unwrap();
+
+        let status = mgr.job_status(job_id).await.unwrap();
+        check_status_started(status, &root.cert, job_id, "yes");
+
+        mgr.job_abort(job_id).await.unwrap();
         assert!(rx.await.is_err());
         assert!((Utc::now() - mark).as_seconds_f32() < 1.0);
 
         let status = mgr.job_status(job_id).await.unwrap();
-        check_job_status(status, &root.cert, job_id, "yes", None, 0, 0);
+        check_status_ended(status, &root.cert, job_id, "yes", None, 0, 0);
     }
 
     #[tokio::test]
@@ -1171,8 +1274,8 @@ mod test {
 
         let (job_id, _time_reserved) = mgr.reserve_one().await.unwrap();
         let job = SignedJob::new(job_id, &child, "true").unwrap();
-        let rx = mgr.start_job(job).await.unwrap();
+        let rx = mgr.job_start(job).await.unwrap();
         let status = rx.await.unwrap().unwrap();
-        check_job_status(status, &child.cert, job_id, "true", Some(0), 0, 0);
+        check_status_ended(status, &child.cert, job_id, "true", Some(0), 0, 0);
     }
 }

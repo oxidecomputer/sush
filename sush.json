@@ -1,0 +1,606 @@
+{
+  "openapi": "3.0.3",
+  "info": {
+    "title": "Oxide Support Shell",
+    "version": "0.1.0"
+  },
+  "paths": {
+    "/certs": {
+      "put": {
+        "summary": "Import a certificate, verify its signature, and return a key ID for it.",
+        "operationId": "import_cert",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "title": "Array_of_uint8",
+                "type": "array",
+                "items": {
+                  "type": "integer",
+                  "format": "uint8",
+                  "minimum": 0
+                }
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "description": "successful operation",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/KeyId"
+                }
+              }
+            }
+          },
+          "4XX": {
+            "$ref": "#/components/responses/Error"
+          },
+          "5XX": {
+            "$ref": "#/components/responses/Error"
+          }
+        }
+      }
+    },
+    "/certs/{key_id}": {
+      "get": {
+        "summary": "Get the certificate chain that validates a key, in root-to-leaf order.",
+        "operationId": "cert_chain",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "key_id",
+            "required": true,
+            "schema": {
+              "$ref": "#/components/schemas/KeyId"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "successful operation",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "title": "Array_of_Array_of_uint8",
+                  "type": "array",
+                  "items": {
+                    "type": "array",
+                    "items": {
+                      "type": "integer",
+                      "format": "uint8",
+                      "minimum": 0
+                    }
+                  }
+                }
+              }
+            }
+          },
+          "4XX": {
+            "$ref": "#/components/responses/Error"
+          },
+          "5XX": {
+            "$ref": "#/components/responses/Error"
+          }
+        }
+      }
+    },
+    "/jobs/{job_id}/abort": {
+      "get": {
+        "summary": "Abort a started job.",
+        "operationId": "job_abort",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "job_id",
+            "required": true,
+            "schema": {
+              "$ref": "#/components/schemas/JobId"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "successful operation",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "title": "Null",
+                  "type": "string",
+                  "enum": [
+                    null
+                  ]
+                }
+              }
+            }
+          },
+          "4XX": {
+            "$ref": "#/components/responses/Error"
+          },
+          "5XX": {
+            "$ref": "#/components/responses/Error"
+          }
+        }
+      }
+    },
+    "/jobs/{job_id}/start": {
+      "post": {
+        "operationId": "job_start",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "job_id",
+            "required": true,
+            "schema": {
+              "$ref": "#/components/schemas/JobId"
+            }
+          },
+          {
+            "in": "query",
+            "name": "wait",
+            "schema": {
+              "nullable": true,
+              "type": "boolean"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/SignedJob"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "description": "successful operation",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/JobStatus"
+                }
+              }
+            }
+          },
+          "4XX": {
+            "$ref": "#/components/responses/Error"
+          },
+          "5XX": {
+            "$ref": "#/components/responses/Error"
+          }
+        }
+      }
+    },
+    "/jobs/{job_id}/status": {
+      "get": {
+        "summary": "Get the status of a started job.",
+        "operationId": "job_status",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "job_id",
+            "required": true,
+            "schema": {
+              "$ref": "#/components/schemas/JobId"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "successful operation",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/JobStatus"
+                }
+              }
+            }
+          },
+          "4XX": {
+            "$ref": "#/components/responses/Error"
+          },
+          "5XX": {
+            "$ref": "#/components/responses/Error"
+          }
+        }
+      }
+    },
+    "/jobs/{job_id}/stderr": {
+      "get": {
+        "summary": "Get the standard output of a job.",
+        "operationId": "job_stderr",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "job_id",
+            "required": true,
+            "schema": {
+              "$ref": "#/components/schemas/JobId"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "successful operation",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "title": "Array_of_uint8",
+                  "type": "array",
+                  "items": {
+                    "type": "integer",
+                    "format": "uint8",
+                    "minimum": 0
+                  }
+                }
+              }
+            }
+          },
+          "4XX": {
+            "$ref": "#/components/responses/Error"
+          },
+          "5XX": {
+            "$ref": "#/components/responses/Error"
+          }
+        }
+      }
+    },
+    "/jobs/{job_id}/stdout": {
+      "get": {
+        "summary": "Get the standard output of a job.",
+        "operationId": "job_stdout",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "job_id",
+            "required": true,
+            "schema": {
+              "$ref": "#/components/schemas/JobId"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "successful operation",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "title": "Array_of_uint8",
+                  "type": "array",
+                  "items": {
+                    "type": "integer",
+                    "format": "uint8",
+                    "minimum": 0
+                  }
+                }
+              }
+            }
+          },
+          "4XX": {
+            "$ref": "#/components/responses/Error"
+          },
+          "5XX": {
+            "$ref": "#/components/responses/Error"
+          }
+        }
+      }
+    },
+    "/reserved": {
+      "get": {
+        "summary": "Map of job ID → time reserved for unused job slots.",
+        "operationId": "get_reserved",
+        "responses": {
+          "200": {
+            "description": "successful operation",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "title": "Map_of_DateTime",
+                  "type": "object",
+                  "additionalProperties": {
+                    "type": "string",
+                    "format": "date-time"
+                  }
+                }
+              }
+            }
+          },
+          "4XX": {
+            "$ref": "#/components/responses/Error"
+          },
+          "5XX": {
+            "$ref": "#/components/responses/Error"
+          }
+        }
+      },
+      "post": {
+        "summary": "Reserve some job slots with fresh, globally unique IDs.",
+        "operationId": "reserve_jobs",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "title": "uint8",
+                "type": "integer",
+                "format": "uint8",
+                "minimum": 0
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "description": "successful operation",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/JobsReserved"
+                }
+              }
+            }
+          },
+          "4XX": {
+            "$ref": "#/components/responses/Error"
+          },
+          "5XX": {
+            "$ref": "#/components/responses/Error"
+          }
+        }
+      },
+      "delete": {
+        "summary": "Revoke a set of reserved but unused job slots.",
+        "description": "Has no effect on jobs already started (or finished), so it is safe to call this with a batch of IDs where some have been used. Returns the number of jobs actually revoked.",
+        "operationId": "revoke_reserved",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "title": "Array_of_JobId",
+                "type": "array",
+                "items": {
+                  "$ref": "#/components/schemas/JobId"
+                }
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "description": "successful operation",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "title": "uint",
+                  "type": "integer",
+                  "format": "uint",
+                  "minimum": 0
+                }
+              }
+            }
+          },
+          "4XX": {
+            "$ref": "#/components/responses/Error"
+          },
+          "5XX": {
+            "$ref": "#/components/responses/Error"
+          }
+        }
+      }
+    }
+  },
+  "components": {
+    "schemas": {
+      "Error": {
+        "description": "Error information from a response.",
+        "type": "object",
+        "properties": {
+          "error_code": {
+            "type": "string"
+          },
+          "message": {
+            "type": "string"
+          },
+          "request_id": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "message",
+          "request_id"
+        ]
+      },
+      "JobId": {
+        "type": "string",
+        "format": "uuid"
+      },
+      "JobStatus": {
+        "oneOf": [
+          {
+            "type": "string",
+            "enum": [
+              "NotFound"
+            ]
+          },
+          {
+            "type": "object",
+            "properties": {
+              "Reserved": {
+                "type": "object",
+                "properties": {
+                  "job_id": {
+                    "$ref": "#/components/schemas/JobId"
+                  },
+                  "time_reserved": {
+                    "type": "string",
+                    "format": "date-time"
+                  }
+                },
+                "required": [
+                  "job_id",
+                  "time_reserved"
+                ]
+              }
+            },
+            "required": [
+              "Reserved"
+            ],
+            "additionalProperties": false
+          },
+          {
+            "type": "object",
+            "properties": {
+              "Started": {
+                "type": "object",
+                "properties": {
+                  "job": {
+                    "$ref": "#/components/schemas/SignedJob"
+                  },
+                  "time_reserved": {
+                    "type": "string",
+                    "format": "date-time"
+                  },
+                  "time_started": {
+                    "type": "string",
+                    "format": "date-time"
+                  }
+                },
+                "required": [
+                  "job",
+                  "time_reserved",
+                  "time_started"
+                ]
+              }
+            },
+            "required": [
+              "Started"
+            ],
+            "additionalProperties": false
+          },
+          {
+            "type": "object",
+            "properties": {
+              "Ended": {
+                "type": "object",
+                "properties": {
+                  "job": {
+                    "$ref": "#/components/schemas/SignedJob"
+                  },
+                  "status": {
+                    "nullable": true,
+                    "type": "integer",
+                    "format": "int32"
+                  },
+                  "stderr_len": {
+                    "type": "integer",
+                    "format": "int32"
+                  },
+                  "stdout_len": {
+                    "type": "integer",
+                    "format": "int32"
+                  },
+                  "time_ended": {
+                    "type": "string",
+                    "format": "date-time"
+                  },
+                  "time_reserved": {
+                    "type": "string",
+                    "format": "date-time"
+                  },
+                  "time_started": {
+                    "type": "string",
+                    "format": "date-time"
+                  }
+                },
+                "required": [
+                  "job",
+                  "stderr_len",
+                  "stdout_len",
+                  "time_ended",
+                  "time_reserved",
+                  "time_started"
+                ]
+              }
+            },
+            "required": [
+              "Ended"
+            ],
+            "additionalProperties": false
+          }
+        ]
+      },
+      "JobsReserved": {
+        "description": "The response to a job reservation request.",
+        "type": "object",
+        "properties": {
+          "job_ids": {
+            "description": "Fresh, globally unique job IDs.",
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/JobId"
+            }
+          },
+          "time_reserved": {
+            "description": "The server's idea of the time at which the job IDs were reserved.",
+            "type": "string",
+            "format": "date-time"
+          }
+        },
+        "required": [
+          "job_ids",
+          "time_reserved"
+        ]
+      },
+      "KeyId": {
+        "description": "Upper half of the SHA-256 of a certificate subject, encoded with base64 for storage and transport.",
+        "type": "string"
+      },
+      "Signature": {
+        "description": "Base64 encoded signature.",
+        "type": "string"
+      },
+      "SignedJob": {
+        "type": "object",
+        "properties": {
+          "command": {
+            "type": "string"
+          },
+          "job_id": {
+            "$ref": "#/components/schemas/JobId"
+          },
+          "key_id": {
+            "$ref": "#/components/schemas/KeyId"
+          },
+          "signature": {
+            "$ref": "#/components/schemas/Signature"
+          }
+        },
+        "required": [
+          "command",
+          "job_id",
+          "key_id",
+          "signature"
+        ]
+      }
+    },
+    "responses": {
+      "Error": {
+        "description": "Error",
+        "content": {
+          "application/json": {
+            "schema": {
+              "$ref": "#/components/schemas/Error"
+            }
+          }
+        }
+      }
+    }
+  }
+}

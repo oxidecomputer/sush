@@ -3,18 +3,23 @@ name = "sush-server"
 description = "support shell server"
 version = "0.1.0"
 edition = "2024"
+publish = false
 
 [[bin]]
-name = "sush-server"
+name = "server"
 path = "src/main.rs"
 
 [dependencies]
 base64.workspace = true
 chrono.workspace = true
+clap.workspace = true
+dropshot.workspace = true
 ed25519-dalek.workspace = true
 p256.workspace = true
 rand_core.workspace = true
 rusqlite.workspace = true
+schemars.workspace = true
+serde.workspace = true
 sha2.workspace = true
 sush-common = { path = "../common" }
 tempfile.workspace = true
