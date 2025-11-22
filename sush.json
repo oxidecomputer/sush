@@ -151,7 +151,7 @@
           "content": {
             "application/json": {
               "schema": {
-                "$ref": "#/components/schemas/SignedJob"
+                "$ref": "#/components/schemas/Signed_for_JobStartRequest"
               }
             }
           },
@@ -421,6 +421,22 @@
         "type": "string",
         "format": "uuid"
       },
+      "JobStartRequest": {
+        "description": "A request to run the given `command` in the slot reserved by `job_id`.",
+        "type": "object",
+        "properties": {
+          "command": {
+            "type": "string"
+          },
+          "job_id": {
+            "$ref": "#/components/schemas/JobId"
+          }
+        },
+        "required": [
+          "command",
+          "job_id"
+        ]
+      },
       "JobStatus": {
         "oneOf": [
           {
@@ -461,7 +477,7 @@
                 "type": "object",
                 "properties": {
                   "job": {
-                    "$ref": "#/components/schemas/SignedJob"
+                    "$ref": "#/components/schemas/Signed_for_JobStartRequest"
                   },
                   "time_reserved": {
                     "type": "string",
@@ -491,7 +507,7 @@
                 "type": "object",
                 "properties": {
                   "job": {
-                    "$ref": "#/components/schemas/SignedJob"
+                    "$ref": "#/components/schemas/Signed_for_JobStartRequest"
                   },
                   "status": {
                     "nullable": true,
@@ -566,26 +582,23 @@
         "description": "Base64 encoded signature.",
         "type": "string"
       },
-      "SignedJob": {
+      "Signed_for_JobStartRequest": {
+        "description": "A signed envelope around some data.",
         "type": "object",
         "properties": {
-          "command": {
-            "type": "string"
-          },
-          "job_id": {
-            "$ref": "#/components/schemas/JobId"
-          },
           "key_id": {
             "$ref": "#/components/schemas/KeyId"
+          },
+          "payload": {
+            "$ref": "#/components/schemas/JobStartRequest"
           },
           "signature": {
             "$ref": "#/components/schemas/Signature"
           }
         },
         "required": [
-          "command",
-          "job_id",
           "key_id",
+          "payload",
           "signature"
         ]
       }

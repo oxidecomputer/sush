@@ -126,7 +126,7 @@ async fn job_start(
     let JobIdParam { job_id } = params.into_inner();
     let JobStartParams { wait } = query.into_inner();
     let job = body.into_inner();
-    if job.job_id != job_id {
+    if job.job_id() != job_id {
         return Err(HttpError::for_client_error(
             None,
             ClientErrorStatusCode::BAD_REQUEST,

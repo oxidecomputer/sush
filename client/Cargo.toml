@@ -11,8 +11,11 @@ path = "src/main.rs"
 
 [dependencies]
 anyhow.workspace = true
+blake3.workspace = true
 chrono.workspace = true
 clap.workspace = true
+permission-slip-client.workspace = true
+permission-slip-common.workspace = true
 progenitor.workspace = true
 reqwest.workspace = true
 serde.workspace = true
@@ -20,3 +23,4 @@ serde_json.workspace = true
 sush-common = { path = "../common" }
 tokio.workspace = true
 uuid.workspace = true
+x509-cert.workspace = true

@@ -4,12 +4,15 @@ resolver = "2"
 
 [workspace.dependencies]
 anyhow = "1"
+blake3 = "1"
 base64 = "0.22"
 chrono = "0.4"
 clap = { version = "4", features = ["derive", "env"] }
 dropshot = "0.16"
 ed25519-dalek = { version = "2", features = ["rand_core"] }
 p256 = { version = "0.13", features = ["ecdsa"] }
+permission-slip-client = { path = "../permission-slip/client" }
+permission-slip-common = { path = "../permission-slip/common" }
 progenitor = "0.11"
 rand_core = "0.6"
 reqwest = "0.12"

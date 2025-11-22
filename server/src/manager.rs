@@ -31,8 +31,8 @@ use x509_cert::Certificate;
 use x509_cert::der::{Decode as _, Encode as _};
 
 use sush_common::blob::{BlobError, file_len, get_blob, read_blob_chunk, read_blob_from_file};
-use sush_common::certs::{CertError, KeyId, ROOT_CERTS, Signature, verify_signature};
-use sush_common::jobs::{JobId, JobStatus, JobsReserved, SignedJob, VerifiedJob};
+use sush_common::certs::{CertError, KeyId, ROOT_CERTS, Signature};
+use sush_common::jobs::{JobId, JobStartRequest, JobStatus, JobsReserved, SignedJob, VerifiedJob};
 
 #[derive(Debug, Error)]
 pub enum JobError {
@@ -48,7 +48,7 @@ pub enum JobError {
     InvalidJobId(JobId),
     #[error(transparent)]
     Io(#[from] std::io::Error),
-    #[error("can't find certificate for key {}", BASE64.encode(**.0))]
+    #[error("can't find certificate for key {}", BASE64.encode(.0.as_slice()))]
     MissingCert(KeyId),
     #[error("can't receive response: sender dropped")]
     Recv(#[from] oneshot::error::RecvError),
@@ -85,7 +85,7 @@ impl JobStart {
         let time_started = Utc::now();
         let child = Command::new("bash")
             .arg("-c")
-            .arg(&job.command)
+            .arg(job.command())
             .env("SUSH_JOB_ID", job.job_id.to_string())
             .stdin(Stdio::null())
             .stdout(stdout.try_clone()?)
@@ -102,7 +102,7 @@ impl JobStart {
     }
 
     pub fn job_id(&self) -> JobId {
-        self.job.job_id
+        self.job.job_id()
     }
 
     pub async fn wait(mut self) -> Result<JobEnd, JobError> {
@@ -142,7 +142,7 @@ pub struct JobEnd {
 
 impl JobEnd {
     pub fn job_id(&self) -> JobId {
-        self.job.job_id
+        self.job.job_id()
     }
 }
 
@@ -223,6 +223,8 @@ impl JobManager {
                 select! {
                     Some(end) = tasks.join_next() => {
                         // A job has finished.
+                        // TODO: Revoke reservations on error.
+                        // TODO: Ensure killed jobs are reaped.
                         match end {
                             Err(err) if err.is_cancelled() => (),
                             Err(err) => return Err(err.into()),
@@ -462,9 +464,9 @@ fn start_job(
 
     let txn = db.transaction()?;
     let job = start.job.clone();
-    let job_id = job.job_id;
+    let job_id = job.job_id();
     let time_reserved = with_err_response!(verify_reservation(&txn, job_id));
-    let cert = with_err_response!(get_cert(&txn, job.key_id));
+    let cert = with_err_response!(get_cert(&txn, job.key_id()));
     let job = with_err_response!(job.verify(&cert));
     with_err_response!(job_started(&txn, job, start.time_started));
     txn.commit()?;
@@ -519,21 +521,15 @@ fn get_cert_chain(db: &Connection, mut key_id: KeyId) -> Result<Vec<Certificate>
 fn import_cert(db: &Connection, cert: &Certificate, root: bool) -> Result<KeyId, JobError> {
     let subject = &cert.tbs_certificate.subject;
     let issuer = &cert.tbs_certificate.issuer;
+    let signature = Signature::new(cert.signature.raw_bytes().to_vec());
     if subject == issuer {
         if !root {
             return Err(JobError::Cert(CertError::SelfSigned));
         }
-        verify_signature(
-            &cert.tbs_certificate.to_der()?,
-            &Signature::new(cert.signature.raw_bytes().to_vec()),
-            cert,
-        )?;
+        signature.verify(&cert.tbs_certificate.to_der()?, cert)?;
     } else {
-        verify_signature(
-            &cert.tbs_certificate.to_der()?,
-            &Signature::new(cert.signature.raw_bytes().to_vec()),
-            &get_cert(db, KeyId::try_from(issuer)?)?,
-        )?;
+        let issuer_cert = get_cert(db, KeyId::try_from(issuer)?)?;
+        signature.verify(&cert.tbs_certificate.to_der()?, &issuer_cert)?;
     }
 
     let key_id = KeyId::try_from(subject)?;
@@ -620,17 +616,17 @@ fn job_started(
          WHERE job_id = ?1 AND time_started IS NULL",
         // `--SEARCH jobs USING INDEX sqlite_autoindex_jobs_1 (job_id=?)
         (
-            job.job_id,
-            job.key_id,
-            &job.command,
-            &job.signature,
+            job.job_id(),
+            job.key_id(),
+            job.command(),
+            job.signature(),
             time_started,
         ),
     )? == 1
     {
         Ok(())
     } else {
-        Err(JobError::InvalidJobId(job.job_id))
+        Err(JobError::InvalidJobId(job.job_id()))
     }
 }
 
@@ -681,8 +677,8 @@ fn job_status(db: &Connection, job_id: JobId) -> Result<JobStatus, JobError> {
     if let Some(status) = db
         .query_one(
             "SELECT job_id, key_id, command, signature, \
-                time_reserved, time_started, time_ended, \
-                status, length(stdout), length(stderr) \
+                    time_reserved, time_started, time_ended, \
+                    status, length(stdout), length(stderr) \
              FROM jobs WHERE job_id = ?1",
             // `--SEARCH jobs USING INDEX sqlite_autoindex_jobs_1 (job_id=?)
             [job_id],
@@ -690,12 +686,14 @@ fn job_status(db: &Connection, job_id: JobId) -> Result<JobStatus, JobError> {
                 assert_eq!(row.get("job_id"), Ok(job_id));
                 if let Ok(time_ended) = row.get("time_ended") {
                     Ok(JobStatus::Ended {
-                        job: SignedJob {
-                            job_id,
-                            key_id: row.get("key_id")?,
-                            command: row.get("command")?,
-                            signature: row.get("signature")?,
-                        },
+                        job: SignedJob::new(
+                            JobStartRequest {
+                                job_id,
+                                command: row.get("command")?,
+                            },
+                            row.get("key_id")?,
+                            row.get("signature")?,
+                        ),
                         time_reserved: row.get("time_reserved")?,
                         time_started: row.get("time_started")?,
                         time_ended,
@@ -705,12 +703,14 @@ fn job_status(db: &Connection, job_id: JobId) -> Result<JobStatus, JobError> {
                     })
                 } else if let Ok(time_started) = row.get("time_started") {
                     Ok(JobStatus::Started {
-                        job: SignedJob {
-                            job_id,
-                            key_id: row.get("key_id")?,
-                            command: row.get("command")?,
-                            signature: row.get("signature")?,
-                        },
+                        job: SignedJob::new(
+                            JobStartRequest {
+                                job_id,
+                                command: row.get("command")?,
+                            },
+                            row.get("key_id")?,
+                            row.get("signature")?,
+                        ),
                         time_reserved: row.get("time_reserved")?,
                         time_started,
                     })
@@ -784,205 +784,54 @@ mod test {
     use std::io::{Write as _, read_to_string};
     use std::time::Duration;
 
-    use ed25519_dalek::{Signer as _, SigningKey as Ed25519SigningKey};
-    use p256::{SecretKey as P256SecretKey, ecdsa};
-    use rand_core::OsRng;
-    use rand_core::RngCore;
+    use rand_core::{OsRng, RngCore as _};
     use tempfile::NamedTempFile;
-    use x509_cert::der::oid::db::rfc5912::{ID_EC_PUBLIC_KEY, SECP_256_R_1};
-    use x509_cert::der::oid::db::rfc8410::ID_ED_25519;
-    use x509_cert::{
-        TbsCertificate, Version,
-        der::asn1::{Any, BitString},
-        name::Name,
-        serial_number::SerialNumber,
-        spki::AlgorithmIdentifierOwned,
-        spki::SubjectPublicKeyInfo,
-        time::Validity,
-    };
+    use x509_cert::name::Name;
+    use x509_cert::time::Validity;
 
+    use sush_common::certs::{EphemeralKey, KeyType, Signer as _};
     #[allow(unused_imports)]
     use sush_common::database::{open_database, open_database_in_memory};
-    use sush_common::jobs::JobSigner;
 
     use super::*;
 
-    enum SigningKey {
-        Ed25519(Ed25519SigningKey),
-        P256(P256SecretKey),
+    trait SignJobRequest {
+        async fn sign_job_request<S: AsRef<str>>(&self, job_id: JobId, command: S) -> SignedJob;
     }
 
-    impl SigningKey {
-        fn sign(&self, message: &[u8]) -> Vec<u8> {
-            match self {
-                Self::Ed25519(key) => key.sign(message).to_vec(),
-                Self::P256(key) => {
-                    let sig: ecdsa::Signature = ecdsa::SigningKey::from(key).sign(message);
-                    sig.to_vec()
-                }
-            }
-        }
-
-        fn signature_algorithm(&self) -> AlgorithmIdentifierOwned {
-            match self {
-                Self::Ed25519(_) => AlgorithmIdentifierOwned {
-                    oid: ID_ED_25519,
-                    parameters: None,
-                },
-                Self::P256(_) => AlgorithmIdentifierOwned {
-                    oid: ID_EC_PUBLIC_KEY,
-                    parameters: Some((&SECP_256_R_1).into()),
-                },
-            }
-        }
-
-        fn public_key(&self) -> Vec<u8> {
-            match self {
-                Self::Ed25519(key) => key.verifying_key().as_bytes().to_vec(),
-                Self::P256(key) => key.public_key().to_sec1_bytes().to_vec(),
-            }
-        }
-
-        fn spki(&self) -> SubjectPublicKeyInfo<Any, BitString> {
-            SubjectPublicKeyInfo {
-                algorithm: self.signature_algorithm(),
-                subject_public_key: BitString::from_bytes(&self.public_key()).unwrap(),
-            }
+    impl SignJobRequest for EphemeralKey {
+        async fn sign_job_request<S: AsRef<str>>(&self, job_id: JobId, command: S) -> SignedJob {
+            self.sign(JobStartRequest::new(job_id, command))
+                .await
+                .unwrap()
         }
     }
 
-    struct EphemeralKey {
-        key: SigningKey,
-        key_id: KeyId,
-        cert: Certificate,
+    /// Inject some randomness into the subject DN to ensure unique key IDs.
+    fn ephemeral_test_subject() -> Name {
+        let mut buf = [0; 8];
+        OsRng.fill_bytes(&mut buf);
+        format!(
+            "CN=Ephemeral Test Key {},O=Oxide Computer Company,C=US",
+            BASE64.encode(buf),
+        )
+        .parse()
+        .unwrap()
     }
 
-    impl EphemeralKey {
-        /// Ed25519 root key with self-signed cert.
-        fn new_root() -> Self {
-            let key = SigningKey::Ed25519(Ed25519SigningKey::generate(&mut OsRng));
-            let cert = Self::self_signed_cert(&key);
-            let subject = cert.tbs_certificate.subject.to_owned();
-            let key_id = KeyId::try_from(&subject).unwrap();
-            verify_signature(
-                &cert.tbs_certificate.to_der().unwrap(),
-                &Signature::new(cert.signature.raw_bytes().to_vec()),
-                &cert,
-            )
-            .unwrap();
-            Self { key, key_id, cert }
-        }
-
-        /// P-256 key with cert signed by a parent.
-        fn new_child(parent: &Self) -> Self {
-            let key = SigningKey::P256(P256SecretKey::random(&mut OsRng));
-            let serial_number = Self::serial_number();
-            let subject: Name = format!(
-                "CN=Ephemeral Test Child Key {},O=Oxide Computer Company,C=US",
-                BASE64.encode(serial_number.as_bytes()),
-            )
-            .parse()
-            .unwrap();
-            let key_id = KeyId::try_from(&subject).unwrap();
-            let issuer = parent.cert.tbs_certificate.subject.to_owned();
-            let tbs_certificate = Self::tbs_certificate(
-                &key,
-                Self::serial_number(),
-                subject,
-                issuer,
-                Validity::from_now(Duration::from_secs(60)).unwrap(),
-            );
-            let cert = parent.sign_cert(tbs_certificate);
-            verify_signature(
-                &cert.tbs_certificate.to_der().unwrap(),
-                &Signature::new(cert.signature.raw_bytes().to_vec()),
-                &parent.cert,
-            )
-            .unwrap();
-            Self { key, key_id, cert }
-        }
-
-        fn serial_number() -> SerialNumber {
-            let mut buf = [0; 16];
-            OsRng.fill_bytes(&mut buf);
-            SerialNumber::new(&buf).unwrap()
-        }
-
-        fn tbs_certificate(
-            key: &SigningKey,
-            serial_number: SerialNumber,
-            subject: Name,
-            issuer: Name,
-            validity: Validity,
-        ) -> TbsCertificate {
-            TbsCertificate {
-                version: Version::V3,
-                serial_number,
-                signature: key.signature_algorithm(),
-                issuer,
-                validity,
-                subject,
-                subject_public_key_info: key.spki(),
-                issuer_unique_id: None,
-                subject_unique_id: None,
-                extensions: None,
-            }
-        }
-
-        fn self_signed_cert(key: &SigningKey) -> Certificate {
-            let serial_number = Self::serial_number();
-            let subject: Name = format!(
-                "CN=Ephemeral Test Root Key {},O=Oxide Computer Company,C=US",
-                BASE64.encode(serial_number.as_bytes()),
-            )
-            .parse()
-            .unwrap();
-            let tbs_certificate = Self::tbs_certificate(
-                key,
-                serial_number,
-                subject.clone(),
-                subject,
-                Validity::from_now(Duration::from_secs(60)).unwrap(),
-            );
-
-            let tbs = tbs_certificate.to_der().unwrap();
-            let signature = key.sign(&tbs);
-            Certificate {
-                tbs_certificate,
-                signature_algorithm: key.signature_algorithm(),
-                signature: BitString::from_bytes(&signature).unwrap(),
-            }
-        }
-
-        fn sign_cert(&self, tbs_certificate: TbsCertificate) -> Certificate {
-            let signature = self.sign(&tbs_certificate.to_der().unwrap()).unwrap();
-            Certificate {
-                tbs_certificate,
-                signature_algorithm: AlgorithmIdentifierOwned {
-                    oid: ID_ED_25519,
-                    parameters: None,
-                },
-                signature: BitString::from_bytes(&signature).unwrap(),
-            }
-        }
-    }
-
-    impl JobSigner for EphemeralKey {
-        type Error = JobError;
-
-        fn key_id(&self) -> KeyId {
-            self.key_id
-        }
-
-        fn sign(&self, message: &[u8]) -> Result<Vec<u8>, Self::Error> {
-            Ok(self.key.sign(message))
-        }
+    fn ephemeral_test_root() -> EphemeralKey {
+        EphemeralKey::new_root(
+            KeyType::Ed25519,
+            ephemeral_test_subject(),
+            Validity::from_now(Duration::from_secs(60)).unwrap(),
+        )
+        .unwrap()
     }
 
     #[tokio::test]
     async fn false_() {
-        let key = EphemeralKey::new_root();
-        let job = SignedJob::new(JobId::new(), &key, "false").unwrap();
+        let key = ephemeral_test_root();
+        let job = key.sign_job_request(JobId::new(), "false").await;
         let start = JobStart::new(job).unwrap();
         let end = start.wait().await.unwrap();
         assert!(!end.status.success());
@@ -992,8 +841,8 @@ mod test {
 
     #[tokio::test]
     async fn true_() {
-        let key = EphemeralKey::new_root();
-        let job = SignedJob::new(JobId::new(), &key, "true").unwrap();
+        let key = ephemeral_test_root();
+        let job = key.sign_job_request(JobId::new(), "true").await;
         let start = JobStart::new(job).unwrap();
         let end = start.wait().await.unwrap();
         assert!(end.status.success());
@@ -1003,8 +852,8 @@ mod test {
 
     #[tokio::test]
     async fn stderr() {
-        let key = EphemeralKey::new_root();
-        let job = SignedJob::new(JobId::new(), &key, "echo error >&2").unwrap();
+        let key = ephemeral_test_root();
+        let job = key.sign_job_request(JobId::new(), "echo error >&2").await;
         let start = JobStart::new(job).unwrap();
         let end = start.wait().await.unwrap();
         assert!(end.status.success());
@@ -1018,9 +867,10 @@ mod test {
         let mut file = NamedTempFile::new().unwrap();
         write!(file, "{content}").unwrap();
 
-        let key = EphemeralKey::new_root();
+        let key = ephemeral_test_root();
         let path = file.path().display().to_string();
-        let job = SignedJob::new(JobId::new(), &key, format!("cat {}", &path)).unwrap();
+        let command = format!("cat {}", &path);
+        let job = key.sign_job_request(JobId::new(), command).await;
         let start = JobStart::new(job).unwrap();
         let end = start.wait().await.unwrap();
         assert!(end.status.success());
@@ -1031,8 +881,8 @@ mod test {
 
     #[tokio::test]
     async fn pipeline() {
-        let key = EphemeralKey::new_root();
-        let job = SignedJob::new(JobId::new(), &key, "yes | head -n 1").unwrap();
+        let key = ephemeral_test_root();
+        let job = key.sign_job_request(JobId::new(), "yes | head -n 1").await;
         let start = JobStart::new(job).unwrap();
         let end = start.wait().await.unwrap();
         assert!(end.status.success());
@@ -1093,22 +943,22 @@ mod test {
         assert_eq!(stderr_len, expected_stderr_len);
     }
 
-    async fn manager_and_root(db: Option<&str>) -> (JobManager, EphemeralKey) {
+    async fn manager_and_test_root(db: Option<&str>) -> (JobManager, EphemeralKey) {
         let db = if let Some(db) = db {
             open_database(db).unwrap()
         } else {
             open_database_in_memory().unwrap()
         };
         let mgr = JobManager::new(db).await.unwrap();
-        let root = EphemeralKey::new_root();
-        let key_id = mgr.import_cert(&root.cert, true).await.unwrap();
-        assert_eq!(key_id, root.key_id);
+        let root = ephemeral_test_root();
+        let key_id = mgr.import_cert(root.cert(), true).await.unwrap();
+        assert_eq!(key_id, root.key_id().await.unwrap());
         (mgr, root)
     }
 
     #[tokio::test]
     async fn jobs() {
-        let (mgr, root) = manager_and_root(None).await;
+        let (mgr, root) = manager_and_test_root(None).await;
         let JobsReserved {
             mut job_ids,
             time_reserved,
@@ -1122,7 +972,7 @@ mod test {
         }
 
         let job_id = job_ids.pop().unwrap();
-        let job = SignedJob::new(job_id, &root, "true").unwrap();
+        let job = root.sign_job_request(job_id, "true").await;
         assert!(matches!(
             mgr.job_status(job_id).await.unwrap(),
             JobStatus::Reserved { job_id: id, time_reserved }
@@ -1131,7 +981,7 @@ mod test {
 
         let rx = mgr.job_start(job.clone()).await.unwrap();
         let status = rx.await.unwrap().unwrap();
-        check_status_ended(status, &root.cert, job_id, "true", Some(0), 0, 0);
+        check_status_ended(status, root.cert(), job_id, "true", Some(0), 0, 0);
 
         let rx = mgr.job_start(job).await.unwrap();
         assert!(
@@ -1143,20 +993,20 @@ mod test {
         );
 
         let job_id = job_ids.pop().unwrap();
-        let job = SignedJob::new(job_id, &root, "false").unwrap();
+        let job = root.sign_job_request(job_id, "false").await;
         let rx = mgr.job_start(job).await.unwrap();
         let status = rx.await.unwrap().unwrap();
-        check_status_ended(status, &root.cert, job_id, "false", Some(1), 0, 0);
+        check_status_ended(status, root.cert(), job_id, "false", Some(1), 0, 0);
 
         let job_id = job_ids.pop().unwrap();
         let job_id_string = job_id.to_string();
         let job_id_bytes = job_id_string.as_bytes();
-        let job = SignedJob::new(job_id, &root, "echo -n $SUSH_JOB_ID").unwrap();
+        let job = root.sign_job_request(job_id, "echo -n $SUSH_JOB_ID").await;
         let rx = mgr.job_start(job).await.unwrap();
         let status = rx.await.unwrap().unwrap();
         check_status_ended(
             status,
-            &root.cert,
+            root.cert(),
             job_id,
             "echo -n $SUSH_JOB_ID",
             Some(0),
@@ -1175,13 +1025,13 @@ mod test {
 
     #[tokio::test]
     async fn revoke() {
-        let (mgr, root) = manager_and_root(None).await;
+        let (mgr, root) = manager_and_test_root(None).await;
         let (job_id, time_reserved) = mgr.reserve_one().await.unwrap();
         assert_eq!(mgr.revoke_reserved(vec![job_id]).await.unwrap(), 1);
         assert_eq!(mgr.revoke_reserved(vec![job_id]).await.unwrap(), 0);
         assert_eq!(mgr.revoke_reserved(vec![job_id]).await.unwrap(), 0);
 
-        let job = SignedJob::new(job_id, &root, "false").unwrap();
+        let job = root.sign_job_request(job_id, "false").await;
         let rx = mgr.job_start(job).await.unwrap();
         assert!(
             matches!(
@@ -1213,69 +1063,76 @@ mod test {
 
     #[tokio::test]
     async fn abort() {
-        let (mgr, root) = manager_and_root(None).await;
+        let (mgr, root) = manager_and_test_root(None).await;
         let (job_id, time_reserved) = mgr.reserve_one().await.unwrap();
 
         let mark = Utc::now();
         assert!(time_reserved < mark);
-        let job = SignedJob::new(job_id, &root, "yes").unwrap();
+        let job = root.sign_job_request(job_id, "yes").await;
         let rx = mgr.job_start(job).await.unwrap();
 
         let status = mgr.job_status(job_id).await.unwrap();
-        check_status_started(status, &root.cert, job_id, "yes");
+        check_status_started(status, root.cert(), job_id, "yes");
 
         mgr.job_abort(job_id).await.unwrap();
         assert!(rx.await.is_err());
         assert!((Utc::now() - mark).as_seconds_f32() < 1.0);
 
         let status = mgr.job_status(job_id).await.unwrap();
-        check_status_ended(status, &root.cert, job_id, "yes", None, 0, 0);
+        check_status_ended(status, root.cert(), job_id, "yes", None, 0, 0);
     }
 
     #[tokio::test]
     async fn cert_chain() {
-        let root = EphemeralKey::new_root();
-        let child = EphemeralKey::new_child(&root);
-        assert_ne!(child.key_id, root.key_id);
-        assert_ne!(child.key.public_key(), root.key.public_key());
+        let validity = Validity::from_now(Duration::from_secs(60)).unwrap();
+        let root =
+            EphemeralKey::new_root(KeyType::Ed25519, ephemeral_test_subject(), validity).unwrap();
+        let root_key_id = root.key_id().await.unwrap();
+        let root_cert = root.cert().to_owned();
+        let issuer = root.subject();
+        let subject = ephemeral_test_subject();
+        let child = EphemeralKey::new_child(KeyType::P256, subject, issuer, validity, &root)
+            .await
+            .unwrap();
+        assert_ne!(child.key_id().await.unwrap(), root_key_id);
 
         let db = open_database_in_memory().unwrap();
         let mgr = JobManager::new(db).await.unwrap();
         assert!(
             matches!(
-                mgr.import_cert(&root.cert, false).await.unwrap_err(),
+                mgr.import_cert(&root_cert, false).await.unwrap_err(),
                 JobError::Cert(CertError::SelfSigned),
             ),
             "should not accept root cert without override"
         );
         assert!(
             matches!(
-                mgr.import_cert(&child.cert, false).await.unwrap_err(),
-                JobError::MissingCert(key_id) if key_id == root.key_id,
+                mgr.import_cert(child.cert(), false).await.unwrap_err(),
+                JobError::MissingCert(key_id) if key_id == root_key_id,
             ),
             "should not accept child cert without root"
         );
         assert_eq!(
-            mgr.import_cert(&root.cert, true).await.unwrap(),
-            root.key_id
+            mgr.import_cert(&root_cert, true).await.unwrap(),
+            root_key_id
         );
         assert_eq!(
-            mgr.cert_chain(root.key_id).await.unwrap(),
-            vec![root.cert.clone()]
+            mgr.cert_chain(root_key_id).await.unwrap(),
+            vec![root_cert.clone()]
         );
         assert_eq!(
-            mgr.import_cert(&child.cert, false).await.unwrap(),
-            child.key_id
+            mgr.import_cert(child.cert(), false).await.unwrap(),
+            child.key_id().await.unwrap()
         );
         assert_eq!(
-            mgr.cert_chain(child.key_id).await.unwrap(),
-            vec![root.cert.clone(), child.cert.clone()]
+            mgr.cert_chain(child.key_id().await.unwrap()).await.unwrap(),
+            vec![root_cert.clone(), child.cert().clone()]
         );
 
         let (job_id, _time_reserved) = mgr.reserve_one().await.unwrap();
-        let job = SignedJob::new(job_id, &child, "true").unwrap();
+        let job = child.sign_job_request(job_id, "true").await;
         let rx = mgr.job_start(job).await.unwrap();
         let status = rx.await.unwrap().unwrap();
-        check_status_ended(status, &child.cert, job_id, "true", Some(0), 0, 0);
+        check_status_ended(status, child.cert(), job_id, "true", Some(0), 0, 0);
     }
 }
