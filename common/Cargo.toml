@@ -1,5 +1,6 @@
 [package]
 name = "sush-common"
+description = "Oxide Support Shell Common Code"
 version = "0.1.0"
 edition = "2024"
 publish = false

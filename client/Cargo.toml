@@ -1,6 +1,6 @@
 [package]
 name = "sush-client"
-description = "support shell client"
+description = "Oxide Support Shell Client"
 version = "0.1.0"
 edition = "2024"
 publish = false
@@ -11,6 +11,7 @@ path = "src/main.rs"
 
 [dependencies]
 anyhow.workspace = true
+async-recursion.workspace = true
 blake3.workspace = true
 chrono.workspace = true
 clap.workspace = true
@@ -18,9 +19,12 @@ permission-slip-client.workspace = true
 permission-slip-common.workspace = true
 progenitor.workspace = true
 reqwest.workspace = true
+rustyline.workspace = true
 serde.workspace = true
 serde_json.workspace = true
+shlex.workspace = true
 sush-common = { path = "../common" }
 tokio.workspace = true
 uuid.workspace = true
 x509-cert.workspace = true
+xdg.workspace = true

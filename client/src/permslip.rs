@@ -8,10 +8,13 @@ use permslip_client_lib::{Client, ClientRequestBuilder};
 use serde_json::{json, to_string as json_to_string};
 use x509_cert::Certificate;
 use x509_cert::der::Decode as _;
-use x509_cert::der::pem::{PemLabel, decode_vec as decode_pem};
+use x509_cert::der::pem::{PemLabel as _, decode_vec as decode_pem};
 use x509_cert::spki::AlgorithmIdentifierOwned;
 
 use sush_common::certs::{KeyId, Signature, Signed, Signer, ToBeSigned};
+
+/// The default Permission Slip (aka Online Signing Service) server.
+pub const DEFAULT_PERMSLIP_URL: &str = "https://signer-us-west.corp.oxide.computer";
 
 pub struct PermslipSigner {
     client: Client,

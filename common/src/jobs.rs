@@ -1,5 +1,6 @@
 //! Signed job requests.
 
+use std::fmt;
 use std::ops::Deref;
 use std::str::FromStr;
 
@@ -31,6 +32,12 @@ impl Deref for JobId {
 
     fn deref(&self) -> &Self::Target {
         &self.0
+    }
+}
+
+impl fmt::Display for JobId {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "{}", self.0)
     }
 }
 

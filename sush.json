@@ -378,9 +378,9 @@
             "content": {
               "application/json": {
                 "schema": {
-                  "title": "uint",
+                  "title": "uint64",
                   "type": "integer",
-                  "format": "uint",
+                  "format": "uint64",
                   "minimum": 0
                 }
               }

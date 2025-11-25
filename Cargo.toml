@@ -4,10 +4,11 @@ resolver = "2"
 
 [workspace.dependencies]
 anyhow = "1"
+async-recursion = "1"
 blake3 = "1"
 base64 = "0.22"
 chrono = "0.4"
-clap = { version = "4", features = ["derive", "env"] }
+clap = { version = "4", features = ["derive", "env", "wrap_help"] }
 dropshot = "0.16"
 ed25519-dalek = { version = "2", features = ["rand_core"] }
 p256 = { version = "0.13", features = ["ecdsa"] }
@@ -17,12 +18,15 @@ progenitor = "0.11"
 rand_core = "0.6"
 reqwest = "0.12"
 rusqlite = { version = "0.37", features = ["blob", "chrono", "modern_sqlite", "uuid"] }
+rustyline = "17"
 schemars = { version = "0.8", features = ["chrono", "uuid1"] }
 serde = "1"
 serde_json = "1"
 sha2 = "0.10"
+shlex = "1"
 tempfile = "3"
 thiserror = "1"
 tokio = { version = "1", features = ["macros", "process", "rt", "sync", "time"] }
 uuid = { version = "1", features = ["serde", "v4"] }
 x509-cert = { version = "0.2", features = ["std"] }
+xdg = "3"

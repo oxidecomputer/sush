@@ -53,6 +53,7 @@ struct CertChainParams {
 }
 
 /// Get the certificate chain that validates a key, in root-to-leaf order.
+// TODO: more precise return type
 #[endpoint { method = GET, path = "/certs/{key_id}" }]
 async fn cert_chain(
     ctx: Context,
@@ -97,10 +98,10 @@ async fn get_reserved(
 async fn revoke_reserved(
     ctx: Context,
     params: TypedBody<Vec<JobId>>,
-) -> Result<HttpResponseOk<usize>, HttpError> {
+) -> Result<HttpResponseOk<u64>, HttpError> {
     let job_ids = params.into_inner();
     let nrevoked = ctx.context().revoke_reserved(job_ids).await?;
-    Ok(HttpResponseOk(nrevoked))
+    Ok(HttpResponseOk(nrevoked as u64))
 }
 
 // Job management requests.
