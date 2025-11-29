@@ -46,7 +46,7 @@ impl CommandContext for Repl {
         self.cli.ack(reserved)
     }
 
-    fn cert_chain(&self, key_id: KeyId, certs: Vec<Vec<u8>>) -> Result<()> {
+    fn cert_chain(&self, key_id: KeyId, certs: String) -> Result<()> {
         self.cli.cert_chain(key_id, certs)
     }
 

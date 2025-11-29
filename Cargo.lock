@@ -3137,6 +3137,7 @@ dependencies = [
  "chrono",
  "ed25519-dalek",
  "p256",
+ "pem-rfc7468",
  "rand_core",
  "rusqlite",
  "schemars",

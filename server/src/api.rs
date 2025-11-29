@@ -12,10 +12,10 @@ use dropshot::{
 use schemars::JsonSchema;
 use serde::Deserialize;
 
-use sush_common::certs::KeyId;
+use sush_common::certs::{KeyId, pem_cert_chain};
 use sush_common::jobs::{JobId, JobStatus, JobsReserved, SignedJob};
 
-use crate::manager::JobManager;
+use crate::manager::{JobError, JobManager};
 
 type Context = RequestContext<JobManager>;
 
@@ -52,19 +52,19 @@ struct CertChainParams {
     key_id: KeyId,
 }
 
-/// Get the certificate chain that validates a key, in root-to-leaf order.
-// TODO: more precise return type
+/// Get the certificate chain that validates a key.
+///
+/// Certificates are in root-to-leaf order,
+/// PEM encoded and newline separated.
 #[endpoint { method = GET, path = "/certs/{key_id}" }]
 async fn cert_chain(
     ctx: Context,
     params: PathParams<CertChainParams>,
-) -> Result<HttpResponseOk<Vec<Vec<u8>>>, HttpError> {
-    use x509_cert::der::Encode as _;
+) -> Result<HttpResponseOk<String>, HttpError> {
     let CertChainParams { key_id } = params.into_inner();
     let certs = ctx.context().cert_chain(key_id).await?;
-    Ok(HttpResponseOk(
-        certs.into_iter().map(|c| c.to_der().unwrap()).collect(),
-    ))
+    let chain = pem_cert_chain(certs).map_err(JobError::Cert)?;
+    Ok(HttpResponseOk(chain))
 }
 
 // Job reservation requests.

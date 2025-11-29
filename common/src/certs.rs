@@ -19,6 +19,7 @@ use x509_cert::der::Encode as _;
 use x509_cert::der::asn1::{Any, BitString};
 use x509_cert::der::oid::db::rfc5912::{ECDSA_WITH_SHA_256, ID_EC_PUBLIC_KEY, SECP_256_R_1};
 use x509_cert::der::oid::db::rfc8410::ID_ED_25519;
+use x509_cert::der::pem::{LineEnding, PemLabel as _, encode_string as pem_encode};
 use x509_cert::name::Name;
 use x509_cert::serial_number::SerialNumber;
 use x509_cert::spki::{AlgorithmIdentifier, AlgorithmIdentifierOwned, SubjectPublicKeyInfo};
@@ -47,6 +48,8 @@ pub enum CertError {
     InvalidPublicKey,
     #[error("invalid signature")]
     InvalidSignature,
+    #[error(transparent)]
+    Pem(#[from] pem_rfc7468::Error),
     #[error("can't import a self-signed (root) certificate")]
     SelfSigned,
     #[error("error while signing: {0}")]
@@ -467,4 +470,16 @@ impl Signer for EphemeralKey {
     async fn signature_algorithm(&self) -> Result<AlgorithmIdentifierOwned, Self::Error> {
         Ok(self.key.signature_algorithm())
     }
+}
+
+/// Encode a vector of certs as PEM and join them on newline for transport.
+pub fn pem_cert_chain(certs: Vec<Certificate>) -> Result<String, CertError> {
+    Ok(certs
+        .into_iter()
+        .map(|cert| cert.to_der())
+        .collect::<Result<Vec<Vec<u8>>, _>>()?
+        .into_iter()
+        .map(|cert| pem_encode(Certificate::PEM_LABEL, LineEnding::LF, &cert))
+        .collect::<Result<Vec<String>, _>>()?
+        .join("\n"))
 }

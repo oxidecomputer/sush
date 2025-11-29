@@ -10,6 +10,7 @@ base64.workspace = true
 chrono.workspace = true
 ed25519-dalek.workspace = true
 p256.workspace = true
+pem-rfc7468.workspace = true
 rand_core.workspace = true
 schemars.workspace = true
 serde.workspace = true

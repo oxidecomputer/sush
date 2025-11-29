@@ -13,8 +13,7 @@ use chrono::{DateTime, Utc};
 use clap::{Parser, Subcommand, ValueEnum};
 use serde_json::json;
 use x509_cert::Certificate;
-use x509_cert::der::pem::{LineEnding, PemLabel as _, encode_string as pem_encode};
-use x509_cert::der::{Decode as _, Encode as _};
+use x509_cert::der::Encode as _;
 
 use sush_common::certs::{KeyId, Signature, Signer as _};
 use sush_common::jobs::{JobId, JobStartRequest, JobStatus, JobsReserved};
@@ -173,7 +172,7 @@ pub trait CommandContext {
     fn set_output_format(&mut self, output: OutputFormat);
 
     fn ack(&self, reserved: JobsReserved) -> Result<()>;
-    fn cert_chain(&self, key_id: KeyId, certs: Vec<Vec<u8>>) -> Result<()>;
+    fn cert_chain(&self, key_id: KeyId, certs: String) -> Result<()>;
     fn cert_imported(&self, path: &Path, key_id: KeyId) -> Result<()>;
     fn job_aborted(&self, job_id: JobId) -> Result<()>;
     fn job_output(&self, output: Vec<u8>, binary: bool) -> Result<()>;
@@ -213,11 +212,8 @@ impl CommandContext for Cli {
         Ok(())
     }
 
-    fn cert_chain(&self, key_id: KeyId, certs: Vec<Vec<u8>>) -> Result<()> {
-        let chain = certs
-            .iter()
-            .map(|cert| Certificate::from_der(cert))
-            .collect::<Result<Vec<Certificate>, _>>()?;
+    fn cert_chain(&self, key_id: KeyId, certs: String) -> Result<()> {
+        let chain = Certificate::load_pem_chain(certs.as_bytes())?;
         let Some((root, rest)) = chain.split_first() else {
             bail!("empty certificate chain");
         };
@@ -250,14 +246,8 @@ impl CommandContext for Cli {
         }
 
         if matches!(self.get_output_format(), OutputFormat::Json) {
-            let pem_chain = certs
-                .into_iter()
-                .map(|cert| pem_encode(Certificate::PEM_LABEL, LineEnding::LF, &cert))
-                .collect::<Result<Vec<String>, _>>()?
-                .join("\n");
-            println!("{}", json!(pem_chain));
+            println!("{}", json!(certs));
         }
-
         Ok(())
     }
 
