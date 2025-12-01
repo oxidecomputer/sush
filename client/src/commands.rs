@@ -10,18 +10,18 @@ use std::path::{Path, PathBuf};
 use async_recursion::async_recursion;
 use chrono::{DateTime, Utc};
 use clap::{Parser, Subcommand, ValueEnum};
+use thiserror::Error;
 use tokio::select;
 use tokio::signal::ctrl_c;
 
-use sush_common::certs::{KeyId, Signer as _};
+use sush_common::certs::{CertError, KeyId, Signer as _};
 use sush_common::jobs::{JobId, JobStartRequest, JobStatus, JobsReserved};
 
-use crate::Client;
-use crate::Error as ClientError;
-use crate::cli::CliError;
-use crate::permslip::{DEFAULT_PERMSLIP_URL, PermslipError, PermslipSigner};
+use crate::permslip::PermslipError;
+use crate::permslip::{DEFAULT_PERMSLIP_URL, PermslipSigner};
 use crate::repl::Repl;
 use crate::types::Error as ApiError;
+use crate::{Client, Error as ClientError};
 
 /// Default Support Shell HTTP API address.
 const DEFAULT_SUSH_URL: &str = "http://127.0.0.1:44444";
@@ -67,7 +67,7 @@ pub struct ClientArgs {
 }
 
 impl ClientArgs {
-    pub async fn execute<C>(&self, ctx: &mut C) -> Result<(), C::Error>
+    pub async fn execute<C>(&self, ctx: &mut C) -> Result<(), CommandError>
     where
         C: CommandContext + Send + Sync,
     {
@@ -104,9 +104,14 @@ pub enum ClientCommand {
     /// Sign and start a job.
     #[clap(alias = "start")]
     JobStart {
+        /// The command for the job to run. Passed as an argument to
+        /// `bash -c`, so may be an arbitrary bash(1) command or pipeline.
+        /// Be sure to quote spaces and characters special to your shell!
+        command: String,
+
         /// Previously reserved but unused job ID.
-        #[arg(short = 'i', long, env = SUSH_JOB_ID)]
-        job_id: JobId,
+        #[clap(env = SUSH_JOB_ID)]
+        job_id: Option<JobId>,
 
         /// Use `permslip` to sign requests with this key name.
         #[arg(short, long, env = "SUSH_PERMSLIP_KEY", name = "KEY_NAME")]
@@ -116,21 +121,16 @@ pub enum ClientCommand {
         #[arg(long, env = "PERMSLIP_URL", default_value = DEFAULT_PERMSLIP_URL)]
         permslip_url: String,
 
-        /// If true, wait for the job to end before returning.
+        /// Wait for the job to end before returning.
         #[arg(short, long, default_value_t = false)]
         wait: bool,
-
-        /// The command for the job to run. Passed as an argument to
-        /// `bash -c`, so may be an arbitrary bash(1) command or pipeline.
-        /// Be sure to quote spaces and characters special to your shell!
-        command: String,
     },
 
     /// Get the status of a started job.
     #[clap(alias = "status")]
     JobStatus {
         /// The job whose status should be fetched.
-        #[arg(short = 'i', long, env = SUSH_JOB_ID)]
+        #[clap(env = SUSH_JOB_ID)]
         job_id: JobId,
     },
 
@@ -138,7 +138,7 @@ pub enum ClientCommand {
     #[clap(alias = "stdout")]
     JobStdout {
         /// The job whose output should be fetched.
-        #[arg(short = 'i', long, env = SUSH_JOB_ID)]
+        #[clap(env = SUSH_JOB_ID)]
         job_id: JobId,
 
         /// Job output is binary, not UTF-8 encoded text.
@@ -150,7 +150,7 @@ pub enum ClientCommand {
     #[clap(alias = "stderr")]
     JobStderr {
         /// The job whose error output should be fetched.
-        #[arg(short = 'i', long, env = SUSH_JOB_ID)]
+        #[clap(env = SUSH_JOB_ID)]
         job_id: JobId,
 
         /// Job error output is binary, not UTF-8 encoded text.
@@ -162,7 +162,7 @@ pub enum ClientCommand {
     #[clap(alias = "abort")]
     JobAbort {
         /// The job to abort.
-        #[arg(short = 'i', long, env = SUSH_JOB_ID)]
+        #[clap(env = SUSH_JOB_ID)]
         job_id: JobId,
     },
 
@@ -172,34 +172,28 @@ pub enum ClientCommand {
 }
 
 pub trait CommandContext {
-    type Error: From<CliError>
-        + From<clap::Error>
-        + From<ClientError<ApiError>>
-        + From<std::io::Error>
-        + From<PermslipError>;
-
     fn get_output_format(&self) -> OutputFormat;
     fn set_output_format(&mut self, output: OutputFormat);
     fn pre_parse_hook(&mut self, _command: &str) {}
 
-    fn ack(&mut self, reserved: JobsReserved) -> Result<(), Self::Error>;
-    fn cert_chain(&mut self, key_id: KeyId, certs: &str) -> Result<(), Self::Error>;
-    fn cert_imported(&mut self, path: &Path, key_id: KeyId) -> Result<(), Self::Error>;
-    fn job_aborted(&mut self, id: JobId) -> Result<(), Self::Error>;
-    fn job_stdout(&mut self, id: JobId, output: &[u8], binary: bool) -> Result<(), Self::Error>;
-    fn job_stderr(&mut self, id: JobId, errors: &[u8], binary: bool) -> Result<(), Self::Error>;
-    fn job_status(&mut self, id: JobId, status: &JobStatus) -> Result<(), Self::Error>;
-    fn jobs_reserved(&mut self, reserved: &JobsReserved) -> Result<(), Self::Error>;
+    fn ack(&mut self, reserved: JobsReserved) -> Result<(), CommandError>;
+    fn cert_chain(&mut self, key_id: KeyId, certs: &str) -> Result<(), CommandError>;
+    fn cert_imported(&mut self, path: &Path, key_id: KeyId) -> Result<(), CommandError>;
+    fn job_aborted(&mut self, id: JobId) -> Result<(), CommandError>;
+    fn job_stdout(&mut self, id: JobId, output: &[u8], binary: bool) -> Result<(), CommandError>;
+    fn job_stderr(&mut self, id: JobId, errors: &[u8], binary: bool) -> Result<(), CommandError>;
+    fn job_status(&mut self, id: JobId, status: &JobStatus) -> Result<(), CommandError>;
+    fn jobs_reserved(&mut self, reserved: &JobsReserved) -> Result<(), CommandError>;
     fn reserved_map(
         &mut self,
         reserved: &HashMap<String, DateTime<Utc>>,
-    ) -> Result<(), Self::Error>;
-    fn revoked(&mut self, revoked: &[JobId]) -> Result<(), Self::Error>;
+    ) -> Result<(), CommandError>;
+    fn revoked(&mut self, revoked: &[JobId]) -> Result<(), CommandError>;
 }
 
 impl ClientCommand {
     #[async_recursion]
-    pub async fn execute<C>(&self, args: &ClientArgs, ctx: &mut C) -> Result<(), C::Error>
+    pub async fn execute<C>(&self, args: &ClientArgs, ctx: &mut C) -> Result<(), CommandError>
     where
         C: CommandContext + Send + Sync,
     {
@@ -233,8 +227,11 @@ impl ClientCommand {
                 let revoked = client.revoke_reserved(job_ids).await?.into_inner();
                 ctx.revoked(&revoked)
             }
+            ClientCommand::JobStart { job_id: None, .. } => {
+                return Err(CommandError::MissingJobId);
+            }
             ClientCommand::JobStart {
-                job_id,
+                job_id: Some(job_id),
                 permslip,
                 permslip_url,
                 wait,
@@ -278,6 +275,66 @@ impl ClientCommand {
                 Repl::default().run(args).await?;
                 Ok(())
             }
+        }
+    }
+}
+
+/// What went wrong parsing, preparing, or executing a client command.
+#[derive(Debug, Error)]
+pub enum CommandError {
+    #[error("❌ {0}")]
+    Cert(#[from] CertError),
+    #[error("❌ {0}")]
+    Clap(#[from] clap::Error),
+    #[error("❌ {0}")]
+    Client(String),
+    #[error("❌ {0}")]
+    Der(#[from] x509_cert::der::Error),
+    #[error("❌ Empty certificate chain")]
+    EmptyCertChain,
+    #[error("❌ {0}")]
+    Io(#[from] std::io::Error),
+    #[error("❌ Leaf certificate does not match key `{0}`")]
+    InvalidLeafCert(KeyId),
+    #[error("❌ Root certificate is not self-signed")]
+    InvalidRootCert,
+    #[error("❌ Missing job ID, try `reserve-jobs` or `get-reserved`")]
+    MissingJobId,
+    #[error("❌ {0}")]
+    Permslip(#[from] PermslipError),
+    #[error("❌ {0}")]
+    Readline(#[from] rustyline::error::ReadlineError),
+    #[error(transparent)]
+    Recursive(#[from] Box<Self>),
+    #[error("❌ {0}")]
+    Utf8(#[from] std::string::FromUtf8Error),
+    #[error("❌ {0}")]
+    Uuid(#[from] uuid::Error),
+}
+
+impl From<ClientError<ApiError>> for CommandError {
+    fn from(error: ClientError<ApiError>) -> Self {
+        use ClientError::*;
+        match error {
+            InvalidRequest(e) => CommandError::Client(format!("Invalid request: {e}")),
+            CommunicationError(e) => CommandError::Client(format!("Communication error: {e}")),
+            InvalidUpgrade(e) => CommandError::Client(e.to_string()),
+            ErrorResponse(e) => CommandError::Client(e.message.to_owned()),
+            ResponseBodyError(e) => CommandError::Client(e.to_string()),
+            InvalidResponsePayload(_b, e) => CommandError::Client(e.to_string()),
+            UnexpectedResponse(e) if e.status().is_redirection() => {
+                if let Some(l) = e.headers().get("location") {
+                    CommandError::Client(format!(
+                        "Got {} to {}",
+                        e.status(),
+                        l.to_str().unwrap_or("?")
+                    ))
+                } else {
+                    CommandError::Client(format!("Got {}", e.status()))
+                }
+            }
+            UnexpectedResponse(e) => CommandError::Client(format!("Unexpected response: {e:?}")),
+            Custom(e) => CommandError::Client(e.to_string()),
         }
     }
 }

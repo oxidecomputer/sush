@@ -1,4 +1,6 @@
 //! Read, evaluate, print, loop.
+//!
+//! Inherits most of its behavior from the (non-interactive) CLI.
 
 use std::collections::HashMap;
 use std::env;
@@ -15,11 +17,12 @@ use xdg::BaseDirectories;
 use sush_common::certs::KeyId;
 use sush_common::jobs::{JobId, JobStatus, JobsReserved};
 
-use crate::cli::{Cli, CliError};
-use crate::commands::{ClientArgs, ClientCommand, CommandContext, OutputFormat, SUSH_JOB_ID};
+use crate::cli::Cli;
+use crate::commands::{
+    ClientArgs, ClientCommand, CommandContext, CommandError, OutputFormat, SUSH_JOB_ID,
+};
 
 const PREFIX: &str = "sush";
-const PROMPT: &str = "sush# ";
 const HISTORY_FILE: &str = "history.txt";
 
 #[derive(Debug, Parser)]
@@ -30,7 +33,7 @@ struct ReplCommandParser {
 }
 
 impl ReplCommandParser {
-    fn try_parse<I, T, C>(words: I, ctx: &mut C) -> Result<Self, C::Error>
+    fn try_parse<I, T, C>(words: I, ctx: &mut C) -> Result<Self, CommandError>
     where
         I: IntoIterator<Item = T>,
         T: Into<OsString> + Clone,
@@ -46,7 +49,7 @@ impl ReplCommandParser {
     }
 }
 
-/// Interactive Read-Evaluate-Print-Loop.
+/// Interactive REPL.
 #[derive(Clone, Debug, Default)]
 pub struct Repl {
     cli: Cli,
@@ -54,38 +57,38 @@ pub struct Repl {
 }
 
 impl Repl {
-    pub async fn run(mut self, args: &ClientArgs) -> Result<(), <Self as CommandContext>::Error> {
+    pub async fn run(mut self, args: &ClientArgs) -> Result<(), CommandError> {
         let xdg = BaseDirectories::with_prefix(PREFIX);
         let history_file = xdg.place_state_file(HISTORY_FILE)?;
         let mut rl = DefaultEditor::new()?;
         let _ = rl.load_history(&history_file);
         loop {
-            match rl.readline(PROMPT) {
+            match rl.readline(&self.prompt()) {
                 Ok(command) => {
                     if command.trim().is_empty() {
                         continue;
                     }
                     rl.add_history_entry(&command)?;
                     let Some(words) = split_command(&command) else {
-                        println!("invalid quoting in command");
+                        eprintln!("❌ Invalid quoting in command");
                         continue;
                     };
                     let command = match ReplCommandParser::try_parse(&words, &mut self) {
                         Ok(ReplCommandParser { command }) => command,
                         Err(err) => {
-                            println!("{err}");
+                            eprintln!("{err}");
                             continue;
                         }
                     };
                     match command.execute(args, &mut self).await {
                         Ok(()) => (),
-                        Err(err) => println!("{err}"),
+                        Err(err) => eprintln!("{err}"),
                     }
                 }
                 Err(ReadlineError::Interrupted) => continue,
                 Err(ReadlineError::Eof) => break,
                 Err(err) => {
-                    println!("Error reading input: {err}");
+                    eprintln!("❌ Error reading input: {err}");
                     break;
                 }
             }
@@ -94,26 +97,41 @@ impl Repl {
         Ok(())
     }
 
-    /// Set the `SUSH_JOB_ID` environment variable to a reserved but unused job
-    /// as a default for `--job-id` arguments.
-    fn set_job_id(&mut self) {
-        if let Ok(job_id) = env::var(SUSH_JOB_ID)
-            && let Ok(job_id) = job_id.parse()
-        {
-            self.remove_job_id(job_id);
-        }
+    /// Get the default job ID from the `SUSH_JOB_ID` environment variable.
+    fn default_job_id(&self) -> Option<JobId> {
+        env::var(SUSH_JOB_ID)
+            .ok()
+            .and_then(|job_id| job_id.parse().ok())
+    }
 
-        if let Some(job_id) = self.reserved.first() {
+    /// (Un)set the `SUSH_JOB_ID` environment variable as a default for
+    /// job ID arguments.
+    fn set_job_id(&mut self, job_id: Option<JobId>) {
+        if let Some(job_id) = job_id {
             unsafe { env::set_var(SUSH_JOB_ID, job_id.to_string()) }
         } else {
             unsafe { env::remove_var(SUSH_JOB_ID) }
         }
     }
 
-    /// Note that `job_id` is no longer available.
-    fn remove_job_id(&mut self, job_id: JobId) {
+    /// Set the `SUSH_JOB_ID` environment variable to a reserved but unused job.
+    fn set_default_job_id(&mut self) {
+        self.set_job_id(self.reserved.first().copied());
+    }
+
+    /// Remove `job_id` from the list of reserved jobs.
+    fn unreserve_job_id(&mut self, job_id: JobId) {
         if let Some(i) = self.reserved.iter().position(|&j| j == job_id) {
             self.reserved.remove(i);
+        }
+    }
+
+    /// Make a prompt including the default job ID.
+    fn prompt(&self) -> String {
+        if let Some(job_id) = self.default_job_id() {
+            format!("{PREFIX} {job_id}# ")
+        } else {
+            format!("{PREFIX}# ")
         }
     }
 }
@@ -121,8 +139,6 @@ impl Repl {
 /// Most of these methods simply punt to those of [`Cli`] for display.
 /// But we also update local (ephemeral) state for certain responses.
 impl CommandContext for Repl {
-    type Error = CliError;
-
     fn get_output_format(&self) -> OutputFormat {
         self.cli.get_output_format()
     }
@@ -133,25 +149,26 @@ impl CommandContext for Repl {
 
     fn pre_parse_hook(&mut self, command: &str) {
         if matches!(command, "job-start" | "start") {
-            self.set_job_id();
+            self.set_default_job_id();
         }
     }
 
-    fn ack(&mut self, reserved: JobsReserved) -> Result<(), Self::Error> {
+    fn ack(&mut self, reserved: JobsReserved) -> Result<(), CommandError> {
         self.cli.ack(reserved)
     }
 
-    fn cert_chain(&mut self, key_id: KeyId, certs: &str) -> Result<(), Self::Error> {
+    fn cert_chain(&mut self, key_id: KeyId, certs: &str) -> Result<(), CommandError> {
         self.cli.cert_chain(key_id, certs)
     }
 
-    fn cert_imported(&mut self, path: &Path, key_id: KeyId) -> Result<(), Self::Error> {
+    fn cert_imported(&mut self, path: &Path, key_id: KeyId) -> Result<(), CommandError> {
         self.cli.cert_imported(path, key_id)
     }
 
-    fn job_aborted(&mut self, job_id: JobId) -> Result<(), Self::Error> {
+    fn job_aborted(&mut self, job_id: JobId) -> Result<(), CommandError> {
         self.cli.job_aborted(job_id)?;
-        self.remove_job_id(job_id);
+        self.set_job_id(Some(job_id));
+        self.unreserve_job_id(job_id);
         Ok(())
     }
 
@@ -160,8 +177,10 @@ impl CommandContext for Repl {
         job_id: JobId,
         output: &[u8],
         binary: bool,
-    ) -> Result<(), Self::Error> {
-        self.cli.job_stdout(job_id, output, binary)
+    ) -> Result<(), CommandError> {
+        self.cli.job_stdout(job_id, output, binary)?;
+        self.set_job_id(Some(job_id));
+        Ok(())
     }
 
     fn job_stderr(
@@ -169,15 +188,20 @@ impl CommandContext for Repl {
         job_id: JobId,
         errors: &[u8],
         binary: bool,
-    ) -> Result<(), Self::Error> {
-        self.cli.job_stderr(job_id, errors, binary)
+    ) -> Result<(), CommandError> {
+        self.cli.job_stderr(job_id, errors, binary)?;
+        self.set_job_id(Some(job_id));
+        Ok(())
     }
 
-    fn job_status(&mut self, job_id: JobId, status: &JobStatus) -> Result<(), Self::Error> {
-        self.cli.job_status(job_id, status)
+    fn job_status(&mut self, job_id: JobId, status: &JobStatus) -> Result<(), CommandError> {
+        self.cli.job_status(job_id, status)?;
+        self.set_job_id(Some(job_id));
+        self.unreserve_job_id(job_id);
+        Ok(())
     }
 
-    fn jobs_reserved(&mut self, reserved: &JobsReserved) -> Result<(), Self::Error> {
+    fn jobs_reserved(&mut self, reserved: &JobsReserved) -> Result<(), CommandError> {
         self.cli.jobs_reserved(reserved)?;
         self.reserved = reserved.job_ids.clone();
         Ok(())
@@ -186,7 +210,7 @@ impl CommandContext for Repl {
     fn reserved_map(
         &mut self,
         reserved: &HashMap<String, DateTime<Utc>>,
-    ) -> Result<(), Self::Error> {
+    ) -> Result<(), CommandError> {
         self.cli.reserved_map(reserved)?;
         self.reserved = reserved
             .keys()
@@ -195,7 +219,7 @@ impl CommandContext for Repl {
         Ok(())
     }
 
-    fn revoked(&mut self, revoked: &[JobId]) -> Result<(), Self::Error> {
+    fn revoked(&mut self, revoked: &[JobId]) -> Result<(), CommandError> {
         self.cli.revoked(revoked)?;
         self.reserved.retain(|j| !revoked.contains(j));
         Ok(())

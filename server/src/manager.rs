@@ -44,13 +44,13 @@ pub enum JobError {
     ChannelClosed,
     #[error("DER encoding error: {0}")]
     Der(#[from] x509_cert::der::Error),
-    #[error("Invalid command: {0}")]
+    #[error("Invalid command `{0}`")]
     InvalidCommand(String),
     #[error("Invalid or duplicate job ID")]
     InvalidJobId(JobId),
     #[error(transparent)]
     Io(#[from] std::io::Error),
-    #[error("Can't find certificate for key {}", BASE64.encode(.0.as_slice()))]
+    #[error("Can't find certificate for key `{}`", BASE64.encode(.0.as_slice()))]
     MissingCert(KeyId),
     #[error("Can't receive response: sender dropped")]
     Recv(#[from] oneshot::error::RecvError),
