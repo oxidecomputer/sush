@@ -4,6 +4,7 @@ use std::collections::HashMap;
 use std::io::{Write as _, stdout};
 use std::path::Path;
 
+use bytesize::ByteSize;
 use chrono::{DateTime, Utc};
 use serde_json::json;
 use x509_cert::Certificate;
@@ -218,8 +219,10 @@ impl CommandContext for Cli {
                      Started at:\t{time_started}\n   \
                      Ended at:\t{time_ended}\n   \
                      Status:\t{status}\n   \
-                     Stdout:\t{stdout_len} bytes\n   \
-                     Stderr:\t{stderr_len} bytes",
+                     Stdout:\t{}\n   \
+                     Stderr:\t{}",
+                    ByteSize::b(*stdout_len as u64).display().si(),
+                    ByteSize::b(*stderr_len as u64).display().si(),
                 ),
                 JobStatus::Ended {
                     time_reserved,

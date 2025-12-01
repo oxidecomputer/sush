@@ -12,6 +12,7 @@ path = "src/main.rs"
 [dependencies]
 async-recursion.workspace = true
 blake3.workspace = true
+bytesize.workspace = true
 chrono.workspace = true
 clap.workspace = true
 pem-rfc7468.workspace = true

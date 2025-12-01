@@ -6,6 +6,7 @@ resolver = "2"
 async-recursion = "1"
 blake3 = "1"
 base64 = "0.22"
+bytesize = "2"
 chrono = "0.4"
 clap = { version = "4", features = ["derive", "env", "wrap_help"] }
 dropshot = "0.16"
