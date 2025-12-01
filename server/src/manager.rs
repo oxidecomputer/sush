@@ -20,6 +20,7 @@ use std::process::{ExitStatus, Stdio};
 use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD as BASE64};
 use chrono::{DateTime, Utc};
 use dropshot::{ClientErrorStatusCode, HttpError};
+use rusqlite::limits::Limit;
 use rusqlite::{Connection, OptionalExtension as _, blob::ZeroBlob};
 use tempfile::tempfile;
 use thiserror::Error;
@@ -30,7 +31,9 @@ use tokio::task::{AbortHandle, JoinError, JoinHandle, JoinSet, spawn};
 use x509_cert::Certificate;
 use x509_cert::der::{Decode as _, Encode as _};
 
-use sush_common::blob::{BlobError, file_len, get_blob, read_blob_chunk, read_blob_from_file};
+use sush_common::blob::{
+    BlobError, blob_limit, file_len, get_blob, read_blob_chunk, read_blob_from_file,
+};
 use sush_common::certs::{CertError, KeyId, ROOT_CERTS, Signature};
 use sush_common::jobs::{JobId, JobStartRequest, JobStatus, JobsReserved, SignedJob, VerifiedJob};
 
@@ -67,6 +70,14 @@ pub enum JobError {
 impl From<JobError> for HttpError {
     fn from(err: JobError) -> Self {
         HttpError::for_client_error(None, ClientErrorStatusCode::BAD_REQUEST, err.to_string())
+    }
+}
+
+struct ExecutionError(JobId, DateTime<Utc>);
+
+impl ExecutionError {
+    fn new(job_id: JobId) -> Self {
+        Self(job_id, Utc::now())
     }
 }
 
@@ -222,28 +233,29 @@ impl JobManager {
         // Accept and process job requests.
         let (tx, mut rx) = mpsc::channel::<JobRequest>(1);
         let task = spawn(async move {
-            let mut tasks = JoinSet::<Result<JobEnd, JobError>>::new();
+            let mut tasks = JoinSet::<Result<JobEnd, ExecutionError>>::new();
             let mut abort = BTreeMap::<JobId, AbortHandle>::new();
             loop {
                 select! {
                     Some(end) = tasks.join_next() => {
                         // A job has finished.
-                        // TODO: Revoke reservations on error.
-                        // TODO: Ensure killed jobs are reaped.
                         match end {
                             Err(err) if err.is_cancelled() => (),
-                            Err(err) => return Err(err.into()),
-                            Ok(Err(_)) => continue,
+                            Err(err) => panic!("Can't join job task: {err}"),
+                            Ok(Err(ExecutionError(job_id, time_ended))) => {
+                                assert!(abort.remove(&job_id).is_some());
+                                let _ = job_aborted(&db, job_id, time_ended);
+                            }
                             Ok(Ok(end)) => {
                                 assert!(abort.remove(&end.job_id()).is_some());
-                                job_ended(
+                                let _ = job_ended(
                                     &mut db,
                                     end.job_id(),
                                     end.status.code(),
                                     end.stdout,
                                     end.stderr,
                                     end.time_ended,
-                                )?;
+                                );
                             }
                         }
                     }
@@ -294,7 +306,7 @@ impl JobManager {
                             Some(JobRequest::Abort { job_id }) => {
                                 if let Some(job) = abort.remove(&job_id) {
                                     job.abort();
-                                    job_aborted(&db, job_id, Utc::now())?;
+                                    let _ = job_aborted(&db, job_id, Utc::now());
                                 }
                             }
                         }
@@ -450,7 +462,7 @@ fn start_job(
     db: &mut Connection,
     start: JobStart,
     response: oneshot::Sender<Result<JobStatus, JobError>>,
-    tasks: &mut JoinSet<Result<JobEnd, JobError>>,
+    tasks: &mut JoinSet<Result<JobEnd, ExecutionError>>,
 ) -> Result<AbortHandle, JobError> {
     macro_rules! with_err_response {
         ($expr:expr) => {
@@ -467,6 +479,7 @@ fn start_job(
         };
     }
 
+    let limit = blob_limit(db)?;
     let txn = db.transaction()?;
     let job = start.job.clone();
     let job_id = job.job_id();
@@ -477,16 +490,18 @@ fn start_job(
     txn.commit()?;
 
     Ok(tasks.spawn(async move {
-        let end = with_err_response!(start.wait().await, JobError::Wait);
-        assert_eq!(job_id, end.job_id());
+        let exe = || ExecutionError::new(job_id);
+        let end = with_err_response!(start.wait().await, exe());
+        let stdout_len = with_err_response!(file_len(&end.stdout, limit), exe());
+        let stderr_len = with_err_response!(file_len(&end.stderr, limit), exe());
         let _ = response.send(Ok(JobStatus::Ended {
             job: end.job.clone(),
             time_reserved,
             time_started: end.time_started,
             time_ended: end.time_ended,
             status: end.status.code(),
-            stdout_len: file_len(&end.stdout)?,
-            stderr_len: file_len(&end.stderr)?,
+            stdout_len,
+            stderr_len,
         }));
         Ok(end)
     }))
@@ -752,8 +767,14 @@ fn job_ended(
     mut stderr: File,
     time_ended: DateTime<Utc>,
 ) -> Result<(), BlobError> {
-    let stdout_len = file_len(&stdout)?;
-    let stderr_len = file_len(&stderr)?;
+    let limit = blob_limit(db)?;
+    let stdout_len = file_len(&stdout, limit)?;
+    let stderr_len = file_len(&stderr, limit)?;
+    let blob_limit = db.limit(Limit::SQLITE_LIMIT_LENGTH)?;
+    if stdout_len > blob_limit || stderr_len > blob_limit {
+        dbg!((stdout_len, stderr_len, blob_limit));
+        return Err(BlobError::FileTooLarge);
+    }
     let txn = db.transaction()?;
     txn.execute(
         "UPDATE jobs SET status = ?2, stdout = ?3, stderr = ?4, time_ended = ?5 \
@@ -1145,5 +1166,36 @@ mod test {
         let rx = mgr.job_start(job).await.unwrap();
         let status = rx.await.unwrap().unwrap();
         check_status_ended(status, child.cert(), job_id, "true", Some(0), 0, 0);
+    }
+
+    #[ignore = "takes a few seconds"]
+    #[tokio::test]
+    async fn too_much_output() {
+        let (mgr, root) = manager_and_test_root(None).await;
+        let JobsReserved {
+            mut job_ids,
+            time_reserved: _,
+        } = mgr.reserve_jobs(2).await.unwrap();
+
+        let job_id = job_ids.pop().unwrap();
+        let command = "dd if=/dev/zero bs=1000 count=999999 2>/dev/null";
+        let job = root.sign_job_request(job_id, command).await;
+        let rx = mgr.job_start(job).await.unwrap();
+        let status = rx.await.unwrap().unwrap();
+        check_status_ended(status, root.cert(), job_id, command, Some(0), 999999000, 0);
+
+        let job_id = job_ids.pop().unwrap();
+        let command = "dd if=/dev/zero bs=1000 count=1000000 2>/dev/null";
+        let job = root.sign_job_request(job_id, command).await;
+        let rx = mgr.job_start(job).await.unwrap();
+        assert!(
+            matches!(
+                rx.await.unwrap().unwrap_err(),
+                JobError::Blob(BlobError::FileTooLarge),
+            ),
+            "should exceed BLOB size limit"
+        );
+        let status = mgr.job_status(job_id).await.unwrap();
+        check_status_ended(status, root.cert(), job_id, command, None, 0, 0);
     }
 }

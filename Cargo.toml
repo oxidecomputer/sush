@@ -18,7 +18,7 @@ permission-slip-common = { path = "../permission-slip/common" }
 progenitor = "0.11"
 rand_core = "0.6"
 reqwest = "0.12"
-rusqlite = { version = "0.37", features = ["blob", "chrono", "modern_sqlite", "uuid"] }
+rusqlite = { version = "0.37", features = ["blob", "chrono", "limits", "modern_sqlite", "uuid"] }
 rustyline = "17"
 schemars = { version = "0.8", features = ["chrono", "uuid1"] }
 serde = "1"

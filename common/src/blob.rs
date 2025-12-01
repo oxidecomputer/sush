@@ -5,12 +5,14 @@ use std::io::{Seek as _, copy};
 use std::ops::Range;
 
 use rusqlite::blob::{Blob, ZeroBlob};
+use rusqlite::limits::Limit;
 use rusqlite::{Connection, Name, ToSql};
 use thiserror::Error;
 
+/// What went wrong reading from or writing to a BLOB.
 #[derive(Debug, Error)]
 pub enum BlobError {
-    #[error("file is too large for a BLOB (> 2GiB)")]
+    #[error("file is too large for a BLOB")]
     FileTooLarge,
     #[error(transparent)]
     Io(#[from] std::io::Error),
@@ -70,8 +72,8 @@ where
     Ok(db.blob_open(db_name.as_str(), table, blob_column, row_id, false)?)
 }
 
-/// Read a chunk of `blob`. May return a vector shorter than the requested `range`
-/// if it falls partly outside the extent of `blob`.
+/// Read a chunk of a BLOB. May return a vector shorter than the requested
+/// `range` if it falls partly outside the extent of `blob`.
 pub fn read_blob_chunk(blob: &Blob, range: Range<i32>) -> Result<Vec<u8>, BlobError> {
     let start = range.start as usize;
     let len = range.len().min(blob.len().saturating_sub(start));
@@ -93,7 +95,8 @@ where
     N: Name,
     T: ToSql,
 {
-    let len = file_len(file)?;
+    let limit = blob_limit(db)?;
+    let len = file_len(file, limit)?;
     let mut blob = set_blob_size(db, table, blob_column, key_column, key, len)?;
     file.rewind()?;
     copy(file, &mut blob)?;
@@ -106,13 +109,20 @@ pub fn write_blob_to_file(blob: &mut Blob, file: &mut File) -> Result<u64, BlobE
     Ok(copy(blob, file)?)
 }
 
-/// Return the length in bytes of `file`, or an error if it exceeds the
-/// maximum capacity of a SQLite BLOB.
-pub fn file_len(file: &File) -> Result<i32, BlobError> {
-    file.metadata()?
-        .len()
-        .try_into()
-        .map_err(|_| BlobError::FileTooLarge)
+/// Return the current maximum size of a string or BLOB.
+pub fn blob_limit(db: &Connection) -> Result<i32, BlobError> {
+    Ok(db.limit(Limit::SQLITE_LIMIT_LENGTH)?)
+}
+
+/// Return the length in bytes of `file`, or an error if it is too
+/// big to fit in a BLOB.
+pub fn file_len(file: &File, limit: i32) -> Result<i32, BlobError> {
+    let len = file.metadata()?.len();
+    if len < limit as u64 {
+        Ok(len as i32)
+    } else {
+        Err(BlobError::FileTooLarge)
+    }
 }
 
 #[cfg(test)]
