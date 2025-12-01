@@ -10,6 +10,8 @@ use std::path::{Path, PathBuf};
 use async_recursion::async_recursion;
 use chrono::{DateTime, Utc};
 use clap::{Parser, Subcommand, ValueEnum};
+use tokio::select;
+use tokio::signal::ctrl_c;
 
 use sush_common::certs::{KeyId, Signer as _};
 use sush_common::jobs::{JobId, JobStartRequest, JobStatus, JobsReserved};
@@ -240,7 +242,13 @@ impl ClientCommand {
             } => {
                 let signer = PermslipSigner::new(permslip, permslip_url).await?;
                 let job = signer.sign(JobStartRequest::new(*job_id, command)).await?;
-                let status = client.job_start(job_id, *wait, &job).await?.into_inner();
+                let status = select! {
+                    status = client.job_start(job_id, *wait, &job) => status?.into_inner(),
+                    _ = ctrl_c() => {
+                        client.job_abort(job_id).await?;
+                        client.job_status(job_id).await?.into_inner()
+                    }
+                };
                 ctx.job_status(*job_id, &status)?;
                 if *wait {
                     let stdout = client.job_stdout(job_id).await?.into_inner();
