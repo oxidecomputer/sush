@@ -91,17 +91,18 @@ async fn get_reserved(
 
 /// Revoke a set of reserved but unused job slots.
 ///
-/// Has no effect on jobs already started (or finished), so it is safe to
-/// call this with a batch of IDs where some have been used. Returns the
-/// number of jobs actually revoked.
+/// Has no effect on jobs already started or finished, so it is safe to
+/// call this with a list of IDs where some have been used. If called with
+/// an empty list, revokes all reserved but unused jobs. Returns the list
+/// of jobs actually revoked.
 #[endpoint { method = DELETE, path = "/reserved" }]
 async fn revoke_reserved(
     ctx: Context,
     params: TypedBody<Vec<JobId>>,
-) -> Result<HttpResponseOk<u64>, HttpError> {
+) -> Result<HttpResponseOk<Vec<JobId>>, HttpError> {
     let job_ids = params.into_inner();
-    let nrevoked = ctx.context().revoke_reserved(job_ids).await?;
-    Ok(HttpResponseOk(nrevoked as u64))
+    let revoked = ctx.context().revoke_reserved(job_ids).await?;
+    Ok(HttpResponseOk(revoked))
 }
 
 // Job management requests.
@@ -113,7 +114,7 @@ struct JobIdParam {
 
 #[derive(Deserialize, JsonSchema)]
 struct JobStartParams {
-    wait: Option<bool>,
+    wait: bool,
 }
 
 #[endpoint { method = POST, path = "/jobs/{job_id}/start" }]
@@ -135,7 +136,7 @@ async fn job_start(
         ));
     }
     let status = mgr.job_start(job).await?;
-    if wait == Some(true) {
+    if wait {
         Ok(HttpResponseOk(status.await.map_err(|_| {
             HttpError::for_internal_error(String::from("can't wait for job, sender dropped"))
         })??))

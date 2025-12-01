@@ -58,7 +58,7 @@ pub enum CertError {
 
 /// Upper half of the SHA-256 of a certificate subject,
 /// encoded with base64 for storage and transport.
-#[derive(Clone, Copy, Debug, Eq, JsonSchema, Ord, PartialEq, PartialOrd)]
+#[derive(Clone, Copy, Debug, Eq, Hash, JsonSchema, Ord, PartialEq, PartialOrd)]
 pub struct KeyId(#[schemars(with = "String")] [u8; 16]);
 
 impl KeyId {

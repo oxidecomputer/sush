@@ -172,7 +172,7 @@ pub enum JobRequest {
     },
     RevokeReserved {
         job_ids: Vec<JobId>,
-        response: oneshot::Sender<Result<usize, JobError>>,
+        response: oneshot::Sender<Result<Vec<JobId>, JobError>>,
     },
 
     // Job management requests.
@@ -373,7 +373,7 @@ impl JobManager {
         rx.await?
     }
 
-    pub async fn revoke_reserved(&self, job_ids: Vec<JobId>) -> Result<usize, JobError> {
+    pub async fn revoke_reserved(&self, job_ids: Vec<JobId>) -> Result<Vec<JobId>, JobError> {
         let (tx, rx) = oneshot::channel();
         self.request(JobRequest::RevokeReserved {
             job_ids,
@@ -575,19 +575,26 @@ fn get_reserved(db: &Connection) -> Result<BTreeMap<JobId, DateTime<Utc>>, JobEr
     Ok(reserved)
 }
 
-fn revoke_reserved(db: &mut Connection, job_ids: &[JobId]) -> Result<usize, JobError> {
-    let mut nrevoked = 0;
+fn revoke_reserved(db: &mut Connection, job_ids: &[JobId]) -> Result<Vec<JobId>, JobError> {
     let txn = db.transaction()?;
+    let job_ids = if !job_ids.is_empty() {
+        job_ids.to_vec()
+    } else {
+        get_reserved(&txn)?.keys().copied().collect()
+    };
     let mut stmt = txn.prepare(
         "DELETE FROM jobs WHERE job_id = ?1 AND time_started IS NULL",
         // `--SEARCH jobs USING INDEX sqlite_autoindex_jobs_1 (job_id=?)
     )?;
+    let mut revoked = Vec::new();
     for job_id in job_ids {
-        nrevoked += stmt.execute([job_id])?;
+        if stmt.execute([job_id])? == 1 {
+            revoked.push(job_id);
+        }
     }
     stmt.finalize()?;
     txn.commit()?;
-    Ok(nrevoked)
+    Ok(revoked)
 }
 
 fn verify_reservation(db: &Connection, job_id: JobId) -> Result<DateTime<Utc>, JobError> {
@@ -1016,20 +1023,16 @@ mod test {
         assert_eq!(mgr.job_stdout(job_id, None).await.unwrap(), job_id_bytes);
         assert!(mgr.job_stderr(job_id, None).await.unwrap().is_empty());
 
-        assert_eq!(
-            mgr.revoke_reserved(job_ids).await.unwrap(),
-            2,
-            "should have used 3 out of 5 reserved jobs"
-        );
+        assert_eq!(mgr.revoke_reserved(job_ids.clone()).await.unwrap(), job_ids);
     }
 
     #[tokio::test]
     async fn revoke() {
         let (mgr, root) = manager_and_test_root(None).await;
         let (job_id, time_reserved) = mgr.reserve_one().await.unwrap();
-        assert_eq!(mgr.revoke_reserved(vec![job_id]).await.unwrap(), 1);
-        assert_eq!(mgr.revoke_reserved(vec![job_id]).await.unwrap(), 0);
-        assert_eq!(mgr.revoke_reserved(vec![job_id]).await.unwrap(), 0);
+        let job_ids = vec![job_id];
+        assert_eq!(mgr.revoke_reserved(job_ids.clone()).await.unwrap(), job_ids);
+        assert!(mgr.revoke_reserved(job_ids).await.unwrap().is_empty());
 
         let job = root.sign_job_request(job_id, "false").await;
         let rx = mgr.job_start(job).await.unwrap();
@@ -1047,18 +1050,21 @@ mod test {
         let (new_job_id, new_time_reserved) = mgr.reserve_one().await.unwrap();
         assert_ne!(new_job_id, job_id);
         assert!(new_time_reserved > time_reserved);
+
         let job_ids = vec![job_id, new_job_id];
-        assert_eq!(mgr.revoke_reserved(job_ids.clone()).await.unwrap(), 1);
-        assert_eq!(mgr.revoke_reserved(job_ids.clone()).await.unwrap(), 0);
-        assert_eq!(mgr.revoke_reserved(job_ids.clone()).await.unwrap(), 0);
+        assert_eq!(
+            mgr.revoke_reserved(job_ids.clone()).await.unwrap(),
+            vec![new_job_id],
+            "old job was previously revoked"
+        );
+        assert!(mgr.revoke_reserved(job_ids).await.unwrap().is_empty());
 
         let JobsReserved {
             job_ids,
             time_reserved: _,
         } = mgr.reserve_jobs(100).await.unwrap();
-        assert_eq!(mgr.revoke_reserved(job_ids.clone()).await.unwrap(), 100);
-        assert_eq!(mgr.revoke_reserved(job_ids.clone()).await.unwrap(), 0);
-        assert_eq!(mgr.revoke_reserved(job_ids.clone()).await.unwrap(), 0);
+        assert_eq!(mgr.revoke_reserved(job_ids.clone()).await.unwrap(), job_ids);
+        assert!(mgr.revoke_reserved(job_ids).await.unwrap().is_empty());
     }
 
     #[tokio::test]

@@ -3,7 +3,8 @@
 use anyhow::Result;
 use clap::Parser as _;
 
-use sush_client::commands::{Cli, ClientArgs};
+use sush_client::cli::Cli;
+use sush_client::commands::ClientArgs;
 
 #[tokio::main]
 async fn main() -> Result<()> {

@@ -12,7 +12,7 @@ use uuid::Uuid;
 
 use crate::certs::{KeyId, Signed, ToBeSigned, Verified};
 
-#[derive(Clone, Copy, Debug, Eq, JsonSchema, Ord, PartialEq, PartialOrd)]
+#[derive(Clone, Copy, Debug, Eq, Hash, JsonSchema, Ord, PartialEq, PartialOrd)]
 pub struct JobId(Uuid);
 
 impl JobId {

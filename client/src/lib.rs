@@ -1,3 +1,4 @@
+pub mod cli;
 pub mod commands;
 pub mod permslip;
 pub mod repl;
