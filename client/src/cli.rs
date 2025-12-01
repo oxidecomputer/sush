@@ -195,39 +195,49 @@ impl CommandContext for Cli {
                 JobStatus::Reserved {
                     job_id,
                     time_reserved,
-                } => println!("✅ Job {job_id} reserved at {time_reserved}"),
-                JobStatus::Started { time_started, .. } => {
-                    println!("✅ Job {job_id} started at {time_started}")
+                } => println!(
+                    "✅ Job ID:\t{job_id}\n   \
+                     Reserved at:\t{time_reserved}"
+                ),
+                JobStatus::Started {
+                    time_reserved,
+                    time_started,
+                    ..
+                } => {
+                    println!(
+                        "✅ Job ID:\t{job_id}\n   \
+                         Reserved at:\t{time_reserved}\n   \
+                         Started at:\t{time_started}"
+                    )
                 }
                 JobStatus::Ended {
-                    time_ended,
-                    status: Some(status),
-                    stdout_len: 0,
-                    stderr_len: 0,
-                    ..
-                } => println!(
-                    "✅ Job {job_id} ended at {time_ended}\n   \
-                     with status {status}, producing no output",
-                ),
-                JobStatus::Ended {
+                    job: _,
+                    time_reserved,
+                    time_started,
                     time_ended,
                     status: Some(status),
                     stdout_len,
                     stderr_len,
-                    ..
                 } => println!(
-                    "✅ Job {job_id} ended at {time_ended}\n   \
-                     with status {status}, producing {stdout_len} bytes on stdout \
-                     and {stderr_len} bytes on stderr",
+                    "✅ Job ID:\t{job_id}\n   \
+                     Reserved at:\t{time_reserved}\n   \
+                     Started at:\t{time_started}\n   \
+                     Ended at:\t{time_ended}\n   \
+                     Status:\t{status}\n   \
+                     Stdout:\t{stdout_len} bytes\n   \
+                     Stderr:\t{stderr_len} bytes",
                 ),
                 JobStatus::Ended {
+                    time_reserved,
                     time_started,
                     time_ended,
                     status: None,
                     ..
                 } => println!(
-                    "✅ Job {job_id} started at {time_started}\n   \
-                     and was aborted by a signal at {time_ended}",
+                    "✅ Job ID:\t{job_id}\n   \
+                     Reserved at:\t{time_reserved}\n   \
+                     Started at:\t{time_started}\n   \
+                     Aborted at:\t{time_ended}",
                 ),
             },
         }
