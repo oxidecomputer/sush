@@ -1,19 +1,22 @@
 //! Possibly-interactive command-line interface.
 
 use std::collections::HashMap;
-use std::io::{Write as _, stderr, stdout};
+use std::io::{Write as _, stdout};
 use std::path::Path;
 
-use anyhow::{Result, bail};
 use chrono::{DateTime, Utc};
 use serde_json::json;
+use thiserror::Error;
 use x509_cert::Certificate;
 use x509_cert::der::Encode as _;
 
-use sush_common::certs::{KeyId, Signature};
+use sush_common::certs::{CertError, KeyId, Signature};
 use sush_common::jobs::{JobId, JobStatus, JobsReserved};
 
+use crate::Error as ClientError;
 use crate::commands::{CommandContext, OutputFormat};
+use crate::permslip::PermslipError;
+use crate::types::Error as ApiError;
 
 #[derive(Clone, Debug, Default)]
 pub struct Cli {
@@ -27,6 +30,8 @@ impl Cli {
 }
 
 impl CommandContext for Cli {
+    type Error = CliError;
+
     fn get_output_format(&self) -> OutputFormat {
         self.output
     }
@@ -35,8 +40,7 @@ impl CommandContext for Cli {
         self.output = output;
     }
 
-    fn ack(&mut self, reserved: JobsReserved) -> Result<()> {
-        assert!(reserved.job_ids.is_empty());
+    fn ack(&mut self, reserved: JobsReserved) -> Result<(), Self::Error> {
         match self.get_output_format() {
             OutputFormat::Json => println!("{}", json!(reserved)),
             OutputFormat::Text => println!("✅ {}", reserved.time_reserved),
@@ -44,16 +48,16 @@ impl CommandContext for Cli {
         Ok(())
     }
 
-    fn cert_chain(&mut self, key_id: KeyId, certs: &str) -> Result<()> {
+    fn cert_chain(&mut self, key_id: KeyId, certs: &str) -> Result<(), Self::Error> {
         let chain = Certificate::load_pem_chain(certs.as_bytes())?;
         let Some((root, rest)) = chain.split_first() else {
-            bail!("empty certificate chain");
+            return Err(Self::Error::EmptyCertChain);
         };
         if root.tbs_certificate.subject != root.tbs_certificate.issuer {
-            bail!("root certificate is not self-signed");
+            return Err(Self::Error::InvalidRootCert);
         }
-        Signature::new(root.signature.raw_bytes().to_vec())
-            .verify(&root.tbs_certificate.to_der()?, root)?;
+        let tbs = root.tbs_certificate.to_der()?;
+        Signature::new(root.signature.raw_bytes().to_vec()).verify(&tbs, root)?;
         if matches!(self.get_output_format(), OutputFormat::Text) {
             println!(
                 "✅ Verified root certificate for subject `{}`",
@@ -63,8 +67,8 @@ impl CommandContext for Cli {
 
         let mut prev = root;
         for cert in rest {
-            Signature::new(cert.signature.raw_bytes().to_vec())
-                .verify(&cert.tbs_certificate.to_der()?, prev)?;
+            let tbs = cert.tbs_certificate.to_der()?;
+            Signature::new(cert.signature.raw_bytes().to_vec()).verify(&tbs, prev)?;
             prev = cert;
             if matches!(self.get_output_format(), OutputFormat::Text) {
                 println!(
@@ -74,7 +78,7 @@ impl CommandContext for Cli {
             }
         }
         if KeyId::try_from(prev)? != key_id {
-            bail!("expected leaf certificate for key `{key_id}`");
+            return Err(Self::Error::InvalidLeafCert(key_id));
         }
 
         if matches!(self.get_output_format(), OutputFormat::Json) {
@@ -83,7 +87,7 @@ impl CommandContext for Cli {
         Ok(())
     }
 
-    fn cert_imported(&mut self, path: &Path, key_id: KeyId) -> Result<()> {
+    fn cert_imported(&mut self, path: &Path, key_id: KeyId) -> Result<(), Self::Error> {
         match self.get_output_format() {
             OutputFormat::Json => println!("{}", json!(key_id)),
             OutputFormat::Text => println!(
@@ -96,7 +100,10 @@ impl CommandContext for Cli {
     }
 
     #[allow(clippy::print_literal)]
-    fn reserved_map(&mut self, reserved: &HashMap<String, DateTime<Utc>>) -> Result<()> {
+    fn reserved_map(
+        &mut self,
+        reserved: &HashMap<String, DateTime<Utc>>,
+    ) -> Result<(), Self::Error> {
         match self.get_output_format() {
             OutputFormat::Json => println!("{}", json!(reserved)),
             OutputFormat::Text => {
@@ -114,8 +121,7 @@ impl CommandContext for Cli {
         Ok(())
     }
 
-    fn jobs_reserved(&mut self, number: u8, reserved: &JobsReserved) -> Result<()> {
-        assert_eq!(reserved.job_ids.len(), number as usize);
+    fn jobs_reserved(&mut self, reserved: &JobsReserved) -> Result<(), Self::Error> {
         match self.get_output_format() {
             OutputFormat::Json => println!("{}", json!(reserved)),
             OutputFormat::Text => {
@@ -135,7 +141,7 @@ impl CommandContext for Cli {
         Ok(())
     }
 
-    fn job_aborted(&mut self, job_id: JobId) -> Result<()> {
+    fn job_aborted(&mut self, job_id: JobId) -> Result<(), Self::Error> {
         match self.get_output_format() {
             OutputFormat::Json => println!("{job_id}"),
             OutputFormat::Text => println!("✅ Aborted job {job_id}"),
@@ -143,7 +149,12 @@ impl CommandContext for Cli {
         Ok(())
     }
 
-    fn job_stdout(&mut self, job_id: JobId, output: &[u8], binary: bool) -> Result<()> {
+    fn job_stdout(
+        &mut self,
+        job_id: JobId,
+        output: &[u8],
+        binary: bool,
+    ) -> Result<(), Self::Error> {
         match self.get_output_format() {
             OutputFormat::Json if binary => println!("{}", json!(output)),
             OutputFormat::Json => println!("{}", json!(String::from_utf8(output.to_vec())?)),
@@ -157,25 +168,30 @@ impl CommandContext for Cli {
         Ok(())
     }
 
-    fn job_stderr(&mut self, job_id: JobId, errors: &[u8], binary: bool) -> Result<()> {
+    fn job_stderr(
+        &mut self,
+        job_id: JobId,
+        errors: &[u8],
+        binary: bool,
+    ) -> Result<(), Self::Error> {
         match self.get_output_format() {
             OutputFormat::Json if binary => println!("{}", json!(errors)),
             OutputFormat::Json => println!("{}", json!(String::from_utf8(errors.to_vec())?)),
-            OutputFormat::Text if binary => stderr().write(errors).map(|_| ())?,
+            OutputFormat::Text if binary => stdout().write(errors).map(|_| ())?,
             OutputFormat::Text if errors.is_empty() => (),
             OutputFormat::Text => {
-                eprintln!("❌ Job {job_id} stderr:");
-                eprint!("{}", String::from_utf8(errors.to_vec())?);
+                println!("❌ Job {job_id} stderr:");
+                print!("{}", String::from_utf8(errors.to_vec())?);
             }
         }
         Ok(())
     }
 
-    fn job_status(&mut self, job_id: JobId, status: &JobStatus) -> Result<()> {
+    fn job_status(&mut self, job_id: JobId, status: &JobStatus) -> Result<(), Self::Error> {
         match self.get_output_format() {
             OutputFormat::Json => println!("{}", json!(status)),
             OutputFormat::Text => match status {
-                JobStatus::NotFound => eprintln!("❌ Job {job_id} not found"),
+                JobStatus::NotFound => println!("❌ Job {job_id} not found"),
                 JobStatus::Reserved {
                     job_id,
                     time_reserved,
@@ -218,7 +234,7 @@ impl CommandContext for Cli {
         Ok(())
     }
 
-    fn revoked(&mut self, revoked: &[JobId]) -> Result<()> {
+    fn revoked(&mut self, revoked: &[JobId]) -> Result<(), Self::Error> {
         match self.get_output_format() {
             OutputFormat::Json => println!("{}", json!(revoked)),
             OutputFormat::Text => {
@@ -236,5 +252,62 @@ impl CommandContext for Cli {
             }
         }
         Ok(())
+    }
+}
+
+#[derive(Debug, Error)]
+pub enum CliError {
+    #[error("❌ {0}")]
+    Cert(#[from] CertError),
+    #[error("❌ {0}")]
+    Clap(#[from] clap::Error),
+    #[error("❌ {0}")]
+    Client(String),
+    #[error("❌ {0}")]
+    Der(#[from] x509_cert::der::Error),
+    #[error("❌ Empty certificate chain")]
+    EmptyCertChain,
+    #[error("❌ {0}")]
+    Io(#[from] std::io::Error),
+    #[error("❌ Leaf certificate does not match key `{0}`")]
+    InvalidLeafCert(KeyId),
+    #[error("❌ Root certificate is not self-signed")]
+    InvalidRootCert,
+    #[error("❌ {0}")]
+    Permslip(#[from] PermslipError),
+    #[error("❌ {0}")]
+    Readline(#[from] rustyline::error::ReadlineError),
+    #[error(transparent)]
+    Recursive(#[from] Box<Self>),
+    #[error("❌ {0}")]
+    Utf8(#[from] std::string::FromUtf8Error),
+    #[error("❌ {0}")]
+    Uuid(#[from] uuid::Error),
+}
+
+impl From<ClientError<ApiError>> for CliError {
+    fn from(error: ClientError<ApiError>) -> Self {
+        use ClientError::*;
+        match error {
+            InvalidRequest(e) => CliError::Client(format!("Invalid request: {e}")),
+            CommunicationError(e) => CliError::Client(format!("Communication error: {e}")),
+            InvalidUpgrade(e) => CliError::Client(e.to_string()),
+            ErrorResponse(e) => CliError::Client(e.message.to_owned()),
+            ResponseBodyError(e) => CliError::Client(e.to_string()),
+            InvalidResponsePayload(_b, e) => CliError::Client(e.to_string()),
+            UnexpectedResponse(e) if e.status().is_redirection() => {
+                if let Some(l) = e.headers().get("location") {
+                    CliError::Client(format!(
+                        "Got {} to {}",
+                        e.status(),
+                        l.to_str().unwrap_or("?")
+                    ))
+                } else {
+                    CliError::Client(format!("Got {}", e.status()))
+                }
+            }
+            UnexpectedResponse(e) => CliError::Client(format!("Unexpected response: {e:?}")),
+            Custom(e) => CliError::Client(e.to_string()),
+        }
     }
 }

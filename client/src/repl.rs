@@ -5,7 +5,6 @@ use std::env;
 use std::ffi::OsString;
 use std::path::Path;
 
-use anyhow::{Result, anyhow};
 use chrono::{DateTime, Utc};
 use clap::Parser;
 use rustyline::DefaultEditor;
@@ -16,7 +15,7 @@ use xdg::BaseDirectories;
 use sush_common::certs::KeyId;
 use sush_common::jobs::{JobId, JobStatus, JobsReserved};
 
-use crate::cli::Cli;
+use crate::cli::{Cli, CliError};
 use crate::commands::{ClientArgs, ClientCommand, CommandContext, OutputFormat, SUSH_JOB_ID};
 
 const PREFIX: &str = "sush";
@@ -31,7 +30,7 @@ struct ReplCommandParser {
 }
 
 impl ReplCommandParser {
-    fn try_parse<I, T, C>(words: I, ctx: &mut C) -> Result<Self>
+    fn try_parse<I, T, C>(words: I, ctx: &mut C) -> Result<Self, C::Error>
     where
         I: IntoIterator<Item = T>,
         T: Into<OsString> + Clone,
@@ -55,7 +54,7 @@ pub struct Repl {
 }
 
 impl Repl {
-    pub async fn run(mut self, args: &ClientArgs) -> Result<()> {
+    pub async fn run(mut self, args: &ClientArgs) -> Result<(), <Self as CommandContext>::Error> {
         let xdg = BaseDirectories::with_prefix(PREFIX);
         let history_file = xdg.place_state_file(HISTORY_FILE)?;
         let mut rl = DefaultEditor::new()?;
@@ -106,10 +105,8 @@ impl Repl {
 
         if let Some(job_id) = self.reserved.first() {
             unsafe { env::set_var(SUSH_JOB_ID, job_id.to_string()) }
-            println!("✅ Default job ID = {job_id}");
         } else {
             unsafe { env::remove_var(SUSH_JOB_ID) }
-            println!("❌ No more reserved job IDs, try `reserve-jobs`");
         }
     }
 
@@ -124,6 +121,8 @@ impl Repl {
 /// Most of these methods simply punt to those of [`Cli`] for display.
 /// But we also update local (ephemeral) state for certain responses.
 impl CommandContext for Repl {
+    type Error = CliError;
+
     fn get_output_format(&self) -> OutputFormat {
         self.cli.get_output_format()
     }
@@ -133,58 +132,70 @@ impl CommandContext for Repl {
     }
 
     fn pre_parse_hook(&mut self, command: &str) {
-        if command == "start" {
+        if matches!(command, "job-start" | "start") {
             self.set_job_id();
         }
     }
 
-    fn ack(&mut self, reserved: JobsReserved) -> Result<()> {
+    fn ack(&mut self, reserved: JobsReserved) -> Result<(), Self::Error> {
         self.cli.ack(reserved)
     }
 
-    fn cert_chain(&mut self, key_id: KeyId, certs: &str) -> Result<()> {
+    fn cert_chain(&mut self, key_id: KeyId, certs: &str) -> Result<(), Self::Error> {
         self.cli.cert_chain(key_id, certs)
     }
 
-    fn cert_imported(&mut self, path: &Path, key_id: KeyId) -> Result<()> {
+    fn cert_imported(&mut self, path: &Path, key_id: KeyId) -> Result<(), Self::Error> {
         self.cli.cert_imported(path, key_id)
     }
 
-    fn job_aborted(&mut self, job_id: JobId) -> Result<()> {
+    fn job_aborted(&mut self, job_id: JobId) -> Result<(), Self::Error> {
         self.cli.job_aborted(job_id)?;
         self.remove_job_id(job_id);
         Ok(())
     }
 
-    fn job_stdout(&mut self, job_id: JobId, output: &[u8], binary: bool) -> Result<()> {
+    fn job_stdout(
+        &mut self,
+        job_id: JobId,
+        output: &[u8],
+        binary: bool,
+    ) -> Result<(), Self::Error> {
         self.cli.job_stdout(job_id, output, binary)
     }
 
-    fn job_stderr(&mut self, job_id: JobId, errors: &[u8], binary: bool) -> Result<()> {
+    fn job_stderr(
+        &mut self,
+        job_id: JobId,
+        errors: &[u8],
+        binary: bool,
+    ) -> Result<(), Self::Error> {
         self.cli.job_stderr(job_id, errors, binary)
     }
 
-    fn job_status(&mut self, job_id: JobId, status: &JobStatus) -> Result<()> {
-        self.cli.job_status(job_id, status)?;
-        Ok(())
+    fn job_status(&mut self, job_id: JobId, status: &JobStatus) -> Result<(), Self::Error> {
+        self.cli.job_status(job_id, status)
     }
 
-    fn jobs_reserved(&mut self, number: u8, reserved: &JobsReserved) -> Result<()> {
-        self.cli.jobs_reserved(number, reserved)?;
+    fn jobs_reserved(&mut self, reserved: &JobsReserved) -> Result<(), Self::Error> {
+        self.cli.jobs_reserved(reserved)?;
         self.reserved = reserved.job_ids.clone();
         Ok(())
     }
 
-    fn reserved_map(&mut self, reserved: &HashMap<String, DateTime<Utc>>) -> Result<()> {
+    fn reserved_map(
+        &mut self,
+        reserved: &HashMap<String, DateTime<Utc>>,
+    ) -> Result<(), Self::Error> {
         self.cli.reserved_map(reserved)?;
         self.reserved = reserved
             .keys()
-            .map(|s| s.parse::<JobId>().map_err(|e| anyhow!(e)))
+            .map(|s| s.parse::<JobId>())
             .collect::<Result<Vec<JobId>, _>>()?;
         Ok(())
     }
 
-    fn revoked(&mut self, revoked: &[JobId]) -> Result<()> {
+    fn revoked(&mut self, revoked: &[JobId]) -> Result<(), Self::Error> {
         self.cli.revoked(revoked)?;
         self.reserved.retain(|j| !revoked.contains(j));
         Ok(())

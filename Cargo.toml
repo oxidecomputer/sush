@@ -3,7 +3,6 @@ members = ["client", "common", "openapi", "server"]
 resolver = "2"
 
 [workspace.dependencies]
-anyhow = "1"
 async-recursion = "1"
 blake3 = "1"
 base64 = "0.22"

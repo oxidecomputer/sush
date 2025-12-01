@@ -7,7 +7,6 @@ use std::fs::File;
 use std::io::Read as _;
 use std::path::{Path, PathBuf};
 
-use anyhow::Result;
 use async_recursion::async_recursion;
 use chrono::{DateTime, Utc};
 use clap::{Parser, Subcommand, ValueEnum};
@@ -16,8 +15,11 @@ use sush_common::certs::{KeyId, Signer as _};
 use sush_common::jobs::{JobId, JobStartRequest, JobStatus, JobsReserved};
 
 use crate::Client;
-use crate::permslip::{DEFAULT_PERMSLIP_URL, PermslipSigner};
+use crate::Error as ClientError;
+use crate::cli::CliError;
+use crate::permslip::{DEFAULT_PERMSLIP_URL, PermslipError, PermslipSigner};
 use crate::repl::Repl;
+use crate::types::Error as ApiError;
 
 /// Default Support Shell HTTP API address.
 const DEFAULT_SUSH_URL: &str = "http://127.0.0.1:44444";
@@ -63,7 +65,7 @@ pub struct ClientArgs {
 }
 
 impl ClientArgs {
-    pub async fn execute<C>(&self, ctx: &mut C) -> Result<()>
+    pub async fn execute<C>(&self, ctx: &mut C) -> Result<(), C::Error>
     where
         C: CommandContext + Send + Sync,
     {
@@ -168,25 +170,34 @@ pub enum ClientCommand {
 }
 
 pub trait CommandContext {
+    type Error: From<CliError>
+        + From<clap::Error>
+        + From<ClientError<ApiError>>
+        + From<std::io::Error>
+        + From<PermslipError>;
+
     fn get_output_format(&self) -> OutputFormat;
     fn set_output_format(&mut self, output: OutputFormat);
     fn pre_parse_hook(&mut self, _command: &str) {}
 
-    fn ack(&mut self, reserved: JobsReserved) -> Result<()>;
-    fn cert_chain(&mut self, key_id: KeyId, certs: &str) -> Result<()>;
-    fn cert_imported(&mut self, path: &Path, key_id: KeyId) -> Result<()>;
-    fn job_aborted(&mut self, job_id: JobId) -> Result<()>;
-    fn job_stdout(&mut self, job_id: JobId, output: &[u8], binary: bool) -> Result<()>;
-    fn job_stderr(&mut self, job_id: JobId, errors: &[u8], binary: bool) -> Result<()>;
-    fn job_status(&mut self, job_id: JobId, status: &JobStatus) -> Result<()>;
-    fn jobs_reserved(&mut self, number: u8, reserved: &JobsReserved) -> Result<()>;
-    fn reserved_map(&mut self, reserved: &HashMap<String, DateTime<Utc>>) -> Result<()>;
-    fn revoked(&mut self, revoked: &[JobId]) -> Result<()>;
+    fn ack(&mut self, reserved: JobsReserved) -> Result<(), Self::Error>;
+    fn cert_chain(&mut self, key_id: KeyId, certs: &str) -> Result<(), Self::Error>;
+    fn cert_imported(&mut self, path: &Path, key_id: KeyId) -> Result<(), Self::Error>;
+    fn job_aborted(&mut self, id: JobId) -> Result<(), Self::Error>;
+    fn job_stdout(&mut self, id: JobId, output: &[u8], binary: bool) -> Result<(), Self::Error>;
+    fn job_stderr(&mut self, id: JobId, errors: &[u8], binary: bool) -> Result<(), Self::Error>;
+    fn job_status(&mut self, id: JobId, status: &JobStatus) -> Result<(), Self::Error>;
+    fn jobs_reserved(&mut self, reserved: &JobsReserved) -> Result<(), Self::Error>;
+    fn reserved_map(
+        &mut self,
+        reserved: &HashMap<String, DateTime<Utc>>,
+    ) -> Result<(), Self::Error>;
+    fn revoked(&mut self, revoked: &[JobId]) -> Result<(), Self::Error>;
 }
 
 impl ClientCommand {
     #[async_recursion]
-    pub async fn execute<C>(&self, args: &ClientArgs, ctx: &mut C) -> Result<()>
+    pub async fn execute<C>(&self, args: &ClientArgs, ctx: &mut C) -> Result<(), C::Error>
     where
         C: CommandContext + Send + Sync,
     {
@@ -197,20 +208,28 @@ impl ClientCommand {
                 let mut file = File::open(path)?;
                 let mut cert = Vec::new();
                 file.read_to_end(&mut cert)?;
-                ctx.cert_imported(path, client.import_cert(&cert).await?.into_inner())
+                let key_id = client.import_cert(&cert).await?.into_inner();
+                ctx.cert_imported(path, key_id)
             }
             ClientCommand::CertChain { key_id } => {
-                ctx.cert_chain(*key_id, &client.cert_chain(key_id).await?.into_inner())
+                let certs = client.cert_chain(key_id).await?.into_inner();
+                ctx.cert_chain(*key_id, &certs)
             }
-            ClientCommand::Ping => ctx.ack(client.reserve_jobs(0).await?.into_inner()),
+            ClientCommand::Ping => {
+                let reserved = client.reserve_jobs(0).await?.into_inner();
+                ctx.ack(reserved)
+            }
             ClientCommand::ReserveJobs { number } => {
-                ctx.jobs_reserved(*number, &client.reserve_jobs(*number).await?.into_inner())
+                let reserved = client.reserve_jobs(*number).await?.into_inner();
+                ctx.jobs_reserved(&reserved)
             }
             ClientCommand::GetReserved => {
-                ctx.reserved_map(&client.get_reserved().await?.into_inner())
+                let map = client.get_reserved().await?.into_inner();
+                ctx.reserved_map(&map)
             }
             ClientCommand::RevokeReserved { job_ids } => {
-                ctx.revoked(&client.revoke_reserved(job_ids).await?.into_inner())
+                let revoked = client.revoke_reserved(job_ids).await?.into_inner();
+                ctx.revoked(&revoked)
             }
             ClientCommand::JobStart {
                 job_id,
@@ -232,7 +251,8 @@ impl ClientCommand {
                 Ok(())
             }
             ClientCommand::JobStatus { job_id } => {
-                ctx.job_status(*job_id, &client.job_status(job_id).await?.into_inner())
+                let status = client.job_status(job_id).await?.into_inner();
+                ctx.job_status(*job_id, &status)
             }
             ClientCommand::JobStdout { job_id, binary } => {
                 let stdout = client.job_stdout(job_id).await?.into_inner();

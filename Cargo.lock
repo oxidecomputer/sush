@@ -3109,11 +3109,11 @@ checksum = "13c2bddecc57b384dee18652358fb23172facb8a2c51ccc10d74c157bdea3292"
 name = "sush-client"
 version = "0.1.0"
 dependencies = [
- "anyhow",
  "async-recursion",
  "blake3",
  "chrono",
  "clap",
+ "pem-rfc7468",
  "permission-slip-client",
  "permission-slip-common",
  "progenitor",
@@ -3123,6 +3123,7 @@ dependencies = [
  "serde_json",
  "shlex",
  "sush-common",
+ "thiserror 1.0.69",
  "tokio",
  "uuid",
  "x509-cert",

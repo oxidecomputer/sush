@@ -40,25 +40,27 @@ pub enum JobError {
     Blob(#[from] BlobError),
     #[error(transparent)]
     Cert(#[from] CertError),
-    #[error("can't send job request: receiver dropped")]
+    #[error("Can't send job request: receiver dropped")]
     ChannelClosed,
     #[error("DER encoding error: {0}")]
     Der(#[from] x509_cert::der::Error),
-    #[error("invalid or duplicate job ID")]
+    #[error("Invalid command: {0}")]
+    InvalidCommand(String),
+    #[error("Invalid or duplicate job ID")]
     InvalidJobId(JobId),
     #[error(transparent)]
     Io(#[from] std::io::Error),
-    #[error("can't find certificate for key {}", BASE64.encode(.0.as_slice()))]
+    #[error("Can't find certificate for key {}", BASE64.encode(.0.as_slice()))]
     MissingCert(KeyId),
-    #[error("can't receive response: sender dropped")]
+    #[error("Can't receive response: sender dropped")]
     Recv(#[from] oneshot::error::RecvError),
     #[error(transparent)]
     Sqlite(#[from] rusqlite::Error),
-    #[error("unable to start job")]
+    #[error("Unable to start job")]
     Start,
     #[error(transparent)]
     Task(#[from] JoinError),
-    #[error("unable to wait for job end")]
+    #[error("Unable to wait for job end")]
     Wait,
 }
 
@@ -80,6 +82,9 @@ pub struct JobStart {
 impl JobStart {
     /// Execute commands via a shell to allow pipelines, redirects, etc.
     pub fn new(job: SignedJob) -> Result<Self, JobError> {
+        if job.command().starts_with('-') {
+            return Err(JobError::InvalidCommand(job.command().to_owned()));
+        }
         let stdout = tempfile()?;
         let stderr = tempfile()?;
         let time_started = Utc::now();

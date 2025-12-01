@@ -1,17 +1,18 @@
 //! Use Permission Slip to sign Support Shell job requests.
 
-use anyhow::{Error, Result, bail};
 use permission_slip_common::params::{BlobStampParams, SignParams, StampParams};
 use permission_slip_common::{ArtifactKind, HashAlgorithm};
 use permslip_client_lib::login::{IdentityProvider, TokenProvider};
-use permslip_client_lib::{Client, ClientRequestBuilder};
+use permslip_client_lib::types::Error as ApiError;
+use permslip_client_lib::{Client, ClientRequestBuilder, Error as ClientError};
 use serde_json::{json, to_string as json_to_string};
+use thiserror::Error;
 use x509_cert::Certificate;
 use x509_cert::der::Decode as _;
 use x509_cert::der::pem::{PemLabel as _, decode_vec as decode_pem};
 use x509_cert::spki::AlgorithmIdentifierOwned;
 
-use sush_common::certs::{KeyId, Signature, Signed, Signer, ToBeSigned};
+use sush_common::certs::{CertError, KeyId, Signature, Signed, Signer, ToBeSigned};
 
 /// The default Permission Slip (aka Online Signing Service) server.
 pub const DEFAULT_PERMSLIP_URL: &str = "https://signer-us-west.corp.oxide.computer";
@@ -23,10 +24,11 @@ pub struct PermslipSigner {
 }
 
 impl PermslipSigner {
-    pub async fn new<N: AsRef<str>>(key_name: N, url: &str) -> Result<Self> {
+    pub async fn new<N: AsRef<str>>(key_name: N, url: &str) -> Result<Self, PermslipError> {
         let tokens = TokenProvider::IdP(IdentityProvider::Google);
         let mut builder = ClientRequestBuilder::new();
-        builder = builder.token(tokens.token().await?.into_header_value()?);
+        let token = tokens.token().await.map_err(PermslipError::token)?;
+        builder = builder.token(token.into_header_value().map_err(PermslipError::token)?);
         let client = Client::new_with_client(url, builder.build()?);
         let key_name = key_name.as_ref().to_owned();
         let cert = Self::get_cert(&client, &key_name).await?;
@@ -37,7 +39,7 @@ impl PermslipSigner {
         })
     }
 
-    async fn get_cert(client: &Client, key_name: &str) -> Result<Certificate> {
+    async fn get_cert(client: &Client, key_name: &str) -> Result<Certificate, PermslipError> {
         let pem = client
             .get_cert()
             .key_name(key_name)
@@ -45,18 +47,18 @@ impl PermslipSigner {
             .await?
             .into_inner();
         if !pem.starts_with("-----BEGIN ") {
-            bail!("invalid PEM");
+            return Err(PermslipError::InvalidPem);
         }
         let (label, der) = decode_pem(pem.as_bytes())?;
         if label != Certificate::PEM_LABEL {
-            bail!("invalid PEM certificate");
+            return Err(PermslipError::InvalidPem);
         }
         Ok(Certificate::from_der(&der)?)
     }
 }
 
 impl Signer for PermslipSigner {
-    type Error = Error;
+    type Error = PermslipError;
 
     async fn key_id(&self) -> Result<KeyId, Self::Error> {
         Ok(KeyId::try_from(&self.cert)?)
@@ -94,5 +96,58 @@ impl Signer for PermslipSigner {
             .await?
             .into_inner();
         Ok(Signed::new(thing, key_id, Signature::new(signature)))
+    }
+}
+
+#[derive(Debug, Error)]
+pub enum PermslipError {
+    #[error(transparent)]
+    Cert(#[from] CertError),
+    #[error("permslip: {0}")]
+    Client(String),
+    #[error(transparent)]
+    Der(#[from] x509_cert::der::Error),
+    #[error("invalid PEM certificate")]
+    InvalidPem,
+    #[error(transparent)]
+    Json(#[from] serde_json::Error),
+    #[error(transparent)]
+    Pem(#[from] pem_rfc7468::Error),
+    #[error(transparent)]
+    Reqwest(#[from] reqwest::Error),
+    #[error("permslip authentication token: {0}")]
+    Token(String),
+}
+
+impl PermslipError {
+    fn token<E: ToString>(error: E) -> Self {
+        Self::Token(error.to_string())
+    }
+}
+
+impl From<ClientError<ApiError>> for PermslipError {
+    fn from(error: ClientError<ApiError>) -> Self {
+        use ClientError::*;
+        match error {
+            InvalidRequest(e) => PermslipError::Client(format!("Invalid request: {e}")),
+            CommunicationError(e) => PermslipError::Client(format!("Communication error: {e}")),
+            InvalidUpgrade(e) => PermslipError::Client(e.to_string()),
+            ErrorResponse(e) => PermslipError::Client(e.message.to_owned()),
+            ResponseBodyError(e) => PermslipError::Client(e.to_string()),
+            InvalidResponsePayload(_b, e) => PermslipError::Client(e.to_string()),
+            UnexpectedResponse(e) if e.status().is_redirection() => {
+                if let Some(l) = e.headers().get("location") {
+                    PermslipError::Client(format!(
+                        "Got {} to {}",
+                        e.status(),
+                        l.to_str().unwrap_or("?")
+                    ))
+                } else {
+                    PermslipError::Client(format!("Got {}", e.status()))
+                }
+            }
+            UnexpectedResponse(e) => PermslipError::Client(format!("Unexpected response: {e:?}")),
+            Custom(e) => PermslipError::Client(e.to_string()),
+        }
     }
 }
