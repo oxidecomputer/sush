@@ -11,9 +11,9 @@ use x509_cert::Certificate;
 use x509_cert::der::Encode as _;
 
 use sush_common::certs::{KeyId, Signature};
-use sush_common::jobs::{JobId, JobStatus, JobsReserved};
+use sush_common::jobs::{JobId, JobStatus, JobsReserved, SignedJob};
 
-use crate::commands::{CommandContext, CommandError, OutputFormat};
+use crate::commands::{CommandContext, CommandError, GlobalArgs, OutputFormat};
 
 #[derive(Clone, Debug, Default)]
 pub struct Cli {
@@ -33,6 +33,17 @@ impl CommandContext for Cli {
 
     fn set_output_format(&mut self, output: OutputFormat) {
         self.output = output;
+    }
+
+    fn set_globals(&mut self, _args: &mut GlobalArgs, values: GlobalArgs) {
+        match self.get_output_format() {
+            OutputFormat::Json => {
+                let GlobalArgs { output, url, .. } = values;
+                let output = output.map(|o| o.as_str());
+                println!("{}", json!({"output": output, "url": url}))
+            }
+            OutputFormat::Text => println!("❌ `set` is most useful interactively, try `shell`"),
+        }
     }
 
     fn ack(&mut self, reserved: JobsReserved) -> Result<(), CommandError> {
@@ -120,12 +131,16 @@ impl CommandContext for Cli {
         match self.get_output_format() {
             OutputFormat::Json => println!("{}", json!(reserved)),
             OutputFormat::Text => {
-                let n = reserved.job_ids.len();
+                let JobsReserved {
+                    job_ids,
+                    time_reserved,
+                } = reserved;
+                let n = job_ids.len();
                 match n {
                     0 => println!("✅ No jobs reserved"),
-                    1 => println!("✅ Reserved job ID: {}", reserved.job_ids[0]),
+                    1 => println!("✅ Reserved job ID {} at {}", job_ids[0], time_reserved),
                     _ => {
-                        println!("✅ Reserved job IDs:");
+                        println!("✅ Reserved job IDs at {}:", time_reserved);
                         for job_id in &reserved.job_ids {
                             println!("{job_id}");
                         }
@@ -248,7 +263,7 @@ impl CommandContext for Cli {
                 let n = revoked.len();
                 match n {
                     0 => println!("✅ No job IDs revoked"),
-                    1 => println!("✅ Reserved job ID: {}", revoked[0]),
+                    1 => println!("✅ Revoked job ID {}", revoked[0]),
                     _ => {
                         println!("✅ Revoked job IDs:");
                         for job_id in revoked {
@@ -257,6 +272,18 @@ impl CommandContext for Cli {
                     }
                 }
             }
+        }
+        Ok(())
+    }
+
+    fn job_signed(&mut self, job: &SignedJob) -> Result<(), CommandError> {
+        match self.get_output_format() {
+            OutputFormat::Json => println!("{}", serde_json::to_string(&job)?),
+            OutputFormat::Text => println!(
+                "✅ Signed request for job {}\n{}",
+                job.job_id(),
+                serde_json::to_string_pretty(&job)?
+            ),
         }
         Ok(())
     }

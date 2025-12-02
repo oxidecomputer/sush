@@ -3,19 +3,22 @@
 //! May be executed via either the main CLI or the interactive REPL.
 
 use std::collections::HashMap;
+use std::fmt;
 use std::fs::File;
-use std::io::Read as _;
+use std::io::{Read as _, Write as _, stdin, stdout};
+use std::os::fd::AsRawFd;
 use std::path::{Path, PathBuf};
 
 use async_recursion::async_recursion;
 use chrono::{DateTime, Utc};
 use clap::{Parser, Subcommand, ValueEnum};
+use libc::{FIONREAD, ioctl};
 use thiserror::Error;
 use tokio::select;
 use tokio::signal::ctrl_c;
 
 use sush_common::certs::{CertError, KeyId, Signer as _};
-use sush_common::jobs::{JobId, JobStartRequest, JobStatus, JobsReserved};
+use sush_common::jobs::{JobId, JobStartRequest, JobStatus, JobsReserved, SignedJob};
 
 use crate::permslip::PermslipError;
 use crate::permslip::{DEFAULT_PERMSLIP_URL, PermslipSigner};
@@ -23,11 +26,12 @@ use crate::repl::Repl;
 use crate::types::Error as ApiError;
 use crate::{Client, Error as ClientError};
 
-/// Default Support Shell HTTP API address.
-const DEFAULT_SUSH_URL: &str = "http://127.0.0.1:44444";
-
-/// The name of the job ID environment variable.
+// Names of environment variables for argument defaults.
+pub const PERMSLIP_URL: &str = "PERMSLIP_URL";
 pub const SUSH_JOB_ID: &str = "SUSH_JOB_ID";
+pub const SUSH_PERMSLIP_KEY: &str = "SUSH_PERMSLIP_KEY";
+pub const SUSH_OUTPUT_FORMAT: &str = "SUSH_OUTPUT_FORMAT";
+pub const SUSH_URL: &str = "SUSH_URL";
 
 /// What kind of output to emit.
 #[derive(Clone, Copy, Debug, Default, ValueEnum)]
@@ -37,45 +41,78 @@ pub enum OutputFormat {
     Json,
 }
 
+impl OutputFormat {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Self::Text => "text",
+            Self::Json => "json",
+        }
+    }
+}
+
+impl fmt::Display for OutputFormat {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "{}", self.as_str())
+    }
+}
+
+/// Optional global arguments.
+#[derive(Clone, Debug, Parser)]
+pub struct GlobalArgs {
+    /// Output type
+    #[arg(long,
+          env = SUSH_OUTPUT_FORMAT,
+          default_value = "text",
+          default_value_if("json", "true", "json"),
+          default_value_if("text", "true", "text"),
+          name = "FORMAT",
+          value_enum)]
+    #[clap(global = true)]
+    pub output: Option<OutputFormat>,
+
+    /// Shortcut for `--output=json`
+    #[arg(short, long, default_value_t = false, conflicts_with = "text")]
+    #[clap(global = true)]
+    pub json: bool,
+
+    /// Shortcut for `--output=text`
+    #[arg(short, long, default_value_t = false, conflicts_with = "json")]
+    #[clap(global = true)]
+    pub text: bool,
+
+    /// Support Shell HTTP API address for online mode
+    #[arg(short, long, env = SUSH_URL)]
+    #[clap(global = true)]
+    pub url: Option<String>,
+
+    /// Offline mode, i.e., signing only
+    #[arg(long, default_value_t = false, conflicts_with = "url")]
+    #[clap(global = true)]
+    pub offline: bool,
+}
+
 #[derive(Debug, Parser)]
 #[clap(name = "Oxide Support Shell")]
 #[clap(author = "Oxide Computer Company")]
 #[clap(about, version)]
 pub struct ClientArgs {
-    /// Output type.
-    #[arg(short,
-          long,
-          default_value_t = OutputFormat::Text,
-          default_value_if("json", "true", "json"),
-          value_enum)]
-    #[clap(global = true)]
-    output: OutputFormat,
-
-    /// Alias for `--output=json`
-    #[arg(short, long, default_value_t = false)]
-    #[clap(global = true)]
-    json: bool,
-
-    /// Support Shell HTTP API address
-    #[arg(short, long, default_value = DEFAULT_SUSH_URL, env = "SUSH_URL")]
-    #[clap(global = true)]
-    url: String,
-
-    /// Support shell job management command
+    #[clap(flatten)]
+    globals: GlobalArgs,
     #[clap(subcommand)]
     command: ClientCommand,
 }
 
 impl ClientArgs {
-    pub async fn execute<C>(&self, ctx: &mut C) -> Result<(), CommandError>
+    pub async fn execute<C>(&mut self, ctx: &mut C) -> Result<(), CommandError>
     where
         C: CommandContext + Send + Sync,
     {
-        self.command.execute(self, ctx).await
+        self.command.clone().execute(&mut self.globals, ctx).await
     }
 }
 
-#[derive(Debug, Subcommand)]
+/// Support Shell job management command
+#[derive(Clone, Debug, Subcommand)]
 pub enum ClientCommand {
     /// Import a certificate, verify its signature, and return a key ID for it.
     ImportCert { path: PathBuf },
@@ -107,23 +144,27 @@ pub enum ClientCommand {
         /// The command for the job to run. Passed as an argument to
         /// `bash -c`, so may be an arbitrary bash(1) command or pipeline.
         /// Be sure to quote spaces and characters special to your shell!
-        command: String,
+        command: Option<String>,
 
         /// Previously reserved but unused job ID.
         #[clap(env = SUSH_JOB_ID)]
         job_id: Option<JobId>,
 
         /// Use `permslip` to sign requests with this key name.
-        #[arg(short, long, env = "SUSH_PERMSLIP_KEY", name = "KEY_NAME")]
-        permslip: String,
+        #[arg(short, long, env = SUSH_PERMSLIP_KEY, name = "KEY_NAME")]
+        permslip: Option<String>,
 
         /// The `permslip` server to contact for signing.
-        #[arg(long, env = "PERMSLIP_URL", default_value = DEFAULT_PERMSLIP_URL)]
+        #[arg(long, env = PERMSLIP_URL, default_value = DEFAULT_PERMSLIP_URL)]
         permslip_url: String,
 
-        /// Wait for the job to end before returning.
+        /// Wait for the job to end and display its output.
         #[arg(short, long, default_value_t = false)]
         wait: bool,
+
+        /// Job output is binary, not UTF-8 encoded text.
+        #[arg(short, long, default_value_t = false, requires = "wait")]
+        binary: bool,
     },
 
     /// Get the status of a started job.
@@ -166,14 +207,23 @@ pub enum ClientCommand {
         job_id: JobId,
     },
 
+    /// Arguments for subsequent interactive commands.
+    Set {
+        #[clap(flatten)]
+        args: GlobalArgs,
+    },
+
     /// Start an interactive REPL.
     #[clap(alias = "repl")]
     Shell,
 }
 
+/// Behavior in response to command execution, e.g., printing output,
+/// maintaining (ephemeral) state.
 pub trait CommandContext {
     fn get_output_format(&self) -> OutputFormat;
     fn set_output_format(&mut self, output: OutputFormat);
+    fn set_globals(&mut self, _args: &mut GlobalArgs, _values: GlobalArgs) {}
     fn pre_parse_hook(&mut self, _command: &str) {}
 
     fn ack(&mut self, reserved: JobsReserved) -> Result<(), CommandError>;
@@ -183,6 +233,7 @@ pub trait CommandContext {
     fn job_stdout(&mut self, id: JobId, output: &[u8], binary: bool) -> Result<(), CommandError>;
     fn job_stderr(&mut self, id: JobId, errors: &[u8], binary: bool) -> Result<(), CommandError>;
     fn job_status(&mut self, id: JobId, status: &JobStatus) -> Result<(), CommandError>;
+    fn job_signed(&mut self, job: &SignedJob) -> Result<(), CommandError>;
     fn jobs_reserved(&mut self, reserved: &JobsReserved) -> Result<(), CommandError>;
     fn reserved_map(
         &mut self,
@@ -193,90 +244,193 @@ pub trait CommandContext {
 
 impl ClientCommand {
     #[async_recursion]
-    pub async fn execute<C>(&self, args: &ClientArgs, ctx: &mut C) -> Result<(), CommandError>
+    pub async fn execute<C>(self, args: &mut GlobalArgs, ctx: &mut C) -> Result<(), CommandError>
     where
         C: CommandContext + Send + Sync,
     {
-        ctx.set_output_format(args.output);
-        let client = Client::new(&args.url);
-        match self {
-            ClientCommand::ImportCert { path } => {
-                let mut file = File::open(path)?;
+        if let Some(output) = args.output {
+            ctx.set_output_format(output);
+        }
+        let client = args.url.as_ref().map(|url| Client::new(url));
+        match (self, client) {
+            (ClientCommand::ImportCert { path }, Some(client)) => {
+                let mut file = File::open(&path)?;
                 let mut cert = Vec::new();
                 file.read_to_end(&mut cert)?;
                 let key_id = client.import_cert(&cert).await?.into_inner();
-                ctx.cert_imported(path, key_id)
+                ctx.cert_imported(&path, key_id)
             }
-            ClientCommand::CertChain { key_id } => {
-                let certs = client.cert_chain(key_id).await?.into_inner();
-                ctx.cert_chain(*key_id, &certs)
+            (ClientCommand::CertChain { key_id }, Some(client)) => {
+                let certs = client.cert_chain(&key_id).await?.into_inner();
+                ctx.cert_chain(key_id, &certs)
             }
-            ClientCommand::Ping => {
+            (ClientCommand::Ping, Some(client)) => {
                 let reserved = client.reserve_jobs(0).await?.into_inner();
                 ctx.ack(reserved)
             }
-            ClientCommand::ReserveJobs { number } => {
-                let reserved = client.reserve_jobs(*number).await?.into_inner();
+            (ClientCommand::ReserveJobs { number }, Some(client)) => {
+                let reserved = client.reserve_jobs(number).await?.into_inner();
                 ctx.jobs_reserved(&reserved)
             }
-            ClientCommand::GetReserved => {
+            (ClientCommand::GetReserved, None) => match read_reserved()? {
+                Reserved::Batch(reserved) => ctx.jobs_reserved(&reserved),
+                Reserved::Map(map) => ctx.reserved_map(&map),
+            },
+            (ClientCommand::GetReserved, Some(client)) => {
                 let map = client.get_reserved().await?.into_inner();
                 ctx.reserved_map(&map)
             }
-            ClientCommand::RevokeReserved { job_ids } => {
-                let revoked = client.revoke_reserved(job_ids).await?.into_inner();
+            (ClientCommand::RevokeReserved { job_ids }, Some(client)) => {
+                let revoked = client.revoke_reserved(&job_ids).await?.into_inner();
                 ctx.revoked(&revoked)
             }
-            ClientCommand::JobStart { job_id: None, .. } => {
-                return Err(CommandError::MissingJobId);
+            (
+                ClientCommand::JobStart {
+                    command: None,
+                    permslip: None,
+                    wait,
+                    binary,
+                    ..
+                },
+                Some(client),
+            ) => {
+                let job = read_signed_job()?;
+                job_start(&client, ctx, job, wait, binary).await?;
+                Ok(())
             }
-            ClientCommand::JobStart {
-                job_id: Some(job_id),
-                permslip,
-                permslip_url,
-                wait,
-                command,
-            } => {
-                let signer = PermslipSigner::new(permslip, permslip_url).await?;
-                let job = signer.sign(JobStartRequest::new(*job_id, command)).await?;
-                let status = select! {
-                    status = client.job_start(job_id, *wait, &job) => status?.into_inner(),
-                    _ = ctrl_c() => {
-                        client.job_abort(job_id).await?;
-                        client.job_status(job_id).await?.into_inner()
-                    }
-                };
-                ctx.job_status(*job_id, &status)?;
-                if *wait {
-                    let stdout = client.job_stdout(job_id).await?.into_inner();
-                    let stderr = client.job_stderr(job_id).await?.into_inner();
-                    ctx.job_stdout(*job_id, &stdout, false)?;
-                    ctx.job_stderr(*job_id, &stderr, false)?;
+            (ClientCommand::JobStart { command: None, .. }, Some(_)) => {
+                Err(CommandError::MissingCommand)
+            }
+            (ClientCommand::JobStart { permslip: None, .. }, Some(_)) => {
+                Err(CommandError::MissingKeyName)
+            }
+            (ClientCommand::JobStart { job_id: None, .. }, _client) => {
+                Err(CommandError::MissingJobId)
+            }
+            (
+                ClientCommand::JobStart {
+                    command: Some(command),
+                    job_id: Some(job_id),
+                    permslip: Some(key_name),
+                    permslip_url,
+                    wait,
+                    binary,
+                },
+                client,
+            ) => {
+                let signer = PermslipSigner::new(key_name, &permslip_url).await?;
+                let job = signer.sign(JobStartRequest::new(job_id, command)).await?;
+                if let Some(client) = client {
+                    job_start(&client, ctx, job, wait, binary).await?;
+                } else {
+                    ctx.job_signed(&job)?;
                 }
                 Ok(())
             }
-            ClientCommand::JobStatus { job_id } => {
-                let status = client.job_status(job_id).await?.into_inner();
-                ctx.job_status(*job_id, &status)
+            (ClientCommand::JobStatus { job_id }, Some(client)) => {
+                let status = client.job_status(&job_id).await?.into_inner();
+                ctx.job_status(job_id, &status)
             }
-            ClientCommand::JobStdout { job_id, binary } => {
-                let stdout = client.job_stdout(job_id).await?.into_inner();
-                ctx.job_stdout(*job_id, &stdout, *binary)
+            (ClientCommand::JobStdout { job_id, binary }, Some(client)) => {
+                let stdout = client.job_stdout(&job_id).await?.into_inner();
+                ctx.job_stdout(job_id, &stdout, binary)
             }
-            ClientCommand::JobStderr { job_id, binary } => {
-                let stderr = client.job_stderr(job_id).await?.into_inner();
-                ctx.job_stderr(*job_id, &stderr, *binary)
+            (ClientCommand::JobStderr { job_id, binary }, Some(client)) => {
+                let stderr = client.job_stderr(&job_id).await?.into_inner();
+                ctx.job_stderr(job_id, &stderr, binary)
             }
-            ClientCommand::JobAbort { job_id } => {
-                client.job_abort(job_id).await?;
-                ctx.job_aborted(*job_id)
+            (ClientCommand::JobAbort { job_id }, Some(client)) => {
+                client.job_abort(&job_id).await?;
+                ctx.job_aborted(job_id)
             }
-            ClientCommand::Shell => {
+            (ClientCommand::Set { args: values }, _) => {
+                ctx.set_globals(args, values);
+                Ok(())
+            }
+            (ClientCommand::Shell, _) => {
                 Repl::default().run(args).await?;
                 Ok(())
             }
+            (_, None) => Err(CommandError::Offline),
         }
     }
+}
+
+async fn job_start<C>(
+    client: &Client,
+    ctx: &mut C,
+    job: SignedJob,
+    wait: bool,
+    binary: bool,
+) -> Result<(), CommandError>
+where
+    C: CommandContext + Send + Sync,
+{
+    let job_id = job.job_id();
+    let status = select! {
+        status = client.job_start(&job_id, wait, &job) => status?.into_inner(),
+        _ = ctrl_c() => {
+            client.job_abort(&job_id).await?;
+            client.job_status(&job_id).await?.into_inner()
+        }
+    };
+    ctx.job_status(job_id, &status)?;
+    if wait {
+        let stdout = client.job_stdout(&job_id).await?.into_inner();
+        let stderr = client.job_stderr(&job_id).await?.into_inner();
+        ctx.job_stdout(job_id, &stdout, binary)?;
+        ctx.job_stderr(job_id, &stderr, binary)?;
+    }
+    Ok(())
+}
+
+/// Read stdin until EOF, prompting unless there's already input available.
+fn read_input(prompt: &str) -> Result<String, CommandError> {
+    let mut avail: i32 = 0;
+    let rc = unsafe { ioctl(stdin().as_raw_fd(), FIONREAD, &mut avail) };
+    if rc >= 0 && avail == 0 {
+        stdout().write_all(prompt.as_bytes())?;
+        stdout().flush()?;
+    }
+
+    let mut input = String::new();
+    stdin().read_to_string(&mut input)?;
+    Ok(input)
+}
+
+enum Reserved {
+    Batch(JobsReserved),
+    Map(HashMap<String, DateTime<Utc>>),
+}
+
+/// Read reserved job IDs from stdin, relayed from an online client.
+fn read_reserved() -> Result<Reserved, CommandError> {
+    let input = read_input("✅ Enter reserved job IDs, terminated with Ctrl-D:\n")?;
+    if input.trim_start().starts_with('{') {
+        if let Ok(jobs) = serde_json::from_str(&input) {
+            Ok(Reserved::Batch(jobs))
+        } else if let Ok(map) = serde_json::from_str(&input) {
+            Ok(Reserved::Map(map))
+        } else {
+            Err(CommandError::InvalidReservedJobs)
+        }
+    } else {
+        Ok(Reserved::Batch(JobsReserved {
+            job_ids: input
+                .split('\n')
+                .filter(|s| !s.is_empty())
+                .map(|s| s.split_whitespace().next().unwrap_or(s).parse())
+                .collect::<Result<Vec<JobId>, _>>()?,
+            time_reserved: Utc::now(),
+        }))
+    }
+}
+
+/// Read a signed job request from stdin, relayed from an offline client
+/// with signing authorization.
+fn read_signed_job() -> Result<SignedJob, CommandError> {
+    let input = read_input("✅ Enter signed job request, terminated with Ctrl-D:\n")?;
+    Ok(serde_json::from_str(&input)?)
 }
 
 /// What went wrong parsing, preparing, or executing a client command.
@@ -284,7 +438,7 @@ impl ClientCommand {
 pub enum CommandError {
     #[error("❌ {0}")]
     Cert(#[from] CertError),
-    #[error("❌ {0}")]
+    #[error("🛈 {0}")]
     Clap(#[from] clap::Error),
     #[error("❌ {0}")]
     Client(String),
@@ -296,19 +450,29 @@ pub enum CommandError {
     Io(#[from] std::io::Error),
     #[error("❌ Leaf certificate does not match key `{0}`")]
     InvalidLeafCert(KeyId),
+    #[error("❌ Unable to read reserved job IDs")]
+    InvalidReservedJobs,
     #[error("❌ Root certificate is not self-signed")]
     InvalidRootCert,
+    #[error("❌ JSON error: {0}")]
+    Json(#[from] serde_json::Error),
+    #[error("❌ Missing job command, try `--help`")]
+    MissingCommand,
     #[error("❌ Missing job ID, try `reserve-jobs` or `get-reserved`")]
     MissingJobId,
-    #[error("❌ {0}")]
+    #[error("❌ Missing signing key name, try `--permslip`")]
+    MissingKeyName,
+    #[error("❌ Command not supported in offline mode, try `--url`")]
+    Offline,
+    #[error("❌ `permslip` error: {0}")]
     Permslip(#[from] PermslipError),
     #[error("❌ {0}")]
     Readline(#[from] rustyline::error::ReadlineError),
     #[error(transparent)]
     Recursive(#[from] Box<Self>),
-    #[error("❌ {0}")]
+    #[error("❌ UTF-8 error: {0}")]
     Utf8(#[from] std::string::FromUtf8Error),
-    #[error("❌ {0}")]
+    #[error("❌ UUID error: {0}")]
     Uuid(#[from] uuid::Error),
 }
 

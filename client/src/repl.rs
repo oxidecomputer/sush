@@ -15,11 +15,12 @@ use shlex::split as split_command;
 use xdg::BaseDirectories;
 
 use sush_common::certs::KeyId;
-use sush_common::jobs::{JobId, JobStatus, JobsReserved};
+use sush_common::jobs::{JobId, JobStatus, JobsReserved, SignedJob};
 
 use crate::cli::Cli;
 use crate::commands::{
-    ClientArgs, ClientCommand, CommandContext, CommandError, OutputFormat, SUSH_JOB_ID,
+    ClientCommand, CommandContext, CommandError, GlobalArgs, OutputFormat, SUSH_JOB_ID,
+    SUSH_OUTPUT_FORMAT, SUSH_URL,
 };
 
 const PREFIX: &str = "sush";
@@ -49,7 +50,7 @@ impl ReplCommandParser {
     }
 }
 
-/// Interactive REPL.
+/// Interactive REPL context.
 #[derive(Clone, Debug, Default)]
 pub struct Repl {
     cli: Cli,
@@ -57,7 +58,7 @@ pub struct Repl {
 }
 
 impl Repl {
-    pub async fn run(mut self, args: &ClientArgs) -> Result<(), CommandError> {
+    pub async fn run(mut self, args: &mut GlobalArgs) -> Result<(), CommandError> {
         let xdg = BaseDirectories::with_prefix(PREFIX);
         let history_file = xdg.place_state_file(HISTORY_FILE)?;
         let mut rl = DefaultEditor::new()?;
@@ -137,7 +138,7 @@ impl Repl {
 }
 
 /// Most of these methods simply punt to those of [`Cli`] for display.
-/// But we also update local (ephemeral) state for certain responses.
+/// But we do update local (ephemeral) state in response to some commands.
 impl CommandContext for Repl {
     fn get_output_format(&self) -> OutputFormat {
         self.cli.get_output_format()
@@ -145,6 +146,40 @@ impl CommandContext for Repl {
 
     fn set_output_format(&mut self, output: OutputFormat) {
         self.cli.set_output_format(output)
+    }
+
+    fn set_globals(&mut self, args: &mut GlobalArgs, values: GlobalArgs) {
+        let GlobalArgs {
+            mut output,
+            json,
+            text,
+            mut url,
+            offline,
+        } = values;
+        if json {
+            output = Some(OutputFormat::Json);
+        } else if text {
+            output = Some(OutputFormat::Text);
+        }
+        if offline {
+            url = None;
+        }
+
+        macro_rules! set_or_unset {
+            ($arg:ident, $var:expr, $name:literal) => {{
+                if let Some(arg) = $arg {
+                    unsafe { env::set_var($var, arg.to_string()) }
+                    args.$arg = Some(arg.clone());
+                    println!("✅ {} set to `{}`", $name, arg);
+                } else {
+                    unsafe { env::remove_var($var) }
+                    args.$arg = None;
+                    println!("✅ {} unset", $name);
+                }
+            }};
+        }
+        set_or_unset!(output, SUSH_OUTPUT_FORMAT, "Output format");
+        set_or_unset!(url, SUSH_URL, "Server URL");
     }
 
     fn pre_parse_hook(&mut self, command: &str) {
@@ -198,6 +233,12 @@ impl CommandContext for Repl {
         self.cli.job_status(job_id, status)?;
         self.set_job_id(Some(job_id));
         self.unreserve_job_id(job_id);
+        Ok(())
+    }
+
+    fn job_signed(&mut self, job: &SignedJob) -> Result<(), CommandError> {
+        self.cli.job_signed(job)?;
+        self.unreserve_job_id(job.job_id());
         Ok(())
     }
 

@@ -3120,6 +3120,7 @@ dependencies = [
  "bytesize",
  "chrono",
  "clap",
+ "libc",
  "pem-rfc7468",
  "permission-slip-client",
  "permission-slip-common",

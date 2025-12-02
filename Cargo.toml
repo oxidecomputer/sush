@@ -11,6 +11,7 @@ chrono = "0.4"
 clap = { version = "4", features = ["derive", "env", "wrap_help"] }
 dropshot = "0.16"
 ed25519-dalek = { version = "2", features = ["rand_core"] }
+libc = "0.2"
 p256 = { version = "0.13", features = ["ecdsa"] }
 pem-rfc7468 = { version = "0.7", features = ["std"] }
 permission-slip-client = { path = "../permission-slip/client" }

@@ -103,7 +103,7 @@ impl Signer for PermslipSigner {
 pub enum PermslipError {
     #[error(transparent)]
     Cert(#[from] CertError),
-    #[error("permslip: {0}")]
+    #[error("{0}")]
     Client(String),
     #[error(transparent)]
     Der(#[from] x509_cert::der::Error),
@@ -115,7 +115,7 @@ pub enum PermslipError {
     Pem(#[from] pem_rfc7468::Error),
     #[error(transparent)]
     Reqwest(#[from] reqwest::Error),
-    #[error("permslip authentication token: {0}")]
+    #[error("authentication token: {0}")]
     Token(String),
 }
 
