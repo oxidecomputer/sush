@@ -26,13 +26,6 @@ use x509_cert::spki::{AlgorithmIdentifier, AlgorithmIdentifierOwned, SubjectPubl
 use x509_cert::time::Validity;
 use x509_cert::{Certificate, TbsCertificate, Version};
 
-/// Self-signed (root) X.509 certificates. Self-signed certificates may
-/// not be imported (except in test code), and so must be included here.
-pub const ROOT_CERTS: &[&[u8]] = &[
-    //include_bytes!("../certs/root.der"),
-    include_bytes!("../../../permission-slip/sush.crt"),
-];
-
 /// What went wrong handling a key, signature, or certificate.
 #[derive(Debug, Error)]
 pub enum CertError {

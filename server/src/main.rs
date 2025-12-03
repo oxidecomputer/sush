@@ -7,8 +7,8 @@ use clap::Parser;
 use clap::builder::PathBufValueParser;
 use dropshot::{ConfigDropshot, ConfigLogging, ConfigLoggingLevel, HandlerTaskMode, ServerBuilder};
 
-use sush_common::database::open_database;
 use sush_server::api::api;
+use sush_server::database::open_database;
 use sush_server::manager::JobManager;
 
 const DEFAULT_ADDRESS: &str = "0.0.0.0:44444";

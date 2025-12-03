@@ -31,11 +31,19 @@ use tokio::task::{AbortHandle, JoinError, JoinHandle, JoinSet, spawn};
 use x509_cert::Certificate;
 use x509_cert::der::{Decode as _, Encode as _};
 
-use sush_common::blob::{
+use sush_common::certs::{CertError, KeyId, Signature};
+use sush_common::jobs::{JobId, JobStartRequest, JobStatus, JobsReserved, SignedJob, VerifiedJob};
+
+use crate::blob::{
     BlobError, blob_limit, file_len, get_blob, read_blob_chunk, read_blob_from_file,
 };
-use sush_common::certs::{CertError, KeyId, ROOT_CERTS, Signature};
-use sush_common::jobs::{JobId, JobStartRequest, JobStatus, JobsReserved, SignedJob, VerifiedJob};
+
+/// Self-signed (root) X.509 certificates. Self-signed certificates may
+/// not be imported (except in test code), and so must be included here.
+pub const ROOT_CERTS: &[&[u8]] = &[
+    // TODO: replace with a trusted root
+    include_bytes!("../certs/untrusted.crt"),
+];
 
 #[derive(Debug, Error)]
 pub enum JobError {
@@ -823,8 +831,9 @@ mod test {
     use x509_cert::time::Validity;
 
     use sush_common::certs::{EphemeralKey, KeyType, Signer as _};
+
     #[allow(unused_imports)]
-    use sush_common::database::{open_database, open_database_in_memory};
+    use crate::database::{open_database, open_database_in_memory};
 
     use super::*;
 
