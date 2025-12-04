@@ -64,7 +64,7 @@ impl Repl {
         let mut rl = DefaultEditor::new()?;
         let _ = rl.load_history(&history_file);
         loop {
-            match rl.readline(&self.prompt()) {
+            match rl.readline(&self.prompt(args)) {
                 Ok(command) => {
                     if command.trim().is_empty() {
                         continue;
@@ -128,11 +128,12 @@ impl Repl {
     }
 
     /// Make a prompt including the default job ID.
-    fn prompt(&self) -> String {
+    fn prompt(&self, args: &GlobalArgs) -> String {
+        let offline = if args.url.is_some() { "" } else { " (offline)" };
         if let Some(job_id) = self.default_job_id() {
-            format!("{PREFIX} {job_id}# ")
+            format!("{PREFIX}{offline} {job_id}# ")
         } else {
-            format!("{PREFIX}# ")
+            format!("{PREFIX}{offline}# ")
         }
     }
 }
@@ -188,8 +189,8 @@ impl CommandContext for Repl {
         }
     }
 
-    fn ack(&mut self, reserved: JobsReserved) -> Result<(), CommandError> {
-        self.cli.ack(reserved)
+    fn ack(&mut self, url: &str, time: DateTime<Utc>) -> Result<(), CommandError> {
+        self.cli.ack(url, time)
     }
 
     fn cert_chain(&mut self, key_id: KeyId, certs: &str) -> Result<(), CommandError> {
@@ -244,6 +245,12 @@ impl CommandContext for Repl {
 
     fn jobs_reserved(&mut self, reserved: &JobsReserved) -> Result<(), CommandError> {
         self.cli.jobs_reserved(reserved)?;
+        self.reserved = reserved.job_ids.clone();
+        Ok(())
+    }
+
+    fn reserved_read(&mut self, reserved: &JobsReserved) -> Result<(), CommandError> {
+        self.cli.reserved_read(reserved)?;
         self.reserved = reserved.job_ids.clone();
         Ok(())
     }

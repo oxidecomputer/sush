@@ -226,7 +226,7 @@ pub trait CommandContext {
     fn set_globals(&mut self, _args: &mut GlobalArgs, _values: GlobalArgs) {}
     fn pre_parse_hook(&mut self, _command: &str) {}
 
-    fn ack(&mut self, reserved: JobsReserved) -> Result<(), CommandError>;
+    fn ack(&mut self, url: &str, time: DateTime<Utc>) -> Result<(), CommandError>;
     fn cert_chain(&mut self, key_id: KeyId, certs: &str) -> Result<(), CommandError>;
     fn cert_imported(&mut self, path: &Path, key_id: KeyId) -> Result<(), CommandError>;
     fn job_aborted(&mut self, id: JobId) -> Result<(), CommandError>;
@@ -235,6 +235,7 @@ pub trait CommandContext {
     fn job_status(&mut self, id: JobId, status: &JobStatus) -> Result<(), CommandError>;
     fn job_signed(&mut self, job: &SignedJob) -> Result<(), CommandError>;
     fn jobs_reserved(&mut self, reserved: &JobsReserved) -> Result<(), CommandError>;
+    fn reserved_read(&mut self, reserved: &JobsReserved) -> Result<(), CommandError>;
     fn reserved_map(
         &mut self,
         reserved: &HashMap<String, DateTime<Utc>>,
@@ -266,14 +267,14 @@ impl ClientCommand {
             }
             (ClientCommand::Ping, Some(client)) => {
                 let reserved = client.reserve_jobs(0).await?.into_inner();
-                ctx.ack(reserved)
+                ctx.ack(&client.baseurl, reserved.time_reserved)
             }
             (ClientCommand::ReserveJobs { number }, Some(client)) => {
                 let reserved = client.reserve_jobs(number).await?.into_inner();
                 ctx.jobs_reserved(&reserved)
             }
             (ClientCommand::GetReserved, None) => match read_reserved()? {
-                Reserved::Batch(reserved) => ctx.jobs_reserved(&reserved),
+                Reserved::Batch(reserved) => ctx.reserved_read(&reserved),
                 Reserved::Map(map) => ctx.reserved_map(&map),
             },
             (ClientCommand::GetReserved, Some(client)) => {

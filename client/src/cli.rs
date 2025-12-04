@@ -46,10 +46,10 @@ impl CommandContext for Cli {
         }
     }
 
-    fn ack(&mut self, reserved: JobsReserved) -> Result<(), CommandError> {
+    fn ack(&mut self, url: &str, time: DateTime<Utc>) -> Result<(), CommandError> {
         match self.get_output_format() {
-            OutputFormat::Json => println!("{}", json!(reserved)),
-            OutputFormat::Text => println!("✅ {}", reserved.time_reserved),
+            OutputFormat::Json => println!("{}", json!({url: time})),
+            OutputFormat::Text => println!("✅ `{}` reports time {}", url, time),
         }
         Ok(())
     }
@@ -127,6 +127,16 @@ impl CommandContext for Cli {
         Ok(())
     }
 
+    fn reserved_read(&mut self, reserved: &JobsReserved) -> Result<(), CommandError> {
+        match self.get_output_format() {
+            OutputFormat::Json => println!("{}", json!(reserved)),
+            OutputFormat::Text => {
+                println!("✅ Read {} reserved job IDs", reserved.job_ids.len());
+            }
+        }
+        Ok(())
+    }
+
     fn jobs_reserved(&mut self, reserved: &JobsReserved) -> Result<(), CommandError> {
         match self.get_output_format() {
             OutputFormat::Json => println!("{}", json!(reserved)),
@@ -140,7 +150,7 @@ impl CommandContext for Cli {
                     0 => println!("✅ No jobs reserved"),
                     1 => println!("✅ Reserved job ID {} at {}", job_ids[0], time_reserved),
                     _ => {
-                        println!("✅ Reserved job IDs at {}:", time_reserved);
+                        println!("✅ Reserved {n} job IDs at {time_reserved}:");
                         for job_id in &reserved.job_ids {
                             println!("{job_id}");
                         }
@@ -265,7 +275,7 @@ impl CommandContext for Cli {
                     0 => println!("✅ No job IDs revoked"),
                     1 => println!("✅ Revoked job ID {}", revoked[0]),
                     _ => {
-                        println!("✅ Revoked job IDs:");
+                        println!("✅ Revoked {} job IDs:", revoked.len());
                         for job_id in revoked {
                             println!("{job_id}");
                         }
