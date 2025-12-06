@@ -14,8 +14,8 @@ ed25519-dalek = { version = "2", features = ["rand_core"] }
 libc = "0.2"
 p256 = { version = "0.13", features = ["ecdsa"] }
 pem-rfc7468 = { version = "0.7", features = ["std"] }
-permission-slip-client = { path = "../permission-slip/client" }
-permission-slip-common = { path = "../permission-slip/common" }
+permission-slip-client = { git = "https://github.com/oxidecomputer/permission-slip" }
+permission-slip-common = { git = "https://github.com/oxidecomputer/permission-slip" }
 progenitor = "0.11"
 rand_core = "0.6"
 reqwest = "0.12"

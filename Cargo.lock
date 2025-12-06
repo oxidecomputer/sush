@@ -2033,6 +2033,7 @@ checksum = "9b4f627cb1b25917193a259e49bdad08f671f8d9708acfd5fe0a8c1455d87220"
 [[package]]
 name = "permission-slip-client"
 version = "1.1.0"
+source = "git+https://github.com/oxidecomputer/permission-slip#b8dfbcba8cd5d159cfe0167142771d2e5acd73e7"
 dependencies = [
  "anyhow",
  "base64 0.22.1",
@@ -2064,6 +2065,7 @@ dependencies = [
 [[package]]
 name = "permission-slip-common"
 version = "0.1.0"
+source = "git+https://github.com/oxidecomputer/permission-slip#b8dfbcba8cd5d159cfe0167142771d2e5acd73e7"
 dependencies = [
  "blake3",
  "clap",

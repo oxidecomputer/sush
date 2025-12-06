@@ -1,0 +1,31 @@
+name: Test
+on: [push]
+jobs:
+  Test:
+    runs-on: ubuntu-22.04-8core
+    steps:
+    - name: Install Rust toolchain
+      uses: dtolnay/rust-toolchain@master
+      with:
+        toolchain: 1.91
+        components: clippy,rustfmt
+
+    - name: Configure Git
+      run: |
+        git config --global init.defaultBranch main &&
+        git config --global url."https://${{ secrets.GIT_CREDENTIALS }}@github.com".insteadOf https://github.com
+
+    - name: Checkout
+      uses: actions/checkout@v6
+
+    - name: Lint
+      run: |
+        cargo fmt -- --check &&
+        cargo clippy -- --no-deps --deny warnings &&
+        cargo clippy --tests -- --no-deps --deny warnings
+
+    - name: Build
+      run: cargo build --locked
+
+    - name: Test
+      run: cargo test && cargo test -- --ignored
