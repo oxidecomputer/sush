@@ -83,6 +83,7 @@ impl Repl {
                     };
                     match command.execute(args, &mut self).await {
                         Ok(()) => (),
+                        Err(CommandError::Quit) => break,
                         Err(err) => eprintln!("{err}"),
                     }
                 }
