@@ -20,7 +20,6 @@ use std::process::{ExitStatus, Stdio};
 use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD as BASE64};
 use chrono::{DateTime, Utc};
 use dropshot::{ClientErrorStatusCode, HttpError};
-use rusqlite::limits::Limit;
 use rusqlite::{Connection, OptionalExtension as _, blob::ZeroBlob};
 use tempfile::tempfile;
 use thiserror::Error;
@@ -778,11 +777,10 @@ fn job_ended(
     let limit = blob_limit(db)?;
     let stdout_len = file_len(&stdout, limit)?;
     let stderr_len = file_len(&stderr, limit)?;
-    let blob_limit = db.limit(Limit::SQLITE_LIMIT_LENGTH)?;
-    if stdout_len > blob_limit || stderr_len > blob_limit {
-        dbg!((stdout_len, stderr_len, blob_limit));
+    if stdout_len > limit || stderr_len > limit {
         return Err(BlobError::FileTooLarge);
     }
+
     let txn = db.transaction()?;
     txn.execute(
         "UPDATE jobs SET status = ?2, stdout = ?3, stderr = ?4, time_ended = ?5 \
@@ -826,6 +824,7 @@ mod test {
     use std::time::Duration;
 
     use rand_core::{OsRng, RngCore as _};
+    use rusqlite::limits::Limit;
     use tempfile::NamedTempFile;
     use x509_cert::name::Name;
     use x509_cert::time::Validity;
@@ -985,12 +984,16 @@ mod test {
         assert_eq!(stderr_len, expected_stderr_len);
     }
 
+    const TEST_LIMIT_LENGTH: i32 = 1000;
+
     async fn manager_and_test_root(db: Option<&str>) -> (JobManager, EphemeralKey) {
         let db = if let Some(db) = db {
             open_database(db).unwrap()
         } else {
             open_database_in_memory().unwrap()
         };
+        db.set_limit(Limit::SQLITE_LIMIT_LENGTH, TEST_LIMIT_LENGTH)
+            .unwrap();
         let mgr = JobManager::new(db).await.unwrap();
         let root = ephemeral_test_root();
         let key_id = mgr.import_cert(root.cert(), true).await.unwrap();
@@ -1177,7 +1180,6 @@ mod test {
         check_status_ended(status, child.cert(), job_id, "true", Some(0), 0, 0);
     }
 
-    #[ignore = "takes a few seconds"]
     #[tokio::test]
     async fn too_much_output() {
         let (mgr, root) = manager_and_test_root(None).await;
@@ -1187,15 +1189,17 @@ mod test {
         } = mgr.reserve_jobs(2).await.unwrap();
 
         let job_id = job_ids.pop().unwrap();
-        let command = "dd if=/dev/zero bs=1000 count=999999 2>/dev/null";
-        let job = root.sign_job_request(job_id, command).await;
+        let n = TEST_LIMIT_LENGTH - 1;
+        let command = format!("head -c {n} /dev/zero");
+        let job = root.sign_job_request(job_id, &command).await;
         let rx = mgr.job_start(job).await.unwrap();
         let status = rx.await.unwrap().unwrap();
-        check_status_ended(status, root.cert(), job_id, command, Some(0), 999999000, 0);
+        check_status_ended(status, root.cert(), job_id, &command, Some(0), n, 0);
 
         let job_id = job_ids.pop().unwrap();
-        let command = "dd if=/dev/zero bs=1000 count=1000000 2>/dev/null";
-        let job = root.sign_job_request(job_id, command).await;
+        let n = TEST_LIMIT_LENGTH;
+        let command = format!("head -c {n} /dev/zero");
+        let job = root.sign_job_request(job_id, &command).await;
         let rx = mgr.job_start(job).await.unwrap();
         assert!(
             matches!(
@@ -1205,6 +1209,6 @@ mod test {
             "should exceed BLOB size limit"
         );
         let status = mgr.job_status(job_id).await.unwrap();
-        check_status_ended(status, root.cert(), job_id, command, None, 0, 0);
+        check_status_ended(status, root.cert(), job_id, &command, None, 0, 0);
     }
 }
