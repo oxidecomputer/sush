@@ -216,6 +216,10 @@ pub enum ClientCommand {
     /// Start an interactive REPL.
     #[clap(alias = "repl")]
     Shell,
+
+    /// Leave the interactive REPL.
+    #[clap(alias = "exit")]
+    Quit,
 }
 
 /// Behavior in response to command execution, e.g., printing output,
@@ -352,6 +356,7 @@ impl ClientCommand {
                 Repl::default().run(args).await?;
                 Ok(())
             }
+            (ClientCommand::Quit, _) => Err(CommandError::Quit),
             (_, None) => Err(CommandError::Offline),
         }
     }
@@ -467,6 +472,8 @@ pub enum CommandError {
     Offline,
     #[error("❌ `permslip` error: {0}")]
     Permslip(#[from] PermslipError),
+    #[error("👋 Goodbye!")]
+    Quit,
     #[error("❌ {0}")]
     Readline(#[from] rustyline::error::ReadlineError),
     #[error(transparent)]
