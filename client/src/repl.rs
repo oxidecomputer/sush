@@ -64,6 +64,12 @@ impl Repl {
         let mut rl = DefaultEditor::new()?;
         let _ = rl.load_history(&history_file);
         loop {
+            macro_rules! perr {
+                ($($arg:tt)*) => {{
+                    eprintln!($($arg)*);
+                    continue;
+                }}
+            }
             match rl.readline(&self.prompt(args)) {
                 Ok(command) => {
                     if command.trim().is_empty() {
@@ -71,28 +77,21 @@ impl Repl {
                     }
                     rl.add_history_entry(&command)?;
                     let Some(words) = split_command(&command) else {
-                        eprintln!("❌ Invalid quoting in command");
-                        continue;
+                        perr!("❌ Invalid quoting in command");
                     };
                     let command = match ReplCommandParser::try_parse(&words, &mut self) {
                         Ok(ReplCommandParser { command }) => command,
-                        Err(err) => {
-                            eprintln!("{err}");
-                            continue;
-                        }
+                        Err(err) => perr!("{err}"),
                     };
                     match command.execute(args, &mut self).await {
                         Ok(()) => (),
                         Err(CommandError::Quit) => break,
-                        Err(err) => eprintln!("{err}"),
+                        Err(err) => perr!("{err}"),
                     }
                 }
                 Err(ReadlineError::Interrupted) => continue,
                 Err(ReadlineError::Eof) => break,
-                Err(err) => {
-                    eprintln!("❌ Error reading input: {err}");
-                    break;
-                }
+                Err(err) => perr!("❌ Error reading input: {err}"),
             }
         }
         rl.save_history(&history_file)?;
