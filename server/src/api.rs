@@ -15,7 +15,7 @@ use serde::Deserialize;
 use sush_common::certs::{KeyId, pem_cert_chain};
 use sush_common::jobs::{JobId, JobStatus, JobsReserved, SignedJob};
 
-use crate::manager::{JobError, JobManager};
+use crate::manager::{JobError, JobLimits, JobManager};
 
 type Context = RequestContext<JobManager>;
 
@@ -135,7 +135,7 @@ async fn job_start(
             String::from("query parameter job ID does not match body's"),
         ));
     }
-    let status = mgr.job_start(job).await?;
+    let status = mgr.job_start(job, JobLimits::default()).await?;
     if wait {
         Ok(HttpResponseOk(status.await.map_err(|_| {
             HttpError::for_internal_error(String::from("can't wait for job, sender dropped"))

@@ -254,12 +254,18 @@ impl CommandContext for Cli {
                     time_started,
                     time_ended,
                     status: None,
+                    stdout_len,
+                    stderr_len,
                     ..
                 } => println!(
                     "✅ Job ID:\t{job_id}\n   \
                      Reserved at:\t{time_reserved}\n   \
                      Started at:\t{time_started}\n   \
-                     Aborted at:\t{time_ended}",
+                     Aborted at:\t{time_ended}\n   \
+                     Stdout:\t{}\n   \
+                     Stderr:\t{}",
+                    ByteSize::b(*stdout_len as u64).display().si(),
+                    ByteSize::b(*stderr_len as u64).display().si(),
                 ),
             },
         }

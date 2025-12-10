@@ -4,7 +4,7 @@ use std::fmt;
 use std::ops::Deref;
 use std::str::FromStr;
 
-use chrono::{DateTime, Utc};
+use chrono::{DateTime, TimeDelta, Utc};
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest as _, Sha256};
@@ -125,4 +125,18 @@ pub enum JobStatus {
         stdout_len: i32,
         stderr_len: i32,
     },
+}
+
+impl JobStatus {
+    pub fn time_elapsed(&self) -> Option<TimeDelta> {
+        match self {
+            Self::NotFound | Self::Reserved { .. } => None,
+            Self::Started { time_started, .. } => Some(Utc::now() - time_started),
+            Self::Ended {
+                time_started,
+                time_ended,
+                ..
+            } => Some(*time_ended - time_started),
+        }
+    }
 }
