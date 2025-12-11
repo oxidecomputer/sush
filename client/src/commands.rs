@@ -497,6 +497,8 @@ pub enum CommandError {
     Client(String),
     #[error("❌ {0}")]
     Der(#[from] x509_cert::der::Error),
+    #[error("❌ {0}")]
+    DurationOutOfRange(#[from] chrono::OutOfRangeError),
     #[error("❌ Empty certificate chain")]
     EmptyCertChain,
     #[error("❌ {0}")]
