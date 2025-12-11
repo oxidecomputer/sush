@@ -18,7 +18,7 @@ use tokio::select;
 use tokio::signal::ctrl_c;
 
 use sush_common::certs::{CertError, KeyId, Signer as _};
-use sush_common::jobs::{JobId, JobStartRequest, JobStatus, JobsReserved, SignedJob};
+use sush_common::jobs::{JobId, JobLimits, JobStartRequest, JobStatus, JobsReserved, SignedJob};
 
 use crate::permslip::PermslipError;
 use crate::permslip::{DEFAULT_PERMSLIP_URL, PermslipSigner};
@@ -29,6 +29,9 @@ use crate::{Client, Error as ClientError};
 // Names of environment variables for argument defaults.
 pub const PERMSLIP_URL: &str = "PERMSLIP_URL";
 pub const SUSH_JOB_ID: &str = "SUSH_JOB_ID";
+pub const SUSH_MAX_CPU: &str = "SUSH_MAX_CPU";
+pub const SUSH_MAX_MEM: &str = "SUSH_MAX_MEM";
+pub const SUSH_MAX_FSIZE: &str = "SUSH_MAX_FSIZE";
 pub const SUSH_PERMSLIP_KEY: &str = "SUSH_PERMSLIP_KEY";
 pub const SUSH_OUTPUT_FORMAT: &str = "SUSH_OUTPUT_FORMAT";
 pub const SUSH_URL: &str = "SUSH_URL";
@@ -56,7 +59,39 @@ impl fmt::Display for OutputFormat {
     }
 }
 
-/// Optional global arguments.
+/// Process limits for job execution.
+#[derive(Clone, Debug, Parser)]
+pub struct LimitArgs {
+    /// Maximum CPU use in seconds.
+    #[arg(long, env = SUSH_MAX_CPU)]
+    pub max_cpu: Option<u64>,
+
+    /// Maximum size of address space in bytes.
+    #[arg(long, env = SUSH_MAX_MEM)]
+    pub max_mem: Option<u64>,
+
+    /// Maximum file size in bytes.
+    #[arg(long, env = SUSH_MAX_FSIZE)]
+    pub max_fsize: Option<u64>,
+}
+
+impl LimitArgs {
+    pub fn into_limits(self) -> JobLimits {
+        let Self {
+            max_cpu,
+            max_mem,
+            max_fsize,
+        } = self;
+        let defaults = JobLimits::default();
+        JobLimits {
+            max_cpu: max_cpu.unwrap_or(defaults.max_cpu),
+            max_mem: max_mem.unwrap_or(defaults.max_mem),
+            max_fsize: max_fsize.unwrap_or(defaults.max_fsize),
+        }
+    }
+}
+
+/// Optional global arguments, i.e., ones that apply to every command.
 #[derive(Clone, Debug, Parser)]
 pub struct GlobalArgs {
     /// Output type
@@ -98,6 +133,7 @@ pub struct GlobalArgs {
 pub struct ClientArgs {
     #[clap(flatten)]
     globals: GlobalArgs,
+
     #[clap(subcommand)]
     command: ClientCommand,
 }
@@ -141,6 +177,9 @@ pub enum ClientCommand {
     /// Sign and start a job.
     #[clap(alias = "start")]
     JobStart {
+        #[clap(flatten)]
+        limits: LimitArgs,
+
         /// The command for the job to run. Passed as an argument to
         /// `bash -c`, so may be an arbitrary bash(1) command or pipeline.
         /// Be sure to quote spaces and characters special to your shell!
@@ -295,12 +334,13 @@ impl ClientCommand {
                     permslip: None,
                     wait,
                     binary,
+                    limits,
                     ..
                 },
                 Some(client),
             ) => {
                 let job = read_signed_job()?;
-                job_start(&client, ctx, job, wait, binary).await?;
+                job_start(&client, ctx, job, limits.into_limits(), wait, binary).await?;
                 Ok(())
             }
             (ClientCommand::JobStart { command: None, .. }, Some(_)) => {
@@ -318,6 +358,7 @@ impl ClientCommand {
                     job_id: Some(job_id),
                     permslip: Some(key_name),
                     permslip_url,
+                    limits,
                     wait,
                     binary,
                 },
@@ -326,7 +367,7 @@ impl ClientCommand {
                 let signer = PermslipSigner::new(key_name, &permslip_url).await?;
                 let job = signer.sign(JobStartRequest::new(job_id, command)).await?;
                 if let Some(client) = client {
-                    job_start(&client, ctx, job, wait, binary).await?;
+                    job_start(&client, ctx, job, limits.into_limits(), wait, binary).await?;
                 } else {
                     ctx.job_signed(&job)?;
                 }
@@ -366,6 +407,7 @@ async fn job_start<C>(
     client: &Client,
     ctx: &mut C,
     job: SignedJob,
+    limits: JobLimits,
     wait: bool,
     binary: bool,
 ) -> Result<(), CommandError>
@@ -373,8 +415,13 @@ where
     C: CommandContext + Send + Sync,
 {
     let job_id = job.job_id();
+    let JobLimits {
+        max_cpu,
+        max_mem,
+        max_fsize,
+    } = limits;
     let status = select! {
-        status = client.job_start(&job_id, wait, &job) => status?.into_inner(),
+        status = client.job_start(&job_id, max_cpu, max_mem, max_fsize, wait, &job) => status?.into_inner(),
         _ = ctrl_c() => {
             client.job_abort(&job_id).await?;
             client.job_status(&job_id).await?.into_inner()

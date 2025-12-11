@@ -11,14 +11,12 @@ path = "src/main.rs"
 
 [dependencies]
 base64.workspace = true
-bytesize.workspace = true
 chrono.workspace = true
 clap.workspace = true
 dropshot.workspace = true
 ed25519-dalek.workspace = true
 p256.workspace = true
 rand_core.workspace = true
-rlimit.workspace = true
 rusqlite.workspace = true
 schemars.workspace = true
 serde.workspace = true

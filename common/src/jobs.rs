@@ -1,10 +1,13 @@
 //! Signed job requests.
 
 use std::fmt;
+use std::io::Error as IoError;
 use std::ops::Deref;
 use std::str::FromStr;
 
+use bytesize::GB;
 use chrono::{DateTime, TimeDelta, Utc};
+use rlimit::Resource;
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest as _, Sha256};
@@ -137,6 +140,51 @@ impl JobStatus {
                 time_ended,
                 ..
             } => Some(*time_ended - time_started),
+        }
+    }
+}
+
+/// Limits on job processes.
+#[derive(Clone, Debug, Deserialize, JsonSchema, Serialize)]
+pub struct JobLimits {
+    /// Maximum CPU use in seconds.
+    pub max_cpu: u64,
+
+    /// Maximum size of address space in bytes.
+    pub max_mem: u64,
+
+    /// Maximum file size in bytes.
+    pub max_fsize: u64,
+}
+
+impl JobLimits {
+    pub fn apply(&self) -> Result<(), IoError> {
+        let Self {
+            max_cpu,
+            max_mem,
+            max_fsize,
+        } = *self;
+        self.set_limit(Resource::CPU, max_cpu)?;
+        self.set_limit(Resource::AS, max_mem)?;
+        self.set_limit(Resource::FSIZE, max_fsize)?;
+        Ok(())
+    }
+
+    fn set_limit(&self, resource: Resource, value: u64) -> Result<(), IoError> {
+        let (_soft, hard) = resource.get()?;
+        resource.set(value.min(hard), hard)
+    }
+}
+
+/// Default limits should be increased as needed.
+/// But note that if `fsize` > `SQLITE_LIMIT_LENGTH`,
+/// job output may be truncated.
+impl Default for JobLimits {
+    fn default() -> Self {
+        JobLimits {
+            max_cpu: 60,
+            max_mem: GB,
+            max_fsize: GB,
         }
     }
 }

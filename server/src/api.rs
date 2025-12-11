@@ -13,9 +13,9 @@ use schemars::JsonSchema;
 use serde::Deserialize;
 
 use sush_common::certs::{KeyId, pem_cert_chain};
-use sush_common::jobs::{JobId, JobStatus, JobsReserved, SignedJob};
+use sush_common::jobs::{JobId, JobLimits, JobStatus, JobsReserved, SignedJob};
 
-use crate::manager::{JobError, JobLimits, JobManager};
+use crate::manager::{JobError, JobManager};
 
 type Context = RequestContext<JobManager>;
 
@@ -114,6 +114,20 @@ struct JobIdParam {
 
 #[derive(Deserialize, JsonSchema)]
 struct JobStartParams {
+    // A flattend struct should work here, but produces runtime errors:
+    // unable to parse query string: invalid type: string "1", expected u64
+    //#[serde(flatten)]
+    //limits: JobLimits,
+    /// Maximum CPU use in seconds.
+    max_cpu: u64,
+
+    /// Maximum size of address space in bytes.
+    max_mem: u64,
+
+    /// Maximum file size in bytes.
+    max_fsize: u64,
+
+    /// Keep the request open until the job ends.
     wait: bool,
 }
 
@@ -126,7 +140,12 @@ async fn job_start(
 ) -> Result<HttpResponseOk<JobStatus>, HttpError> {
     let mgr = ctx.context();
     let JobIdParam { job_id } = params.into_inner();
-    let JobStartParams { wait } = query.into_inner();
+    let JobStartParams {
+        max_cpu,
+        max_mem,
+        max_fsize,
+        wait,
+    } = query.into_inner();
     let job = body.into_inner();
     if job.job_id() != job_id {
         return Err(HttpError::for_client_error(
@@ -135,7 +154,16 @@ async fn job_start(
             String::from("query parameter job ID does not match body's"),
         ));
     }
-    let status = mgr.job_start(job, JobLimits::default()).await?;
+    let status = mgr
+        .job_start(
+            job,
+            JobLimits {
+                max_cpu,
+                max_mem,
+                max_fsize,
+            },
+        )
+        .await?;
     if wait {
         Ok(HttpResponseOk(status.await.map_err(|_| {
             HttpError::for_internal_error(String::from("can't wait for job, sender dropped"))

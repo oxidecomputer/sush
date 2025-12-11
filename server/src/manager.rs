@@ -13,15 +13,13 @@
 use std::collections::BTreeMap;
 use std::ffi::CStr;
 use std::fs::File;
-use std::io::{Error as IoError, Seek as _};
+use std::io::Seek as _;
 use std::ops::Range;
 use std::process::{ExitStatus, Stdio};
 
 use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD as BASE64};
-use bytesize::GB;
 use chrono::{DateTime, Utc};
 use dropshot::{ClientErrorStatusCode, HttpError};
-use rlimit::Resource;
 use rusqlite::{Connection, OptionalExtension as _, blob::ZeroBlob};
 use tempfile::tempfile;
 use thiserror::Error;
@@ -33,7 +31,9 @@ use x509_cert::Certificate;
 use x509_cert::der::{Decode as _, Encode as _};
 
 use sush_common::certs::{CertError, KeyId, Signature};
-use sush_common::jobs::{JobId, JobStartRequest, JobStatus, JobsReserved, SignedJob, VerifiedJob};
+use sush_common::jobs::{
+    JobId, JobLimits, JobStartRequest, JobStatus, JobsReserved, SignedJob, VerifiedJob,
+};
 
 use crate::blob::{
     BlobError, blob_limit, file_len, get_blob, read_blob_chunk, read_blob_from_file,
@@ -45,46 +45,6 @@ pub const ROOT_CERTS: &[&[u8]] = &[
     // TODO: replace with a trusted root
     include_bytes!("../certs/untrusted.crt"),
 ];
-
-/// Limits on job processes.
-pub struct JobLimits {
-    /// Maximum CPU use in seconds.
-    pub cpu: u64,
-
-    /// Maximum size of address space in bytes.
-    pub mem: u64,
-
-    /// Maximum file size in bytes.
-    pub fsize: u64,
-}
-
-impl JobLimits {
-    fn apply(&self) -> Result<(), IoError> {
-        let Self { cpu, mem, fsize } = *self;
-        self.set_limit(Resource::CPU, cpu)?;
-        self.set_limit(Resource::AS, mem)?;
-        self.set_limit(Resource::FSIZE, fsize)?;
-        Ok(())
-    }
-
-    fn set_limit(&self, resource: Resource, value: u64) -> Result<(), IoError> {
-        let (_soft, hard) = resource.get()?;
-        resource.set(value.min(hard), hard)
-    }
-}
-
-/// Default limits should be increased as needed.
-/// But note that if `fsize` > `SQLITE_LIMIT_LENGTH`,
-/// job output may be truncated.
-impl Default for JobLimits {
-    fn default() -> Self {
-        JobLimits {
-            cpu: 60,
-            mem: GB,
-            fsize: GB,
-        }
-    }
-}
 
 #[derive(Debug, Error)]
 pub enum JobError {
@@ -1241,8 +1201,8 @@ mod test {
             .job_start(
                 job,
                 JobLimits {
-                    cpu: 1,
-                    fsize: 100,
+                    max_cpu: 1,
+                    max_fsize: 100,
                     ..JobLimits::default()
                 },
             )
@@ -1283,7 +1243,7 @@ mod test {
             .job_start(
                 job,
                 JobLimits {
-                    fsize: n as u64 - 1,
+                    max_fsize: n as u64 - 1,
                     ..JobLimits::default()
                 },
             )
