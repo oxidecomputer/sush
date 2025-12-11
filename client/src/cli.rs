@@ -183,7 +183,12 @@ impl CommandContext for Cli {
             OutputFormat::Text if output.is_empty() => (),
             OutputFormat::Text => {
                 println!("✅ Job {job_id} stdout:");
-                print!("{}", String::from_utf8(output.to_vec())?);
+                let output = String::from_utf8(output.to_vec())?;
+                if output.ends_with('\n') {
+                    print!("{output}");
+                } else {
+                    println!("{output}");
+                }
             }
         }
         Ok(())
@@ -202,7 +207,12 @@ impl CommandContext for Cli {
             OutputFormat::Text if errors.is_empty() => (),
             OutputFormat::Text => {
                 println!("❌ Job {job_id} stderr:");
-                print!("{}", String::from_utf8(errors.to_vec())?);
+                let errors = String::from_utf8(errors.to_vec())?;
+                if errors.ends_with('\n') {
+                    print!("{errors}");
+                } else {
+                    println!("{errors}");
+                }
             }
         }
         Ok(())
