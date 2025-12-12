@@ -3,6 +3,7 @@
 //! A paper-thin wrapper around [`JobManager`].
 
 use std::collections::BTreeMap;
+use std::fmt;
 
 use chrono::{DateTime, Utc};
 use dropshot::{
@@ -11,6 +12,7 @@ use dropshot::{
 };
 use schemars::JsonSchema;
 use serde::Deserialize;
+use serde::de::{Deserializer, Error as DeserializeError, IntoDeserializer, MapAccess, Visitor};
 
 use sush_common::certs::{KeyId, pem_cert_chain};
 use sush_common::jobs::{JobId, JobLimits, JobStatus, JobsReserved, SignedJob};
@@ -114,21 +116,43 @@ struct JobIdParam {
 
 #[derive(Deserialize, JsonSchema)]
 struct JobStartParams {
-    // A flattend struct should work here, but produces runtime errors:
-    // unable to parse query string: invalid type: string "1", expected u64
-    //#[serde(flatten)]
-    //limits: JobLimits,
-    /// Maximum CPU use in seconds.
-    max_cpu: u64,
-
-    /// Maximum size of address space in bytes.
-    max_mem: u64,
-
-    /// Maximum file size in bytes.
-    max_fsize: u64,
+    #[serde(flatten, deserialize_with = "deserialize_job_limits")]
+    limits: JobLimits,
 
     /// Keep the request open until the job ends.
     wait: bool,
+}
+
+/// This deserialization method is a work-around for a bug in Serde; see
+/// <https://github.com/oxidecomputer/sush/pull/3#discussion_r2613036692>,
+/// <https://github.com/serde-rs/serde/issues/1183#issuecomment-668315831>.
+/// Luckily limits are homogeneous, so it's pretty simple.
+fn deserialize_job_limits<'de, D>(de: D) -> Result<JobLimits, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    struct LimitsVisitor;
+
+    impl<'de> Visitor<'de> for LimitsVisitor {
+        type Value = JobLimits;
+
+        fn expecting(&self, f: &mut fmt::Formatter) -> fmt::Result {
+            f.write_str("a homogeneous map of process limits")
+        }
+
+        fn visit_map<A>(self, mut map: A) -> Result<Self::Value, A::Error>
+        where
+            A: MapAccess<'de>,
+        {
+            let mut limits = BTreeMap::<String, u64>::new();
+            while let Some((key, value)) = map.next_entry::<String, String>()? {
+                limits.insert(key, value.parse().map_err(DeserializeError::custom)?);
+            }
+            JobLimits::deserialize(limits.into_deserializer())
+        }
+    }
+
+    de.deserialize_map(LimitsVisitor)
 }
 
 #[endpoint { method = POST, path = "/jobs/{job_id}/start" }]
@@ -140,12 +164,7 @@ async fn job_start(
 ) -> Result<HttpResponseOk<JobStatus>, HttpError> {
     let mgr = ctx.context();
     let JobIdParam { job_id } = params.into_inner();
-    let JobStartParams {
-        max_cpu,
-        max_mem,
-        max_fsize,
-        wait,
-    } = query.into_inner();
+    let JobStartParams { limits, wait } = query.into_inner();
     let job = body.into_inner();
     if job.job_id() != job_id {
         return Err(HttpError::for_client_error(
@@ -154,16 +173,7 @@ async fn job_start(
             String::from("query parameter job ID does not match body's"),
         ));
     }
-    let status = mgr
-        .job_start(
-            job,
-            JobLimits {
-                max_cpu,
-                max_mem,
-                max_fsize,
-            },
-        )
-        .await?;
+    let status = mgr.job_start(job, limits).await?;
     if wait {
         Ok(HttpResponseOk(status.await.map_err(|_| {
             HttpError::for_internal_error(String::from("can't wait for job, sender dropped"))

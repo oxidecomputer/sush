@@ -133,6 +133,15 @@
           },
           {
             "in": "query",
+            "name": "wait",
+            "description": "Keep the request open until the job ends.",
+            "required": true,
+            "schema": {
+              "type": "boolean"
+            }
+          },
+          {
+            "in": "query",
             "name": "max_cpu",
             "description": "Maximum CPU use in seconds.",
             "required": true,
@@ -162,15 +171,6 @@
               "type": "integer",
               "format": "uint64",
               "minimum": 0
-            }
-          },
-          {
-            "in": "query",
-            "name": "wait",
-            "description": "Keep the request open until the job ends.",
-            "required": true,
-            "schema": {
-              "type": "boolean"
             }
           }
         ],
