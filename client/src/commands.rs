@@ -272,10 +272,10 @@ pub trait CommandContext {
     fn ack(&mut self, url: &str, time: DateTime<Utc>) -> Result<(), CommandError>;
     fn cert_chain(&mut self, key_id: KeyId, certs: &str) -> Result<(), CommandError>;
     fn cert_imported(&mut self, path: &Path, key_id: KeyId) -> Result<(), CommandError>;
-    fn job_aborted(&mut self, id: JobId) -> Result<(), CommandError>;
-    fn job_stdout(&mut self, id: JobId, output: &[u8], binary: bool) -> Result<(), CommandError>;
-    fn job_stderr(&mut self, id: JobId, errors: &[u8], binary: bool) -> Result<(), CommandError>;
-    fn job_status(&mut self, id: JobId, status: &JobStatus) -> Result<(), CommandError>;
+    fn job_aborted(&mut self, id: &JobId) -> Result<(), CommandError>;
+    fn job_stdout(&mut self, id: &JobId, output: &[u8], binary: bool) -> Result<(), CommandError>;
+    fn job_stderr(&mut self, id: &JobId, errors: &[u8], binary: bool) -> Result<(), CommandError>;
+    fn job_status(&mut self, id: &JobId, status: &JobStatus) -> Result<(), CommandError>;
     fn job_signed(&mut self, job: &SignedJob) -> Result<(), CommandError>;
     fn jobs_reserved(&mut self, reserved: &JobsReserved) -> Result<(), CommandError>;
     fn reserved_read(&mut self, reserved: &JobsReserved) -> Result<(), CommandError>;
@@ -375,19 +375,19 @@ impl ClientCommand {
             }
             (ClientCommand::JobStatus { job_id }, Some(client)) => {
                 let status = client.job_status(&job_id).await?.into_inner();
-                ctx.job_status(job_id, &status)
+                ctx.job_status(&job_id, &status)
             }
             (ClientCommand::JobStdout { job_id, binary }, Some(client)) => {
                 let stdout = client.job_stdout(&job_id).await?.into_inner();
-                ctx.job_stdout(job_id, &stdout, binary)
+                ctx.job_stdout(&job_id, &stdout, binary)
             }
             (ClientCommand::JobStderr { job_id, binary }, Some(client)) => {
                 let stderr = client.job_stderr(&job_id).await?.into_inner();
-                ctx.job_stderr(job_id, &stderr, binary)
+                ctx.job_stderr(&job_id, &stderr, binary)
             }
             (ClientCommand::JobAbort { job_id }, Some(client)) => {
                 client.job_abort(&job_id).await?;
-                ctx.job_aborted(job_id)
+                ctx.job_aborted(&job_id)
             }
             (ClientCommand::Set { args: values }, _) => {
                 ctx.set_globals(args, values);
@@ -421,16 +421,16 @@ where
         max_fsize,
     } = limits;
     let status = select! {
-        status = client.job_start(&job_id, max_cpu, max_mem, max_fsize, wait, &job) => status?.into_inner(),
+        status = client.job_start(job_id, max_cpu, max_mem, max_fsize, wait, &job) => status?.into_inner(),
         _ = ctrl_c() => {
-            client.job_abort(&job_id).await?;
-            client.job_status(&job_id).await?.into_inner()
+            client.job_abort(job_id).await?;
+            client.job_status(job_id).await?.into_inner()
         }
     };
     ctx.job_status(job_id, &status)?;
     if wait {
-        let stdout = client.job_stdout(&job_id).await?.into_inner();
-        let stderr = client.job_stderr(&job_id).await?.into_inner();
+        let stdout = client.job_stdout(job_id).await?.into_inner();
+        let stderr = client.job_stderr(job_id).await?.into_inner();
         ctx.job_stdout(job_id, &stdout, binary)?;
         ctx.job_stderr(job_id, &stderr, binary)?;
     }
@@ -471,9 +471,10 @@ fn read_reserved() -> Result<Reserved, CommandError> {
         Ok(Reserved::Batch(JobsReserved {
             job_ids: input
                 .split('\n')
+                .map(|s| s.trim())
                 .filter(|s| !s.is_empty())
-                .map(|s| s.split_whitespace().next().unwrap_or(s).parse())
-                .collect::<Result<Vec<JobId>, _>>()?,
+                .map(JobId::from)
+                .collect::<Vec<JobId>>(),
             time_reserved: Utc::now(),
         }))
     }
@@ -529,8 +530,6 @@ pub enum CommandError {
     Recursive(#[from] Box<Self>),
     #[error("❌ UTF-8 error: {0}")]
     Utf8(#[from] std::string::FromUtf8Error),
-    #[error("❌ UUID error: {0}")]
-    Uuid(#[from] uuid::Error),
 }
 
 impl From<ClientError<ApiError>> for CommandError {

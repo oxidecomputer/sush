@@ -29,6 +29,5 @@ shlex.workspace = true
 sush-common = { path = "../common" }
 thiserror.workspace = true
 tokio.workspace = true
-uuid.workspace = true
 x509-cert.workspace = true
 xdg.workspace = true

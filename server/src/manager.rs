@@ -17,7 +17,6 @@ use std::io::Seek as _;
 use std::ops::Range;
 use std::process::{ExitStatus, Stdio};
 
-use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD as BASE64};
 use chrono::{DateTime, Utc};
 use dropshot::{ClientErrorStatusCode, HttpError};
 use rusqlite::{Connection, OptionalExtension as _, blob::ZeroBlob};
@@ -31,6 +30,7 @@ use x509_cert::Certificate;
 use x509_cert::der::{Decode as _, Encode as _};
 
 use sush_common::certs::{CertError, KeyId, Signature};
+use sush_common::codephrases::generate_id;
 use sush_common::jobs::{
     JobId, JobLimits, JobStartRequest, JobStatus, JobsReserved, SignedJob, VerifiedJob,
 };
@@ -62,7 +62,7 @@ pub enum JobError {
     InvalidJobId(JobId),
     #[error(transparent)]
     Io(#[from] std::io::Error),
-    #[error("Can't find certificate for key `{}`", BASE64.encode(.0.as_slice()))]
+    #[error("Can't find certificate for key `{0}`")]
     MissingCert(KeyId),
     #[error("Can't receive response: sender dropped")]
     Recv(#[from] oneshot::error::RecvError),
@@ -132,7 +132,7 @@ impl JobStart {
         })
     }
 
-    pub fn job_id(&self) -> JobId {
+    pub fn job_id(&self) -> &JobId {
         self.job.job_id()
     }
 
@@ -172,7 +172,7 @@ pub struct JobEnd {
 }
 
 impl JobEnd {
-    pub fn job_id(&self) -> JobId {
+    pub fn job_id(&self) -> &JobId {
         self.job.job_id()
     }
 }
@@ -262,10 +262,10 @@ impl JobManager {
                                 let _ = job_aborted(&db, job_id, time_ended);
                             }
                             Ok(Ok(end)) => {
-                                assert!(abort.remove(&end.job_id()).is_some());
+                                assert!(abort.remove(end.job_id()).is_some());
                                 let _ = job_ended(
                                     &mut db,
-                                    end.job_id(),
+                                    end.job_id().to_owned(),
                                     end.status.code(),
                                     end.stdout,
                                     end.stderr,
@@ -302,7 +302,7 @@ impl JobManager {
                                 let _ = response.send(revoke_reserved(&mut db, &job_ids));
                             }
                             Some(JobRequest::Start{ request: start, response }) => {
-                                let job_id = start.job_id();
+                                let job_id = start.job_id().to_owned();
                                 match start_job(&mut db, *start, response, &mut tasks) {
                                     Ok(handle) => assert!(abort.insert(job_id, handle).is_none()),
                                     Err(JobError::Start) => continue,
@@ -429,28 +429,31 @@ impl JobManager {
         Ok(rx)
     }
 
-    pub async fn job_status(&self, job_id: JobId) -> Result<JobStatus, JobError> {
+    pub async fn job_status(&self, job_id: &JobId) -> Result<JobStatus, JobError> {
         let (tx, rx) = oneshot::channel();
         self.request(JobRequest::Status {
-            job_id,
+            job_id: job_id.to_owned(),
             response: tx,
         })
         .await?;
         rx.await?
     }
 
-    pub async fn job_abort(&self, job_id: JobId) -> Result<(), JobError> {
-        self.request(JobRequest::Abort { job_id }).await
+    pub async fn job_abort(&self, job_id: &JobId) -> Result<(), JobError> {
+        self.request(JobRequest::Abort {
+            job_id: job_id.to_owned(),
+        })
+        .await
     }
 
     pub async fn job_stdout(
         &self,
-        job_id: JobId,
+        job_id: &JobId,
         range: Option<Range<i32>>,
     ) -> Result<Vec<u8>, JobError> {
         let (tx, rx) = oneshot::channel();
         self.request(JobRequest::Stdout {
-            job_id,
+            job_id: job_id.to_owned(),
             range,
             response: tx,
         })
@@ -460,12 +463,12 @@ impl JobManager {
 
     pub async fn job_stderr(
         &self,
-        job_id: JobId,
+        job_id: &JobId,
         range: Option<Range<i32>>,
     ) -> Result<Vec<u8>, JobError> {
         let (tx, rx) = oneshot::channel();
         self.request(JobRequest::Stderr {
-            job_id,
+            job_id: job_id.to_owned(),
             range,
             response: tx,
         })
@@ -498,8 +501,8 @@ fn start_job(
     let limit = blob_limit(db)?;
     let txn = db.transaction()?;
     let job = start.job.clone();
-    let job_id = job.job_id();
-    let time_reserved = with_err_response!(verify_reservation(&txn, job_id));
+    let job_id = job.job_id().to_owned();
+    let time_reserved = with_err_response!(verify_reservation(&txn, &job_id));
     let cert = with_err_response!(get_cert(&txn, job.key_id()));
     let job = with_err_response!(job.verify(&cert));
     with_err_response!(job_started(&txn, job, start.time_started));
@@ -523,7 +526,7 @@ fn start_job(
     }))
 }
 
-fn get_cert(db: &Connection, key_id: KeyId) -> Result<Certificate, JobError> {
+fn get_cert(db: &Connection, key_id: &KeyId) -> Result<Certificate, JobError> {
     if let Some(cert) = db
         .query_one(
             "SELECT cert FROM certs WHERE key_id = ?1",
@@ -535,14 +538,14 @@ fn get_cert(db: &Connection, key_id: KeyId) -> Result<Certificate, JobError> {
     {
         Ok(Certificate::from_der(&cert)?)
     } else {
-        Err(JobError::MissingCert(key_id))
+        Err(JobError::MissingCert(key_id.to_owned()))
     }
 }
 
 fn get_cert_chain(db: &Connection, mut key_id: KeyId) -> Result<Vec<Certificate>, JobError> {
     let mut chain = Vec::new();
     loop {
-        let cert = get_cert(db, key_id)?;
+        let cert = get_cert(db, &key_id)?;
         let self_signed = cert.tbs_certificate.subject == cert.tbs_certificate.issuer;
         key_id = KeyId::try_from(&cert.tbs_certificate.issuer)?;
         chain.push(cert);
@@ -564,7 +567,7 @@ fn import_cert(db: &Connection, cert: &Certificate, root: bool) -> Result<KeyId,
         }
         signature.verify(&cert.tbs_certificate.to_der()?, cert)?;
     } else {
-        let issuer_cert = get_cert(db, KeyId::try_from(issuer)?)?;
+        let issuer_cert = get_cert(db, &KeyId::try_from(issuer)?)?;
         signature.verify(&cert.tbs_certificate.to_der()?, &issuer_cert)?;
     }
 
@@ -572,7 +575,7 @@ fn import_cert(db: &Connection, cert: &Certificate, root: bool) -> Result<KeyId,
     db.execute(
         "INSERT INTO certs(key_id, cert) VALUES(?1, ?2) \
          ON CONFLICT(key_id) DO UPDATE SET cert = ?2",
-        (key_id, cert.to_der()?),
+        (&key_id, cert.to_der()?),
     )?;
     Ok(key_id)
 }
@@ -586,8 +589,8 @@ fn reserve_jobs(db: &mut Connection, number: u8) -> Result<JobsReserved, JobErro
          VALUES(?1, ?2, ?3, ?4)",
     )?;
     for _ in 0..number {
-        let job_id = JobId::new();
-        stmt.execute((job_id, time_reserved, ZeroBlob(0), ZeroBlob(0)))?;
+        let job_id = JobId::from(&generate_id());
+        stmt.execute((&job_id, time_reserved, ZeroBlob(0), ZeroBlob(0)))?;
         job_ids.push(job_id);
     }
     stmt.finalize()?;
@@ -616,7 +619,7 @@ fn revoke_reserved(db: &mut Connection, job_ids: &[JobId]) -> Result<Vec<JobId>,
     let job_ids = if !job_ids.is_empty() {
         job_ids.to_vec()
     } else {
-        get_reserved(&txn)?.keys().copied().collect()
+        get_reserved(&txn)?.keys().cloned().collect()
     };
     let mut stmt = txn.prepare(
         "DELETE FROM jobs WHERE job_id = ?1 AND time_started IS NULL",
@@ -624,7 +627,7 @@ fn revoke_reserved(db: &mut Connection, job_ids: &[JobId]) -> Result<Vec<JobId>,
     )?;
     let mut revoked = Vec::new();
     for job_id in job_ids {
-        if stmt.execute([job_id])? == 1 {
+        if stmt.execute([&job_id])? == 1 {
             revoked.push(job_id);
         }
     }
@@ -633,7 +636,7 @@ fn revoke_reserved(db: &mut Connection, job_ids: &[JobId]) -> Result<Vec<JobId>,
     Ok(revoked)
 }
 
-fn verify_reservation(db: &Connection, job_id: JobId) -> Result<DateTime<Utc>, JobError> {
+fn verify_reservation(db: &Connection, job_id: &JobId) -> Result<DateTime<Utc>, JobError> {
     if let Some(time_reserved) = db
         .query_one(
             "SELECT time_reserved FROM jobs WHERE job_id = ?1",
@@ -645,7 +648,7 @@ fn verify_reservation(db: &Connection, job_id: JobId) -> Result<DateTime<Utc>, J
     {
         Ok(time_reserved)
     } else {
-        Err(JobError::InvalidJobId(job_id))
+        Err(JobError::InvalidJobId(job_id.to_owned()))
     }
 }
 
@@ -669,7 +672,7 @@ fn job_started(
     {
         Ok(())
     } else {
-        Err(JobError::InvalidJobId(job.job_id()))
+        Err(JobError::InvalidJobId(job.job_id().to_owned()))
     }
 }
 
@@ -705,7 +708,7 @@ fn job_output(
                 // `--SEARCH jobs USING INDEX sqlite_autoindex_jobs_1 (job_id=?)
                 column.to_string_lossy()
             ),
-            [job_id],
+            [&job_id],
             |row| -> Result<Vec<u8>, _> { row.get(0) },
         )
         .optional()?
@@ -724,14 +727,14 @@ fn job_status(db: &Connection, job_id: JobId) -> Result<JobStatus, JobError> {
                     status, length(stdout), length(stderr) \
              FROM jobs WHERE job_id = ?1",
             // `--SEARCH jobs USING INDEX sqlite_autoindex_jobs_1 (job_id=?)
-            [job_id],
+            [&job_id],
             |row| {
-                assert_eq!(row.get("job_id"), Ok(job_id));
+                assert_eq!(row.get("job_id").as_ref(), Ok(&job_id));
                 if let Ok(time_ended) = row.get("time_ended") {
                     Ok(JobStatus::Ended {
                         job: SignedJob::new(
                             JobStartRequest {
-                                job_id,
+                                job_id: job_id.clone(),
                                 command: row.get("command")?,
                             },
                             row.get("key_id")?,
@@ -748,7 +751,7 @@ fn job_status(db: &Connection, job_id: JobId) -> Result<JobStatus, JobError> {
                     Ok(JobStatus::Started {
                         job: SignedJob::new(
                             JobStartRequest {
-                                job_id,
+                                job_id: job_id.clone(),
                                 command: row.get("command")?,
                             },
                             row.get("key_id")?,
@@ -759,7 +762,7 @@ fn job_status(db: &Connection, job_id: JobId) -> Result<JobStatus, JobError> {
                     })
                 } else if let Ok(time_reserved) = row.get("time_reserved") {
                     Ok(JobStatus::Reserved {
-                        job_id,
+                        job_id: job_id.clone(),
                         time_reserved,
                     })
                 } else {
@@ -796,7 +799,7 @@ fn job_ended(
          WHERE job_id = ?1 AND time_started IS NOT NULL AND time_ended IS NULL",
         // `--SEARCH jobs USING INDEX sqlite_autoindex_jobs_1 (job_id=?)
         (
-            job_id,
+            &job_id,
             status,
             ZeroBlob(stdout_len),
             ZeroBlob(stderr_len),
@@ -804,11 +807,11 @@ fn job_ended(
         ),
     )?;
     {
-        let blob = read_blob_from_file(&mut stdout, &txn, c"jobs", c"stdout", c"job_id", job_id)?;
+        let blob = read_blob_from_file(&mut stdout, &txn, c"jobs", c"stdout", c"job_id", &job_id)?;
         assert_eq!(blob.size(), stdout_len);
     }
     {
-        let blob = read_blob_from_file(&mut stderr, &txn, c"jobs", c"stderr", c"job_id", job_id)?;
+        let blob = read_blob_from_file(&mut stderr, &txn, c"jobs", c"stderr", c"job_id", &job_id)?;
         assert_eq!(blob.size(), stderr_len);
     }
     txn.commit()?;
@@ -846,12 +849,12 @@ mod test {
     use super::*;
 
     trait SignJobRequest {
-        async fn sign_job_request<S: AsRef<str>>(&self, job_id: JobId, command: S) -> SignedJob;
+        async fn sign_job_request<S: AsRef<str>>(&self, job_id: &JobId, command: S) -> SignedJob;
     }
 
     impl SignJobRequest for EphemeralKey {
-        async fn sign_job_request<S: AsRef<str>>(&self, job_id: JobId, command: S) -> SignedJob {
-            self.sign(JobStartRequest::new(job_id, command))
+        async fn sign_job_request<S: AsRef<str>>(&self, job_id: &JobId, command: S) -> SignedJob {
+            self.sign(JobStartRequest::new(job_id.to_owned(), command))
                 .await
                 .unwrap()
         }
@@ -861,12 +864,10 @@ mod test {
     fn ephemeral_test_subject() -> Name {
         let mut buf = [0; 8];
         OsRng.fill_bytes(&mut buf);
-        format!(
-            "CN=Ephemeral Test Key {},O=Oxide Computer Company,C=US",
-            BASE64.encode(buf),
-        )
-        .parse()
-        .unwrap()
+        let id = generate_id();
+        format!("CN=Ephemeral Test Key {id},O=Oxide Computer Company,C=US")
+            .parse()
+            .unwrap()
     }
 
     fn ephemeral_test_root() -> EphemeralKey {
@@ -878,10 +879,14 @@ mod test {
         .unwrap()
     }
 
+    fn random_job_id() -> JobId {
+        JobId::from(&generate_id())
+    }
+
     #[tokio::test]
     async fn false_() {
         let key = ephemeral_test_root();
-        let job = key.sign_job_request(JobId::new(), "false").await;
+        let job = key.sign_job_request(&random_job_id(), "false").await;
         let start = JobStart::new(job).unwrap();
         let end = start.wait().await.unwrap();
         assert!(!end.status.success());
@@ -892,7 +897,7 @@ mod test {
     #[tokio::test]
     async fn true_() {
         let key = ephemeral_test_root();
-        let job = key.sign_job_request(JobId::new(), "true").await;
+        let job = key.sign_job_request(&random_job_id(), "true").await;
         let start = JobStart::new(job).unwrap();
         let end = start.wait().await.unwrap();
         assert!(end.status.success());
@@ -903,7 +908,9 @@ mod test {
     #[tokio::test]
     async fn stderr() {
         let key = ephemeral_test_root();
-        let job = key.sign_job_request(JobId::new(), "echo error >&2").await;
+        let job = key
+            .sign_job_request(&random_job_id(), "echo error >&2")
+            .await;
         let start = JobStart::new(job).unwrap();
         let end = start.wait().await.unwrap();
         assert!(end.status.success());
@@ -920,7 +927,7 @@ mod test {
         let key = ephemeral_test_root();
         let path = file.path().display().to_string();
         let command = format!("cat {}", &path);
-        let job = key.sign_job_request(JobId::new(), command).await;
+        let job = key.sign_job_request(&random_job_id(), command).await;
         let start = JobStart::new(job).unwrap();
         let end = start.wait().await.unwrap();
         assert!(end.status.success());
@@ -932,7 +939,9 @@ mod test {
     #[tokio::test]
     async fn pipeline() {
         let key = ephemeral_test_root();
-        let job = key.sign_job_request(JobId::new(), "yes | head -n 1").await;
+        let job = key
+            .sign_job_request(&random_job_id(), "yes | head -n 1")
+            .await;
         let start = JobStart::new(job).unwrap();
         let end = start.wait().await.unwrap();
         assert!(end.status.success());
@@ -943,7 +952,7 @@ mod test {
     fn check_status_started(
         status: JobStatus,
         cert: &Certificate,
-        expected_job_id: JobId,
+        expected_job_id: &JobId,
         expected_command: &str,
     ) {
         let JobStatus::Started {
@@ -954,7 +963,7 @@ mod test {
         else {
             panic!("expected job to be started");
         };
-        assert_eq!(job.job_id, expected_job_id);
+        assert_eq!(job.job_id, *expected_job_id);
         let job = job.verify(cert).unwrap();
         assert_eq!(job.command, expected_command);
         assert!(time_reserved < time_started);
@@ -964,7 +973,7 @@ mod test {
     fn check_status_ended(
         status: JobStatus,
         cert: &Certificate,
-        expected_job_id: JobId,
+        expected_job_id: &JobId,
         expected_command: &str,
         expected_status: Option<i32>,
         expected_stdout_len: i32,
@@ -982,7 +991,7 @@ mod test {
         else {
             panic!("expected job to be finished");
         };
-        assert_eq!(job.job_id, expected_job_id);
+        assert_eq!(job.job_id, *expected_job_id);
         let job = job.verify(cert).unwrap();
         assert_eq!(job.command, expected_command);
         assert!(time_reserved < time_started);
@@ -1026,9 +1035,9 @@ mod test {
         }
 
         let job_id = job_ids.pop().unwrap();
-        let job = root.sign_job_request(job_id, "true").await;
+        let job = root.sign_job_request(&job_id, "true").await;
         assert!(matches!(
-            mgr.job_status(job_id).await.unwrap(),
+            mgr.job_status(&job_id).await.unwrap(),
             JobStatus::Reserved { job_id: id, time_reserved }
             if id == job_id && time_reserved < Utc::now(),
         ));
@@ -1038,7 +1047,7 @@ mod test {
             .await
             .unwrap();
         let status = rx.await.unwrap().unwrap();
-        check_status_ended(status, root.cert(), job_id, "true", Some(0), 0, 0);
+        check_status_ended(status, root.cert(), &job_id, "true", Some(0), 0, 0);
 
         let rx = mgr.job_start(job, JobLimits::default()).await.unwrap();
         assert!(
@@ -1050,28 +1059,28 @@ mod test {
         );
 
         let job_id = job_ids.pop().unwrap();
-        let job = root.sign_job_request(job_id, "false").await;
+        let job = root.sign_job_request(&job_id, "false").await;
         let rx = mgr.job_start(job, JobLimits::default()).await.unwrap();
         let status = rx.await.unwrap().unwrap();
-        check_status_ended(status, root.cert(), job_id, "false", Some(1), 0, 0);
+        check_status_ended(status, root.cert(), &job_id, "false", Some(1), 0, 0);
 
         let job_id = job_ids.pop().unwrap();
         let job_id_string = job_id.to_string();
         let job_id_bytes = job_id_string.as_bytes();
-        let job = root.sign_job_request(job_id, "echo -n $SUSH_JOB_ID").await;
+        let job = root.sign_job_request(&job_id, "echo -n $SUSH_JOB_ID").await;
         let rx = mgr.job_start(job, JobLimits::default()).await.unwrap();
         let status = rx.await.unwrap().unwrap();
         check_status_ended(
             status,
             root.cert(),
-            job_id,
+            &job_id,
             "echo -n $SUSH_JOB_ID",
             Some(0),
             job_id_bytes.len() as i32,
             0,
         );
-        assert_eq!(mgr.job_stdout(job_id, None).await.unwrap(), job_id_bytes);
-        assert!(mgr.job_stderr(job_id, None).await.unwrap().is_empty());
+        assert_eq!(mgr.job_stdout(&job_id, None).await.unwrap(), job_id_bytes);
+        assert!(mgr.job_stderr(&job_id, None).await.unwrap().is_empty());
 
         assert_eq!(mgr.revoke_reserved(job_ids.clone()).await.unwrap(), job_ids);
     }
@@ -1080,11 +1089,11 @@ mod test {
     async fn revoke() {
         let (mgr, root) = manager_and_test_root(None).await;
         let (job_id, time_reserved) = mgr.reserve_one().await.unwrap();
-        let job_ids = vec![job_id];
+        let job_ids = vec![job_id.clone()];
         assert_eq!(mgr.revoke_reserved(job_ids.clone()).await.unwrap(), job_ids);
         assert!(mgr.revoke_reserved(job_ids).await.unwrap().is_empty());
 
-        let job = root.sign_job_request(job_id, "false").await;
+        let job = root.sign_job_request(&job_id, "false").await;
         let rx = mgr.job_start(job, JobLimits::default()).await.unwrap();
         assert!(
             matches!(
@@ -1094,14 +1103,14 @@ mod test {
             "should not be allowed to start a revoked job"
         );
 
-        let status = mgr.job_status(job_id).await.unwrap();
+        let status = mgr.job_status(&job_id).await.unwrap();
         assert!(matches!(status, JobStatus::NotFound));
 
         let (new_job_id, new_time_reserved) = mgr.reserve_one().await.unwrap();
         assert_ne!(new_job_id, job_id);
         assert!(new_time_reserved > time_reserved);
 
-        let job_ids = vec![job_id, new_job_id];
+        let job_ids = vec![job_id.clone(), new_job_id.clone()];
         assert_eq!(
             mgr.revoke_reserved(job_ids.clone()).await.unwrap(),
             vec![new_job_id],
@@ -1123,18 +1132,18 @@ mod test {
         let (job_id, _time_reserved) = mgr.reserve_one().await.unwrap();
 
         let command = "sleep 10";
-        let job = root.sign_job_request(job_id, command).await;
+        let job = root.sign_job_request(&job_id, command).await;
         let rx = mgr.job_start(job, JobLimits::default()).await.unwrap();
 
-        let status = mgr.job_status(job_id).await.unwrap();
-        check_status_started(status, root.cert(), job_id, command);
+        let status = mgr.job_status(&job_id).await.unwrap();
+        check_status_started(status, root.cert(), &job_id, command);
 
-        mgr.job_abort(job_id).await.unwrap();
+        mgr.job_abort(&job_id).await.unwrap();
         assert!(rx.await.is_err());
 
-        let status = mgr.job_status(job_id).await.unwrap();
+        let status = mgr.job_status(&job_id).await.unwrap();
         assert!(status.time_elapsed().unwrap().to_std().unwrap() < Duration::from_secs(1));
-        check_status_ended(status, root.cert(), job_id, command, None, 0, 0);
+        check_status_ended(status, root.cert(), &job_id, command, None, 0, 0);
     }
 
     #[tokio::test]
@@ -1185,10 +1194,10 @@ mod test {
         );
 
         let (job_id, _time_reserved) = mgr.reserve_one().await.unwrap();
-        let job = child.sign_job_request(job_id, "true").await;
+        let job = child.sign_job_request(&job_id, "true").await;
         let rx = mgr.job_start(job, JobLimits::default()).await.unwrap();
         let status = rx.await.unwrap().unwrap();
-        check_status_ended(status, child.cert(), job_id, "true", Some(0), 0, 0);
+        check_status_ended(status, child.cert(), &job_id, "true", Some(0), 0, 0);
     }
 
     #[tokio::test]
@@ -1196,7 +1205,7 @@ mod test {
         let (mgr, root) = manager_and_test_root(None).await;
         let (job_id, _time_reserved) = mgr.reserve_one().await.unwrap();
         let command = "openssl speed sha1";
-        let job = root.sign_job_request(job_id, command).await;
+        let job = root.sign_job_request(&job_id, command).await;
         let rx = mgr
             .job_start(
                 job,
@@ -1212,15 +1221,15 @@ mod test {
         assert!(status.time_elapsed().unwrap().to_std().unwrap() < Duration::from_secs(2));
 
         // The output of `openssl speed` changed between v3.0 and v3.5.
-        let stderr = mgr.job_stderr(job_id, None).await.unwrap();
+        let stderr = mgr.job_stderr(&job_id, None).await.unwrap();
         let stderr = String::from_utf8_lossy(&stderr);
         match status {
             JobStatus::Ended { stderr_len: 37, .. } => {
-                check_status_ended(status, root.cert(), job_id, command, None, 0, 37);
+                check_status_ended(status, root.cert(), &job_id, command, None, 0, 37);
                 assert_eq!(stderr, "Doing sha1 for 3s on 16 size blocks: ");
             }
             JobStatus::Ended { stderr_len: 41, .. } => {
-                check_status_ended(status, root.cert(), job_id, command, None, 0, 41);
+                check_status_ended(status, root.cert(), &job_id, command, None, 0, 41);
                 assert_eq!(stderr, "Doing sha1 ops for 3s on 16 size blocks: ");
             }
             _ => todo!("what does `{command}` produce on your system?"),
@@ -1238,7 +1247,7 @@ mod test {
         let job_id = job_ids.pop().unwrap();
         let n: i32 = 100;
         let command = &format!("head -c {n} /dev/zero");
-        let job = root.sign_job_request(job_id, command).await;
+        let job = root.sign_job_request(&job_id, command).await;
         let rx = mgr
             .job_start(
                 job,
@@ -1250,20 +1259,20 @@ mod test {
             .await
             .unwrap();
         let status = rx.await.unwrap().unwrap();
-        check_status_ended(status, root.cert(), job_id, command, None, n - 1, 0);
+        check_status_ended(status, root.cert(), &job_id, command, None, n - 1, 0);
 
         let job_id = job_ids.pop().unwrap();
         let n = TEST_LIMIT_LENGTH - 1;
         let command = &format!("head -c {n} /dev/zero");
-        let job = root.sign_job_request(job_id, command).await;
+        let job = root.sign_job_request(&job_id, command).await;
         let rx = mgr.job_start(job, JobLimits::default()).await.unwrap();
         let status = rx.await.unwrap().unwrap();
-        check_status_ended(status, root.cert(), job_id, command, Some(0), n, 0);
+        check_status_ended(status, root.cert(), &job_id, command, Some(0), n, 0);
 
         let job_id = job_ids.pop().unwrap();
         let n = TEST_LIMIT_LENGTH;
         let command = &format!("head -c {n} /dev/zero");
-        let job = root.sign_job_request(job_id, command).await;
+        let job = root.sign_job_request(&job_id, command).await;
         let rx = mgr.job_start(job, JobLimits::default()).await.unwrap();
         assert!(
             matches!(
@@ -1272,7 +1281,7 @@ mod test {
             ),
             "should exceed BLOB size limit"
         );
-        let status = mgr.job_status(job_id).await.unwrap();
-        check_status_ended(status, root.cert(), job_id, command, None, 0, 0);
+        let status = mgr.job_status(&job_id).await.unwrap();
+        check_status_ended(status, root.cert(), &job_id, command, None, 0, 0);
     }
 }

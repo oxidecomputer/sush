@@ -1,7 +1,6 @@
-/// Several types will serialize to and from strings, e.g.,
-/// as UUIDs or base64. This macro implements those in terms
-/// of `to_string` and `parse`, a.k.a., [`std::fmt::Display`]
-/// and [`std::str::FromStr`].
+/// Several types will serialize to and from (base64) strings.
+/// This macro implements those in terms of `to_string` and `parse`,
+/// a.k.a., [`std::fmt::Display`] and [`std::str::FromStr`].
 macro_rules! impl_to_from_sql_and_serde {
     ($ty:ident) => {
         impl rusqlite::ToSql for $ty {

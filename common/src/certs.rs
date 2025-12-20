@@ -1,16 +1,18 @@
 //! Key, signature, and X.509 certificate management.
 
+use std::convert::Infallible;
 use std::fmt;
 use std::ops::Deref;
 use std::str::FromStr;
 
 use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD as BASE64};
+use crypto_bigint::{ArrayEncoding as _, Random as _, U128, U256};
 use ed25519_dalek::{
     Signature as Ed25519Signature, Signer as _, SigningKey as Ed25519SigningKey, Verifier as _,
     VerifyingKey as Ed25519VerifyingKey,
 };
 use p256::{SecretKey as P256SecretKey, ecdsa};
-use rand_core::{OsRng, RngCore as _};
+use rand_core::OsRng;
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest as _, Sha256};
@@ -26,6 +28,8 @@ use x509_cert::spki::{AlgorithmIdentifier, AlgorithmIdentifierOwned, SubjectPubl
 use x509_cert::time::Validity;
 use x509_cert::{Certificate, TbsCertificate, Version};
 
+use crate::codephrases::codephrase;
+
 /// What went wrong handling a key, signature, or certificate.
 #[derive(Debug, Error)]
 pub enum CertError {
@@ -35,7 +39,7 @@ pub enum CertError {
     Der(#[from] x509_cert::der::Error),
     #[error("Ed25519 error: {0}")]
     Ed25519(#[from] ed25519_dalek::ed25519::Error),
-    #[error("invalid key ID: should be 16 bytes")]
+    #[error("invalid key ID")]
     InvalidKeyId,
     #[error("invalid subject public key")]
     InvalidPublicKey,
@@ -49,33 +53,30 @@ pub enum CertError {
     Signer(String),
 }
 
-/// Upper half of the SHA-256 of a certificate subject,
-/// encoded with base64 for storage and transport.
-#[derive(Clone, Copy, Debug, Eq, Hash, JsonSchema, Ord, PartialEq, PartialOrd)]
-pub struct KeyId(#[schemars(with = "String")] [u8; 16]);
+/// SHA-256 of a certificate subject, encoded as a pseudo-random
+/// passphrase for storage and transport.
+#[derive(Clone, Debug, Eq, Hash, JsonSchema, Ord, PartialEq, PartialOrd)]
+pub struct KeyId(String);
 
-impl KeyId {
-    pub fn as_slice(&self) -> &[u8; 16] {
+impl Deref for KeyId {
+    type Target = str;
+
+    fn deref(&self) -> &Self::Target {
         &self.0
     }
 }
 
 impl fmt::Display for KeyId {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "{}", BASE64.encode(self.0))
+        write!(f, "{}", self.0)
     }
 }
 
 impl FromStr for KeyId {
-    type Err = CertError;
+    type Err = Infallible;
 
     fn from_str(s: &str) -> Result<Self, Self::Err> {
-        Ok(Self(
-            BASE64
-                .decode(s)?
-                .try_into()
-                .map_err(|_| CertError::InvalidKeyId)?,
-        ))
+        Ok(Self(s.to_string()))
     }
 }
 
@@ -84,7 +85,8 @@ impl TryFrom<&Name> for KeyId {
 
     fn try_from(name: &Name) -> Result<KeyId, Self::Error> {
         let hash = Sha256::digest(&name.to_der()?);
-        Ok(KeyId(hash[..16].try_into().unwrap()))
+        let words = codephrase(U256::from_be_slice(hash.as_slice()));
+        Ok(KeyId(words[..6].join(" ")))
     }
 }
 
@@ -202,8 +204,8 @@ impl<T> Signed<T> {
         &self.payload
     }
 
-    pub fn key_id(&self) -> KeyId {
-        self.key_id
+    pub fn key_id(&self) -> &KeyId {
+        &self.key_id
     }
 
     pub fn signature(&self) -> &Signature {
@@ -238,8 +240,8 @@ pub struct Verified<T> {
 }
 
 impl<T> Verified<T> {
-    pub fn verified_by(&self) -> KeyId {
-        self.verified_by
+    pub fn verified_by(&self) -> &KeyId {
+        &self.verified_by
     }
 }
 
@@ -379,9 +381,9 @@ impl EphemeralKey {
     }
 
     fn generate_serial_number() -> Result<SerialNumber, CertError> {
-        let mut buf = [0; 16];
-        OsRng.fill_bytes(&mut buf);
-        Ok(SerialNumber::new(&buf)?)
+        Ok(SerialNumber::new(
+            &U128::random(&mut OsRng).to_be_byte_array(),
+        )?)
     }
 
     fn tbs_certificate(
@@ -451,7 +453,7 @@ impl Signer for EphemeralKey {
     type Error = CertError;
 
     async fn key_id(&self) -> Result<KeyId, Self::Error> {
-        Ok(self.key_id)
+        Ok(self.key_id.clone())
     }
 
     async fn sign<T: ToBeSigned>(&self, what: T) -> Result<Signed<T>, Self::Error> {

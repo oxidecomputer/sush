@@ -25,5 +25,4 @@ sush-common = { path = "../common" }
 tempfile.workspace = true
 thiserror.workspace = true
 tokio.workspace = true
-uuid.workspace = true
 x509-cert.workspace = true

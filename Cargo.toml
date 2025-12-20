@@ -4,11 +4,13 @@ resolver = "2"
 
 [workspace.dependencies]
 async-recursion = "1"
-blake3 = "1"
 base64 = "0.22"
+blake3 = "1"
 bytesize = "2"
 chrono = "0.4"
 clap = { version = "4", features = ["derive", "env", "wrap_help"] }
+crypto-bigint = "0.5"
+diceware_wordlists = "1"
 dropshot = "0.16"
 ed25519-dalek = { version = "2", features = ["rand_core"] }
 humantime = "2"
@@ -18,12 +20,13 @@ pem-rfc7468 = { version = "0.7", features = ["std"] }
 permission-slip-client = { git = "https://github.com/oxidecomputer/permission-slip" }
 permission-slip-common = { git = "https://github.com/oxidecomputer/permission-slip" }
 progenitor = "0.11"
+rand = "0.8"
 rand_core = "0.6"
 reqwest = "0.12"
 rlimit = "0.10"
-rusqlite = { version = "0.37", features = ["blob", "chrono", "limits", "modern_sqlite", "uuid"] }
+rusqlite = { version = "0.37", features = ["blob", "chrono", "limits", "modern_sqlite"] }
 rustyline = "17"
-schemars = { version = "0.8", features = ["chrono", "preserve_order", "uuid1"] }
+schemars = { version = "0.8", features = ["chrono", "preserve_order"] }
 serde = "1"
 serde_json = "1"
 sha2 = "0.10"
@@ -31,6 +34,5 @@ shlex = "1"
 tempfile = "3"
 thiserror = "1"
 tokio = { version = "1", features = ["macros", "process", "rt", "sync", "time"] }
-uuid = { version = "1", features = ["serde", "v4"] }
 x509-cert = { version = "0.2", features = ["std"] }
 xdg = "3"
