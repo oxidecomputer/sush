@@ -8,6 +8,7 @@ progenitor::generate_api!(
     interface = Positional,
     replace = {
         JobId = sush_common::jobs::JobId,
+        JobLimits = sush_common::jobs::JobLimits,
         JobStatus = sush_common::jobs::JobStatus,
         JobsReserved = sush_common::jobs::JobsReserved,
         KeyId = sush_common::certs::KeyId,

@@ -6,6 +6,7 @@ use std::path::Path;
 
 use bytesize::ByteSize;
 use chrono::{DateTime, Utc};
+use humantime::format_duration;
 use serde_json::json;
 use x509_cert::Certificate;
 use x509_cert::der::Encode as _;
@@ -182,7 +183,12 @@ impl CommandContext for Cli {
             OutputFormat::Text if output.is_empty() => (),
             OutputFormat::Text => {
                 println!("✅ Job {job_id} stdout:");
-                print!("{}", String::from_utf8(output.to_vec())?);
+                let output = String::from_utf8(output.to_vec())?;
+                if output.ends_with('\n') {
+                    print!("{output}");
+                } else {
+                    println!("{output}");
+                }
             }
         }
         Ok(())
@@ -201,7 +207,12 @@ impl CommandContext for Cli {
             OutputFormat::Text if errors.is_empty() => (),
             OutputFormat::Text => {
                 println!("❌ Job {job_id} stderr:");
-                print!("{}", String::from_utf8(errors.to_vec())?);
+                let errors = String::from_utf8(errors.to_vec())?;
+                if errors.ends_with('\n') {
+                    print!("{errors}");
+                } else {
+                    println!("{errors}");
+                }
             }
         }
         Ok(())
@@ -235,17 +246,18 @@ impl CommandContext for Cli {
                     time_reserved,
                     time_started,
                     time_ended,
-                    status: Some(status),
+                    status: Some(exit_status),
                     stdout_len,
                     stderr_len,
                 } => println!(
                     "✅ Job ID:\t{job_id}\n   \
                      Reserved at:\t{time_reserved}\n   \
                      Started at:\t{time_started}\n   \
-                     Ended at:\t{time_ended}\n   \
-                     Status:\t{status}\n   \
+                     Ended at:\t{time_ended} ({})\n   \
+                     Status:\t{exit_status}\n   \
                      Stdout:\t{}\n   \
                      Stderr:\t{}",
+                    format_duration(status.time_elapsed().unwrap().to_std()?),
                     ByteSize::b(*stdout_len as u64).display().si(),
                     ByteSize::b(*stderr_len as u64).display().si(),
                 ),
@@ -254,12 +266,19 @@ impl CommandContext for Cli {
                     time_started,
                     time_ended,
                     status: None,
+                    stdout_len,
+                    stderr_len,
                     ..
                 } => println!(
                     "✅ Job ID:\t{job_id}\n   \
                      Reserved at:\t{time_reserved}\n   \
                      Started at:\t{time_started}\n   \
-                     Aborted at:\t{time_ended}",
+                     Aborted at:\t{time_ended} ({})\n   \
+                     Stdout:\t{}\n   \
+                     Stderr:\t{}",
+                    format_duration(status.time_elapsed().unwrap().to_std()?),
+                    ByteSize::b(*stdout_len as u64).display().si(),
+                    ByteSize::b(*stderr_len as u64).display().si(),
                 ),
             },
         }

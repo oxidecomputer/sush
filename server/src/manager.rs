@@ -20,7 +20,6 @@ use std::process::{ExitStatus, Stdio};
 use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD as BASE64};
 use chrono::{DateTime, Utc};
 use dropshot::{ClientErrorStatusCode, HttpError};
-use rusqlite::limits::Limit;
 use rusqlite::{Connection, OptionalExtension as _, blob::ZeroBlob};
 use tempfile::tempfile;
 use thiserror::Error;
@@ -32,7 +31,9 @@ use x509_cert::Certificate;
 use x509_cert::der::{Decode as _, Encode as _};
 
 use sush_common::certs::{CertError, KeyId, Signature};
-use sush_common::jobs::{JobId, JobStartRequest, JobStatus, JobsReserved, SignedJob, VerifiedJob};
+use sush_common::jobs::{
+    JobId, JobLimits, JobStartRequest, JobStatus, JobsReserved, SignedJob, VerifiedJob,
+};
 
 use crate::blob::{
     BlobError, blob_limit, file_len, get_blob, read_blob_chunk, read_blob_from_file,
@@ -99,27 +100,33 @@ pub struct JobStart {
 }
 
 impl JobStart {
-    /// Execute commands via a shell to allow pipelines, redirects, etc.
     pub fn new(job: SignedJob) -> Result<Self, JobError> {
+        Self::new_with_limits(job, JobLimits::default())
+    }
+
+    pub fn new_with_limits(job: SignedJob, limits: JobLimits) -> Result<Self, JobError> {
         if job.command().starts_with('-') {
             return Err(JobError::InvalidCommand(job.command().to_owned()));
         }
         let stdout = tempfile()?;
         let stderr = tempfile()?;
         let time_started = Utc::now();
-        let child = Command::new("bash")
+        let mut command = Command::new("bash");
+        command
             .arg("-c")
             .arg(job.command())
             .env("SUSH_JOB_ID", job.job_id.to_string())
             .stdin(Stdio::null())
             .stdout(stdout.try_clone()?)
             .stderr(stderr.try_clone()?)
-            .kill_on_drop(true)
-            .spawn()?;
+            .kill_on_drop(true);
+        unsafe {
+            command.pre_exec(move || limits.apply());
+        }
         Ok(Self {
             job,
             time_started,
-            child,
+            child: command.spawn()?,
             stdout,
             stderr,
         })
@@ -411,10 +418,11 @@ impl JobManager {
     pub async fn job_start(
         &self,
         job: SignedJob,
+        limits: JobLimits,
     ) -> Result<oneshot::Receiver<Result<JobStatus, JobError>>, JobError> {
         let (tx, rx) = oneshot::channel();
         self.request(JobRequest::Start {
-            request: Box::new(JobStart::new(job)?),
+            request: Box::new(JobStart::new_with_limits(job, limits)?),
             response: tx,
         })
         .await?;
@@ -778,11 +786,10 @@ fn job_ended(
     let limit = blob_limit(db)?;
     let stdout_len = file_len(&stdout, limit)?;
     let stderr_len = file_len(&stderr, limit)?;
-    let blob_limit = db.limit(Limit::SQLITE_LIMIT_LENGTH)?;
-    if stdout_len > blob_limit || stderr_len > blob_limit {
-        dbg!((stdout_len, stderr_len, blob_limit));
+    if stdout_len > limit || stderr_len > limit {
         return Err(BlobError::FileTooLarge);
     }
+
     let txn = db.transaction()?;
     txn.execute(
         "UPDATE jobs SET status = ?2, stdout = ?3, stderr = ?4, time_ended = ?5 \
@@ -826,6 +833,7 @@ mod test {
     use std::time::Duration;
 
     use rand_core::{OsRng, RngCore as _};
+    use rusqlite::limits::Limit;
     use tempfile::NamedTempFile;
     use x509_cert::name::Name;
     use x509_cert::time::Validity;
@@ -985,12 +993,16 @@ mod test {
         assert_eq!(stderr_len, expected_stderr_len);
     }
 
+    const TEST_LIMIT_LENGTH: i32 = 1000;
+
     async fn manager_and_test_root(db: Option<&str>) -> (JobManager, EphemeralKey) {
         let db = if let Some(db) = db {
             open_database(db).unwrap()
         } else {
             open_database_in_memory().unwrap()
         };
+        db.set_limit(Limit::SQLITE_LIMIT_LENGTH, TEST_LIMIT_LENGTH)
+            .unwrap();
         let mgr = JobManager::new(db).await.unwrap();
         let root = ephemeral_test_root();
         let key_id = mgr.import_cert(root.cert(), true).await.unwrap();
@@ -1021,11 +1033,14 @@ mod test {
             if id == job_id && time_reserved < Utc::now(),
         ));
 
-        let rx = mgr.job_start(job.clone()).await.unwrap();
+        let rx = mgr
+            .job_start(job.clone(), JobLimits::default())
+            .await
+            .unwrap();
         let status = rx.await.unwrap().unwrap();
         check_status_ended(status, root.cert(), job_id, "true", Some(0), 0, 0);
 
-        let rx = mgr.job_start(job).await.unwrap();
+        let rx = mgr.job_start(job, JobLimits::default()).await.unwrap();
         assert!(
             matches!(
                 rx.await.unwrap().unwrap_err(),
@@ -1036,7 +1051,7 @@ mod test {
 
         let job_id = job_ids.pop().unwrap();
         let job = root.sign_job_request(job_id, "false").await;
-        let rx = mgr.job_start(job).await.unwrap();
+        let rx = mgr.job_start(job, JobLimits::default()).await.unwrap();
         let status = rx.await.unwrap().unwrap();
         check_status_ended(status, root.cert(), job_id, "false", Some(1), 0, 0);
 
@@ -1044,7 +1059,7 @@ mod test {
         let job_id_string = job_id.to_string();
         let job_id_bytes = job_id_string.as_bytes();
         let job = root.sign_job_request(job_id, "echo -n $SUSH_JOB_ID").await;
-        let rx = mgr.job_start(job).await.unwrap();
+        let rx = mgr.job_start(job, JobLimits::default()).await.unwrap();
         let status = rx.await.unwrap().unwrap();
         check_status_ended(
             status,
@@ -1070,7 +1085,7 @@ mod test {
         assert!(mgr.revoke_reserved(job_ids).await.unwrap().is_empty());
 
         let job = root.sign_job_request(job_id, "false").await;
-        let rx = mgr.job_start(job).await.unwrap();
+        let rx = mgr.job_start(job, JobLimits::default()).await.unwrap();
         assert!(
             matches!(
                 rx.await.unwrap().unwrap_err(),
@@ -1105,22 +1120,21 @@ mod test {
     #[tokio::test]
     async fn abort() {
         let (mgr, root) = manager_and_test_root(None).await;
-        let (job_id, time_reserved) = mgr.reserve_one().await.unwrap();
+        let (job_id, _time_reserved) = mgr.reserve_one().await.unwrap();
 
-        let mark = Utc::now();
-        assert!(time_reserved < mark);
-        let job = root.sign_job_request(job_id, "yes").await;
-        let rx = mgr.job_start(job).await.unwrap();
+        let command = "sleep 10";
+        let job = root.sign_job_request(job_id, command).await;
+        let rx = mgr.job_start(job, JobLimits::default()).await.unwrap();
 
         let status = mgr.job_status(job_id).await.unwrap();
-        check_status_started(status, root.cert(), job_id, "yes");
+        check_status_started(status, root.cert(), job_id, command);
 
         mgr.job_abort(job_id).await.unwrap();
         assert!(rx.await.is_err());
-        assert!((Utc::now() - mark).as_seconds_f32() < 1.0);
 
         let status = mgr.job_status(job_id).await.unwrap();
-        check_status_ended(status, root.cert(), job_id, "yes", None, 0, 0);
+        assert!(status.time_elapsed().unwrap().to_std().unwrap() < Duration::from_secs(1));
+        check_status_ended(status, root.cert(), job_id, command, None, 0, 0);
     }
 
     #[tokio::test]
@@ -1172,31 +1186,85 @@ mod test {
 
         let (job_id, _time_reserved) = mgr.reserve_one().await.unwrap();
         let job = child.sign_job_request(job_id, "true").await;
-        let rx = mgr.job_start(job).await.unwrap();
+        let rx = mgr.job_start(job, JobLimits::default()).await.unwrap();
         let status = rx.await.unwrap().unwrap();
         check_status_ended(status, child.cert(), job_id, "true", Some(0), 0, 0);
     }
 
-    #[ignore = "takes a few seconds"]
+    #[tokio::test]
+    async fn too_much_cpu() {
+        let (mgr, root) = manager_and_test_root(None).await;
+        let (job_id, _time_reserved) = mgr.reserve_one().await.unwrap();
+        let command = "openssl speed sha1";
+        let job = root.sign_job_request(job_id, command).await;
+        let rx = mgr
+            .job_start(
+                job,
+                JobLimits {
+                    max_cpu: 1,
+                    max_fsize: 100,
+                    ..JobLimits::default()
+                },
+            )
+            .await
+            .unwrap();
+        let status = rx.await.unwrap().unwrap();
+        assert!(status.time_elapsed().unwrap().to_std().unwrap() < Duration::from_secs(2));
+
+        // The output of `openssl speed` changed between v3.0 and v3.5.
+        let stderr = mgr.job_stderr(job_id, None).await.unwrap();
+        let stderr = String::from_utf8_lossy(&stderr);
+        match status {
+            JobStatus::Ended { stderr_len: 37, .. } => {
+                check_status_ended(status, root.cert(), job_id, command, None, 0, 37);
+                assert_eq!(stderr, "Doing sha1 for 3s on 16 size blocks: ");
+            }
+            JobStatus::Ended { stderr_len: 41, .. } => {
+                check_status_ended(status, root.cert(), job_id, command, None, 0, 41);
+                assert_eq!(stderr, "Doing sha1 ops for 3s on 16 size blocks: ");
+            }
+            _ => todo!("what does `{command}` produce on your system?"),
+        }
+    }
+
     #[tokio::test]
     async fn too_much_output() {
         let (mgr, root) = manager_and_test_root(None).await;
         let JobsReserved {
             mut job_ids,
             time_reserved: _,
-        } = mgr.reserve_jobs(2).await.unwrap();
+        } = mgr.reserve_jobs(3).await.unwrap();
 
         let job_id = job_ids.pop().unwrap();
-        let command = "dd if=/dev/zero bs=1000 count=999999 2>/dev/null";
+        let n: i32 = 100;
+        let command = &format!("head -c {n} /dev/zero");
         let job = root.sign_job_request(job_id, command).await;
-        let rx = mgr.job_start(job).await.unwrap();
+        let rx = mgr
+            .job_start(
+                job,
+                JobLimits {
+                    max_fsize: n as u64 - 1,
+                    ..JobLimits::default()
+                },
+            )
+            .await
+            .unwrap();
         let status = rx.await.unwrap().unwrap();
-        check_status_ended(status, root.cert(), job_id, command, Some(0), 999999000, 0);
+        check_status_ended(status, root.cert(), job_id, command, None, n - 1, 0);
 
         let job_id = job_ids.pop().unwrap();
-        let command = "dd if=/dev/zero bs=1000 count=1000000 2>/dev/null";
+        let n = TEST_LIMIT_LENGTH - 1;
+        let command = &format!("head -c {n} /dev/zero");
         let job = root.sign_job_request(job_id, command).await;
-        let rx = mgr.job_start(job).await.unwrap();
+        let rx = mgr.job_start(job, JobLimits::default()).await.unwrap();
+        let status = rx.await.unwrap().unwrap();
+        check_status_ended(status, root.cert(), job_id, command, Some(0), n, 0);
+
+        let job_id = job_ids.pop().unwrap();
+        let n = TEST_LIMIT_LENGTH;
+        let command = &format!("head -c {n} /dev/zero");
+        let job = root.sign_job_request(job_id, command).await;
+        let rx = mgr.job_start(job, JobLimits::default()).await.unwrap();
         assert!(
             matches!(
                 rx.await.unwrap().unwrap_err(),
