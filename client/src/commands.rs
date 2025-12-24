@@ -520,7 +520,7 @@ pub enum CommandError {
     MissingKeyName,
     #[error("❌ Command not supported in offline mode, try `--url`")]
     Offline,
-    #[error("❌ `permslip` error: {0}")]
+    #[error("❌ permslip error: {0}")]
     Permslip(#[from] PermslipError),
     #[error("👋 Goodbye!")]
     Quit,

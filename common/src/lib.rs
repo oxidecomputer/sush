@@ -1,5 +1,3 @@
-#[macro_use]
-mod macros;
 pub mod certs;
 pub mod codephrases;
 pub mod jobs;

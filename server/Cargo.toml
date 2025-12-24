@@ -10,7 +10,6 @@ name = "sush-server"
 path = "src/main.rs"
 
 [dependencies]
-base64.workspace = true
 chrono.workspace = true
 clap.workspace = true
 dropshot.workspace = true
@@ -20,6 +19,7 @@ rand_core.workspace = true
 rusqlite.workspace = true
 schemars.workspace = true
 serde.workspace = true
+serde_json.workspace = true
 sha2.workspace = true
 sush-common = { path = "../common" }
 tempfile.workspace = true

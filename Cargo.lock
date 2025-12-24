@@ -3160,8 +3160,10 @@ dependencies = [
  "bytesize",
  "chrono",
  "clap",
+ "ed25519-dalek",
  "humantime",
  "libc",
+ "p256",
  "pem-rfc7468",
  "permission-slip-client",
  "permission-slip-common",
@@ -3182,7 +3184,6 @@ dependencies = [
 name = "sush-common"
 version = "0.1.0"
 dependencies = [
- "base64 0.22.1",
  "bytesize",
  "chrono",
  "crypto-bigint",
@@ -3196,6 +3197,7 @@ dependencies = [
  "rusqlite",
  "schemars",
  "serde",
+ "serde_json",
  "sha2",
  "tempfile",
  "thiserror 1.0.69",
@@ -3206,7 +3208,6 @@ dependencies = [
 name = "sush-server"
 version = "0.1.0"
 dependencies = [
- "base64 0.22.1",
  "chrono",
  "clap",
  "dropshot",
@@ -3216,6 +3217,7 @@ dependencies = [
  "rusqlite",
  "schemars",
  "serde",
+ "serde_json",
  "sha2",
  "sush-common",
  "tempfile",

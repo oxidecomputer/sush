@@ -62,6 +62,8 @@ pub enum JobError {
     InvalidJobId(JobId),
     #[error(transparent)]
     Io(#[from] std::io::Error),
+    #[error(transparent)]
+    Json(#[from] serde_json::Error),
     #[error("Can't find certificate for key `{0}`")]
     MissingCert(KeyId),
     #[error("Can't receive response: sender dropped")]
@@ -560,15 +562,17 @@ fn get_cert_chain(db: &Connection, mut key_id: KeyId) -> Result<Vec<Certificate>
 fn import_cert(db: &Connection, cert: &Certificate, root: bool) -> Result<KeyId, JobError> {
     let subject = &cert.tbs_certificate.subject;
     let issuer = &cert.tbs_certificate.issuer;
-    let signature = Signature::new(cert.signature.raw_bytes().to_vec());
+    let spki = &cert.tbs_certificate.subject_public_key_info;
+    let signature = Signature::try_from(cert)?;
     if subject == issuer {
         if !root {
             return Err(JobError::Cert(CertError::SelfSigned));
         }
-        signature.verify(&cert.tbs_certificate.to_der()?, cert)?;
+        signature.verify(&cert.tbs_certificate.to_der()?, spki)?;
     } else {
         let issuer_cert = get_cert(db, &KeyId::try_from(issuer)?)?;
-        signature.verify(&cert.tbs_certificate.to_der()?, &issuer_cert)?;
+        let issuer_pki = &issuer_cert.tbs_certificate.subject_public_key_info;
+        signature.verify(&cert.tbs_certificate.to_der()?, issuer_pki)?;
     }
 
     let key_id = KeyId::try_from(subject)?;
@@ -872,7 +876,7 @@ mod test {
 
     fn ephemeral_test_root() -> EphemeralKey {
         EphemeralKey::new_root(
-            KeyType::Ed25519,
+            KeyType::P256,
             ephemeral_test_subject(),
             Validity::from_now(Duration::from_secs(60)).unwrap(),
         )
@@ -1150,12 +1154,12 @@ mod test {
     async fn cert_chain() {
         let validity = Validity::from_now(Duration::from_secs(60)).unwrap();
         let root =
-            EphemeralKey::new_root(KeyType::Ed25519, ephemeral_test_subject(), validity).unwrap();
+            EphemeralKey::new_root(KeyType::P256, ephemeral_test_subject(), validity).unwrap();
         let root_key_id = root.key_id().await.unwrap();
         let root_cert = root.cert().to_owned();
         let issuer = root.subject();
         let subject = ephemeral_test_subject();
-        let child = EphemeralKey::new_child(KeyType::P256, subject, issuer, validity, &root)
+        let child = EphemeralKey::new_child(KeyType::Ed25519, subject, issuer, validity, &root)
             .await
             .unwrap();
         assert_ne!(child.key_id().await.unwrap(), root_key_id);

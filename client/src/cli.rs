@@ -64,7 +64,7 @@ impl CommandContext for Cli {
             return Err(CommandError::InvalidRootCert);
         }
         let tbs = root.tbs_certificate.to_der()?;
-        Signature::new(root.signature.raw_bytes().to_vec()).verify(&tbs, root)?;
+        Signature::try_from(root)?.verify(&tbs, &root.tbs_certificate.subject_public_key_info)?;
         if matches!(self.get_output_format(), OutputFormat::Text) {
             println!(
                 "✅ Verified root certificate for subject `{}`",
@@ -75,7 +75,8 @@ impl CommandContext for Cli {
         let mut prev = root;
         for cert in rest {
             let tbs = cert.tbs_certificate.to_der()?;
-            Signature::new(cert.signature.raw_bytes().to_vec()).verify(&tbs, prev)?;
+            Signature::try_from(cert)?
+                .verify(&tbs, &prev.tbs_certificate.subject_public_key_info)?;
             prev = cert;
             if matches!(self.get_output_format(), OutputFormat::Text) {
                 println!(

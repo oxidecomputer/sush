@@ -1,5 +1,7 @@
 //! Use Permission Slip to sign Support Shell job requests.
 
+use ed25519_dalek::Signature as Ed25519Signature;
+use p256::ecdsa;
 use permission_slip_common::params::{BlobStampParams, SignParams, StampParams};
 use permission_slip_common::{ArtifactKind, HashAlgorithm};
 use permslip_client_lib::login::{IdentityProvider, TokenProvider};
@@ -9,6 +11,8 @@ use serde_json::{json, to_string as json_to_string};
 use thiserror::Error;
 use x509_cert::Certificate;
 use x509_cert::der::Decode as _;
+use x509_cert::der::oid::db::rfc5912::ECDSA_WITH_SHA_256;
+use x509_cert::der::oid::db::rfc8410::ID_ED_25519;
 use x509_cert::der::pem::{PemLabel as _, decode_vec as decode_pem};
 use x509_cert::spki::AlgorithmIdentifierOwned;
 
@@ -64,13 +68,17 @@ impl Signer for PermslipSigner {
         Ok(KeyId::try_from(&self.cert)?)
     }
 
-    async fn signature_algorithm(&self) -> Result<AlgorithmIdentifierOwned, Self::Error> {
+    async fn algorithm_id(&self) -> Result<AlgorithmIdentifierOwned, Self::Error> {
         Ok(self
             .cert
             .tbs_certificate
             .subject_public_key_info
             .algorithm
             .clone())
+    }
+
+    async fn signature_algorithm(&self) -> Result<AlgorithmIdentifierOwned, Self::Error> {
+        Ok(self.cert.signature_algorithm.clone())
     }
 
     async fn sign<T: ToBeSigned>(&self, thing: T) -> Result<Signed<T>, Self::Error> {
@@ -87,6 +95,7 @@ impl Signer for PermslipSigner {
                 version_prev: None,
             },
         });
+        let algorithm = self.signature_algorithm().await?;
         let signature = self
             .client
             .sign()
@@ -95,7 +104,21 @@ impl Signer for PermslipSigner {
             .send()
             .await?
             .into_inner();
-        Ok(Signed::new(thing, key_id, Signature::new(signature)))
+        Ok(Signed::new(
+            thing,
+            key_id,
+            match algorithm {
+                AlgorithmIdentifierOwned {
+                    oid: ID_ED_25519,
+                    parameters: None,
+                } => Signature::Ed25519(Ed25519Signature::from_slice(&signature)?).encode(),
+                AlgorithmIdentifierOwned {
+                    oid: ECDSA_WITH_SHA_256,
+                    parameters: None,
+                } => Signature::EcdsaSha256(ecdsa::Signature::from_der(&signature)?).encode(),
+                _ => return Err(Self::Error::InvalidSignature),
+            },
+        ))
     }
 }
 
@@ -107,8 +130,12 @@ pub enum PermslipError {
     Client(String),
     #[error(transparent)]
     Der(#[from] x509_cert::der::Error),
+    #[error("Ed25519 error: {0}")]
+    Ed25519(#[from] ed25519_dalek::ed25519::Error),
     #[error("invalid PEM certificate")]
     InvalidPem,
+    #[error("invalid signature")]
+    InvalidSignature,
     #[error(transparent)]
     Json(#[from] serde_json::Error),
     #[error(transparent)]

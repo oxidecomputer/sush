@@ -460,7 +460,7 @@
             "$ref": "#/components/schemas/KeyId"
           },
           "signature": {
-            "$ref": "#/components/schemas/Signature"
+            "$ref": "#/components/schemas/EncodedSignature"
           }
         },
         "required": [
@@ -488,9 +488,21 @@
       "JobId": {
         "type": "string"
       },
-      "Signature": {
-        "description": "Base64 encoded signature.",
-        "type": "string"
+      "EncodedSignature": {
+        "description": "Code phrase encoded signature.",
+        "type": "object",
+        "properties": {
+          "r": {
+            "type": "string"
+          },
+          "s": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "r",
+          "s"
+        ]
       },
       "JobStatus": {
         "oneOf": [
