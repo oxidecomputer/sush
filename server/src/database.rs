@@ -1,6 +1,6 @@
 //! Simple SQLite schema migrations.
 //!
-//! Migrations must be idempotent.
+//! Migrations need not be idempotent.
 
 use std::ops::Range;
 use std::path::Path;
@@ -16,6 +16,7 @@ pub const SCHEMA: &[&str] = &[
     include_str!("../schema/0_migrations.sql"),
     include_str!("../schema/1_certs.sql"),
     include_str!("../schema/2_jobs.sql"),
+    include_str!("../schema/3_hashes.sql"),
     // Add new migrations here.
 ];
 
@@ -115,10 +116,8 @@ mod test {
         let txn = db.transaction().unwrap();
         assert!(schema_version(&txn).is_none());
         for v in 0..SCHEMA_VERSION {
-            for _ in 0..=1 {
-                apply_migration(&txn, v).unwrap();
-                assert_eq!(schema_version(&txn), Some(v));
-            }
+            apply_migration(&txn, v).unwrap();
+            assert_eq!(schema_version(&txn), Some(v));
         }
     }
 }

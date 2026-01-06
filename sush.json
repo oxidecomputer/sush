@@ -119,6 +119,48 @@
         }
       }
     },
+    "/jobs/{job_id}/output/{stream}": {
+      "get": {
+        "summary": "Get (a subset of) the standard output or standard error of a job.",
+        "operationId": "job_output",
+        "parameters": [
+          {
+            "in": "header",
+            "name": "range",
+            "description": "A request to access a portion of the resource, such as `bytes=0-499`\n\nSee: <https://developer.mozilla.org/en-US/docs/Web/HTTP/Reference/Headers/Range>",
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "in": "path",
+            "name": "job_id",
+            "required": true,
+            "schema": {
+              "$ref": "#/components/schemas/JobId"
+            }
+          },
+          {
+            "in": "path",
+            "name": "stream",
+            "required": true,
+            "schema": {
+              "$ref": "#/components/schemas/JobOutputStream"
+            }
+          }
+        ],
+        "responses": {
+          "default": {
+            "description": "",
+            "content": {
+              "*/*": {
+                "schema": {}
+              }
+            }
+          }
+        }
+      }
+    },
     "/jobs/{job_id}/start": {
       "post": {
         "operationId": "job_start",
@@ -225,86 +267,6 @@
               "application/json": {
                 "schema": {
                   "$ref": "#/components/schemas/JobStatus"
-                }
-              }
-            }
-          },
-          "4XX": {
-            "$ref": "#/components/responses/Error"
-          },
-          "5XX": {
-            "$ref": "#/components/responses/Error"
-          }
-        }
-      }
-    },
-    "/jobs/{job_id}/stderr": {
-      "get": {
-        "summary": "Get the standard output of a job.",
-        "operationId": "job_stderr",
-        "parameters": [
-          {
-            "in": "path",
-            "name": "job_id",
-            "required": true,
-            "schema": {
-              "$ref": "#/components/schemas/JobId"
-            }
-          }
-        ],
-        "responses": {
-          "200": {
-            "description": "successful operation",
-            "content": {
-              "application/json": {
-                "schema": {
-                  "title": "Array_of_uint8",
-                  "type": "array",
-                  "items": {
-                    "type": "integer",
-                    "format": "uint8",
-                    "minimum": 0
-                  }
-                }
-              }
-            }
-          },
-          "4XX": {
-            "$ref": "#/components/responses/Error"
-          },
-          "5XX": {
-            "$ref": "#/components/responses/Error"
-          }
-        }
-      }
-    },
-    "/jobs/{job_id}/stdout": {
-      "get": {
-        "summary": "Get the standard output of a job.",
-        "operationId": "job_stdout",
-        "parameters": [
-          {
-            "in": "path",
-            "name": "job_id",
-            "required": true,
-            "schema": {
-              "$ref": "#/components/schemas/JobId"
-            }
-          }
-        ],
-        "responses": {
-          "200": {
-            "description": "successful operation",
-            "content": {
-              "application/json": {
-                "schema": {
-                  "title": "Array_of_uint8",
-                  "type": "array",
-                  "items": {
-                    "type": "integer",
-                    "format": "uint8",
-                    "minimum": 0
-                  }
                 }
               }
             }
@@ -595,16 +557,26 @@
                   },
                   "stdout_len": {
                     "type": "integer",
-                    "format": "int32"
+                    "format": "uint64",
+                    "minimum": 0
                   },
                   "stderr_len": {
                     "type": "integer",
-                    "format": "int32"
+                    "format": "uint64",
+                    "minimum": 0
+                  },
+                  "stdout_hash": {
+                    "$ref": "#/components/schemas/JobOutputHash"
+                  },
+                  "stderr_hash": {
+                    "$ref": "#/components/schemas/JobOutputHash"
                   }
                 },
                 "required": [
                   "job",
+                  "stderr_hash",
                   "stderr_len",
+                  "stdout_hash",
                   "stdout_len",
                   "time_ended",
                   "time_reserved",
@@ -618,6 +590,11 @@
             "additionalProperties": false
           }
         ]
+      },
+      "JobOutputHash": {
+        "description": "BLAKE3 hash of job output, used as a checksum.",
+        "type": "string",
+        "format": "hex encoded hash (32 bytes)"
       },
       "JobsReserved": {
         "description": "The response to a job reservation request.",
@@ -639,6 +616,14 @@
         "required": [
           "job_ids",
           "time_reserved"
+        ]
+      },
+      "JobOutputStream": {
+        "description": "Either the standard output or standard error of a job.",
+        "type": "string",
+        "enum": [
+          "stdout",
+          "stderr"
         ]
       }
     },

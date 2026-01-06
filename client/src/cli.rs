@@ -7,23 +7,28 @@ use std::path::Path;
 use bytesize::ByteSize;
 use chrono::{DateTime, Utc};
 use humantime::format_duration;
+use indicatif::{ProgressBar, ProgressStyle};
 use serde_json::json;
 use x509_cert::Certificate;
 use x509_cert::der::Encode as _;
 
 use sush_common::certs::{KeyId, Signature};
-use sush_common::jobs::{JobId, JobStatus, JobsReserved, SignedJob};
+use sush_common::jobs::{JobId, JobOutputStream, JobStatus, JobsReserved, SignedJob};
 
 use crate::commands::{CommandContext, CommandError, GlobalArgs, OutputFormat};
 
 #[derive(Clone, Debug, Default)]
 pub struct Cli {
     output: OutputFormat,
+    progress: Option<ProgressBar>,
 }
 
 impl Cli {
     pub fn new(output: OutputFormat) -> Self {
-        Self { output }
+        Self {
+            output,
+            progress: None,
+        }
     }
 }
 
@@ -170,19 +175,27 @@ impl CommandContext for Cli {
         Ok(())
     }
 
-    fn job_stdout(
+    fn job_output(
         &mut self,
         _job_id: &JobId,
+        stream: JobOutputStream,
         output: &[u8],
         binary: bool,
     ) -> Result<(), CommandError> {
         match self.get_output_format() {
             OutputFormat::Json if binary => println!("{}", json!(output)),
             OutputFormat::Json => println!("{}", json!(String::from_utf8(output.to_vec())?)),
-            OutputFormat::Text if binary => stdout().write(output).map(|_| ())?,
+            OutputFormat::Text if binary => {
+                stdout()
+                    .write(output)
+                    .map_err(|error| CommandError::io("stdout", error))?;
+            }
             OutputFormat::Text if output.is_empty() => (),
             OutputFormat::Text => {
-                println!("✅ Job stdout:");
+                match stream {
+                    JobOutputStream::Stdout => println!("✅ Job stdout:"),
+                    JobOutputStream::Stderr => println!("❌ Job stderr:"),
+                };
                 let output = String::from_utf8(output.to_vec())?;
                 if output.ends_with('\n') {
                     print!("{output}");
@@ -194,26 +207,61 @@ impl CommandContext for Cli {
         Ok(())
     }
 
-    fn job_stderr(
+    fn job_output_started(
         &mut self,
-        _job_id: &JobId,
-        errors: &[u8],
-        binary: bool,
+        _id: &JobId,
+        stream: JobOutputStream,
+        stage: &str,
+        total_length: u64,
     ) -> Result<(), CommandError> {
-        match self.get_output_format() {
-            OutputFormat::Json if binary => println!("{}", json!(errors)),
-            OutputFormat::Json => println!("{}", json!(String::from_utf8(errors.to_vec())?)),
-            OutputFormat::Text if binary => stdout().write(errors).map(|_| ())?,
-            OutputFormat::Text if errors.is_empty() => (),
-            OutputFormat::Text => {
-                println!("❌ Job stderr:");
-                let errors = String::from_utf8(errors.to_vec())?;
-                if errors.ends_with('\n') {
-                    print!("{errors}");
-                } else {
-                    println!("{errors}");
-                }
-            }
+        if self.progress.is_none() {
+            let bar = ProgressBar::new(total_length);
+            bar.set_prefix(format!("{stage} {stream}"));
+            bar.set_style(
+                ProgressStyle::with_template(
+                    "{prefix} \
+                     [{elapsed_precise}] \
+                     {bar:40.cyan/blue} \
+                     {decimal_bytes:>7}/{decimal_total_bytes:7} \
+                     {msg}",
+                )
+                .unwrap(),
+            );
+            self.progress = Some(bar);
+        }
+        Ok(())
+    }
+
+    fn job_output_update(
+        &mut self,
+        _id: &JobId,
+        _stream: JobOutputStream,
+        length: u64,
+    ) -> Result<(), CommandError> {
+        if let Some(progress) = &mut self.progress {
+            progress.inc(length);
+        }
+        Ok(())
+    }
+
+    fn job_output_finished(
+        &mut self,
+        job_id: &JobId,
+        stream: JobOutputStream,
+        stage: &str,
+    ) -> Result<(), CommandError> {
+        if let Some(progress) = self.progress.take() {
+            progress.finish_and_clear();
+            let length = ByteSize::b(progress.length().unwrap_or(0));
+            let elapsed = progress.elapsed();
+            println!(
+                "✅ {stage} {stream}:\t{} in {} ({:.0} MB/s)",
+                length.display().si(),
+                format_duration(progress.elapsed()),
+                length.as_mb() / elapsed.as_secs_f64(),
+            );
+        } else if let OutputFormat::Text = self.get_output_format() {
+            println!("✅ {stage} {stream} for {job_id}");
         }
         Ok(())
     }
@@ -249,36 +297,44 @@ impl CommandContext for Cli {
                     status: Some(exit_status),
                     stdout_len,
                     stderr_len,
+                    stdout_hash,
+                    stderr_hash,
                 } => println!(
                     "✅ Job ID:\t{job_id}\n   \
                      Reserved at:\t{time_reserved}\n   \
                      Started at:\t{time_started}\n   \
                      Ended at:\t{time_ended} ({})\n   \
                      Status:\t{exit_status}\n   \
-                     Stdout:\t{}\n   \
-                     Stderr:\t{}",
+                     Stdout len:\t{}\n   \
+                     Stderr len:\t{}\n   \
+                     Stdout hash:\t{stdout_hash}\n   \
+                     Stderr hash:\t{stderr_hash}",
                     format_duration(status.time_elapsed().unwrap().to_std()?),
-                    ByteSize::b(*stdout_len as u64).display().si(),
-                    ByteSize::b(*stderr_len as u64).display().si(),
+                    ByteSize::b(*stdout_len).display().si(),
+                    ByteSize::b(*stderr_len).display().si(),
                 ),
                 JobStatus::Ended {
+                    job: _,
                     time_reserved,
                     time_started,
                     time_ended,
                     status: None,
                     stdout_len,
                     stderr_len,
-                    ..
+                    stdout_hash,
+                    stderr_hash,
                 } => println!(
                     "✅ Job ID:\t{job_id}\n   \
                      Reserved at:\t{time_reserved}\n   \
                      Started at:\t{time_started}\n   \
                      Aborted at:\t{time_ended} ({})\n   \
-                     Stdout:\t{}\n   \
-                     Stderr:\t{}",
+                     Stdout len:\t{}\n   \
+                     Stderr len:\t{}\n   \
+                     Stdout hash:\t{stdout_hash}\n   \
+                     Stderr hash:\t{stderr_hash}",
                     format_duration(status.time_elapsed().unwrap().to_std()?),
-                    ByteSize::b(*stdout_len as u64).display().si(),
-                    ByteSize::b(*stderr_len as u64).display().si(),
+                    ByteSize::b(*stdout_len).display().si(),
+                    ByteSize::b(*stderr_len).display().si(),
                 ),
             },
         }

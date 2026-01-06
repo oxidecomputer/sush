@@ -1,26 +1,25 @@
 //! Manage a set of jobs.
 //!
-//! The manager runs as an agent loop with exclusive access to the sole
-//! database connection. It services requests and sends responses via
-//! oneshot channels (included in the requests). Jobs are spawned onto
-//! new tokio tasks, which the manager loop watches for completion.
-//!
-//! We store the standard output and error of all jobs as BLOBs in the
-//! database. Because SQLite does not support resizing BLOBs via its
-//! incremental I/O interface, we first collect them into anonymous
-//! temporary files, then slurp them into BLOBs.
+//! The manager runs as an agent loop with exclusive access to the
+//! database. It services requests and sends responses via oneshot
+//! channels (included in the requests). Jobs are spawned onto new
+//! tokio tasks, which the manager loop watches for completion.
+//! Standard output and standard error are saved as files.
 
 use std::collections::BTreeMap;
-use std::ffi::CStr;
-use std::fs::File;
-use std::io::Seek as _;
-use std::ops::Range;
+use std::fs::{DirBuilder, File};
+use std::io::{Read as _, Seek as _, SeekFrom};
+use std::path::{Path, PathBuf};
 use std::process::{ExitStatus, Stdio};
+use std::sync::Arc;
 
+use blake3::{Hasher, hash};
+use bytesize::MIB;
 use chrono::{DateTime, Utc};
 use dropshot::{ClientErrorStatusCode, HttpError};
-use rusqlite::{Connection, OptionalExtension as _, blob::ZeroBlob};
-use tempfile::tempfile;
+use http_range_header::{EndPosition, StartPosition, SyntacticallyCorrectRange as Range};
+use rusqlite::{Connection, OptionalExtension as _, prepare_cached_and_bind};
+use slog::{Logger, error, info};
 use thiserror::Error;
 use tokio::process::{Child, Command};
 use tokio::select;
@@ -31,12 +30,10 @@ use x509_cert::der::{Decode as _, Encode as _};
 
 use sush_common::certs::{CertError, KeyId, Signature};
 use sush_common::codephrases::generate_id;
+use sush_common::jobs::JobOutputStream::{self, Stderr, Stdout};
 use sush_common::jobs::{
-    JobId, JobLimits, JobStartRequest, JobStatus, JobsReserved, SignedJob, VerifiedJob,
-};
-
-use crate::blob::{
-    BlobError, blob_limit, file_len, get_blob, read_blob_chunk, read_blob_from_file,
+    JobId, JobLimits, JobOutputHash, JobStartRequest, JobStatus, JobsReserved, SignedJob,
+    VerifiedJob,
 };
 
 /// Self-signed (root) X.509 certificates. Self-signed certificates may
@@ -46,32 +43,43 @@ pub const ROOT_CERTS: &[&[u8]] = &[
     include_bytes!("../certs/untrusted.crt"),
 ];
 
+/// Output files or ranges larger than this will not be served all at once.
+const OUTPUT_THRESHOLD: u64 = 128 * MIB;
+
 #[derive(Debug, Error)]
 pub enum JobError {
-    #[error(transparent)]
-    Blob(#[from] BlobError),
     #[error(transparent)]
     Cert(#[from] CertError),
     #[error("Can't send job request: receiver dropped")]
     ChannelClosed,
     #[error("DER encoding error: {0}")]
     Der(#[from] x509_cert::der::Error),
+    #[error(transparent)]
+    Execution(#[from] ExecutionError),
     #[error("Invalid command `{0}`")]
     InvalidCommand(String),
     #[error("Invalid or duplicate job ID")]
     InvalidJobId(JobId),
+    #[error("Invalid range, please use absolute byte positions < {0}")]
+    InvalidRange(u64),
     #[error(transparent)]
     Io(#[from] std::io::Error),
     #[error(transparent)]
     Json(#[from] serde_json::Error),
     #[error("Can't find certificate for key `{0}`")]
     MissingCert(KeyId),
+    #[error("Job output hash mismatch, file may be corrupt")]
+    OutputHashMismatch(JobId, JobOutputHash),
+    #[error("Output not yet available")]
+    OutputPending,
+    #[error("Output too big, please use range requests")]
+    OutputTooBig,
     #[error("Can't receive response: sender dropped")]
     Recv(#[from] oneshot::error::RecvError),
     #[error(transparent)]
+    Slice(#[from] std::array::TryFromSliceError),
+    #[error(transparent)]
     Sqlite(#[from] rusqlite::Error),
-    #[error("Unable to start job")]
-    Start,
     #[error(transparent)]
     Task(#[from] JoinError),
     #[error("Unable to wait for job end")]
@@ -79,112 +87,143 @@ pub enum JobError {
 }
 
 impl From<JobError> for HttpError {
-    fn from(err: JobError) -> Self {
-        HttpError::for_client_error(None, ClientErrorStatusCode::BAD_REQUEST, err.to_string())
+    fn from(error: JobError) -> Self {
+        use JobError::*;
+        let message = error.to_string();
+        match error {
+            Cert(_)
+            | ChannelClosed
+            | Der(_)
+            | Execution(_)
+            | Io(_)
+            | OutputHashMismatch(_, _)
+            | Recv(_)
+            | Sqlite(_)
+            | Task(_)
+            | Slice(_)
+            | Wait => HttpError::for_internal_error(message),
+            InvalidRange(length) => {
+                let mut error = HttpError::for_client_error(
+                    None,
+                    ClientErrorStatusCode::RANGE_NOT_SATISFIABLE,
+                    message,
+                );
+                error
+                    .add_header("content-range", format!("bytes */{length}"))
+                    .expect("should be able to add content-range header");
+                error
+            }
+            OutputTooBig => {
+                HttpError::for_client_error(None, ClientErrorStatusCode::PAYLOAD_TOO_LARGE, message)
+            }
+            InvalidCommand(_) | InvalidJobId(_) | OutputPending | Json(_) | MissingCert(_) => {
+                HttpError::for_client_error(None, ClientErrorStatusCode::BAD_REQUEST, message)
+            }
+        }
     }
 }
 
-struct ExecutionError(JobId, DateTime<Utc>);
+#[derive(Clone, Debug, Error)]
+#[error("{error}")]
+pub struct ExecutionError {
+    job_id: JobId,
+    time: DateTime<Utc>,
+    error: Arc<JobError>,
+}
 
 impl ExecutionError {
-    fn new(job_id: JobId) -> Self {
-        Self(job_id, Utc::now())
+    fn new(job_id: JobId, error: JobError) -> Self {
+        let time = Utc::now();
+        Self {
+            job_id,
+            time,
+            error: Arc::new(error),
+        }
+    }
+
+    #[cfg(test)]
+    fn error(&self) -> &JobError {
+        &self.error
     }
 }
 
 #[derive(Debug)]
-pub struct JobStart {
-    pub job: SignedJob,
-    pub time_started: DateTime<Utc>,
-    pub child: Child,
-    pub stdout: File,
-    pub stderr: File,
+struct JobStart {
+    job: SignedJob,
+    limits: JobLimits,
+    output_dir: PathBuf,
 }
 
 impl JobStart {
-    pub fn new(job: SignedJob) -> Result<Self, JobError> {
-        Self::new_with_limits(job, JobLimits::default())
+    fn new(job: SignedJob, limits: JobLimits, output_dir: PathBuf) -> Self {
+        Self {
+            job,
+            limits,
+            output_dir,
+        }
     }
 
-    pub fn new_with_limits(job: SignedJob, limits: JobLimits) -> Result<Self, JobError> {
+    fn start(self) -> Result<JobStarted, JobError> {
+        let Self {
+            job,
+            limits,
+            output_dir,
+        } = self;
         if job.command().starts_with('-') {
             return Err(JobError::InvalidCommand(job.command().to_owned()));
         }
-        let stdout = tempfile()?;
-        let stderr = tempfile()?;
-        let time_started = Utc::now();
+        let job_id = &job.job_id;
+        let job_dir = job_output_dir(&output_dir, job_id);
+        DirBuilder::new().recursive(true).create(job_dir)?;
+        let stdout_path = job_output_path(&output_dir, job_id, Stdout);
+        let stderr_path = job_output_path(&output_dir, job_id, Stderr);
+        let stdout = File::create_new(stdout_path)?;
+        let stderr = File::create_new(stderr_path)?;
         let mut command = Command::new("bash");
         command
             .arg("-c")
             .arg(job.command())
-            .env("SUSH_JOB_ID", job.job_id.to_string())
+            .env("SUSH_JOB_ID", job_id.to_string())
             .stdin(Stdio::null())
-            .stdout(stdout.try_clone()?)
-            .stderr(stderr.try_clone()?)
+            .stdout(stdout)
+            .stderr(stderr)
             .kill_on_drop(true);
         unsafe {
             command.pre_exec(move || limits.apply());
         }
-        Ok(Self {
-            job,
-            time_started,
+        Ok(JobStarted {
+            time_started: Utc::now(),
             child: command.spawn()?,
-            stdout,
-            stderr,
         })
     }
 
-    pub fn job_id(&self) -> &JobId {
+    fn job_id(&self) -> &JobId {
         self.job.job_id()
-    }
-
-    pub async fn wait(mut self) -> Result<JobEnd, JobError> {
-        let status = self.child.wait().await?;
-        let time_ended = Utc::now();
-        let Self {
-            job,
-            time_started,
-            child: _,
-            mut stdout,
-            mut stderr,
-        } = self;
-        stdout.sync_all()?;
-        stderr.sync_all()?;
-        stdout.rewind()?;
-        stderr.rewind()?;
-        Ok(JobEnd {
-            job,
-            time_started,
-            time_ended,
-            status,
-            stdout,
-            stderr,
-        })
     }
 }
 
 #[derive(Debug)]
+struct JobStarted {
+    time_started: DateTime<Utc>,
+    child: Child,
+}
+
+#[derive(Clone, Debug)]
 pub struct JobEnd {
-    pub job: SignedJob,
-    pub time_started: DateTime<Utc>,
-    pub time_ended: DateTime<Utc>,
-    pub status: ExitStatus,
-    pub stdout: File,
-    pub stderr: File,
-}
-
-impl JobEnd {
-    pub fn job_id(&self) -> &JobId {
-        self.job.job_id()
-    }
+    job: VerifiedJob,
+    time_ended: DateTime<Utc>,
+    status: ExitStatus,
+    stdout_hash: JobOutputHash,
+    stderr_hash: JobOutputHash,
 }
 
 #[derive(Debug)]
-pub enum JobRequest {
+enum JobRequest {
     // Certificate requests.
     ImportCert {
         cert: Box<Certificate>,
         response: oneshot::Sender<Result<KeyId, JobError>>,
+
         /// **For tests only:** Override the usual refusal to import
         /// a self-signed (root) certficate via a request.
         #[cfg(test)]
@@ -211,20 +250,16 @@ pub enum JobRequest {
     // Job management requests.
     Start {
         request: Box<JobStart>,
-        response: oneshot::Sender<Result<JobStatus, JobError>>,
+        response: oneshot::Sender<Result<JobEnd, ExecutionError>>,
     },
     Status {
         job_id: JobId,
         response: oneshot::Sender<Result<JobStatus, JobError>>,
     },
-    Stdout {
+    Output {
         job_id: JobId,
-        range: Option<Range<i32>>,
-        response: oneshot::Sender<Result<Vec<u8>, JobError>>,
-    },
-    Stderr {
-        job_id: JobId,
-        range: Option<Range<i32>>,
+        stream: JobOutputStream,
+        range: Option<Range>,
         response: oneshot::Sender<Result<Vec<u8>, JobError>>,
     },
     Abort {
@@ -236,102 +271,54 @@ pub enum JobRequest {
 pub struct JobManager {
     channel: mpsc::Sender<JobRequest>,
     task: JoinHandle<Result<(), JobError>>,
+    output_dir: PathBuf,
 }
 
 impl JobManager {
     /// Spawn a task that processes job requests and monitors jobs for completion.
-    pub async fn new(mut db: Connection) -> Result<Self, JobError> {
+    pub async fn new(mut db: Connection, output_dir: &Path, log: Logger) -> Result<Self, JobError> {
         // Import the root certificates.
         for root in ROOT_CERTS {
             let cert = Certificate::from_der(root)?;
-            import_cert(&db, &cert, true)?;
+            let key_id = import_cert(&db, &cert, true)?;
+            info!(log, "imported root certificate"; "key_id" => %key_id);
         }
 
-        // Accept and process job requests.
-        let (tx, mut rx) = mpsc::channel::<JobRequest>(1);
-        let task = spawn(async move {
-            let mut tasks = JoinSet::<Result<JobEnd, ExecutionError>>::new();
-            let mut abort = BTreeMap::<JobId, AbortHandle>::new();
-            loop {
-                select! {
-                    Some(end) = tasks.join_next() => {
-                        // A job has finished.
-                        match end {
-                            Err(err) if err.is_cancelled() => (),
-                            Err(err) => panic!("Can't join job task: {err}"),
-                            Ok(Err(ExecutionError(job_id, time_ended))) => {
-                                assert!(abort.remove(&job_id).is_some());
-                                let _ = job_aborted(&db, job_id, time_ended);
-                            }
-                            Ok(Ok(end)) => {
-                                assert!(abort.remove(end.job_id()).is_some());
-                                let _ = job_ended(
-                                    &mut db,
-                                    end.job_id().to_owned(),
-                                    end.status.code(),
-                                    end.stdout,
-                                    end.stderr,
-                                    end.time_ended,
-                                );
-                            }
+        // Accept and process job requests and end events.
+        let (tx_requests, mut rx_requests) = mpsc::channel::<JobRequest>(8);
+        let task = spawn({
+            let output_dir = output_dir.to_owned();
+            async move {
+                let mut tasks = JoinSet::<Result<JobEnd, ExecutionError>>::new();
+                let mut abort = BTreeMap::<JobId, AbortHandle>::new();
+                loop {
+                    select! {
+                        Some(request) = rx_requests.recv() => {
+                            client_request(
+                                &mut db,
+                                &log,
+                                request,
+                                &mut tasks,
+                                &mut abort,
+                                &output_dir,
+                            )?
                         }
-                    }
-
-                    request = rx.recv() => {
-                        // Process the next request.
-                        match request {
-                            None => return Ok(()),
-                            Some(JobRequest::ImportCert {
-                                cert,
-                                #[cfg(test)]
-                                root,
-                                response,
-                            }) => {
-                                #[cfg(not(test))]
-                                let root = false;
-                                let _ = response.send(import_cert(&db, &cert, root));
-                            }
-                            Some(JobRequest::CertChain { key_id, response }) => {
-                                let _ = response.send(get_cert_chain(&db, key_id));
-                            }
-                            Some(JobRequest::Reserve { number, response }) => {
-                                let _ = response.send(reserve_jobs(&mut db, number));
-                            }
-                            Some(JobRequest::GetReserved { response }) => {
-                                let _ = response.send(get_reserved(&db));
-                            }
-                            Some(JobRequest::RevokeReserved { job_ids, response }) => {
-                                let _ = response.send(revoke_reserved(&mut db, &job_ids));
-                            }
-                            Some(JobRequest::Start{ request: start, response }) => {
-                                let job_id = start.job_id().to_owned();
-                                match start_job(&mut db, *start, response, &mut tasks) {
-                                    Ok(handle) => assert!(abort.insert(job_id, handle).is_none()),
-                                    Err(JobError::Start) => continue,
-                                    Err(err) => return Err(err),
-                                }
-                            }
-                            Some(JobRequest::Status { job_id, response }) => {
-                                let _ = response.send(job_status(&db, job_id));
-                            }
-                            Some(JobRequest::Stdout { job_id, range, response }) => {
-                                let _ = response.send(job_stdout(&db, job_id, range));
-                            }
-                            Some(JobRequest::Stderr { job_id, range, response }) => {
-                                let _ = response.send(job_stderr(&db, job_id, range));
-                            }
-                            Some(JobRequest::Abort { job_id }) => {
-                                if let Some(job) = abort.remove(&job_id) {
-                                    job.abort();
-                                    let _ = job_aborted(&db, job_id, Utc::now());
-                                }
-                            }
+                        Some(end) = tasks.join_next() => {
+                            job_ended(&db, &output_dir, &log, end, &mut abort)?
+                        }
+                        else => {
+                            info!(log, "job manager shutting down");
+                            return Ok(());
                         }
                     }
                 }
             }
         });
-        Ok(Self { channel: tx, task })
+        Ok(Self {
+            channel: tx_requests,
+            output_dir: output_dir.to_owned(),
+            task,
+        })
     }
 
     pub async fn wait(self) -> Result<(), JobError> {
@@ -421,10 +408,10 @@ impl JobManager {
         &self,
         job: SignedJob,
         limits: JobLimits,
-    ) -> Result<oneshot::Receiver<Result<JobStatus, JobError>>, JobError> {
+    ) -> Result<oneshot::Receiver<Result<JobEnd, ExecutionError>>, JobError> {
         let (tx, rx) = oneshot::channel();
         self.request(JobRequest::Start {
-            request: Box::new(JobStart::new_with_limits(job, limits)?),
+            request: Box::new(JobStart::new(job, limits, self.output_dir.to_owned())),
             response: tx,
         })
         .await?;
@@ -448,29 +435,16 @@ impl JobManager {
         .await
     }
 
-    pub async fn job_stdout(
+    pub async fn job_output(
         &self,
         job_id: &JobId,
-        range: Option<Range<i32>>,
+        stream: JobOutputStream,
+        range: Option<Range>,
     ) -> Result<Vec<u8>, JobError> {
         let (tx, rx) = oneshot::channel();
-        self.request(JobRequest::Stdout {
+        self.request(JobRequest::Output {
             job_id: job_id.to_owned(),
-            range,
-            response: tx,
-        })
-        .await?;
-        rx.await?
-    }
-
-    pub async fn job_stderr(
-        &self,
-        job_id: &JobId,
-        range: Option<Range<i32>>,
-    ) -> Result<Vec<u8>, JobError> {
-        let (tx, rx) = oneshot::channel();
-        self.request(JobRequest::Stderr {
-            job_id: job_id.to_owned(),
+            stream,
             range,
             response: tx,
         })
@@ -479,63 +453,225 @@ impl JobManager {
     }
 }
 
+fn job_output_dir(base_dir: &Path, job_id: &JobId) -> PathBuf {
+    base_dir.join("jobs").join(job_id.to_string())
+}
+
+fn job_output_path(base_dir: &Path, job_id: &JobId, stream: JobOutputStream) -> PathBuf {
+    job_output_dir(base_dir, job_id).join(stream.as_str())
+}
+
+fn job_output_len(base_dir: &Path, job_id: &JobId, stream: JobOutputStream) -> u64 {
+    job_output_path(base_dir, job_id, stream)
+        .metadata()
+        .map(|m| m.len())
+        .unwrap_or(0)
+}
+
+fn job_output_hash(
+    base_dir: &Path,
+    job_id: &JobId,
+    stream: JobOutputStream,
+) -> Result<JobOutputHash, JobError> {
+    let mut hasher = Hasher::new();
+    hasher.update_mmap_rayon(job_output_path(base_dir, job_id, stream))?;
+    Ok(hasher.finalize().into())
+}
+
+fn job_ended(
+    db: &Connection,
+    output_dir: &Path,
+    log: &Logger,
+    end: Result<Result<JobEnd, ExecutionError>, JoinError>,
+    abort: &mut BTreeMap<JobId, AbortHandle>,
+) -> Result<(), JobError> {
+    match end {
+        Err(error) if error.is_cancelled() => {
+            info!(log, "job aborted"; "error" => %error);
+        }
+        Err(error) => {
+            error!(log, "job failed"; "error" => %error);
+        }
+        Ok(Err(ExecutionError {
+            job_id,
+            time,
+            error,
+        })) => {
+            error!(log, "job execution failed"; "error" => %error, "job_id" => %job_id, "time" => %time);
+            assert!(abort.remove(&job_id).is_some());
+            job_aborted(db, output_dir, &job_id, time)?;
+        }
+        Ok(Ok(JobEnd {
+            job,
+            time_ended,
+            status,
+            stdout_hash,
+            stderr_hash,
+        })) => {
+            let job_id = job.job_id();
+            let status = status.code();
+            assert!(abort.remove(job_id).is_some());
+            prepare_cached_and_bind!(
+                db,
+                "UPDATE jobs \
+                 SET time_ended = $time_ended, \
+                     status = $status, \
+                     stdout_hash = $stdout_hash, \
+                     stderr_hash = $stderr_hash \
+                 WHERE job_id = $job_id AND \
+                       time_started IS NOT NULL AND \
+                       time_ended IS NULL"
+            )
+            .raw_execute()?;
+        }
+    }
+    Ok(())
+}
+
+fn job_aborted(
+    db: &Connection,
+    output_dir: &Path,
+    job_id: &JobId,
+    time_ended: DateTime<Utc>,
+) -> Result<(), JobError> {
+    let stdout_hash = job_output_hash(output_dir, &job_id, Stdout)?;
+    let stderr_hash = job_output_hash(output_dir, &job_id, Stderr)?;
+    prepare_cached_and_bind!(
+        db,
+        "UPDATE jobs \
+         SET time_ended = $time_ended, \
+             stdout_hash = $stdout_hash, \
+             stderr_hash = $stderr_hash \
+         WHERE job_id = $job_id AND \
+               time_started IS NOT NULL AND \
+               time_ended IS NULL"
+    )
+    .raw_execute()?;
+    Ok(())
+}
+
+fn client_request(
+    db: &mut Connection,
+    log: &Logger,
+    request: JobRequest,
+    tasks: &mut JoinSet<Result<JobEnd, ExecutionError>>,
+    abort: &mut BTreeMap<JobId, AbortHandle>,
+    output_dir: &Path,
+) -> Result<(), JobError> {
+    match request {
+        JobRequest::ImportCert {
+            cert,
+            #[cfg(test)]
+            root,
+            response,
+        } => {
+            #[cfg(not(test))]
+            let root = false;
+            let _ = response.send(import_cert(db, &cert, root));
+        }
+        JobRequest::CertChain { key_id, response } => {
+            let _ = response.send(get_cert_chain(db, key_id));
+        }
+        JobRequest::Reserve { number, response } => {
+            let _ = response.send(reserve_jobs(db, number));
+        }
+        JobRequest::GetReserved { response } => {
+            let _ = response.send(get_reserved(db));
+        }
+        JobRequest::RevokeReserved { job_ids, response } => {
+            let _ = response.send(revoke_reserved(db, &job_ids));
+        }
+        JobRequest::Start {
+            request: start,
+            response,
+        } => {
+            let job_id = start.job_id().to_owned();
+            match start_job(db, output_dir, *start, response, tasks) {
+                Ok(handle) => assert!(abort.insert(job_id, handle).is_none()),
+                Err(error) => {
+                    error!(log, "job execution error"; "error" => %error, "job_id" => %job_id);
+                }
+            }
+        }
+        JobRequest::Status { job_id, response } => {
+            let _ = response.send(get_job_status(db, output_dir, &job_id));
+        }
+        JobRequest::Output {
+            job_id,
+            stream,
+            range,
+            response,
+        } => {
+            let _ = response.send(get_job_output(db, output_dir, &job_id, stream, range));
+        }
+        JobRequest::Abort { job_id } => {
+            if let Some(task) = abort.remove(&job_id) {
+                task.abort();
+                if let Err(error) = job_aborted(db, output_dir, &job_id, Utc::now()) {
+                    error!(log, "can't record job as aborted"; "error" => %error, "job_id" => %job_id);
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
 fn start_job(
     db: &mut Connection,
+    output_dir: &Path,
     start: JobStart,
-    response: oneshot::Sender<Result<JobStatus, JobError>>,
+    response: oneshot::Sender<Result<JobEnd, ExecutionError>>,
     tasks: &mut JoinSet<Result<JobEnd, ExecutionError>>,
-) -> Result<AbortHandle, JobError> {
-    macro_rules! with_err_response {
+) -> Result<AbortHandle, ExecutionError> {
+    let job = start.job.clone();
+    let job_id = job.job_id().to_owned();
+    macro_rules! exe {
         ($expr:expr) => {
-            with_err_response!($expr, JobError::Start)
-        };
-        ($expr:expr, $err:expr) => {
             match $expr {
                 Ok(x) => x,
                 Err(e) => {
-                    let _ = response.send(Err(e.into()));
-                    return Err($err);
+                    let e = ExecutionError::new(job_id, e.into());
+                    let _ = response.send(Err(e.clone()));
+                    return Err(e);
                 }
             }
         };
     }
 
-    let limit = blob_limit(db)?;
-    let txn = db.transaction()?;
-    let job = start.job.clone();
-    let job_id = job.job_id().to_owned();
-    let time_reserved = with_err_response!(verify_reservation(&txn, &job_id));
-    let cert = with_err_response!(get_cert(&txn, job.key_id()));
-    let job = with_err_response!(job.verify(&cert));
-    with_err_response!(job_started(&txn, job, start.time_started));
-    txn.commit()?;
+    let txn = exe!(db.transaction());
+    let _time_reserved = exe!(verify_reservation(&txn, &job_id));
+    let cert = exe!(get_cert(&txn, job.key_id()));
+    let job = exe!(job.verify(&cert));
+    let mut started = exe!(start.start());
+    let time_started = started.time_started;
+    exe!(job_started(&txn, &job, time_started));
+    exe!(txn.commit());
 
+    let output_dir = output_dir.to_owned();
     Ok(tasks.spawn(async move {
-        let exe = || ExecutionError::new(job_id);
-        let end = with_err_response!(start.wait().await, exe());
-        let stdout_len = with_err_response!(file_len(&end.stdout, limit), exe());
-        let stderr_len = with_err_response!(file_len(&end.stderr, limit), exe());
-        let _ = response.send(Ok(JobStatus::Ended {
-            job: end.job.clone(),
-            time_reserved,
-            time_started: end.time_started,
-            time_ended: end.time_ended,
-            status: end.status.code(),
-            stdout_len,
-            stderr_len,
-        }));
+        let status = exe!(started.child.wait().await);
+        let stdout_hash = exe!(job_output_hash(&output_dir, &job_id, Stdout));
+        let stderr_hash = exe!(job_output_hash(&output_dir, &job_id, Stderr));
+        let time_ended = Utc::now();
+        let end = JobEnd {
+            job,
+            time_ended,
+            status,
+            stdout_hash,
+            stderr_hash,
+        };
+        let _ = response.send(Ok(end.clone()));
         Ok(end)
     }))
 }
 
 fn get_cert(db: &Connection, key_id: &KeyId) -> Result<Certificate, JobError> {
-    if let Some(cert) = db
-        .query_one(
-            "SELECT cert FROM certs WHERE key_id = ?1",
-            // `--SEARCH certs USING INDEX sqlite_autoindex_certs_1 (key_id=?)
-            [key_id],
-            |row| -> Result<Vec<u8>, _> { row.get(0) },
-        )
+    let mut stmt = db.prepare_cached(
+        "SELECT cert FROM certs WHERE key_id = ?1",
+        // `--SEARCH certs USING INDEX sqlite_autoindex_certs_1 (key_id=?)
+    )?;
+    if let Some(cert) = stmt
+        .query_one([key_id], |row| -> Result<Vec<u8>, _> { row.get(0) })
         .optional()?
     {
         Ok(Certificate::from_der(&cert)?)
@@ -588,16 +724,15 @@ fn reserve_jobs(db: &mut Connection, number: u8) -> Result<JobsReserved, JobErro
     let time_reserved = Utc::now();
     let txn = db.transaction()?;
     let mut job_ids = Vec::new();
-    let mut stmt = txn.prepare(
-        "INSERT INTO jobs(job_id, time_reserved, stdout, stderr) \
-         VALUES(?1, ?2, ?3, ?4)",
-    )?;
-    for _ in 0..number {
-        let job_id = JobId::from(&generate_id());
-        stmt.execute((&job_id, time_reserved, ZeroBlob(0), ZeroBlob(0)))?;
-        job_ids.push(job_id);
+    {
+        let mut stmt =
+            txn.prepare_cached("INSERT INTO jobs(job_id, time_reserved) VALUES(?1, ?2)")?;
+        for _ in 0..number {
+            let job_id = JobId::from(&generate_id());
+            stmt.execute((&job_id, time_reserved))?;
+            job_ids.push(job_id);
+        }
     }
-    stmt.finalize()?;
     txn.commit()?;
     Ok(JobsReserved {
         job_ids,
@@ -607,7 +742,7 @@ fn reserve_jobs(db: &mut Connection, number: u8) -> Result<JobsReserved, JobErro
 
 fn get_reserved(db: &Connection) -> Result<BTreeMap<JobId, DateTime<Utc>>, JobError> {
     let mut reserved = BTreeMap::new();
-    let mut stmt = db.prepare(
+    let mut stmt = db.prepare_cached(
         "SELECT job_id, time_reserved FROM jobs WHERE time_started IS NULL",
         // `--SCAN jobs USING COVERING INDEX jobs_reserved_only
     )?;
@@ -625,29 +760,29 @@ fn revoke_reserved(db: &mut Connection, job_ids: &[JobId]) -> Result<Vec<JobId>,
     } else {
         get_reserved(&txn)?.keys().cloned().collect()
     };
-    let mut stmt = txn.prepare(
-        "DELETE FROM jobs WHERE job_id = ?1 AND time_started IS NULL",
-        // `--SEARCH jobs USING INDEX sqlite_autoindex_jobs_1 (job_id=?)
-    )?;
     let mut revoked = Vec::new();
-    for job_id in job_ids {
-        if stmt.execute([&job_id])? == 1 {
-            revoked.push(job_id);
+    {
+        let mut stmt = txn.prepare_cached(
+            "DELETE FROM jobs WHERE job_id = ?1 AND time_started IS NULL",
+            // `--SEARCH jobs USING INDEX sqlite_autoindex_jobs_1 (job_id=?)
+        )?;
+        for job_id in job_ids {
+            if stmt.execute([&job_id])? == 1 {
+                revoked.push(job_id);
+            }
         }
     }
-    stmt.finalize()?;
     txn.commit()?;
     Ok(revoked)
 }
 
 fn verify_reservation(db: &Connection, job_id: &JobId) -> Result<DateTime<Utc>, JobError> {
-    if let Some(time_reserved) = db
-        .query_one(
-            "SELECT time_reserved FROM jobs WHERE job_id = ?1",
-            // `--SEARCH jobs USING INDEX sqlite_autoindex_jobs_1 (job_id=?)
-            [job_id],
-            |row| -> Result<DateTime<Utc>, _> { row.get(0) },
-        )
+    let mut stmt = db.prepare_cached(
+        "SELECT time_reserved FROM jobs WHERE job_id = ?1 AND time_started IS NULL",
+        // `--SEARCH jobs USING INDEX sqlite_autoindex_jobs_1 (job_id=?)
+    )?;
+    if let Some(time_reserved) = stmt
+        .query_one([job_id], |row| -> Result<DateTime<Utc>, _> { row.get(0) })
         .optional()?
     {
         Ok(time_reserved)
@@ -658,122 +793,150 @@ fn verify_reservation(db: &Connection, job_id: &JobId) -> Result<DateTime<Utc>, 
 
 fn job_started(
     db: &Connection,
-    job: VerifiedJob,
+    job: &VerifiedJob,
     time_started: DateTime<Utc>,
 ) -> Result<(), JobError> {
-    if db.execute(
-        "UPDATE jobs SET key_id = ?2, command = ?3, signature = ?4, time_started = ?5 \
-         WHERE job_id = ?1 AND time_started IS NULL",
-        // `--SEARCH jobs USING INDEX sqlite_autoindex_jobs_1 (job_id=?)
-        (
-            job.job_id(),
-            job.key_id(),
-            job.command(),
-            job.signature(),
-            time_started,
-        ),
-    )? == 1
-    {
+    let job_id = job.job_id();
+    let key_id = job.key_id();
+    let command = job.command();
+    let signature = job.signature();
+    let mut stmt = prepare_cached_and_bind!(
+        db,
+        "UPDATE jobs \
+         SET key_id = $key_id, command = $command, signature = $signature, time_started = $time_started \
+         WHERE job_id = $job_id AND time_started IS NULL"
+    );
+    if stmt.raw_execute()? == 1 {
         Ok(())
     } else {
         Err(JobError::InvalidJobId(job.job_id().to_owned()))
     }
 }
 
-fn job_stdout(
+fn get_job_output_hash(
     db: &Connection,
-    job_id: JobId,
-    range: Option<Range<i32>>,
-) -> Result<Vec<u8>, JobError> {
-    job_output(db, job_id, range, c"stdout")
-}
-
-fn job_stderr(
-    db: &Connection,
-    job_id: JobId,
-    range: Option<Range<i32>>,
-) -> Result<Vec<u8>, JobError> {
-    job_output(db, job_id, range, c"stderr")
-}
-
-fn job_output(
-    db: &Connection,
-    job_id: JobId,
-    range: Option<Range<i32>>,
-    column: &'static CStr,
-) -> Result<Vec<u8>, JobError> {
-    if let Some(range) = range {
-        let blob = get_blob(db, c"jobs", column, c"job_id", job_id)?;
-        Ok(read_blob_chunk(&blob, range)?)
-    } else if let Some(output) = db
-        .query_one(
-            &format!(
-                "SELECT {} FROM jobs WHERE job_id = ?1",
-                // `--SEARCH jobs USING INDEX sqlite_autoindex_jobs_1 (job_id=?)
-                column.to_string_lossy()
-            ),
-            [&job_id],
-            |row| -> Result<Vec<u8>, _> { row.get(0) },
-        )
+    job_id: &JobId,
+    stream: JobOutputStream,
+) -> Result<Option<JobOutputHash>, JobError> {
+    let query = format!(
+        "SELECT {stream}_hash FROM jobs WHERE job_id = ?1",
+        // `--SEARCH jobs USING INDEX sqlite_autoindex_jobs_1 (job_id=?)
+    );
+    let mut stmt = db.prepare_cached(&query)?;
+    if let Some(hash) = stmt
+        .query_one([job_id], |row| -> Result<Option<_>, _> { row.get(0) })
         .optional()?
     {
-        Ok(output)
+        hash.ok_or(JobError::OutputPending)
     } else {
-        Err(JobError::InvalidJobId(job_id))
+        Err(JobError::InvalidJobId(job_id.to_owned()))
     }
 }
 
-fn job_status(db: &Connection, job_id: JobId) -> Result<JobStatus, JobError> {
-    if let Some(status) = db
-        .query_one(
-            "SELECT job_id, key_id, command, signature, \
-                    time_reserved, time_started, time_ended, \
-                    status, length(stdout), length(stderr) \
-             FROM jobs WHERE job_id = ?1",
+fn get_job_output(
+    db: &Connection,
+    output_dir: &Path,
+    job_id: &JobId,
+    stream: JobOutputStream,
+    range: Option<Range>,
+) -> Result<Vec<u8>, JobError> {
+    let len = job_output_len(output_dir, job_id, stream);
+    let path = job_output_path(output_dir, job_id, stream);
+    let mut file = File::open(&path).map_err(|_| JobError::InvalidJobId(job_id.to_owned()))?;
+    if let Some(Range { start, end }) = range {
+        // HTTP Ranges include both their endpoints.
+        let start = if let StartPosition::Index(start) = start
+            && start < len
+        {
+            file.seek(SeekFrom::Start(start))?
+        } else {
+            return Err(JobError::InvalidRange(len));
+        };
+        let n = match end {
+            EndPosition::Index(end) => end - start + 1,
+            EndPosition::LastByte => len - start + 1,
+        };
+        if n > len.min(OUTPUT_THRESHOLD) {
+            Err(JobError::InvalidRange(len))
+        } else if n == 0 {
+            Ok(vec![])
+        } else {
+            let mut buf = vec![0; n as usize];
+            file.read_exact(&mut buf)?;
+            Ok(buf)
+        }
+    } else if len > OUTPUT_THRESHOLD {
+        Err(JobError::OutputTooBig)
+    } else {
+        let mut buf = Vec::with_capacity(len as usize);
+        file.read_to_end(&mut buf)?;
+        if let Some(expected_hash) = get_job_output_hash(db, job_id, stream)?
+            && JobOutputHash::from(hash(&buf)) != expected_hash
+        {
+            Err(JobError::OutputHashMismatch(job_id.clone(), expected_hash))
+        } else {
+            Ok(buf)
+        }
+    }
+}
+
+fn get_job_status(
+    db: &mut Connection,
+    output_dir: &Path,
+    job_id: &JobId,
+) -> Result<JobStatus, JobError> {
+    let stdout_len = job_output_len(output_dir, job_id, Stdout);
+    let stderr_len = job_output_len(output_dir, job_id, Stderr);
+    let txn = db.transaction()?;
+    if let Some(status) = txn
+        .prepare_cached(
+            "SELECT * FROM jobs WHERE job_id = ?1",
             // `--SEARCH jobs USING INDEX sqlite_autoindex_jobs_1 (job_id=?)
-            [&job_id],
-            |row| {
-                assert_eq!(row.get("job_id").as_ref(), Ok(&job_id));
-                if let Ok(time_ended) = row.get("time_ended") {
-                    Ok(JobStatus::Ended {
-                        job: SignedJob::new(
-                            JobStartRequest {
-                                job_id: job_id.clone(),
-                                command: row.get("command")?,
-                            },
-                            row.get("key_id")?,
-                            row.get("signature")?,
-                        ),
-                        time_reserved: row.get("time_reserved")?,
-                        time_started: row.get("time_started")?,
-                        time_ended,
-                        status: row.get("status")?,
-                        stdout_len: row.get("length(stdout)")?,
-                        stderr_len: row.get("length(stderr)")?,
-                    })
-                } else if let Ok(time_started) = row.get("time_started") {
-                    Ok(JobStatus::Started {
-                        job: SignedJob::new(
-                            JobStartRequest {
-                                job_id: job_id.clone(),
-                                command: row.get("command")?,
-                            },
-                            row.get("key_id")?,
-                            row.get("signature")?,
-                        ),
-                        time_reserved: row.get("time_reserved")?,
-                        time_started,
-                    })
-                } else if let Ok(time_reserved) = row.get("time_reserved") {
-                    Ok(JobStatus::Reserved {
-                        job_id: job_id.clone(),
-                        time_reserved,
-                    })
-                } else {
-                    unreachable!("time_reserved should be NOT NULL")
-                }
-            },
-        )
+        )?
+        .query_one([job_id], |row| {
+            assert_eq!(row.get("job_id").as_ref(), Ok(job_id));
+            if let Ok(time_ended) = row.get("time_ended") {
+                let key_id: KeyId = row.get("key_id")?;
+                Ok(JobStatus::Ended {
+                    job: SignedJob::new(
+                        JobStartRequest {
+                            job_id: job_id.clone(),
+                            command: row.get("command")?,
+                        },
+                        key_id.clone(),
+                        row.get("signature")?,
+                    ),
+                    time_reserved: row.get("time_reserved")?,
+                    time_started: row.get("time_started")?,
+                    time_ended,
+                    status: row.get("status")?,
+                    stdout_len,
+                    stderr_len,
+                    stdout_hash: row.get("stdout_hash")?,
+                    stderr_hash: row.get("stderr_hash")?,
+                })
+            } else if let Ok(time_started) = row.get("time_started") {
+                Ok(JobStatus::Started {
+                    job: SignedJob::new(
+                        JobStartRequest {
+                            job_id: job_id.clone(),
+                            command: row.get("command")?,
+                        },
+                        row.get("key_id")?,
+                        row.get("signature")?,
+                    ),
+                    time_reserved: row.get("time_reserved")?,
+                    time_started,
+                })
+            } else if let Ok(time_reserved) = row.get("time_reserved") {
+                Ok(JobStatus::Reserved {
+                    job_id: job_id.clone(),
+                    time_reserved,
+                })
+            } else {
+                unreachable!("time_reserved should be NOT NULL")
+            }
+        })
         .optional()?
     {
         Ok(status)
@@ -782,66 +945,16 @@ fn job_status(db: &Connection, job_id: JobId) -> Result<JobStatus, JobError> {
     }
 }
 
-fn job_ended(
-    db: &mut Connection,
-    job_id: JobId,
-    status: Option<i32>,
-    mut stdout: File,
-    mut stderr: File,
-    time_ended: DateTime<Utc>,
-) -> Result<(), BlobError> {
-    let limit = blob_limit(db)?;
-    let stdout_len = file_len(&stdout, limit)?;
-    let stderr_len = file_len(&stderr, limit)?;
-    if stdout_len > limit || stderr_len > limit {
-        return Err(BlobError::FileTooLarge);
-    }
-
-    let txn = db.transaction()?;
-    txn.execute(
-        "UPDATE jobs SET status = ?2, stdout = ?3, stderr = ?4, time_ended = ?5 \
-         WHERE job_id = ?1 AND time_started IS NOT NULL AND time_ended IS NULL",
-        // `--SEARCH jobs USING INDEX sqlite_autoindex_jobs_1 (job_id=?)
-        (
-            &job_id,
-            status,
-            ZeroBlob(stdout_len),
-            ZeroBlob(stderr_len),
-            time_ended,
-        ),
-    )?;
-    {
-        let blob = read_blob_from_file(&mut stdout, &txn, c"jobs", c"stdout", c"job_id", &job_id)?;
-        assert_eq!(blob.size(), stdout_len);
-    }
-    {
-        let blob = read_blob_from_file(&mut stderr, &txn, c"jobs", c"stderr", c"job_id", &job_id)?;
-        assert_eq!(blob.size(), stderr_len);
-    }
-    txn.commit()?;
-    Ok(())
-}
-
-fn job_aborted(db: &Connection, job_id: JobId, time_ended: DateTime<Utc>) -> Result<(), JobError> {
-    db.execute(
-        "UPDATE jobs SET time_ended = ?2 \
-         WHERE job_id = ?1 \
-         AND time_started IS NOT NULL \
-         AND time_ended IS NULL",
-        // `--SEARCH jobs USING INDEX sqlite_autoindex_jobs_1 (job_id=?)
-        (job_id, time_ended),
-    )?;
-    Ok(())
-}
-
 #[cfg(test)]
 mod test {
-    use std::io::{Write as _, read_to_string};
     use std::time::Duration;
 
+    use function_name::named;
     use rand_core::{OsRng, RngCore as _};
     use rusqlite::limits::Limit;
-    use tempfile::NamedTempFile;
+    use slog::Drain as _;
+    use slog_term::{FullFormat, PlainSyncDecorator, TestStdoutWriter};
+    use tempfile::TempDir;
     use x509_cert::name::Name;
     use x509_cert::time::Validity;
 
@@ -883,76 +996,6 @@ mod test {
         .unwrap()
     }
 
-    fn random_job_id() -> JobId {
-        JobId::from(&generate_id())
-    }
-
-    #[tokio::test]
-    async fn false_() {
-        let key = ephemeral_test_root();
-        let job = key.sign_job_request(&random_job_id(), "false").await;
-        let start = JobStart::new(job).unwrap();
-        let end = start.wait().await.unwrap();
-        assert!(!end.status.success());
-        assert_eq!(end.stdout.metadata().unwrap().len(), 0);
-        assert_eq!(end.stderr.metadata().unwrap().len(), 0);
-    }
-
-    #[tokio::test]
-    async fn true_() {
-        let key = ephemeral_test_root();
-        let job = key.sign_job_request(&random_job_id(), "true").await;
-        let start = JobStart::new(job).unwrap();
-        let end = start.wait().await.unwrap();
-        assert!(end.status.success());
-        assert_eq!(end.stdout.metadata().unwrap().len(), 0);
-        assert_eq!(end.stderr.metadata().unwrap().len(), 0);
-    }
-
-    #[tokio::test]
-    async fn stderr() {
-        let key = ephemeral_test_root();
-        let job = key
-            .sign_job_request(&random_job_id(), "echo error >&2")
-            .await;
-        let start = JobStart::new(job).unwrap();
-        let end = start.wait().await.unwrap();
-        assert!(end.status.success());
-        assert_eq!(end.stdout.metadata().unwrap().len(), 0);
-        assert_eq!(read_to_string(end.stderr).unwrap(), "error\n");
-    }
-
-    #[tokio::test]
-    async fn cat_temp_file() {
-        let content = "Lorem ipsum dolor sit amet.";
-        let mut file = NamedTempFile::new().unwrap();
-        write!(file, "{content}").unwrap();
-
-        let key = ephemeral_test_root();
-        let path = file.path().display().to_string();
-        let command = format!("cat {}", &path);
-        let job = key.sign_job_request(&random_job_id(), command).await;
-        let start = JobStart::new(job).unwrap();
-        let end = start.wait().await.unwrap();
-        assert!(end.status.success());
-        assert_eq!(end.stdout.metadata().unwrap().len() as usize, content.len());
-        assert_eq!(read_to_string(end.stdout).unwrap(), content);
-        assert_eq!(end.stderr.metadata().unwrap().len(), 0);
-    }
-
-    #[tokio::test]
-    async fn pipeline() {
-        let key = ephemeral_test_root();
-        let job = key
-            .sign_job_request(&random_job_id(), "yes | head -n 1")
-            .await;
-        let start = JobStart::new(job).unwrap();
-        let end = start.wait().await.unwrap();
-        assert!(end.status.success());
-        assert_eq!(read_to_string(end.stdout).unwrap(), "y\n");
-        assert_eq!(end.stderr.metadata().unwrap().len(), 0);
-    }
-
     fn check_status_started(
         status: JobStatus,
         cert: &Certificate,
@@ -976,12 +1019,11 @@ mod test {
 
     fn check_status_ended(
         status: JobStatus,
-        cert: &Certificate,
         expected_job_id: &JobId,
         expected_command: &str,
         expected_status: Option<i32>,
-        expected_stdout_len: i32,
-        expected_stderr_len: i32,
+        expected_stdout_len: u64,
+        expected_stderr_len: u64,
     ) {
         let JobStatus::Ended {
             job,
@@ -991,12 +1033,13 @@ mod test {
             status,
             stdout_len,
             stderr_len,
+            stdout_hash: _,
+            stderr_hash: _,
         } = status
         else {
             panic!("expected job to be finished");
         };
         assert_eq!(job.job_id, *expected_job_id);
-        let job = job.verify(cert).unwrap();
         assert_eq!(job.command, expected_command);
         assert!(time_reserved < time_started);
         assert!(time_started < time_ended);
@@ -1006,26 +1049,31 @@ mod test {
         assert_eq!(stderr_len, expected_stderr_len);
     }
 
-    const TEST_LIMIT_LENGTH: i32 = 1000;
-
-    async fn manager_and_test_root(db: Option<&str>) -> (JobManager, EphemeralKey) {
+    async fn manager_and_test_root(
+        db: Option<&str>,
+        test_name: &'static str,
+    ) -> (JobManager, EphemeralKey, TempDir) {
         let db = if let Some(db) = db {
             open_database(db).unwrap()
         } else {
             open_database_in_memory().unwrap()
         };
-        db.set_limit(Limit::SQLITE_LIMIT_LENGTH, TEST_LIMIT_LENGTH)
-            .unwrap();
-        let mgr = JobManager::new(db).await.unwrap();
+        db.set_limit(Limit::SQLITE_LIMIT_LENGTH, 10_000).unwrap();
+        let decorator = PlainSyncDecorator::new(TestStdoutWriter);
+        let drain = FullFormat::new(decorator).build().fuse();
+        let dir = TempDir::with_prefix("sush-").unwrap();
+        let log = Logger::root(drain, slog::o!("test" => test_name));
+        let mgr = JobManager::new(db, dir.path(), log).await.unwrap();
         let root = ephemeral_test_root();
         let key_id = mgr.import_cert(root.cert(), true).await.unwrap();
         assert_eq!(key_id, root.key_id().await.unwrap());
-        (mgr, root)
+        (mgr, root, dir)
     }
 
+    #[named]
     #[tokio::test]
     async fn jobs() {
-        let (mgr, root) = manager_and_test_root(None).await;
+        let (mgr, root, _dir) = manager_and_test_root(None, function_name!()).await;
         let JobsReserved {
             mut job_ids,
             time_reserved,
@@ -1050,14 +1098,15 @@ mod test {
             .job_start(job.clone(), JobLimits::default())
             .await
             .unwrap();
-        let status = rx.await.unwrap().unwrap();
-        check_status_ended(status, root.cert(), &job_id, "true", Some(0), 0, 0);
+        rx.await.unwrap().unwrap();
+        let status = mgr.job_status(&job_id).await.unwrap();
+        check_status_ended(status, &job_id, "true", Some(0), 0, 0);
 
         let rx = mgr.job_start(job, JobLimits::default()).await.unwrap();
         assert!(
             matches!(
-                rx.await.unwrap().unwrap_err(),
-                JobError::InvalidJobId(id) if id == job_id
+                rx.await.unwrap().unwrap_err().error(),
+                JobError::InvalidJobId(id) if *id == job_id
             ),
             "should not be allowed to reuse a job ID"
         );
@@ -1065,33 +1114,43 @@ mod test {
         let job_id = job_ids.pop().unwrap();
         let job = root.sign_job_request(&job_id, "false").await;
         let rx = mgr.job_start(job, JobLimits::default()).await.unwrap();
-        let status = rx.await.unwrap().unwrap();
-        check_status_ended(status, root.cert(), &job_id, "false", Some(1), 0, 0);
+        rx.await.unwrap().unwrap();
+        let status = mgr.job_status(&job_id).await.unwrap();
+        check_status_ended(status, &job_id, "false", Some(1), 0, 0);
 
         let job_id = job_ids.pop().unwrap();
         let job_id_string = job_id.to_string();
         let job_id_bytes = job_id_string.as_bytes();
         let job = root.sign_job_request(&job_id, "echo -n $SUSH_JOB_ID").await;
         let rx = mgr.job_start(job, JobLimits::default()).await.unwrap();
-        let status = rx.await.unwrap().unwrap();
+        rx.await.unwrap().unwrap();
+        let status = mgr.job_status(&job_id).await.unwrap();
         check_status_ended(
             status,
-            root.cert(),
             &job_id,
             "echo -n $SUSH_JOB_ID",
             Some(0),
-            job_id_bytes.len() as i32,
+            job_id_bytes.len() as u64,
             0,
         );
-        assert_eq!(mgr.job_stdout(&job_id, None).await.unwrap(), job_id_bytes);
-        assert!(mgr.job_stderr(&job_id, None).await.unwrap().is_empty());
+        assert_eq!(
+            mgr.job_output(&job_id, Stdout, None).await.unwrap(),
+            job_id_bytes
+        );
+        assert!(
+            mgr.job_output(&job_id, Stderr, None)
+                .await
+                .unwrap()
+                .is_empty()
+        );
 
         assert_eq!(mgr.revoke_reserved(job_ids.clone()).await.unwrap(), job_ids);
     }
 
+    #[named]
     #[tokio::test]
     async fn revoke() {
-        let (mgr, root) = manager_and_test_root(None).await;
+        let (mgr, root, _dir) = manager_and_test_root(None, function_name!()).await;
         let (job_id, time_reserved) = mgr.reserve_one().await.unwrap();
         let job_ids = vec![job_id.clone()];
         assert_eq!(mgr.revoke_reserved(job_ids.clone()).await.unwrap(), job_ids);
@@ -1101,8 +1160,8 @@ mod test {
         let rx = mgr.job_start(job, JobLimits::default()).await.unwrap();
         assert!(
             matches!(
-                rx.await.unwrap().unwrap_err(),
-                JobError::InvalidJobId(id) if id == job_id
+                rx.await.unwrap().unwrap_err().error(),
+                JobError::InvalidJobId(id) if *id == job_id
             ),
             "should not be allowed to start a revoked job"
         );
@@ -1130,9 +1189,10 @@ mod test {
         assert!(mgr.revoke_reserved(job_ids).await.unwrap().is_empty());
     }
 
+    #[named]
     #[tokio::test]
     async fn abort() {
-        let (mgr, root) = manager_and_test_root(None).await;
+        let (mgr, root, _dir) = manager_and_test_root(None, function_name!()).await;
         let (job_id, _time_reserved) = mgr.reserve_one().await.unwrap();
 
         let command = "sleep 10";
@@ -1147,9 +1207,10 @@ mod test {
 
         let status = mgr.job_status(&job_id).await.unwrap();
         assert!(status.time_elapsed().unwrap().to_std().unwrap() < Duration::from_secs(1));
-        check_status_ended(status, root.cert(), &job_id, command, None, 0, 0);
+        check_status_ended(status, &job_id, command, None, 0, 0);
     }
 
+    #[named]
     #[tokio::test]
     async fn cert_chain() {
         let validity = Validity::from_now(Duration::from_secs(60)).unwrap();
@@ -1165,7 +1226,9 @@ mod test {
         assert_ne!(child.key_id().await.unwrap(), root_key_id);
 
         let db = open_database_in_memory().unwrap();
-        let mgr = JobManager::new(db).await.unwrap();
+        let dir = TempDir::with_prefix("sush-").unwrap();
+        let log = Logger::root(slog::Discard, slog::o!("test" => function_name!()));
+        let mgr = JobManager::new(db, dir.path(), log).await.unwrap();
         assert!(
             matches!(
                 mgr.import_cert(&root_cert, false).await.unwrap_err(),
@@ -1200,13 +1263,15 @@ mod test {
         let (job_id, _time_reserved) = mgr.reserve_one().await.unwrap();
         let job = child.sign_job_request(&job_id, "true").await;
         let rx = mgr.job_start(job, JobLimits::default()).await.unwrap();
-        let status = rx.await.unwrap().unwrap();
-        check_status_ended(status, child.cert(), &job_id, "true", Some(0), 0, 0);
+        rx.await.unwrap().unwrap();
+        let status = mgr.job_status(&job_id).await.unwrap();
+        check_status_ended(status, &job_id, "true", Some(0), 0, 0);
     }
 
+    #[named]
     #[tokio::test]
     async fn too_much_cpu() {
-        let (mgr, root) = manager_and_test_root(None).await;
+        let (mgr, root, _dir) = manager_and_test_root(None, function_name!()).await;
         let (job_id, _time_reserved) = mgr.reserve_one().await.unwrap();
         let command = "openssl speed sha1";
         let job = root.sign_job_request(&job_id, command).await;
@@ -1221,71 +1286,136 @@ mod test {
             )
             .await
             .unwrap();
-        let status = rx.await.unwrap().unwrap();
+        rx.await.unwrap().unwrap();
+        let status = mgr.job_status(&job_id).await.unwrap();
         assert!(status.time_elapsed().unwrap().to_std().unwrap() < Duration::from_secs(2));
 
         // The output of `openssl speed` changed between v3.0 and v3.5.
-        let stderr = mgr.job_stderr(&job_id, None).await.unwrap();
+        let stderr = mgr.job_output(&job_id, Stderr, None).await.unwrap();
         let stderr = String::from_utf8_lossy(&stderr);
         match status {
             JobStatus::Ended { stderr_len: 37, .. } => {
-                check_status_ended(status, root.cert(), &job_id, command, None, 0, 37);
+                check_status_ended(status, &job_id, command, None, 0, 37);
                 assert_eq!(stderr, "Doing sha1 for 3s on 16 size blocks: ");
             }
             JobStatus::Ended { stderr_len: 41, .. } => {
-                check_status_ended(status, root.cert(), &job_id, command, None, 0, 41);
+                check_status_ended(status, &job_id, command, None, 0, 41);
                 assert_eq!(stderr, "Doing sha1 ops for 3s on 16 size blocks: ");
             }
             _ => todo!("what does `{command}` produce on your system?"),
         }
     }
 
+    #[named]
     #[tokio::test]
-    async fn too_much_output() {
-        let (mgr, root) = manager_and_test_root(None).await;
+    async fn output_ranges() {
+        let (mgr, root, _dir) = manager_and_test_root(None, function_name!()).await;
         let JobsReserved {
             mut job_ids,
             time_reserved: _,
-        } = mgr.reserve_jobs(3).await.unwrap();
+        } = mgr.reserve_jobs(1).await.unwrap();
 
+        // Read some random bytes.
+        let n = 1000;
+        let command = &format!("head -c {n} /dev/urandom");
         let job_id = job_ids.pop().unwrap();
-        let n: i32 = 100;
-        let command = &format!("head -c {n} /dev/zero");
         let job = root.sign_job_request(&job_id, command).await;
-        let rx = mgr
-            .job_start(
-                job,
-                JobLimits {
-                    max_fsize: n as u64 - 1,
-                    ..JobLimits::default()
-                },
+        let rx = mgr.job_start(job, JobLimits::default()).await.unwrap();
+        rx.await.unwrap().unwrap();
+        let status = mgr.job_status(&job_id).await.unwrap();
+        check_status_ended(status, &job_id, command, Some(0), n, 0);
+
+        // No range, i.e., full output.
+        let r = mgr.job_output(&job_id, Stdout, None).await.unwrap();
+
+        // One byte too big.
+        assert!(matches!(
+            mgr.job_output(
+                &job_id,
+                Stdout,
+                Some(Range {
+                    start: StartPosition::Index(0),
+                    end: EndPosition::Index(n),
+                })
+            )
+            .await
+            .unwrap_err(),
+            JobError::InvalidRange(m) if m == n,
+        ));
+
+        // Whole range.
+        assert_eq!(
+            mgr.job_output(
+                &job_id,
+                Stdout,
+                Some(Range {
+                    start: StartPosition::Index(0),
+                    end: EndPosition::Index(n - 1),
+                })
+            )
+            .await
+            .unwrap(),
+            r
+        );
+
+        // Two half-ranges.
+        let mut o = mgr
+            .job_output(
+                &job_id,
+                Stdout,
+                Some(Range {
+                    start: StartPosition::Index(0),
+                    end: EndPosition::Index(n / 2 - 1),
+                }),
             )
             .await
             .unwrap();
-        let status = rx.await.unwrap().unwrap();
-        check_status_ended(status, root.cert(), &job_id, command, None, n - 1, 0);
-
-        let job_id = job_ids.pop().unwrap();
-        let n = TEST_LIMIT_LENGTH - 1;
-        let command = &format!("head -c {n} /dev/zero");
-        let job = root.sign_job_request(&job_id, command).await;
-        let rx = mgr.job_start(job, JobLimits::default()).await.unwrap();
-        let status = rx.await.unwrap().unwrap();
-        check_status_ended(status, root.cert(), &job_id, command, Some(0), n, 0);
-
-        let job_id = job_ids.pop().unwrap();
-        let n = TEST_LIMIT_LENGTH;
-        let command = &format!("head -c {n} /dev/zero");
-        let job = root.sign_job_request(&job_id, command).await;
-        let rx = mgr.job_start(job, JobLimits::default()).await.unwrap();
-        assert!(
-            matches!(
-                rx.await.unwrap().unwrap_err(),
-                JobError::Blob(BlobError::FileTooLarge),
-            ),
-            "should exceed BLOB size limit"
+        o.extend(
+            mgr.job_output(
+                &job_id,
+                Stdout,
+                Some(Range {
+                    start: StartPosition::Index(n / 2),
+                    end: EndPosition::Index(n - 1),
+                }),
+            )
+            .await
+            .unwrap(),
         );
-        let status = mgr.job_status(&job_id).await.unwrap();
-        check_status_ended(status, root.cert(), &job_id, command, None, 0, 0);
+        assert_eq!(o, r);
+
+        // Various ranges, from one byte to half.
+        for l in 1..n / 2 {
+            let mut i = 0;
+            let mut o = vec![];
+            while i + l < n {
+                o.extend(
+                    mgr.job_output(
+                        &job_id,
+                        Stdout,
+                        Some(Range {
+                            start: StartPosition::Index(i),
+                            end: EndPosition::Index(i + l - 1),
+                        }),
+                    )
+                    .await
+                    .unwrap(),
+                );
+                i += l;
+            }
+            o.extend(
+                mgr.job_output(
+                    &job_id,
+                    Stdout,
+                    Some(Range {
+                        start: StartPosition::Index(i),
+                        end: EndPosition::Index(n - 1),
+                    }),
+                )
+                .await
+                .unwrap(),
+            );
+            assert_eq!(o, r);
+        }
     }
 }

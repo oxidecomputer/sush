@@ -15,7 +15,7 @@ use shlex::split as split_command;
 use xdg::BaseDirectories;
 
 use sush_common::certs::KeyId;
-use sush_common::jobs::{JobId, JobStatus, JobsReserved, SignedJob};
+use sush_common::jobs::{JobId, JobOutputStream, JobStatus, JobsReserved, SignedJob};
 
 use crate::cli::Cli;
 use crate::commands::{
@@ -60,7 +60,9 @@ pub struct Repl {
 impl Repl {
     pub async fn run(mut self, args: &mut GlobalArgs) -> Result<(), CommandError> {
         let xdg = BaseDirectories::with_prefix(PREFIX);
-        let history_file = xdg.place_state_file(HISTORY_FILE)?;
+        let history_file = xdg
+            .place_state_file(HISTORY_FILE)
+            .map_err(|error| CommandError::io(HISTORY_FILE, error))?;
         let mut rl = DefaultEditor::new()?;
         let _ = rl.load_history(&history_file);
         loop {
@@ -199,37 +201,56 @@ impl CommandContext for Repl {
     }
 
     fn job_aborted(&mut self, job_id: &JobId) -> Result<(), CommandError> {
-        self.cli.job_aborted(job_id)?;
         self.set_job_id(Some(job_id.to_owned()));
+        self.cli.job_aborted(job_id)?;
         self.unreserve_job_id(job_id);
         Ok(())
     }
 
-    fn job_stdout(
+    fn job_output(
         &mut self,
         job_id: &JobId,
+        stream: JobOutputStream,
         output: &[u8],
         binary: bool,
     ) -> Result<(), CommandError> {
-        self.cli.job_stdout(job_id, output, binary)?;
         self.set_job_id(Some(job_id.to_owned()));
+        self.cli.job_output(job_id, stream, output, binary)?;
         Ok(())
     }
 
-    fn job_stderr(
+    fn job_output_started(
         &mut self,
         job_id: &JobId,
-        errors: &[u8],
-        binary: bool,
+        stream: JobOutputStream,
+        stage: &str,
+        total: u64,
     ) -> Result<(), CommandError> {
-        self.cli.job_stderr(job_id, errors, binary)?;
         self.set_job_id(Some(job_id.to_owned()));
-        Ok(())
+        self.cli.job_output_started(job_id, stream, stage, total)
+    }
+
+    fn job_output_update(
+        &mut self,
+        job_id: &JobId,
+        stream: JobOutputStream,
+        length: u64,
+    ) -> Result<(), CommandError> {
+        self.cli.job_output_update(job_id, stream, length)
+    }
+
+    fn job_output_finished(
+        &mut self,
+        job_id: &JobId,
+        stream: JobOutputStream,
+        stage: &str,
+    ) -> Result<(), CommandError> {
+        self.cli.job_output_finished(job_id, stream, stage)
     }
 
     fn job_status(&mut self, job_id: &JobId, status: &JobStatus) -> Result<(), CommandError> {
-        self.cli.job_status(job_id, status)?;
         self.set_job_id(Some(job_id.to_owned()));
+        self.cli.job_status(job_id, status)?;
         self.unreserve_job_id(job_id);
         Ok(())
     }

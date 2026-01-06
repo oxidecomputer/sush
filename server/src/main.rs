@@ -6,6 +6,7 @@ use std::path::PathBuf;
 use clap::Parser;
 use clap::builder::PathBufValueParser;
 use dropshot::{ConfigDropshot, ConfigLogging, ConfigLoggingLevel, HandlerTaskMode, ServerBuilder};
+use slog::o;
 
 use sush_server::api::api;
 use sush_server::database::open_database;
@@ -31,13 +32,22 @@ struct ServerArgs {
     /// Enable debug log messages
     #[arg(short = 'D', long, default_value_t = false)]
     debug: bool,
+
+    /// Path to the job output directory
+    #[arg(short = 'o', long, default_value = ".")]
+    directory: PathBuf,
 }
 
 #[tokio::main]
 async fn main() -> Result<(), String> {
-    let args = ServerArgs::parse();
+    let ServerArgs {
+        address,
+        database,
+        debug,
+        directory,
+    } = ServerArgs::parse();
     let log = ConfigLogging::StderrTerminal {
-        level: if args.debug {
+        level: if debug {
             ConfigLoggingLevel::Debug
         } else {
             ConfigLoggingLevel::Info
@@ -46,11 +56,13 @@ async fn main() -> Result<(), String> {
     .to_logger(ROOT_LOG_NAME)
     .map_err(|e| e.to_string())?;
 
-    let db = open_database(args.database).map_err(|e| e.to_string())?;
-    let mgr = JobManager::new(db).await.map_err(|e| e.to_string())?;
+    let db = open_database(database).map_err(|e| e.to_string())?;
+    let mgr = JobManager::new(db, &directory, log.new(o!("component" => "job-manager")))
+        .await
+        .map_err(|e| e.to_string())?;
     ServerBuilder::new(api(), mgr, log)
         .config(ConfigDropshot {
-            bind_address: args.address,
+            bind_address: address,
             default_request_body_max_bytes: REQUEST_MAX_BODY_BYTES,
             default_handler_task_mode: HandlerTaskMode::Detached,
             log_headers: vec![],
