@@ -119,9 +119,8 @@ impl ToBeSigned for JobStartRequest {
 pub type SignedJob = Signed<JobStartRequest>;
 pub type VerifiedJob = Verified<JobStartRequest>;
 
-#[derive(Debug, Deserialize, JsonSchema, Serialize)]
+#[derive(Clone, Debug, Deserialize, JsonSchema, Serialize)]
 pub enum JobStatus {
-    NotFound,
     Reserved {
         job_id: JobId,
         time_reserved: DateTime<Utc>,
@@ -149,13 +148,20 @@ pub enum JobStatus {
 impl JobStatus {
     pub fn time_elapsed(&self) -> Option<TimeDelta> {
         match self {
-            Self::NotFound | Self::Reserved { .. } => None,
+            Self::Reserved { .. } => None,
             Self::Started { time_started, .. } => Some(Utc::now() - time_started),
             Self::Ended {
                 time_started,
                 time_ended,
                 ..
             } => Some(*time_ended - time_started),
+        }
+    }
+
+    pub fn job_id(&self) -> &JobId {
+        match self {
+            Self::Reserved { job_id, .. } => job_id,
+            Self::Started { job, .. } | Self::Ended { job, .. } => job.job_id(),
         }
     }
 }

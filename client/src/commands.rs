@@ -6,7 +6,7 @@ use std::collections::HashMap;
 use std::fmt;
 use std::fs::{File, OpenOptions};
 use std::io::{Read as _, Seek as _, SeekFrom, Write as _, stdin, stdout};
-use std::num::{NonZeroU8, NonZeroU64};
+use std::num::{NonZeroU8, NonZeroU32, NonZeroU64};
 use std::os::fd::AsRawFd;
 use std::path::{Path, PathBuf};
 use std::pin::Pin;
@@ -39,6 +39,7 @@ use crate::permslip::{DEFAULT_PERMSLIP_URL, PermslipSigner};
 use crate::repl::Repl;
 use crate::types::Error as ApiError;
 use crate::{Client, Error as ClientError};
+use futures::TryStreamExt as _;
 
 // Names of environment variables for argument defaults.
 pub const PERMSLIP_URL: &str = "PERMSLIP_URL";
@@ -55,6 +56,9 @@ const DEFAULT_CHUNK_SIZE: ByteSize = ByteSize::mib(32);
 
 /// Default number of simultaneous downloads for large output.
 const PARALLEL_CHUNKS: NonZeroU8 = NonZeroU8::new(8).unwrap();
+
+/// Default number of history entries to fetch at once.
+const DEFAULT_HISTORY_BATCH_SIZE: NonZeroU32 = NonZeroU32::new(10).unwrap();
 
 /// What kind of output to emit.
 #[derive(Clone, Copy, Debug, Default, ValueEnum)]
@@ -281,6 +285,17 @@ pub enum ClientCommand {
         job_id: JobId,
     },
 
+    /// Show status of previously started jobs.
+    History {
+        /// How many history entries to fetch with each request.
+        #[arg(short, long, default_value_t = DEFAULT_HISTORY_BATCH_SIZE)]
+        batch_size: NonZeroU32,
+
+        /// How many history entries to fetch in total, or 0 for all.
+        #[arg(short, long, default_value_t = 0)]
+        limit: usize,
+    },
+
     /// Arguments for subsequent interactive commands.
     Set {
         #[clap(flatten)]
@@ -450,6 +465,19 @@ impl ClientCommand {
             (ClientCommand::JobAbort { job_id }, Some(client)) => {
                 client.job_abort(&job_id).await?;
                 ctx.job_aborted(&job_id)
+            }
+            (ClientCommand::History { batch_size, limit }, Some(client)) => {
+                let mut stream = client.history_stream(Some(batch_size)).boxed();
+                if limit > 0 {
+                    stream = stream.take(limit).boxed();
+                }
+                loop {
+                    match stream.try_next().await {
+                        Ok(Some(status)) => ctx.job_status(status.job_id(), &status)?,
+                        Ok(None) => return Ok(()),
+                        Err(e) => return Err(e.into()),
+                    }
+                }
             }
             (ClientCommand::Set { args: values }, _) => {
                 ctx.set_globals(args, values);

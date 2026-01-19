@@ -9,6 +9,7 @@
 use std::collections::BTreeMap;
 use std::fs::{DirBuilder, File};
 use std::io::{Read as _, Seek as _, SeekFrom};
+use std::num::NonZeroU32;
 use std::path::{Path, PathBuf};
 use std::process::{ExitStatus, Stdio};
 use std::sync::Arc;
@@ -18,7 +19,9 @@ use bytesize::MIB;
 use chrono::{DateTime, Utc};
 use dropshot::{ClientErrorStatusCode, HttpError};
 use http_range_header::{EndPosition, StartPosition, SyntacticallyCorrectRange as Range};
-use rusqlite::{Connection, OptionalExtension as _, prepare_cached_and_bind};
+use rusqlite::{
+    Connection, Error as SqliteError, OptionalExtension as _, Row, prepare_cached_and_bind,
+};
 use slog::{Logger, error, info};
 use thiserror::Error;
 use tokio::process::{Child, Command};
@@ -268,6 +271,11 @@ enum JobRequest {
     Abort {
         job_id: JobId,
     },
+    History {
+        start: Option<JobId>,
+        limit: NonZeroU32,
+        response: oneshot::Sender<Result<Vec<JobStatus>, JobError>>,
+    },
 }
 
 #[derive(Debug)]
@@ -425,6 +433,21 @@ impl JobManager {
         let (tx, rx) = oneshot::channel();
         self.request(JobRequest::Status {
             job_id: job_id.to_owned(),
+            response: tx,
+        })
+        .await?;
+        rx.await?
+    }
+
+    pub async fn job_history(
+        &self,
+        start: Option<JobId>,
+        limit: NonZeroU32,
+    ) -> Result<Vec<JobStatus>, JobError> {
+        let (tx, rx) = oneshot::channel();
+        self.request(JobRequest::History {
+            start,
+            limit,
             response: tx,
         })
         .await?;
@@ -612,6 +635,13 @@ fn client_request(
             response,
         } => {
             let _ = response.send(get_job_output(db, output_dir, &job_id, stream, range));
+        }
+        JobRequest::History {
+            start,
+            limit,
+            response,
+        } => {
+            let _ = response.send(job_history(db, output_dir, start, limit));
         }
     }
     Ok(())
@@ -899,71 +929,108 @@ fn get_job_output(
     }
 }
 
+/// Return a closure over `output_dir`.
+fn job_row_to_status(output_dir: &Path) -> impl FnOnce(&Row<'_>) -> Result<JobStatus, SqliteError> {
+    move |row| {
+        let job_id: JobId = row.get("job_id")?;
+        if let Ok(time_ended) = row.get("time_ended") {
+            let key_id: KeyId = row.get("key_id")?;
+            Ok(JobStatus::Ended {
+                job: SignedJob::new(
+                    JobStartRequest {
+                        job_id: job_id.clone(),
+                        command: row.get("command")?,
+                    },
+                    key_id.clone(),
+                    row.get("signature")?,
+                ),
+                time_reserved: row.get("time_reserved")?,
+                time_started: row.get("time_started")?,
+                time_ended,
+                status: row.get("status")?,
+                stdout_len: job_output_len(output_dir, &job_id, Stdout),
+                stderr_len: job_output_len(output_dir, &job_id, Stderr),
+                stdout_hash: row.get("stdout_hash")?,
+                stderr_hash: row.get("stderr_hash")?,
+            })
+        } else if let Ok(time_started) = row.get("time_started") {
+            Ok(JobStatus::Started {
+                job: SignedJob::new(
+                    JobStartRequest {
+                        job_id: job_id.clone(),
+                        command: row.get("command")?,
+                    },
+                    row.get("key_id")?,
+                    row.get("signature")?,
+                ),
+                time_reserved: row.get("time_reserved")?,
+                time_started,
+                stdout_len: job_output_len(output_dir, &job_id, Stdout),
+                stderr_len: job_output_len(output_dir, &job_id, Stderr),
+            })
+        } else if let Ok(time_reserved) = row.get("time_reserved") {
+            Ok(JobStatus::Reserved {
+                job_id: job_id.clone(),
+                time_reserved,
+            })
+        } else {
+            panic!("time_reserved should be NOT NULL")
+        }
+    }
+}
+
 fn get_job_status(
-    db: &mut Connection,
+    db: &Connection,
     output_dir: &Path,
     job_id: &JobId,
 ) -> Result<JobStatus, JobError> {
-    let stdout_len = job_output_len(output_dir, job_id, Stdout);
-    let stderr_len = job_output_len(output_dir, job_id, Stderr);
-    let txn = db.transaction()?;
-    if let Some(status) = txn
+    if let Some(status) = db
         .prepare_cached(
             "SELECT * FROM jobs WHERE job_id = ?1",
             // `--SEARCH jobs USING INDEX sqlite_autoindex_jobs_1 (job_id=?)
         )?
-        .query_one([job_id], |row| {
-            assert_eq!(row.get("job_id").as_ref(), Ok(job_id));
-            if let Ok(time_ended) = row.get("time_ended") {
-                let key_id: KeyId = row.get("key_id")?;
-                Ok(JobStatus::Ended {
-                    job: SignedJob::new(
-                        JobStartRequest {
-                            job_id: job_id.clone(),
-                            command: row.get("command")?,
-                        },
-                        key_id.clone(),
-                        row.get("signature")?,
-                    ),
-                    time_reserved: row.get("time_reserved")?,
-                    time_started: row.get("time_started")?,
-                    time_ended,
-                    status: row.get("status")?,
-                    stdout_len,
-                    stderr_len,
-                    stdout_hash: row.get("stdout_hash")?,
-                    stderr_hash: row.get("stderr_hash")?,
-                })
-            } else if let Ok(time_started) = row.get("time_started") {
-                Ok(JobStatus::Started {
-                    job: SignedJob::new(
-                        JobStartRequest {
-                            job_id: job_id.clone(),
-                            command: row.get("command")?,
-                        },
-                        row.get("key_id")?,
-                        row.get("signature")?,
-                    ),
-                    time_reserved: row.get("time_reserved")?,
-                    time_started,
-                    stdout_len,
-                    stderr_len,
-                })
-            } else if let Ok(time_reserved) = row.get("time_reserved") {
-                Ok(JobStatus::Reserved {
-                    job_id: job_id.clone(),
-                    time_reserved,
-                })
-            } else {
-                unreachable!("time_reserved should be NOT NULL")
-            }
-        })
+        .query_one([job_id], job_row_to_status(output_dir))
         .optional()?
     {
         Ok(status)
     } else {
-        Ok(JobStatus::NotFound)
+        Err(JobError::InvalidJobId(job_id.to_owned()))
     }
+}
+
+fn job_history(
+    db: &Connection,
+    output_dir: &Path,
+    start: Option<JobId>,
+    limit: NonZeroU32,
+) -> Result<Vec<JobStatus>, JobError> {
+    let mut stmt = if let Some(start) = start {
+        prepare_cached_and_bind!(
+            db,
+            "SELECT * FROM jobs \
+             WHERE time_started < (SELECT time_started FROM jobs WHERE job_id=$start) \
+             ORDER by time_started DESC, time_reserved DESC \
+             LIMIT $limit"
+        )
+        // |--SEARCH jobs USING INDEX jobs_time_started (time_started<?)
+        // |--SCALAR SUBQUERY 1
+        // |  `--SEARCH jobs USING INDEX sqlite_autoindex_jobs_1 (job_id=?)
+        // `--USE TEMP B-TREE FOR LAST TERM OF ORDER BY
+    } else {
+        prepare_cached_and_bind!(
+            db,
+            "SELECT * FROM jobs \
+             ORDER BY time_started DESC \
+             LIMIT $limit"
+        )
+        // `--SCAN jobs USING INDEX jobs_time_started
+    };
+    let mut entries = vec![];
+    let mut rows = stmt.raw_query();
+    while let Some(row) = rows.next()? {
+        entries.push(job_row_to_status(output_dir)(row)?);
+    }
+    Ok(entries)
 }
 
 #[cfg(test)]
@@ -1188,9 +1255,13 @@ mod test {
             ),
             "should not be allowed to start a revoked job"
         );
-
-        let status = mgr.job_status(&job_id).await.unwrap();
-        assert!(matches!(status, JobStatus::NotFound));
+        assert!(
+            matches!(
+                mgr.job_status(&job_id).await.unwrap_err(),
+                JobError::InvalidJobId(id) if id == job_id
+            ),
+            "revoked jobs should not have a status"
+        );
 
         let (new_job_id, new_time_reserved) = mgr.reserve_one().await.unwrap();
         assert_ne!(new_job_id, job_id);

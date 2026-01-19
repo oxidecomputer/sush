@@ -81,6 +81,55 @@
         }
       }
     },
+    "/history": {
+      "get": {
+        "summary": "List previous jobs (paginated).",
+        "operationId": "history",
+        "parameters": [
+          {
+            "in": "query",
+            "name": "limit",
+            "description": "Maximum number of items returned by a single call",
+            "schema": {
+              "nullable": true,
+              "type": "integer",
+              "format": "uint32",
+              "minimum": 1
+            }
+          },
+          {
+            "in": "query",
+            "name": "page_token",
+            "description": "Token returned by previous call to retrieve the subsequent page",
+            "schema": {
+              "nullable": true,
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "successful operation",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/JobStatusResultsPage"
+                }
+              }
+            }
+          },
+          "4XX": {
+            "$ref": "#/components/responses/Error"
+          },
+          "5XX": {
+            "$ref": "#/components/responses/Error"
+          }
+        },
+        "x-dropshot-pagination": {
+          "required": []
+        }
+      }
+    },
     "/jobs/{job_id}/abort": {
       "get": {
         "summary": "Abort a started job.",
@@ -411,69 +460,29 @@
           "request_id"
         ]
       },
-      "Signed_for_JobStartRequest": {
-        "description": "A signed envelope around some data.",
+      "JobStatusResultsPage": {
+        "description": "A single page of results",
         "type": "object",
         "properties": {
-          "payload": {
-            "$ref": "#/components/schemas/JobStartRequest"
+          "next_page": {
+            "nullable": true,
+            "description": "token used to fetch the next page of results (if any)",
+            "type": "string"
           },
-          "key_id": {
-            "$ref": "#/components/schemas/KeyId"
-          },
-          "signature": {
-            "$ref": "#/components/schemas/EncodedSignature"
+          "items": {
+            "description": "list of items on this page of results",
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/JobStatus"
+            }
           }
         },
         "required": [
-          "key_id",
-          "payload",
-          "signature"
-        ]
-      },
-      "JobStartRequest": {
-        "description": "A request to run the given `command` in the slot reserved by `job_id`.",
-        "type": "object",
-        "properties": {
-          "job_id": {
-            "$ref": "#/components/schemas/JobId"
-          },
-          "command": {
-            "type": "string"
-          }
-        },
-        "required": [
-          "command",
-          "job_id"
-        ]
-      },
-      "JobId": {
-        "type": "string"
-      },
-      "EncodedSignature": {
-        "description": "Code phrase encoded signature.",
-        "type": "object",
-        "properties": {
-          "r": {
-            "type": "string"
-          },
-          "s": {
-            "type": "string"
-          }
-        },
-        "required": [
-          "r",
-          "s"
+          "items"
         ]
       },
       "JobStatus": {
         "oneOf": [
-          {
-            "type": "string",
-            "enum": [
-              "NotFound"
-            ]
-          },
           {
             "type": "object",
             "properties": {
@@ -601,6 +610,61 @@
             ],
             "additionalProperties": false
           }
+        ]
+      },
+      "JobId": {
+        "type": "string"
+      },
+      "Signed_for_JobStartRequest": {
+        "description": "A signed envelope around some data.",
+        "type": "object",
+        "properties": {
+          "payload": {
+            "$ref": "#/components/schemas/JobStartRequest"
+          },
+          "key_id": {
+            "$ref": "#/components/schemas/KeyId"
+          },
+          "signature": {
+            "$ref": "#/components/schemas/EncodedSignature"
+          }
+        },
+        "required": [
+          "key_id",
+          "payload",
+          "signature"
+        ]
+      },
+      "JobStartRequest": {
+        "description": "A request to run the given `command` in the slot reserved by `job_id`.",
+        "type": "object",
+        "properties": {
+          "job_id": {
+            "$ref": "#/components/schemas/JobId"
+          },
+          "command": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "command",
+          "job_id"
+        ]
+      },
+      "EncodedSignature": {
+        "description": "Code phrase encoded signature.",
+        "type": "object",
+        "properties": {
+          "r": {
+            "type": "string"
+          },
+          "s": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "r",
+          "s"
         ]
       },
       "JobOutputHash": {

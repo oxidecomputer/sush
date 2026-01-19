@@ -331,7 +331,6 @@ impl CommandContext for Cli {
         match self.get_output_format() {
             OutputFormat::Json => println!("{}", json!(status)),
             OutputFormat::Text => match status {
-                JobStatus::NotFound => println!("❌ Job `{job_id}` not found"),
                 JobStatus::Reserved {
                     job_id,
                     time_reserved,

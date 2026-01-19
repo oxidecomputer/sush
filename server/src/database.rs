@@ -17,6 +17,7 @@ pub const SCHEMA: &[&str] = &[
     include_str!("../schema/1_certs.sql"),
     include_str!("../schema/2_jobs.sql"),
     include_str!("../schema/3_hashes.sql"),
+    include_str!("../schema/4_index_time_started.sql"),
     // Add new migrations here.
 ];
 

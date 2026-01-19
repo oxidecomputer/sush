@@ -4,11 +4,13 @@
 
 use std::collections::BTreeMap;
 use std::fmt;
+use std::num::NonZeroU32;
 
 use chrono::{DateTime, Utc};
 use dropshot::{
-    ApiDescription, Body, ClientErrorStatusCode, Header, HttpError, HttpResponseOk,
-    Path as PathParams, Query as QueryParams, RequestContext, TypedBody, endpoint,
+    ApiDescription, Body, ClientErrorStatusCode, EmptyScanParams, Header, HttpError,
+    HttpResponseOk, PaginationParams, Path as PathParams, Query as QueryParams, RequestContext,
+    ResultsPage, TypedBody, WhichPage, endpoint,
 };
 use http_range_header::{SyntacticallyCorrectRange as Range, parse_range_header};
 use hyper::Response;
@@ -34,6 +36,7 @@ pub fn api() -> ApiDescription<JobManager> {
     api.register(job_status).unwrap();
     api.register(job_output).unwrap();
     api.register(job_abort).unwrap();
+    api.register(history).unwrap();
     api
 }
 
@@ -261,4 +264,32 @@ async fn job_abort(
     let JobIdParam { job_id } = params.into_inner();
     ctx.context().job_abort(&job_id).await?;
     Ok(HttpResponseOk(()))
+}
+
+/// List previous jobs (paginated).
+#[endpoint { method = GET, path = "/history" }]
+async fn history(
+    ctx: Context,
+    params: QueryParams<PaginationParams<EmptyScanParams, JobId>>,
+) -> Result<HttpResponseOk<ResultsPage<JobStatus>>, HttpError> {
+    let pag_params = params.into_inner();
+    let Some(limit) = NonZeroU32::new(ctx.page_limit(&pag_params)?.get()) else {
+        return Err(HttpError::for_client_error(
+            None,
+            ClientErrorStatusCode::BAD_REQUEST,
+            String::from("page limit must be non-zero"),
+        ));
+    };
+
+    let mgr = ctx.context();
+    let list = match pag_params.page {
+        WhichPage::First(..) => mgr.job_history(None, limit).await?,
+        WhichPage::Next(job_id) => mgr.job_history(Some(job_id), limit).await?,
+    };
+
+    Ok(HttpResponseOk(ResultsPage::new(
+        list,
+        &EmptyScanParams {},
+        |job: &JobStatus, _| job.job_id().to_owned(),
+    )?))
 }
