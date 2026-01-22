@@ -570,12 +570,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "diceware_wordlists"
-version = "1.2.3"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "5f9b52b69d268c7a2bc582e3aec5cdfa43ac91cef4fe6b6751b02da2b43d6166"
-
-[[package]]
 name = "digest"
 version = "0.10.7"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -3187,7 +3181,6 @@ dependencies = [
  "bytesize",
  "chrono",
  "crypto-bigint",
- "diceware_wordlists",
  "ed25519-dalek",
  "p256",
  "pem-rfc7468",

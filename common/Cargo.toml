@@ -9,7 +9,6 @@ publish = false
 bytesize.workspace = true
 chrono.workspace = true
 crypto-bigint.workspace = true
-diceware_wordlists.workspace = true
 ed25519-dalek.workspace = true
 p256.workspace = true
 pem-rfc7468.workspace = true

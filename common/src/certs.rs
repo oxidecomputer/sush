@@ -29,7 +29,7 @@ use x509_cert::spki::{AlgorithmIdentifierOwned, SubjectPublicKeyInfo};
 use x509_cert::time::Validity;
 use x509_cert::{Certificate, TbsCertificate, Version};
 
-use crate::codephrases::{InvalidCodephrase, codephrase, decode_phrase};
+use crate::codephrases::{InvalidCodephrase, WORD_SEPARATOR, codephrase, decode_phrase, id_phrase};
 
 /// What went wrong handling a key, signature, or certificate.
 #[derive(Debug, Error)]
@@ -96,8 +96,8 @@ impl TryFrom<&Name> for KeyId {
 
     fn try_from(name: &Name) -> Result<KeyId, Self::Error> {
         let hash = Sha256::digest(&name.to_der()?);
-        let words = codephrase(U256::from_be_slice(hash.as_slice()));
-        Ok(KeyId(words[..6].join(" ")))
+        let phrase = id_phrase(U256::from_be_slice(hash.as_slice()));
+        Ok(KeyId(phrase.join(WORD_SEPARATOR)))
     }
 }
 
@@ -193,14 +193,15 @@ impl Signature {
     }
 
     pub fn encode(&self) -> EncodedSignature {
+        let codephrase = |x: U256| codephrase(x).join(WORD_SEPARATOR);
         match self {
             Self::EcdsaSha256(signature) => EncodedSignature {
-                r: codephrase(U256::from_be_byte_array(signature.r().to_bytes())).join(" "),
-                s: codephrase(U256::from_be_byte_array(signature.s().to_bytes())).join(" "),
+                r: codephrase(U256::from_be_byte_array(signature.r().to_bytes())),
+                s: codephrase(U256::from_be_byte_array(signature.s().to_bytes())),
             },
             Self::Ed25519(signature) => EncodedSignature {
-                r: codephrase(U256::from_be_slice(signature.r_bytes())).join(" "),
-                s: codephrase(U256::from_be_slice(signature.s_bytes())).join(" "),
+                r: codephrase(U256::from_be_slice(signature.r_bytes())),
+                s: codephrase(U256::from_be_slice(signature.s_bytes())),
             },
         }
     }

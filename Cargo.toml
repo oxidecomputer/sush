@@ -9,7 +9,6 @@ bytesize = "2"
 chrono = "0.4"
 clap = { version = "4", features = ["derive", "env", "wrap_help"] }
 crypto-bigint = "0.5"
-diceware_wordlists = "1"
 dropshot = "0.16"
 ed25519-dalek = { version = "2", features = ["rand_core"] }
 humantime = "2"
