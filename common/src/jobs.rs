@@ -130,6 +130,8 @@ pub enum JobStatus {
         job: SignedJob,
         time_reserved: DateTime<Utc>,
         time_started: DateTime<Utc>,
+        stdout_len: u64,
+        stderr_len: u64,
     },
     Ended {
         job: SignedJob,

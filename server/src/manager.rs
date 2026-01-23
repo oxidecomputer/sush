@@ -24,7 +24,7 @@ use thiserror::Error;
 use tokio::process::{Child, Command};
 use tokio::select;
 use tokio::sync::{mpsc, oneshot};
-use tokio::task::{AbortHandle, JoinError, JoinHandle, JoinSet, spawn};
+use tokio::task::{JoinError, JoinHandle, JoinSet, spawn};
 use x509_cert::Certificate;
 use x509_cert::der::{Decode as _, Encode as _};
 
@@ -45,6 +45,9 @@ pub const ROOT_CERTS: &[&[u8]] = &[
 
 /// Output files or ranges larger than this will not be served all at once.
 const OUTPUT_THRESHOLD: u64 = 128 * MIB;
+
+/// An asynchronous kill signal, delivered by the abort request.
+type KillShot = oneshot::Sender<JobId>;
 
 #[derive(Debug, Error)]
 pub enum JobError {
@@ -212,7 +215,7 @@ struct JobStarted {
 pub struct JobEnd {
     job: VerifiedJob,
     time_ended: DateTime<Utc>,
-    status: ExitStatus,
+    status: Option<ExitStatus>,
     stdout_hash: JobOutputHash,
     stderr_hash: JobOutputHash,
 }
@@ -290,7 +293,7 @@ impl JobManager {
             let output_dir = output_dir.to_owned();
             async move {
                 let mut tasks = JoinSet::<Result<JobEnd, ExecutionError>>::new();
-                let mut abort = BTreeMap::<JobId, AbortHandle>::new();
+                let mut killers = BTreeMap::<JobId, KillShot>::new();
                 loop {
                     select! {
                         Some(request) = rx_requests.recv() => {
@@ -299,12 +302,12 @@ impl JobManager {
                                 &log,
                                 request,
                                 &mut tasks,
-                                &mut abort,
+                                &mut killers,
                                 &output_dir,
                             )?
                         }
                         Some(end) = tasks.join_next() => {
-                            job_ended(&db, &output_dir, &log, end, &mut abort)?
+                            job_ended(&db, &output_dir, &log, end, &mut killers)?
                         }
                         else => {
                             info!(log, "job manager shutting down");
@@ -483,7 +486,7 @@ fn job_ended(
     output_dir: &Path,
     log: &Logger,
     end: Result<Result<JobEnd, ExecutionError>, JoinError>,
-    abort: &mut BTreeMap<JobId, AbortHandle>,
+    killers: &mut BTreeMap<JobId, KillShot>,
 ) -> Result<(), JobError> {
     match end {
         Err(error) if error.is_cancelled() => {
@@ -498,7 +501,7 @@ fn job_ended(
             error,
         })) => {
             error!(log, "job execution failed"; "error" => %error, "job_id" => %job_id, "time" => %time);
-            assert!(abort.remove(&job_id).is_some());
+            assert!(killers.remove(&job_id).is_some());
             job_aborted(db, output_dir, &job_id, time)?;
         }
         Ok(Ok(JobEnd {
@@ -509,8 +512,7 @@ fn job_ended(
             stderr_hash,
         })) => {
             let job_id = job.job_id();
-            let status = status.code();
-            assert!(abort.remove(job_id).is_some());
+            let status = status.map(|status| status.code());
             prepare_cached_and_bind!(
                 db,
                 "UPDATE jobs \
@@ -534,8 +536,8 @@ fn job_aborted(
     job_id: &JobId,
     time_ended: DateTime<Utc>,
 ) -> Result<(), JobError> {
-    let stdout_hash = job_output_hash(output_dir, &job_id, Stdout)?;
-    let stderr_hash = job_output_hash(output_dir, &job_id, Stderr)?;
+    let stdout_hash = job_output_hash(output_dir, job_id, Stdout)?;
+    let stderr_hash = job_output_hash(output_dir, job_id, Stderr)?;
     prepare_cached_and_bind!(
         db,
         "UPDATE jobs \
@@ -555,7 +557,7 @@ fn client_request(
     log: &Logger,
     request: JobRequest,
     tasks: &mut JoinSet<Result<JobEnd, ExecutionError>>,
-    abort: &mut BTreeMap<JobId, AbortHandle>,
+    killers: &mut BTreeMap<JobId, KillShot>,
     output_dir: &Path,
 ) -> Result<(), JobError> {
     match request {
@@ -587,10 +589,17 @@ fn client_request(
         } => {
             let job_id = start.job_id().to_owned();
             match start_job(db, output_dir, *start, response, tasks) {
-                Ok(handle) => assert!(abort.insert(job_id, handle).is_none()),
+                Ok(kill) => assert!(killers.insert(job_id, kill).is_none()),
                 Err(error) => {
                     error!(log, "job execution error"; "error" => %error, "job_id" => %job_id);
                 }
+            }
+        }
+        JobRequest::Abort { job_id } => {
+            if let Some(kill) = killers.remove(&job_id)
+                && let Err(job_id) = kill.send(job_id)
+            {
+                error!(log, "can't kill job"; "job_id" => %job_id);
             }
         }
         JobRequest::Status { job_id, response } => {
@@ -604,25 +613,19 @@ fn client_request(
         } => {
             let _ = response.send(get_job_output(db, output_dir, &job_id, stream, range));
         }
-        JobRequest::Abort { job_id } => {
-            if let Some(task) = abort.remove(&job_id) {
-                task.abort();
-                if let Err(error) = job_aborted(db, output_dir, &job_id, Utc::now()) {
-                    error!(log, "can't record job as aborted"; "error" => %error, "job_id" => %job_id);
-                }
-            }
-        }
     }
     Ok(())
 }
 
+/// Verify and start a job, spawn a task to wait for it and report its end,
+/// and return a oneshot channel to kill it.
 fn start_job(
     db: &mut Connection,
     output_dir: &Path,
     start: JobStart,
     response: oneshot::Sender<Result<JobEnd, ExecutionError>>,
     tasks: &mut JoinSet<Result<JobEnd, ExecutionError>>,
-) -> Result<AbortHandle, ExecutionError> {
+) -> Result<KillShot, ExecutionError> {
     let job = start.job.clone();
     let job_id = job.job_id().to_owned();
     macro_rules! exe {
@@ -638,18 +641,32 @@ fn start_job(
         };
     }
 
+    // Verify the job request.
     let txn = exe!(db.transaction());
     let _time_reserved = exe!(verify_reservation(&txn, &job_id));
     let cert = exe!(get_cert(&txn, job.key_id()));
     let job = exe!(job.verify(&cert));
-    let mut started = exe!(start.start());
-    let time_started = started.time_started;
+
+    // Start the job.
+    let JobStarted {
+        time_started,
+        mut child,
+    } = exe!(start.start());
     exe!(job_started(&txn, &job, time_started));
     exe!(txn.commit());
 
+    // Wait for the job to die or be killed.
     let output_dir = output_dir.to_owned();
-    Ok(tasks.spawn(async move {
-        let status = exe!(started.child.wait().await);
+    let (kill, die) = oneshot::channel();
+    tasks.spawn(async move {
+        let status = select! {
+            status = child.wait() => Some(exe!(status)),
+            target = die => {
+                assert_eq!(exe!(target), job_id);
+                exe!(child.kill().await);
+                None
+            }
+        };
         let stdout_hash = exe!(job_output_hash(&output_dir, &job_id, Stdout));
         let stderr_hash = exe!(job_output_hash(&output_dir, &job_id, Stderr));
         let time_ended = Utc::now();
@@ -662,7 +679,9 @@ fn start_job(
         };
         let _ = response.send(Ok(end.clone()));
         Ok(end)
-    }))
+    });
+
+    Ok(kill)
 }
 
 fn get_cert(db: &Connection, key_id: &KeyId) -> Result<Certificate, JobError> {
@@ -927,6 +946,8 @@ fn get_job_status(
                     ),
                     time_reserved: row.get("time_reserved")?,
                     time_started,
+                    stdout_len,
+                    stderr_len,
                 })
             } else if let Ok(time_reserved) = row.get("time_reserved") {
                 Ok(JobStatus::Reserved {
@@ -1006,6 +1027,8 @@ mod test {
             job,
             time_reserved,
             time_started,
+            stdout_len: _,
+            stderr_len: _,
         } = status
         else {
             panic!("expected job to be started");
@@ -1203,7 +1226,7 @@ mod test {
         check_status_started(status, root.cert(), &job_id, command);
 
         mgr.job_abort(&job_id).await.unwrap();
-        assert!(rx.await.is_err());
+        assert_eq!(rx.await.unwrap().unwrap().job.job_id(), &job_id);
 
         let status = mgr.job_status(&job_id).await.unwrap();
         assert!(status.time_elapsed().unwrap().to_std().unwrap() < Duration::from_secs(1));

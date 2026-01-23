@@ -267,6 +267,10 @@ impl CommandContext for Cli {
     }
 
     fn job_status(&mut self, job_id: &JobId, status: &JobStatus) -> Result<(), CommandError> {
+        fn byte_size(len: u64) -> bytesize::Display {
+            ByteSize::b(len).display().si()
+        }
+
         match self.get_output_format() {
             OutputFormat::Json => println!("{}", json!(status)),
             OutputFormat::Text => match status {
@@ -281,12 +285,18 @@ impl CommandContext for Cli {
                 JobStatus::Started {
                     time_reserved,
                     time_started,
+                    stdout_len,
+                    stderr_len,
                     ..
                 } => {
+                    let stdout_len = byte_size(*stdout_len);
+                    let stderr_len = byte_size(*stderr_len);
                     println!(
                         "✅ Job ID:\t{job_id}\n   \
                          Reserved at:\t{time_reserved}\n   \
-                         Started at:\t{time_started}"
+                         Started at:\t{time_started}\n   \
+                         Stdout len:\t{stdout_len}\n   \
+                         Stderr len:\t{stderr_len}"
                     )
                 }
                 JobStatus::Ended {
@@ -299,20 +309,22 @@ impl CommandContext for Cli {
                     stderr_len,
                     stdout_hash,
                     stderr_hash,
-                } => println!(
-                    "✅ Job ID:\t{job_id}\n   \
-                     Reserved at:\t{time_reserved}\n   \
-                     Started at:\t{time_started}\n   \
-                     Ended at:\t{time_ended} ({})\n   \
-                     Status:\t{exit_status}\n   \
-                     Stdout len:\t{}\n   \
-                     Stderr len:\t{}\n   \
-                     Stdout hash:\t{stdout_hash}\n   \
-                     Stderr hash:\t{stderr_hash}",
-                    format_duration(status.time_elapsed().unwrap().to_std()?),
-                    ByteSize::b(*stdout_len).display().si(),
-                    ByteSize::b(*stderr_len).display().si(),
-                ),
+                } => {
+                    let duration = format_duration(status.time_elapsed().unwrap().to_std()?);
+                    let stdout_len = byte_size(*stdout_len);
+                    let stderr_len = byte_size(*stderr_len);
+                    println!(
+                        "✅ Job ID:\t{job_id}\n   \
+                         Reserved at:\t{time_reserved}\n   \
+                         Started at:\t{time_started}\n   \
+                         Ended at:\t{time_ended} ({duration})\n   \
+                         Status:\t{exit_status}\n   \
+                         Stdout len:\t{stdout_len}\n   \
+                         Stderr len:\t{stderr_len}\n   \
+                         Stdout hash:\t{stdout_hash}\n   \
+                         Stderr hash:\t{stderr_hash}",
+                    );
+                }
                 JobStatus::Ended {
                     job: _,
                     time_reserved,
@@ -323,19 +335,21 @@ impl CommandContext for Cli {
                     stderr_len,
                     stdout_hash,
                     stderr_hash,
-                } => println!(
-                    "✅ Job ID:\t{job_id}\n   \
-                     Reserved at:\t{time_reserved}\n   \
-                     Started at:\t{time_started}\n   \
-                     Aborted at:\t{time_ended} ({})\n   \
-                     Stdout len:\t{}\n   \
-                     Stderr len:\t{}\n   \
-                     Stdout hash:\t{stdout_hash}\n   \
-                     Stderr hash:\t{stderr_hash}",
-                    format_duration(status.time_elapsed().unwrap().to_std()?),
-                    ByteSize::b(*stdout_len).display().si(),
-                    ByteSize::b(*stderr_len).display().si(),
-                ),
+                } => {
+                    let duration = format_duration(status.time_elapsed().unwrap().to_std()?);
+                    let stdout_len = byte_size(*stdout_len);
+                    let stderr_len = byte_size(*stderr_len);
+                    println!(
+                        "✅ Job ID:\t{job_id}\n   \
+                         Reserved at:\t{time_reserved}\n   \
+                         Started at:\t{time_started}\n   \
+                         Aborted at:\t{time_ended} ({duration})\n   \
+                         Stdout len:\t{stdout_len}\n   \
+                         Stderr len:\t{stderr_len}\n   \
+                         Stdout hash:\t{stdout_hash}\n   \
+                         Stderr hash:\t{stderr_hash}",
+                    );
+                }
             },
         }
         Ok(())

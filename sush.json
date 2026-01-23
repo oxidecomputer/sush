@@ -515,10 +515,22 @@
                   "time_started": {
                     "type": "string",
                     "format": "date-time"
+                  },
+                  "stdout_len": {
+                    "type": "integer",
+                    "format": "uint64",
+                    "minimum": 0
+                  },
+                  "stderr_len": {
+                    "type": "integer",
+                    "format": "uint64",
+                    "minimum": 0
                   }
                 },
                 "required": [
                   "job",
+                  "stderr_len",
+                  "stdout_len",
                   "time_reserved",
                   "time_started"
                 ]
