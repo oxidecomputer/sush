@@ -601,31 +601,44 @@ async fn job_output<C>(
 where
     C: CommandContext + Send + Sync,
 {
+    // Fetch job status for output length and hash.
+    let JobStatus::Ended {
+        stdout_len,
+        stderr_len,
+        stdout_hash,
+        stderr_hash,
+        ..
+    } = client.job_status(&job_id).await?.into_inner()
+    else {
+        // TODO: emulate `tail -f` for running jobs
+        return Err(CommandError::JobStillRunning(job_id.to_owned()));
+    };
+    let len = match stream {
+        Stdout => stdout_len,
+        Stderr => stderr_len,
+    };
+    if len == 0 {
+        return Ok(());
+    }
+    let expected_hash = match stream {
+        Stdout => stdout_hash,
+        Stderr => stderr_hash,
+    };
+    let check_hash = |hash: Hash| -> Result<(), CommandError> {
+        let expected = expected_hash;
+        let received = hash.into();
+        if received == expected {
+            Ok(())
+        } else {
+            Err(CommandError::OutputHashMismatch { expected, received })
+        }
+    };
+
     if let Some(path) = file {
         // Save the output to a file, downloading in chunks.
         let Some(chunk_size) = NonZeroU64::new(chunk_size.as_u64()) else {
             return Err(CommandError::ChunkSizeZero);
         };
-
-        // Fetch job status.
-        let JobStatus::Ended {
-            stdout_len,
-            stderr_len,
-            stdout_hash,
-            stderr_hash,
-            ..
-        } = client.job_status(&job_id).await?.into_inner()
-        else {
-            // TODO: emulate `tail -f` for running jobs
-            return Err(CommandError::JobStillRunning(job_id.to_owned()));
-        };
-        let len = match stream {
-            Stdout => stdout_len,
-            Stderr => stderr_len,
-        };
-        if len == 0 {
-            return Ok(());
-        }
 
         // Open the output file.
         let io_error = |error| CommandError::io(&path, error);
@@ -654,23 +667,9 @@ where
         // Verify the output hash. Multi-threaded BLAKE3 is very, very fast,
         // but still takes noticeable time on multi-GB outputs. So if there's
         // more than one chunk, we'll give it a progress bar, too.
-        let expected_hash = match stream {
-            Stdout => stdout_hash,
-            Stderr => stderr_hash,
-        };
         let output = unsafe { Mmap::map(&file) }.map_err(io_error)?;
-        let check_hash = |hash: JobOutputHash| -> Result<(), CommandError> {
-            if hash == expected_hash {
-                Ok(())
-            } else {
-                Err(CommandError::OutputHashMismatch {
-                    expected: expected_hash,
-                    received: hash,
-                })
-            }
-        };
         if len < chunk_size.get() {
-            check_hash(hash(&output).into())
+            check_hash(hash(&output))
         } else {
             ctx.job_output_started(&job_id, stream, "Verifying", len)?;
             let mut hasher = Hasher::new();
@@ -678,7 +677,7 @@ where
                 hasher.update_rayon(chunk);
                 ctx.job_output_update(&job_id, stream, chunk.len() as u64)?;
             }
-            check_hash(hasher.finalize().into())?;
+            check_hash(hasher.finalize())?;
             ctx.job_output_finished(&job_id, stream, "Verified")?;
             Ok(())
         }
@@ -689,6 +688,7 @@ where
             .await?
             .into_inner();
         let bytes = byte_stream_to_vec(byte_stream).await?;
+        check_hash(hash(&bytes))?;
         ctx.job_output(&job_id, stream, &bytes, binary)
     }
 }
@@ -729,7 +729,7 @@ async fn byte_stream_to_file(
     mut bytes: ByteStream,
     range: Range,
 ) -> Result<u64, CommandError> {
-    let io_error = |error| CommandError::io(&path, error);
+    let io_error = |error| CommandError::io(path, error);
     let Range { start, end: _ } = range;
     file.seek(SeekFrom::Start(start)).map_err(io_error)?;
 
