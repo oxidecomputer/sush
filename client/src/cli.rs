@@ -3,6 +3,7 @@
 use std::collections::HashMap;
 use std::io::{Write as _, stdout};
 use std::path::Path;
+use std::time::Duration;
 
 use bytesize::ByteSize;
 use chrono::{DateTime, Utc};
@@ -30,6 +31,10 @@ impl Cli {
             progress: None,
         }
     }
+}
+
+fn byte_size(len: u64) -> bytesize::Display {
+    ByteSize::b(len).display().si()
 }
 
 impl CommandContext for Cli {
@@ -255,22 +260,74 @@ impl CommandContext for Cli {
             let length = ByteSize::b(progress.length().unwrap_or(0));
             let elapsed = progress.elapsed();
             println!(
-                "✅ {stage} {stream}:\t{} in {} ({:.0} MB/s)",
+                "{stage} {stream}:\t{} in {} ({:.0} MB/s)",
                 length.display().si(),
                 format_duration(progress.elapsed()),
                 length.as_mb() / elapsed.as_secs_f64(),
             );
         } else if let OutputFormat::Text = self.get_output_format() {
-            println!("✅ {stage} {stream} for {job_id}");
+            println!("{stage} {stream} for {job_id}");
+        }
+        Ok(())
+    }
+
+    fn job_polling_started(
+        &mut self,
+        job_id: &JobId,
+        elapsed: Duration,
+    ) -> Result<(), CommandError> {
+        if self.progress.is_none() {
+            let bar = ProgressBar::new_spinner();
+            bar.set_elapsed(elapsed);
+            bar.set_prefix(format!("Waiting for `{job_id}`"));
+            bar.set_style(
+                ProgressStyle::with_template(
+                    "{spinner}  \
+                     {prefix} \
+                     [{elapsed_precise}] \
+                     {msg}",
+                )
+                .unwrap(),
+            );
+            self.progress = Some(bar);
+        }
+        Ok(())
+    }
+
+    fn job_polling_update(
+        &mut self,
+        _job_id: &JobId,
+        status: &JobStatus,
+    ) -> Result<(), CommandError> {
+        if let Some(progress) = &mut self.progress {
+            if let JobStatus::Started {
+                stdout_len,
+                stderr_len,
+                ..
+            }
+            | JobStatus::Ended {
+                stdout_len,
+                stderr_len,
+                ..
+            } = status
+            {
+                let stdout_len = byte_size(*stdout_len);
+                let stderr_len = byte_size(*stderr_len);
+                progress.set_message(format!("stdout: {stdout_len}, stderr: {stderr_len}"));
+            }
+            progress.tick();
+        }
+        Ok(())
+    }
+
+    fn job_polling_finished(&mut self, _job_id: &JobId) -> Result<(), CommandError> {
+        if let Some(progress) = self.progress.take() {
+            progress.finish_and_clear();
         }
         Ok(())
     }
 
     fn job_status(&mut self, job_id: &JobId, status: &JobStatus) -> Result<(), CommandError> {
-        fn byte_size(len: u64) -> bytesize::Display {
-            ByteSize::b(len).display().si()
-        }
-
         match self.get_output_format() {
             OutputFormat::Json => println!("{}", json!(status)),
             OutputFormat::Text => match status {
@@ -279,7 +336,8 @@ impl CommandContext for Cli {
                     job_id,
                     time_reserved,
                 } => println!(
-                    "✅ Job ID:\t{job_id}\n   \
+                    "✅ Job status\n   \
+                     Job ID:\t{job_id}\n   \
                      Reserved at:\t{time_reserved}"
                 ),
                 JobStatus::Started {
@@ -292,7 +350,8 @@ impl CommandContext for Cli {
                     let stdout_len = byte_size(*stdout_len);
                     let stderr_len = byte_size(*stderr_len);
                     println!(
-                        "✅ Job ID:\t{job_id}\n   \
+                        "✅ Job status\n   \
+                         Job ID:\t{job_id}\n   \
                          Reserved at:\t{time_reserved}\n   \
                          Started at:\t{time_started}\n   \
                          Stdout len:\t{stdout_len}\n   \
@@ -314,7 +373,8 @@ impl CommandContext for Cli {
                     let stdout_len = byte_size(*stdout_len);
                     let stderr_len = byte_size(*stderr_len);
                     println!(
-                        "✅ Job ID:\t{job_id}\n   \
+                        "✅ Job status\n   \
+                         Job ID:\t{job_id}\n   \
                          Reserved at:\t{time_reserved}\n   \
                          Started at:\t{time_started}\n   \
                          Ended at:\t{time_ended} ({duration})\n   \
@@ -340,7 +400,8 @@ impl CommandContext for Cli {
                     let stdout_len = byte_size(*stdout_len);
                     let stderr_len = byte_size(*stderr_len);
                     println!(
-                        "✅ Job ID:\t{job_id}\n   \
+                        "✅ Job status\n   \
+                         Job ID:\t{job_id}\n   \
                          Reserved at:\t{time_reserved}\n   \
                          Started at:\t{time_started}\n   \
                          Aborted at:\t{time_ended} ({duration})\n   \

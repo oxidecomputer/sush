@@ -6,6 +6,7 @@ use std::collections::HashMap;
 use std::env;
 use std::ffi::OsString;
 use std::path::Path;
+use std::time::Duration;
 
 use chrono::{DateTime, Utc};
 use clap::Parser;
@@ -246,6 +247,26 @@ impl CommandContext for Repl {
         stage: &str,
     ) -> Result<(), CommandError> {
         self.cli.job_output_finished(job_id, stream, stage)
+    }
+
+    fn job_polling_started(
+        &mut self,
+        job_id: &JobId,
+        duration: Duration,
+    ) -> Result<(), CommandError> {
+        self.cli.job_polling_started(job_id, duration)
+    }
+
+    fn job_polling_update(
+        &mut self,
+        job_id: &JobId,
+        status: &JobStatus,
+    ) -> Result<(), CommandError> {
+        self.cli.job_polling_update(job_id, status)
+    }
+
+    fn job_polling_finished(&mut self, job_id: &JobId) -> Result<(), CommandError> {
+        self.cli.job_polling_finished(job_id)
     }
 
     fn job_status(&mut self, job_id: &JobId, status: &JobStatus) -> Result<(), CommandError> {

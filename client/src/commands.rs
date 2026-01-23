@@ -10,9 +10,10 @@ use std::num::{NonZeroU8, NonZeroU64};
 use std::os::fd::AsRawFd;
 use std::path::{Path, PathBuf};
 use std::pin::Pin;
+use std::time::Duration;
 
 use async_recursion::async_recursion;
-use blake3::{Hasher, hash};
+use blake3::{Hash, Hasher, hash};
 use bytesize::ByteSize;
 use chrono::{DateTime, Utc};
 use clap::{Parser, Subcommand, ValueEnum};
@@ -22,8 +23,9 @@ use http::status::StatusCode;
 use libc::{FIONREAD, ioctl};
 use memmap2::Mmap;
 use thiserror::Error;
-use tokio::select;
 use tokio::signal::ctrl_c;
+use tokio::time::{MissedTickBehavior, interval, sleep};
+use tokio::{pin, select};
 
 use sush_common::certs::{CertError, KeyId, Signer as _};
 use sush_common::jobs::JobOutputStream::{self, Stderr, Stdout};
@@ -157,10 +159,7 @@ pub struct ClientArgs {
 }
 
 impl ClientArgs {
-    pub async fn execute<C>(&mut self, ctx: &mut C) -> Result<(), CommandError>
-    where
-        C: CommandContext + Send + Sync,
-    {
+    pub async fn execute(&mut self, ctx: &mut impl CommandContext) -> Result<(), CommandError> {
         self.command.clone().execute(&mut self.globals, ctx).await
     }
 }
@@ -299,7 +298,7 @@ pub enum ClientCommand {
 
 /// Behavior in response to command execution, e.g., printing output,
 /// maintaining (ephemeral) state.
-pub trait CommandContext {
+pub trait CommandContext: Clone + Send + Sync {
     fn get_output_format(&self) -> OutputFormat;
     fn set_output_format(&mut self, output: OutputFormat);
     fn set_globals(&mut self, _args: &mut GlobalArgs, _values: GlobalArgs) {}
@@ -335,6 +334,9 @@ pub trait CommandContext {
         stream: JobOutputStream,
         stage: &str,
     ) -> Result<(), CommandError>;
+    fn job_polling_started(&mut self, id: &JobId, duration: Duration) -> Result<(), CommandError>;
+    fn job_polling_update(&mut self, id: &JobId, status: &JobStatus) -> Result<(), CommandError>;
+    fn job_polling_finished(&mut self, id: &JobId) -> Result<(), CommandError>;
     fn job_status(&mut self, id: &JobId, status: &JobStatus) -> Result<(), CommandError>;
     fn job_signed(&mut self, job: &SignedJob) -> Result<(), CommandError>;
     fn jobs_reserved(&mut self, reserved: &JobsReserved) -> Result<(), CommandError>;
@@ -348,10 +350,11 @@ pub trait CommandContext {
 
 impl ClientCommand {
     #[async_recursion]
-    pub async fn execute<C>(self, args: &mut GlobalArgs, ctx: &mut C) -> Result<(), CommandError>
-    where
-        C: CommandContext + Send + Sync,
-    {
+    pub async fn execute(
+        self,
+        args: &mut GlobalArgs,
+        ctx: &mut impl CommandContext,
+    ) -> Result<(), CommandError> {
         if let Some(output) = args.output {
             ctx.set_output_format(output);
         }
@@ -462,31 +465,55 @@ impl ClientCommand {
     }
 }
 
-async fn job_start<C>(
+async fn job_start(
     client: &Client,
-    ctx: &mut C,
+    ctx: &mut impl CommandContext,
     job: SignedJob,
     limits: JobLimits,
     wait: bool,
     binary: bool,
-) -> Result<(), CommandError>
-where
-    C: CommandContext + Send + Sync,
-{
+) -> Result<(), CommandError> {
     let job_id = job.job_id();
     let JobLimits {
         max_cpu,
         max_mem,
         max_fsize,
     } = limits;
-    let status = select! {
-        status = client.job_start(job_id, max_cpu, max_fsize, max_mem, wait, &job) => status?.into_inner(),
-        _ = ctrl_c() => {
-            client.job_abort(job_id).await?;
-            client.job_status(job_id).await?.into_inner()
+
+    // If we wait for more than a second, show a spinner and poll status.
+    let mut polling = false;
+    let timeout = Duration::from_secs(1);
+    let timer = sleep(timeout);
+    pin!(timer);
+    let mut interval = interval(Duration::from_millis(250));
+    interval.set_missed_tick_behavior(MissedTickBehavior::Skip);
+    let start = client.job_start(job_id, max_cpu, max_fsize, max_mem, wait, &job);
+    pin!(start);
+    let status = loop {
+        select! {
+            status = &mut start => {
+                ctx.job_polling_finished(job_id)?;
+                break status?.into_inner();
+            }
+            _ = &mut timer, if !polling => {
+                ctx.job_polling_started(job_id, timeout)?;
+                polling = true;
+            }
+            _ = interval.tick(), if polling => {
+                let status = client.job_status(job_id).await?.into_inner();
+                ctx.job_polling_update(job_id, &status)?;
+            }
+            _ = ctrl_c() => {
+                ctx.job_polling_finished(job_id)?;
+                client.job_abort(job_id).await?;
+                ctx.job_aborted(job_id)?;
+                break client.job_status(job_id).await?.into_inner();
+            }
         }
     };
     ctx.job_status(job_id, &status)?;
+
+    // If we waited for the job to end, also show its output.
     if wait {
         let stdout =
             byte_stream_to_vec(client.job_output(job_id, &Stdout, None).await?.into_inner())
@@ -599,7 +626,7 @@ async fn job_output<C>(
     }: JobOutput,
 ) -> Result<(), CommandError>
 where
-    C: CommandContext + Send + Sync,
+    C: CommandContext,
 {
     // Fetch job status for output length and hash.
     let JobStatus::Ended {
@@ -617,9 +644,6 @@ where
         Stdout => stdout_len,
         Stderr => stderr_len,
     };
-    if len == 0 {
-        return Ok(());
-    }
     let expected_hash = match stream {
         Stdout => stdout_hash,
         Stderr => stderr_hash,
@@ -662,7 +686,7 @@ where
             byte_stream_to_file(&mut file, &path, bytes, range).await?;
         }
         file.flush().map_err(io_error)?;
-        ctx.job_output_finished(&job_id, stream, "Downloaded")?;
+        ctx.job_output_finished(&job_id, stream, "✅ Downloaded")?;
 
         // Verify the output hash. Multi-threaded BLAKE3 is very, very fast,
         // but still takes noticeable time on multi-GB outputs. So if there's
@@ -677,9 +701,11 @@ where
                 hasher.update_rayon(chunk);
                 ctx.job_output_update(&job_id, stream, chunk.len() as u64)?;
             }
-            check_hash(hasher.finalize())?;
-            ctx.job_output_finished(&job_id, stream, "Verified")?;
-            Ok(())
+            if let Err(error) = check_hash(hasher.finalize()) {
+                ctx.job_output_finished(&job_id, stream, &error.to_string())
+            } else {
+                ctx.job_output_finished(&job_id, stream, "✅ Verified")
+            }
         }
     } else {
         // Download and print the output all at once.
