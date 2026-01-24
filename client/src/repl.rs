@@ -52,7 +52,7 @@ impl ReplCommandParser {
 }
 
 /// Interactive REPL context.
-#[derive(Clone, Debug, Default)]
+#[derive(Debug, Default)]
 pub struct Repl {
     cli: Cli,
     reserved: Vec<JobId>,
@@ -244,7 +244,7 @@ impl CommandContext for Repl {
         &mut self,
         job_id: &JobId,
         stream: JobOutputStream,
-        stage: &str,
+        stage: Option<&str>,
     ) -> Result<(), CommandError> {
         self.cli.job_output_finished(job_id, stream, stage)
     }

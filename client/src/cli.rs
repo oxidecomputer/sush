@@ -18,7 +18,7 @@ use sush_common::jobs::{JobId, JobOutputStream, JobStatus, JobsReserved, SignedJ
 
 use crate::commands::{CommandContext, CommandError, GlobalArgs, OutputFormat};
 
-#[derive(Clone, Debug, Default)]
+#[derive(Debug, Default)]
 pub struct Cli {
     output: OutputFormat,
     progress: Option<ProgressBar>,
@@ -251,22 +251,22 @@ impl CommandContext for Cli {
 
     fn job_output_finished(
         &mut self,
-        job_id: &JobId,
+        _job_id: &JobId,
         stream: JobOutputStream,
-        stage: &str,
+        stage: Option<&str>,
     ) -> Result<(), CommandError> {
         if let Some(progress) = self.progress.take() {
             progress.finish_and_clear();
-            let length = ByteSize::b(progress.length().unwrap_or(0));
-            let elapsed = progress.elapsed();
-            println!(
-                "{stage} {stream}:\t{} in {} ({:.0} MB/s)",
-                length.display().si(),
-                format_duration(progress.elapsed()),
-                length.as_mb() / elapsed.as_secs_f64(),
-            );
-        } else if let OutputFormat::Text = self.get_output_format() {
-            println!("{stage} {stream} for {job_id}");
+            if let Some(stage) = stage {
+                let length = ByteSize::b(progress.length().unwrap_or(0));
+                let elapsed = progress.elapsed();
+                println!(
+                    "{stage} {stream}:\t{} in {} ({:.0} MB/s)",
+                    length.display().si(),
+                    format_duration(progress.elapsed()),
+                    length.as_mb() / elapsed.as_secs_f64(),
+                );
+            }
         }
         Ok(())
     }

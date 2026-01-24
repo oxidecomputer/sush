@@ -35,6 +35,7 @@ pub fn api() -> ApiDescription<JobManager> {
     api.register(job_start).unwrap();
     api.register(job_status).unwrap();
     api.register(job_output).unwrap();
+    api.register(job_output_delete).unwrap();
     api.register(job_abort).unwrap();
     api.register(history).unwrap();
     api
@@ -253,6 +254,23 @@ async fn job_output(
     let JobOutputParams { job_id, stream } = params.into_inner();
     let stdout = ctx.context().job_output(&job_id, stream, range).await?;
     Ok(Response::new(stdout.into()))
+}
+
+/// Truncate the standard output or standard error of a job.
+/// Returns its new length.
+#[endpoint { method = DELETE, path = "/jobs/{job_id}/output/{stream}" }]
+async fn job_output_delete(
+    ctx: Context,
+    headers: Header<RangeRequest>,
+    params: PathParams<JobOutputParams>,
+) -> Result<HttpResponseOk<u64>, HttpError> {
+    let range = headers.into_inner().range()?;
+    let JobOutputParams { job_id, stream } = params.into_inner();
+    let n = ctx
+        .context()
+        .job_output_delete(&job_id, stream, range)
+        .await?;
+    Ok(HttpResponseOk(n))
 }
 
 /// Abort a started job.

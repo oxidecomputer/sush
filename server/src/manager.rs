@@ -7,14 +7,14 @@
 //! Standard output and standard error are saved as files.
 
 use std::collections::BTreeMap;
-use std::fs::{DirBuilder, File};
+use std::fs::{DirBuilder, File, OpenOptions};
 use std::io::{Read as _, Seek as _, SeekFrom};
 use std::num::NonZeroU32;
 use std::path::{Path, PathBuf};
 use std::process::{ExitStatus, Stdio};
 use std::sync::Arc;
 
-use blake3::{Hasher, hash};
+use blake3::Hasher;
 use bytesize::MIB;
 use chrono::{DateTime, Utc};
 use dropshot::{ClientErrorStatusCode, HttpError};
@@ -66,7 +66,7 @@ pub enum JobError {
     InvalidCommand(String),
     #[error("Invalid or duplicate job ID")]
     InvalidJobId(JobId),
-    #[error("Invalid range, please use absolute byte positions < {0}")]
+    #[error("Invalid range for output of length {0}")]
     InvalidRange(u64),
     #[error(transparent)]
     Io(#[from] std::io::Error),
@@ -271,10 +271,18 @@ enum JobRequest {
     Abort {
         job_id: JobId,
     },
+
+    // History and post-hoc modification requests.
     History {
         start: Option<JobId>,
         limit: NonZeroU32,
         response: oneshot::Sender<Result<Vec<JobStatus>, JobError>>,
+    },
+    DeleteOutput {
+        job_id: JobId,
+        stream: JobOutputStream,
+        range: Option<Range>,
+        response: oneshot::Sender<Result<u64, JobError>>,
     },
 }
 
@@ -439,21 +447,6 @@ impl JobManager {
         rx.await?
     }
 
-    pub async fn job_history(
-        &self,
-        start: Option<JobId>,
-        limit: NonZeroU32,
-    ) -> Result<Vec<JobStatus>, JobError> {
-        let (tx, rx) = oneshot::channel();
-        self.request(JobRequest::History {
-            start,
-            limit,
-            response: tx,
-        })
-        .await?;
-        rx.await?
-    }
-
     pub async fn job_abort(&self, job_id: &JobId) -> Result<(), JobError> {
         self.request(JobRequest::Abort {
             job_id: job_id.to_owned(),
@@ -472,6 +465,38 @@ impl JobManager {
             job_id: job_id.to_owned(),
             stream,
             range,
+            response: tx,
+        })
+        .await?;
+        rx.await?
+    }
+
+    pub async fn job_output_delete(
+        &self,
+        job_id: &JobId,
+        stream: JobOutputStream,
+        range: Option<Range>,
+    ) -> Result<u64, JobError> {
+        let (tx, rx) = oneshot::channel();
+        self.request(JobRequest::DeleteOutput {
+            job_id: job_id.to_owned(),
+            stream,
+            range,
+            response: tx,
+        })
+        .await?;
+        rx.await?
+    }
+
+    pub async fn job_history(
+        &self,
+        start: Option<JobId>,
+        limit: NonZeroU32,
+    ) -> Result<Vec<JobStatus>, JobError> {
+        let (tx, rx) = oneshot::channel();
+        self.request(JobRequest::History {
+            start,
+            limit,
             response: tx,
         })
         .await?;
@@ -634,7 +659,7 @@ fn client_request(
             range,
             response,
         } => {
-            let _ = response.send(get_job_output(db, output_dir, &job_id, stream, range));
+            let _ = response.send(get_job_output(output_dir, &job_id, stream, range));
         }
         JobRequest::History {
             start,
@@ -642,6 +667,14 @@ fn client_request(
             response,
         } => {
             let _ = response.send(job_history(db, output_dir, start, limit));
+        }
+        JobRequest::DeleteOutput {
+            job_id,
+            stream,
+            range,
+            response,
+        } => {
+            let _ = response.send(delete_job_output(output_dir, &job_id, stream, range));
         }
     }
     Ok(())
@@ -862,28 +895,7 @@ fn job_started(
     }
 }
 
-fn get_job_output_hash(
-    db: &Connection,
-    job_id: &JobId,
-    stream: JobOutputStream,
-) -> Result<Option<JobOutputHash>, JobError> {
-    let query = format!(
-        "SELECT {stream}_hash FROM jobs WHERE job_id = ?1",
-        // `--SEARCH jobs USING INDEX sqlite_autoindex_jobs_1 (job_id=?)
-    );
-    let mut stmt = db.prepare_cached(&query)?;
-    if let Some(hash) = stmt
-        .query_one([job_id], |row| -> Result<Option<_>, _> { row.get(0) })
-        .optional()?
-    {
-        hash.ok_or(JobError::OutputPending)
-    } else {
-        Err(JobError::InvalidJobId(job_id.to_owned()))
-    }
-}
-
 fn get_job_output(
-    db: &Connection,
     output_dir: &Path,
     job_id: &JobId,
     stream: JobOutputStream,
@@ -919,13 +931,50 @@ fn get_job_output(
     } else {
         let mut buf = Vec::with_capacity(len as usize);
         file.read_to_end(&mut buf)?;
-        if let Some(expected_hash) = get_job_output_hash(db, job_id, stream)?
-            && JobOutputHash::from(hash(&buf)) != expected_hash
-        {
-            Err(JobError::OutputHashMismatch(job_id.clone(), expected_hash))
-        } else {
-            Ok(buf)
-        }
+        Ok(buf)
+    }
+}
+
+fn delete_job_output(
+    output_dir: &Path,
+    job_id: &JobId,
+    stream: JobOutputStream,
+    range: Option<Range>,
+) -> Result<u64, JobError> {
+    let len = job_output_len(output_dir, job_id, stream);
+    if let Some(Range {
+        start: StartPosition::Index(n),
+        end: EndPosition::LastByte,
+    }) = range
+        && n <= len
+    {
+        let path = job_output_path(output_dir, job_id, stream);
+        let Ok(file) = OpenOptions::new().write(true).open(&path) else {
+            return Ok(0);
+        };
+        file.set_len(n)?;
+        Ok(n)
+    } else {
+        Err(JobError::InvalidRange(len))
+    }
+}
+
+fn get_job_status(
+    db: &Connection,
+    output_dir: &Path,
+    job_id: &JobId,
+) -> Result<JobStatus, JobError> {
+    if let Some(status) = db
+        .prepare_cached(
+            "SELECT * FROM jobs WHERE job_id = ?1",
+            // `--SEARCH jobs USING INDEX sqlite_autoindex_jobs_1 (job_id=?)
+        )?
+        .query_one([job_id], job_row_to_status(output_dir))
+        .optional()?
+    {
+        Ok(status)
+    } else {
+        Err(JobError::InvalidJobId(job_id.to_owned()))
     }
 }
 
@@ -976,25 +1025,6 @@ fn job_row_to_status(output_dir: &Path) -> impl FnOnce(&Row<'_>) -> Result<JobSt
         } else {
             panic!("time_reserved should be NOT NULL")
         }
-    }
-}
-
-fn get_job_status(
-    db: &Connection,
-    output_dir: &Path,
-    job_id: &JobId,
-) -> Result<JobStatus, JobError> {
-    if let Some(status) = db
-        .prepare_cached(
-            "SELECT * FROM jobs WHERE job_id = ?1",
-            // `--SEARCH jobs USING INDEX sqlite_autoindex_jobs_1 (job_id=?)
-        )?
-        .query_one([job_id], job_row_to_status(output_dir))
-        .optional()?
-    {
-        Ok(status)
-    } else {
-        Err(JobError::InvalidJobId(job_id.to_owned()))
     }
 }
 

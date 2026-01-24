@@ -13,7 +13,7 @@ use std::pin::Pin;
 use std::time::Duration;
 
 use async_recursion::async_recursion;
-use blake3::{Hash, Hasher, hash};
+use blake3::{Hasher, hash};
 use bytesize::ByteSize;
 use chrono::{DateTime, Utc};
 use clap::{Parser, Subcommand, ValueEnum};
@@ -176,7 +176,7 @@ pub struct JobOutput {
     job_id: JobId,
 
     /// Job output is binary, not UTF-8 encoded text.
-    #[arg(short, long, default_value_t = false)]
+    #[arg(short, long, default_value_t = false, conflicts_with = "file")]
     binary: bool,
 
     /// File that output should be written to.
@@ -184,16 +184,23 @@ pub struct JobOutput {
     file: Option<PathBuf>,
 
     /// Overwrite output file if it exists.
-    #[arg(long)]
+    #[arg(long, requires = "file")]
     force: bool,
 
     /// Chunk size for parallel downloads of large output.
-    #[arg(short, long, default_value_t = DEFAULT_CHUNK_SIZE)]
+    #[arg(short, long, default_value_t = DEFAULT_CHUNK_SIZE, requires = "file")]
     chunk_size: ByteSize,
 
     /// Number of simultaneous downloads for large output [max: 255].
-    #[arg(short, long, default_value_t = PARALLEL_CHUNKS)]
+    #[arg(short, long, default_value_t = PARALLEL_CHUNKS, requires = "file")]
     parallel: NonZeroU8,
+
+    /// Size to which output should be truncated *on the server*.
+    ///
+    /// WARNING: Destructive and irreversible! Subsequent downloads of this
+    /// output will show a hash mismatch to warn that this has taken place.
+    #[arg(long, conflicts_with = "file")]
+    truncate: Option<ByteSize>,
 }
 
 /// Support Shell job management command
@@ -313,7 +320,7 @@ pub enum ClientCommand {
 
 /// Behavior in response to command execution, e.g., printing output,
 /// maintaining (ephemeral) state.
-pub trait CommandContext: Clone + Send + Sync {
+pub trait CommandContext: Send + Sync {
     fn get_output_format(&self) -> OutputFormat;
     fn set_output_format(&mut self, output: OutputFormat);
     fn set_globals(&mut self, _args: &mut GlobalArgs, _values: GlobalArgs) {}
@@ -347,7 +354,7 @@ pub trait CommandContext: Clone + Send + Sync {
         &mut self,
         id: &JobId,
         stream: JobOutputStream,
-        stage: &str,
+        stage: Option<&str>,
     ) -> Result<(), CommandError>;
     fn job_polling_started(&mut self, id: &JobId, duration: Duration) -> Result<(), CommandError>;
     fn job_polling_update(&mut self, id: &JobId, status: &JobStatus) -> Result<(), CommandError>;
@@ -639,10 +646,10 @@ struct Chunk(Range, ByteStream);
 /// A promise of some bytes for a range of output.
 type FutureChunk<'a> = dyn Future<Output = Result<Chunk, CommandError>> + Send + 'a;
 
-/// Download job output and save or print it.
-async fn job_output<C>(
+/// Download or truncate job output.
+async fn job_output(
     client: &Client,
-    ctx: &mut C,
+    ctx: &mut impl CommandContext,
     stream: JobOutputStream,
     JobOutput {
         job_id,
@@ -651,11 +658,17 @@ async fn job_output<C>(
         force,
         chunk_size,
         parallel,
+        truncate,
     }: JobOutput,
-) -> Result<(), CommandError>
-where
-    C: CommandContext,
-{
+) -> Result<(), CommandError> {
+    // Maybe truncate instead of fetching output.
+    if let Some(n) = truncate.map(|n| n.as_u64()) {
+        client
+            .job_output_delete(&job_id, &stream, Some(&format!("bytes={n}-")))
+            .await?;
+        return Ok(());
+    }
+
     // Fetch job status for output length and hash.
     let JobStatus::Ended {
         stdout_len,
@@ -676,15 +689,19 @@ where
         Stdout => stdout_hash,
         Stderr => stderr_hash,
     };
-    let check_hash = |hash: Hash| -> Result<(), CommandError> {
-        let expected = expected_hash;
-        let received = hash.into();
-        if received == expected {
-            Ok(())
-        } else {
-            Err(CommandError::OutputHashMismatch { expected, received })
-        }
-    };
+
+    macro_rules! check_hash {
+        ($hash:expr, $stage:expr) => {{
+            let expected = expected_hash;
+            let received = $hash.into();
+            if received == expected {
+                ctx.job_output_finished(&job_id, stream, $stage)
+            } else {
+                let _ = ctx.job_output_finished(&job_id, stream, None);
+                Err(CommandError::OutputHashMismatch { expected, received })
+            }
+        }};
+    }
 
     if let Some(path) = file {
         // Save the output to a file, downloading in chunks.
@@ -714,35 +731,35 @@ where
             byte_stream_to_file(&mut file, &path, bytes, range).await?;
         }
         file.flush().map_err(io_error)?;
-        ctx.job_output_finished(&job_id, stream, "✅ Downloaded")?;
+        ctx.job_output_finished(&job_id, stream, Some("✅ Downloaded"))?;
 
-        // Verify the output hash. Multi-threaded BLAKE3 is very, very fast,
-        // but still takes noticeable time on multi-GB outputs. So if there's
-        // more than one chunk, we'll give it a progress bar, too.
+        // Verify the output hash. Note that even if this verification fails,
+        // we will leave the file as written. This provides a way of fetching
+        // truncated outputs (with an error).
         let output = unsafe { Mmap::map(&file) }.map_err(io_error)?;
         if len < chunk_size.get() {
-            check_hash(hash(&output))
+            check_hash!(hash(&output), None)
         } else {
+            // Multi-threaded BLAKE3 is very, very fast, but still takes
+            // perceptible time on multi-GB outputs. So if there's more
+            // than one chunk, hash in chunks with a progress bar.
             ctx.job_output_started(&job_id, stream, "Verifying", len)?;
             let mut hasher = Hasher::new();
             for chunk in output.chunks(chunk_size.get() as usize) {
                 hasher.update_rayon(chunk);
                 ctx.job_output_update(&job_id, stream, chunk.len() as u64)?;
             }
-            if let Err(error) = check_hash(hasher.finalize()) {
-                ctx.job_output_finished(&job_id, stream, &error.to_string())
-            } else {
-                ctx.job_output_finished(&job_id, stream, "✅ Verified")
-            }
+            check_hash!(hasher.finalize(), Some("✅ Verified"))
         }
     } else {
-        // Download and print the output all at once.
+        // Download and print the output all at once. If hash verification
+        // fails here, do not print any output.
         let byte_stream = client
             .job_output(&job_id, &stream, None)
             .await?
             .into_inner();
         let bytes = byte_stream_to_vec(byte_stream).await?;
-        check_hash(hash(&bytes))?;
+        check_hash!(hash(&bytes), None)?;
         ctx.job_output(&job_id, stream, &bytes, binary)
     }
 }
