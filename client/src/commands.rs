@@ -490,8 +490,8 @@ impl ClientCommand {
                 ctx.set_globals(args, values);
                 Ok(())
             }
-            (ClientCommand::Shell, _) => {
-                Repl::default().run(args).await?;
+            (ClientCommand::Shell, client) => {
+                Repl::default().run(args, client).await?;
                 Ok(())
             }
             (ClientCommand::Quit, _) => Err(CommandError::Quit),

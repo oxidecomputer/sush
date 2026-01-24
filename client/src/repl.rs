@@ -18,6 +18,7 @@ use xdg::BaseDirectories;
 use sush_common::certs::KeyId;
 use sush_common::jobs::{JobId, JobOutputStream, JobStatus, JobsReserved, SignedJob};
 
+use crate::Client;
 use crate::cli::Cli;
 use crate::commands::{
     ClientCommand, CommandContext, CommandError, GlobalArgs, OutputFormat, SUSH_JOB_ID,
@@ -59,7 +60,16 @@ pub struct Repl {
 }
 
 impl Repl {
-    pub async fn run(mut self, args: &mut GlobalArgs) -> Result<(), CommandError> {
+    pub async fn run(
+        mut self,
+        args: &mut GlobalArgs,
+        client: Option<Client>,
+    ) -> Result<(), CommandError> {
+        if let Some(client) = client {
+            let map = client.get_reserved().await?.into_inner();
+            self.reserved_map(&map)?;
+        }
+
         let xdg = BaseDirectories::with_prefix(PREFIX);
         let history_file = xdg
             .place_state_file(HISTORY_FILE)
@@ -300,6 +310,9 @@ impl CommandContext for Repl {
     ) -> Result<(), CommandError> {
         self.cli.reserved_map(reserved)?;
         self.reserved = reserved.keys().map(JobId::from).collect();
+        if let Some(job_id) = self.reserved.first() {
+            self.set_job_id(Some(job_id.to_owned()));
+        }
         Ok(())
     }
 
