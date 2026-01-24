@@ -328,13 +328,17 @@ impl<T: ToBeSigned> Signed<T> {
 }
 
 /// An envelope whose signature has been verified.
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, Deserialize, JsonSchema, Serialize)]
 pub struct Verified<T> {
     signed: Signed<T>,
     verified_by: KeyId,
 }
 
 impl<T> Verified<T> {
+    pub fn into_signed(self) -> Signed<T> {
+        self.signed
+    }
+
     pub fn verified_by(&self) -> &KeyId {
         &self.verified_by
     }

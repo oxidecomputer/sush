@@ -169,7 +169,7 @@ impl JobStart {
         }
     }
 
-    fn start(self) -> Result<JobStarted, JobError> {
+    fn start(self, time_reserved: DateTime<Utc>) -> Result<JobStarted, JobError> {
         let Self {
             job,
             limits,
@@ -198,6 +198,7 @@ impl JobStart {
             command.pre_exec(move || limits.apply());
         }
         Ok(JobStarted {
+            time_reserved,
             time_started: Utc::now(),
             child: command.spawn()?,
         })
@@ -210,6 +211,7 @@ impl JobStart {
 
 #[derive(Debug)]
 struct JobStarted {
+    time_reserved: DateTime<Utc>,
     time_started: DateTime<Utc>,
     child: Child,
 }
@@ -217,10 +219,41 @@ struct JobStarted {
 #[derive(Clone, Debug)]
 pub struct JobEnd {
     job: VerifiedJob,
+    time_reserved: DateTime<Utc>,
+    time_started: DateTime<Utc>,
     time_ended: DateTime<Utc>,
     status: Option<ExitStatus>,
+    stdout_len: u64,
+    stderr_len: u64,
     stdout_hash: JobOutputHash,
     stderr_hash: JobOutputHash,
+}
+
+impl From<JobEnd> for JobStatus {
+    fn from(end: JobEnd) -> Self {
+        let JobEnd {
+            job,
+            time_reserved,
+            time_started,
+            time_ended,
+            status,
+            stdout_len,
+            stderr_len,
+            stdout_hash,
+            stderr_hash,
+        } = end;
+        Self::Ended {
+            job,
+            time_reserved,
+            time_started,
+            time_ended,
+            status: status.and_then(|status| status.code()),
+            stdout_len,
+            stderr_len,
+            stdout_hash,
+            stderr_hash,
+        }
+    }
 }
 
 #[derive(Debug)]
@@ -554,8 +587,12 @@ fn job_ended(
         }
         Ok(Ok(JobEnd {
             job,
+            time_reserved: _,
+            time_started: _,
             time_ended,
             status,
+            stdout_len: _,
+            stderr_len: _,
             stdout_hash,
             stderr_hash,
         })) => {
@@ -666,7 +703,7 @@ fn client_request(
             limit,
             response,
         } => {
-            let _ = response.send(job_history(db, output_dir, start, limit));
+            let _ = response.send(get_job_history(db, output_dir, start, limit));
         }
         JobRequest::DeleteOutput {
             job_id,
@@ -706,15 +743,16 @@ fn start_job(
 
     // Verify the job request.
     let txn = exe!(db.transaction());
-    let _time_reserved = exe!(verify_reservation(&txn, &job_id));
+    let time_reserved = exe!(verify_reservation(&txn, &job_id));
     let cert = exe!(get_cert(&txn, job.key_id()));
     let job = exe!(job.verify(&cert));
 
     // Start the job.
     let JobStarted {
+        time_reserved,
         time_started,
         mut child,
-    } = exe!(start.start());
+    } = exe!(start.start(time_reserved));
     exe!(job_started(&txn, &job, time_started));
     exe!(txn.commit());
 
@@ -730,17 +768,23 @@ fn start_job(
                 None
             }
         };
+        let stdout_len = job_output_len(&output_dir, &job_id, Stdout);
+        let stderr_len = job_output_len(&output_dir, &job_id, Stderr);
         let stdout_hash = exe!(job_output_hash(&output_dir, &job_id, Stdout));
         let stderr_hash = exe!(job_output_hash(&output_dir, &job_id, Stderr));
         let time_ended = Utc::now();
         let end = JobEnd {
             job,
+            time_reserved,
+            time_started,
             time_ended,
             status,
+            stdout_len,
+            stderr_len,
             stdout_hash,
             stderr_hash,
         };
-        let _ = response.send(Ok(end.clone()));
+        let _ = response.send(Ok(dbg!(end.clone())));
         Ok(end)
     });
 
@@ -966,10 +1010,11 @@ fn get_job_status(
 ) -> Result<JobStatus, JobError> {
     if let Some(status) = db
         .prepare_cached(
-            "SELECT * FROM jobs WHERE job_id = ?1",
-            // `--SEARCH jobs USING INDEX sqlite_autoindex_jobs_1 (job_id=?)
+            "SELECT * FROM jobs NATURAL LEFT JOIN certs WHERE job_id = ?1",
+            // |--SEARCH jobs USING INDEX sqlite_autoindex_jobs_1 (job_id=?)
+            // `--SEARCH certs USING INDEX sqlite_autoindex_certs_1 (key_id=?) LEFT-JOIN
         )?
-        .query_one([job_id], job_row_to_status(output_dir))
+        .query_one([job_id], make_job_row_to_status(output_dir))
         .optional()?
     {
         Ok(status)
@@ -978,57 +1023,7 @@ fn get_job_status(
     }
 }
 
-/// Return a closure over `output_dir`.
-fn job_row_to_status(output_dir: &Path) -> impl FnOnce(&Row<'_>) -> Result<JobStatus, SqliteError> {
-    move |row| {
-        let job_id: JobId = row.get("job_id")?;
-        if let Ok(time_ended) = row.get("time_ended") {
-            let key_id: KeyId = row.get("key_id")?;
-            Ok(JobStatus::Ended {
-                job: SignedJob::new(
-                    JobStartRequest {
-                        job_id: job_id.clone(),
-                        command: row.get("command")?,
-                    },
-                    key_id.clone(),
-                    row.get("signature")?,
-                ),
-                time_reserved: row.get("time_reserved")?,
-                time_started: row.get("time_started")?,
-                time_ended,
-                status: row.get("status")?,
-                stdout_len: job_output_len(output_dir, &job_id, Stdout),
-                stderr_len: job_output_len(output_dir, &job_id, Stderr),
-                stdout_hash: row.get("stdout_hash")?,
-                stderr_hash: row.get("stderr_hash")?,
-            })
-        } else if let Ok(time_started) = row.get("time_started") {
-            Ok(JobStatus::Started {
-                job: SignedJob::new(
-                    JobStartRequest {
-                        job_id: job_id.clone(),
-                        command: row.get("command")?,
-                    },
-                    row.get("key_id")?,
-                    row.get("signature")?,
-                ),
-                time_reserved: row.get("time_reserved")?,
-                time_started,
-                stdout_len: job_output_len(output_dir, &job_id, Stdout),
-                stderr_len: job_output_len(output_dir, &job_id, Stderr),
-            })
-        } else if let Ok(time_reserved) = row.get("time_reserved") {
-            Ok(JobStatus::Reserved {
-                job_id: job_id.clone(),
-                time_reserved,
-            })
-        } else {
-            panic!("time_reserved should be NOT NULL")
-        }
-    }
-}
-
-fn job_history(
+fn get_job_history(
     db: &Connection,
     output_dir: &Path,
     start: Option<JobId>,
@@ -1058,9 +1053,65 @@ fn job_history(
     let mut entries = vec![];
     let mut rows = stmt.raw_query();
     while let Some(row) = rows.next()? {
-        entries.push(job_row_to_status(output_dir)(row)?);
+        entries.push(make_job_row_to_status(output_dir)(row)?);
     }
     Ok(entries)
+}
+
+/// Return a closure over `output_dir` that constructs a [`JobStatus`]
+/// from a row in the `jobs` table.
+///
+/// Panics if the row structure is not as expected and if an invalid
+/// certificate or signature is found.
+fn make_job_row_to_status(
+    output_dir: &Path,
+) -> impl FnOnce(&Row<'_>) -> Result<JobStatus, SqliteError> {
+    move |row| {
+        let job_id: JobId = row.get("job_id")?;
+        let get_verified_job = || -> Result<VerifiedJob, SqliteError> {
+            let cert = Certificate::from_der(&row.get::<_, Vec<u8>>("cert")?)
+                .expect("certificate should be DER, database may be corrupt");
+            Ok(SignedJob::new(
+                JobStartRequest {
+                    job_id: job_id.clone(),
+                    command: row.get("command")?,
+                },
+                row.get("key_id")?,
+                row.get("signature")?,
+            )
+            .verify(&cert)
+            .expect("signature should validate, database may be corrupt"))
+        };
+
+        if let Ok(time_ended) = row.get("time_ended") {
+            Ok(JobStatus::Ended {
+                job: get_verified_job()?,
+                time_reserved: row.get("time_reserved")?,
+                time_started: row.get("time_started")?,
+                time_ended,
+                status: row.get("status")?,
+                stdout_len: job_output_len(output_dir, &job_id, Stdout),
+                stderr_len: job_output_len(output_dir, &job_id, Stderr),
+                stdout_hash: row.get("stdout_hash")?,
+                stderr_hash: row.get("stderr_hash")?,
+            })
+        } else if let Ok(time_started) = row.get("time_started") {
+            Ok(JobStatus::Started {
+                job: get_verified_job()?,
+                time_reserved: row.get("time_reserved")?,
+                time_started,
+                stdout_len: job_output_len(output_dir, &job_id, Stdout),
+                stderr_len: job_output_len(output_dir, &job_id, Stderr),
+            })
+        } else if let Ok(time_reserved) = row.get("time_reserved") {
+            Ok(JobStatus::Reserved {
+                job_id: job_id.clone(),
+                time_reserved,
+            })
+        } else {
+            panic!("time_reserved should be NOT NULL")
+        }
+    }
 }
 
 #[cfg(test)]
@@ -1131,10 +1182,10 @@ mod test {
             panic!("expected job to be started");
         };
         assert_eq!(job.job_id, *expected_job_id);
-        let job = job.verify(cert).unwrap();
         assert_eq!(job.command, expected_command);
         assert!(time_reserved < time_started);
         assert!(time_started < Utc::now());
+        job.into_signed().verify(cert).unwrap();
     }
 
     fn check_status_ended(
@@ -1218,8 +1269,7 @@ mod test {
             .job_start(job.clone(), JobLimits::default())
             .await
             .unwrap();
-        rx.await.unwrap().unwrap();
-        let status = mgr.job_status(&job_id).await.unwrap();
+        let status = rx.await.unwrap().unwrap().into();
         check_status_ended(status, &job_id, "true", Some(0), 0, 0);
 
         let rx = mgr.job_start(job, JobLimits::default()).await.unwrap();
@@ -1234,8 +1284,7 @@ mod test {
         let job_id = job_ids.pop().unwrap();
         let job = root.sign_job_request(&job_id, "false").await;
         let rx = mgr.job_start(job, JobLimits::default()).await.unwrap();
-        rx.await.unwrap().unwrap();
-        let status = mgr.job_status(&job_id).await.unwrap();
+        let status = rx.await.unwrap().unwrap().into();
         check_status_ended(status, &job_id, "false", Some(1), 0, 0);
 
         let job_id = job_ids.pop().unwrap();
@@ -1445,8 +1494,7 @@ mod test {
         let job_id = job_ids.pop().unwrap();
         let job = root.sign_job_request(&job_id, command).await;
         let rx = mgr.job_start(job, JobLimits::default()).await.unwrap();
-        rx.await.unwrap().unwrap();
-        let status = mgr.job_status(&job_id).await.unwrap();
+        let status = rx.await.unwrap().unwrap().into();
         check_status_ended(status, &job_id, command, Some(0), n, 0);
 
         // No range, i.e., full output.

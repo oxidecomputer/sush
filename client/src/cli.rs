@@ -335,7 +335,8 @@ impl CommandContext for Cli {
                     job_id,
                     time_reserved,
                 } => println!(
-                    "✅ Job status\n   \
+                    "✅ Job ID:\t{job_id}\n   \
+                     Job status:\tReserved\n   \
                      Job ID:\t{job_id}\n   \
                      Reserved at:\t{time_reserved}"
                 ),
@@ -349,8 +350,8 @@ impl CommandContext for Cli {
                     let stdout_len = byte_size(*stdout_len);
                     let stderr_len = byte_size(*stderr_len);
                     println!(
-                        "✅ Job status\n   \
-                         Job ID:\t{job_id}\n   \
+                        "✅ Job ID:\t{job_id}\n   \
+                         Job status:\tStarted\n   \
                          Reserved at:\t{time_reserved}\n   \
                          Started at:\t{time_started}\n   \
                          Stdout len:\t{stdout_len}\n   \
@@ -372,8 +373,8 @@ impl CommandContext for Cli {
                     let stdout_len = byte_size(*stdout_len);
                     let stderr_len = byte_size(*stderr_len);
                     println!(
-                        "✅ Job status\n   \
-                         Job ID:\t{job_id}\n   \
+                        "✅ Job ID:\t{job_id}\n   \
+                         Job status:\tEnded\n   \
                          Reserved at:\t{time_reserved}\n   \
                          Started at:\t{time_started}\n   \
                          Ended at:\t{time_ended} ({duration})\n   \
@@ -399,8 +400,8 @@ impl CommandContext for Cli {
                     let stdout_len = byte_size(*stdout_len);
                     let stderr_len = byte_size(*stderr_len);
                     println!(
-                        "✅ Job status\n   \
-                         Job ID:\t{job_id}\n   \
+                        "✅ Job ID:\t{job_id}\n   \
+                         Job status: Aborted\n   \
                          Reserved at:\t{time_reserved}\n   \
                          Started at:\t{time_started}\n   \
                          Aborted at:\t{time_ended} ({duration})\n   \

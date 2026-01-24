@@ -180,13 +180,16 @@ async fn job_start(
     }
     let done = mgr.job_start(job, limits).await?;
     if wait {
-        done.await
+        let end = done
+            .await
             .map_err(|_| {
                 HttpError::for_internal_error(String::from("can't wait for job, sender dropped"))
             })?
             .map_err(JobError::from)?;
+        Ok(HttpResponseOk(end.into()))
+    } else {
+        Ok(HttpResponseOk(mgr.job_status(&job_id).await?))
     }
-    Ok(HttpResponseOk(ctx.context().job_status(&job_id).await?))
 }
 
 /// Get the status of a started job.
