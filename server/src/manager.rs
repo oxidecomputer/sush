@@ -785,7 +785,7 @@ fn start_job(
             stdout_hash,
             stderr_hash,
         };
-        let _ = response.send(Ok(dbg!(end.clone())));
+        let _ = response.send(Ok(end.clone()));
         Ok(end)
     });
 
@@ -1033,7 +1033,7 @@ fn get_job_history(
     let mut stmt = if let Some(start) = start {
         prepare_cached_and_bind!(
             db,
-            "SELECT * FROM jobs \
+            "SELECT * FROM jobs NATURAL LEFT JOIN certs \
              WHERE time_started < (SELECT time_started FROM jobs WHERE job_id=$start) \
              ORDER by time_started DESC, time_reserved DESC \
              LIMIT $limit"
@@ -1041,15 +1041,17 @@ fn get_job_history(
         // |--SEARCH jobs USING INDEX jobs_time_started (time_started<?)
         // |--SCALAR SUBQUERY 1
         // |  `--SEARCH jobs USING INDEX sqlite_autoindex_jobs_1 (job_id=?)
+        // |--SEARCH certs USING INDEX sqlite_autoindex_certs_1 (key_id=?) LEFT-JOIN
         // `--USE TEMP B-TREE FOR LAST TERM OF ORDER BY
     } else {
         prepare_cached_and_bind!(
             db,
-            "SELECT * FROM jobs \
+            "SELECT * FROM jobs NATURAL LEFT JOIN certs \
              ORDER BY time_started DESC \
              LIMIT $limit"
         )
-        // `--SCAN jobs USING INDEX jobs_time_started
+        // |--SCAN jobs USING INDEX jobs_time_started
+        // `--SEARCH certs USING INDEX sqlite_autoindex_certs_1 (key_id=?) LEFT-JOIN
     };
     let mut entries = vec![];
     let mut rows = stmt.raw_query();
