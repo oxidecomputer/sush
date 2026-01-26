@@ -4,7 +4,7 @@
 //! database. It services requests and sends responses via oneshot
 //! channels (included in the requests). Jobs are spawned onto new
 //! tokio tasks, which the manager loop watches for completion.
-//! Standard output and standard error are saved as files.
+//! Standard output and standard error are saved in files.
 
 use std::collections::BTreeMap;
 use std::fs::{DirBuilder, File, OpenOptions};
@@ -183,16 +183,14 @@ impl JobStart {
         DirBuilder::new().recursive(true).create(job_dir)?;
         let stdout_path = job_output_path(&output_dir, job_id, Stdout);
         let stderr_path = job_output_path(&output_dir, job_id, Stderr);
-        let stdout = File::create_new(stdout_path)?;
-        let stderr = File::create_new(stderr_path)?;
         let mut command = Command::new("bash");
         command
             .arg("-c")
             .arg(job.command())
             .env("SUSH_JOB_ID", job_id.to_string())
             .stdin(Stdio::null())
-            .stdout(stdout)
-            .stderr(stderr)
+            .stdout(File::create_new(stdout_path)?)
+            .stderr(File::create_new(stderr_path)?)
             .kill_on_drop(true);
         unsafe {
             command.pre_exec(move || limits.apply());
@@ -209,6 +207,7 @@ impl JobStart {
     }
 }
 
+/// Event representing the start of a job.
 #[derive(Debug)]
 struct JobStarted {
     time_reserved: DateTime<Utc>,
@@ -216,6 +215,8 @@ struct JobStarted {
     child: Child,
 }
 
+/// Event representing the end of a job. If the job ended due to
+/// a signal or an abort, `status` will be `None`.
 #[derive(Clone, Debug)]
 pub struct JobEnd {
     job: VerifiedJob,

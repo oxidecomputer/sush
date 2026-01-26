@@ -863,7 +863,11 @@ pub enum CommandError {
     MissingKeyName,
     #[error("❌ Command not supported in offline mode, try `--url`")]
     Offline,
-    #[error("❌ Output hash mismatch: expected {expected}, received {received}")]
+    #[error(
+        "❌ Hash mismatch, output may be truncated or corrupt\n   \
+            Expected: {expected}\n   \
+            Received: {received}"
+    )]
     OutputHashMismatch {
         expected: JobOutputHash,
         received: JobOutputHash,
