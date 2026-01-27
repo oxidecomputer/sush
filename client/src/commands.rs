@@ -714,7 +714,7 @@ async fn job_output(
         let mut options = OpenOptions::new();
         options.read(true).write(true);
         if force {
-            options.truncate(true);
+            options.create(true).truncate(true);
         } else {
             options.create_new(true);
         }
@@ -864,7 +864,7 @@ pub enum CommandError {
     #[error("❌ Command not supported in offline mode, try `--url`")]
     Offline,
     #[error(
-        "❌ Hash mismatch, output may be truncated or corrupt\n   \
+        "❌ Hash mismatch, output may be truncated or corrupted\n   \
             Expected: {expected}\n   \
             Received: {received}"
     )]

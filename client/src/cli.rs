@@ -199,7 +199,7 @@ impl CommandContext for Cli {
             OutputFormat::Text => {
                 match stream {
                     JobOutputStream::Stdout => println!("✅ Job stdout:"),
-                    JobOutputStream::Stderr => println!("❌ Job stderr:"),
+                    JobOutputStream::Stderr => println!("✅ Job stderr:"),
                 };
                 let output = String::from_utf8(output.to_vec())?;
                 if output.ends_with('\n') {
