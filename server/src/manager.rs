@@ -29,7 +29,7 @@ use tokio::select;
 use tokio::sync::{mpsc, oneshot};
 use tokio::task::{JoinError, JoinHandle, JoinSet, spawn};
 use x509_cert::Certificate;
-use x509_cert::der::{Decode as _, Encode as _};
+use x509_cert::der::{Decode as _, DecodePem as _, Encode as _};
 
 use sush_common::certs::{CertError, KeyId, Signature};
 use sush_common::codephrases::generate_id;
@@ -42,8 +42,9 @@ use sush_common::jobs::{
 /// Self-signed (root) X.509 certificates. Self-signed certificates may
 /// not be imported (except in test code), and so must be included here.
 pub const ROOT_CERTS: &[&[u8]] = &[
-    // TODO: replace with a trusted root
-    include_bytes!("../certs/untrusted.crt"),
+    // export PERMSLIP_URL="https://permslip.inickles.0xeng.dev"
+    // export SUSH_PERMSLIP_KEY="UNTRUSTED Support Shell Prototype"
+    include_bytes!("../certs/sandbox.pem"),
 ];
 
 /// Output files or ranges larger than this will not be served all at once.
@@ -332,7 +333,7 @@ impl JobManager {
     pub async fn new(mut db: Connection, output_dir: &Path, log: Logger) -> Result<Self, JobError> {
         // Import the root certificates.
         for root in ROOT_CERTS {
-            let cert = Certificate::from_der(root)?;
+            let cert = Certificate::from_pem(root).or_else(|_| Certificate::from_der(root))?;
             let key_id = import_cert(&db, &cert, true)?;
             info!(log, "imported root certificate"; "key_id" => %key_id);
         }
