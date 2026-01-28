@@ -180,6 +180,11 @@ impl CommandContext for Cli {
         Ok(())
     }
 
+    fn job_error(&mut self, error: CommandError) -> Result<(), CommandError> {
+        eprintln!("{error}");
+        Ok(())
+    }
+
     fn job_output(
         &mut self,
         _job_id: &JobId,

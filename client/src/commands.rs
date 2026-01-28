@@ -330,6 +330,7 @@ pub trait CommandContext: Send + Sync {
     fn cert_chain(&mut self, key_id: KeyId, certs: &str) -> Result<(), CommandError>;
     fn cert_imported(&mut self, path: &Path, key_id: KeyId) -> Result<(), CommandError>;
     fn job_aborted(&mut self, id: &JobId) -> Result<(), CommandError>;
+    fn job_error(&mut self, error: CommandError) -> Result<(), CommandError>;
     fn job_output(
         &mut self,
         id: &JobId,
@@ -548,16 +549,19 @@ async fn job_start(
     };
     ctx.job_status(job_id, &status)?;
 
-    // If we waited for the job to end, also show its output.
+    // If we waited for the job to end, also try to show its output.
     if wait {
-        let stdout =
-            byte_stream_to_vec(client.job_output(job_id, &Stdout, None).await?.into_inner())
-                .await?;
-        let stderr =
-            byte_stream_to_vec(client.job_output(job_id, &Stderr, None).await?.into_inner())
-                .await?;
-        ctx.job_output(job_id, Stdout, &stdout, binary)?;
-        ctx.job_output(job_id, Stderr, &stderr, binary)?;
+        for stream in [Stdout, Stderr] {
+            match client.job_output(job_id, &stream, None).await {
+                Ok(byte_stream) => {
+                    let output = byte_stream_to_vec(byte_stream.into_inner()).await?;
+                    ctx.job_output(job_id, stream, &output, binary)?;
+                }
+                Err(error) => {
+                    ctx.job_error(error.into())?;
+                }
+            }
+        }
     }
     Ok(())
 }

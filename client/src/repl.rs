@@ -218,6 +218,10 @@ impl CommandContext for Repl {
         Ok(())
     }
 
+    fn job_error(&mut self, error: CommandError) -> Result<(), CommandError> {
+        self.cli.job_error(error)
+    }
+
     fn job_output(
         &mut self,
         job_id: &JobId,
