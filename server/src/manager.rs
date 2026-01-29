@@ -10,19 +10,24 @@ use std::collections::BTreeMap;
 use std::fs::{DirBuilder, File, OpenOptions};
 use std::io::{Read as _, Seek as _, SeekFrom};
 use std::num::NonZeroU32;
+use std::os::unix::io::AsRawFd as _;
 use std::path::{Path, PathBuf};
 use std::process::{ExitStatus, Stdio};
 use std::sync::Arc;
 
 use blake3::Hasher;
-use bytesize::MIB;
+use bytesize::ByteSize;
 use chrono::{DateTime, Utc};
 use dropshot::{ClientErrorStatusCode, HttpError};
 use http_range_header::{EndPosition, StartPosition, SyntacticallyCorrectRange as Range};
 use rusqlite::{
     Connection, Error as SqliteError, OptionalExtension as _, Row, prepare_cached_and_bind,
 };
-use slog::{Logger, error, info};
+use rust_pty::UnixPtyMaster;
+use rust_pty::unix::open_slave;
+use rustix::io::close;
+use rustix::process::{ioctl_tiocsctty, setsid};
+use slog::{Logger, error, info, o, warn};
 use thiserror::Error;
 use tokio::process::{Child, Command};
 use tokio::select;
@@ -38,6 +43,9 @@ use sush_common::jobs::{
     JobId, JobLimits, JobOutputHash, JobStartRequest, JobStatus, JobsReserved, SignedJob,
     VerifiedJob,
 };
+use sush_common::session::SessionError;
+
+use crate::session::{Session, SocketSender};
 
 /// Self-signed (root) X.509 certificates. Self-signed certificates may
 /// not be imported (except in test code), and so must be included here.
@@ -48,7 +56,7 @@ pub const ROOT_CERTS: &[&[u8]] = &[
 ];
 
 /// Output files or ranges larger than this will not be served all at once.
-const OUTPUT_THRESHOLD: u64 = 128 * MIB;
+const OUTPUT_THRESHOLD: u64 = ByteSize::mb(128).as_u64();
 
 /// An asynchronous kill signal, delivered by the abort request.
 type KillShot = oneshot::Sender<JobId>;
@@ -63,14 +71,19 @@ pub enum JobError {
     Der(#[from] x509_cert::der::Error),
     #[error(transparent)]
     Execution(#[from] ExecutionError),
+    #[error("File I/O error accessing `{path}`: {error}")]
+    FileIo {
+        path: PathBuf,
+        error: std::io::Error,
+    },
     #[error("Invalid command `{0}`")]
     InvalidCommand(String),
     #[error("Invalid or duplicate job ID")]
     InvalidJobId(JobId),
     #[error("Invalid range for output of length {0}")]
     InvalidRange(u64),
-    #[error(transparent)]
-    Io(#[from] std::io::Error),
+    #[error("I/O error during {what}: {error}")]
+    Io { what: String, error: std::io::Error },
     #[error(transparent)]
     Json(#[from] serde_json::Error),
     #[error("Can't find certificate for key `{0}`")]
@@ -81,8 +94,12 @@ pub enum JobError {
     OutputPending,
     #[error("Output too big, please use range requests")]
     OutputTooBig,
+    #[error("Pseudoterminal error: {0}")]
+    Pty(#[from] rust_pty::PtyError),
     #[error("Can't receive response: sender dropped")]
     Recv(#[from] oneshot::error::RecvError),
+    #[error("Interactive session error: {0}")]
+    Session(#[from] SessionError),
     #[error(transparent)]
     Slice(#[from] std::array::TryFromSliceError),
     #[error(transparent)]
@@ -91,6 +108,29 @@ pub enum JobError {
     Task(#[from] JoinError),
     #[error("Unable to wait for job end")]
     Wait,
+}
+
+impl JobError {
+    /// Report I/O errors with the corresponding path or stream name.
+    pub fn io(what: impl AsRef<str>, error: std::io::Error) -> Self {
+        Self::Io {
+            what: what.as_ref().to_owned(),
+            error,
+        }
+    }
+
+    /// Report I/O errors with the corresponding path or stream name.
+    pub fn file_io(path: impl AsRef<Path>, error: std::io::Error) -> Self {
+        Self::FileIo {
+            path: path.as_ref().to_owned(),
+            error,
+        }
+    }
+
+    /// Close over a path.
+    pub fn file_io_for(path: impl AsRef<Path>) -> impl Fn(std::io::Error) -> Self {
+        move |error| Self::file_io(path.as_ref(), error)
+    }
 }
 
 impl From<JobError> for HttpError {
@@ -102,8 +142,10 @@ impl From<JobError> for HttpError {
             | ChannelClosed
             | Der(_)
             | Execution(_)
-            | Io(_)
+            | FileIo { .. }
+            | Io { .. }
             | OutputHashMismatch(_, _)
+            | Pty(_)
             | Recv(_)
             | Sqlite(_)
             | Task(_)
@@ -123,7 +165,12 @@ impl From<JobError> for HttpError {
             OutputTooBig => {
                 HttpError::for_client_error(None, ClientErrorStatusCode::PAYLOAD_TOO_LARGE, message)
             }
-            InvalidCommand(_) | InvalidJobId(_) | OutputPending | Json(_) | MissingCert(_) => {
+            Session(error) => HttpError::for_client_error(
+                None,
+                ClientErrorStatusCode::NOT_FOUND,
+                error.to_string(),
+            ),
+            InvalidCommand(_) | InvalidJobId(_) | Json(_) | MissingCert(_) | OutputPending => {
                 HttpError::for_client_error(None, ClientErrorStatusCode::BAD_REQUEST, message)
             }
         }
@@ -176,30 +223,76 @@ impl JobStart {
             limits,
             output_dir,
         } = self;
-        if job.command().starts_with('-') {
-            return Err(JobError::InvalidCommand(job.command().to_owned()));
+        let JobStartRequest {
+            job_id,
+            command,
+            interactive,
+        } = job.into_payload();
+        if command.starts_with('-') {
+            return Err(JobError::InvalidCommand(command));
         }
-        let job_id = &job.job_id;
-        let job_dir = job_output_dir(&output_dir, job_id);
-        DirBuilder::new().recursive(true).create(job_dir)?;
-        let stdout_path = job_output_path(&output_dir, job_id, Stdout);
-        let stderr_path = job_output_path(&output_dir, job_id, Stderr);
-        let mut command = Command::new("bash");
-        command
+
+        let job_dir = job_output_dir(&output_dir, &job_id);
+        DirBuilder::new()
+            .recursive(true)
+            .create(&job_dir)
+            .map_err(|error| JobError::file_io(job_dir, error))?;
+        let stdout_path = job_output_path(&output_dir, &job_id, Stdout);
+        let stderr_path = job_output_path(&output_dir, &job_id, Stderr);
+        let stdout_file = File::create_new(&stdout_path)
+            .map_err(|error| JobError::file_io(&stdout_path, error))?;
+        let stderr_file = File::create_new(&stderr_path)
+            .map_err(|error| JobError::file_io(&stderr_path, error))?;
+
+        let mut child = Command::new("bash");
+        child
             .arg("-c")
-            .arg(job.command())
+            .arg(command)
+            .env_clear()
+            // TODO: PATH, TERM, etc.
+            .env("TERM", "xterm") // XXX
             .env("SUSH_JOB_ID", job_id.to_string())
-            .stdin(Stdio::null())
-            .stdout(File::create_new(stdout_path)?)
-            .stderr(File::create_new(stderr_path)?)
             .kill_on_drop(true);
-        unsafe {
-            command.pre_exec(move || limits.apply());
-        }
+
+        let master = if interactive {
+            // Create a pseudoterminal for interactive jobs.
+            let (master, slave_path) = UnixPtyMaster::open()?;
+            let master_raw = master.as_raw_fd();
+            let slave = open_slave(&slave_path)?;
+            let slave_error = JobError::file_io_for(&slave_path);
+            let clone_slave = || slave.try_clone().map_err(&slave_error);
+            child
+                .env("SUSH_TTY", &slave_path)
+                .stdin(clone_slave()?)
+                .stdout(clone_slave()?)
+                .stderr(clone_slave()?);
+            unsafe {
+                child.pre_exec(move || {
+                    setsid()?; // create new process session
+                    close(master_raw); // not needed in the child
+                    ioctl_tiocsctty(slave.try_clone()?)?; // set controlling terminal
+                    limits.apply()?; // set process limits
+                    Ok(())
+                });
+            }
+            Some(master)
+        } else {
+            // Close stdin for batch jobs, send output directly to files.
+            child
+                .stdin(Stdio::null())
+                .stdout(stdout_file)
+                .stderr(stderr_file);
+            unsafe {
+                child.pre_exec(move || limits.apply());
+            }
+            None
+        };
+
         Ok(JobStarted {
             time_reserved,
             time_started: Utc::now(),
-            child: command.spawn()?,
+            child: child.spawn().map_err(|e| JobError::io("spawn", e))?,
+            master,
         })
     }
 
@@ -214,6 +307,7 @@ struct JobStarted {
     time_reserved: DateTime<Utc>,
     time_started: DateTime<Utc>,
     child: Child,
+    master: Option<UnixPtyMaster>,
 }
 
 /// Event representing the end of a job. If the job ended due to
@@ -258,7 +352,6 @@ impl From<JobEnd> for JobStatus {
     }
 }
 
-#[derive(Debug)]
 enum JobRequest {
     // Certificate requests.
     ImportCert {
@@ -292,6 +385,10 @@ enum JobRequest {
     Start {
         request: Box<JobStart>,
         response: oneshot::Sender<Result<JobEnd, ExecutionError>>,
+    },
+    Session {
+        job_id: JobId,
+        response: oneshot::Sender<Result<SocketSender, JobError>>,
     },
     Status {
         job_id: JobId,
@@ -330,7 +427,7 @@ pub struct JobManager {
 
 impl JobManager {
     /// Spawn a task that processes job requests and monitors jobs for completion.
-    pub async fn new(mut db: Connection, output_dir: &Path, log: Logger) -> Result<Self, JobError> {
+    pub async fn new(log: Logger, mut db: Connection, output_dir: &Path) -> Result<Self, JobError> {
         // Import the root certificates.
         for root in ROOT_CERTS {
             let cert = Certificate::from_pem(root).or_else(|_| Certificate::from_der(root))?;
@@ -345,20 +442,22 @@ impl JobManager {
             async move {
                 let mut tasks = JoinSet::<Result<JobEnd, ExecutionError>>::new();
                 let mut killers = BTreeMap::<JobId, KillShot>::new();
+                let mut sessions = BTreeMap::<JobId, SocketSender>::new();
                 loop {
                     select! {
                         Some(request) = rx_requests.recv() => {
                             client_request(
-                                &mut db,
                                 &log,
+                                &mut db,
+                                &output_dir,
                                 request,
                                 &mut tasks,
                                 &mut killers,
-                                &output_dir,
+                                &mut sessions,
                             )?
                         }
                         Some(end) = tasks.join_next() => {
-                            job_ended(&db, &output_dir, &log, end, &mut killers)?
+                            job_ended(&log, &db, &output_dir, end, &mut killers, &mut sessions)?
                         }
                         else => {
                             info!(log, "job manager shutting down");
@@ -472,6 +571,16 @@ impl JobManager {
         Ok(rx)
     }
 
+    pub async fn job_session(&self, job_id: &JobId) -> Result<SocketSender, JobError> {
+        let (tx, rx) = oneshot::channel();
+        self.request(JobRequest::Session {
+            job_id: job_id.to_owned(),
+            response: tx,
+        })
+        .await?;
+        rx.await?
+    }
+
     pub async fn job_status(&self, job_id: &JobId) -> Result<JobStatus, JobError> {
         let (tx, rx) = oneshot::channel();
         self.request(JobRequest::Status {
@@ -560,16 +669,20 @@ fn job_output_hash(
     stream: JobOutputStream,
 ) -> Result<JobOutputHash, JobError> {
     let mut hasher = Hasher::new();
-    hasher.update_mmap_rayon(job_output_path(base_dir, job_id, stream))?;
+    let path = job_output_path(base_dir, job_id, stream);
+    hasher
+        .update_mmap_rayon(&path)
+        .map_err(|error| JobError::file_io(path, error))?;
     Ok(hasher.finalize().into())
 }
 
 fn job_ended(
+    log: &Logger,
     db: &Connection,
     output_dir: &Path,
-    log: &Logger,
     end: Result<Result<JobEnd, ExecutionError>, JoinError>,
     killers: &mut BTreeMap<JobId, KillShot>,
+    sessions: &mut BTreeMap<JobId, SocketSender>,
 ) -> Result<(), JobError> {
     match end {
         Err(error) if error.is_cancelled() => {
@@ -585,6 +698,7 @@ fn job_ended(
         })) => {
             error!(log, "job execution failed"; "error" => %error, "job_id" => %job_id, "time" => %time);
             assert!(killers.remove(&job_id).is_some());
+            assert!(sessions.remove(&job_id).is_some());
             job_aborted(db, output_dir, &job_id, time)?;
         }
         Ok(Ok(JobEnd {
@@ -600,6 +714,7 @@ fn job_ended(
         })) => {
             let job_id = job.job_id();
             let _ = killers.remove(job_id);
+            let _ = sessions.remove(job_id);
             let status = status.map(|status| status.code());
             prepare_cached_and_bind!(
                 db,
@@ -641,12 +756,13 @@ fn job_aborted(
 }
 
 fn client_request(
-    db: &mut Connection,
     log: &Logger,
+    db: &mut Connection,
+    output_dir: &Path,
     request: JobRequest,
     tasks: &mut JoinSet<Result<JobEnd, ExecutionError>>,
     killers: &mut BTreeMap<JobId, KillShot>,
-    output_dir: &Path,
+    sessions: &mut BTreeMap<JobId, SocketSender>,
 ) -> Result<(), JobError> {
     match request {
         JobRequest::ImportCert {
@@ -659,30 +775,47 @@ fn client_request(
             let root = false;
             let _ = response.send(import_cert(db, &cert, root));
         }
+
         JobRequest::CertChain { key_id, response } => {
             let _ = response.send(get_cert_chain(db, key_id));
         }
+
         JobRequest::Reserve { number, response } => {
             let _ = response.send(reserve_jobs(db, number));
         }
+
         JobRequest::GetReserved { response } => {
             let _ = response.send(get_reserved(db));
         }
+
         JobRequest::RevokeReserved { job_ids, response } => {
             let _ = response.send(revoke_reserved(db, &job_ids));
         }
+
         JobRequest::Start {
             request: start,
             response,
         } => {
             let job_id = start.job_id().to_owned();
-            match start_job(db, output_dir, *start, response, tasks) {
+            let log = log.new(o!("job_id" => job_id.to_string()));
+            match start_job(&log, db, output_dir, *start, response, tasks, sessions) {
                 Ok(kill) => assert!(killers.insert(job_id, kill).is_none()),
                 Err(error) => {
-                    error!(log, "job execution error"; "error" => %error, "job_id" => %job_id);
+                    error!(log, "job execution error"; "error" => %error);
                 }
             }
         }
+
+        JobRequest::Session { job_id, response } => {
+            let _ = response.send(if let Some(session) = sessions.get_mut(&job_id) {
+                info!(log, "allowing interactive session"; "job_id" => %job_id);
+                Ok(session.clone())
+            } else {
+                warn!(log, "can't start session, job ended"; "job_id" => %job_id);
+                Err(JobError::Session(SessionError::JobEnded))
+            });
+        }
+
         JobRequest::Abort { job_id } => {
             if let Some(kill) = killers.remove(&job_id)
                 && let Err(job_id) = kill.send(job_id)
@@ -690,9 +823,11 @@ fn client_request(
                 error!(log, "can't kill job"; "job_id" => %job_id);
             }
         }
+
         JobRequest::Status { job_id, response } => {
             let _ = response.send(get_job_status(db, output_dir, &job_id));
         }
+
         JobRequest::Output {
             job_id,
             stream,
@@ -701,6 +836,7 @@ fn client_request(
         } => {
             let _ = response.send(get_job_output(output_dir, &job_id, stream, range));
         }
+
         JobRequest::History {
             start,
             limit,
@@ -708,6 +844,7 @@ fn client_request(
         } => {
             let _ = response.send(get_job_history(db, output_dir, start, limit));
         }
+
         JobRequest::DeleteOutput {
             job_id,
             stream,
@@ -723,11 +860,13 @@ fn client_request(
 /// Verify and start a job, spawn a task to wait for it and report its end,
 /// and return a oneshot channel to kill it.
 fn start_job(
+    log: &Logger,
     db: &mut Connection,
     output_dir: &Path,
     start: JobStart,
     response: oneshot::Sender<Result<JobEnd, ExecutionError>>,
     tasks: &mut JoinSet<Result<JobEnd, ExecutionError>>,
+    sessions: &mut BTreeMap<JobId, SocketSender>,
 ) -> Result<KillShot, ExecutionError> {
     let job = start.job.clone();
     let job_id = job.job_id().to_owned();
@@ -755,22 +894,52 @@ fn start_job(
         time_reserved,
         time_started,
         mut child,
+        master,
     } = exe!(start.start(time_reserved));
     exe!(job_started(&txn, &job, time_started));
     exe!(txn.commit());
+
+    // If the command is interactive, start a new session for it. The
+    // session will initially have no client attached, but will still
+    // record job output.
+    let session = if let Some(master) = master {
+        let job_id = job_id.clone();
+        let output_dir = output_dir.to_owned();
+        let path = job_output_path(&output_dir, &job_id, Stdout);
+        let io_error = JobError::file_io_for(path.clone());
+        let output_file = exe!(
+            OpenOptions::new()
+                .read(true)
+                .write(true)
+                .open(&path)
+                .map_err(&io_error)
+        );
+        let session = Session::start(log.clone(), output_file.into(), master);
+        assert!(sessions.insert(job_id, session.clients()).is_none());
+        Some(session)
+    } else {
+        None
+    };
 
     // Wait for the job to die or be killed.
     let output_dir = output_dir.to_owned();
     let (kill, die) = oneshot::channel();
     tasks.spawn(async move {
         let status = select! {
-            status = child.wait() => Some(exe!(status)),
+            status = child.wait() => {
+                Some(exe!(status.map_err(|e| JobError::io("wait", e))))
+            }
             target = die => {
                 assert_eq!(exe!(target), job_id);
-                exe!(child.kill().await);
+                exe!(child.kill().await.map_err(|e| JobError::io("kill", e)));
                 None
             }
         };
+
+        if let Some(session) = session {
+            exe!(session.shutdown().await);
+        }
+
         let stdout_len = job_output_len(&output_dir, &job_id, Stdout);
         let stderr_len = job_output_len(&output_dir, &job_id, Stderr);
         let stdout_hash = exe!(job_output_hash(&output_dir, &job_id, Stdout));
@@ -928,11 +1097,12 @@ fn job_started(
     let job_id = job.job_id();
     let key_id = job.key_id();
     let command = job.command();
+    let interactive = job.interactive;
     let signature = job.signature();
     let mut stmt = prepare_cached_and_bind!(
         db,
         "UPDATE jobs \
-         SET key_id = $key_id, command = $command, signature = $signature, time_started = $time_started \
+         SET key_id = $key_id, command = $command, interactive = $interactive, signature = $signature, time_started = $time_started \
          WHERE job_id = $job_id AND time_started IS NULL"
     );
     if stmt.raw_execute()? == 1 {
@@ -950,13 +1120,14 @@ fn get_job_output(
 ) -> Result<Vec<u8>, JobError> {
     let len = job_output_len(output_dir, job_id, stream);
     let path = job_output_path(output_dir, job_id, stream);
+    let io_error = JobError::file_io_for(&path);
     let mut file = File::open(&path).map_err(|_| JobError::InvalidJobId(job_id.to_owned()))?;
     if let Some(Range { start, end }) = range {
         // HTTP Ranges include both their endpoints.
         let start = if let StartPosition::Index(start) = start
             && start < len
         {
-            file.seek(SeekFrom::Start(start))?
+            file.seek(SeekFrom::Start(start)).map_err(&io_error)?
         } else {
             return Err(JobError::InvalidRange(len));
         };
@@ -970,14 +1141,14 @@ fn get_job_output(
             Ok(vec![])
         } else {
             let mut buf = vec![0; n as usize];
-            file.read_exact(&mut buf)?;
+            file.read_exact(&mut buf).map_err(&io_error)?;
             Ok(buf)
         }
     } else if len > OUTPUT_THRESHOLD {
         Err(JobError::OutputTooBig)
     } else {
         let mut buf = Vec::with_capacity(len as usize);
-        file.read_to_end(&mut buf)?;
+        file.read_to_end(&mut buf).map_err(&io_error)?;
         Ok(buf)
     }
 }
@@ -999,7 +1170,7 @@ fn delete_job_output(
         let Ok(file) = OpenOptions::new().write(true).open(&path) else {
             return Ok(0);
         };
-        file.set_len(n)?;
+        file.set_len(n).map_err(|e| JobError::file_io(&path, e))?;
         Ok(n)
     } else {
         Err(JobError::InvalidRange(len))
@@ -1080,6 +1251,7 @@ fn make_job_row_to_status(
                 JobStartRequest {
                     job_id: job_id.clone(),
                     command: row.get("command")?,
+                    interactive: row.get("interactive")?,
                 },
                 row.get("key_id")?,
                 row.get("signature")?,
@@ -1145,7 +1317,7 @@ mod test {
 
     impl SignJobRequest for EphemeralKey {
         async fn sign_job_request<S: AsRef<str>>(&self, job_id: &JobId, command: S) -> SignedJob {
-            self.sign(JobStartRequest::new(job_id.to_owned(), command))
+            self.sign(JobStartRequest::new(job_id.to_owned(), command, false))
                 .await
                 .unwrap()
         }
@@ -1239,7 +1411,7 @@ mod test {
         let drain = FullFormat::new(decorator).build().fuse();
         let dir = TempDir::with_prefix("sush-").unwrap();
         let log = Logger::root(drain, slog::o!("test" => test_name));
-        let mgr = JobManager::new(db, dir.path(), log).await.unwrap();
+        let mgr = JobManager::new(log, db, dir.path()).await.unwrap();
         let root = ephemeral_test_root();
         let key_id = mgr.import_cert(root.cert(), true).await.unwrap();
         assert_eq!(key_id, root.key_id().await.unwrap());
@@ -1406,7 +1578,7 @@ mod test {
         let db = open_database_in_memory().unwrap();
         let dir = TempDir::with_prefix("sush-").unwrap();
         let log = Logger::root(slog::Discard, slog::o!("test" => function_name!()));
-        let mgr = JobManager::new(db, dir.path(), log).await.unwrap();
+        let mgr = JobManager::new(log, db, dir.path()).await.unwrap();
         assert!(
             matches!(
                 mgr.import_cert(&root_cert, false).await.unwrap_err(),

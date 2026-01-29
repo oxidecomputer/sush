@@ -17,26 +17,32 @@ use blake3::{Hasher, hash};
 use bytesize::ByteSize;
 use chrono::{DateTime, Utc};
 use clap::{Parser, Subcommand, ValueEnum};
-use futures::FutureExt as _;
-use futures::stream::{self, StreamExt as _};
+use futures::stream;
+use futures::{FutureExt as _, StreamExt as _};
 use http::status::StatusCode;
 use libc::{FIONREAD, ioctl};
 use memmap2::Mmap;
+use reqwest::Upgraded;
 use thiserror::Error;
 use tokio::signal::ctrl_c;
-use tokio::time::{MissedTickBehavior, interval, sleep};
+use tokio::time::{MissedTickBehavior, interval};
 use tokio::{pin, select};
+use tokio_tungstenite::WebSocketStream;
+use tokio_tungstenite::tungstenite::error::Error as WebSocketError;
+use tokio_tungstenite::tungstenite::protocol::Role;
 
 use sush_common::certs::{CertError, KeyId, Signer as _};
 use sush_common::jobs::JobOutputStream::{self, Stderr, Stdout};
 use sush_common::jobs::{
     JobId, JobLimits, JobOutputHash, JobStartRequest, JobStatus, JobsReserved, SignedJob,
 };
+use sush_common::session::SessionError;
 
 use crate::ByteStream;
 use crate::permslip::PermslipError;
 use crate::permslip::{DEFAULT_PERMSLIP_URL, PermslipSigner};
 use crate::repl::Repl;
+use crate::session::session;
 use crate::types::Error as ApiError;
 use crate::{Client, Error as ClientError};
 use futures::TryStreamExt as _;
@@ -245,6 +251,10 @@ pub enum ClientCommand {
         #[clap(env = SUSH_JOB_ID)]
         job_id: Option<JobId>,
 
+        /// The job should be run interactively. Implies `--wait`.
+        #[arg(short, long, default_value_t = false)]
+        interactive: bool,
+
         /// Use `permslip` to sign requests with this key name.
         #[arg(short, long, env = SUSH_PERMSLIP_KEY, name = "KEY_NAME")]
         permslip: Option<String>,
@@ -254,7 +264,7 @@ pub enum ClientCommand {
         permslip_url: String,
 
         /// Wait for the job to end and display its output.
-        #[arg(short, long, default_value_t = false)]
+        #[arg(short, long, default_value_if("interactive", "true", "true"))]
         wait: bool,
 
         /// Job output is binary, not UTF-8 encoded text.
@@ -448,11 +458,14 @@ impl ClientCommand {
                     limits,
                     wait,
                     binary,
+                    interactive,
                 },
                 client,
             ) => {
                 let signer = PermslipSigner::new(key_name, &permslip_url).await?;
-                let job = signer.sign(JobStartRequest::new(job_id, command)).await?;
+                let job = signer
+                    .sign(JobStartRequest::new(job_id, command, interactive))
+                    .await?;
                 if let Some(client) = client {
                     job_start(&client, ctx, job, limits.into_limits(), wait, binary).await?;
                 } else {
@@ -509,61 +522,74 @@ async fn job_start(
     wait: bool,
     binary: bool,
 ) -> Result<(), CommandError> {
+    let interactive = job.is_interactive();
     let job_id = job.job_id();
     let JobLimits {
         max_cpu,
         max_mem,
         max_fsize,
     } = limits;
-
-    // If we wait for more than a second, show a spinner and poll status.
-    let mut polling = false;
-    let timeout = Duration::from_secs(1);
-    let timer = sleep(timeout);
-    pin!(timer);
-    let mut interval = interval(Duration::from_millis(250));
-    interval.set_missed_tick_behavior(MissedTickBehavior::Skip);
-    let start = client.job_start(job_id, max_cpu, max_fsize, max_mem, wait, &job);
+    let start = client.job_start(
+        job_id,
+        max_cpu,
+        max_fsize,
+        max_mem,
+        wait && !interactive,
+        &job,
+    );
     pin!(start);
-    let status = loop {
-        select! {
-            status = &mut start => {
-                ctx.job_polling_finished(job_id)?;
-                break status?.into_inner();
-            }
-            _ = &mut timer, if !polling => {
-                ctx.job_polling_started(job_id, timeout)?;
-                polling = true;
-            }
-            _ = interval.tick(), if polling => {
-                let status = client.job_status(job_id).await?.into_inner();
-                ctx.job_polling_update(job_id, &status)?;
-            }
-            _ = ctrl_c() => {
-                ctx.job_polling_finished(job_id)?;
-                client.job_abort(job_id).await?;
-                ctx.job_aborted(job_id)?;
-                break client.job_status(job_id).await?.into_inner();
-            }
-        }
-    };
-    ctx.job_status(job_id, &status)?;
 
-    // If we waited for the job to end, also try to show its output.
-    if wait {
-        for stream in [Stdout, Stderr] {
-            match client.job_output(job_id, &stream, None).await {
-                Ok(byte_stream) => {
-                    let output = byte_stream_to_vec(byte_stream.into_inner()).await?;
-                    ctx.job_output(job_id, stream, &output, binary)?;
-                }
-                Err(error) => {
-                    ctx.job_error(error.into())?;
+    if interactive {
+        start.as_mut().await?;
+        match client.job_session(job_id).await {
+            Err(error) => ctx.job_error(error.into())?,
+            Ok(socket) => {
+                let socket = socket.into_inner();
+                let stream = WebSocketStream::from_raw_socket(socket, Role::Client, None).await;
+                if let Err(error) = session(stream).await {
+                    ctx.job_error(CommandError::from(error))?;
                 }
             }
         }
+        let status = client.job_status(job_id).await?.into_inner();
+        ctx.job_status(job_id, &status)?;
+        Ok(())
+    } else {
+        let mut interval = interval(Duration::from_millis(250));
+        interval.set_missed_tick_behavior(MissedTickBehavior::Skip);
+        let status = loop {
+            select! {
+                status = &mut start => {
+                    ctx.job_polling_finished(job_id)?;
+                    break status?.into_inner();
+                }
+                _ = interval.tick() => {
+                    ctx.job_polling_started(job_id, interval.period())?;
+                    let status = client.job_status(job_id).await?.into_inner();
+                    ctx.job_polling_update(job_id, &status)?;
+                }
+                _ = ctrl_c() => {
+                    ctx.job_polling_finished(job_id)?;
+                    client.job_abort(job_id).await?;
+                    ctx.job_aborted(job_id)?;
+                    break client.job_status(job_id).await?.into_inner();
+                }
+            }
+        };
+        ctx.job_status(job_id, &status)?;
+        if wait {
+            for stream in [Stdout, Stderr] {
+                match client.job_output(job_id, &stream, None).await {
+                    Ok(byte_stream) => {
+                        let output = byte_stream_to_vec(byte_stream.into_inner()).await?;
+                        ctx.job_output(job_id, stream, &output, binary)?;
+                    }
+                    Err(error) => ctx.job_error(error.into())?,
+                }
+            }
+        }
+        Ok(())
     }
-    Ok(())
 }
 
 /// Read stdin until EOF, prompting unless there's already input available.
@@ -886,10 +912,16 @@ pub enum CommandError {
     Recursive(#[from] Box<Self>),
     #[error("❌ Reqwest error: {0}")]
     Reqwest(#[from] reqwest::Error),
+    #[error("❌ Interactive session error: {0}")]
+    Session(#[from] SessionError),
     #[error("❌ Too much output to display on terminal, try `--file`")]
     TooMuchOutput,
+    #[error("❌ Can't start interactive session: {0}")]
+    Upgrade(String),
     #[error("❌ UTF-8 error: {0}")]
     Utf8(#[from] std::string::FromUtf8Error),
+    #[error("❌ WebSocket error: {0}")]
+    WebSocket(#[from] WebSocketError),
 }
 
 impl CommandError {
@@ -931,10 +963,19 @@ impl From<ClientError<ApiError>> for CommandError {
 
 impl From<ClientError<ByteStream>> for CommandError {
     fn from(error: ClientError<ByteStream>) -> Self {
-        if error.status() == Some(StatusCode::PAYLOAD_TOO_LARGE) {
-            Self::TooMuchOutput
-        } else {
-            Self::Client(error.status().unwrap().to_string())
+        match error.status() {
+            Some(StatusCode::PAYLOAD_TOO_LARGE) => Self::TooMuchOutput,
+            Some(status) => Self::Client(status.to_string()),
+            None => Self::Client(error.to_string()),
+        }
+    }
+}
+
+impl From<ClientError<Upgraded>> for CommandError {
+    fn from(error: ClientError<Upgraded>) -> Self {
+        match error.status() {
+            Some(status) => Self::Client(status.to_string()),
+            None => Self::Client(error.to_string()),
         }
     }
 }

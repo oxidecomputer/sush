@@ -2,6 +2,7 @@ pub mod cli;
 pub mod commands;
 pub mod permslip;
 pub mod repl;
+pub mod session;
 
 progenitor::generate_api!(
     spec = "../sush.json", // must match `sush_common::OPENAPI_DOCUMENT`

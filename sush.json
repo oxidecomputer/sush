@@ -262,6 +262,33 @@
         }
       }
     },
+    "/jobs/{job_id}/session": {
+      "get": {
+        "summary": "Start a new interactive job session.",
+        "operationId": "job_session",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "job_id",
+            "required": true,
+            "schema": {
+              "$ref": "#/components/schemas/JobId"
+            }
+          }
+        ],
+        "responses": {
+          "default": {
+            "description": "",
+            "content": {
+              "*/*": {
+                "schema": {}
+              }
+            }
+          }
+        },
+        "x-dropshot-websocket": {}
+      }
+    },
     "/jobs/{job_id}/start": {
       "post": {
         "summary": "Start an authorized job.",
@@ -713,6 +740,9 @@
           },
           "command": {
             "type": "string"
+          },
+          "interactive": {
+            "type": "boolean"
           }
         },
         "required": [

@@ -294,6 +294,10 @@ impl<T> Signed<T> {
         }
     }
 
+    pub fn into_payload(self) -> T {
+        self.payload
+    }
+
     pub fn payload(&self) -> &T {
         &self.payload
     }

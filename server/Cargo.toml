@@ -16,12 +16,16 @@ chrono.workspace = true
 clap.workspace = true
 dropshot.workspace = true
 ed25519-dalek.workspace = true
+futures.workspace = true
 http-range-header.workspace = true
 hyper.workspace = true
+libc.workspace = true
 memmap2.workspace = true
 p256.workspace = true
 rand_core.workspace = true
 rusqlite.workspace = true
+rust-pty.workspace = true
+rustix.workspace = true
 schemars.workspace = true
 serde.workspace = true
 serde_json.workspace = true
@@ -33,6 +37,7 @@ sush-common = { path = "../common" }
 tempfile.workspace = true
 thiserror.workspace = true
 tokio.workspace = true
+tokio-tungstenite.workspace = true
 x509-cert.workspace = true
 
 [dev-dependencies]

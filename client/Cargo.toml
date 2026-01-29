@@ -11,6 +11,7 @@ path = "src/main.rs"
 
 [dependencies]
 async-recursion.workspace = true
+base64.workspace = true
 blake3.workspace = true
 bytesize.workspace = true
 chrono.workspace = true
@@ -28,7 +29,9 @@ pem-rfc7468.workspace = true
 permission-slip-client.workspace = true
 permission-slip-common.workspace = true
 progenitor.workspace = true
+rand.workspace = true
 reqwest.workspace = true
+rustix.workspace = true
 rustyline.workspace = true
 serde.workspace = true
 serde_json.workspace = true
@@ -36,5 +39,7 @@ shlex.workspace = true
 sush-common = { path = "../common" }
 thiserror.workspace = true
 tokio.workspace = true
+tokio-fd.workspace = true
+tokio-tungstenite.workspace = true
 x509-cert.workspace = true
 xdg.workspace = true

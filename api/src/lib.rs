@@ -7,7 +7,7 @@ use chrono::{DateTime, Utc};
 use dropshot::{
     Body, ClientErrorStatusCode, EmptyScanParams, Header, HttpError, HttpResponseOk,
     PaginationParams, Path as PathParams, Query as QueryParams, RequestContext, ResultsPage,
-    TypedBody, api_description,
+    TypedBody, WebsocketEndpointResult, WebsocketUpgrade, api_description,
 };
 use http_range_header::{SyntacticallyCorrectRange as Range, parse_range_header};
 use hyper::Response;
@@ -86,6 +86,16 @@ pub trait SushApi {
         ctx: RequestContext<Self::Context>,
         params: PathParams<JobIdParam>,
     ) -> Result<HttpResponseOk<JobStatus>, HttpError>;
+
+    /// Start a new interactive job session.
+    // This should use `channel { protocol = WEBSOCKETS, .. }`, but that
+    // does not currently let us return errors before the connection upgrade.
+    #[endpoint { method = GET, path = "/jobs/{job_id}/session" }]
+    async fn job_session(
+        ctx: RequestContext<Self::Context>,
+        params: PathParams<JobIdParam>,
+        upgrade: WebsocketUpgrade,
+    ) -> WebsocketEndpointResult;
 
     /// Abort a started job.
     #[endpoint { method = GET, path = "/jobs/{job_id}/abort" }]

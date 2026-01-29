@@ -7,9 +7,11 @@ use chrono::{DateTime, Utc};
 use dropshot::{
     Body, ClientErrorStatusCode, EmptyScanParams, Header, HttpError, HttpResponseOk,
     PaginationParams, Path as PathParams, Query as QueryParams, RequestContext, ResultsPage,
-    TypedBody, WhichPage,
+    TypedBody, WebsocketEndpointResult, WebsocketUpgrade, WhichPage,
 };
 use hyper::Response;
+use tokio_tungstenite::WebSocketStream;
+use tokio_tungstenite::tungstenite::protocol::Role;
 
 use sush_api::{
     CertChainParams, JobIdParam, JobOutputParams, JobStartParams, RangeRequest, SushApi,
@@ -108,6 +110,28 @@ impl SushApi for ApiServer {
         let JobIdParam { job_id } = params.into_inner();
         let status = ctx.context().job_status(&job_id).await?;
         Ok(HttpResponseOk(status))
+    }
+
+    async fn job_session(
+        ctx: RequestContext<Self::Context>,
+        params: PathParams<JobIdParam>,
+        upgrade: WebsocketUpgrade,
+    ) -> WebsocketEndpointResult {
+        let mgr = ctx.context();
+        let JobIdParam { job_id } = params.into_inner();
+        let session = mgr.job_session(&job_id).await?;
+        upgrade.handle(async move |conn| {
+            let socket = conn.into_inner();
+            let stream = WebSocketStream::from_raw_socket(socket, Role::Server, None).await;
+            session.try_send(stream).map_err(|_| {
+                HttpError::for_client_error(
+                    None,
+                    ClientErrorStatusCode::NOT_FOUND,
+                    String::from("interactive session unavailable"),
+                )
+            })?;
+            Ok(())
+        })
     }
 
     async fn job_abort(

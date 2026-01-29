@@ -342,7 +342,6 @@ impl CommandContext for Cli {
                 } => println!(
                     "✅ Job ID:\t{job_id}\n   \
                      Job status:\tReserved\n   \
-                     Job ID:\t{job_id}\n   \
                      Reserved at:\t{time_reserved}"
                 ),
                 JobStatus::Started {

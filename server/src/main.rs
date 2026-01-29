@@ -58,7 +58,7 @@ async fn main() -> Result<(), String> {
     .map_err(|e| e.to_string())?;
 
     let db = open_database(database).map_err(|e| e.to_string())?;
-    let mgr = JobManager::new(db, &directory, log.new(o!("component" => "job-manager")))
+    let mgr = JobManager::new(log.new(o!("component" => "job-manager")), db, &directory)
         .await
         .map_err(|e| e.to_string())?;
 
