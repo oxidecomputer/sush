@@ -65,9 +65,9 @@ pub fn codephrase(value: U256) -> Vec<&'static str> {
 /// Turn 256 bits of entropy into a reasonably unique code phrase.
 /// We use the low-order words of the full codephrase.
 pub fn id_phrase(value: U256) -> Vec<&'static str> {
-    let phrase = codephrase(value);
+    let mut phrase = codephrase(value);
     let n = phrase.len().saturating_sub(PHRASE_WORDS_ID);
-    codephrase(value).split_off(n)
+    phrase.split_off(n)
 }
 
 /// Generate a code phrase for use as an identifier.
