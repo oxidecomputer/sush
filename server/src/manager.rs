@@ -599,6 +599,7 @@ fn job_ended(
             stderr_hash,
         })) => {
             let job_id = job.job_id();
+            let _ = killers.remove(job_id);
             let status = status.map(|status| status.code());
             prepare_cached_and_bind!(
                 db,
