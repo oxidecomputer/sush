@@ -1976,14 +1976,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "384b8ab6d37215f3c5301a95a4accb5d64aa607f1fcb26a11b5303878451b4fe"
 
 [[package]]
-name = "openapi"
-version = "0.1.0"
-dependencies = [
- "sush-common",
- "sush-server",
-]
-
-[[package]]
 name = "openapiv3"
 version = "2.2.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -3326,6 +3318,19 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "13c2bddecc57b384dee18652358fb23172facb8a2c51ccc10d74c157bdea3292"
 
 [[package]]
+name = "sush-api"
+version = "0.1.0"
+dependencies = [
+ "chrono",
+ "dropshot",
+ "http-range-header",
+ "hyper 1.8.1",
+ "schemars",
+ "serde",
+ "sush-common",
+]
+
+[[package]]
 name = "sush-client"
 version = "0.1.0"
 dependencies = [
@@ -3407,6 +3412,7 @@ dependencies = [
  "sha2",
  "slog",
  "slog-term",
+ "sush-api",
  "sush-common",
  "tempfile",
  "thiserror 1.0.69",
@@ -4508,6 +4514,15 @@ name = "xdg"
 version = "3.0.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "2fb433233f2df9344722454bc7e96465c9d03bff9d77c248f9e7523fe79585b5"
+
+[[package]]
+name = "xtask"
+version = "0.1.0"
+dependencies = [
+ "clap",
+ "sush-api",
+ "sush-common",
+]
 
 [[package]]
 name = "yoke"

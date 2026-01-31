@@ -1,9 +1,0 @@
-[package]
-name = "openapi"
-version = "0.1.0"
-edition = "2024"
-publish = false
-
-[dependencies]
-sush-common = { path = "../common" }
-sush-server = { path = "../server" }

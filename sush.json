@@ -264,6 +264,7 @@
     },
     "/jobs/{job_id}/start": {
       "post": {
+        "summary": "Start an authorized job.",
         "operationId": "job_start",
         "parameters": [
           {
