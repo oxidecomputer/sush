@@ -29,6 +29,7 @@ pem-rfc7468.workspace = true
 permission-slip-client.workspace = true
 permission-slip-common.workspace = true
 progenitor.workspace = true
+progenitor-client.workspace = true
 rand.workspace = true
 reqwest.workspace = true
 rustix.workspace = true

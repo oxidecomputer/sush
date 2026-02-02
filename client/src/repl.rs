@@ -66,7 +66,7 @@ impl Repl {
         client: Option<Client>,
     ) -> Result<(), CommandError> {
         if let Some(client) = client {
-            let map = client.get_reserved().await?.into_inner();
+            let map = client.get_reserved().send().await?.into_inner();
             self.reserved_map(&map)?;
         }
 

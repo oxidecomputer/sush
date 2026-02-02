@@ -48,6 +48,12 @@ impl FromStr for JobId {
     }
 }
 
+impl From<&Self> for JobId {
+    fn from(other: &Self) -> Self {
+        other.to_owned()
+    }
+}
+
 impl<S: AsRef<str>> From<S> for JobId {
     fn from(s: S) -> Self {
         Self(s.as_ref().to_string())

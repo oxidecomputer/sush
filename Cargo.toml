@@ -27,6 +27,7 @@ pem-rfc7468 = { version = "0.7", features = ["std"] }
 permission-slip-client = { git = "https://github.com/oxidecomputer/permission-slip" }
 permission-slip-common = { git = "https://github.com/oxidecomputer/permission-slip" }
 progenitor = "0.11"
+progenitor-client = "0.11"
 rand = "0.8"
 rand_core = "0.6"
 reqwest = "0.12"

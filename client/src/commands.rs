@@ -6,7 +6,7 @@ use std::collections::HashMap;
 use std::fmt;
 use std::fs::{File, OpenOptions};
 use std::io::{Read as _, Seek as _, SeekFrom, Write as _, stdin, stdout};
-use std::num::{NonZeroU8, NonZeroU32, NonZeroU64};
+use std::num::{NonZeroU8, NonZeroU64};
 use std::os::fd::AsRawFd;
 use std::path::{Path, PathBuf};
 use std::pin::Pin;
@@ -62,9 +62,6 @@ const DEFAULT_CHUNK_SIZE: ByteSize = ByteSize::mib(32);
 
 /// Default number of simultaneous downloads for large output.
 const PARALLEL_CHUNKS: NonZeroU8 = NonZeroU8::new(8).unwrap();
-
-/// Default number of history entries to fetch at once.
-const DEFAULT_HISTORY_BATCH_SIZE: NonZeroU32 = NonZeroU32::new(10).unwrap();
 
 /// What kind of output to emit.
 #[derive(Clone, Copy, Debug, Default, ValueEnum)]
@@ -304,10 +301,6 @@ pub enum ClientCommand {
 
     /// Show status of previously started jobs.
     History {
-        /// How many history entries to fetch with each request.
-        #[arg(short, long, default_value_t = DEFAULT_HISTORY_BATCH_SIZE)]
-        batch_size: NonZeroU32,
-
         /// How many history entries to fetch in total, or 0 for all.
         #[arg(short, long, default_value_t = 0)]
         limit: usize,
@@ -398,19 +391,24 @@ impl ClientCommand {
                 let mut file = File::open(&path).map_err(io_error)?;
                 let mut cert = Vec::new();
                 file.read_to_end(&mut cert).map_err(io_error)?;
-                let key_id = client.import_cert(&cert).await?.into_inner();
+                let key_id = client.import_cert().body(cert).send().await?.into_inner();
                 ctx.cert_imported(&path, key_id)
             }
             (ClientCommand::CertChain { key_id }, Some(client)) => {
-                let certs = client.cert_chain(&key_id).await?.into_inner();
+                let certs = client
+                    .cert_chain()
+                    .key_id(&key_id)
+                    .send()
+                    .await?
+                    .into_inner();
                 ctx.cert_chain(key_id, &certs)
             }
             (ClientCommand::Ping, Some(client)) => {
-                let reserved = client.reserve_jobs(0).await?.into_inner();
+                let reserved = client.reserve_jobs().body(0).send().await?.into_inner();
                 ctx.ack(&client.baseurl, reserved.time_reserved)
             }
-            (ClientCommand::ReserveJobs { number }, Some(client)) => {
-                let reserved = client.reserve_jobs(number).await?.into_inner();
+            (ClientCommand::ReserveJobs { number: n }, Some(client)) => {
+                let reserved = client.reserve_jobs().body(n).send().await?.into_inner();
                 ctx.jobs_reserved(&reserved)
             }
             (ClientCommand::GetReserved, None) => match read_reserved()? {
@@ -418,11 +416,16 @@ impl ClientCommand {
                 Reserved::Map(map) => ctx.reserved_map(&map),
             },
             (ClientCommand::GetReserved, Some(client)) => {
-                let map = client.get_reserved().await?.into_inner();
+                let map = client.get_reserved().send().await?.into_inner();
                 ctx.reserved_map(&map)
             }
             (ClientCommand::RevokeReserved { job_ids }, Some(client)) => {
-                let revoked = client.revoke_reserved(&job_ids).await?.into_inner();
+                let revoked = client
+                    .revoke_reserved()
+                    .body(job_ids)
+                    .send()
+                    .await?
+                    .into_inner();
                 ctx.revoked(&revoked)
             }
             (
@@ -474,7 +477,12 @@ impl ClientCommand {
                 Ok(())
             }
             (ClientCommand::JobStatus { job_id }, Some(client)) => {
-                let status = client.job_status(&job_id).await?.into_inner();
+                let status = client
+                    .job_status()
+                    .job_id(&job_id)
+                    .send()
+                    .await?
+                    .into_inner();
                 ctx.job_status(&job_id, &status)
             }
             (ClientCommand::JobStdout { output }, Some(client)) => {
@@ -484,11 +492,11 @@ impl ClientCommand {
                 job_output(&client, ctx, Stderr, output).await
             }
             (ClientCommand::JobAbort { job_id }, Some(client)) => {
-                client.job_abort(&job_id).await?;
+                client.job_abort().job_id(&job_id).send().await?;
                 ctx.job_aborted(&job_id)
             }
-            (ClientCommand::History { batch_size, limit }, Some(client)) => {
-                let mut stream = client.history_stream(Some(batch_size)).boxed();
+            (ClientCommand::History { limit }, Some(client)) => {
+                let mut stream = client.history().stream().boxed();
                 if limit > 0 {
                     stream = stream.take(limit).boxed();
                 }
@@ -523,25 +531,26 @@ async fn job_start(
     binary: bool,
 ) -> Result<(), CommandError> {
     let interactive = job.is_interactive();
-    let job_id = job.job_id();
+    let job_id = job.job_id().to_owned();
     let JobLimits {
         max_cpu,
         max_mem,
         max_fsize,
     } = limits;
-    let start = client.job_start(
-        job_id,
-        max_cpu,
-        max_fsize,
-        max_mem,
-        wait && !interactive,
-        &job,
-    );
+    let start = client
+        .job_start()
+        .job_id(&job_id)
+        .max_cpu(max_cpu)
+        .max_mem(max_mem)
+        .max_fsize(max_fsize)
+        .wait(wait && !interactive)
+        .body(job)
+        .send();
     pin!(start);
 
     if interactive {
         start.as_mut().await?;
-        match client.job_session(job_id).await {
+        match client.job_session().job_id(&job_id).send().await {
             Err(error) => ctx.job_error(error.into())?,
             Ok(socket) => {
                 let socket = socket.into_inner();
@@ -551,8 +560,13 @@ async fn job_start(
                 }
             }
         }
-        let status = client.job_status(job_id).await?.into_inner();
-        ctx.job_status(job_id, &status)?;
+        let status = client
+            .job_status()
+            .job_id(&job_id)
+            .send()
+            .await?
+            .into_inner();
+        ctx.job_status(&job_id, &status)?;
         Ok(())
     } else {
         let mut interval = interval(Duration::from_millis(250));
@@ -560,29 +574,35 @@ async fn job_start(
         let status = loop {
             select! {
                 status = &mut start => {
-                    ctx.job_polling_finished(job_id)?;
+                    ctx.job_polling_finished(&job_id)?;
                     break status?.into_inner();
                 }
                 _ = interval.tick() => {
-                    ctx.job_polling_started(job_id, interval.period())?;
-                    let status = client.job_status(job_id).await?.into_inner();
-                    ctx.job_polling_update(job_id, &status)?;
+                    let status = client.job_status().job_id(&job_id).send().await?.into_inner();
+                    ctx.job_polling_started(&job_id, interval.period())?;
+                    ctx.job_polling_update(&job_id, &status)?;
                 }
                 _ = ctrl_c() => {
-                    ctx.job_polling_finished(job_id)?;
-                    client.job_abort(job_id).await?;
-                    ctx.job_aborted(job_id)?;
-                    break client.job_status(job_id).await?.into_inner();
+                    client.job_abort().job_id(&job_id).send().await?;
+                    ctx.job_polling_finished(&job_id)?;
+                    ctx.job_aborted(&job_id)?;
+                    break client.job_status().job_id(&job_id).send().await?.into_inner();
                 }
             }
         };
-        ctx.job_status(job_id, &status)?;
+        ctx.job_status(&job_id, &status)?;
         if wait {
             for stream in [Stdout, Stderr] {
-                match client.job_output(job_id, &stream, None).await {
+                match client
+                    .job_output()
+                    .job_id(&job_id)
+                    .stream(stream)
+                    .send()
+                    .await
+                {
                     Ok(byte_stream) => {
                         let output = byte_stream_to_vec(byte_stream.into_inner()).await?;
-                        ctx.job_output(job_id, stream, &output, binary)?;
+                        ctx.job_output(&job_id, stream, &output, binary)?;
                     }
                     Err(error) => ctx.job_error(error.into())?,
                 }
@@ -694,7 +714,11 @@ async fn job_output(
     // Maybe truncate instead of fetching output.
     if let Some(n) = truncate.map(|n| n.as_u64()) {
         client
-            .job_output_delete(&job_id, &stream, Some(&format!("bytes={n}-")))
+            .job_output_delete()
+            .job_id(job_id)
+            .stream(stream)
+            .range(format!("bytes={n}-"))
+            .send()
             .await?;
         return Ok(());
     }
@@ -706,7 +730,12 @@ async fn job_output(
         stdout_hash,
         stderr_hash,
         ..
-    } = client.job_status(&job_id).await?.into_inner()
+    } = client
+        .job_status()
+        .job_id(&job_id)
+        .send()
+        .await?
+        .into_inner()
     else {
         // TODO: emulate `tail -f` for running jobs
         return Err(CommandError::JobStillRunning(job_id.to_owned()));
@@ -785,7 +814,10 @@ async fn job_output(
         // Download and print the output all at once. If hash verification
         // fails here, do not print any output.
         let byte_stream = client
-            .job_output(&job_id, &stream, None)
+            .job_output()
+            .job_id(&job_id)
+            .stream(stream)
+            .send()
             .await?
             .into_inner();
         let bytes = byte_stream_to_vec(byte_stream).await?;
@@ -811,7 +843,11 @@ fn job_output_chunks<'a>(
             async move {
                 let bytes = range.bytes();
                 let stream = client
-                    .job_output(job_id, &stream, Some(&bytes))
+                    .job_output()
+                    .job_id(job_id)
+                    .stream(stream)
+                    .range(&bytes)
+                    .send()
                     .await?
                     .into_inner();
                 Ok(Chunk(range, stream))

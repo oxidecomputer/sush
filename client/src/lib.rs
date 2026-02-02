@@ -6,7 +6,7 @@ pub mod session;
 
 progenitor::generate_api!(
     spec = "../sush.json", // must match `sush_common::OPENAPI_DOCUMENT`
-    interface = Positional,
+    interface = Builder,
     replace = {
         JobId = sush_common::jobs::JobId,
         JobLimits = sush_common::jobs::JobLimits,

@@ -91,6 +91,12 @@ impl FromStr for KeyId {
     }
 }
 
+impl From<&Self> for KeyId {
+    fn from(other: &Self) -> Self {
+        other.to_owned()
+    }
+}
+
 impl TryFrom<&Name> for KeyId {
     type Error = CertError;
 
