@@ -35,6 +35,7 @@ slog-term.workspace = true
 sush-api = { path = "../api" }
 sush-common = { path = "../common" }
 tempfile.workspace = true
+terminfo.workspace = true
 thiserror.workspace = true
 tokio.workspace = true
 tokio-tungstenite.workspace = true

@@ -139,12 +139,21 @@ pub struct JobIdParam {
     pub job_id: JobId,
 }
 
-#[derive(Deserialize, JsonSchema)]
+#[derive(Debug, Default, Deserialize, JsonSchema)]
 pub struct JobStartParams {
     #[serde(flatten, deserialize_with = "deserialize_job_limits")]
     pub limits: JobLimits,
 
-    /// Keep the request open until the job ends.
+    /// Terminal type for interactive jobs.
+    pub term: Option<String>,
+
+    /// Terminal window height for interactive jobs.
+    pub rows: Option<u16>,
+
+    /// Terminal window width for interactive jobs.
+    pub cols: Option<u16>,
+
+    /// Keep the request open until the batch job ends.
     pub wait: bool,
 }
 

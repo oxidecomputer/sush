@@ -44,6 +44,7 @@ shlex = "1"
 slog = "2"
 slog-term = "2"
 tempfile = "3"
+terminfo = "0.9"
 thiserror = "1"
 tokio = { version = "1", features = ["macros", "process", "rt", "sync", "time"] }
 tokio-fd = "0.3"

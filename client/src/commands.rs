@@ -23,6 +23,7 @@ use http::status::StatusCode;
 use libc::{FIONREAD, ioctl};
 use memmap2::Mmap;
 use reqwest::Upgraded;
+use rustix::termios::tcgetwinsize;
 use thiserror::Error;
 use tokio::signal::ctrl_c;
 use tokio::time::{MissedTickBehavior, interval};
@@ -103,7 +104,7 @@ pub struct LimitArgs {
 }
 
 impl LimitArgs {
-    pub fn into_limits(self) -> JobLimits {
+    pub fn as_limits(&self) -> JobLimits {
         let Self {
             max_cpu,
             max_mem,
@@ -235,39 +236,7 @@ pub enum ClientCommand {
 
     /// Sign and start a job.
     #[clap(alias = "start")]
-    JobStart {
-        #[clap(flatten)]
-        limits: LimitArgs,
-
-        /// The command for the job to run. Passed as an argument to
-        /// `bash -c`, so may be an arbitrary bash(1) command or pipeline.
-        /// Be sure to quote spaces and characters special to your shell!
-        command: Option<String>,
-
-        /// Previously reserved but unused job ID.
-        #[clap(env = SUSH_JOB_ID)]
-        job_id: Option<JobId>,
-
-        /// The job should be run interactively. Implies `--wait`.
-        #[arg(short, long, default_value_t = false)]
-        interactive: bool,
-
-        /// Use `permslip` to sign requests with this key name.
-        #[arg(short, long, env = SUSH_PERMSLIP_KEY, name = "KEY_NAME")]
-        permslip: Option<String>,
-
-        /// The `permslip` server to contact for signing.
-        #[arg(long, env = PERMSLIP_URL, default_value = DEFAULT_PERMSLIP_URL)]
-        permslip_url: String,
-
-        /// Wait for the job to end and display its output.
-        #[arg(short, long, default_value_if("interactive", "true", "true"))]
-        wait: bool,
-
-        /// Job output is binary, not UTF-8 encoded text.
-        #[arg(short, long, default_value_t = false, requires = "wait")]
-        binary: bool,
-    },
+    JobStart(JobStartArgs),
 
     /// Get the status of a started job.
     #[clap(alias = "status")]
@@ -327,6 +296,45 @@ pub enum ClientCommand {
     /// Leave the interactive REPL.
     #[clap(alias = "exit")]
     Quit,
+}
+
+#[derive(Clone, Debug, Parser)]
+pub struct JobStartArgs {
+    #[clap(flatten)]
+    limits: LimitArgs,
+
+    /// The command for the job to run. Passed as an argument to
+    /// `bash -c`, so may be an arbitrary bash(1) command or pipeline.
+    /// Be sure to quote spaces and characters special to your shell!
+    command: Option<String>,
+
+    /// Previously reserved but unused job ID.
+    #[clap(env = SUSH_JOB_ID)]
+    job_id: Option<JobId>,
+
+    /// Job output is binary, not UTF-8 encoded text.
+    #[arg(short, long, default_value_t = false, requires = "wait")]
+    binary: bool,
+
+    /// The job should be run interactively. Implies `--wait`.
+    #[arg(short, long, default_value_t = false)]
+    interactive: bool,
+
+    /// Use `permslip` to sign requests with this key name.
+    #[arg(short, long, env = SUSH_PERMSLIP_KEY, name = "KEY_NAME")]
+    permslip: Option<String>,
+
+    /// The `permslip` server to contact for signing.
+    #[arg(long, env = PERMSLIP_URL, default_value = DEFAULT_PERMSLIP_URL)]
+    permslip_url: String,
+
+    /// Terminal type for interactive jobs.
+    #[arg(long, env = "TERM")]
+    term: Option<String>,
+
+    /// Wait for the job to end and display its output.
+    #[arg(short, long, default_value_if("interactive", "true", "true"))]
+    wait: bool,
 }
 
 /// Behavior in response to command execution, e.g., printing output,
@@ -437,48 +445,51 @@ impl ClientCommand {
                 ctx.revoked(&revoked)
             }
             (
-                ClientCommand::JobStart {
-                    command: None,
-                    permslip: None,
-                    wait,
-                    binary,
-                    limits,
-                    ..
-                },
+                ClientCommand::JobStart(
+                    args @ JobStartArgs {
+                        command: None,
+                        permslip: None,
+                        ..
+                    },
+                ),
                 Some(client),
             ) => {
                 let job = read_signed_job()?;
-                job_start(&client, ctx, job, limits.into_limits(), wait, binary).await?;
+                job_start(&client, ctx, job, args).await?;
                 Ok(())
             }
-            (ClientCommand::JobStart { command: None, .. }, Some(_)) => {
+            (ClientCommand::JobStart(JobStartArgs { command: None, .. }), Some(_)) => {
                 Err(CommandError::MissingCommand)
             }
-            (ClientCommand::JobStart { permslip: None, .. }, Some(_)) => {
+            (ClientCommand::JobStart(JobStartArgs { permslip: None, .. }), Some(_)) => {
                 Err(CommandError::MissingKeyName)
             }
-            (ClientCommand::JobStart { job_id: None, .. }, _client) => {
+            (ClientCommand::JobStart(JobStartArgs { job_id: None, .. }), _client) => {
                 Err(CommandError::MissingJobId)
             }
             (
-                ClientCommand::JobStart {
-                    command: Some(command),
-                    job_id: Some(job_id),
-                    permslip: Some(key_name),
-                    permslip_url,
-                    limits,
-                    wait,
-                    binary,
-                    interactive,
-                },
+                ClientCommand::JobStart(
+                    ref args @ JobStartArgs {
+                        command: Some(ref command),
+                        job_id: Some(ref job_id),
+                        permslip: Some(ref key_name),
+                        ref permslip_url,
+                        interactive,
+                        ..
+                    },
+                ),
                 client,
             ) => {
-                let signer = PermslipSigner::new(key_name, &permslip_url).await?;
+                let signer = PermslipSigner::new(key_name, permslip_url).await?;
                 let job = signer
-                    .sign(JobStartRequest::new(job_id, command, interactive))
+                    .sign(JobStartRequest::new(
+                        job_id.to_owned(),
+                        command,
+                        interactive,
+                    ))
                     .await?;
                 if let Some(client) = client {
-                    job_start(&client, ctx, job, limits.into_limits(), wait, binary).await?;
+                    job_start(&client, ctx, job, args.clone()).await?;
                 } else {
                     ctx.job_signed(&job)?;
                 }
@@ -538,26 +549,38 @@ async fn job_start(
     client: &Client,
     ctx: &mut impl CommandContext,
     job: SignedJob,
-    limits: JobLimits,
-    wait: bool,
-    binary: bool,
+    args: JobStartArgs,
 ) -> Result<(), CommandError> {
     let interactive = job.is_interactive();
     let job_id = job.job_id().to_owned();
+    let JobStartArgs {
+        limits,
+        binary,
+        term,
+        wait,
+        ..
+    } = args;
     let JobLimits {
         max_cpu,
         max_mem,
         max_fsize,
-    } = limits;
-    let start = client
+    } = limits.as_limits();
+    let mut start = client
         .job_start()
         .job_id(&job_id)
         .max_cpu(max_cpu)
         .max_mem(max_mem)
         .max_fsize(max_fsize)
         .wait(wait && !interactive)
-        .body(job)
-        .send();
+        .body(job);
+    if let Some(term) = term {
+        start = start.term(term);
+        if let Ok(winsize) = tcgetwinsize(stdin()) {
+            start = start.rows(winsize.ws_row);
+            start = start.cols(winsize.ws_col);
+        }
+    }
+    let start = start.send();
     pin!(start);
 
     if interactive {

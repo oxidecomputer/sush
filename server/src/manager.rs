@@ -23,11 +23,12 @@ use http_range_header::{EndPosition, StartPosition, SyntacticallyCorrectRange as
 use rusqlite::{
     Connection, Error as SqliteError, OptionalExtension as _, Row, prepare_cached_and_bind,
 };
-use rust_pty::UnixPtyMaster;
 use rust_pty::unix::open_slave;
+use rust_pty::{UnixPtyMaster, WindowSize};
 use rustix::io::close;
 use rustix::process::{ioctl_tiocsctty, setsid};
 use slog::{Logger, error, info, o, warn};
+use terminfo::Database as Terminfo;
 use thiserror::Error;
 use tokio::process::{Child, Command};
 use tokio::select;
@@ -36,12 +37,12 @@ use tokio::task::{JoinError, JoinHandle, JoinSet, spawn};
 use x509_cert::Certificate;
 use x509_cert::der::{Decode as _, DecodePem as _, Encode as _};
 
+use sush_api::JobStartParams;
 use sush_common::certs::{CertError, KeyId, Signature};
 use sush_common::codephrases::generate_id;
 use sush_common::jobs::JobOutputStream::{self, Stderr, Stdout};
 use sush_common::jobs::{
-    JobId, JobLimits, JobOutputHash, JobStartRequest, JobStatus, JobsReserved, SignedJob,
-    VerifiedJob,
+    JobId, JobOutputHash, JobStartRequest, JobStatus, JobsReserved, SignedJob, VerifiedJob,
 };
 use sush_common::session::SessionError;
 
@@ -204,15 +205,15 @@ impl ExecutionError {
 #[derive(Debug)]
 struct JobStart {
     job: SignedJob,
-    limits: JobLimits,
+    params: JobStartParams,
     output_dir: PathBuf,
 }
 
 impl JobStart {
-    fn new(job: SignedJob, limits: JobLimits, output_dir: PathBuf) -> Self {
+    fn new(job: SignedJob, params: JobStartParams, output_dir: PathBuf) -> Self {
         Self {
             job,
-            limits,
+            params,
             output_dir,
         }
     }
@@ -220,7 +221,14 @@ impl JobStart {
     fn start(self, time_reserved: DateTime<Utc>) -> Result<JobStarted, JobError> {
         let Self {
             job,
-            limits,
+            params:
+                JobStartParams {
+                    limits,
+                    term,
+                    rows,
+                    cols,
+                    wait: _,
+                },
             output_dir,
         } = self;
         let JobStartRequest {
@@ -232,6 +240,7 @@ impl JobStart {
             return Err(JobError::InvalidCommand(command));
         }
 
+        // Set up output files.
         let job_dir = job_output_dir(&output_dir, &job_id);
         DirBuilder::new()
             .recursive(true)
@@ -244,13 +253,12 @@ impl JobStart {
         let stderr_file = File::create_new(&stderr_path)
             .map_err(|error| JobError::file_io(&stderr_path, error))?;
 
+        // Set up the job process as a child.
         let mut child = Command::new("bash");
         child
             .arg("-c")
             .arg(command)
             .env_clear()
-            // TODO: PATH, TERM, etc.
-            .env("TERM", "xterm") // XXX
             .env("SUSH_JOB_ID", job_id.to_string())
             .kill_on_drop(true);
 
@@ -258,6 +266,21 @@ impl JobStart {
             // Create a pseudoterminal for interactive jobs.
             let (master, slave_path) = UnixPtyMaster::open()?;
             let master_raw = master.as_raw_fd();
+
+            // If it has a valid terminfo database, set `TERM` and the
+            // initial pseudoterminal window size.
+            if let Some(term) = term
+                && Terminfo::from_name(&term).is_ok()
+            {
+                child.env("TERM", term);
+                if let Some(rows) = rows
+                    && let Some(cols) = cols
+                {
+                    master.set_window_size(WindowSize::new(cols, rows))?;
+                }
+            };
+
+            // Initialize the pseudoterminal slave for the child.
             let slave = open_slave(&slave_path)?;
             let slave_error = JobError::file_io_for(&slave_path);
             let clone_slave = || slave.try_clone().map_err(&slave_error);
@@ -268,16 +291,16 @@ impl JobStart {
                 .stderr(clone_slave()?);
             unsafe {
                 child.pre_exec(move || {
+                    close(master_raw); // unneeded in child
                     setsid()?; // create new process session
-                    close(master_raw); // not needed in the child
                     ioctl_tiocsctty(slave.try_clone()?)?; // set controlling terminal
-                    limits.apply()?; // set process limits
-                    Ok(())
+                    limits.apply() // set process limits
                 });
             }
+
             Some(master)
         } else {
-            // Close stdin for batch jobs, send output directly to files.
+            // For batch jobs, close stdin and send output directly to files.
             child
                 .stdin(Stdio::null())
                 .stdout(stdout_file)
@@ -288,6 +311,7 @@ impl JobStart {
             None
         };
 
+        // Go!
         Ok(JobStarted {
             time_reserved,
             time_started: Utc::now(),
@@ -560,11 +584,11 @@ impl JobManager {
     pub async fn job_start(
         &self,
         job: SignedJob,
-        limits: JobLimits,
+        params: JobStartParams,
     ) -> Result<oneshot::Receiver<Result<JobEnd, ExecutionError>>, JobError> {
         let (tx, rx) = oneshot::channel();
         self.request(JobRequest::Start {
-            request: Box::new(JobStart::new(job, limits, self.output_dir.to_owned())),
+            request: Box::new(JobStart::new(job, params, self.output_dir.to_owned())),
             response: tx,
         })
         .await?;
@@ -1305,6 +1329,7 @@ mod test {
     use x509_cert::time::Validity;
 
     use sush_common::certs::{EphemeralKey, KeyType, Signer as _};
+    use sush_common::jobs::JobLimits;
 
     #[allow(unused_imports)]
     use crate::database::{open_database, open_database_in_memory};
@@ -1443,13 +1468,13 @@ mod test {
         ));
 
         let rx = mgr
-            .job_start(job.clone(), JobLimits::default())
+            .job_start(job.clone(), Default::default())
             .await
             .unwrap();
         let status = rx.await.unwrap().unwrap().into();
         check_status_ended(status, &job_id, "true", Some(0), 0, 0);
 
-        let rx = mgr.job_start(job, JobLimits::default()).await.unwrap();
+        let rx = mgr.job_start(job, Default::default()).await.unwrap();
         assert!(
             matches!(
                 rx.await.unwrap().unwrap_err().error(),
@@ -1460,7 +1485,7 @@ mod test {
 
         let job_id = job_ids.pop().unwrap();
         let job = root.sign_job_request(&job_id, "false").await;
-        let rx = mgr.job_start(job, JobLimits::default()).await.unwrap();
+        let rx = mgr.job_start(job, Default::default()).await.unwrap();
         let status = rx.await.unwrap().unwrap().into();
         check_status_ended(status, &job_id, "false", Some(1), 0, 0);
 
@@ -1468,7 +1493,7 @@ mod test {
         let job_id_string = job_id.to_string();
         let job_id_bytes = job_id_string.as_bytes();
         let job = root.sign_job_request(&job_id, "echo -n $SUSH_JOB_ID").await;
-        let rx = mgr.job_start(job, JobLimits::default()).await.unwrap();
+        let rx = mgr.job_start(job, Default::default()).await.unwrap();
         rx.await.unwrap().unwrap();
         let status = mgr.job_status(&job_id).await.unwrap();
         check_status_ended(
@@ -1503,7 +1528,7 @@ mod test {
         assert!(mgr.revoke_reserved(job_ids).await.unwrap().is_empty());
 
         let job = root.sign_job_request(&job_id, "false").await;
-        let rx = mgr.job_start(job, JobLimits::default()).await.unwrap();
+        let rx = mgr.job_start(job, Default::default()).await.unwrap();
         assert!(
             matches!(
                 rx.await.unwrap().unwrap_err().error(),
@@ -1547,7 +1572,7 @@ mod test {
 
         let command = "sleep 10";
         let job = root.sign_job_request(&job_id, command).await;
-        let rx = mgr.job_start(job, JobLimits::default()).await.unwrap();
+        let rx = mgr.job_start(job, Default::default()).await.unwrap();
 
         let status = mgr.job_status(&job_id).await.unwrap();
         check_status_started(status, root.cert(), &job_id, command);
@@ -1612,7 +1637,7 @@ mod test {
 
         let (job_id, _time_reserved) = mgr.reserve_one().await.unwrap();
         let job = child.sign_job_request(&job_id, "true").await;
-        let rx = mgr.job_start(job, JobLimits::default()).await.unwrap();
+        let rx = mgr.job_start(job, Default::default()).await.unwrap();
         rx.await.unwrap().unwrap();
         let status = mgr.job_status(&job_id).await.unwrap();
         check_status_ended(status, &job_id, "true", Some(0), 0, 0);
@@ -1628,10 +1653,13 @@ mod test {
         let rx = mgr
             .job_start(
                 job,
-                JobLimits {
-                    max_cpu: 1,
-                    max_fsize: 100,
-                    ..JobLimits::default()
+                JobStartParams {
+                    limits: JobLimits {
+                        max_cpu: 1,
+                        max_fsize: 100,
+                        ..Default::default()
+                    },
+                    ..Default::default()
                 },
             )
             .await
@@ -1670,7 +1698,7 @@ mod test {
         let command = &format!("head -c {n} /dev/urandom");
         let job_id = job_ids.pop().unwrap();
         let job = root.sign_job_request(&job_id, command).await;
-        let rx = mgr.job_start(job, JobLimits::default()).await.unwrap();
+        let rx = mgr.job_start(job, Default::default()).await.unwrap();
         let status = rx.await.unwrap().unwrap().into();
         check_status_ended(status, &job_id, command, Some(0), n, 0);
 

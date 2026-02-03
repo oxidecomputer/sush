@@ -78,7 +78,7 @@ impl SushApi for ApiServer {
     ) -> Result<HttpResponseOk<JobStatus>, HttpError> {
         let mgr = ctx.context();
         let JobIdParam { job_id } = params.into_inner();
-        let JobStartParams { limits, wait } = query.into_inner();
+        let params = query.into_inner();
         let job = body.into_inner();
         if *job.job_id() != job_id {
             return Err(HttpError::for_client_error(
@@ -87,7 +87,8 @@ impl SushApi for ApiServer {
                 String::from("query parameter job ID does not match body"),
             ));
         }
-        let done = mgr.job_start(job, limits).await?;
+        let wait = params.wait;
+        let done = mgr.job_start(job, params).await?;
         if wait {
             let end = done
                 .await
