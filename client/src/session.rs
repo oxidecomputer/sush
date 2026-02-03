@@ -23,12 +23,13 @@ where
 {
     let sigwinch = signal(SignalKind::window_change())?;
     let stdin = stdin();
+    let _ = stdin.lock();
     let stdout = stdout();
     let stdin_async = AsyncFd::try_from(stdin.as_raw_fd())?;
     let stdout_async = AsyncFd::try_from(stdout.as_raw_fd())?;
-    let stdin_mode = raw_mode(stdin.as_fd())?;
-    session_inner(stdin.as_fd(), stdin_async, stdout_async, stream, sigwinch).await;
-    restore_mode(stdin, stdin_mode)?;
+    let stdin_mode = raw_mode(&stdin)?;
+    session_inner(&stdin, stdin_async, stdout_async, stream, sigwinch).await;
+    restore_mode(&stdin, stdin_mode)?;
     Ok(())
 }
 
