@@ -3426,6 +3426,7 @@ dependencies = [
  "async-recursion",
  "base64 0.22.1",
  "blake3",
+ "bytes",
  "bytesize",
  "chrono",
  "clap",
@@ -3464,6 +3465,7 @@ name = "sush-common"
 version = "0.1.0"
 dependencies = [
  "blake3",
+ "bytes",
  "bytesize",
  "chrono",
  "crypto-bigint",
@@ -3475,6 +3477,7 @@ dependencies = [
  "rand_core 0.6.4",
  "rlimit",
  "rusqlite",
+ "rust-pty",
  "rustix",
  "schemars",
  "serde",
@@ -3492,6 +3495,7 @@ name = "sush-server"
 version = "0.1.0"
 dependencies = [
  "blake3",
+ "bytes",
  "bytesize",
  "chrono",
  "clap",

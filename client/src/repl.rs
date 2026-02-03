@@ -287,6 +287,10 @@ impl CommandContext for Repl {
         self.cli.job_session_connected(job_id)
     }
 
+    fn job_session_disconnected(&mut self, job_id: &JobId) -> Result<(), CommandError> {
+        self.cli.job_session_disconnected(job_id)
+    }
+
     fn job_status(&mut self, job_id: &JobId, status: &JobStatus) -> Result<(), CommandError> {
         self.set_job_id(Some(job_id.to_owned()));
         self.cli.job_status(job_id, status)?;

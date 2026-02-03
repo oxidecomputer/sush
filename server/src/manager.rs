@@ -253,12 +253,13 @@ impl JobStart {
         let stderr_file = File::create_new(&stderr_path)
             .map_err(|error| JobError::file_io(&stderr_path, error))?;
 
-        // Set up the job process as a child.
+        // Set up the job child process.
         let mut child = Command::new("bash");
         child
             .arg("-c")
             .arg(command)
             .env_clear()
+            .env("SSH_CLIENT", "sush") // read bashrc
             .env("SUSH_JOB_ID", job_id.to_string())
             .kill_on_drop(true);
 
@@ -832,7 +833,7 @@ fn client_request(
 
         JobRequest::Session { job_id, response } => {
             let _ = response.send(if let Some(session) = sessions.get_mut(&job_id) {
-                info!(log, "allowing interactive session"; "job_id" => %job_id);
+                info!(log, "accepted interactive session"; "job_id" => %job_id);
                 Ok(session.clone())
             } else {
                 warn!(log, "can't start session, job ended"; "job_id" => %job_id);
@@ -938,7 +939,11 @@ fn start_job(
                 .open(&path)
                 .map_err(&io_error)
         );
-        let session = Session::start(log.clone(), output_file.into(), master);
+        let session = Session::start(
+            log.new(o!("interactive" => job.is_interactive())),
+            output_file.into(),
+            master,
+        );
         assert!(sessions.insert(job_id, session.clients()).is_none());
         Some(session)
     } else {

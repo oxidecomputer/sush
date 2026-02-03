@@ -335,10 +335,22 @@ impl CommandContext for Cli {
     fn job_session_connected(&mut self, job_id: &JobId) -> Result<(), CommandError> {
         match self.get_output_format() {
             OutputFormat::Json => {
-                println!("{}", json!({"job_id": job_id}));
+                println!("{}", json!({"connected": job_id}));
             }
             OutputFormat::Text => {
                 println!("✅ Connected to interactive job `{job_id}`");
+            }
+        }
+        Ok(())
+    }
+
+    fn job_session_disconnected(&mut self, job_id: &JobId) -> Result<(), CommandError> {
+        match self.get_output_format() {
+            OutputFormat::Json => {
+                println!("{}", json!({"disconnected": job_id}));
+            }
+            OutputFormat::Text => {
+                println!("\r✅ Disconnected interactive job `{job_id}`");
             }
         }
         Ok(())

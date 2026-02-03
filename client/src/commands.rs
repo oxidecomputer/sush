@@ -380,6 +380,7 @@ pub trait CommandContext: Send + Sync {
     fn job_polling_update(&mut self, id: &JobId, status: &JobStatus) -> Result<(), CommandError>;
     fn job_polling_finished(&mut self, id: &JobId) -> Result<(), CommandError>;
     fn job_session_connected(&mut self, id: &JobId) -> Result<(), CommandError>;
+    fn job_session_disconnected(&mut self, id: &JobId) -> Result<(), CommandError>;
     fn job_status(&mut self, id: &JobId, status: &JobStatus) -> Result<(), CommandError>;
     fn job_signed(&mut self, job: &SignedJob) -> Result<(), CommandError>;
     fn jobs_reserved(&mut self, reserved: &JobsReserved) -> Result<(), CommandError>;
@@ -921,17 +922,17 @@ async fn job_session(
     job_id: &JobId,
 ) -> Result<(), CommandError> {
     match client.job_session().job_id(job_id).send().await {
-        Err(error) => ctx.job_error(error.into())?,
+        Err(error) => ctx.job_error(error.into()),
         Ok(socket) => {
             ctx.job_session_connected(job_id)?;
             let socket = socket.into_inner();
             let stream = WebSocketStream::from_raw_socket(socket, Role::Client, None).await;
             if let Err(error) = session(stream).await {
-                ctx.job_error(CommandError::from(error))?;
+                return ctx.job_error(CommandError::from(error));
             }
+            ctx.job_session_disconnected(job_id)
         }
     }
-    Ok(())
 }
 
 /// What went wrong parsing, preparing, or executing a client command.
