@@ -291,7 +291,15 @@ pub enum ClientCommand {
         output: JobOutput,
     },
 
-    /// Abort a started job.
+    /// Connect to a running interactive job.
+    #[clap(alias = "session")]
+    JobSession {
+        /// The job to connect to.
+        #[clap(env = SUSH_JOB_ID)]
+        job_id: JobId,
+    },
+
+    /// Abort a running job.
     #[clap(alias = "abort")]
     JobAbort {
         /// The job to abort.
@@ -491,6 +499,10 @@ impl ClientCommand {
             (ClientCommand::JobStderr { output }, Some(client)) => {
                 job_output(&client, ctx, Stderr, output).await
             }
+            (ClientCommand::JobSession { job_id }, Some(client)) => {
+                job_session(&client, ctx, &job_id).await?;
+                Ok(())
+            }
             (ClientCommand::JobAbort { job_id }, Some(client)) => {
                 client.job_abort().job_id(&job_id).send().await?;
                 ctx.job_aborted(&job_id)
@@ -550,16 +562,7 @@ async fn job_start(
 
     if interactive {
         start.as_mut().await?;
-        match client.job_session().job_id(&job_id).send().await {
-            Err(error) => ctx.job_error(error.into())?,
-            Ok(socket) => {
-                let socket = socket.into_inner();
-                let stream = WebSocketStream::from_raw_socket(socket, Role::Client, None).await;
-                if let Err(error) = session(stream).await {
-                    ctx.job_error(CommandError::from(error))?;
-                }
-            }
-        }
+        job_session(client, ctx, &job_id).await?;
         let status = client
             .job_status()
             .job_id(&job_id)
@@ -885,6 +888,25 @@ async fn byte_stream_to_file(
             received: n,
         })
     }
+}
+
+/// Connect via WebSockets to a running interactive job.
+async fn job_session(
+    client: &Client,
+    ctx: &mut impl CommandContext,
+    job_id: &JobId,
+) -> Result<(), CommandError> {
+    match client.job_session().job_id(job_id).send().await {
+        Err(error) => ctx.job_error(error.into())?,
+        Ok(socket) => {
+            let socket = socket.into_inner();
+            let stream = WebSocketStream::from_raw_socket(socket, Role::Client, None).await;
+            if let Err(error) = session(stream).await {
+                ctx.job_error(CommandError::from(error))?;
+            }
+        }
+    }
+    Ok(())
 }
 
 /// What went wrong parsing, preparing, or executing a client command.
