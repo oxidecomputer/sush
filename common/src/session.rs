@@ -10,7 +10,9 @@ pub enum ClientMessage {
 }
 
 #[derive(Debug, Deserialize, Serialize)]
-pub enum ClientControlMessage {}
+pub enum ClientControlMessage {
+    WindowSize { rows: u16, cols: u16 },
+}
 
 #[derive(Debug)]
 pub struct DataPacket {
@@ -29,6 +31,8 @@ pub enum SessionError {
     JobEnded,
     #[error("Can't join session task: {0}")]
     Join(#[from] tokio::task::JoinError),
+    #[error("Can't (de)serialize JSON session control message: {0}")]
+    Json(#[from] serde_json::Error),
     #[error("WebSocket error: {0}")]
     Tungstenite(#[from] tokio_tungstenite::tungstenite::error::Error),
 }

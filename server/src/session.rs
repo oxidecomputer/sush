@@ -5,8 +5,9 @@ use std::io::SeekFrom;
 
 use dropshot::WebsocketConnectionRaw;
 use futures::{SinkExt as _, Stream, StreamExt as _};
-use rust_pty::UnixPtyMaster;
-use slog::{Logger, error};
+use rust_pty::{UnixPtyMaster, WindowSize};
+use serde_json::from_str as from_json;
+use slog::{Logger, error, info};
 use tokio::fs::File;
 use tokio::io::{AsyncReadExt as _, AsyncSeekExt as _, AsyncWriteExt as _};
 use tokio::sync::{mpsc, oneshot};
@@ -17,7 +18,7 @@ use tokio_tungstenite::tungstenite::protocol::frame::coding::CloseCode;
 use tokio_tungstenite::tungstenite::protocol::{CloseFrame, Message};
 
 use sush_common::codephrases::generate_id;
-use sush_common::session::SessionError;
+use sush_common::session::{ClientControlMessage, SessionError};
 
 pub type SocketStream = WebSocketStream<WebsocketConnectionRaw>;
 pub type SocketSender = mpsc::Sender<SocketStream>;
@@ -78,7 +79,19 @@ impl Session {
                         Some(Ok(message)) = next_if_some(&mut client) => {
                             // Handle a message from the client.
                             match message {
-                                Message::Text(message) => todo!("control message: {message}"),
+                                Message::Text(message) => {
+                                    match from_json::<ClientControlMessage>(&message) {
+                                        Ok(ClientControlMessage::WindowSize { cols, rows }) => {
+                                            info!(log, "received window size message"; "cols" => cols, "rows" => rows);
+                                            if let Err(error) = pty.set_window_size(WindowSize::new(cols, rows)) {
+                                                error!(log, "can't set window size"; "error" => %error);
+                                            }
+                                        }
+                                        Err(error) => {
+                                            error!(log, "received invalid control message"; "error" => %error);
+                                        }
+                                    }
+                                }
                                 Message::Binary(bytes) => {
                                     pty.write_all(&bytes).await?;
                                 }
