@@ -381,8 +381,11 @@ pub trait CommandContext: Send + Sync {
     fn job_polling_finished(&mut self, id: &JobId) -> Result<(), CommandError>;
     fn job_session_connected(&mut self, id: &JobId) -> Result<(), CommandError>;
     fn job_session_disconnected(&mut self, id: &JobId) -> Result<(), CommandError>;
-    fn job_status(&mut self, id: &JobId, status: &JobStatus) -> Result<(), CommandError>;
+    fn job_signing_started(&mut self, id: &JobId) -> Result<(), CommandError>;
+    fn job_signing_update(&mut self, id: &JobId) -> Result<(), CommandError>;
+    fn job_signing_finished(&mut self, id: &JobId) -> Result<(), CommandError>;
     fn job_signed(&mut self, job: &SignedJob) -> Result<(), CommandError>;
+    fn job_status(&mut self, id: &JobId, status: &JobStatus) -> Result<(), CommandError>;
     fn jobs_reserved(&mut self, reserved: &JobsReserved) -> Result<(), CommandError>;
     fn reserved_read(&mut self, reserved: &JobsReserved) -> Result<(), CommandError>;
     fn reserved_map(
@@ -483,13 +486,25 @@ impl ClientCommand {
                 client,
             ) => {
                 let signer = PermslipSigner::new(key_name, permslip_url).await?;
-                let job = signer
-                    .sign(JobStartRequest::new(
-                        job_id.to_owned(),
-                        command,
-                        interactive,
-                    ))
-                    .await?;
+                let mut interval = interval(Duration::from_millis(100));
+                interval.set_missed_tick_behavior(MissedTickBehavior::Skip);
+                let sign = signer.sign(JobStartRequest::new(
+                    job_id.to_owned(),
+                    command,
+                    interactive,
+                ));
+                pin!(sign);
+                ctx.job_signing_started(job_id)?;
+                let job = loop {
+                    select! {
+                        job = &mut sign => {
+                            ctx.job_signing_finished(job_id)?;
+                            break job?;
+                        }
+                        _ = interval.tick() => ctx.job_signing_update(job_id)?,
+                        _ = ctrl_c() => return ctx.job_signing_finished(job_id),
+                    }
+                };
                 if let Some(client) = client {
                     job_start(&client, ctx, job, args.clone()).await?;
                 } else {

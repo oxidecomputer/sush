@@ -291,16 +291,28 @@ impl CommandContext for Repl {
         self.cli.job_session_disconnected(job_id)
     }
 
-    fn job_status(&mut self, job_id: &JobId, status: &JobStatus) -> Result<(), CommandError> {
-        self.set_job_id(Some(job_id.to_owned()));
-        self.cli.job_status(job_id, status)?;
-        self.unreserve_job_id(job_id);
-        Ok(())
+    fn job_signing_started(&mut self, job_id: &JobId) -> Result<(), CommandError> {
+        self.cli.job_signing_started(job_id)
+    }
+
+    fn job_signing_update(&mut self, job_id: &JobId) -> Result<(), CommandError> {
+        self.cli.job_signing_update(job_id)
+    }
+
+    fn job_signing_finished(&mut self, job_id: &JobId) -> Result<(), CommandError> {
+        self.cli.job_signing_finished(job_id)
     }
 
     fn job_signed(&mut self, job: &SignedJob) -> Result<(), CommandError> {
         self.cli.job_signed(job)?;
         self.unreserve_job_id(job.job_id());
+        Ok(())
+    }
+
+    fn job_status(&mut self, job_id: &JobId, status: &JobStatus) -> Result<(), CommandError> {
+        self.set_job_id(Some(job_id.to_owned()));
+        self.cli.job_status(job_id, status)?;
+        self.unreserve_job_id(job_id);
         Ok(())
     }
 
