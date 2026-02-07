@@ -137,7 +137,7 @@ pub struct EncodedSignature {
 impl EncodedSignature {
     fn decode(
         &self,
-        public_key_algorithm: &AlgorithmIdentifierOwned,
+        signature_algorithm: &AlgorithmIdentifierOwned,
     ) -> Result<Signature, CertError> {
         // Currently assumes all (r, s) values are 256 bits.
         // If we introduce longer signature variants later,
@@ -145,13 +145,13 @@ impl EncodedSignature {
         let Self { r, s } = self;
         let r = decode_phrase(r)?.to_be_byte_array();
         let s = decode_phrase(s)?.to_be_byte_array();
-        match public_key_algorithm {
+        match signature_algorithm {
             AlgorithmIdentifierOwned {
-                oid: ID_EC_PUBLIC_KEY,
-                parameters: Some(parameters),
-            } if *parameters == (&SECP_256_R_1).into() => Ok(Signature::EcdsaSha256(
-                ecdsa::Signature::from_scalars(r, s)?,
-            )),
+                oid: ECDSA_WITH_SHA_256,
+                parameters: None,
+            } => Ok(Signature::EcdsaSha256(ecdsa::Signature::from_scalars(
+                r, s,
+            )?)),
             AlgorithmIdentifierOwned {
                 oid: ID_ED_25519,
                 parameters: None,
@@ -260,14 +260,11 @@ impl TryFrom<&Certificate> for Signature {
     }
 }
 
-/// Produce a signature.
+/// Produce a verifiable signature.
 #[allow(async_fn_in_trait)]
 pub trait Signer {
     type Error: std::fmt::Display;
 
-    async fn key_id(&self) -> Result<KeyId, Self::Error>;
-    async fn algorithm_id(&self) -> Result<AlgorithmIdentifierOwned, Self::Error>;
-    async fn signature_algorithm(&self) -> Result<AlgorithmIdentifierOwned, Self::Error>;
     async fn sign<T: ToBeSigned>(&self, thing: T) -> Result<Signed<T>, Self::Error>;
 }
 
@@ -326,14 +323,38 @@ impl<T> Deref for Signed<T> {
 }
 
 impl<T: ToBeSigned> Signed<T> {
+    /// Verify that the signature on a payload was produced by the private key
+    /// corresponding to the subject of `cert`.
     pub fn verify(self, cert: &Certificate) -> Result<Verified<T>, CertError> {
-        let tbs = self.to_be_signed(&self.key_id);
         let spki = &cert.tbs_certificate.subject_public_key_info;
-        self.signature.decode(&spki.algorithm)?.verify(&tbs, spki)?;
+        self.signature
+            .decode(&Self::signature_algorithm_from_spki(&spki.algorithm)?)?
+            .verify(&self.to_be_signed(&self.key_id), spki)?;
         Ok(Verified {
             signed: self,
             verified_by: KeyId::try_from(cert)?,
         })
+    }
+
+    /// Derive a signature algorithm from the subject public key algorithm.
+    /// This mapping must be fixed and one-to-one.
+    pub fn signature_algorithm_from_spki(
+        algorithm_id: &AlgorithmIdentifierOwned,
+    ) -> Result<AlgorithmIdentifierOwned, CertError> {
+        match algorithm_id {
+            AlgorithmIdentifierOwned {
+                oid: ID_ED_25519,
+                parameters: None,
+            } => Ok(algorithm_id.to_owned()),
+            AlgorithmIdentifierOwned {
+                oid: ID_EC_PUBLIC_KEY,
+                parameters: Some(parameters),
+            } if *parameters == (&SECP_256_R_1).into() => Ok(AlgorithmIdentifierOwned {
+                oid: ECDSA_WITH_SHA_256,
+                parameters: None,
+            }),
+            _ => Err(CertError::InvalidPublicKeyAlgorithm),
+        }
     }
 }
 
@@ -468,19 +489,16 @@ impl EphemeralKey {
     }
 
     /// Ephemeral key with cert signed by a parent.
-    pub async fn new_child<S: Signer>(
+    pub async fn new_child(
         key_type: KeyType,
         subject: Name,
         issuer: Name,
         validity: Validity,
-        signer: &S,
+        signer: &impl Signer,
+        signature_algorithm: AlgorithmIdentifierOwned,
     ) -> Result<Self, CertError> {
         let key = SigningKey::new(key_type);
         let key_id = KeyId::try_from(&subject)?;
-        let signature_algorithm = signer
-            .signature_algorithm()
-            .await
-            .map_err(|e| CertError::Signer(e.to_string()))?;
         let tbs_certificate = Self::tbs_certificate(
             &key,
             Self::generate_serial_number()?,
@@ -493,6 +511,14 @@ impl EphemeralKey {
             .await
             .map_err(|e| CertError::Signer(e.to_string()))?;
         Ok(Self { key, key_id, cert })
+    }
+
+    pub fn key_id(&self) -> &KeyId {
+        &self.key_id
+    }
+
+    pub fn signature_algorithm(&self) -> AlgorithmIdentifierOwned {
+        self.key.signature_algorithm()
     }
 
     pub fn cert(&self) -> &Certificate {
@@ -512,7 +538,7 @@ impl EphemeralKey {
     fn tbs_certificate(
         key: &SigningKey,
         serial_number: SerialNumber,
-        signature_algorithm: AlgorithmIdentifierOwned,
+        signature: AlgorithmIdentifierOwned,
         subject: Name,
         issuer: Name,
         validity: Validity,
@@ -520,7 +546,7 @@ impl EphemeralKey {
         TbsCertificate {
             version: Version::V3,
             serial_number,
-            signature: signature_algorithm,
+            signature,
             issuer,
             validity,
             subject,
@@ -536,42 +562,40 @@ impl EphemeralKey {
         subject: Name,
         validity: Validity,
     ) -> Result<Certificate, CertError> {
+        let signature_algorithm = key.signature_algorithm();
         let tbs_certificate = Self::tbs_certificate(
             key,
             Self::generate_serial_number()?,
-            key.signature_algorithm(),
+            signature_algorithm.clone(),
             subject.clone(),
             subject,
             validity,
         );
-        let signature = key.sign(&tbs_certificate.to_der()?);
+        let signature = key.sign(&tbs_certificate.to_der()?).to_bit_string()?;
         Ok(Certificate {
             tbs_certificate,
-            signature_algorithm: key.signature_algorithm(),
-            signature: signature.to_bit_string()?,
+            signature_algorithm,
+            signature,
         })
     }
 
-    async fn sign_cert<S: Signer>(
+    async fn sign_cert(
         tbs_certificate: TbsCertificate,
-        signer: &S,
+        signer: &impl Signer,
     ) -> Result<Certificate, CertError> {
         let tbs = tbs_certificate.to_der()?;
-        let algorithm_id = signer.algorithm_id().await.map_err(CertError::signer)?;
-        let signature_algorithm = signer
-            .signature_algorithm()
-            .await
-            .map_err(CertError::signer)?;
+        let signature_algorithm = tbs_certificate.signature.to_owned();
         let signature = signer
             .sign(&tbs)
             .await
             .map_err(CertError::signer)?
             .signature
-            .decode(&algorithm_id)?;
+            .decode(&signature_algorithm)?
+            .to_bit_string()?;
         Ok(Certificate {
             tbs_certificate,
             signature_algorithm,
-            signature: signature.to_bit_string()?,
+            signature,
         })
     }
 }
@@ -579,20 +603,8 @@ impl EphemeralKey {
 impl Signer for EphemeralKey {
     type Error = CertError;
 
-    async fn key_id(&self) -> Result<KeyId, Self::Error> {
-        Ok(self.key_id.clone())
-    }
-
-    async fn algorithm_id(&self) -> Result<AlgorithmIdentifierOwned, Self::Error> {
-        Ok(self.key.algorithm_id())
-    }
-
-    async fn signature_algorithm(&self) -> Result<AlgorithmIdentifierOwned, Self::Error> {
-        Ok(self.key.signature_algorithm())
-    }
-
     async fn sign<T: ToBeSigned>(&self, what: T) -> Result<Signed<T>, Self::Error> {
-        let key_id = self.key_id().await?;
+        let key_id = self.key_id.clone();
         let signature = self.key.sign(&what.to_be_signed(&key_id));
         Ok(Signed::new(what, key_id, signature.encode()))
     }

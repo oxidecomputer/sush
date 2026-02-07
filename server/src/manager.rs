@@ -1444,7 +1444,7 @@ mod test {
         let mgr = JobManager::new(log, db, dir.path()).await.unwrap();
         let root = ephemeral_test_root();
         let key_id = mgr.import_cert(root.cert(), true).await.unwrap();
-        assert_eq!(key_id, root.key_id().await.unwrap());
+        assert_eq!(&key_id, root.key_id());
         (mgr, root, dir)
     }
 
@@ -1596,14 +1596,22 @@ mod test {
         let validity = Validity::from_now(Duration::from_secs(60)).unwrap();
         let root =
             EphemeralKey::new_root(KeyType::P256, ephemeral_test_subject(), validity).unwrap();
-        let root_key_id = root.key_id().await.unwrap();
+        let root_key_id = root.key_id().to_owned();
         let root_cert = root.cert().to_owned();
         let issuer = root.subject();
         let subject = ephemeral_test_subject();
-        let child = EphemeralKey::new_child(KeyType::Ed25519, subject, issuer, validity, &root)
-            .await
-            .unwrap();
-        assert_ne!(child.key_id().await.unwrap(), root_key_id);
+        let child = EphemeralKey::new_child(
+            KeyType::Ed25519,
+            subject,
+            issuer,
+            validity,
+            &root,
+            root.signature_algorithm(),
+        )
+        .await
+        .unwrap();
+        assert_ne!(child.key_id(), &root_key_id);
+        let child_key_id = child.key_id().to_owned();
 
         let db = open_database_in_memory().unwrap();
         let dir = TempDir::with_prefix("sush-").unwrap();
@@ -1633,10 +1641,10 @@ mod test {
         );
         assert_eq!(
             mgr.import_cert(child.cert(), false).await.unwrap(),
-            child.key_id().await.unwrap()
+            child_key_id,
         );
         assert_eq!(
-            mgr.cert_chain(child.key_id().await.unwrap()).await.unwrap(),
+            mgr.cert_chain(child_key_id).await.unwrap(),
             vec![root_cert.clone(), child.cert().clone()]
         );
 

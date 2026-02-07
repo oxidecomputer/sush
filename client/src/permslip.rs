@@ -24,7 +24,6 @@ pub const DEFAULT_PERMSLIP_URL: &str = "https://signer-us-west.corp.oxide.comput
 pub struct PermslipSigner {
     client: Client,
     key_name: String,
-    cert: Certificate,
 }
 
 impl PermslipSigner {
@@ -33,20 +32,18 @@ impl PermslipSigner {
         let mut builder = ClientRequestBuilder::new();
         let token = tokens.token().await.map_err(PermslipError::token)?;
         builder = builder.token(token.into_header_value().map_err(PermslipError::token)?);
-        let client = Client::new_with_client(url, builder.build()?);
-        let key_name = key_name.as_ref().to_owned();
-        let cert = Self::get_cert(&client, &key_name).await?;
         Ok(Self {
-            client,
-            key_name,
-            cert,
+            client: Client::new_with_client(url, builder.build()?),
+            key_name: key_name.as_ref().to_owned(),
         })
     }
 
-    async fn get_cert(client: &Client, key_name: &str) -> Result<Certificate, PermslipError> {
-        let pem = client
+    // TODO: fetch once
+    async fn get_cert(&self) -> Result<Certificate, PermslipError> {
+        let pem = self
+            .client
             .get_cert()
-            .key_name(key_name)
+            .key_name(&self.key_name)
             .send()
             .await?
             .into_inner();
@@ -64,25 +61,10 @@ impl PermslipSigner {
 impl Signer for PermslipSigner {
     type Error = PermslipError;
 
-    async fn key_id(&self) -> Result<KeyId, Self::Error> {
-        Ok(KeyId::try_from(&self.cert)?)
-    }
-
-    async fn algorithm_id(&self) -> Result<AlgorithmIdentifierOwned, Self::Error> {
-        Ok(self
-            .cert
-            .tbs_certificate
-            .subject_public_key_info
-            .algorithm
-            .clone())
-    }
-
-    async fn signature_algorithm(&self) -> Result<AlgorithmIdentifierOwned, Self::Error> {
-        Ok(self.cert.signature_algorithm.clone())
-    }
-
     async fn sign<T: ToBeSigned>(&self, thing: T) -> Result<Signed<T>, Self::Error> {
-        let key_id = self.key_id().await?;
+        let cert = self.get_cert().await?;
+        let spki = &cert.tbs_certificate.subject_public_key_info;
+        let key_id = KeyId::try_from(&cert)?;
         let message = thing.to_be_signed(&key_id);
         let params = StampParams::Blob(BlobStampParams {
             sign: SignParams {
@@ -95,7 +77,6 @@ impl Signer for PermslipSigner {
                 version_prev: None,
             },
         });
-        let algorithm = self.signature_algorithm().await?;
         let signature = self
             .client
             .sign()
@@ -107,7 +88,7 @@ impl Signer for PermslipSigner {
         Ok(Signed::new(
             thing,
             key_id,
-            match algorithm {
+            match Signed::<T>::signature_algorithm_from_spki(&spki.algorithm)? {
                 AlgorithmIdentifierOwned {
                     oid: ID_ED_25519,
                     parameters: None,
