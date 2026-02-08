@@ -2,17 +2,20 @@
 
 use std::future::pending;
 use std::io::{self, SeekFrom};
+use std::process::ExitStatus;
+use std::time::Duration;
 
 use bytes::{Buf as _, Bytes, BytesMut};
 use dropshot::WebsocketConnectionRaw;
 use futures::{SinkExt as _, Stream, StreamExt as _};
-use rust_pty::{UnixPtyMaster, WindowSize};
 use slog::{Logger, error, info};
 use tokio::fs::File;
 use tokio::io::{AsyncReadExt as _, AsyncSeekExt as _, AsyncWriteExt as _};
+use tokio::process::Child;
+use tokio::signal::unix::{SignalKind, signal};
 use tokio::sync::{mpsc, oneshot};
 use tokio::task::JoinHandle;
-use tokio::time::{MissedTickBehavior, interval};
+use tokio::time::{MissedTickBehavior, interval, sleep};
 use tokio::{select, spawn};
 use tokio_tungstenite::WebSocketStream;
 
@@ -21,60 +24,62 @@ use sush_common::session::{
     SessionError, SessionMessage,
 };
 
+use crate::pty::{Pty, WindowSize};
+
+pub type ShutdownSession = oneshot::Sender<()>;
 pub type SocketStream = WebSocketStream<WebsocketConnectionRaw>;
 pub type SocketSender = mpsc::Sender<SocketStream>;
 
 pub struct Session {
-    task: JoinHandle<Result<(), SessionError>>,
+    task: JoinHandle<Result<ExitStatus, SessionError>>,
     tx_client: SocketSender,
-    tx_shutdown: oneshot::Sender<()>,
 }
 
 impl Session {
-    pub fn start(log: Logger, output_file: File, pty: UnixPtyMaster) -> Self {
+    pub fn start(log: Logger, child: Child, pty: Pty, output: File) -> (Self, ShutdownSession) {
         let (tx_client, rx_client) = mpsc::channel::<SocketStream>(1);
         let (tx_shutdown, rx_shutdown) = oneshot::channel();
-        let task = spawn(session(log, output_file, pty, rx_client, rx_shutdown));
-        Self {
-            task,
-            tx_client,
-            tx_shutdown,
-        }
+        let task = spawn(session(log, child, pty, output, rx_client, rx_shutdown));
+        (Self { task, tx_client }, tx_shutdown)
     }
 
     pub fn clients(&self) -> SocketSender {
         self.tx_client.clone()
     }
 
-    pub async fn shutdown(self) -> Result<(), SessionError> {
-        let _ = self.tx_shutdown.send(());
-        self.task.await??;
-        Ok(())
+    pub async fn wait(self) -> Result<ExitStatus, SessionError> {
+        self.task.await?
     }
 }
+
+/// How long to continue trying to read from a dead process.
+const SESSION_DRAIN_TIMEOUT: Duration = Duration::from_millis(10);
 
 /// Run an interactive job that allows, but does not require,
 /// a client connection via WebSocket.
 async fn session(
     log: Logger,
-    mut output_file: File,
-    mut pty: UnixPtyMaster,
+    mut child: Child,
+    mut pty: Pty,
+    mut output: File,
     mut rx_client: mpsc::Receiver<SocketStream>,
     mut rx_shutdown: oneshot::Receiver<()>,
-) -> Result<(), SessionError> {
+) -> Result<ExitStatus, SessionError> {
     let mut buffer = BytesMut::with_capacity(SESSION_BUFFER_SIZE);
     let mut client = None::<SocketStream>;
     let mut decoder = SessionDecoder::default();
     let mut encoder = SessionEncoder::default();
     let mut interval = interval(SESSION_REKEY_PERIOD);
     interval.set_missed_tick_behavior(MissedTickBehavior::Skip);
+    let mut sigchld = signal(SignalKind::child())?;
+    let mut shutdown = false;
+    let mut died = false;
 
     // Client-induced errors must not break the loop;
     // close the client, log the error, and continue.
     macro_rules! close_client {
         ($stream:ident) => {{
             let _ = $stream.close(None).await;
-            let _ = $stream.flush().await;
             client.take();
         }};
         ($stream:ident, $msg:literal; $($keys:tt)*) => {{
@@ -97,13 +102,17 @@ async fn session(
 
     loop {
         select! {
-            // Read job output, record it, and relay it to the client if there is one.
+            // Read available job output, record it, and relay it to the client
+            // if there is one. We try to read regardless of whether the process
+            // is known to be dead. It is essential to drain output that may be
+            // sent before the process dies, but which arrives after the signal
+            // of its death; the dead cannot speak, yet they may still be heard.
             Ok(n) = pty.read_buf(&mut buffer) => {
                 if n == 0 {
-                    error!(log, "EOF from interactive job");
+                    info!(log, "EOF from job process");
                     break;
                 }
-                output_file.write_all(&buffer[..n]).await?;
+                output.write_all(&buffer[..n]).await?;
                 if let Some(stream) = client.as_mut() {
                     let message = SessionMessage::Data(buffer.copy_to_bytes(n));
                     if let Err(error) = stream.send(encoder.encode(message)?).await {
@@ -113,10 +122,18 @@ async fn session(
                 buffer.truncate(0);
             }
 
+            // Give output a chance to drain from a dead process. It would
+            // be great if there were a reliable, non-timeout way of doing
+            // this, but it appears there is not. OpenSSH does this too, FWIW.
+            _ = sleep(SESSION_DRAIN_TIMEOUT), if died || child.try_wait()?.is_some() => {
+                info!(log, "job output drained");
+                break;
+            }
+
             // Accept a new client, rekey it, and play back the last buffer.
-            Some(mut stream) = rx_client.recv() => {
+            Some(mut stream) = rx_client.recv(), if !died => {
                 rekey_client!(stream);
-                if let Some(playback) = playback_buffer(&mut output_file, SESSION_BUFFER_SIZE).await? {
+                if let Some(playback) = playback_buffer(&mut output, SESSION_BUFFER_SIZE).await? {
                     let playback_len = playback.len();
                     let message = SessionMessage::Data(playback);
                     match stream.send(encoder.encode(message)?).await {
@@ -132,7 +149,7 @@ async fn session(
             }
 
             // Handle a message from the client.
-            Some(Ok(message)) = next_if_some(&mut client) => {
+            Some(Ok(message)) = next_if_some(&mut client), if !died => {
                 match decoder.decode(message) {
                     Err(error) => error!(log, "failed to decode client message"; "error" => %error),
                     Ok(message) => {
@@ -152,47 +169,59 @@ async fn session(
                 }
             }
 
-            // Periodically rekey.
+            // Periodically rekey the client.
             _ = interval.tick() => {
                 if let Some(stream) = client.as_mut() {
                     rekey_client!(stream);
                 }
             }
 
-            // Shutdown when the job ends.
-            Ok(()) = &mut rx_shutdown => break,
+            // Notice when the job dies, but do not exit the loop;
+            // we must continue reading output until we hit EOF or
+            // the drain timeout expires.
+            _ = sigchld.recv(), if !died => {
+                info!(log, "job process died");
+                died = true;
+            }
 
-            // Errors, etc.
-            else => break,
+            // Kill job on shutdown signal, but only once.
+            Ok(()) = &mut rx_shutdown, if !died && !shutdown => {
+                info!(log, "job shutdown on signal");
+                child.start_kill()?;
+                shutdown = true;
+            }
         }
     }
 
-    output_file.flush().await?;
+    // Reap the job and collect its exit status.
+    let status = child.wait().await?;
     if let Some(stream) = client.as_mut() {
         close_client!(stream);
     }
     info!(
         log,
-        "session ended";
+        "job ended";
         "encoded_bytes" => encoder.count(),
         "decoded_bytes" => decoder.count()
     );
-    Ok(())
+    Ok(status)
 }
 
 async fn handle_client_message(
     log: &Logger,
-    pty: &mut UnixPtyMaster,
+    pty: &mut Pty,
     decoder: &mut SessionDecoder,
     message: SessionMessage,
 ) -> Result<(), SessionError> {
     match message {
         SessionMessage::Control(message) => match message {
-            SessionControl::WindowChange { cols, rows } => {
-                pty.set_window_size(WindowSize::new(cols, rows))?;
+            SessionControl::WindowChange { rows, cols } => {
+                pty.set_window_size(WindowSize { rows, cols })?;
             }
         },
-        SessionMessage::Data(bytes) => pty.write_all(&bytes).await?,
+        SessionMessage::Data(bytes) => {
+            pty.write_all(&bytes).await?;
+        }
         SessionMessage::Ping(_) => (),
         SessionMessage::Pong(bytes) => {
             decoder.rekey(&bytes);
@@ -233,4 +262,48 @@ async fn playback_buffer(
     let mut buffer = BytesMut::zeroed(output_bytes as usize);
     output_file.read_exact(&mut buffer).await?;
     Ok(Some(buffer.freeze()))
+}
+
+#[cfg(test)]
+mod test {
+    use std::fs::read_to_string;
+
+    use slog::{Drain as _, o};
+    use slog_term::{FullFormat, PlainSyncDecorator, TestStdoutWriter};
+    use tempfile::NamedTempFile;
+    use tokio::process::Command;
+
+    use super::*;
+
+    /// Exercise the race between process exit and slurping all of its
+    /// output from the pseudoterminal.
+    #[named]
+    #[tokio::test]
+    async fn tty() {
+        for _ in 0..100 {
+            let decorator = PlainSyncDecorator::new(TestStdoutWriter);
+            let drain = FullFormat::new(decorator).build().fuse();
+            let log = Logger::root(drain, o!("test" => function_name!()));
+            let (pty, pts, pts_path) = Pty::open().unwrap();
+            assert!(pts_path.starts_with("/dev/pts/"));
+
+            let output_file = NamedTempFile::new().unwrap();
+            let child = Command::new("tty")
+                .stdin(pts.try_clone().unwrap())
+                .stdout(pts.try_clone().unwrap())
+                .spawn()
+                .unwrap();
+            let (session, shutdown) =
+                Session::start(log, child, pty, output_file.reopen().unwrap().into());
+            assert!(session.wait().await.unwrap().success());
+            assert!(shutdown.send(()).is_err());
+
+            // The output of `tty` on GNU/Linux is written using puts(3),
+            // which uses two write(2) calls: one for the string, and one
+            // for the line terminator. If we don't drain with a timeout,
+            // it is possible to catch the first write without the second.
+            let output = read_to_string(&output_file).unwrap();
+            assert_eq!(output, format!("{}\r\n", pts_path.display()));
+        }
+    }
 }

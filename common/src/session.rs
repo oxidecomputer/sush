@@ -190,8 +190,8 @@ pub enum SessionError {
     Join(#[from] tokio::task::JoinError),
     #[error("Can't (de)serialize JSON session control message: {0}")]
     Json(#[from] serde_json::Error),
-    #[error("Session pseudoterminal error: {0}")]
-    Pty(#[from] rust_pty::PtyError),
+    #[error("Can't send shutdown signal")]
+    Shutdown,
     #[error("WebSocket error: {0}")]
     Tungstenite(#[from] tokio_tungstenite::tungstenite::error::Error),
 }

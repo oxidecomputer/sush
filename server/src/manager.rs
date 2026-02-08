@@ -10,8 +10,9 @@ use std::collections::BTreeMap;
 use std::fs::{DirBuilder, File, OpenOptions};
 use std::io::{Read as _, Seek as _, SeekFrom};
 use std::num::NonZeroU32;
-use std::os::unix::io::AsRawFd as _;
+use std::os::fd::AsRawFd as _;
 use std::path::{Path, PathBuf};
+use std::pin::Pin;
 use std::process::{ExitStatus, Stdio};
 use std::sync::Arc;
 
@@ -19,12 +20,12 @@ use blake3::Hasher;
 use bytesize::ByteSize;
 use chrono::{DateTime, Utc};
 use dropshot::{ClientErrorStatusCode, HttpError};
+use futures::future::FutureExt as _;
 use http_range_header::{EndPosition, StartPosition, SyntacticallyCorrectRange as Range};
+use pwd::Passwd;
 use rusqlite::{
     Connection, Error as SqliteError, OptionalExtension as _, Row, prepare_cached_and_bind,
 };
-use rust_pty::unix::open_slave;
-use rust_pty::{UnixPtyMaster, WindowSize};
 use rustix::io::close;
 use rustix::process::{ioctl_tiocsctty, setsid};
 use slog::{Logger, error, info, o, warn};
@@ -46,6 +47,7 @@ use sush_common::jobs::{
 };
 use sush_common::session::SessionError;
 
+use crate::pty::{Pty, WindowSize};
 use crate::session::{Session, SocketSender};
 
 /// Self-signed (root) X.509 certificates. Self-signed certificates may
@@ -60,7 +62,10 @@ pub const ROOT_CERTS: &[&[u8]] = &[
 const OUTPUT_THRESHOLD: u64 = ByteSize::mb(128).as_u64();
 
 /// An asynchronous kill signal, delivered by the abort request.
-type KillShot = oneshot::Sender<JobId>;
+type KillShot = oneshot::Sender<()>;
+
+/// A pinned interactive session.
+type PinnedSession = Pin<Box<dyn Future<Output = Result<ExitStatus, JobError>> + Send>>;
 
 #[derive(Debug, Error)]
 pub enum JobError {
@@ -95,8 +100,6 @@ pub enum JobError {
     OutputPending,
     #[error("Output too big, please use range requests")]
     OutputTooBig,
-    #[error("Pseudoterminal error: {0}")]
-    Pty(#[from] rust_pty::PtyError),
     #[error("Can't receive response: sender dropped")]
     Recv(#[from] oneshot::error::RecvError),
     #[error("Interactive session error: {0}")]
@@ -130,7 +133,7 @@ impl JobError {
 
     /// Close over a path.
     pub fn file_io_for(path: impl AsRef<Path>) -> impl Fn(std::io::Error) -> Self {
-        move |error| Self::file_io(path.as_ref(), error)
+        move |err| Self::file_io(path.as_ref(), err)
     }
 }
 
@@ -146,7 +149,6 @@ impl From<JobError> for HttpError {
             | FileIo { .. }
             | Io { .. }
             | OutputHashMismatch(_, _)
-            | Pty(_)
             | Recv(_)
             | Sqlite(_)
             | Task(_)
@@ -245,61 +247,69 @@ impl JobStart {
         DirBuilder::new()
             .recursive(true)
             .create(&job_dir)
-            .map_err(|error| JobError::file_io(job_dir, error))?;
+            .map_err(|err| JobError::file_io(job_dir, err))?;
         let stdout_path = job_output_path(&output_dir, &job_id, Stdout);
         let stderr_path = job_output_path(&output_dir, &job_id, Stderr);
-        let stdout_file = File::create_new(&stdout_path)
-            .map_err(|error| JobError::file_io(&stdout_path, error))?;
-        let stderr_file = File::create_new(&stderr_path)
-            .map_err(|error| JobError::file_io(&stderr_path, error))?;
+        let stdout_file =
+            File::create_new(&stdout_path).map_err(|err| JobError::file_io(&stdout_path, err))?;
+        let stderr_file =
+            File::create_new(&stderr_path).map_err(|err| JobError::file_io(&stderr_path, err))?;
 
         // Set up the job child process.
         let mut child = Command::new("bash");
         child
             .arg("-c")
-            .arg(command)
+            .arg(&command)
             .env_clear()
             .env("SSH_CLIENT", "sush") // read bashrc
             .env("SUSH_JOB_ID", job_id.to_string())
+            .env("SUSH_COMMAND", &command)
             .kill_on_drop(true);
 
-        let master = if interactive {
-            // Create a pseudoterminal for interactive jobs.
-            let (master, slave_path) = UnixPtyMaster::open()?;
-            let master_raw = master.as_raw_fd();
+        // Set basic user environment variables.
+        if let Some(pwd) = Passwd::current_user() {
+            child
+                .env("USER", &pwd.name)
+                .env("LOGNAME", &pwd.name)
+                .env("HOME", &pwd.dir);
+        }
+
+        let pty = if interactive {
+            // Create a pseudoterminal for interactive jobs and wire
+            // the child up to it.
+            let (pty, pts, pts_path) = Pty::open().map_err(|err| JobError::io("pty open", err))?;
+            let pts_error = JobError::file_io_for(&pts_path);
+            let pts_clone = || pts.try_clone().map_err(&pts_error);
+            child
+                .stdin(pts_clone()?)
+                .stdout(pts_clone()?)
+                .stderr(pts_clone()?);
+            unsafe {
+                let pty = pty.as_raw_fd();
+                child.pre_exec(move || {
+                    close(pty); // not needed in the child
+                    setsid()?; // create new process session
+                    ioctl_tiocsctty(&pts)?; // set controlling terminal
+                    limits.apply() // set process limits
+                });
+            }
 
             // If it has a valid terminfo database, set `TERM` and the
             // initial pseudoterminal window size.
             if let Some(term) = term
                 && Terminfo::from_name(&term).is_ok()
             {
+                child.env("SUSH_TTY", &pts_path);
                 child.env("TERM", term);
                 if let Some(rows) = rows
                     && let Some(cols) = cols
                 {
-                    master.set_window_size(WindowSize::new(cols, rows))?;
+                    pty.set_window_size(WindowSize { rows, cols })
+                        .map_err(|err| JobError::io("pty window resize", err))?;
                 }
             };
 
-            // Initialize the pseudoterminal slave for the child.
-            let slave = open_slave(&slave_path)?;
-            let slave_error = JobError::file_io_for(&slave_path);
-            let clone_slave = || slave.try_clone().map_err(&slave_error);
-            child
-                .env("SUSH_TTY", &slave_path)
-                .stdin(clone_slave()?)
-                .stdout(clone_slave()?)
-                .stderr(clone_slave()?);
-            unsafe {
-                child.pre_exec(move || {
-                    close(master_raw); // unneeded in child
-                    setsid()?; // create new process session
-                    ioctl_tiocsctty(slave.try_clone()?)?; // set controlling terminal
-                    limits.apply() // set process limits
-                });
-            }
-
-            Some(master)
+            Some(pty)
         } else {
             // For batch jobs, close stdin and send output directly to files.
             child
@@ -316,8 +326,8 @@ impl JobStart {
         Ok(JobStarted {
             time_reserved,
             time_started: Utc::now(),
-            child: child.spawn().map_err(|e| JobError::io("spawn", e))?,
-            master,
+            child: child.spawn().map_err(|err| JobError::io("spawn", err))?,
+            pty,
         })
     }
 
@@ -332,7 +342,7 @@ struct JobStarted {
     time_reserved: DateTime<Utc>,
     time_started: DateTime<Utc>,
     child: Child,
-    master: Option<UnixPtyMaster>,
+    pty: Option<Pty>,
 }
 
 /// Event representing the end of a job. If the job ended due to
@@ -343,7 +353,7 @@ pub struct JobEnd {
     time_reserved: DateTime<Utc>,
     time_started: DateTime<Utc>,
     time_ended: DateTime<Utc>,
-    status: Option<ExitStatus>,
+    status: ExitStatus,
     stdout_len: u64,
     stderr_len: u64,
     stdout_hash: JobOutputHash,
@@ -368,7 +378,7 @@ impl From<JobEnd> for JobStatus {
             time_reserved,
             time_started,
             time_ended,
-            status: status.and_then(|status| status.code()),
+            status: status.code(),
             stdout_len,
             stderr_len,
             stdout_hash,
@@ -427,6 +437,7 @@ enum JobRequest {
     },
     Abort {
         job_id: JobId,
+        response: oneshot::Sender<Result<(), JobError>>,
     },
 
     // History and post-hoc modification requests.
@@ -617,10 +628,13 @@ impl JobManager {
     }
 
     pub async fn job_abort(&self, job_id: &JobId) -> Result<(), JobError> {
+        let (tx, rx) = oneshot::channel();
         self.request(JobRequest::Abort {
             job_id: job_id.to_owned(),
+            response: tx,
         })
-        .await
+        .await?;
+        rx.await?
     }
 
     pub async fn job_output(
@@ -697,7 +711,7 @@ fn job_output_hash(
     let path = job_output_path(base_dir, job_id, stream);
     hasher
         .update_mmap_rayon(&path)
-        .map_err(|error| JobError::file_io(path, error))?;
+        .map_err(|err| JobError::file_io(path, err))?;
     Ok(hasher.finalize().into())
 }
 
@@ -740,7 +754,7 @@ fn job_ended(
             let job_id = job.job_id();
             let _ = killers.remove(job_id);
             let _ = sessions.remove(job_id);
-            let status = status.map(|status| status.code());
+            let status = status.code();
             prepare_cached_and_bind!(
                 db,
                 "UPDATE jobs \
@@ -841,11 +855,14 @@ fn client_request(
             });
         }
 
-        JobRequest::Abort { job_id } => {
+        JobRequest::Abort { job_id, response } => {
             if let Some(kill) = killers.remove(&job_id)
-                && let Err(job_id) = kill.send(job_id)
+                && let Err(()) = kill.send(())
             {
                 error!(log, "can't kill job"; "job_id" => %job_id);
+                let _ = response.send(Err(SessionError::Shutdown.into()));
+            } else {
+                let _ = response.send(Ok(()));
             }
         }
 
@@ -902,7 +919,7 @@ fn start_job(
                 Err(e) => {
                     let e = ExecutionError::new(job_id, e.into());
                     let _ = response.send(Err(e.clone()));
-                    return Err(e);
+                    return Err(e.into());
                 }
             }
         };
@@ -918,17 +935,17 @@ fn start_job(
     let JobStarted {
         time_reserved,
         time_started,
-        mut child,
-        master,
+        child,
+        pty,
     } = exe!(start.start(time_reserved));
     exe!(job_started(&txn, &job, time_started));
     exe!(txn.commit());
 
-    // If the command is interactive, start a new session for it. The
-    // session will initially have no client attached, but will still
-    // record job output.
-    let session = if let Some(master) = master {
-        let job_id = job_id.clone();
+    // If the command is interactive, start a new session for it.
+    // Otherwise, run it as a batch (non-interactive) job.
+    let output_dir = output_dir.to_owned();
+    let (session, shutdown): (PinnedSession, KillShot) = if let Some(pty) = pty {
+        let log = log.new(o!("interactive" => job.is_interactive()));
         let output_dir = output_dir.to_owned();
         let path = job_output_path(&output_dir, &job_id, Stdout);
         let io_error = JobError::file_io_for(path.clone());
@@ -939,36 +956,16 @@ fn start_job(
                 .open(&path)
                 .map_err(&io_error)
         );
-        let session = Session::start(
-            log.new(o!("interactive" => job.is_interactive())),
-            output_file.into(),
-            master,
-        );
-        assert!(sessions.insert(job_id, session.clients()).is_none());
-        Some(session)
+        let (session, shutdown) = Session::start(log, child, pty, output_file.into());
+        assert!(sessions.insert(job_id.clone(), session.clients()).is_none());
+        let future = async { session.wait().await.map_err(|err| err.into()) };
+        (future.boxed(), shutdown)
     } else {
-        None
+        batch_job(child)
     };
 
-    // Wait for the job to die or be killed.
-    let output_dir = output_dir.to_owned();
-    let (kill, die) = oneshot::channel();
     tasks.spawn(async move {
-        let status = select! {
-            status = child.wait() => {
-                Some(exe!(status.map_err(|e| JobError::io("wait", e))))
-            }
-            target = die => {
-                assert_eq!(exe!(target), job_id);
-                exe!(child.kill().await.map_err(|e| JobError::io("kill", e)));
-                None
-            }
-        };
-
-        if let Some(session) = session {
-            exe!(session.shutdown().await);
-        }
-
+        let status = exe!(session.await);
         let stdout_len = job_output_len(&output_dir, &job_id, Stdout);
         let stderr_len = job_output_len(&output_dir, &job_id, Stderr);
         let stdout_hash = exe!(job_output_hash(&output_dir, &job_id, Stdout));
@@ -989,7 +986,21 @@ fn start_job(
         Ok(end)
     });
 
-    Ok(kill)
+    Ok(shutdown)
+}
+
+fn batch_job(mut child: Child) -> (PinnedSession, KillShot) {
+    let (kill, die) = oneshot::channel();
+    let future = async move {
+        select! {
+            status = child.wait() => status.map_err(|err| JobError::io("wait", err)),
+            _ = die => {
+                child.start_kill().map_err(|err| JobError::io("kill", err))?;
+                child.wait().await.map_err(|err| JobError::io("wait", err))
+            }
+        }
+    };
+    (future.boxed(), kill)
 }
 
 fn get_cert(db: &Connection, key_id: &KeyId) -> Result<Certificate, JobError> {
@@ -1199,7 +1210,8 @@ fn delete_job_output(
         let Ok(file) = OpenOptions::new().write(true).open(&path) else {
             return Ok(0);
         };
-        file.set_len(n).map_err(|e| JobError::file_io(&path, e))?;
+        file.set_len(n)
+            .map_err(|err| JobError::file_io(&path, err))?;
         Ok(n)
     } else {
         Err(JobError::InvalidRange(len))
@@ -1327,7 +1339,7 @@ mod test {
     use function_name::named;
     use rand_core::{OsRng, RngCore as _};
     use rusqlite::limits::Limit;
-    use slog::Drain as _;
+    use slog::{Drain as _, o};
     use slog_term::{FullFormat, PlainSyncDecorator, TestStdoutWriter};
     use tempfile::TempDir;
     use x509_cert::name::Name;
@@ -1440,7 +1452,7 @@ mod test {
         let decorator = PlainSyncDecorator::new(TestStdoutWriter);
         let drain = FullFormat::new(decorator).build().fuse();
         let dir = TempDir::with_prefix("sush-").unwrap();
-        let log = Logger::root(drain, slog::o!("test" => test_name));
+        let log = Logger::root(drain, o!("test" => test_name));
         let mgr = JobManager::new(log, db, dir.path()).await.unwrap();
         let root = ephemeral_test_root();
         let key_id = mgr.import_cert(root.cert(), true).await.unwrap();

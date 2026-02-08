@@ -18,7 +18,6 @@ pem-rfc7468.workspace = true
 rand.workspace = true
 rand_core.workspace = true
 rlimit.workspace = true
-rust-pty.workspace = true
 rustix.workspace = true
 schemars.workspace = true
 serde.workspace = true

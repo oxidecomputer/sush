@@ -2408,6 +2408,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "pwd"
+version = "1.4.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "72c71c0c79b9701efe4e1e4b563b2016dd4ee789eb99badcb09d61ac4b92e4a2"
+dependencies = [
+ "libc",
+ "thiserror 1.0.69",
+]
+
+[[package]]
 name = "quote"
 version = "1.0.42"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2719,22 +2729,6 @@ dependencies = [
  "fallible-iterator",
  "litrs",
  "sqlite3-parser",
-]
-
-[[package]]
-name = "rust-pty"
-version = "0.1.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "229c28cfb11188c277dc96a3ec1d69ff9782e31429eb078027a1274dfce2c753"
-dependencies = [
- "libc",
- "rustix",
- "signal-hook",
- "signal-hook-tokio",
- "thiserror 2.0.17",
- "tokio",
- "tracing",
- "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -3141,34 +3135,12 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "0fda2ff0d084019ba4d7c6f371c95d8fd75ce3524c3cb8fb653a3023f6323e64"
 
 [[package]]
-name = "signal-hook"
-version = "0.4.3"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "3b57709da74f9ff9f4a27dce9526eec25ca8407c45a7887243b031a58935fb8e"
-dependencies = [
- "libc",
- "signal-hook-registry",
-]
-
-[[package]]
 name = "signal-hook-registry"
 version = "1.4.6"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "b2a4719bff48cee6b39d12c020eeb490953ad2443b7055bd0b21fca26bd8c28b"
 dependencies = [
  "libc",
-]
-
-[[package]]
-name = "signal-hook-tokio"
-version = "0.4.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "e513e435a8898a0002270f29d0a708b7879708fb5c4d00e46983ca2d2d378cf0"
-dependencies = [
- "futures-core",
- "libc",
- "signal-hook",
- "tokio",
 ]
 
 [[package]]
@@ -3477,7 +3449,6 @@ dependencies = [
  "rand_core 0.6.4",
  "rlimit",
  "rusqlite",
- "rust-pty",
  "rustix",
  "schemars",
  "serde",
@@ -3508,9 +3479,9 @@ dependencies = [
  "libc",
  "memmap2",
  "p256",
+ "pwd",
  "rand_core 0.6.4",
  "rusqlite",
- "rust-pty",
  "rustix",
  "schemars",
  "serde",
@@ -3982,19 +3953,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "784e0ac535deb450455cbfa28a6f0df145ea1bb7ae51b821cf5e7927fdcfbdd0"
 dependencies = [
  "pin-project-lite",
- "tracing-attributes",
  "tracing-core",
-]
-
-[[package]]
-name = "tracing-attributes"
-version = "0.1.31"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "7490cfa5ec963746568740651ac6781f701c9c5ea257c58e057f3ba8cf69e8da"
-dependencies = [
- "proc-macro2",
- "quote",
- "syn 2.0.109",
 ]
 
 [[package]]
