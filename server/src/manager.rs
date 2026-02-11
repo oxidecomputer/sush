@@ -266,12 +266,13 @@ impl JobStart {
             .env("SUSH_COMMAND", &command)
             .kill_on_drop(true);
 
-        // Set basic user environment variables.
+        // Set basic user environment.
         if let Some(pwd) = Passwd::current_user() {
             child
-                .env("USER", &pwd.name)
+                .current_dir(&pwd.dir)
+                .env("HOME", &pwd.dir)
                 .env("LOGNAME", &pwd.name)
-                .env("HOME", &pwd.dir);
+                .env("USER", &pwd.name);
         }
 
         let pty = if interactive {
@@ -285,6 +286,7 @@ impl JobStart {
                 .stdin(pts_clone()?)
                 .stdout(pts_clone()?)
                 .stderr(pts_clone()?);
+
             unsafe {
                 let pty = pty.as_raw_fd();
                 child.pre_exec(move || {
@@ -1337,6 +1339,7 @@ mod test {
     use std::time::Duration;
 
     use function_name::named;
+    use pwd::Passwd;
     use rand_core::{OsRng, RngCore as _};
     use rusqlite::limits::Limit;
     use slog::{Drain as _, o};
@@ -1524,6 +1527,25 @@ mod test {
         assert_eq!(
             mgr.job_output(&job_id, Stdout, None).await.unwrap(),
             job_id_bytes
+        );
+        assert!(
+            mgr.job_output(&job_id, Stderr, None)
+                .await
+                .unwrap()
+                .is_empty()
+        );
+
+        let job_id = job_ids.pop().unwrap();
+        let job = root.sign_job_request(&job_id, "pwd").await;
+        let rx = mgr.job_start(job, Default::default()).await.unwrap();
+        rx.await.unwrap().unwrap();
+        let home = Passwd::current_user().unwrap().dir;
+        let pwd = format!("{home}\n");
+        let status = mgr.job_status(&job_id).await.unwrap();
+        check_status_ended(status, &job_id, "pwd", Some(0), pwd.len() as u64, 0);
+        assert_eq!(
+            mgr.job_output(&job_id, Stdout, None).await.unwrap(),
+            pwd.as_bytes(),
         );
         assert!(
             mgr.job_output(&job_id, Stderr, None)
