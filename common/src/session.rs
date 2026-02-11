@@ -56,9 +56,17 @@ impl From<SessionControl> for SessionMessage {
 }
 
 /// A session control message.
-#[derive(Debug, Deserialize, Serialize)]
+#[derive(Clone, Debug, Deserialize, Serialize)]
 pub enum SessionControl {
-    WindowChange { rows: u16, cols: u16 },
+    WindowChange(WindowSize),
+}
+
+/// Size of an interactive session pseudoterminal.
+/// Shells sometimes call these `$LINES` and `$COLUMNS`.
+#[derive(Clone, Debug, Deserialize, Serialize)]
+pub struct WindowSize {
+    pub rows: u16,
+    pub cols: u16,
 }
 
 /// Data packet decoder.

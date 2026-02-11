@@ -15,7 +15,7 @@ use tokio_tungstenite::WebSocketStream;
 
 use sush_common::session::{
     SESSION_BUFFER_SIZE, SessionControl, SessionDecoder, SessionEncoder, SessionError,
-    SessionMessage,
+    SessionMessage, WindowSize,
 };
 
 /// Drive an interactive job session, relaying stdin/stdout to/from a WebSocket.
@@ -85,10 +85,10 @@ where
             // Send window size on change.
             Some(()) = sigwinch.recv() => {
                 let winsize = tcgetwinsize(stdin)?;
-                let message = SessionControl::WindowChange {
+                let message = SessionControl::WindowChange(WindowSize {
                     rows: winsize.ws_row,
                     cols: winsize.ws_col,
-                }.into();
+                }).into();
                 stream.send(encoder.encode(message)?).await?;
             }
 

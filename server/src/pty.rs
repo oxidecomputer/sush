@@ -19,6 +19,8 @@ use rustix::termios::{Winsize, tcsetwinsize};
 use tokio::io::unix::AsyncFd;
 use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
 
+use sush_common::session::WindowSize;
+
 /// Unix pseudoterminal.
 #[derive(Debug)]
 pub struct Pty(AsyncFd<OwnedFd>);
@@ -50,8 +52,16 @@ impl Pty {
     }
 
     /// Set the pseudoterminal window size.
-    pub fn set_window_size(&self, size: WindowSize) -> io::Result<()> {
-        Ok(tcsetwinsize(&self.0, size.into())?)
+    pub fn set_window_size(&self, WindowSize { rows, cols }: WindowSize) -> io::Result<()> {
+        Ok(tcsetwinsize(
+            &self.0,
+            Winsize {
+                ws_row: rows,
+                ws_col: cols,
+                ws_xpixel: 0,
+                ws_ypixel: 0,
+            },
+        )?)
     }
 }
 
@@ -119,22 +129,6 @@ impl AsyncWrite for Pty {
 
     fn poll_shutdown(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<io::Result<()>> {
         Poll::Ready(Ok(()))
-    }
-}
-
-pub struct WindowSize {
-    pub rows: u16,
-    pub cols: u16,
-}
-
-impl From<WindowSize> for Winsize {
-    fn from(WindowSize { rows, cols }: WindowSize) -> Winsize {
-        Winsize {
-            ws_row: rows,
-            ws_col: cols,
-            ws_xpixel: 0,
-            ws_ypixel: 0,
-        }
     }
 }
 

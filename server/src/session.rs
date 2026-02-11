@@ -24,7 +24,7 @@ use sush_common::session::{
     SessionError, SessionMessage,
 };
 
-use crate::pty::{Pty, WindowSize};
+use crate::pty::Pty;
 
 pub type ShutdownSession = oneshot::Sender<()>;
 pub type SocketStream = WebSocketStream<WebsocketConnectionRaw>;
@@ -215,13 +215,9 @@ async fn handle_client_message(
 ) -> Result<(), SessionError> {
     match message {
         SessionMessage::Control(message) => match message {
-            SessionControl::WindowChange { rows, cols } => {
-                pty.set_window_size(WindowSize { rows, cols })?;
-            }
+            SessionControl::WindowChange(size) => pty.set_window_size(size)?,
         },
-        SessionMessage::Data(bytes) => {
-            pty.write_all(&bytes).await?;
-        }
+        SessionMessage::Data(bytes) => pty.write_all(&bytes).await?,
         SessionMessage::Ping(_) => (),
         SessionMessage::Pong(bytes) => {
             decoder.rekey(&bytes);

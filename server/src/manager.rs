@@ -45,9 +45,9 @@ use sush_common::jobs::JobOutputStream::{self, Stderr, Stdout};
 use sush_common::jobs::{
     JobId, JobOutputHash, JobStartRequest, JobStatus, JobsReserved, SignedJob, VerifiedJob,
 };
-use sush_common::session::SessionError;
+use sush_common::session::{SessionError, WindowSize};
 
-use crate::pty::{Pty, WindowSize};
+use crate::pty::Pty;
 use crate::session::{Session, SocketSender};
 
 /// Self-signed (root) X.509 certificates. Self-signed certificates may
@@ -281,6 +281,7 @@ impl JobStart {
             let pts_error = JobError::file_io_for(&pts_path);
             let pts_clone = || pts.try_clone().map_err(&pts_error);
             child
+                .env("SUSH_TTY", &pts_path)
                 .stdin(pts_clone()?)
                 .stdout(pts_clone()?)
                 .stderr(pts_clone()?);
@@ -299,7 +300,6 @@ impl JobStart {
             if let Some(term) = term
                 && Terminfo::from_name(&term).is_ok()
             {
-                child.env("SUSH_TTY", &pts_path);
                 child.env("TERM", term);
                 if let Some(rows) = rows
                     && let Some(cols) = cols
