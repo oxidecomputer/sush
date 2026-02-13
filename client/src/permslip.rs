@@ -16,7 +16,7 @@ use x509_cert::der::oid::db::rfc8410::ID_ED_25519;
 use x509_cert::der::pem::{PemLabel as _, decode_vec as decode_pem};
 use x509_cert::spki::AlgorithmIdentifierOwned;
 
-use sush_common::certs::{CertError, KeyId, Signature, Signed, Signer, ToBeSigned};
+use sush_common::keys::{KeyError, KeyId, Signature, Signed, Signer, ToBeSigned};
 
 /// The default Permission Slip (aka Online Signing Service) server.
 pub const DEFAULT_PERMSLIP_URL: &str = "https://signer-us-west.corp.oxide.computer";
@@ -61,11 +61,10 @@ impl PermslipSigner {
 impl Signer for PermslipSigner {
     type Error = PermslipError;
 
-    async fn sign<T: ToBeSigned>(&self, thing: T) -> Result<Signed<T>, Self::Error> {
+    async fn sign<T: ToBeSigned>(&mut self, thing: T) -> Result<Signed<T>, Self::Error> {
         let cert = self.get_cert().await?;
         let spki = &cert.tbs_certificate.subject_public_key_info;
-        let key_id = KeyId::try_from(&cert)?;
-        let message = thing.to_be_signed(&key_id);
+        let message = thing.to_be_signed();
         let params = StampParams::Blob(BlobStampParams {
             sign: SignParams {
                 artifact_kind: ArtifactKind::Blob,
@@ -87,16 +86,16 @@ impl Signer for PermslipSigner {
             .into_inner();
         Ok(Signed::new(
             thing,
-            key_id,
+            KeyId::try_from(&cert)?,
             match Signed::<T>::signature_algorithm_from_spki(&spki.algorithm)? {
                 AlgorithmIdentifierOwned {
                     oid: ID_ED_25519,
                     parameters: None,
-                } => Signature::Ed25519(Ed25519Signature::from_slice(&signature)?).encode(),
+                } => Signature::Ed25519(Ed25519Signature::from_slice(&signature)?).encode()?,
                 AlgorithmIdentifierOwned {
                     oid: ECDSA_WITH_SHA_256,
                     parameters: None,
-                } => Signature::EcdsaSha256(ecdsa::Signature::from_der(&signature)?).encode(),
+                } => Signature::EcdsaSha256(ecdsa::Signature::from_der(&signature)?).encode()?,
                 _ => return Err(Self::Error::InvalidSignature),
             },
         ))
@@ -105,8 +104,6 @@ impl Signer for PermslipSigner {
 
 #[derive(Debug, Error)]
 pub enum PermslipError {
-    #[error(transparent)]
-    Cert(#[from] CertError),
     #[error("{0}")]
     Client(String),
     #[error(transparent)]
@@ -119,6 +116,8 @@ pub enum PermslipError {
     InvalidSignature,
     #[error(transparent)]
     Json(#[from] serde_json::Error),
+    #[error("Key error: {0}")]
+    Key(#[from] KeyError),
     #[error(transparent)]
     Pem(#[from] pem_rfc7468::Error),
     #[error(transparent)]

@@ -1,22 +1,30 @@
-//! Key, signature, and X.509 certificate management.
+//! Key, signature, and certificate management.
 
-use std::convert::Infallible;
+// Handle raw SSH public keys, algorithms, and signatures.
+#![allow(clippy::disallowed_types)]
+
 use std::fmt;
 use std::ops::Deref;
-use std::str::FromStr;
 
+use bytes::{Buf as _, BufMut as _, BytesMut};
 use crypto_bigint::{ArrayEncoding as _, Random as _, U128, U256};
 use ed25519_dalek::{
-    Signature as Ed25519Signature, Signer as _, SigningKey as Ed25519SigningKey, Verifier as _,
+    Signature as Ed25519Signature, Signer as _, SigningKey as Ed25519SigningKey,
     VerifyingKey as Ed25519VerifyingKey,
 };
+use kms_agent_lib::protocol::{ProtocolError, SshBufReader as _, SshBufWriter as _};
 use p256::{SecretKey as P256SecretKey, ecdsa};
 use rand_core::OsRng;
-use rusqlite::Error as SqlError;
-use rusqlite::types::{FromSql, FromSqlError, ToSql, ToSqlOutput, ValueRef};
-use schemars::JsonSchema;
+use rusqlite::types::{FromSql, FromSqlError, FromSqlResult, ToSql, ToSqlOutput, ValueRef};
+use rusqlite::{Error as SqlError, Result as SqlResult};
+use schemars::schema::Schema;
+use schemars::{JsonSchema, SchemaGenerator};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest as _, Sha256};
+use signature::Verifier;
+use ssh_key::{
+    Algorithm as SshAlgorithm, EcdsaCurve, Error as SshKeyError, Signature as SshSignature,
+};
 use thiserror::Error;
 use x509_cert::der::Encode as _;
 use x509_cert::der::asn1::{Any, BitString};
@@ -31,39 +39,8 @@ use x509_cert::{Certificate, TbsCertificate, Version};
 
 use crate::codephrases::{InvalidCodephrase, WORD_SEPARATOR, codephrase, decode_phrase, id_phrase};
 
-/// What went wrong handling a key, signature, or certificate.
-#[derive(Debug, Error)]
-pub enum CertError {
-    #[error("DER encoding error: {0}")]
-    Der(#[from] x509_cert::der::Error),
-    #[error("Ed25519 error: {0}")]
-    Ed25519(#[from] ed25519_dalek::ed25519::Error),
-    #[error(transparent)]
-    InvalidCodephrase(#[from] InvalidCodephrase),
-    #[error("invalid key ID")]
-    InvalidKeyId,
-    #[error("invalid subject public key")]
-    InvalidPublicKey,
-    #[error("invalid public key algorithm")]
-    InvalidPublicKeyAlgorithm,
-    #[error("invalid signature")]
-    InvalidSignature,
-    #[error(transparent)]
-    Pem(#[from] pem_rfc7468::Error),
-    #[error("can't import a self-signed (root) certificate")]
-    SelfSigned,
-    #[error("error while signing: {0}")]
-    Signer(String),
-}
-
-impl CertError {
-    fn signer(error: impl std::fmt::Display) -> Self {
-        Self::Signer(error.to_string())
-    }
-}
-
-/// SHA-256 of a certificate subject, encoded as a pseudo-random
-/// code phrase for storage and transport.
+/// SHA-256 of a certificate subject or an identity public key,
+/// encoded as a pseudorandom code phrase for storage & transport.
 #[derive(
     Clone, Debug, Deserialize, Eq, Hash, JsonSchema, Ord, PartialEq, PartialOrd, Serialize,
 )]
@@ -83,11 +60,9 @@ impl fmt::Display for KeyId {
     }
 }
 
-impl FromStr for KeyId {
-    type Err = Infallible;
-
-    fn from_str(s: &str) -> Result<Self, Self::Err> {
-        Ok(Self(s.to_string()))
+impl From<String> for KeyId {
+    fn from(s: String) -> Self {
+        Self(s)
     }
 }
 
@@ -98,7 +73,7 @@ impl From<&Self> for KeyId {
 }
 
 impl TryFrom<&Name> for KeyId {
-    type Error = CertError;
+    type Error = KeyError;
 
     fn try_from(name: &Name) -> Result<KeyId, Self::Error> {
         let hash = Sha256::digest(&name.to_der()?);
@@ -108,10 +83,21 @@ impl TryFrom<&Name> for KeyId {
 }
 
 impl TryFrom<&Certificate> for KeyId {
-    type Error = CertError;
+    type Error = KeyError;
 
     fn try_from(cert: &Certificate) -> Result<Self, Self::Error> {
         Self::try_from(&cert.tbs_certificate.subject)
+    }
+}
+
+#[allow(clippy::disallowed_types)]
+impl TryFrom<&ssh_key::PublicKey> for KeyId {
+    type Error = KeyError;
+
+    fn try_from(public_key: &ssh_key::PublicKey) -> Result<Self, Self::Error> {
+        let hash = Sha256::digest(public_key.to_bytes()?);
+        let phrase = id_phrase(U256::from_be_slice(hash.as_slice()));
+        Ok(KeyId(phrase.join(WORD_SEPARATOR)))
     }
 }
 
@@ -127,22 +113,123 @@ impl ToSql for KeyId {
     }
 }
 
+/// A (de)serializable wrapper around [`ssh_key::PublicKey`].
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub struct SshPublicKey(ssh_key::PublicKey);
+
+impl SshPublicKey {
+    pub fn key_id(&self) -> Result<KeyId, KeyError> {
+        KeyId::try_from(&self.0)
+    }
+
+    pub fn is_acceptable_algorithm(&self) -> bool {
+        use EcdsaCurve::*;
+        use SshAlgorithm::*;
+        matches!(
+            self.algorithm(),
+            Ecdsa { curve: NistP256 } | Ed25519 | SkEcdsaSha2NistP256 | SkEd25519
+        )
+    }
+
+    pub fn is_sk_algorithm(&self) -> bool {
+        use SshAlgorithm::*;
+        matches!(self.algorithm(), SkEcdsaSha2NistP256 | SkEd25519)
+    }
+
+    pub fn verify(&self, message: &[u8], signature: &Signature) -> Result<(), KeyError> {
+        signature.verify_with_ssh_public_key(message, self)
+    }
+
+    pub fn into_inner(self) -> ssh_key::PublicKey {
+        self.0
+    }
+}
+
+impl From<ssh_key::PublicKey> for SshPublicKey {
+    fn from(key: ssh_key::PublicKey) -> Self {
+        Self(key)
+    }
+}
+
+impl Deref for SshPublicKey {
+    type Target = ssh_key::PublicKey;
+
+    fn deref(&self) -> &Self::Target {
+        &self.0
+    }
+}
+
+impl FromSql for SshPublicKey {
+    fn column_result(value: ValueRef<'_>) -> FromSqlResult<Self> {
+        Ok(Self(
+            ssh_key::PublicKey::from_openssh(value.as_str()?).map_err(FromSqlError::other)?,
+        ))
+    }
+}
+
+impl ToSql for SshPublicKey {
+    fn to_sql(&self) -> SqlResult<ToSqlOutput<'_>> {
+        Ok(ToSqlOutput::from(
+            self.0.to_openssh().map_err(FromSqlError::other)?,
+        ))
+    }
+}
+
+impl JsonSchema for SshPublicKey {
+    fn schema_name() -> String {
+        <String as JsonSchema>::schema_name()
+    }
+
+    fn json_schema(generator: &mut SchemaGenerator) -> Schema {
+        <String as JsonSchema>::json_schema(generator)
+    }
+
+    fn is_referenceable() -> bool {
+        <String as JsonSchema>::is_referenceable()
+    }
+}
+
 /// Code phrase encoded signature.
+///
+/// The decoded phrases `r` and `s` together comprise a signature
+/// _(r, s)_ over a 256 bit elliptic curve.
+///
+/// The `flags` and `counter` parameters are for the [`SK-*` family of SSH
+/// public keys](https://cvsweb.openbsd.org/src/usr.bin/ssh/PROTOCOL.u2f?annotate=HEAD).
+/// They should be set to 0 for other key types.
 #[derive(Clone, Debug, Deserialize, Eq, JsonSchema, Ord, PartialEq, PartialOrd, Serialize)]
 pub struct EncodedSignature {
-    r: String,
-    s: String,
+    pub r: String,
+    pub s: String,
+
+    #[serde(default, skip_serializing_if = "is_zero_flags")]
+    pub flags: u8,
+    #[serde(default, skip_serializing_if = "is_zero_counter")]
+    pub counter: u32,
+}
+
+fn is_zero_flags(flags: &u8) -> bool {
+    *flags == 0
+}
+
+fn is_zero_counter(counter: &u32) -> bool {
+    *counter == 0
 }
 
 impl EncodedSignature {
-    fn decode(
+    fn decode_with_cert(
         &self,
         signature_algorithm: &AlgorithmIdentifierOwned,
-    ) -> Result<Signature, CertError> {
+    ) -> Result<Signature, KeyError> {
         // Currently assumes all (r, s) values are 256 bits.
         // If we introduce longer signature variants later,
         // this code will need to change slightly.
-        let Self { r, s } = self;
+        let Self {
+            r,
+            s,
+            flags: _,
+            counter: _,
+        } = self;
         let r = decode_phrase(r)?.to_be_byte_array();
         let s = decode_phrase(s)?.to_be_byte_array();
         match signature_algorithm {
@@ -159,12 +246,57 @@ impl EncodedSignature {
                 r.into(),
                 s.into(),
             ))),
-            _ => Err(CertError::InvalidPublicKeyAlgorithm),
+            _ => Err(KeyError::InvalidPublicKeyAlgorithm),
+        }
+    }
+
+    fn decode_with_ssh_public_key(&self, algorithm: SshAlgorithm) -> Result<Signature, KeyError> {
+        use EcdsaCurve::*;
+        use SshAlgorithm::*;
+        let Self {
+            r,
+            s,
+            flags,
+            counter,
+        } = self;
+        let r = decode_phrase(r)?.to_be_byte_array();
+        let s = decode_phrase(s)?.to_be_byte_array();
+        match algorithm {
+            Ecdsa { curve: NistP256 } => Ok(Signature::EcdsaSha256(
+                ecdsa::Signature::from_scalars(r, s)?,
+            )),
+            Ed25519 => Ok(Signature::Ed25519(Ed25519Signature::from_components(
+                r.into(),
+                s.into(),
+            ))),
+            SkEcdsaSha2NistP256 => {
+                let mut bytes = BytesMut::new();
+                bytes.put_mpint(r)?;
+                bytes.put_mpint(s)?;
+                bytes.put_u8(*flags);
+                bytes.put_u32(*counter);
+                Ok(Signature::SkEcdsaSha256(SshSignature::new(
+                    algorithm,
+                    bytes.freeze(),
+                )?))
+            }
+            SkEd25519 => {
+                let mut bytes = BytesMut::new();
+                bytes.extend(r);
+                bytes.extend(s);
+                bytes.put_u8(*flags);
+                bytes.put_u32(*counter);
+                Ok(Signature::SkEd25519(SshSignature::new(
+                    algorithm,
+                    bytes.freeze(),
+                )?))
+            }
+            _ => Err(KeyError::InvalidPublicKeyAlgorithm),
         }
     }
 }
 
-// Use JSON to encode signature (r, s) values. Keeps the database
+// Use JSON to encode signatures values for storage. Keeps the database
 // consistent with the wire protocol, but we might regret it later.
 
 impl FromSql for EncodedSignature {
@@ -186,37 +318,67 @@ impl ToSql for EncodedSignature {
 pub enum Signature {
     EcdsaSha256(ecdsa::Signature),
     Ed25519(Ed25519Signature),
+    SkEcdsaSha256(SshSignature),
+    SkEd25519(SshSignature),
 }
 
 impl Signature {
-    pub fn to_bit_string(&self) -> Result<BitString, CertError> {
+    pub fn to_bit_string(&self) -> Result<BitString, KeyError> {
         match self {
             Self::EcdsaSha256(signature) => Ok(BitString::from_bytes(
                 signature.to_der().to_bytes().as_ref(),
             )?),
             Self::Ed25519(signature) => Ok(BitString::from_bytes(signature.to_bytes().as_slice())?),
+            Self::SkEcdsaSha256(_) | Self::SkEd25519(_) => Err(KeyError::InvalidSignatureAlgorithm),
         }
     }
 
-    pub fn encode(&self) -> EncodedSignature {
+    pub fn encode(&self) -> Result<EncodedSignature, KeyError> {
         let codephrase = |x: U256| codephrase(x).join(WORD_SEPARATOR);
         match self {
-            Self::EcdsaSha256(signature) => EncodedSignature {
+            Self::EcdsaSha256(signature) => Ok(EncodedSignature {
                 r: codephrase(U256::from_be_byte_array(signature.r().to_bytes())),
                 s: codephrase(U256::from_be_byte_array(signature.s().to_bytes())),
-            },
-            Self::Ed25519(signature) => EncodedSignature {
+                flags: 0,
+                counter: 0,
+            }),
+            Self::Ed25519(signature) => Ok(EncodedSignature {
                 r: codephrase(U256::from_be_slice(signature.r_bytes())),
                 s: codephrase(U256::from_be_slice(signature.s_bytes())),
-            },
+                flags: 0,
+                counter: 0,
+            }),
+            Self::SkEcdsaSha256(signature) => {
+                let (signature, flags, counter) = sk_split(signature.as_bytes());
+                let mut signature = BytesMut::from(signature);
+                let r = signature.try_get_mpint()?;
+                let s = signature.try_get_mpint()?;
+                let e = || KeyError::InvalidSignatureEncoding;
+                Ok(EncodedSignature {
+                    r: codephrase(U256::from_be_slice(r.as_positive_bytes().ok_or_else(e)?)),
+                    s: codephrase(U256::from_be_slice(s.as_positive_bytes().ok_or_else(e)?)),
+                    flags,
+                    counter,
+                })
+            }
+            Self::SkEd25519(signature) => {
+                let (signature, flags, counter) = sk_split(signature.as_bytes());
+                let signature = Ed25519Signature::from_slice(signature)?;
+                Ok(EncodedSignature {
+                    r: codephrase(U256::from_be_slice(signature.r_bytes())),
+                    s: codephrase(U256::from_be_slice(signature.s_bytes())),
+                    flags,
+                    counter,
+                })
+            }
         }
     }
 
-    pub fn verify(
+    pub fn verify_with_spki(
         &self,
         message: &[u8],
         spki: &SubjectPublicKeyInfo<Any, BitString>,
-    ) -> Result<(), CertError> {
+    ) -> Result<(), KeyError> {
         let public_key_bytes = spki.subject_public_key.raw_bytes();
         match self {
             Self::EcdsaSha256(signature) => {
@@ -227,22 +389,55 @@ impl Signature {
                 let public_key = Ed25519VerifyingKey::from_bytes(
                     &public_key_bytes
                         .try_into()
-                        .map_err(|_| CertError::InvalidPublicKey)?,
+                        .map_err(|_| KeyError::InvalidPublicKey)?,
                 )?;
                 public_key.verify(message, signature)?;
+            }
+            Self::SkEcdsaSha256(_) | Self::SkEd25519(_) => {
+                return Err(KeyError::InvalidSignatureAlgorithm);
+            }
+        }
+        Ok(())
+    }
+
+    pub fn verify_with_ssh_public_key(
+        &self,
+        message: &[u8],
+        public_key: &SshPublicKey,
+    ) -> Result<(), KeyError> {
+        match self {
+            Self::EcdsaSha256(signature) => {
+                Verifier::verify(&public_key.0, message, &signature.try_into()?)?;
+            }
+            Self::Ed25519(signature) => {
+                let signature = SshSignature::new(SshAlgorithm::Ed25519, signature.to_bytes())?;
+                Verifier::verify(&public_key.0, message, &signature)?;
+            }
+            Self::SkEcdsaSha256(signature) | Self::SkEd25519(signature) => {
+                Verifier::verify(&public_key.0, message, signature)?;
             }
         }
         Ok(())
     }
 }
 
+/// See <https://cvsweb.openbsd.org/src/usr.bin/ssh/PROTOCOL.u2f?annotate=HEAD>
+fn sk_split(raw_signature: &[u8]) -> (&[u8], u8, u32) {
+    let n = raw_signature.len();
+    let (signature, mut trailer) = raw_signature.split_at(n - 1 - 4);
+    let flags = trailer.get_u8();
+    let counter = trailer.get_u32();
+    assert!(trailer.is_empty());
+    (signature, flags, counter)
+}
+
 /// Extract the signature on a certificate.
 impl TryFrom<&Certificate> for Signature {
-    type Error = CertError;
+    type Error = KeyError;
 
     fn try_from(cert: &Certificate) -> Result<Self, Self::Error> {
         if cert.signature_algorithm != cert.tbs_certificate.signature {
-            return Err(Self::Error::InvalidSignature);
+            return Err(Self::Error::InvalidSignatureAlgorithm);
         }
 
         let signature = cert.signature.raw_bytes();
@@ -255,7 +450,24 @@ impl TryFrom<&Certificate> for Signature {
                 oid: ID_ED_25519,
                 parameters: None,
             } => Ok(Self::Ed25519(Ed25519Signature::from_slice(signature)?)),
-            _ => Err(Self::Error::InvalidSignature),
+            _ => Err(Self::Error::InvalidSignatureAlgorithm),
+        }
+    }
+}
+
+/// Translate from an SSH signature.
+impl TryFrom<SshSignature> for Signature {
+    type Error = KeyError;
+
+    fn try_from(signature: SshSignature) -> Result<Self, Self::Error> {
+        use EcdsaCurve::*;
+        use SshAlgorithm::*;
+        match signature.algorithm() {
+            Ecdsa { curve: NistP256 } => Ok(Self::EcdsaSha256(signature.try_into()?)),
+            Ed25519 => Ok(Self::Ed25519(signature.try_into()?)),
+            SkEcdsaSha2NistP256 => Ok(Self::SkEcdsaSha256(signature.to_owned())),
+            SkEd25519 => Ok(Self::SkEd25519(signature.to_owned())),
+            _ => Err(Self::Error::InvalidSignatureAlgorithm),
         }
     }
 }
@@ -265,17 +477,17 @@ impl TryFrom<&Certificate> for Signature {
 pub trait Signer {
     type Error: std::fmt::Display;
 
-    async fn sign<T: ToBeSigned>(&self, thing: T) -> Result<Signed<T>, Self::Error>;
+    async fn sign<T: ToBeSigned>(&mut self, thing: T) -> Result<Signed<T>, Self::Error>;
 }
 
-/// Some data or a hash to be signed with a particular key.
+/// Some data or a hash to be signed.
 pub trait ToBeSigned {
-    fn to_be_signed(&self, key_id: &KeyId) -> Vec<u8>;
+    fn to_be_signed(&self) -> Vec<u8>;
 }
 
 impl<T: AsRef<[u8]>> ToBeSigned for T {
     /// Trivial transformation for raw bytes.
-    fn to_be_signed(&self, _key_id: &KeyId) -> Vec<u8> {
+    fn to_be_signed(&self) -> Vec<u8> {
         self.as_ref().to_vec()
     }
 }
@@ -324,23 +536,58 @@ impl<T> Deref for Signed<T> {
 
 impl<T: ToBeSigned> Signed<T> {
     /// Verify that the signature on a payload was produced by the private key
+    /// corresponding to the given SSH public key.
+    pub fn verify_with_ssh_public_key(
+        self,
+        public_key: &SshPublicKey,
+    ) -> Result<Verified<T>, KeyError> {
+        self.signature
+            .decode_with_ssh_public_key(public_key.algorithm())?
+            .verify_with_ssh_public_key(&self.to_be_signed(), public_key)?;
+        Ok(Verified {
+            signed: self,
+            verified_by: public_key.key_id()?,
+        })
+    }
+
+    /// Verify that the signature on a payload was produced by the private key
     /// corresponding to the subject of `cert`.
-    pub fn verify(self, cert: &Certificate) -> Result<Verified<T>, CertError> {
+    pub fn verify_with_cert(self, cert: &Certificate) -> Result<Verified<T>, KeyError> {
         let spki = &cert.tbs_certificate.subject_public_key_info;
         self.signature
-            .decode(&Self::signature_algorithm_from_spki(&spki.algorithm)?)?
-            .verify(&self.to_be_signed(&self.key_id), spki)?;
+            .decode_with_cert(&Self::signature_algorithm_from_spki(&spki.algorithm)?)?
+            .verify_with_spki(&self.to_be_signed(), spki)?;
         Ok(Verified {
             signed: self,
             verified_by: KeyId::try_from(cert)?,
         })
     }
 
+    /// Derive a signature algorithm from an SSH public key algorithm.
+    /// This mapping must be one-to-one.
+    pub fn signature_algorithm_from_ssh_public_key(
+        public_key: &SshPublicKey,
+    ) -> Result<AlgorithmIdentifierOwned, KeyError> {
+        use EcdsaCurve::*;
+        use SshAlgorithm::*;
+        match public_key.algorithm() {
+            Ecdsa { curve: NistP256 } | SkEcdsaSha2NistP256 => Ok(AlgorithmIdentifierOwned {
+                oid: ECDSA_WITH_SHA_256,
+                parameters: None,
+            }),
+            Ed25519 | SkEd25519 => Ok(AlgorithmIdentifierOwned {
+                oid: ID_ED_25519,
+                parameters: None,
+            }),
+            _ => Err(KeyError::InvalidPublicKeyAlgorithm),
+        }
+    }
+
     /// Derive a signature algorithm from the subject public key algorithm.
-    /// This mapping must be fixed and one-to-one.
+    /// This mapping must be one-to-one.
     pub fn signature_algorithm_from_spki(
         algorithm_id: &AlgorithmIdentifierOwned,
-    ) -> Result<AlgorithmIdentifierOwned, CertError> {
+    ) -> Result<AlgorithmIdentifierOwned, KeyError> {
         match algorithm_id {
             AlgorithmIdentifierOwned {
                 oid: ID_ED_25519,
@@ -353,7 +600,7 @@ impl<T: ToBeSigned> Signed<T> {
                 oid: ECDSA_WITH_SHA_256,
                 parameters: None,
             }),
-            _ => Err(CertError::InvalidPublicKeyAlgorithm),
+            _ => Err(KeyError::InvalidPublicKeyAlgorithm),
         }
     }
 }
@@ -368,6 +615,10 @@ pub struct Verified<T> {
 impl<T> Verified<T> {
     pub fn into_signed(self) -> Signed<T> {
         self.signed
+    }
+
+    pub fn into_payload(self) -> T {
+        self.into_signed().into_payload()
     }
 
     pub fn verified_by(&self) -> &KeyId {
@@ -475,13 +726,13 @@ impl EphemeralKey {
         key_type: KeyType,
         subject: Name,
         validity: Validity,
-    ) -> Result<Self, CertError> {
+    ) -> Result<Self, KeyError> {
         let key = SigningKey::new(key_type);
         let cert = Self::self_signed_cert(&key, subject, validity)?;
         let subject = cert.tbs_certificate.subject.to_owned();
         let key_id = KeyId::try_from(&subject)?;
         let signature = Signature::try_from(&cert)?;
-        signature.verify(
+        signature.verify_with_spki(
             &cert.tbs_certificate.to_der()?,
             &cert.tbs_certificate.subject_public_key_info,
         )?;
@@ -494,9 +745,9 @@ impl EphemeralKey {
         subject: Name,
         issuer: Name,
         validity: Validity,
-        signer: &impl Signer,
+        signer: &mut impl Signer,
         signature_algorithm: AlgorithmIdentifierOwned,
-    ) -> Result<Self, CertError> {
+    ) -> Result<Self, KeyError> {
         let key = SigningKey::new(key_type);
         let key_id = KeyId::try_from(&subject)?;
         let tbs_certificate = Self::tbs_certificate(
@@ -509,7 +760,7 @@ impl EphemeralKey {
         );
         let cert = Self::sign_cert(tbs_certificate, signer)
             .await
-            .map_err(|e| CertError::Signer(e.to_string()))?;
+            .map_err(|e| KeyError::Signer(e.to_string()))?;
         Ok(Self { key, key_id, cert })
     }
 
@@ -529,7 +780,7 @@ impl EphemeralKey {
         self.cert.tbs_certificate.subject.clone()
     }
 
-    fn generate_serial_number() -> Result<SerialNumber, CertError> {
+    fn generate_serial_number() -> Result<SerialNumber, KeyError> {
         Ok(SerialNumber::new(
             &U128::random(&mut OsRng).to_be_byte_array(),
         )?)
@@ -561,7 +812,7 @@ impl EphemeralKey {
         key: &SigningKey,
         subject: Name,
         validity: Validity,
-    ) -> Result<Certificate, CertError> {
+    ) -> Result<Certificate, KeyError> {
         let signature_algorithm = key.signature_algorithm();
         let tbs_certificate = Self::tbs_certificate(
             key,
@@ -581,16 +832,16 @@ impl EphemeralKey {
 
     async fn sign_cert(
         tbs_certificate: TbsCertificate,
-        signer: &impl Signer,
-    ) -> Result<Certificate, CertError> {
+        signer: &mut impl Signer,
+    ) -> Result<Certificate, KeyError> {
         let tbs = tbs_certificate.to_der()?;
         let signature_algorithm = tbs_certificate.signature.to_owned();
         let signature = signer
             .sign(&tbs)
             .await
-            .map_err(CertError::signer)?
+            .map_err(KeyError::signer)?
             .signature
-            .decode(&signature_algorithm)?
+            .decode_with_cert(&signature_algorithm)?
             .to_bit_string()?;
         Ok(Certificate {
             tbs_certificate,
@@ -598,20 +849,31 @@ impl EphemeralKey {
             signature,
         })
     }
+
+    pub fn ssh_public_key(&self) -> SshPublicKey {
+        use ssh_key::public::{EcdsaPublicKey, Ed25519PublicKey};
+        match &self.key {
+            SigningKey::Ed25519(key) => {
+                SshPublicKey(Ed25519PublicKey::from(key.verifying_key()).into())
+            }
+            SigningKey::P256(key) => SshPublicKey(
+                EcdsaPublicKey::from(ecdsa::VerifyingKey::from(key.public_key())).into(),
+            ),
+        }
+    }
 }
 
 impl Signer for EphemeralKey {
-    type Error = CertError;
+    type Error = KeyError;
 
-    async fn sign<T: ToBeSigned>(&self, what: T) -> Result<Signed<T>, Self::Error> {
-        let key_id = self.key_id.clone();
-        let signature = self.key.sign(&what.to_be_signed(&key_id));
-        Ok(Signed::new(what, key_id, signature.encode()))
+    async fn sign<T: ToBeSigned>(&mut self, what: T) -> Result<Signed<T>, Self::Error> {
+        let signature = self.key.sign(&what.to_be_signed());
+        Ok(Signed::new(what, self.key_id.clone(), signature.encode()?))
     }
 }
 
 /// Encode a vector of certs as PEM and join them on newline for transport.
-pub fn pem_cert_chain(certs: Vec<Certificate>) -> Result<String, CertError> {
+pub fn pem_cert_chain(certs: Vec<Certificate>) -> Result<String, KeyError> {
     Ok(certs
         .into_iter()
         .map(|cert| cert.to_der())
@@ -620,4 +882,41 @@ pub fn pem_cert_chain(certs: Vec<Certificate>) -> Result<String, CertError> {
         .map(|cert| pem_encode(Certificate::PEM_LABEL, LineEnding::LF, &cert))
         .collect::<Result<Vec<String>, _>>()?
         .join("\n"))
+}
+
+/// What went wrong handling a key, signature, or certificate.
+#[derive(Debug, Error)]
+pub enum KeyError {
+    #[error("DER encoding error: {0}")]
+    Der(#[from] x509_cert::der::Error),
+    #[error("Ed25519 error: {0}")]
+    Ed25519(#[from] ed25519_dalek::ed25519::Error),
+    #[error(transparent)]
+    InvalidCodephrase(#[from] InvalidCodephrase),
+    #[error("Invalid key ID")]
+    InvalidKeyId,
+    #[error("Invalid subject public key")]
+    InvalidPublicKey,
+    #[error("Invalid public key algorithm")]
+    InvalidPublicKeyAlgorithm,
+    #[error("Invalid signature algorithm")]
+    InvalidSignatureAlgorithm,
+    #[error("Invalid signature encoding")]
+    InvalidSignatureEncoding,
+    #[error(transparent)]
+    Pem(#[from] pem_rfc7468::Error),
+    #[error("SSH agent protocol error: {0}")]
+    Protocol(#[from] ProtocolError),
+    #[error("Will not import a self-signed (root) certificate")]
+    SelfSigned,
+    #[error("Signing error: {0}")]
+    Signer(String),
+    #[error("SSH key error: {0}")]
+    SshKey(#[from] SshKeyError),
+}
+
+impl KeyError {
+    fn signer(error: impl std::fmt::Display) -> Self {
+        Self::Signer(error.to_string())
+    }
 }

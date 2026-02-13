@@ -34,7 +34,7 @@ use serde_json::{from_str as from_json, to_string as to_json};
 use thiserror::Error;
 use tokio_tungstenite::tungstenite::protocol::Message as WebSocketMessage;
 
-pub const SESSION_BUFFER_SIZE: usize = 0x1000;
+pub const SESSION_BUFFER_SIZE: usize = 0x10000;
 pub const SESSION_KEY_CONTEXT: &str = "Oxide Support Shell Session Encoding v1";
 pub const SESSION_KEY_LEN: usize = 32;
 pub const SESSION_REKEY_PERIOD: Duration = Duration::from_secs(30);

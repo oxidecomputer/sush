@@ -33,6 +33,7 @@ serde_json.workspace = true
 sha2.workspace = true
 slog.workspace = true
 slog-term.workspace = true
+ssh-key.workspace = true
 sush-api = { path = "../api" }
 sush-common = { path = "../common" }
 tempfile.workspace = true

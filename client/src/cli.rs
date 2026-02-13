@@ -1,7 +1,7 @@
 //! Possibly-interactive command-line interface.
 
 use std::collections::HashMap;
-use std::io::{Write as _, stdout};
+use std::io::{self, BufRead as _, Read as _, Write as _, stderr, stdin, stdout};
 use std::path::Path;
 use std::time::Duration;
 
@@ -9,14 +9,16 @@ use bytesize::ByteSize;
 use chrono::{DateTime, Utc};
 use humantime::format_duration;
 use indicatif::{ProgressBar, ProgressStyle};
-use serde_json::json;
+use rustix::io::ioctl_fionread;
+use serde_json::{json, to_string as to_json_string, to_string_pretty as to_json_string_pretty};
 use x509_cert::Certificate;
 use x509_cert::der::Encode as _;
 
-use sush_common::certs::{KeyId, Signature};
+use sush_common::authn::Identity;
 use sush_common::jobs::{JobId, JobOutputStream, JobStatus, JobsReserved, SignedJob};
+use sush_common::keys::{KeyId, Signature, SshPublicKey};
 
-use crate::commands::{CommandContext, CommandError, GlobalArgs, OutputFormat};
+use crate::commands::{CommandContext, CommandError, GlobalArgs, OutputFormat, Reserved};
 
 #[derive(Debug, Default)]
 pub struct Cli {
@@ -74,7 +76,8 @@ impl CommandContext for Cli {
             return Err(CommandError::InvalidRootCert);
         }
         let tbs = root.tbs_certificate.to_der()?;
-        Signature::try_from(root)?.verify(&tbs, &root.tbs_certificate.subject_public_key_info)?;
+        Signature::try_from(root)?
+            .verify_with_spki(&tbs, &root.tbs_certificate.subject_public_key_info)?;
         if matches!(self.get_output_format(), OutputFormat::Text) {
             println!(
                 "✅ Verified root certificate for subject `{}`",
@@ -86,7 +89,7 @@ impl CommandContext for Cli {
         for cert in rest {
             let tbs = cert.tbs_certificate.to_der()?;
             Signature::try_from(cert)?
-                .verify(&tbs, &prev.tbs_certificate.subject_public_key_info)?;
+                .verify_with_spki(&tbs, &prev.tbs_certificate.subject_public_key_info)?;
             prev = cert;
             if matches!(self.get_output_format(), OutputFormat::Text) {
                 println!(
@@ -136,6 +139,40 @@ impl CommandContext for Cli {
             }
         }
         Ok(())
+    }
+
+    fn read_signed_job(&mut self) -> Result<SignedJob, CommandError> {
+        let input = read_input(match self.get_output_format() {
+            OutputFormat::Json => "",
+            OutputFormat::Text => "✅ Enter signed job request, terminated with Ctrl-D:\n",
+        })?;
+        Ok(serde_json::from_str(&input)?)
+    }
+
+    fn read_reserved(&mut self) -> Result<Reserved, CommandError> {
+        let input = read_input(match self.get_output_format() {
+            OutputFormat::Json => "",
+            OutputFormat::Text => "✅ Enter reserved job IDs, terminated with Ctrl-D:\n",
+        })?;
+        if input.trim_start().starts_with('{') {
+            if let Ok(jobs) = serde_json::from_str(&input) {
+                Ok(Reserved::Batch(jobs))
+            } else if let Ok(map) = serde_json::from_str(&input) {
+                Ok(Reserved::Map(map))
+            } else {
+                Err(CommandError::InvalidReservedJobs)
+            }
+        } else {
+            Ok(Reserved::Batch(JobsReserved {
+                job_ids: input
+                    .split('\n')
+                    .map(|s| s.trim())
+                    .filter(|s| !s.is_empty())
+                    .map(JobId::from)
+                    .collect::<Vec<JobId>>(),
+                time_reserved: Utc::now(),
+            }))
+        }
     }
 
     fn reserved_read(&mut self, reserved: &JobsReserved) -> Result<(), CommandError> {
@@ -386,8 +423,8 @@ impl CommandContext for Cli {
 
     fn job_signed(&mut self, job: &SignedJob) -> Result<(), CommandError> {
         match self.get_output_format() {
-            OutputFormat::Json => println!("{}", serde_json::to_string(&job)?),
-            OutputFormat::Text => println!("{}", serde_json::to_string_pretty(&job)?),
+            OutputFormat::Json => println!("{}", to_json_string(&job)?),
+            OutputFormat::Text => println!("{}", to_json_string_pretty(&job)?),
         }
         Ok(())
     }
@@ -465,7 +502,7 @@ impl CommandContext for Cli {
                     let stderr_len = byte_size(*stderr_len);
                     println!(
                         "✅ Job ID:\t{job_id}\n   \
-                         Job status: Aborted\n   \
+                         Job status:\tAborted\n   \
                          Reserved at:\t{time_reserved}\n   \
                          Started at:\t{time_started}\n   \
                          Aborted at:\t{time_ended} ({duration})\n   \
@@ -499,4 +536,140 @@ impl CommandContext for Cli {
         }
         Ok(())
     }
+
+    fn iam(&mut self, identity: &Identity) -> Result<(), CommandError> {
+        match self.get_output_format() {
+            OutputFormat::Json => println!("{}", to_json_string(identity)?),
+            OutputFormat::Text => {
+                let Identity {
+                    key_id,
+                    public_key,
+                    nonce,
+                    time_authenticated,
+                    time_revoked,
+                } = identity;
+                let fingerprint = public_key.fingerprint(Default::default()).to_string();
+                let algorithm = public_key.algorithm();
+                let comment = public_key.comment();
+                println!(
+                    "✅ Key ID:\t{key_id}\n   \
+                        Fingerprint:\t{fingerprint}\n   \
+                        Algorithm:\t{algorithm}\n   \
+                        Comment:\t{comment}\n   \
+                        Nonce:\t{nonce}\n   \
+                        Authn at:\t{time_authenticated}",
+                );
+                if let Some(time_revoked) = time_revoked {
+                    println!("   Revoked at:\t{time_revoked}");
+                }
+            }
+        }
+        Ok(())
+    }
+
+    fn identities(&mut self, keys: &[SshPublicKey]) -> Result<(), CommandError> {
+        let n = keys.len();
+        if n == 0 {
+            match self.get_output_format() {
+                OutputFormat::Json => println!("[]"),
+                OutputFormat::Text => println!("❌ No SSH identities found"),
+            }
+        } else {
+            for key in keys {
+                let key_id = key.key_id()?;
+                let fingerprint = key.fingerprint(Default::default()).to_string();
+                let algorithm = key.algorithm();
+                let comment = key.comment();
+                match self.get_output_format() {
+                    OutputFormat::Json => println!(
+                        "{}",
+                        json!({
+                            "key_id": key_id,
+                            "fingerprint": fingerprint,
+                            "algorithm": algorithm.to_string(),
+                            "public_key": key.to_openssh()?,
+                        })
+                    ),
+                    OutputFormat::Text => {
+                        println!(
+                            "✅ Key ID:\t{key_id}\n   \
+                                Fingerprint:\t{fingerprint}\n   \
+                                Algorithm:\t{algorithm}\n   \
+                                Comment:\t{comment}",
+                        );
+                    }
+                }
+            }
+        }
+        Ok(())
+    }
+
+    fn really_revoke(&mut self, key_id: KeyId) -> Result<KeyId, CommandError> {
+        match self.get_output_format() {
+            OutputFormat::Json => Ok(key_id),
+            OutputFormat::Text => {
+                let prompt = format!("❓ Really revoke identity `{key_id}` (yes/no)? ");
+                if read_bool(&prompt)? {
+                    Ok(key_id)
+                } else {
+                    Err(CommandError::Canceled)
+                }
+            }
+        }
+    }
+
+    fn identity_revoked(&mut self, key_id: KeyId) -> Result<(), CommandError> {
+        match self.get_output_format() {
+            OutputFormat::Json => println!("{}", json!({"revoked": key_id})),
+            OutputFormat::Text => println!("✅ Revoked SSH identity `{key_id}`"),
+        }
+        Ok(())
+    }
+
+    fn please_touch(&mut self, identity: &SshPublicKey) -> Result<(), CommandError> {
+        if identity.is_sk_algorithm() {
+            match self.get_output_format() {
+                OutputFormat::Json => (),
+                OutputFormat::Text => eprintln!(
+                    "👋 Please confirm user presence to sign with key `{}`",
+                    identity.key_id()?
+                ),
+            }
+        }
+        Ok(())
+    }
+}
+
+/// Read stdin until EOF, prompting unless there's already input available.
+fn read_input(prompt: &str) -> Result<String, CommandError> {
+    let mut stderr = stderr().lock();
+    let mut stdin = stdin().lock();
+    let avail = ioctl_fionread(&stdin).map_err(stdin_err)?;
+    if avail == 0 && !prompt.is_empty() {
+        stderr.write_all(prompt.as_bytes()).map_err(stderr_err)?;
+    }
+
+    let mut input = String::new();
+    stdin.read_to_string(&mut input).map_err(stdin_err)?;
+    Ok(input)
+}
+
+/// Prompt with a question and read a boolean answer. The (case-insensitive)
+/// strings `"y"` and `"yes"` denote true, anything else denotes false.
+fn read_bool(prompt: &str) -> Result<bool, CommandError> {
+    let mut stderr = stderr().lock();
+    stderr.write_all(prompt.as_bytes()).map_err(stderr_err)?;
+
+    let mut input = String::new();
+    let mut stdin = stdin().lock();
+    stdin.read_line(&mut input).map_err(stdin_err)?;
+    Ok(["y", "yes"].contains(&input.trim().to_ascii_lowercase().as_ref()))
+}
+
+fn stderr_err<E: Into<io::Error>>(err: E) -> CommandError {
+    CommandError::io("stderr", err.into())
+}
+
+fn stdin_err<E: Into<io::Error>>(err: E) -> CommandError {
+    CommandError::io("stdin", err.into())
 }

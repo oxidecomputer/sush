@@ -5,9 +5,9 @@ use std::fmt;
 
 use chrono::{DateTime, Utc};
 use dropshot::{
-    Body, ClientErrorStatusCode, EmptyScanParams, Header, HttpError, HttpResponseOk,
-    PaginationParams, Path as PathParams, Query as QueryParams, RequestContext, ResultsPage,
-    TypedBody, WebsocketEndpointResult, WebsocketUpgrade, api_description,
+    Body, ClientErrorStatusCode, EmptyScanParams, Header, HttpError, HttpResponseDeleted,
+    HttpResponseOk, PaginationParams, Path as PathParams, Query as QueryParams, RequestContext,
+    ResultsPage, TypedBody, WebsocketEndpointResult, WebsocketUpgrade, api_description,
 };
 use http_range_header::{SyntacticallyCorrectRange as Range, parse_range_header};
 use hyper::Response;
@@ -15,8 +15,9 @@ use schemars::JsonSchema;
 use serde::Deserialize;
 use serde::de::{Deserializer, Error as DeserializeError, IntoDeserializer, MapAccess, Visitor};
 
-use sush_common::certs::KeyId;
+use sush_common::authn::Identity;
 use sush_common::jobs::{JobId, JobLimits, JobOutputStream, JobStatus, JobsReserved, SignedJob};
+use sush_common::keys::{KeyId, SshPublicKey};
 
 /// Oxide Support Shell API
 #[api_description]
@@ -39,7 +40,7 @@ pub trait SushApi {
     #[endpoint { method = GET, path = "/certs/{key_id}" }]
     async fn cert_chain(
         ctx: RequestContext<Self::Context>,
-        params: PathParams<CertChainParams>,
+        params: PathParams<KeyIdParam>,
     ) -> Result<HttpResponseOk<String>, HttpError>;
 
     // Job reservation requests.
@@ -75,6 +76,7 @@ pub trait SushApi {
     #[endpoint { method = POST, path = "/jobs/{job_id}/start" }]
     async fn job_start(
         ctx: RequestContext<Self::Context>,
+        headers: Header<Authorization>,
         params: PathParams<JobIdParam>,
         query: QueryParams<JobStartParams>,
         body: TypedBody<SignedJob>,
@@ -93,6 +95,7 @@ pub trait SushApi {
     #[endpoint { method = GET, path = "/jobs/{job_id}/session" }]
     async fn job_session(
         ctx: RequestContext<Self::Context>,
+        headers: Header<Authorization>,
         params: PathParams<JobIdParam>,
         upgrade: WebsocketUpgrade,
     ) -> WebsocketEndpointResult;
@@ -127,10 +130,34 @@ pub trait SushApi {
         ctx: RequestContext<Self::Context>,
         params: QueryParams<PaginationParams<EmptyScanParams, JobId>>,
     ) -> Result<HttpResponseOk<ResultsPage<JobStatus>>, HttpError>;
+
+    /// Prove and register identity.
+    #[endpoint { method = POST, path = "/iam" }]
+    async fn iam(
+        ctx: RequestContext<Self::Context>,
+        headers: Header<Authorization>,
+        body: TypedBody<Option<SshPublicKey>>,
+    ) -> Result<HttpResponseOk<Identity>, HttpError>;
+
+    /// List authenticated identities.
+    #[endpoint { method = GET, path = "/iam" }]
+    async fn identities(
+        ctx: RequestContext<Self::Context>,
+        headers: Header<Authorization>,
+        params: QueryParams<PaginationParams<EmptyScanParams, KeyId>>,
+    ) -> Result<HttpResponseOk<ResultsPage<Identity>>, HttpError>;
+
+    /// Revoke an authenticated identity.
+    #[endpoint { method = DELETE, path = "/iam/{key_id}" }]
+    async fn revoke_identity(
+        ctx: RequestContext<Self::Context>,
+        headers: Header<Authorization>,
+        params: PathParams<KeyIdParam>,
+    ) -> Result<HttpResponseDeleted, HttpError>;
 }
 
 #[derive(Deserialize, JsonSchema)]
-pub struct CertChainParams {
+pub struct KeyIdParam {
     pub key_id: KeyId,
 }
 
@@ -230,4 +257,16 @@ impl RangeRequest {
         };
         Ok(Some(range))
     }
+}
+
+/// HTTP "Authorization" header.
+///
+/// Note that this is misnamed, as it actually carries _authentication_
+/// credentials.
+#[derive(Debug, Deserialize, JsonSchema)]
+pub struct Authorization {
+    /// Authorization to access some resource, such as a signature.
+    ///
+    /// See: <https://developer.mozilla.org/en-US/docs/Web/HTTP/Reference/Headers/Authorization>
+    pub authorization: Option<String>,
 }

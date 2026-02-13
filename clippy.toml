@@ -1,0 +1,13 @@
+[[disallowed-types]]
+path = "ssh_key::Algorithm"
+reason = "localize algorithm decisions to SshPublicKey"
+
+[[disallowed-types]]
+path = "ssh_key::PublicKey"
+reason = "use (de)serializable wrapper instead"
+replacement = "sush_common::keys::SshPublicKey"
+
+[[disallowed-types]]
+path = "ssh_key::Signature"
+reason = "use wrapper instead"
+replacement = "sush_common::keys::Signature"
