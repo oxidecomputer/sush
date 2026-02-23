@@ -6,7 +6,7 @@ use std::collections::HashMap;
 use std::fmt;
 use std::fs::{File, OpenOptions};
 use std::io::{Read as _, Seek as _, SeekFrom, Write as _, stdin, stdout};
-use std::num::{NonZeroU8, NonZeroU32, NonZeroU64};
+use std::num::{NonZeroU8, NonZeroU64};
 use std::os::fd::AsRawFd;
 use std::path::{Path, PathBuf};
 use std::pin::Pin;
@@ -17,26 +17,33 @@ use blake3::{Hasher, hash};
 use bytesize::ByteSize;
 use chrono::{DateTime, Utc};
 use clap::{Parser, Subcommand, ValueEnum};
-use futures::FutureExt as _;
-use futures::stream::{self, StreamExt as _};
+use futures::stream;
+use futures::{FutureExt as _, StreamExt as _};
 use http::status::StatusCode;
 use libc::{FIONREAD, ioctl};
 use memmap2::Mmap;
+use reqwest::Upgraded;
+use rustix::termios::tcgetwinsize;
 use thiserror::Error;
 use tokio::signal::ctrl_c;
-use tokio::time::{MissedTickBehavior, interval, sleep};
+use tokio::time::{MissedTickBehavior, interval};
 use tokio::{pin, select};
+use tokio_tungstenite::WebSocketStream;
+use tokio_tungstenite::tungstenite::error::Error as WebSocketError;
+use tokio_tungstenite::tungstenite::protocol::Role;
 
 use sush_common::certs::{CertError, KeyId, Signer as _};
 use sush_common::jobs::JobOutputStream::{self, Stderr, Stdout};
 use sush_common::jobs::{
     JobId, JobLimits, JobOutputHash, JobStartRequest, JobStatus, JobsReserved, SignedJob,
 };
+use sush_common::session::SessionError;
 
 use crate::ByteStream;
 use crate::permslip::PermslipError;
 use crate::permslip::{DEFAULT_PERMSLIP_URL, PermslipSigner};
 use crate::repl::Repl;
+use crate::session::session;
 use crate::types::Error as ApiError;
 use crate::{Client, Error as ClientError};
 use futures::TryStreamExt as _;
@@ -56,9 +63,6 @@ const DEFAULT_CHUNK_SIZE: ByteSize = ByteSize::mib(32);
 
 /// Default number of simultaneous downloads for large output.
 const PARALLEL_CHUNKS: NonZeroU8 = NonZeroU8::new(8).unwrap();
-
-/// Default number of history entries to fetch at once.
-const DEFAULT_HISTORY_BATCH_SIZE: NonZeroU32 = NonZeroU32::new(10).unwrap();
 
 /// What kind of output to emit.
 #[derive(Clone, Copy, Debug, Default, ValueEnum)]
@@ -100,7 +104,7 @@ pub struct LimitArgs {
 }
 
 impl LimitArgs {
-    pub fn into_limits(self) -> JobLimits {
+    pub fn as_limits(&self) -> JobLimits {
         let Self {
             max_cpu,
             max_mem,
@@ -232,35 +236,7 @@ pub enum ClientCommand {
 
     /// Sign and start a job.
     #[clap(alias = "start")]
-    JobStart {
-        #[clap(flatten)]
-        limits: LimitArgs,
-
-        /// The command for the job to run. Passed as an argument to
-        /// `bash -c`, so may be an arbitrary bash(1) command or pipeline.
-        /// Be sure to quote spaces and characters special to your shell!
-        command: Option<String>,
-
-        /// Previously reserved but unused job ID.
-        #[clap(env = SUSH_JOB_ID)]
-        job_id: Option<JobId>,
-
-        /// Use `permslip` to sign requests with this key name.
-        #[arg(short, long, env = SUSH_PERMSLIP_KEY, name = "KEY_NAME")]
-        permslip: Option<String>,
-
-        /// The `permslip` server to contact for signing.
-        #[arg(long, env = PERMSLIP_URL, default_value = DEFAULT_PERMSLIP_URL)]
-        permslip_url: String,
-
-        /// Wait for the job to end and display its output.
-        #[arg(short, long, default_value_t = false)]
-        wait: bool,
-
-        /// Job output is binary, not UTF-8 encoded text.
-        #[arg(short, long, default_value_t = false, requires = "wait")]
-        binary: bool,
-    },
+    JobStart(JobStartArgs),
 
     /// Get the status of a started job.
     #[clap(alias = "status")]
@@ -284,7 +260,15 @@ pub enum ClientCommand {
         output: JobOutput,
     },
 
-    /// Abort a started job.
+    /// Connect to a running interactive job.
+    #[clap(alias = "session")]
+    JobSession {
+        /// The job to connect to.
+        #[clap(env = SUSH_JOB_ID)]
+        job_id: JobId,
+    },
+
+    /// Abort a running job.
     #[clap(alias = "abort")]
     JobAbort {
         /// The job to abort.
@@ -294,10 +278,6 @@ pub enum ClientCommand {
 
     /// Show status of previously started jobs.
     History {
-        /// How many history entries to fetch with each request.
-        #[arg(short, long, default_value_t = DEFAULT_HISTORY_BATCH_SIZE)]
-        batch_size: NonZeroU32,
-
         /// How many history entries to fetch in total, or 0 for all.
         #[arg(short, long, default_value_t = 0)]
         limit: usize,
@@ -316,6 +296,45 @@ pub enum ClientCommand {
     /// Leave the interactive REPL.
     #[clap(alias = "exit")]
     Quit,
+}
+
+#[derive(Clone, Debug, Parser)]
+pub struct JobStartArgs {
+    #[clap(flatten)]
+    limits: LimitArgs,
+
+    /// The command for the job to run. Passed as an argument to
+    /// `bash -c`, so may be an arbitrary bash(1) command or pipeline.
+    /// Be sure to quote spaces and characters special to your shell!
+    command: Option<String>,
+
+    /// Previously reserved but unused job ID.
+    #[clap(env = SUSH_JOB_ID)]
+    job_id: Option<JobId>,
+
+    /// Job output is binary, not UTF-8 encoded text.
+    #[arg(short, long, default_value_t = false, requires = "wait")]
+    binary: bool,
+
+    /// The job should be run interactively. Implies `--wait`.
+    #[arg(short, long, default_value_t = false)]
+    interactive: bool,
+
+    /// Use `permslip` to sign requests with this key name.
+    #[arg(short, long, env = SUSH_PERMSLIP_KEY, name = "KEY_NAME")]
+    permslip: Option<String>,
+
+    /// The `permslip` server to contact for signing.
+    #[arg(long, env = PERMSLIP_URL, default_value = DEFAULT_PERMSLIP_URL)]
+    permslip_url: String,
+
+    /// Terminal type for interactive jobs.
+    #[arg(long, env = "TERM")]
+    term: Option<String>,
+
+    /// Wait for the job to end and display its output.
+    #[arg(short, long, default_value_if("interactive", "true", "true"))]
+    wait: bool,
 }
 
 /// Behavior in response to command execution, e.g., printing output,
@@ -360,8 +379,13 @@ pub trait CommandContext: Send + Sync {
     fn job_polling_started(&mut self, id: &JobId, duration: Duration) -> Result<(), CommandError>;
     fn job_polling_update(&mut self, id: &JobId, status: &JobStatus) -> Result<(), CommandError>;
     fn job_polling_finished(&mut self, id: &JobId) -> Result<(), CommandError>;
-    fn job_status(&mut self, id: &JobId, status: &JobStatus) -> Result<(), CommandError>;
+    fn job_session_connected(&mut self, id: &JobId) -> Result<(), CommandError>;
+    fn job_session_disconnected(&mut self, id: &JobId) -> Result<(), CommandError>;
+    fn job_signing_started(&mut self, id: &JobId) -> Result<(), CommandError>;
+    fn job_signing_update(&mut self, id: &JobId) -> Result<(), CommandError>;
+    fn job_signing_finished(&mut self, id: &JobId) -> Result<(), CommandError>;
     fn job_signed(&mut self, job: &SignedJob) -> Result<(), CommandError>;
+    fn job_status(&mut self, id: &JobId, status: &JobStatus) -> Result<(), CommandError>;
     fn jobs_reserved(&mut self, reserved: &JobsReserved) -> Result<(), CommandError>;
     fn reserved_read(&mut self, reserved: &JobsReserved) -> Result<(), CommandError>;
     fn reserved_map(
@@ -388,19 +412,24 @@ impl ClientCommand {
                 let mut file = File::open(&path).map_err(io_error)?;
                 let mut cert = Vec::new();
                 file.read_to_end(&mut cert).map_err(io_error)?;
-                let key_id = client.import_cert(&cert).await?.into_inner();
+                let key_id = client.import_cert().body(cert).send().await?.into_inner();
                 ctx.cert_imported(&path, key_id)
             }
             (ClientCommand::CertChain { key_id }, Some(client)) => {
-                let certs = client.cert_chain(&key_id).await?.into_inner();
+                let certs = client
+                    .cert_chain()
+                    .key_id(&key_id)
+                    .send()
+                    .await?
+                    .into_inner();
                 ctx.cert_chain(key_id, &certs)
             }
             (ClientCommand::Ping, Some(client)) => {
-                let reserved = client.reserve_jobs(0).await?.into_inner();
+                let reserved = client.reserve_jobs().body(0).send().await?.into_inner();
                 ctx.ack(&client.baseurl, reserved.time_reserved)
             }
-            (ClientCommand::ReserveJobs { number }, Some(client)) => {
-                let reserved = client.reserve_jobs(number).await?.into_inner();
+            (ClientCommand::ReserveJobs { number: n }, Some(client)) => {
+                let reserved = client.reserve_jobs().body(n).send().await?.into_inner();
                 ctx.jobs_reserved(&reserved)
             }
             (ClientCommand::GetReserved, None) => match read_reserved()? {
@@ -408,60 +437,88 @@ impl ClientCommand {
                 Reserved::Map(map) => ctx.reserved_map(&map),
             },
             (ClientCommand::GetReserved, Some(client)) => {
-                let map = client.get_reserved().await?.into_inner();
+                let map = client.get_reserved().send().await?.into_inner();
                 ctx.reserved_map(&map)
             }
             (ClientCommand::RevokeReserved { job_ids }, Some(client)) => {
-                let revoked = client.revoke_reserved(&job_ids).await?.into_inner();
+                let revoked = client
+                    .revoke_reserved()
+                    .body(job_ids)
+                    .send()
+                    .await?
+                    .into_inner();
                 ctx.revoked(&revoked)
             }
             (
-                ClientCommand::JobStart {
-                    command: None,
-                    permslip: None,
-                    wait,
-                    binary,
-                    limits,
-                    ..
-                },
+                ClientCommand::JobStart(
+                    args @ JobStartArgs {
+                        command: None,
+                        permslip: None,
+                        ..
+                    },
+                ),
                 Some(client),
             ) => {
                 let job = read_signed_job()?;
-                job_start(&client, ctx, job, limits.into_limits(), wait, binary).await?;
+                job_start(&client, ctx, job, args).await?;
                 Ok(())
             }
-            (ClientCommand::JobStart { command: None, .. }, Some(_)) => {
+            (ClientCommand::JobStart(JobStartArgs { command: None, .. }), Some(_)) => {
                 Err(CommandError::MissingCommand)
             }
-            (ClientCommand::JobStart { permslip: None, .. }, Some(_)) => {
+            (ClientCommand::JobStart(JobStartArgs { permslip: None, .. }), Some(_)) => {
                 Err(CommandError::MissingKeyName)
             }
-            (ClientCommand::JobStart { job_id: None, .. }, _client) => {
+            (ClientCommand::JobStart(JobStartArgs { job_id: None, .. }), _client) => {
                 Err(CommandError::MissingJobId)
             }
             (
-                ClientCommand::JobStart {
-                    command: Some(command),
-                    job_id: Some(job_id),
-                    permslip: Some(key_name),
-                    permslip_url,
-                    limits,
-                    wait,
-                    binary,
-                },
+                ClientCommand::JobStart(
+                    ref args @ JobStartArgs {
+                        command: Some(ref command),
+                        job_id: Some(ref job_id),
+                        permslip: Some(ref key_name),
+                        ref permslip_url,
+                        interactive,
+                        ..
+                    },
+                ),
                 client,
             ) => {
-                let signer = PermslipSigner::new(key_name, &permslip_url).await?;
-                let job = signer.sign(JobStartRequest::new(job_id, command)).await?;
+                let signer = PermslipSigner::new(key_name, permslip_url).await?;
+                let mut interval = interval(Duration::from_millis(100));
+                interval.set_missed_tick_behavior(MissedTickBehavior::Skip);
+                let sign = signer.sign(JobStartRequest::new(
+                    job_id.to_owned(),
+                    command,
+                    interactive,
+                ));
+                pin!(sign);
+                ctx.job_signing_started(job_id)?;
+                let job = loop {
+                    select! {
+                        job = &mut sign => {
+                            ctx.job_signing_finished(job_id)?;
+                            break job?;
+                        }
+                        _ = interval.tick() => ctx.job_signing_update(job_id)?,
+                        _ = ctrl_c() => return ctx.job_signing_finished(job_id),
+                    }
+                };
                 if let Some(client) = client {
-                    job_start(&client, ctx, job, limits.into_limits(), wait, binary).await?;
+                    job_start(&client, ctx, job, args.clone()).await?;
                 } else {
                     ctx.job_signed(&job)?;
                 }
                 Ok(())
             }
             (ClientCommand::JobStatus { job_id }, Some(client)) => {
-                let status = client.job_status(&job_id).await?.into_inner();
+                let status = client
+                    .job_status()
+                    .job_id(&job_id)
+                    .send()
+                    .await?
+                    .into_inner();
                 ctx.job_status(&job_id, &status)
             }
             (ClientCommand::JobStdout { output }, Some(client)) => {
@@ -470,12 +527,16 @@ impl ClientCommand {
             (ClientCommand::JobStderr { output }, Some(client)) => {
                 job_output(&client, ctx, Stderr, output).await
             }
+            (ClientCommand::JobSession { job_id }, Some(client)) => {
+                job_session(&client, ctx, &job_id).await?;
+                Ok(())
+            }
             (ClientCommand::JobAbort { job_id }, Some(client)) => {
-                client.job_abort(&job_id).await?;
+                client.job_abort().job_id(&job_id).send().await?;
                 ctx.job_aborted(&job_id)
             }
-            (ClientCommand::History { batch_size, limit }, Some(client)) => {
-                let mut stream = client.history_stream(Some(batch_size)).boxed();
+            (ClientCommand::History { limit }, Some(client)) => {
+                let mut stream = client.history().stream().boxed();
                 if limit > 0 {
                     stream = stream.take(limit).boxed();
                 }
@@ -505,65 +566,93 @@ async fn job_start(
     client: &Client,
     ctx: &mut impl CommandContext,
     job: SignedJob,
-    limits: JobLimits,
-    wait: bool,
-    binary: bool,
+    args: JobStartArgs,
 ) -> Result<(), CommandError> {
-    let job_id = job.job_id();
+    let interactive = job.is_interactive();
+    let job_id = job.job_id().to_owned();
+    let JobStartArgs {
+        limits,
+        binary,
+        term,
+        wait,
+        ..
+    } = args;
     let JobLimits {
         max_cpu,
         max_mem,
         max_fsize,
-    } = limits;
-
-    // If we wait for more than a second, show a spinner and poll status.
-    let mut polling = false;
-    let timeout = Duration::from_secs(1);
-    let timer = sleep(timeout);
-    pin!(timer);
-    let mut interval = interval(Duration::from_millis(250));
-    interval.set_missed_tick_behavior(MissedTickBehavior::Skip);
-    let start = client.job_start(job_id, max_cpu, max_fsize, max_mem, wait, &job);
-    pin!(start);
-    let status = loop {
-        select! {
-            status = &mut start => {
-                ctx.job_polling_finished(job_id)?;
-                break status?.into_inner();
-            }
-            _ = &mut timer, if !polling => {
-                ctx.job_polling_started(job_id, timeout)?;
-                polling = true;
-            }
-            _ = interval.tick(), if polling => {
-                let status = client.job_status(job_id).await?.into_inner();
-                ctx.job_polling_update(job_id, &status)?;
-            }
-            _ = ctrl_c() => {
-                ctx.job_polling_finished(job_id)?;
-                client.job_abort(job_id).await?;
-                ctx.job_aborted(job_id)?;
-                break client.job_status(job_id).await?.into_inner();
-            }
-        }
-    };
-    ctx.job_status(job_id, &status)?;
-
-    // If we waited for the job to end, also try to show its output.
-    if wait {
-        for stream in [Stdout, Stderr] {
-            match client.job_output(job_id, &stream, None).await {
-                Ok(byte_stream) => {
-                    let output = byte_stream_to_vec(byte_stream.into_inner()).await?;
-                    ctx.job_output(job_id, stream, &output, binary)?;
-                }
-                Err(error) => {
-                    ctx.job_error(error.into())?;
-                }
-            }
+    } = limits.as_limits();
+    let mut start = client
+        .job_start()
+        .job_id(&job_id)
+        .max_cpu(max_cpu)
+        .max_mem(max_mem)
+        .max_fsize(max_fsize)
+        .wait(wait && !interactive)
+        .body(job);
+    if let Some(term) = term {
+        start = start.term(term);
+        if let Ok(winsize) = tcgetwinsize(stdin()) {
+            start = start.rows(winsize.ws_row);
+            start = start.cols(winsize.ws_col);
         }
     }
-    Ok(())
+    let start = start.send();
+    pin!(start);
+
+    if interactive {
+        start.as_mut().await?;
+        job_session(client, ctx, &job_id).await?;
+        let status = client
+            .job_status()
+            .job_id(&job_id)
+            .send()
+            .await?
+            .into_inner();
+        ctx.job_status(&job_id, &status)?;
+        Ok(())
+    } else {
+        let mut interval = interval(Duration::from_millis(250));
+        interval.set_missed_tick_behavior(MissedTickBehavior::Skip);
+        let status = loop {
+            select! {
+                status = &mut start => {
+                    ctx.job_polling_finished(&job_id)?;
+                    break status?.into_inner();
+                }
+                _ = interval.tick() => {
+                    let status = client.job_status().job_id(&job_id).send().await?.into_inner();
+                    ctx.job_polling_started(&job_id, interval.period())?;
+                    ctx.job_polling_update(&job_id, &status)?;
+                }
+                _ = ctrl_c() => {
+                    client.job_abort().job_id(&job_id).send().await?;
+                    ctx.job_polling_finished(&job_id)?;
+                    ctx.job_aborted(&job_id)?;
+                    break client.job_status().job_id(&job_id).send().await?.into_inner();
+                }
+            }
+        };
+        ctx.job_status(&job_id, &status)?;
+        if wait {
+            for stream in [Stdout, Stderr] {
+                match client
+                    .job_output()
+                    .job_id(&job_id)
+                    .stream(stream)
+                    .send()
+                    .await
+                {
+                    Ok(byte_stream) => {
+                        let output = byte_stream_to_vec(byte_stream.into_inner()).await?;
+                        ctx.job_output(&job_id, stream, &output, binary)?;
+                    }
+                    Err(error) => ctx.job_error(error.into())?,
+                }
+            }
+        }
+        Ok(())
+    }
 }
 
 /// Read stdin until EOF, prompting unless there's already input available.
@@ -668,7 +757,11 @@ async fn job_output(
     // Maybe truncate instead of fetching output.
     if let Some(n) = truncate.map(|n| n.as_u64()) {
         client
-            .job_output_delete(&job_id, &stream, Some(&format!("bytes={n}-")))
+            .job_output_delete()
+            .job_id(job_id)
+            .stream(stream)
+            .range(format!("bytes={n}-"))
+            .send()
             .await?;
         return Ok(());
     }
@@ -680,7 +773,12 @@ async fn job_output(
         stdout_hash,
         stderr_hash,
         ..
-    } = client.job_status(&job_id).await?.into_inner()
+    } = client
+        .job_status()
+        .job_id(&job_id)
+        .send()
+        .await?
+        .into_inner()
     else {
         // TODO: emulate `tail -f` for running jobs
         return Err(CommandError::JobStillRunning(job_id.to_owned()));
@@ -759,7 +857,10 @@ async fn job_output(
         // Download and print the output all at once. If hash verification
         // fails here, do not print any output.
         let byte_stream = client
-            .job_output(&job_id, &stream, None)
+            .job_output()
+            .job_id(&job_id)
+            .stream(stream)
+            .send()
             .await?
             .into_inner();
         let bytes = byte_stream_to_vec(byte_stream).await?;
@@ -785,7 +886,11 @@ fn job_output_chunks<'a>(
             async move {
                 let bytes = range.bytes();
                 let stream = client
-                    .job_output(job_id, &stream, Some(&bytes))
+                    .job_output()
+                    .job_id(job_id)
+                    .stream(stream)
+                    .range(&bytes)
+                    .send()
                     .await?
                     .into_inner();
                 Ok(Chunk(range, stream))
@@ -822,6 +927,26 @@ async fn byte_stream_to_file(
             expected: range.len(),
             received: n,
         })
+    }
+}
+
+/// Connect via WebSockets to a running interactive job.
+async fn job_session(
+    client: &Client,
+    ctx: &mut impl CommandContext,
+    job_id: &JobId,
+) -> Result<(), CommandError> {
+    match client.job_session().job_id(job_id).send().await {
+        Err(error) => ctx.job_error(error.into()),
+        Ok(socket) => {
+            ctx.job_session_connected(job_id)?;
+            let socket = socket.into_inner();
+            let stream = WebSocketStream::from_raw_socket(socket, Role::Client, None).await;
+            if let Err(error) = session(stream).await {
+                return ctx.job_error(CommandError::from(error));
+            }
+            ctx.job_session_disconnected(job_id)
+        }
     }
 }
 
@@ -886,10 +1011,16 @@ pub enum CommandError {
     Recursive(#[from] Box<Self>),
     #[error("❌ Reqwest error: {0}")]
     Reqwest(#[from] reqwest::Error),
+    #[error("❌ Interactive session error: {0}")]
+    Session(#[from] SessionError),
     #[error("❌ Too much output to display on terminal, try `--file`")]
     TooMuchOutput,
+    #[error("❌ Can't start interactive session: {0}")]
+    Upgrade(String),
     #[error("❌ UTF-8 error: {0}")]
     Utf8(#[from] std::string::FromUtf8Error),
+    #[error("❌ WebSocket error: {0}")]
+    WebSocket(#[from] WebSocketError),
 }
 
 impl CommandError {
@@ -931,10 +1062,19 @@ impl From<ClientError<ApiError>> for CommandError {
 
 impl From<ClientError<ByteStream>> for CommandError {
     fn from(error: ClientError<ByteStream>) -> Self {
-        if error.status() == Some(StatusCode::PAYLOAD_TOO_LARGE) {
-            Self::TooMuchOutput
-        } else {
-            Self::Client(error.status().unwrap().to_string())
+        match error.status() {
+            Some(StatusCode::PAYLOAD_TOO_LARGE) => Self::TooMuchOutput,
+            Some(status) => Self::Client(status.to_string()),
+            None => Self::Client(error.to_string()),
+        }
+    }
+}
+
+impl From<ClientError<Upgraded>> for CommandError {
+    fn from(error: ClientError<Upgraded>) -> Self {
+        match error.status() {
+            Some(status) => Self::Client(status.to_string()),
+            None => Self::Client(error.to_string()),
         }
     }
 }

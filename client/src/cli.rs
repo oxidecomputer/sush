@@ -224,7 +224,7 @@ impl CommandContext for Cli {
         stage: &str,
         total_length: u64,
     ) -> Result<(), CommandError> {
-        if self.progress.is_none() {
+        if matches!(self.get_output_format(), OutputFormat::Text) && self.progress.is_none() {
             let bar = ProgressBar::new(total_length);
             bar.set_prefix(format!("{stage} {stream}"));
             bar.set_style(
@@ -281,7 +281,7 @@ impl CommandContext for Cli {
         job_id: &JobId,
         elapsed: Duration,
     ) -> Result<(), CommandError> {
-        if self.progress.is_none() {
+        if matches!(self.get_output_format(), OutputFormat::Text) && self.progress.is_none() {
             let bar = ProgressBar::new_spinner();
             bar.set_elapsed(elapsed);
             bar.set_prefix(format!("Waiting for `{job_id}`"));
@@ -332,6 +332,66 @@ impl CommandContext for Cli {
         Ok(())
     }
 
+    fn job_session_connected(&mut self, job_id: &JobId) -> Result<(), CommandError> {
+        match self.get_output_format() {
+            OutputFormat::Json => println!("{}", json!({"connected": job_id})),
+            OutputFormat::Text => println!("✅ Connected to interactive job `{job_id}`"),
+        }
+        Ok(())
+    }
+
+    fn job_session_disconnected(&mut self, job_id: &JobId) -> Result<(), CommandError> {
+        match self.get_output_format() {
+            OutputFormat::Json => println!("{}", json!({"disconnected": job_id})),
+            OutputFormat::Text => println!("\r✅ Disconnected interactive job `{job_id}`"),
+        }
+        Ok(())
+    }
+
+    fn job_signing_started(&mut self, job_id: &JobId) -> Result<(), CommandError> {
+        if matches!(self.get_output_format(), OutputFormat::Text) && self.progress.is_none() {
+            let bar = ProgressBar::new_spinner();
+            bar.set_prefix(format!("Waiting for signature on `{job_id}`"));
+            bar.set_style(
+                ProgressStyle::with_template(
+                    "{spinner}  \
+                     {prefix} \
+                     [{elapsed_precise}] \
+                     {msg}",
+                )
+                .unwrap(),
+            );
+            bar.enable_steady_tick(Duration::from_millis(100));
+            self.progress = Some(bar);
+        }
+        Ok(())
+    }
+
+    fn job_signing_update(&mut self, _job_id: &JobId) -> Result<(), CommandError> {
+        if let Some(progress) = &mut self.progress {
+            progress.tick();
+        }
+        Ok(())
+    }
+
+    fn job_signing_finished(&mut self, job_id: &JobId) -> Result<(), CommandError> {
+        if let Some(progress) = self.progress.take() {
+            progress.finish_and_clear();
+        }
+        if matches!(self.get_output_format(), OutputFormat::Text) {
+            println!("✅ Signed request for job `{job_id}`");
+        }
+        Ok(())
+    }
+
+    fn job_signed(&mut self, job: &SignedJob) -> Result<(), CommandError> {
+        match self.get_output_format() {
+            OutputFormat::Json => println!("{}", serde_json::to_string(&job)?),
+            OutputFormat::Text => println!("{}", serde_json::to_string_pretty(&job)?),
+        }
+        Ok(())
+    }
+
     fn job_status(&mut self, job_id: &JobId, status: &JobStatus) -> Result<(), CommandError> {
         match self.get_output_format() {
             OutputFormat::Json => println!("{}", json!(status)),
@@ -342,7 +402,6 @@ impl CommandContext for Cli {
                 } => println!(
                     "✅ Job ID:\t{job_id}\n   \
                      Job status:\tReserved\n   \
-                     Job ID:\t{job_id}\n   \
                      Reserved at:\t{time_reserved}"
                 ),
                 JobStatus::Started {
@@ -437,18 +496,6 @@ impl CommandContext for Cli {
                     }
                 }
             }
-        }
-        Ok(())
-    }
-
-    fn job_signed(&mut self, job: &SignedJob) -> Result<(), CommandError> {
-        match self.get_output_format() {
-            OutputFormat::Json => println!("{}", serde_json::to_string(&job)?),
-            OutputFormat::Text => println!(
-                "✅ Signed request for job `{}`\n{}",
-                job.job_id(),
-                serde_json::to_string_pretty(&job)?
-            ),
         }
         Ok(())
     }

@@ -3,7 +3,7 @@
 use std::convert::Infallible;
 use std::fmt;
 use std::io::Error as IoError;
-use std::ops::Deref;
+use std::ops::{Deref, Not};
 use std::str::FromStr;
 
 use blake3::Hash;
@@ -48,6 +48,12 @@ impl FromStr for JobId {
     }
 }
 
+impl From<&Self> for JobId {
+    fn from(other: &Self) -> Self {
+        other.to_owned()
+    }
+}
+
 impl<S: AsRef<str>> From<S> for JobId {
     fn from(s: S) -> Self {
         Self(s.as_ref().to_string())
@@ -81,13 +87,16 @@ pub struct JobsReserved {
 pub struct JobStartRequest {
     pub job_id: JobId,
     pub command: String,
+    #[serde(default, skip_serializing_if = "Not::not")]
+    pub interactive: bool,
 }
 
 impl JobStartRequest {
-    pub fn new<S: AsRef<str>>(job_id: JobId, command: S) -> Self {
+    pub fn new<S: AsRef<str>>(job_id: JobId, command: S, interactive: bool) -> Self {
         Self {
             job_id,
             command: command.as_ref().to_string(),
+            interactive,
         }
     }
 
@@ -97,6 +106,10 @@ impl JobStartRequest {
 
     pub fn command(&self) -> &str {
         &self.command
+    }
+
+    pub fn is_interactive(&self) -> bool {
+        self.interactive
     }
 }
 

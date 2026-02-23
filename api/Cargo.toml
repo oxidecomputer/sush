@@ -1,0 +1,15 @@
+[package]
+name = "sush-api"
+description = "Oxide Support Shell HTTP API"
+version = "0.1.0"
+edition = "2024"
+publish = false
+
+[dependencies]
+chrono.workspace = true
+dropshot.workspace = true
+http-range-header.workspace = true
+hyper.workspace = true
+schemars.workspace = true
+serde.workspace = true
+sush-common = { path = "../common" }

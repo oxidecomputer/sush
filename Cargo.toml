@@ -1,10 +1,12 @@
 [workspace]
-members = ["client", "common", "openapi", "server"]
+members = ["api", "client", "common", "server", "xtask"]
 resolver = "2"
 
 [workspace.dependencies]
 async-recursion = "1"
+base64 = "0.22"
 blake3 = { version = "1", features = ["mmap", "rayon"] }
+bytes = "1"
 bytesize = "2"
 chrono = "0.4"
 clap = { version = "4", features = ["derive", "env", "wrap_help"] }
@@ -25,11 +27,14 @@ pem-rfc7468 = { version = "0.7", features = ["std"] }
 permission-slip-client = { git = "https://github.com/oxidecomputer/permission-slip" }
 permission-slip-common = { git = "https://github.com/oxidecomputer/permission-slip" }
 progenitor = "0.11"
+progenitor-client = "0.11"
+pwd = "1"
 rand = "0.8"
 rand_core = "0.6"
 reqwest = "0.12"
 rlimit = "0.10"
 rusqlite = { version = "0.37", features = ["blob", "chrono", "limits", "modern_sqlite", "rusqlite-macros"] }
+rustix = { version = "1", features = ["process", "pty"] }
 rustyline = "17"
 schemars = { version = "0.8", features = ["chrono", "preserve_order"] }
 serde = "1"
@@ -39,7 +44,10 @@ shlex = "1"
 slog = "2"
 slog-term = "2"
 tempfile = "3"
+terminfo = "0.9"
 thiserror = "1"
 tokio = { version = "1", features = ["macros", "process", "rt", "sync", "time"] }
+tokio-fd = "0.3"
+tokio-tungstenite = "0.28"
 x509-cert = { version = "0.2", features = ["pem", "std"] }
 xdg = "3"

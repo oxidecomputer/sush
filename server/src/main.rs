@@ -8,9 +8,10 @@ use clap::builder::PathBufValueParser;
 use dropshot::{ConfigDropshot, ConfigLogging, ConfigLoggingLevel, HandlerTaskMode, ServerBuilder};
 use slog::o;
 
-use sush_server::api::api;
+use sush_api::sush_api_mod::api_description;
 use sush_server::database::open_database;
 use sush_server::manager::JobManager;
+use sush_server::server::ApiServer;
 
 const DEFAULT_ADDRESS: &str = "0.0.0.0:44444";
 const DEFAULT_DATABASE: &str = "sush.db";
@@ -57,10 +58,13 @@ async fn main() -> Result<(), String> {
     .map_err(|e| e.to_string())?;
 
     let db = open_database(database).map_err(|e| e.to_string())?;
-    let mgr = JobManager::new(db, &directory, log.new(o!("component" => "job-manager")))
+    let mgr = JobManager::new(log.new(o!("component" => "job-manager")), db, &directory)
         .await
         .map_err(|e| e.to_string())?;
-    ServerBuilder::new(api(), mgr, log)
+
+    let api = api_description::<ApiServer>()
+        .map_err(|error| format!("failed to get API description: {error}"))?;
+    ServerBuilder::new(api, mgr, log)
         .config(ConfigDropshot {
             bind_address: address,
             default_request_body_max_bytes: REQUEST_MAX_BODY_BYTES,
@@ -68,7 +72,8 @@ async fn main() -> Result<(), String> {
             log_headers: vec![],
         })
         .start()
-        .map_err(|error| format!("failed to start server: {}", error))?
+        .map_err(|error| format!("failed to start server: {error}"))?
         .await?;
+
     Ok(())
 }
