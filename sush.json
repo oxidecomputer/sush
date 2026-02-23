@@ -130,6 +130,142 @@
         }
       }
     },
+    "/iam": {
+      "get": {
+        "summary": "List authenticated identities.",
+        "operationId": "identities",
+        "parameters": [
+          {
+            "in": "header",
+            "name": "authorization",
+            "description": "Authorization to access some resource, such as a signature.\n\nSee: <https://developer.mozilla.org/en-US/docs/Web/HTTP/Reference/Headers/Authorization>",
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "in": "query",
+            "name": "limit",
+            "description": "Maximum number of items returned by a single call",
+            "schema": {
+              "nullable": true,
+              "type": "integer",
+              "format": "uint32",
+              "minimum": 1
+            }
+          },
+          {
+            "in": "query",
+            "name": "page_token",
+            "description": "Token returned by previous call to retrieve the subsequent page",
+            "schema": {
+              "nullable": true,
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "successful operation",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/IdentityResultsPage"
+                }
+              }
+            }
+          },
+          "4XX": {
+            "$ref": "#/components/responses/Error"
+          },
+          "5XX": {
+            "$ref": "#/components/responses/Error"
+          }
+        },
+        "x-dropshot-pagination": {
+          "required": []
+        }
+      },
+      "post": {
+        "summary": "Prove and register identity.",
+        "operationId": "iam",
+        "parameters": [
+          {
+            "in": "header",
+            "name": "authorization",
+            "description": "Authorization to access some resource, such as a signature.\n\nSee: <https://developer.mozilla.org/en-US/docs/Web/HTTP/Reference/Headers/Authorization>",
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "nullable": true,
+                "title": "Nullable_String",
+                "type": "string"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "description": "successful operation",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Identity"
+                }
+              }
+            }
+          },
+          "4XX": {
+            "$ref": "#/components/responses/Error"
+          },
+          "5XX": {
+            "$ref": "#/components/responses/Error"
+          }
+        }
+      }
+    },
+    "/iam/{key_id}": {
+      "delete": {
+        "summary": "Revoke an authenticated identity.",
+        "operationId": "revoke_identity",
+        "parameters": [
+          {
+            "in": "header",
+            "name": "authorization",
+            "description": "Authorization to access some resource, such as a signature.\n\nSee: <https://developer.mozilla.org/en-US/docs/Web/HTTP/Reference/Headers/Authorization>",
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "in": "path",
+            "name": "key_id",
+            "required": true,
+            "schema": {
+              "$ref": "#/components/schemas/KeyId"
+            }
+          }
+        ],
+        "responses": {
+          "204": {
+            "description": "successful deletion"
+          },
+          "4XX": {
+            "$ref": "#/components/responses/Error"
+          },
+          "5XX": {
+            "$ref": "#/components/responses/Error"
+          }
+        }
+      }
+    },
     "/jobs/{job_id}/abort": {
       "get": {
         "summary": "Abort a started job.",
@@ -268,6 +404,14 @@
         "operationId": "job_session",
         "parameters": [
           {
+            "in": "header",
+            "name": "authorization",
+            "description": "Authorization to access some resource, such as a signature.\n\nSee: <https://developer.mozilla.org/en-US/docs/Web/HTTP/Reference/Headers/Authorization>",
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
             "in": "path",
             "name": "job_id",
             "required": true,
@@ -294,6 +438,14 @@
         "summary": "Start an authorized job.",
         "operationId": "job_start",
         "parameters": [
+          {
+            "in": "header",
+            "name": "authorization",
+            "description": "Authorization to access some resource, such as a signature.\n\nSee: <https://developer.mozilla.org/en-US/docs/Web/HTTP/Reference/Headers/Authorization>",
+            "schema": {
+              "type": "string"
+            }
+          },
           {
             "in": "path",
             "name": "job_id",
@@ -549,7 +701,7 @@
   "components": {
     "schemas": {
       "KeyId": {
-        "description": "SHA-256 of a certificate subject, encoded as a pseudo-random code phrase for storage and transport.",
+        "description": "SHA-256 of a certificate subject or an identity public key, encoded as a pseudorandom code phrase for storage & transport.",
         "type": "string"
       },
       "Error": {
@@ -773,7 +925,12 @@
             "type": "string"
           },
           "interactive": {
-            "type": "boolean"
+            "nullable": true,
+            "allOf": [
+              {
+                "$ref": "#/components/schemas/KeyId"
+              }
+            ]
           }
         },
         "required": [
@@ -782,7 +939,7 @@
         ]
       },
       "EncodedSignature": {
-        "description": "Code phrase encoded signature.",
+        "description": "Code phrase encoded signature.\n\nThe decoded phrases `r` and `s` together comprise a signature _(r, s)_ over a 256 bit elliptic curve.\n\nThe `flags` and `counter` parameters are for the [`SK-*` family of SSH public keys](https://cvsweb.openbsd.org/src/usr.bin/ssh/PROTOCOL.u2f?annotate=HEAD). They should be set to 0 for other key types.",
         "type": "object",
         "properties": {
           "r": {
@@ -790,6 +947,16 @@
           },
           "s": {
             "type": "string"
+          },
+          "flags": {
+            "type": "integer",
+            "format": "uint8",
+            "minimum": 0
+          },
+          "counter": {
+            "type": "integer",
+            "format": "uint32",
+            "minimum": 0
           }
         },
         "required": [
@@ -801,6 +968,61 @@
         "description": "BLAKE3 hash of job output, used as a checksum.",
         "type": "string",
         "format": "hex encoded hash (32 bytes)"
+      },
+      "IdentityResultsPage": {
+        "description": "A single page of results",
+        "type": "object",
+        "properties": {
+          "next_page": {
+            "nullable": true,
+            "description": "token used to fetch the next page of results (if any)",
+            "type": "string"
+          },
+          "items": {
+            "description": "list of items on this page of results",
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/Identity"
+            }
+          }
+        },
+        "required": [
+          "items"
+        ]
+      },
+      "Identity": {
+        "description": "An authenticated identity; i.e., a row in the `authn` table.",
+        "type": "object",
+        "properties": {
+          "key_id": {
+            "$ref": "#/components/schemas/KeyId"
+          },
+          "public_key": {
+            "type": "string"
+          },
+          "nonce": {
+            "$ref": "#/components/schemas/Nonce"
+          },
+          "time_authenticated": {
+            "type": "string",
+            "format": "date-time"
+          },
+          "time_revoked": {
+            "nullable": true,
+            "type": "string",
+            "format": "date-time"
+          }
+        },
+        "required": [
+          "key_id",
+          "nonce",
+          "public_key",
+          "time_authenticated"
+        ]
+      },
+      "Nonce": {
+        "description": "A unique random string. Authentication credentials have two of these: one generated by the server, and one by the client.",
+        "type": "string"
       },
       "JobsReserved": {
         "description": "The response to a job reservation request.",

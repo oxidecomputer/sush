@@ -28,4 +28,8 @@ jobs:
       run: cargo build --locked
 
     - name: Test
-      run: cargo test
+      run: |
+        eval `ssh-agent -s` &&
+        ssh-keygen -t ed25519 -f /tmp/id_ephemeral -C "ephemeral test key" -P "" &&
+        ssh-add /tmp/id_ephemeral &&
+        cargo test

@@ -15,13 +15,14 @@ use rustyline::error::ReadlineError;
 use shlex::split as split_command;
 use xdg::BaseDirectories;
 
-use sush_common::certs::KeyId;
+use sush_common::authn::Identity;
 use sush_common::jobs::{JobId, JobOutputStream, JobStatus, JobsReserved, SignedJob};
+use sush_common::keys::{KeyId, SshPublicKey};
 
 use crate::Client;
 use crate::cli::Cli;
 use crate::commands::{
-    ClientCommand, CommandContext, CommandError, GlobalArgs, OutputFormat, SUSH_JOB_ID,
+    ClientCommand, CommandContext, CommandError, GlobalArgs, OutputFormat, Reserved, SUSH_JOB_ID,
     SUSH_OUTPUT_FORMAT, SUSH_URL,
 };
 
@@ -322,6 +323,14 @@ impl CommandContext for Repl {
         Ok(())
     }
 
+    fn read_signed_job(&mut self) -> Result<SignedJob, CommandError> {
+        self.cli.read_signed_job()
+    }
+
+    fn read_reserved(&mut self) -> Result<Reserved, CommandError> {
+        self.cli.read_reserved()
+    }
+
     fn reserved_read(&mut self, reserved: &JobsReserved) -> Result<(), CommandError> {
         self.cli.reserved_read(reserved)?;
         self.reserved = reserved.job_ids.clone();
@@ -344,5 +353,25 @@ impl CommandContext for Repl {
         self.cli.revoked(revoked)?;
         self.reserved.retain(|j| !revoked.contains(j));
         Ok(())
+    }
+
+    fn iam(&mut self, identity: &Identity) -> Result<(), CommandError> {
+        self.cli.iam(identity)
+    }
+
+    fn identities(&mut self, identities: &[SshPublicKey]) -> Result<(), CommandError> {
+        self.cli.identities(identities)
+    }
+
+    fn please_touch(&mut self, identity: &SshPublicKey) -> Result<(), CommandError> {
+        self.cli.please_touch(identity)
+    }
+
+    fn really_revoke(&mut self, key_id: KeyId) -> Result<KeyId, CommandError> {
+        self.cli.really_revoke(key_id)
+    }
+
+    fn identity_revoked(&mut self, key_id: KeyId) -> Result<(), CommandError> {
+        self.cli.identity_revoked(key_id)
     }
 }

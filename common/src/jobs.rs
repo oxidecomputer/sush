@@ -3,10 +3,10 @@
 use std::convert::Infallible;
 use std::fmt;
 use std::io::Error as IoError;
-use std::ops::{Deref, Not};
+use std::ops::Deref;
 use std::str::FromStr;
 
-use blake3::Hash;
+use blake3::{Hash, Hasher};
 use bytesize::GB;
 use chrono::{DateTime, TimeDelta, Utc};
 use rlimit::Resource;
@@ -16,10 +16,9 @@ use schemars::schema::{Schema, SchemaObject};
 use schemars::{JsonSchema, SchemaGenerator};
 use serde::de::{Deserializer, Error as DeserializeError, Visitor};
 use serde::{Deserialize, Serialize, Serializer};
-use sha2::{Digest as _, Sha256};
 use thiserror::Error;
 
-use crate::certs::{KeyId, Signed, ToBeSigned, Verified};
+use crate::keys::{KeyId, Signed, ToBeSigned, Verified};
 
 #[derive(
     Clone, Debug, Deserialize, Eq, Hash, JsonSchema, Ord, PartialEq, PartialOrd, Serialize,
@@ -87,12 +86,14 @@ pub struct JobsReserved {
 pub struct JobStartRequest {
     pub job_id: JobId,
     pub command: String,
-    #[serde(default, skip_serializing_if = "Not::not")]
-    pub interactive: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub interactive: Option<KeyId>,
 }
 
 impl JobStartRequest {
-    pub fn new<S: AsRef<str>>(job_id: JobId, command: S, interactive: bool) -> Self {
+    const TYPE_NAME: &[u8] = b"sush_common::jobs::JobStartRequest";
+
+    pub fn new<S: AsRef<str>>(job_id: JobId, command: S, interactive: Option<KeyId>) -> Self {
         Self {
             job_id,
             command: command.as_ref().to_string(),
@@ -108,24 +109,32 @@ impl JobStartRequest {
         &self.command
     }
 
-    pub fn is_interactive(&self) -> bool {
-        self.interactive
+    pub fn interactive(&self) -> Option<&KeyId> {
+        self.interactive.as_ref()
     }
 }
 
 impl ToBeSigned for JobStartRequest {
-    /// Generate a SHA-256 hash over the fields of `self`.
-    fn to_be_signed(&self, key_id: &KeyId) -> Vec<u8> {
-        let mut hasher = Sha256::default();
+    /// BLAKE3 hash over the fields of `self`.
+    fn to_be_signed(&self) -> Vec<u8> {
+        let mut hasher = Hasher::new();
         let mut hash = |data: &[u8]| {
-            hasher.update((data.len() as u64).to_be_bytes());
+            hasher.update(&(data.len() as u64).to_be_bytes());
             hasher.update(data);
         };
-        hash(b"JobStartRequest");
-        hash(self.job_id.as_ref());
-        hash(self.command.as_bytes());
-        hash(key_id.as_bytes());
-        hasher.finalize().to_vec()
+
+        let JobStartRequest {
+            job_id,
+            command,
+            interactive,
+        } = self;
+        hash(Self::TYPE_NAME);
+        hash(job_id.as_bytes());
+        hash(command.as_bytes());
+        if let Some(interactive) = interactive {
+            hash(interactive.as_bytes());
+        }
+        hasher.finalize().as_bytes().to_vec()
     }
 }
 
@@ -210,7 +219,7 @@ impl fmt::Display for JobOutputHash {
 impl FromSql for JobOutputHash {
     fn column_result(value: ValueRef<'_>) -> FromSqlResult<Self> {
         Ok(Self::from(
-            Hash::from_hex(value.as_str()?).map_err(|e| FromSqlError::Other(Box::new(e)))?,
+            Hash::from_hex(value.as_str()?).map_err(FromSqlError::other)?,
         ))
     }
 }

@@ -5,19 +5,20 @@ use std::num::NonZeroU32;
 
 use chrono::{DateTime, Utc};
 use dropshot::{
-    Body, ClientErrorStatusCode, EmptyScanParams, Header, HttpError, HttpResponseOk,
-    PaginationParams, Path as PathParams, Query as QueryParams, RequestContext, ResultsPage,
-    TypedBody, WebsocketEndpointResult, WebsocketUpgrade, WhichPage,
+    Body, ClientErrorStatusCode, EmptyScanParams, Header, HttpError, HttpResponseDeleted,
+    HttpResponseOk, PaginationParams, Path as PathParams, Query as QueryParams, RequestContext,
+    ResultsPage, TypedBody, WebsocketEndpointResult, WebsocketUpgrade, WhichPage,
 };
 use hyper::Response;
 use tokio_tungstenite::WebSocketStream;
 use tokio_tungstenite::tungstenite::protocol::Role;
 
 use sush_api::{
-    CertChainParams, JobIdParam, JobOutputParams, JobStartParams, RangeRequest, SushApi,
+    Authorization, JobIdParam, JobOutputParams, JobStartParams, KeyIdParam, RangeRequest, SushApi,
 };
-use sush_common::certs::{KeyId, pem_cert_chain};
+use sush_common::authn::Identity;
 use sush_common::jobs::{JobId, JobStatus, JobsReserved, SignedJob};
+use sush_common::keys::{KeyId, SshPublicKey, pem_cert_chain};
 
 use crate::manager::{JobError, JobManager};
 
@@ -37,11 +38,11 @@ impl SushApi for ApiServer {
 
     async fn cert_chain(
         ctx: RequestContext<Self::Context>,
-        params: PathParams<CertChainParams>,
+        params: PathParams<KeyIdParam>,
     ) -> Result<HttpResponseOk<String>, HttpError> {
-        let CertChainParams { key_id } = params.into_inner();
+        let KeyIdParam { key_id } = params.into_inner();
         let certs = ctx.context().cert_chain(key_id).await?;
-        let chain = pem_cert_chain(certs).map_err(JobError::Cert)?;
+        let chain = pem_cert_chain(certs).map_err(JobError::Key)?;
         Ok(HttpResponseOk(chain))
     }
 
@@ -72,11 +73,18 @@ impl SushApi for ApiServer {
 
     async fn job_start(
         ctx: RequestContext<Self::Context>,
+        headers: Header<Authorization>,
         params: PathParams<JobIdParam>,
         query: QueryParams<JobStartParams>,
         body: TypedBody<SignedJob>,
     ) -> Result<HttpResponseOk<JobStatus>, HttpError> {
         let mgr = ctx.context();
+        let Authorization { authorization } = headers.into_inner();
+        let authn = if authorization.is_some() {
+            Some(mgr.iam(authorization, None).await?)
+        } else {
+            None
+        };
         let JobIdParam { job_id } = params.into_inner();
         let params = query.into_inner();
         let job = body.into_inner();
@@ -84,17 +92,17 @@ impl SushApi for ApiServer {
             return Err(HttpError::for_client_error(
                 None,
                 ClientErrorStatusCode::BAD_REQUEST,
-                String::from("query parameter job ID does not match body"),
+                String::from("Query parameter job ID does not match body"),
             ));
         }
         let wait = params.wait;
-        let done = mgr.job_start(job, params).await?;
+        let done = mgr.job_start(job, params, authn).await?;
         if wait {
             let end = done
                 .await
                 .map_err(|_| {
                     HttpError::for_internal_error(String::from(
-                        "can't wait for job, sender dropped",
+                        "Can't wait for job, sender dropped",
                     ))
                 })?
                 .map_err(JobError::from)?;
@@ -115,12 +123,15 @@ impl SushApi for ApiServer {
 
     async fn job_session(
         ctx: RequestContext<Self::Context>,
+        headers: Header<Authorization>,
         params: PathParams<JobIdParam>,
         upgrade: WebsocketUpgrade,
     ) -> WebsocketEndpointResult {
         let mgr = ctx.context();
+        let Authorization { authorization } = headers.into_inner();
+        let authn = mgr.iam(authorization, None).await?;
         let JobIdParam { job_id } = params.into_inner();
-        let session = mgr.job_session(&job_id).await?;
+        let session = mgr.job_session(&job_id, &authn).await?;
         upgrade.handle(async move |conn| {
             let socket = conn.into_inner();
             let stream = WebSocketStream::from_raw_socket(socket, Role::Server, None).await;
@@ -128,7 +139,7 @@ impl SushApi for ApiServer {
                 HttpError::for_client_error(
                     None,
                     ClientErrorStatusCode::NOT_FOUND,
-                    String::from("interactive session unavailable"),
+                    String::from("Interactive session unavailable"),
                 )
             })?;
             Ok(())
@@ -178,7 +189,7 @@ impl SushApi for ApiServer {
             return Err(HttpError::for_client_error(
                 None,
                 ClientErrorStatusCode::BAD_REQUEST,
-                String::from("page limit must be non-zero"),
+                String::from("Page limit must be non-zero"),
             ));
         };
 
@@ -193,5 +204,57 @@ impl SushApi for ApiServer {
             &EmptyScanParams {},
             |job: &JobStatus, _| job.job_id().to_owned(),
         )?))
+    }
+
+    async fn iam(
+        ctx: RequestContext<Self::Context>,
+        headers: Header<Authorization>,
+        body: TypedBody<Option<SshPublicKey>>,
+    ) -> Result<HttpResponseOk<Identity>, HttpError> {
+        let mgr = ctx.context();
+        let Authorization { authorization } = headers.into_inner();
+        let public_key = body.into_inner();
+        let identity = mgr.iam(authorization, public_key).await?;
+        Ok(HttpResponseOk(identity))
+    }
+
+    async fn identities(
+        ctx: RequestContext<Self::Context>,
+        headers: Header<Authorization>,
+        params: QueryParams<PaginationParams<EmptyScanParams, KeyId>>,
+    ) -> Result<HttpResponseOk<ResultsPage<Identity>>, HttpError> {
+        let mgr = ctx.context();
+        let Authorization { authorization } = headers.into_inner();
+        let authn = mgr.iam(authorization, None).await?;
+        let pag_params = params.into_inner();
+        let Some(limit) = NonZeroU32::new(ctx.page_limit(&pag_params)?.get()) else {
+            return Err(HttpError::for_client_error(
+                None,
+                ClientErrorStatusCode::BAD_REQUEST,
+                String::from("Page limit must be non-zero"),
+            ));
+        };
+        let list = match pag_params.page {
+            WhichPage::First(..) => mgr.identities(None, limit, &authn).await?,
+            WhichPage::Next(key_id) => mgr.identities(Some(key_id), limit, &authn).await?,
+        };
+        Ok(HttpResponseOk(ResultsPage::new(
+            list,
+            &EmptyScanParams {},
+            |identity: &Identity, _| identity.key_id.to_owned(),
+        )?))
+    }
+
+    async fn revoke_identity(
+        ctx: RequestContext<Self::Context>,
+        headers: Header<Authorization>,
+        params: PathParams<KeyIdParam>,
+    ) -> Result<HttpResponseDeleted, HttpError> {
+        let mgr = ctx.context();
+        let Authorization { authorization } = headers.into_inner();
+        let authn = mgr.iam(authorization, None).await?;
+        let KeyIdParam { key_id } = params.into_inner();
+        mgr.revoke_identity(key_id, &authn).await?;
+        Ok(HttpResponseDeleted())
     }
 }

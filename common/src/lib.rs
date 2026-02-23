@@ -1,6 +1,9 @@
-pub mod certs;
+//! Common data structures and algorithms for the Oxide Support Shell.
+
+pub mod authn;
 pub mod codephrases;
 pub mod jobs;
+pub mod keys;
 pub mod session;
 pub mod wordlist;
 
