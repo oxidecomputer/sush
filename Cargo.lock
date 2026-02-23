@@ -2520,7 +2520,6 @@ dependencies = [
  "hashlink",
  "libsqlite3-sys",
  "smallvec 1.15.1",
- "uuid",
 ]
 
 [[package]]
@@ -3155,8 +3154,10 @@ dependencies = [
  "bytesize",
  "chrono",
  "clap",
+ "ed25519-dalek",
  "humantime",
  "libc",
+ "p256",
  "pem-rfc7468",
  "permission-slip-client",
  "permission-slip-common",
@@ -3169,7 +3170,6 @@ dependencies = [
  "sush-common",
  "thiserror 1.0.69",
  "tokio",
- "uuid",
  "x509-cert",
  "xdg 3.0.0",
 ]
@@ -3178,21 +3178,22 @@ dependencies = [
 name = "sush-common"
 version = "0.1.0"
 dependencies = [
- "base64 0.22.1",
  "bytesize",
  "chrono",
+ "crypto-bigint",
  "ed25519-dalek",
  "p256",
  "pem-rfc7468",
+ "rand",
  "rand_core",
  "rlimit",
  "rusqlite",
  "schemars",
  "serde",
+ "serde_json",
  "sha2",
  "tempfile",
  "thiserror 1.0.69",
- "uuid",
  "x509-cert",
 ]
 
@@ -3200,7 +3201,6 @@ dependencies = [
 name = "sush-server"
 version = "0.1.0"
 dependencies = [
- "base64 0.22.1",
  "chrono",
  "clap",
  "dropshot",
@@ -3210,12 +3210,12 @@ dependencies = [
  "rusqlite",
  "schemars",
  "serde",
+ "serde_json",
  "sha2",
  "sush-common",
  "tempfile",
  "thiserror 1.0.69",
  "tokio",
- "uuid",
  "x509-cert",
 ]
 

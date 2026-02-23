@@ -1,16 +1,19 @@
 //! Key, signature, and X.509 certificate management.
 
+use std::convert::Infallible;
 use std::fmt;
 use std::ops::Deref;
 use std::str::FromStr;
 
-use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD as BASE64};
+use crypto_bigint::{ArrayEncoding as _, Random as _, U128, U256};
 use ed25519_dalek::{
     Signature as Ed25519Signature, Signer as _, SigningKey as Ed25519SigningKey, Verifier as _,
     VerifyingKey as Ed25519VerifyingKey,
 };
 use p256::{SecretKey as P256SecretKey, ecdsa};
-use rand_core::{OsRng, RngCore as _};
+use rand_core::OsRng;
+use rusqlite::Error as SqlError;
+use rusqlite::types::{FromSql, FromSqlError, ToSql, ToSqlOutput, ValueRef};
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest as _, Sha256};
@@ -22,23 +25,27 @@ use x509_cert::der::oid::db::rfc8410::ID_ED_25519;
 use x509_cert::der::pem::{LineEnding, PemLabel as _, encode_string as pem_encode};
 use x509_cert::name::Name;
 use x509_cert::serial_number::SerialNumber;
-use x509_cert::spki::{AlgorithmIdentifier, AlgorithmIdentifierOwned, SubjectPublicKeyInfo};
+use x509_cert::spki::{AlgorithmIdentifierOwned, SubjectPublicKeyInfo};
 use x509_cert::time::Validity;
 use x509_cert::{Certificate, TbsCertificate, Version};
+
+use crate::codephrases::{InvalidCodephrase, WORD_SEPARATOR, codephrase, decode_phrase, id_phrase};
 
 /// What went wrong handling a key, signature, or certificate.
 #[derive(Debug, Error)]
 pub enum CertError {
-    #[error("base64 decoding error: {0}")]
-    Base64(#[from] base64::DecodeError),
     #[error("DER encoding error: {0}")]
     Der(#[from] x509_cert::der::Error),
     #[error("Ed25519 error: {0}")]
     Ed25519(#[from] ed25519_dalek::ed25519::Error),
-    #[error("invalid key ID: should be 16 bytes")]
+    #[error(transparent)]
+    InvalidCodephrase(#[from] InvalidCodephrase),
+    #[error("invalid key ID")]
     InvalidKeyId,
     #[error("invalid subject public key")]
     InvalidPublicKey,
+    #[error("invalid public key algorithm")]
+    InvalidPublicKeyAlgorithm,
     #[error("invalid signature")]
     InvalidSignature,
     #[error(transparent)]
@@ -49,33 +56,38 @@ pub enum CertError {
     Signer(String),
 }
 
-/// Upper half of the SHA-256 of a certificate subject,
-/// encoded with base64 for storage and transport.
-#[derive(Clone, Copy, Debug, Eq, Hash, JsonSchema, Ord, PartialEq, PartialOrd)]
-pub struct KeyId(#[schemars(with = "String")] [u8; 16]);
+impl CertError {
+    fn signer(error: impl std::fmt::Display) -> Self {
+        Self::Signer(error.to_string())
+    }
+}
 
-impl KeyId {
-    pub fn as_slice(&self) -> &[u8; 16] {
+/// SHA-256 of a certificate subject, encoded as a pseudo-random
+/// code phrase for storage and transport.
+#[derive(
+    Clone, Debug, Deserialize, Eq, Hash, JsonSchema, Ord, PartialEq, PartialOrd, Serialize,
+)]
+pub struct KeyId(String);
+
+impl Deref for KeyId {
+    type Target = str;
+
+    fn deref(&self) -> &Self::Target {
         &self.0
     }
 }
 
 impl fmt::Display for KeyId {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "{}", BASE64.encode(self.0))
+        write!(f, "{}", self.0)
     }
 }
 
 impl FromStr for KeyId {
-    type Err = CertError;
+    type Err = Infallible;
 
     fn from_str(s: &str) -> Result<Self, Self::Err> {
-        Ok(Self(
-            BASE64
-                .decode(s)?
-                .try_into()
-                .map_err(|_| CertError::InvalidKeyId)?,
-        ))
+        Ok(Self(s.to_string()))
     }
 }
 
@@ -84,78 +96,161 @@ impl TryFrom<&Name> for KeyId {
 
     fn try_from(name: &Name) -> Result<KeyId, Self::Error> {
         let hash = Sha256::digest(&name.to_der()?);
-        Ok(KeyId(hash[..16].try_into().unwrap()))
+        let phrase = id_phrase(U256::from_be_slice(hash.as_slice()));
+        Ok(KeyId(phrase.join(WORD_SEPARATOR)))
     }
 }
 
 impl TryFrom<&Certificate> for KeyId {
     type Error = CertError;
 
-    fn try_from(cert: &Certificate) -> Result<KeyId, Self::Error> {
+    fn try_from(cert: &Certificate) -> Result<Self, Self::Error> {
         Self::try_from(&cert.tbs_certificate.subject)
     }
 }
 
-impl_to_from_sql_and_serde!(KeyId);
-
-/// Base64 encoded signature.
-#[derive(Clone, Debug, Eq, JsonSchema, Ord, PartialEq, PartialOrd)]
-pub struct Signature(#[schemars(with = "String")] Vec<u8>);
-
-impl Signature {
-    pub fn new(bytes: Vec<u8>) -> Self {
-        Self(bytes)
-    }
-
-    pub fn as_slice(&self) -> &[u8] {
-        &self.0
+impl FromSql for KeyId {
+    fn column_result(value: ValueRef<'_>) -> Result<Self, FromSqlError> {
+        Ok(Self(value.as_str()?.to_string()))
     }
 }
 
-impl fmt::Display for Signature {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "{}", BASE64.encode(&self.0))
+impl ToSql for KeyId {
+    fn to_sql(&self) -> Result<ToSqlOutput<'_>, SqlError> {
+        Ok(ToSqlOutput::from(self.0.clone()))
     }
 }
 
-impl FromStr for Signature {
-    type Err = CertError;
-
-    fn from_str(s: &str) -> Result<Self, Self::Err> {
-        Ok(Self(BASE64.decode(s)?))
-    }
+/// Code phrase encoded signature.
+#[derive(Clone, Debug, Deserialize, Eq, JsonSchema, Ord, PartialEq, PartialOrd, Serialize)]
+pub struct EncodedSignature {
+    r: String,
+    s: String,
 }
 
-impl_to_from_sql_and_serde!(Signature);
-
-impl Signature {
-    pub fn verify(&self, message: &[u8], cert: &Certificate) -> Result<(), CertError> {
-        let spki = &cert.tbs_certificate.subject_public_key_info;
-        let public_key_bytes = spki.subject_public_key.raw_bytes();
-        match &spki.algorithm {
-            AlgorithmIdentifier {
+impl EncodedSignature {
+    fn decode(
+        &self,
+        public_key_algorithm: &AlgorithmIdentifierOwned,
+    ) -> Result<Signature, CertError> {
+        // Currently assumes all (r, s) values are 256 bits.
+        // If we introduce longer signature variants later,
+        // this code will need to change slightly.
+        let Self { r, s } = self;
+        let r = decode_phrase(r)?.to_be_byte_array();
+        let s = decode_phrase(s)?.to_be_byte_array();
+        match public_key_algorithm {
+            AlgorithmIdentifierOwned {
+                oid: ID_EC_PUBLIC_KEY,
+                parameters: Some(parameters),
+            } if *parameters == (&SECP_256_R_1).into() => Ok(Signature::EcdsaSha256(
+                ecdsa::Signature::from_scalars(r, s)?,
+            )),
+            AlgorithmIdentifierOwned {
                 oid: ID_ED_25519,
                 parameters: None,
-            } => {
-                let signature = Ed25519Signature::from_slice(&self.0)?;
+            } => Ok(Signature::Ed25519(Ed25519Signature::from_components(
+                r.into(),
+                s.into(),
+            ))),
+            _ => Err(CertError::InvalidPublicKeyAlgorithm),
+        }
+    }
+}
+
+// Use JSON to encode signature (r, s) values. Keeps the database
+// consistent with the wire protocol, but we might regret it later.
+
+impl FromSql for EncodedSignature {
+    fn column_result(value: ValueRef<'_>) -> Result<Self, FromSqlError> {
+        serde_json::from_str(value.as_str()?).map_err(FromSqlError::other)
+    }
+}
+
+impl ToSql for EncodedSignature {
+    fn to_sql(&self) -> Result<ToSqlOutput<'_>, SqlError> {
+        Ok(ToSqlOutput::from(
+            serde_json::to_string(self).map_err(FromSqlError::other)?,
+        ))
+    }
+}
+
+/// Decoded digital signature.
+#[derive(Debug)]
+pub enum Signature {
+    EcdsaSha256(ecdsa::Signature),
+    Ed25519(Ed25519Signature),
+}
+
+impl Signature {
+    pub fn to_bit_string(&self) -> Result<BitString, CertError> {
+        match self {
+            Self::EcdsaSha256(signature) => Ok(BitString::from_bytes(
+                signature.to_der().to_bytes().as_ref(),
+            )?),
+            Self::Ed25519(signature) => Ok(BitString::from_bytes(signature.to_bytes().as_slice())?),
+        }
+    }
+
+    pub fn encode(&self) -> EncodedSignature {
+        let codephrase = |x: U256| codephrase(x).join(WORD_SEPARATOR);
+        match self {
+            Self::EcdsaSha256(signature) => EncodedSignature {
+                r: codephrase(U256::from_be_byte_array(signature.r().to_bytes())),
+                s: codephrase(U256::from_be_byte_array(signature.s().to_bytes())),
+            },
+            Self::Ed25519(signature) => EncodedSignature {
+                r: codephrase(U256::from_be_slice(signature.r_bytes())),
+                s: codephrase(U256::from_be_slice(signature.s_bytes())),
+            },
+        }
+    }
+
+    pub fn verify(
+        &self,
+        message: &[u8],
+        spki: &SubjectPublicKeyInfo<Any, BitString>,
+    ) -> Result<(), CertError> {
+        let public_key_bytes = spki.subject_public_key.raw_bytes();
+        match self {
+            Self::EcdsaSha256(signature) => {
+                let public_key = ecdsa::VerifyingKey::from_sec1_bytes(public_key_bytes)?;
+                public_key.verify(message, signature)?;
+            }
+            Self::Ed25519(signature) => {
                 let public_key = Ed25519VerifyingKey::from_bytes(
                     &public_key_bytes
                         .try_into()
                         .map_err(|_| CertError::InvalidPublicKey)?,
                 )?;
-                public_key.verify(message, &signature)?;
+                public_key.verify(message, signature)?;
             }
-            AlgorithmIdentifier {
-                oid: ID_EC_PUBLIC_KEY,
-                parameters: Some(parameters),
-            } if *parameters == SECP_256_R_1.into() => {
-                let signature = ecdsa::Signature::from_bytes(self.0.as_slice().into())?;
-                let public_key = ecdsa::VerifyingKey::from_sec1_bytes(public_key_bytes)?;
-                public_key.verify(message, &signature)?;
-            }
-            _ => return Err(CertError::InvalidPublicKey),
         }
         Ok(())
+    }
+}
+
+/// Extract the signature on a certificate.
+impl TryFrom<&Certificate> for Signature {
+    type Error = CertError;
+
+    fn try_from(cert: &Certificate) -> Result<Self, Self::Error> {
+        if cert.signature_algorithm != cert.tbs_certificate.signature {
+            return Err(Self::Error::InvalidSignature);
+        }
+
+        let signature = cert.signature.raw_bytes();
+        match cert.signature_algorithm {
+            AlgorithmIdentifierOwned {
+                oid: ECDSA_WITH_SHA_256,
+                parameters: None,
+            } => Ok(Self::EcdsaSha256(ecdsa::Signature::from_der(signature)?)),
+            AlgorithmIdentifierOwned {
+                oid: ID_ED_25519,
+                parameters: None,
+            } => Ok(Self::Ed25519(Ed25519Signature::from_slice(signature)?)),
+            _ => Err(Self::Error::InvalidSignature),
+        }
     }
 }
 
@@ -165,6 +260,7 @@ pub trait Signer {
     type Error: std::fmt::Display;
 
     async fn key_id(&self) -> Result<KeyId, Self::Error>;
+    async fn algorithm_id(&self) -> Result<AlgorithmIdentifierOwned, Self::Error>;
     async fn signature_algorithm(&self) -> Result<AlgorithmIdentifierOwned, Self::Error>;
     async fn sign<T: ToBeSigned>(&self, thing: T) -> Result<Signed<T>, Self::Error>;
 }
@@ -186,11 +282,11 @@ impl<T: AsRef<[u8]>> ToBeSigned for T {
 pub struct Signed<T> {
     payload: T,
     key_id: KeyId,
-    signature: Signature,
+    signature: EncodedSignature,
 }
 
 impl<T> Signed<T> {
-    pub fn new(payload: T, key_id: KeyId, signature: Signature) -> Self {
+    pub fn new(payload: T, key_id: KeyId, signature: EncodedSignature) -> Self {
         Self {
             payload,
             key_id,
@@ -202,11 +298,11 @@ impl<T> Signed<T> {
         &self.payload
     }
 
-    pub fn key_id(&self) -> KeyId {
-        self.key_id
+    pub fn key_id(&self) -> &KeyId {
+        &self.key_id
     }
 
-    pub fn signature(&self) -> &Signature {
+    pub fn signature(&self) -> &EncodedSignature {
         &self.signature
     }
 }
@@ -222,7 +318,8 @@ impl<T> Deref for Signed<T> {
 impl<T: ToBeSigned> Signed<T> {
     pub fn verify(self, cert: &Certificate) -> Result<Verified<T>, CertError> {
         let tbs = self.to_be_signed(&self.key_id);
-        self.signature.verify(&tbs, cert)?;
+        let spki = &cert.tbs_certificate.subject_public_key_info;
+        self.signature.decode(&spki.algorithm)?.verify(&tbs, spki)?;
         Ok(Verified {
             signed: self,
             verified_by: KeyId::try_from(cert)?,
@@ -238,8 +335,8 @@ pub struct Verified<T> {
 }
 
 impl<T> Verified<T> {
-    pub fn verified_by(&self) -> KeyId {
-        self.verified_by
+    pub fn verified_by(&self) -> &KeyId {
+        &self.verified_by
     }
 }
 
@@ -276,16 +373,30 @@ impl SigningKey {
         }
     }
 
+    /// Sign a message with this key.
     fn sign(&self, message: &[u8]) -> Signature {
         match self {
-            Self::Ed25519(key) => Signature::new(key.sign(message).to_vec()),
-            Self::P256(key) => {
-                let sig: ecdsa::Signature = ecdsa::SigningKey::from(key).sign(message);
-                Signature::new(sig.to_vec())
-            }
+            Self::Ed25519(key) => Signature::Ed25519(key.sign(message)),
+            Self::P256(key) => Signature::EcdsaSha256(ecdsa::SigningKey::from(key).sign(message)),
         }
     }
 
+    /// Identify the algorithm used for signatures with this key,
+    /// i.e., what goes in the X.509 `signatureAlgorithm` and
+    /// `TBSCertificate.signature` fields (which must match).
+    fn signature_algorithm(&self) -> AlgorithmIdentifierOwned {
+        match self {
+            Self::Ed25519(_) => self.algorithm_id(),
+            Self::P256(_) => AlgorithmIdentifierOwned {
+                oid: ECDSA_WITH_SHA_256,
+                parameters: None,
+            },
+        }
+    }
+
+    /// Identify the algorithm used for the key itself, i.e., what
+    /// goes in the X.509 `SubjectPublicKeyInfo.algorithm` field.
+    /// For ECDSA keys this includes the curve ID as a parameter.
     fn algorithm_id(&self) -> AlgorithmIdentifierOwned {
         match self {
             Self::Ed25519(_) => AlgorithmIdentifierOwned {
@@ -299,16 +410,7 @@ impl SigningKey {
         }
     }
 
-    fn signature_algorithm(&self) -> AlgorithmIdentifierOwned {
-        match self {
-            Self::Ed25519(_) => self.algorithm_id(),
-            Self::P256(_) => AlgorithmIdentifierOwned {
-                oid: ECDSA_WITH_SHA_256,
-                parameters: None,
-            },
-        }
-    }
-
+    /// Retrieve the public key associated with this signing key.
     fn public_key(&self) -> Vec<u8> {
         match self {
             Self::Ed25519(key) => key.verifying_key().as_bytes().to_vec(),
@@ -316,6 +418,7 @@ impl SigningKey {
         }
     }
 
+    /// Build an X.509 `SubjectPublicKeyInfo` structure for this key.
     fn spki(&self) -> SubjectPublicKeyInfo<Any, BitString> {
         SubjectPublicKeyInfo {
             algorithm: self.algorithm_id(),
@@ -342,8 +445,11 @@ impl EphemeralKey {
         let cert = Self::self_signed_cert(&key, subject, validity)?;
         let subject = cert.tbs_certificate.subject.to_owned();
         let key_id = KeyId::try_from(&subject)?;
-        let signature = Signature::new(cert.signature.raw_bytes().to_vec());
-        signature.verify(&cert.tbs_certificate.to_der()?, &cert)?;
+        let signature = Signature::try_from(&cert)?;
+        signature.verify(
+            &cert.tbs_certificate.to_der()?,
+            &cert.tbs_certificate.subject_public_key_info,
+        )?;
         Ok(Self { key, key_id, cert })
     }
 
@@ -357,9 +463,14 @@ impl EphemeralKey {
     ) -> Result<Self, CertError> {
         let key = SigningKey::new(key_type);
         let key_id = KeyId::try_from(&subject)?;
+        let signature_algorithm = signer
+            .signature_algorithm()
+            .await
+            .map_err(|e| CertError::Signer(e.to_string()))?;
         let tbs_certificate = Self::tbs_certificate(
             &key,
             Self::generate_serial_number()?,
+            signature_algorithm,
             subject.to_owned(),
             issuer.to_owned(),
             validity,
@@ -379,14 +490,15 @@ impl EphemeralKey {
     }
 
     fn generate_serial_number() -> Result<SerialNumber, CertError> {
-        let mut buf = [0; 16];
-        OsRng.fill_bytes(&mut buf);
-        Ok(SerialNumber::new(&buf)?)
+        Ok(SerialNumber::new(
+            &U128::random(&mut OsRng).to_be_byte_array(),
+        )?)
     }
 
     fn tbs_certificate(
         key: &SigningKey,
         serial_number: SerialNumber,
+        signature_algorithm: AlgorithmIdentifierOwned,
         subject: Name,
         issuer: Name,
         validity: Validity,
@@ -394,7 +506,7 @@ impl EphemeralKey {
         TbsCertificate {
             version: Version::V3,
             serial_number,
-            signature: key.signature_algorithm(),
+            signature: signature_algorithm,
             issuer,
             validity,
             subject,
@@ -413,6 +525,7 @@ impl EphemeralKey {
         let tbs_certificate = Self::tbs_certificate(
             key,
             Self::generate_serial_number()?,
+            key.signature_algorithm(),
             subject.clone(),
             subject,
             validity,
@@ -421,7 +534,7 @@ impl EphemeralKey {
         Ok(Certificate {
             tbs_certificate,
             signature_algorithm: key.signature_algorithm(),
-            signature: BitString::from_bytes(signature.as_slice())?,
+            signature: signature.to_bit_string()?,
         })
     }
 
@@ -430,19 +543,21 @@ impl EphemeralKey {
         signer: &S,
     ) -> Result<Certificate, CertError> {
         let tbs = tbs_certificate.to_der()?;
+        let algorithm_id = signer.algorithm_id().await.map_err(CertError::signer)?;
         let signature_algorithm = signer
             .signature_algorithm()
             .await
-            .map_err(|e| CertError::Signer(e.to_string()))?;
+            .map_err(CertError::signer)?;
         let signature = signer
             .sign(&tbs)
             .await
-            .map_err(|e| CertError::Signer(e.to_string()))?
-            .signature;
+            .map_err(CertError::signer)?
+            .signature
+            .decode(&algorithm_id)?;
         Ok(Certificate {
             tbs_certificate,
             signature_algorithm,
-            signature: BitString::from_bytes(signature.as_slice())?,
+            signature: signature.to_bit_string()?,
         })
     }
 }
@@ -451,17 +566,21 @@ impl Signer for EphemeralKey {
     type Error = CertError;
 
     async fn key_id(&self) -> Result<KeyId, Self::Error> {
-        Ok(self.key_id)
+        Ok(self.key_id.clone())
+    }
+
+    async fn algorithm_id(&self) -> Result<AlgorithmIdentifierOwned, Self::Error> {
+        Ok(self.key.algorithm_id())
+    }
+
+    async fn signature_algorithm(&self) -> Result<AlgorithmIdentifierOwned, Self::Error> {
+        Ok(self.key.signature_algorithm())
     }
 
     async fn sign<T: ToBeSigned>(&self, what: T) -> Result<Signed<T>, Self::Error> {
         let key_id = self.key_id().await?;
         let signature = self.key.sign(&what.to_be_signed(&key_id));
-        Ok(Signed::new(what, key_id, signature))
-    }
-
-    async fn signature_algorithm(&self) -> Result<AlgorithmIdentifierOwned, Self::Error> {
-        Ok(self.key.signature_algorithm())
+        Ok(Signed::new(what, key_id, signature.encode()))
     }
 }
 

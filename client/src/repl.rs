@@ -99,6 +99,7 @@ impl Repl {
     }
 
     /// Get the default job ID from the `SUSH_JOB_ID` environment variable.
+    #[allow(unused)]
     fn default_job_id(&self) -> Option<JobId> {
         env::var(SUSH_JOB_ID)
             .ok()
@@ -117,24 +118,20 @@ impl Repl {
 
     /// Set the `SUSH_JOB_ID` environment variable to a reserved but unused job.
     fn set_default_job_id(&mut self) {
-        self.set_job_id(self.reserved.first().copied());
+        self.set_job_id(self.reserved.first().cloned());
     }
 
     /// Remove `job_id` from the list of reserved jobs.
-    fn unreserve_job_id(&mut self, job_id: JobId) {
-        if let Some(i) = self.reserved.iter().position(|&j| j == job_id) {
+    fn unreserve_job_id(&mut self, job_id: &JobId) {
+        if let Some(i) = self.reserved.iter().position(|j| j == job_id) {
             self.reserved.remove(i);
         }
     }
 
-    /// Make a prompt including the default job ID.
+    /// Make a prompt indicating online/offline status.
     fn prompt(&self, args: &GlobalArgs) -> String {
         let offline = if args.url.is_some() { "" } else { " (offline)" };
-        if let Some(job_id) = self.default_job_id() {
-            format!("{PREFIX}{offline} {job_id}# ")
-        } else {
-            format!("{PREFIX}{offline}# ")
-        }
+        format!("{PREFIX}{offline}# ")
     }
 }
 
@@ -201,38 +198,38 @@ impl CommandContext for Repl {
         self.cli.cert_imported(path, key_id)
     }
 
-    fn job_aborted(&mut self, job_id: JobId) -> Result<(), CommandError> {
+    fn job_aborted(&mut self, job_id: &JobId) -> Result<(), CommandError> {
         self.cli.job_aborted(job_id)?;
-        self.set_job_id(Some(job_id));
+        self.set_job_id(Some(job_id.to_owned()));
         self.unreserve_job_id(job_id);
         Ok(())
     }
 
     fn job_stdout(
         &mut self,
-        job_id: JobId,
+        job_id: &JobId,
         output: &[u8],
         binary: bool,
     ) -> Result<(), CommandError> {
         self.cli.job_stdout(job_id, output, binary)?;
-        self.set_job_id(Some(job_id));
+        self.set_job_id(Some(job_id.to_owned()));
         Ok(())
     }
 
     fn job_stderr(
         &mut self,
-        job_id: JobId,
+        job_id: &JobId,
         errors: &[u8],
         binary: bool,
     ) -> Result<(), CommandError> {
         self.cli.job_stderr(job_id, errors, binary)?;
-        self.set_job_id(Some(job_id));
+        self.set_job_id(Some(job_id.to_owned()));
         Ok(())
     }
 
-    fn job_status(&mut self, job_id: JobId, status: &JobStatus) -> Result<(), CommandError> {
+    fn job_status(&mut self, job_id: &JobId, status: &JobStatus) -> Result<(), CommandError> {
         self.cli.job_status(job_id, status)?;
-        self.set_job_id(Some(job_id));
+        self.set_job_id(Some(job_id.to_owned()));
         self.unreserve_job_id(job_id);
         Ok(())
     }
@@ -260,10 +257,7 @@ impl CommandContext for Repl {
         reserved: &HashMap<String, DateTime<Utc>>,
     ) -> Result<(), CommandError> {
         self.cli.reserved_map(reserved)?;
-        self.reserved = reserved
-            .keys()
-            .map(|s| s.parse::<JobId>())
-            .collect::<Result<Vec<JobId>, _>>()?;
+        self.reserved = reserved.keys().map(JobId::from).collect();
         Ok(())
     }
 

@@ -1,5 +1,6 @@
 //! Signed job requests.
 
+use std::convert::Infallible;
 use std::fmt;
 use std::io::Error as IoError;
 use std::ops::Deref;
@@ -8,30 +9,21 @@ use std::str::FromStr;
 use bytesize::GB;
 use chrono::{DateTime, TimeDelta, Utc};
 use rlimit::Resource;
+use rusqlite::Result as SqlResult;
+use rusqlite::types::{FromSql, FromSqlResult, ToSql, ToSqlOutput, ValueRef};
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest as _, Sha256};
-use uuid::Uuid;
 
 use crate::certs::{KeyId, Signed, ToBeSigned, Verified};
 
-#[derive(Clone, Copy, Debug, Eq, Hash, JsonSchema, Ord, PartialEq, PartialOrd)]
-pub struct JobId(Uuid);
-
-impl JobId {
-    pub fn new() -> Self {
-        Self(Uuid::new_v4())
-    }
-}
-
-impl Default for JobId {
-    fn default() -> Self {
-        Self::new()
-    }
-}
+#[derive(
+    Clone, Debug, Deserialize, Eq, Hash, JsonSchema, Ord, PartialEq, PartialOrd, Serialize,
+)]
+pub struct JobId(String);
 
 impl Deref for JobId {
-    type Target = Uuid;
+    type Target = str;
 
     fn deref(&self) -> &Self::Target {
         &self.0
@@ -45,14 +37,30 @@ impl fmt::Display for JobId {
 }
 
 impl FromStr for JobId {
-    type Err = uuid::Error;
+    type Err = Infallible;
 
     fn from_str(s: &str) -> Result<Self, Self::Err> {
-        Ok(Self(Uuid::from_str(s)?))
+        Ok(Self(s.to_string()))
     }
 }
 
-impl_to_from_sql_and_serde!(JobId);
+impl<S: AsRef<str>> From<S> for JobId {
+    fn from(s: S) -> Self {
+        Self(s.as_ref().to_string())
+    }
+}
+
+impl FromSql for JobId {
+    fn column_result(value: ValueRef<'_>) -> FromSqlResult<Self> {
+        Ok(Self::from(value.as_str()?))
+    }
+}
+
+impl ToSql for JobId {
+    fn to_sql(&self) -> SqlResult<ToSqlOutput<'_>> {
+        Ok(ToSqlOutput::from(self.0.clone()))
+    }
+}
 
 /// The response to a job reservation request.
 #[derive(Debug, Deserialize, JsonSchema, Serialize)]
@@ -79,8 +87,8 @@ impl JobStartRequest {
         }
     }
 
-    pub fn job_id(&self) -> JobId {
-        self.job_id
+    pub fn job_id(&self) -> &JobId {
+        &self.job_id
     }
 
     pub fn command(&self) -> &str {
@@ -97,9 +105,9 @@ impl ToBeSigned for JobStartRequest {
             hasher.update(data);
         };
         hash(b"JobStartRequest");
-        hash(self.job_id.as_bytes());
+        hash(self.job_id.as_ref());
         hash(self.command.as_bytes());
-        hash(key_id.as_slice());
+        hash(key_id.as_bytes());
         hasher.finalize().to_vec()
     }
 }

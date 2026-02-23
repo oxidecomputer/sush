@@ -64,7 +64,7 @@ impl CommandContext for Cli {
             return Err(CommandError::InvalidRootCert);
         }
         let tbs = root.tbs_certificate.to_der()?;
-        Signature::new(root.signature.raw_bytes().to_vec()).verify(&tbs, root)?;
+        Signature::try_from(root)?.verify(&tbs, &root.tbs_certificate.subject_public_key_info)?;
         if matches!(self.get_output_format(), OutputFormat::Text) {
             println!(
                 "✅ Verified root certificate for subject `{}`",
@@ -75,7 +75,8 @@ impl CommandContext for Cli {
         let mut prev = root;
         for cert in rest {
             let tbs = cert.tbs_certificate.to_der()?;
-            Signature::new(cert.signature.raw_bytes().to_vec()).verify(&tbs, prev)?;
+            Signature::try_from(cert)?
+                .verify(&tbs, &prev.tbs_certificate.subject_public_key_info)?;
             prev = cert;
             if matches!(self.get_output_format(), OutputFormat::Text) {
                 println!(
@@ -117,10 +118,9 @@ impl CommandContext for Cli {
                 if reserved.is_empty() {
                     println!("✅ No reserved jobs");
                 } else {
-                    println!("✅ {} reserved jobs", reserved.len());
-                    println!("{:40}{}", "Job ID", "Time Reserved");
-                    for (job_id, time) in reserved {
-                        println!("{job_id:40}{time}");
+                    println!("✅ {} reserved jobs:", reserved.len());
+                    for job_id in reserved.keys() {
+                        println!("{job_id}");
                     }
                 }
             }
@@ -132,7 +132,7 @@ impl CommandContext for Cli {
         match self.get_output_format() {
             OutputFormat::Json => println!("{}", json!(reserved)),
             OutputFormat::Text => {
-                println!("✅ Read {} reserved job IDs", reserved.job_ids.len());
+                println!("✅ Read {} reserved jobs", reserved.job_ids.len());
             }
         }
         Ok(())
@@ -149,9 +149,9 @@ impl CommandContext for Cli {
                 let n = job_ids.len();
                 match n {
                     0 => println!("✅ No jobs reserved"),
-                    1 => println!("✅ Reserved job ID {} at {}", job_ids[0], time_reserved),
+                    1 => println!("✅ Reserved job `{}` at {}", job_ids[0], time_reserved),
                     _ => {
-                        println!("✅ Reserved {n} job IDs at {time_reserved}:");
+                        println!("✅ Reserved {n} jobs at {time_reserved}:");
                         for job_id in &reserved.job_ids {
                             println!("{job_id}");
                         }
@@ -162,17 +162,17 @@ impl CommandContext for Cli {
         Ok(())
     }
 
-    fn job_aborted(&mut self, job_id: JobId) -> Result<(), CommandError> {
+    fn job_aborted(&mut self, job_id: &JobId) -> Result<(), CommandError> {
         match self.get_output_format() {
             OutputFormat::Json => println!("{job_id}"),
-            OutputFormat::Text => println!("✅ Aborted job {job_id}"),
+            OutputFormat::Text => println!("✅ Aborted job `{job_id}`"),
         }
         Ok(())
     }
 
     fn job_stdout(
         &mut self,
-        job_id: JobId,
+        _job_id: &JobId,
         output: &[u8],
         binary: bool,
     ) -> Result<(), CommandError> {
@@ -182,7 +182,7 @@ impl CommandContext for Cli {
             OutputFormat::Text if binary => stdout().write(output).map(|_| ())?,
             OutputFormat::Text if output.is_empty() => (),
             OutputFormat::Text => {
-                println!("✅ Job {job_id} stdout:");
+                println!("✅ Job stdout:");
                 let output = String::from_utf8(output.to_vec())?;
                 if output.ends_with('\n') {
                     print!("{output}");
@@ -196,7 +196,7 @@ impl CommandContext for Cli {
 
     fn job_stderr(
         &mut self,
-        job_id: JobId,
+        _job_id: &JobId,
         errors: &[u8],
         binary: bool,
     ) -> Result<(), CommandError> {
@@ -206,7 +206,7 @@ impl CommandContext for Cli {
             OutputFormat::Text if binary => stdout().write(errors).map(|_| ())?,
             OutputFormat::Text if errors.is_empty() => (),
             OutputFormat::Text => {
-                println!("❌ Job {job_id} stderr:");
+                println!("❌ Job stderr:");
                 let errors = String::from_utf8(errors.to_vec())?;
                 if errors.ends_with('\n') {
                     print!("{errors}");
@@ -218,11 +218,11 @@ impl CommandContext for Cli {
         Ok(())
     }
 
-    fn job_status(&mut self, job_id: JobId, status: &JobStatus) -> Result<(), CommandError> {
+    fn job_status(&mut self, job_id: &JobId, status: &JobStatus) -> Result<(), CommandError> {
         match self.get_output_format() {
             OutputFormat::Json => println!("{}", json!(status)),
             OutputFormat::Text => match status {
-                JobStatus::NotFound => println!("❌ Job {job_id} not found"),
+                JobStatus::NotFound => println!("❌ Job `{job_id}` not found"),
                 JobStatus::Reserved {
                     job_id,
                     time_reserved,
@@ -291,10 +291,10 @@ impl CommandContext for Cli {
             OutputFormat::Text => {
                 let n = revoked.len();
                 match n {
-                    0 => println!("✅ No job IDs revoked"),
-                    1 => println!("✅ Revoked job ID {}", revoked[0]),
+                    0 => println!("✅ No jobs revoked"),
+                    1 => println!("✅ Revoked job `{}`", revoked[0]),
                     _ => {
-                        println!("✅ Revoked {} job IDs:", revoked.len());
+                        println!("✅ Revoked {} jobs:", revoked.len());
                         for job_id in revoked {
                             println!("{job_id}");
                         }
@@ -309,7 +309,7 @@ impl CommandContext for Cli {
         match self.get_output_format() {
             OutputFormat::Json => println!("{}", serde_json::to_string(&job)?),
             OutputFormat::Text => println!(
-                "✅ Signed request for job {}\n{}",
+                "✅ Signed request for job `{}`\n{}",
                 job.job_id(),
                 serde_json::to_string_pretty(&job)?
             ),

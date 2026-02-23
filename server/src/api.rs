@@ -166,7 +166,7 @@ async fn job_start(
     let JobIdParam { job_id } = params.into_inner();
     let JobStartParams { limits, wait } = query.into_inner();
     let job = body.into_inner();
-    if job.job_id() != job_id {
+    if *job.job_id() != job_id {
         return Err(HttpError::for_client_error(
             None,
             ClientErrorStatusCode::BAD_REQUEST,
@@ -179,7 +179,7 @@ async fn job_start(
             HttpError::for_internal_error(String::from("can't wait for job, sender dropped"))
         })??))
     } else {
-        Ok(HttpResponseOk(ctx.context().job_status(job_id).await?))
+        Ok(HttpResponseOk(ctx.context().job_status(&job_id).await?))
     }
 }
 
@@ -190,7 +190,7 @@ async fn job_status(
     params: PathParams<JobIdParam>,
 ) -> Result<HttpResponseOk<JobStatus>, HttpError> {
     let JobIdParam { job_id } = params.into_inner();
-    let status = ctx.context().job_status(job_id).await?;
+    let status = ctx.context().job_status(&job_id).await?;
     Ok(HttpResponseOk(status))
 }
 
@@ -202,7 +202,7 @@ async fn job_stdout(
 ) -> Result<HttpResponseOk<Vec<u8>>, HttpError> {
     // TODO: Range requests.
     let JobIdParam { job_id } = params.into_inner();
-    let stdout = ctx.context().job_stdout(job_id, None).await?;
+    let stdout = ctx.context().job_stdout(&job_id, None).await?;
     Ok(HttpResponseOk(stdout))
 }
 
@@ -214,7 +214,7 @@ async fn job_stderr(
 ) -> Result<HttpResponseOk<Vec<u8>>, HttpError> {
     // TODO: Range requests.
     let JobIdParam { job_id } = params.into_inner();
-    let stderr = ctx.context().job_stderr(job_id, None).await?;
+    let stderr = ctx.context().job_stderr(&job_id, None).await?;
     Ok(HttpResponseOk(stderr))
 }
 
@@ -225,6 +225,6 @@ async fn job_abort(
     params: PathParams<JobIdParam>,
 ) -> Result<HttpResponseOk<()>, HttpError> {
     let JobIdParam { job_id } = params.into_inner();
-    ctx.context().job_abort(job_id).await?;
+    ctx.context().job_abort(&job_id).await?;
     Ok(HttpResponseOk(()))
 }
