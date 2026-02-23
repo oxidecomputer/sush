@@ -81,6 +81,55 @@
         }
       }
     },
+    "/history": {
+      "get": {
+        "summary": "List previous jobs (paginated).",
+        "operationId": "history",
+        "parameters": [
+          {
+            "in": "query",
+            "name": "limit",
+            "description": "Maximum number of items returned by a single call",
+            "schema": {
+              "nullable": true,
+              "type": "integer",
+              "format": "uint32",
+              "minimum": 1
+            }
+          },
+          {
+            "in": "query",
+            "name": "page_token",
+            "description": "Token returned by previous call to retrieve the subsequent page",
+            "schema": {
+              "nullable": true,
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "successful operation",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/JobStatusResultsPage"
+                }
+              }
+            }
+          },
+          "4XX": {
+            "$ref": "#/components/responses/Error"
+          },
+          "5XX": {
+            "$ref": "#/components/responses/Error"
+          }
+        },
+        "x-dropshot-pagination": {
+          "required": []
+        }
+      }
+    },
     "/jobs/{job_id}/abort": {
       "get": {
         "summary": "Abort a started job.",
@@ -106,6 +155,100 @@
                   "enum": [
                     null
                   ]
+                }
+              }
+            }
+          },
+          "4XX": {
+            "$ref": "#/components/responses/Error"
+          },
+          "5XX": {
+            "$ref": "#/components/responses/Error"
+          }
+        }
+      }
+    },
+    "/jobs/{job_id}/output/{stream}": {
+      "get": {
+        "summary": "Get (a subset of) the standard output or standard error of a job.",
+        "operationId": "job_output",
+        "parameters": [
+          {
+            "in": "header",
+            "name": "range",
+            "description": "A request to access a portion of the resource, such as `bytes=0-499`\n\nSee: <https://developer.mozilla.org/en-US/docs/Web/HTTP/Reference/Headers/Range>",
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "in": "path",
+            "name": "job_id",
+            "required": true,
+            "schema": {
+              "$ref": "#/components/schemas/JobId"
+            }
+          },
+          {
+            "in": "path",
+            "name": "stream",
+            "required": true,
+            "schema": {
+              "$ref": "#/components/schemas/JobOutputStream"
+            }
+          }
+        ],
+        "responses": {
+          "default": {
+            "description": "",
+            "content": {
+              "*/*": {
+                "schema": {}
+              }
+            }
+          }
+        }
+      },
+      "delete": {
+        "summary": "Truncate the standard output or standard error of a job.",
+        "description": "Returns its new length.",
+        "operationId": "job_output_delete",
+        "parameters": [
+          {
+            "in": "header",
+            "name": "range",
+            "description": "A request to access a portion of the resource, such as `bytes=0-499`\n\nSee: <https://developer.mozilla.org/en-US/docs/Web/HTTP/Reference/Headers/Range>",
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "in": "path",
+            "name": "job_id",
+            "required": true,
+            "schema": {
+              "$ref": "#/components/schemas/JobId"
+            }
+          },
+          {
+            "in": "path",
+            "name": "stream",
+            "required": true,
+            "schema": {
+              "$ref": "#/components/schemas/JobOutputStream"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "successful operation",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "title": "uint64",
+                  "type": "integer",
+                  "format": "uint64",
+                  "minimum": 0
                 }
               }
             }
@@ -225,86 +368,6 @@
               "application/json": {
                 "schema": {
                   "$ref": "#/components/schemas/JobStatus"
-                }
-              }
-            }
-          },
-          "4XX": {
-            "$ref": "#/components/responses/Error"
-          },
-          "5XX": {
-            "$ref": "#/components/responses/Error"
-          }
-        }
-      }
-    },
-    "/jobs/{job_id}/stderr": {
-      "get": {
-        "summary": "Get the standard output of a job.",
-        "operationId": "job_stderr",
-        "parameters": [
-          {
-            "in": "path",
-            "name": "job_id",
-            "required": true,
-            "schema": {
-              "$ref": "#/components/schemas/JobId"
-            }
-          }
-        ],
-        "responses": {
-          "200": {
-            "description": "successful operation",
-            "content": {
-              "application/json": {
-                "schema": {
-                  "title": "Array_of_uint8",
-                  "type": "array",
-                  "items": {
-                    "type": "integer",
-                    "format": "uint8",
-                    "minimum": 0
-                  }
-                }
-              }
-            }
-          },
-          "4XX": {
-            "$ref": "#/components/responses/Error"
-          },
-          "5XX": {
-            "$ref": "#/components/responses/Error"
-          }
-        }
-      }
-    },
-    "/jobs/{job_id}/stdout": {
-      "get": {
-        "summary": "Get the standard output of a job.",
-        "operationId": "job_stdout",
-        "parameters": [
-          {
-            "in": "path",
-            "name": "job_id",
-            "required": true,
-            "schema": {
-              "$ref": "#/components/schemas/JobId"
-            }
-          }
-        ],
-        "responses": {
-          "200": {
-            "description": "successful operation",
-            "content": {
-              "application/json": {
-                "schema": {
-                  "title": "Array_of_uint8",
-                  "type": "array",
-                  "items": {
-                    "type": "integer",
-                    "format": "uint8",
-                    "minimum": 0
-                  }
                 }
               }
             }
@@ -449,6 +512,177 @@
           "request_id"
         ]
       },
+      "JobStatusResultsPage": {
+        "description": "A single page of results",
+        "type": "object",
+        "properties": {
+          "next_page": {
+            "nullable": true,
+            "description": "token used to fetch the next page of results (if any)",
+            "type": "string"
+          },
+          "items": {
+            "description": "list of items on this page of results",
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/JobStatus"
+            }
+          }
+        },
+        "required": [
+          "items"
+        ]
+      },
+      "JobStatus": {
+        "oneOf": [
+          {
+            "type": "object",
+            "properties": {
+              "Reserved": {
+                "type": "object",
+                "properties": {
+                  "job_id": {
+                    "$ref": "#/components/schemas/JobId"
+                  },
+                  "time_reserved": {
+                    "type": "string",
+                    "format": "date-time"
+                  }
+                },
+                "required": [
+                  "job_id",
+                  "time_reserved"
+                ]
+              }
+            },
+            "required": [
+              "Reserved"
+            ],
+            "additionalProperties": false
+          },
+          {
+            "type": "object",
+            "properties": {
+              "Started": {
+                "type": "object",
+                "properties": {
+                  "job": {
+                    "$ref": "#/components/schemas/Verified_for_JobStartRequest"
+                  },
+                  "time_reserved": {
+                    "type": "string",
+                    "format": "date-time"
+                  },
+                  "time_started": {
+                    "type": "string",
+                    "format": "date-time"
+                  },
+                  "stdout_len": {
+                    "type": "integer",
+                    "format": "uint64",
+                    "minimum": 0
+                  },
+                  "stderr_len": {
+                    "type": "integer",
+                    "format": "uint64",
+                    "minimum": 0
+                  }
+                },
+                "required": [
+                  "job",
+                  "stderr_len",
+                  "stdout_len",
+                  "time_reserved",
+                  "time_started"
+                ]
+              }
+            },
+            "required": [
+              "Started"
+            ],
+            "additionalProperties": false
+          },
+          {
+            "type": "object",
+            "properties": {
+              "Ended": {
+                "type": "object",
+                "properties": {
+                  "job": {
+                    "$ref": "#/components/schemas/Verified_for_JobStartRequest"
+                  },
+                  "time_reserved": {
+                    "type": "string",
+                    "format": "date-time"
+                  },
+                  "time_started": {
+                    "type": "string",
+                    "format": "date-time"
+                  },
+                  "time_ended": {
+                    "type": "string",
+                    "format": "date-time"
+                  },
+                  "status": {
+                    "nullable": true,
+                    "type": "integer",
+                    "format": "int32"
+                  },
+                  "stdout_len": {
+                    "type": "integer",
+                    "format": "uint64",
+                    "minimum": 0
+                  },
+                  "stderr_len": {
+                    "type": "integer",
+                    "format": "uint64",
+                    "minimum": 0
+                  },
+                  "stdout_hash": {
+                    "$ref": "#/components/schemas/JobOutputHash"
+                  },
+                  "stderr_hash": {
+                    "$ref": "#/components/schemas/JobOutputHash"
+                  }
+                },
+                "required": [
+                  "job",
+                  "stderr_hash",
+                  "stderr_len",
+                  "stdout_hash",
+                  "stdout_len",
+                  "time_ended",
+                  "time_reserved",
+                  "time_started"
+                ]
+              }
+            },
+            "required": [
+              "Ended"
+            ],
+            "additionalProperties": false
+          }
+        ]
+      },
+      "JobId": {
+        "type": "string"
+      },
+      "Verified_for_JobStartRequest": {
+        "description": "An envelope whose signature has been verified.",
+        "type": "object",
+        "properties": {
+          "signed": {
+            "$ref": "#/components/schemas/Signed_for_JobStartRequest"
+          },
+          "verified_by": {
+            "$ref": "#/components/schemas/KeyId"
+          }
+        },
+        "required": [
+          "signed",
+          "verified_by"
+        ]
+      },
       "Signed_for_JobStartRequest": {
         "description": "A signed envelope around some data.",
         "type": "object",
@@ -485,9 +719,6 @@
           "job_id"
         ]
       },
-      "JobId": {
-        "type": "string"
-      },
       "EncodedSignature": {
         "description": "Code phrase encoded signature.",
         "type": "object",
@@ -504,120 +735,10 @@
           "s"
         ]
       },
-      "JobStatus": {
-        "oneOf": [
-          {
-            "type": "string",
-            "enum": [
-              "NotFound"
-            ]
-          },
-          {
-            "type": "object",
-            "properties": {
-              "Reserved": {
-                "type": "object",
-                "properties": {
-                  "job_id": {
-                    "$ref": "#/components/schemas/JobId"
-                  },
-                  "time_reserved": {
-                    "type": "string",
-                    "format": "date-time"
-                  }
-                },
-                "required": [
-                  "job_id",
-                  "time_reserved"
-                ]
-              }
-            },
-            "required": [
-              "Reserved"
-            ],
-            "additionalProperties": false
-          },
-          {
-            "type": "object",
-            "properties": {
-              "Started": {
-                "type": "object",
-                "properties": {
-                  "job": {
-                    "$ref": "#/components/schemas/Signed_for_JobStartRequest"
-                  },
-                  "time_reserved": {
-                    "type": "string",
-                    "format": "date-time"
-                  },
-                  "time_started": {
-                    "type": "string",
-                    "format": "date-time"
-                  }
-                },
-                "required": [
-                  "job",
-                  "time_reserved",
-                  "time_started"
-                ]
-              }
-            },
-            "required": [
-              "Started"
-            ],
-            "additionalProperties": false
-          },
-          {
-            "type": "object",
-            "properties": {
-              "Ended": {
-                "type": "object",
-                "properties": {
-                  "job": {
-                    "$ref": "#/components/schemas/Signed_for_JobStartRequest"
-                  },
-                  "time_reserved": {
-                    "type": "string",
-                    "format": "date-time"
-                  },
-                  "time_started": {
-                    "type": "string",
-                    "format": "date-time"
-                  },
-                  "time_ended": {
-                    "type": "string",
-                    "format": "date-time"
-                  },
-                  "status": {
-                    "nullable": true,
-                    "type": "integer",
-                    "format": "int32"
-                  },
-                  "stdout_len": {
-                    "type": "integer",
-                    "format": "int32"
-                  },
-                  "stderr_len": {
-                    "type": "integer",
-                    "format": "int32"
-                  }
-                },
-                "required": [
-                  "job",
-                  "stderr_len",
-                  "stdout_len",
-                  "time_ended",
-                  "time_reserved",
-                  "time_started"
-                ]
-              }
-            },
-            "required": [
-              "Ended"
-            ],
-            "additionalProperties": false
-          }
-        ]
+      "JobOutputHash": {
+        "description": "BLAKE3 hash of job output, used as a checksum.",
+        "type": "string",
+        "format": "hex encoded hash (32 bytes)"
       },
       "JobsReserved": {
         "description": "The response to a job reservation request.",
@@ -639,6 +760,14 @@
         "required": [
           "job_ids",
           "time_reserved"
+        ]
+      },
+      "JobOutputStream": {
+        "description": "Either the standard output or standard error of a job.",
+        "type": "string",
+        "enum": [
+          "stdout",
+          "stderr"
         ]
       }
     },

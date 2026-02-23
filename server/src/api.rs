@@ -4,18 +4,22 @@
 
 use std::collections::BTreeMap;
 use std::fmt;
+use std::num::NonZeroU32;
 
 use chrono::{DateTime, Utc};
 use dropshot::{
-    ApiDescription, ClientErrorStatusCode, HttpError, HttpResponseOk, Path as PathParams,
-    Query as QueryParams, RequestContext, TypedBody, endpoint,
+    ApiDescription, Body, ClientErrorStatusCode, EmptyScanParams, Header, HttpError,
+    HttpResponseOk, PaginationParams, Path as PathParams, Query as QueryParams, RequestContext,
+    ResultsPage, TypedBody, WhichPage, endpoint,
 };
+use http_range_header::{SyntacticallyCorrectRange as Range, parse_range_header};
+use hyper::Response;
 use schemars::JsonSchema;
 use serde::Deserialize;
 use serde::de::{Deserializer, Error as DeserializeError, IntoDeserializer, MapAccess, Visitor};
 
 use sush_common::certs::{KeyId, pem_cert_chain};
-use sush_common::jobs::{JobId, JobLimits, JobStatus, JobsReserved, SignedJob};
+use sush_common::jobs::{JobId, JobLimits, JobOutputStream, JobStatus, JobsReserved, SignedJob};
 
 use crate::manager::{JobError, JobManager};
 
@@ -30,9 +34,10 @@ pub fn api() -> ApiDescription<JobManager> {
     api.register(revoke_reserved).unwrap();
     api.register(job_start).unwrap();
     api.register(job_status).unwrap();
-    api.register(job_stdout).unwrap();
-    api.register(job_stderr).unwrap();
+    api.register(job_output).unwrap();
+    api.register(job_output_delete).unwrap();
     api.register(job_abort).unwrap();
+    api.register(history).unwrap();
     api
 }
 
@@ -170,16 +175,20 @@ async fn job_start(
         return Err(HttpError::for_client_error(
             None,
             ClientErrorStatusCode::BAD_REQUEST,
-            String::from("query parameter job ID does not match body's"),
+            String::from("query parameter job ID does not match body"),
         ));
     }
-    let status = mgr.job_start(job, limits).await?;
+    let done = mgr.job_start(job, limits).await?;
     if wait {
-        Ok(HttpResponseOk(status.await.map_err(|_| {
-            HttpError::for_internal_error(String::from("can't wait for job, sender dropped"))
-        })??))
+        let end = done
+            .await
+            .map_err(|_| {
+                HttpError::for_internal_error(String::from("can't wait for job, sender dropped"))
+            })?
+            .map_err(JobError::from)?;
+        Ok(HttpResponseOk(end.into()))
     } else {
-        Ok(HttpResponseOk(ctx.context().job_status(&job_id).await?))
+        Ok(HttpResponseOk(mgr.job_status(&job_id).await?))
     }
 }
 
@@ -194,28 +203,77 @@ async fn job_status(
     Ok(HttpResponseOk(status))
 }
 
-/// Get the standard output of a job.
-#[endpoint { method = GET, path = "/jobs/{job_id}/stdout" }]
-async fn job_stdout(
-    ctx: Context,
-    params: PathParams<JobIdParam>,
-) -> Result<HttpResponseOk<Vec<u8>>, HttpError> {
-    // TODO: Range requests.
-    let JobIdParam { job_id } = params.into_inner();
-    let stdout = ctx.context().job_stdout(&job_id, None).await?;
-    Ok(HttpResponseOk(stdout))
+/// `Range` request header.
+#[derive(Debug, Deserialize, JsonSchema)]
+struct RangeRequest {
+    /// A request to access a portion of the resource, such as `bytes=0-499`
+    ///
+    /// See: <https://developer.mozilla.org/en-US/docs/Web/HTTP/Reference/Headers/Range>
+    range: Option<String>,
 }
 
-/// Get the standard output of a job.
-#[endpoint { method = GET, path = "/jobs/{job_id}/stderr" }]
-async fn job_stderr(
+impl RangeRequest {
+    /// Extract a single range from the `Range` request header.
+    /// This is just to avoid the complexity of encoding multiple
+    /// ranges as output, not an inherent limitation.
+    fn range(&self) -> Result<Option<Range>, HttpError> {
+        let Some(header) = self.range.as_ref() else {
+            return Ok(None);
+        };
+        let mut parsed = parse_range_header(header).map_err(|e| {
+            HttpError::for_client_error(
+                None,
+                ClientErrorStatusCode::RANGE_NOT_SATISFIABLE,
+                e.to_string(),
+            )
+        })?;
+        let range = if parsed.ranges.len() == 1 {
+            parsed.ranges.pop().unwrap()
+        } else {
+            return Err(HttpError::for_client_error(
+                None,
+                ClientErrorStatusCode::RANGE_NOT_SATISFIABLE,
+                String::from("one range at a time, please"),
+            ));
+        };
+        Ok(Some(range))
+    }
+}
+
+#[derive(Deserialize, JsonSchema)]
+struct JobOutputParams {
+    job_id: JobId,
+    stream: JobOutputStream,
+}
+
+/// Get (a subset of) the standard output or standard error of a job.
+#[endpoint { method = GET, path = "/jobs/{job_id}/output/{stream}" }]
+async fn job_output(
     ctx: Context,
-    params: PathParams<JobIdParam>,
-) -> Result<HttpResponseOk<Vec<u8>>, HttpError> {
-    // TODO: Range requests.
-    let JobIdParam { job_id } = params.into_inner();
-    let stderr = ctx.context().job_stderr(&job_id, None).await?;
-    Ok(HttpResponseOk(stderr))
+    headers: Header<RangeRequest>,
+    params: PathParams<JobOutputParams>,
+) -> Result<Response<Body>, HttpError> {
+    let range = headers.into_inner().range()?;
+    let JobOutputParams { job_id, stream } = params.into_inner();
+    let stdout = ctx.context().job_output(&job_id, stream, range).await?;
+    Ok(Response::new(stdout.into()))
+}
+
+/// Truncate the standard output or standard error of a job.
+/// Returns its new length.
+#[endpoint { method = DELETE, path = "/jobs/{job_id}/output/{stream}" }]
+async fn job_output_delete(
+    ctx: Context,
+    headers: Header<RangeRequest>,
+    params: PathParams<JobOutputParams>,
+) -> Result<HttpResponseOk<u64>, HttpError> {
+    let range = headers.into_inner().range()?;
+    let JobOutputParams { job_id, stream } = params.into_inner();
+    let n = ctx
+        .context()
+        .job_output_delete(&job_id, stream, range)
+        .await?;
+    Ok(HttpResponseOk(n))
 }
 
 /// Abort a started job.
@@ -227,4 +285,32 @@ async fn job_abort(
     let JobIdParam { job_id } = params.into_inner();
     ctx.context().job_abort(&job_id).await?;
     Ok(HttpResponseOk(()))
+}
+
+/// List previous jobs (paginated).
+#[endpoint { method = GET, path = "/history" }]
+async fn history(
+    ctx: Context,
+    params: QueryParams<PaginationParams<EmptyScanParams, JobId>>,
+) -> Result<HttpResponseOk<ResultsPage<JobStatus>>, HttpError> {
+    let pag_params = params.into_inner();
+    let Some(limit) = NonZeroU32::new(ctx.page_limit(&pag_params)?.get()) else {
+        return Err(HttpError::for_client_error(
+            None,
+            ClientErrorStatusCode::BAD_REQUEST,
+            String::from("page limit must be non-zero"),
+        ));
+    };
+
+    let mgr = ctx.context();
+    let list = match pag_params.page {
+        WhichPage::First(..) => mgr.job_history(None, limit).await?,
+        WhichPage::Next(job_id) => mgr.job_history(Some(job_id), limit).await?,
+    };
+
+    Ok(HttpResponseOk(ResultsPage::new(
+        list,
+        &EmptyScanParams {},
+        |job: &JobStatus, _| job.job_id().to_owned(),
+    )?))
 }

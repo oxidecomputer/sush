@@ -3,28 +3,38 @@
 use std::collections::HashMap;
 use std::io::{Write as _, stdout};
 use std::path::Path;
+use std::time::Duration;
 
 use bytesize::ByteSize;
 use chrono::{DateTime, Utc};
 use humantime::format_duration;
+use indicatif::{ProgressBar, ProgressStyle};
 use serde_json::json;
 use x509_cert::Certificate;
 use x509_cert::der::Encode as _;
 
 use sush_common::certs::{KeyId, Signature};
-use sush_common::jobs::{JobId, JobStatus, JobsReserved, SignedJob};
+use sush_common::jobs::{JobId, JobOutputStream, JobStatus, JobsReserved, SignedJob};
 
 use crate::commands::{CommandContext, CommandError, GlobalArgs, OutputFormat};
 
-#[derive(Clone, Debug, Default)]
+#[derive(Debug, Default)]
 pub struct Cli {
     output: OutputFormat,
+    progress: Option<ProgressBar>,
 }
 
 impl Cli {
     pub fn new(output: OutputFormat) -> Self {
-        Self { output }
+        Self {
+            output,
+            progress: None,
+        }
     }
+}
+
+fn byte_size(len: u64) -> bytesize::Display {
+    ByteSize::b(len).display().si()
 }
 
 impl CommandContext for Cli {
@@ -170,19 +180,32 @@ impl CommandContext for Cli {
         Ok(())
     }
 
-    fn job_stdout(
+    fn job_error(&mut self, error: CommandError) -> Result<(), CommandError> {
+        eprintln!("{error}");
+        Ok(())
+    }
+
+    fn job_output(
         &mut self,
         _job_id: &JobId,
+        stream: JobOutputStream,
         output: &[u8],
         binary: bool,
     ) -> Result<(), CommandError> {
         match self.get_output_format() {
             OutputFormat::Json if binary => println!("{}", json!(output)),
             OutputFormat::Json => println!("{}", json!(String::from_utf8(output.to_vec())?)),
-            OutputFormat::Text if binary => stdout().write(output).map(|_| ())?,
+            OutputFormat::Text if binary => {
+                stdout()
+                    .write(output)
+                    .map_err(|error| CommandError::io("stdout", error))?;
+            }
             OutputFormat::Text if output.is_empty() => (),
             OutputFormat::Text => {
-                println!("✅ Job stdout:");
+                match stream {
+                    JobOutputStream::Stdout => println!("✅ Job stdout:"),
+                    JobOutputStream::Stderr => println!("✅ Job stderr:"),
+                };
                 let output = String::from_utf8(output.to_vec())?;
                 if output.ends_with('\n') {
                     print!("{output}");
@@ -194,26 +217,117 @@ impl CommandContext for Cli {
         Ok(())
     }
 
-    fn job_stderr(
+    fn job_output_started(
+        &mut self,
+        _id: &JobId,
+        stream: JobOutputStream,
+        stage: &str,
+        total_length: u64,
+    ) -> Result<(), CommandError> {
+        if self.progress.is_none() {
+            let bar = ProgressBar::new(total_length);
+            bar.set_prefix(format!("{stage} {stream}"));
+            bar.set_style(
+                ProgressStyle::with_template(
+                    "{prefix} \
+                     [{elapsed_precise}] \
+                     {bar:40.cyan/blue} \
+                     {decimal_bytes:>7}/{decimal_total_bytes:7} \
+                     {msg}",
+                )
+                .unwrap(),
+            );
+            self.progress = Some(bar);
+        }
+        Ok(())
+    }
+
+    fn job_output_update(
+        &mut self,
+        _id: &JobId,
+        _stream: JobOutputStream,
+        length: u64,
+    ) -> Result<(), CommandError> {
+        if let Some(progress) = &mut self.progress {
+            progress.inc(length);
+        }
+        Ok(())
+    }
+
+    fn job_output_finished(
         &mut self,
         _job_id: &JobId,
-        errors: &[u8],
-        binary: bool,
+        stream: JobOutputStream,
+        stage: Option<&str>,
     ) -> Result<(), CommandError> {
-        match self.get_output_format() {
-            OutputFormat::Json if binary => println!("{}", json!(errors)),
-            OutputFormat::Json => println!("{}", json!(String::from_utf8(errors.to_vec())?)),
-            OutputFormat::Text if binary => stdout().write(errors).map(|_| ())?,
-            OutputFormat::Text if errors.is_empty() => (),
-            OutputFormat::Text => {
-                println!("❌ Job stderr:");
-                let errors = String::from_utf8(errors.to_vec())?;
-                if errors.ends_with('\n') {
-                    print!("{errors}");
-                } else {
-                    println!("{errors}");
-                }
+        if let Some(progress) = self.progress.take() {
+            progress.finish_and_clear();
+            if let Some(stage) = stage {
+                let length = ByteSize::b(progress.length().unwrap_or(0));
+                let elapsed = progress.elapsed();
+                println!(
+                    "{stage} {stream}:\t{} in {} ({:.0} MB/s)",
+                    length.display().si(),
+                    format_duration(progress.elapsed()),
+                    length.as_mb() / elapsed.as_secs_f64(),
+                );
             }
+        }
+        Ok(())
+    }
+
+    fn job_polling_started(
+        &mut self,
+        job_id: &JobId,
+        elapsed: Duration,
+    ) -> Result<(), CommandError> {
+        if self.progress.is_none() {
+            let bar = ProgressBar::new_spinner();
+            bar.set_elapsed(elapsed);
+            bar.set_prefix(format!("Waiting for `{job_id}`"));
+            bar.set_style(
+                ProgressStyle::with_template(
+                    "{spinner}  \
+                     {prefix} \
+                     [{elapsed_precise}] \
+                     {msg}",
+                )
+                .unwrap(),
+            );
+            self.progress = Some(bar);
+        }
+        Ok(())
+    }
+
+    fn job_polling_update(
+        &mut self,
+        _job_id: &JobId,
+        status: &JobStatus,
+    ) -> Result<(), CommandError> {
+        if let Some(progress) = &mut self.progress {
+            if let JobStatus::Started {
+                stdout_len,
+                stderr_len,
+                ..
+            }
+            | JobStatus::Ended {
+                stdout_len,
+                stderr_len,
+                ..
+            } = status
+            {
+                let stdout_len = byte_size(*stdout_len);
+                let stderr_len = byte_size(*stderr_len);
+                progress.set_message(format!("stdout: {stdout_len}, stderr: {stderr_len}"));
+            }
+            progress.tick();
+        }
+        Ok(())
+    }
+
+    fn job_polling_finished(&mut self, _job_id: &JobId) -> Result<(), CommandError> {
+        if let Some(progress) = self.progress.take() {
+            progress.finish_and_clear();
         }
         Ok(())
     }
@@ -222,23 +336,31 @@ impl CommandContext for Cli {
         match self.get_output_format() {
             OutputFormat::Json => println!("{}", json!(status)),
             OutputFormat::Text => match status {
-                JobStatus::NotFound => println!("❌ Job `{job_id}` not found"),
                 JobStatus::Reserved {
                     job_id,
                     time_reserved,
                 } => println!(
                     "✅ Job ID:\t{job_id}\n   \
+                     Job status:\tReserved\n   \
+                     Job ID:\t{job_id}\n   \
                      Reserved at:\t{time_reserved}"
                 ),
                 JobStatus::Started {
                     time_reserved,
                     time_started,
+                    stdout_len,
+                    stderr_len,
                     ..
                 } => {
+                    let stdout_len = byte_size(*stdout_len);
+                    let stderr_len = byte_size(*stderr_len);
                     println!(
                         "✅ Job ID:\t{job_id}\n   \
+                         Job status:\tStarted\n   \
                          Reserved at:\t{time_reserved}\n   \
-                         Started at:\t{time_started}"
+                         Started at:\t{time_started}\n   \
+                         Stdout len:\t{stdout_len}\n   \
+                         Stderr len:\t{stderr_len}"
                     )
                 }
                 JobStatus::Ended {
@@ -249,37 +371,51 @@ impl CommandContext for Cli {
                     status: Some(exit_status),
                     stdout_len,
                     stderr_len,
-                } => println!(
-                    "✅ Job ID:\t{job_id}\n   \
-                     Reserved at:\t{time_reserved}\n   \
-                     Started at:\t{time_started}\n   \
-                     Ended at:\t{time_ended} ({})\n   \
-                     Status:\t{exit_status}\n   \
-                     Stdout:\t{}\n   \
-                     Stderr:\t{}",
-                    format_duration(status.time_elapsed().unwrap().to_std()?),
-                    ByteSize::b(*stdout_len as u64).display().si(),
-                    ByteSize::b(*stderr_len as u64).display().si(),
-                ),
+                    stdout_hash,
+                    stderr_hash,
+                } => {
+                    let duration = format_duration(status.time_elapsed().unwrap().to_std()?);
+                    let stdout_len = byte_size(*stdout_len);
+                    let stderr_len = byte_size(*stderr_len);
+                    println!(
+                        "✅ Job ID:\t{job_id}\n   \
+                         Job status:\tEnded\n   \
+                         Reserved at:\t{time_reserved}\n   \
+                         Started at:\t{time_started}\n   \
+                         Ended at:\t{time_ended} ({duration})\n   \
+                         Status:\t{exit_status}\n   \
+                         Stdout len:\t{stdout_len}\n   \
+                         Stderr len:\t{stderr_len}\n   \
+                         Stdout hash:\t{stdout_hash}\n   \
+                         Stderr hash:\t{stderr_hash}",
+                    );
+                }
                 JobStatus::Ended {
+                    job: _,
                     time_reserved,
                     time_started,
                     time_ended,
                     status: None,
                     stdout_len,
                     stderr_len,
-                    ..
-                } => println!(
-                    "✅ Job ID:\t{job_id}\n   \
-                     Reserved at:\t{time_reserved}\n   \
-                     Started at:\t{time_started}\n   \
-                     Aborted at:\t{time_ended} ({})\n   \
-                     Stdout:\t{}\n   \
-                     Stderr:\t{}",
-                    format_duration(status.time_elapsed().unwrap().to_std()?),
-                    ByteSize::b(*stdout_len as u64).display().si(),
-                    ByteSize::b(*stderr_len as u64).display().si(),
-                ),
+                    stdout_hash,
+                    stderr_hash,
+                } => {
+                    let duration = format_duration(status.time_elapsed().unwrap().to_std()?);
+                    let stdout_len = byte_size(*stdout_len);
+                    let stderr_len = byte_size(*stderr_len);
+                    println!(
+                        "✅ Job ID:\t{job_id}\n   \
+                         Job status: Aborted\n   \
+                         Reserved at:\t{time_reserved}\n   \
+                         Started at:\t{time_started}\n   \
+                         Aborted at:\t{time_ended} ({duration})\n   \
+                         Stdout len:\t{stdout_len}\n   \
+                         Stderr len:\t{stderr_len}\n   \
+                         Stdout hash:\t{stdout_hash}\n   \
+                         Stderr hash:\t{stderr_hash}",
+                    );
+                }
             },
         }
         Ok(())
