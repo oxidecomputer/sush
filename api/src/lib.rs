@@ -184,6 +184,15 @@ pub struct JobStartParams {
     pub wait: bool,
 }
 
+impl JobStartParams {
+    pub fn wait() -> Self {
+        JobStartParams {
+            wait: true,
+            ..Default::default()
+        }
+    }
+}
+
 /// This deserialization method is a work-around for a bug in Serde; see
 /// <https://github.com/oxidecomputer/sush/pull/3#discussion_r2613036692>,
 /// <https://github.com/serde-rs/serde/issues/1183#issuecomment-668315831>.

@@ -6,7 +6,6 @@ use std::path::PathBuf;
 use clap::Parser;
 use clap::builder::PathBufValueParser;
 use dropshot::{ConfigDropshot, ConfigLogging, ConfigLoggingLevel, HandlerTaskMode, ServerBuilder};
-use slog::o;
 
 use sush_api::sush_api_mod::api_description;
 use sush_server::database::open_database;
@@ -58,7 +57,7 @@ async fn main() -> Result<(), String> {
     .map_err(|e| e.to_string())?;
 
     let db = open_database(database).map_err(|e| e.to_string())?;
-    let mgr = JobManager::new(log.new(o!("component" => "job-manager")), db, &directory)
+    let mgr = JobManager::new(log.clone(), db, &directory)
         .await
         .map_err(|e| e.to_string())?;
 
