@@ -200,7 +200,7 @@ async fn session(
     }
     info!(
         log,
-        "job ended";
+        "interactive job ended";
         "encoded_bytes" => encoder.count(),
         "decoded_bytes" => decoder.count()
     );

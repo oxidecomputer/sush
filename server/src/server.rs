@@ -12,6 +12,8 @@ use dropshot::{
 use hyper::Response;
 use tokio_tungstenite::WebSocketStream;
 use tokio_tungstenite::tungstenite::protocol::Role;
+use x509_cert::Certificate;
+use x509_cert::der::{Decode as _, DecodePem as _};
 
 use sush_api::{
     Authorization, JobIdParam, JobOutputParams, JobStartParams, KeyIdParam, RangeRequest, SushApi,
@@ -20,7 +22,8 @@ use sush_common::authn::Identity;
 use sush_common::jobs::{JobId, JobStatus, JobsReserved, SignedJob};
 use sush_common::keys::{KeyId, SshPublicKey, pem_cert_chain};
 
-use crate::manager::{JobError, JobManager};
+use crate::error::JobError;
+use crate::manager::JobManager;
 
 pub struct ApiServer;
 
@@ -31,8 +34,11 @@ impl SushApi for ApiServer {
         ctx: RequestContext<Self::Context>,
         params: TypedBody<Vec<u8>>,
     ) -> Result<HttpResponseOk<KeyId>, HttpError> {
-        let cert = params.into_inner();
-        let key_id = ctx.context().import_cert_bytes(&cert).await?;
+        let bytes = params.into_inner();
+        let cert = Certificate::from_pem(&bytes)
+            .or_else(|_| Certificate::from_der(&bytes))
+            .map_err(JobError::Der)?;
+        let key_id = ctx.context().import_cert(&cert).await?;
         Ok(HttpResponseOk(key_id))
     }
 
@@ -95,17 +101,7 @@ impl SushApi for ApiServer {
                 String::from("Query parameter job ID does not match body"),
             ));
         }
-        let wait = params.wait;
-        let done = mgr.job_start(job, params, authn).await?;
-        if wait {
-            let end = done
-                .await
-                .map_err(|_| {
-                    HttpError::for_internal_error(String::from(
-                        "Can't wait for job, sender dropped",
-                    ))
-                })?
-                .map_err(JobError::from)?;
+        if let Some(Ok(end)) = mgr.job_start(job, params, authn).await? {
             Ok(HttpResponseOk(end.into()))
         } else {
             Ok(HttpResponseOk(mgr.job_status(&job_id).await?))
