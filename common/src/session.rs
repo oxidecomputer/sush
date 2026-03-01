@@ -28,7 +28,8 @@ use std::time::Duration;
 
 use blake3::{Hasher, derive_key};
 use bytes::{BufMut as _, Bytes, BytesMut};
-use rand::{Rng as _, RngCore as _, thread_rng};
+use rand::Rng as _;
+use rand_core::{OsRng, RngCore as _};
 use serde::{Deserialize, Serialize};
 use serde_json::{from_str as from_json, to_string as to_json};
 use thiserror::Error;
@@ -172,12 +173,12 @@ fn hash_xof(hasher: &mut Hasher, input: &[u8], output_len: usize) -> Bytes {
 
 fn rand_key() -> Bytes {
     let mut key = BytesMut::zeroed(SESSION_KEY_LEN);
-    thread_rng().fill_bytes(&mut key);
+    OsRng.fill_bytes(&mut key);
     key.freeze()
 }
 
 fn rand_len() -> u8 {
-    thread_rng().gen_range(8..255)
+    OsRng.gen_range(8..255)
 }
 
 #[derive(Debug, Error)]
@@ -206,6 +207,8 @@ pub enum SessionError {
 
 #[cfg(test)]
 mod test {
+    use rand::thread_rng;
+
     use super::*;
 
     #[test]
