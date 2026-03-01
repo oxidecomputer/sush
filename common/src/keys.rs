@@ -349,7 +349,7 @@ impl Signature {
                 counter: 0,
             }),
             Self::SkEcdsaSha256(signature) => {
-                let (signature, flags, counter) = sk_split(signature.as_bytes());
+                let (signature, flags, counter) = sk_split(signature.as_bytes())?;
                 let mut signature = BytesMut::from(signature);
                 let r = signature.try_get_mpint()?;
                 let s = signature.try_get_mpint()?;
@@ -362,7 +362,7 @@ impl Signature {
                 })
             }
             Self::SkEd25519(signature) => {
-                let (signature, flags, counter) = sk_split(signature.as_bytes());
+                let (signature, flags, counter) = sk_split(signature.as_bytes())?;
                 let signature = Ed25519Signature::from_slice(signature)?;
                 Ok(EncodedSignature {
                     r: codephrase(U256::from_be_slice(signature.r_bytes())),
@@ -421,14 +421,19 @@ impl Signature {
     }
 }
 
+/// Decode an `SK-*` signature into `(signature, flags, counter)`.
 /// See <https://cvsweb.openbsd.org/src/usr.bin/ssh/PROTOCOL.u2f?annotate=HEAD>
-fn sk_split(raw_signature: &[u8]) -> (&[u8], u8, u32) {
+fn sk_split(raw_signature: &[u8]) -> Result<(&[u8], u8, u32), KeyError> {
+    const TRAILER_LEN: usize = 1 + 4;
     let n = raw_signature.len();
-    let (signature, mut trailer) = raw_signature.split_at(n - 1 - 4);
+    if n < TRAILER_LEN {
+        return Err(KeyError::SignatureTooShort);
+    }
+    let (signature, mut trailer) = raw_signature.split_at(n - TRAILER_LEN);
     let flags = trailer.get_u8();
     let counter = trailer.get_u32();
-    assert!(trailer.is_empty());
-    (signature, flags, counter)
+    assert!(trailer.is_empty(), "leftover trailer bytes");
+    Ok((signature, flags, counter))
 }
 
 /// Extract the signature on a certificate.
@@ -909,6 +914,8 @@ pub enum KeyError {
     SelfSigned,
     #[error("Signature error: {0}")]
     Signature(#[from] signature::Error),
+    #[error("Invalid signature: too short")]
+    SignatureTooShort,
     #[error("Signing error: {0}")]
     Signer(String),
     #[error("SSH key error: {0}")]
@@ -918,5 +925,30 @@ pub enum KeyError {
 impl KeyError {
     fn signer(error: impl std::fmt::Display) -> Self {
         Self::Signer(error.to_string())
+    }
+}
+
+#[cfg(test)]
+mod test {
+    use super::*;
+
+    #[test]
+    fn test_sk_split() {
+        assert!(matches!(
+            sk_split(b"").unwrap_err(),
+            KeyError::SignatureTooShort
+        ));
+        assert!(matches!(
+            sk_split(b"abcd").unwrap_err(),
+            KeyError::SignatureTooShort
+        ));
+        assert!(matches!(
+            sk_split(b"abcde").unwrap(),
+            (&[], 0x61, 0x62_63_64_65)
+        ));
+        assert!(matches!(
+            sk_split(b"sigabcde").unwrap(),
+            (&[0x73, 0x69, 0x67], 0x61, 0x62_63_64_65)
+        ));
     }
 }
