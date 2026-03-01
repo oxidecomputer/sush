@@ -197,7 +197,9 @@ impl JsonSchema for SshPublicKey {
 /// The `flags` and `counter` parameters are for the [`SK-*` family of SSH
 /// public keys](https://cvsweb.openbsd.org/src/usr.bin/ssh/PROTOCOL.u2f?annotate=HEAD).
 /// They should be set to 0 for other key types.
-#[derive(Clone, Debug, Deserialize, Eq, JsonSchema, Ord, PartialEq, PartialOrd, Serialize)]
+#[derive(
+    Clone, Debug, Deserialize, Eq, Hash, JsonSchema, Ord, PartialEq, PartialOrd, Serialize,
+)]
 pub struct EncodedSignature {
     pub r: String,
     pub s: String,
@@ -930,6 +932,11 @@ impl KeyError {
 
 #[cfg(test)]
 mod test {
+    use std::collections::HashSet;
+    use std::time::Duration;
+
+    use crate::authn::Nonce;
+
     use super::*;
 
     #[test]
@@ -950,5 +957,37 @@ mod test {
             sk_split(b"sigabcde").unwrap(),
             (&[0x73, 0x69, 0x67], 0x61, 0x62_63_64_65)
         ));
+    }
+
+    #[tokio::test]
+    async fn signing() {
+        let mut key = EphemeralKey::new_root(
+            KeyType::P256,
+            String::from("CN=Ephemeral Test Signing Key,O=Oxide Computer Company,C=US")
+                .parse()
+                .unwrap(),
+            Validity::from_now(Duration::from_secs(60)).unwrap(),
+        )
+        .unwrap();
+        let mut signatures = HashSet::new();
+        for _ in 0..100 {
+            let nonce = Nonce::generate();
+            let signed = key.sign(nonce.as_bytes()).await.unwrap();
+            assert_eq!(signed.key_id(), key.key_id());
+            assert_eq!(*signed.payload(), nonce.as_bytes());
+            let signature = signed.signature();
+            assert!(signatures.insert(signature.clone()), "duplicate signature");
+            let signature_string = serde_json::to_string(&signature).unwrap();
+            assert!(signature_string.starts_with("{\"r\":\""));
+            assert!(signature_string.contains("\"s\":\""));
+            assert!(signature_string.ends_with("\"}"));
+            assert_eq!(
+                serde_json::from_str::<EncodedSignature>(&signature_string).unwrap(),
+                *signature
+            );
+            let verified = signed.verify_with_cert(key.cert()).unwrap();
+            assert_eq!(verified.verified_by(), key.key_id());
+            assert_eq!(verified.into_payload(), nonce.as_bytes());
+        }
     }
 }
