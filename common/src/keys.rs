@@ -889,8 +889,6 @@ pub fn pem_cert_chain(certs: Vec<Certificate>) -> Result<String, KeyError> {
 pub enum KeyError {
     #[error("DER encoding error: {0}")]
     Der(#[from] x509_cert::der::Error),
-    #[error("Ed25519 error: {0}")]
-    Ed25519(#[from] ed25519_dalek::ed25519::Error),
     #[error(transparent)]
     InvalidCodephrase(#[from] InvalidCodephrase),
     #[error("Invalid key ID")]
@@ -909,6 +907,8 @@ pub enum KeyError {
     Protocol(#[from] ProtocolError),
     #[error("Will not import a self-signed (root) certificate")]
     SelfSigned,
+    #[error("Signature error: {0}")]
+    Signature(#[from] signature::Error),
     #[error("Signing error: {0}")]
     Signer(String),
     #[error("SSH key error: {0}")]
