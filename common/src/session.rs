@@ -19,8 +19,13 @@
 //! └───┴─────────────────────────────┴────────────────┘
 //! ```
 //!
-//! Each side uses a pair of randomly keyed hashers, which may be
-//! rekeyed at will using `Ping` & `Pong` messages.
+//! Each side uses a pair of randomly keyed hashers, which may be rekeyed
+//! using `Ping` & `Pong` messages. The server generates a random `key`,
+//! rekeys its encoder, and sends `Ping(key)` to the client. On receipt of
+//! the `Ping`, the client rekeys its decoder to `key`, generates a fresh
+//! `ckey` and rekeys its encoder, then responds with `Pong(key ^ ckey)`.
+//! On receipt of the `Pong`, the server rekeys its own decoder to `ckey`.
+//! This ensures that each `Pong` corresponds to exactly one `Ping`.
 //!
 //! TODO: Randomize packets in time as well as space, like SSH does.
 
@@ -41,7 +46,7 @@ pub const SESSION_KEY_LEN: usize = 32;
 pub const SESSION_REKEY_PERIOD: Duration = Duration::from_secs(30);
 
 /// An interactive session message.
-#[derive(Debug)]
+#[derive(Clone, Debug)]
 pub enum SessionMessage {
     Control(SessionControl),
     Data(Bytes),
@@ -82,8 +87,11 @@ impl SessionDecoder {
         self.count + self.hasher.count()
     }
 
-    pub fn rekey(&mut self, key_material: &[u8]) {
-        let key = derive_key(SESSION_KEY_CONTEXT, key_material);
+    pub fn rekey(&mut self, mut key_material: Bytes, mask: Option<Bytes>) {
+        if let Some(mask) = mask {
+            key_material = xor_bytes(&key_material, &mask);
+        }
+        let key = derive_key(SESSION_KEY_CONTEXT, &key_material);
         self.count += self.hasher.count();
         self.hasher = Hasher::new_keyed(&key);
     }
@@ -91,7 +99,7 @@ impl SessionDecoder {
     pub fn decode(&mut self, message: WebSocketMessage) -> Result<SessionMessage, SessionError> {
         match message {
             WebSocketMessage::Text(message) => Ok(SessionMessage::Control(from_json(&message)?)),
-            WebSocketMessage::Binary(bytes) => Ok(SessionMessage::Data(self.decode_bytes(&bytes)?)),
+            WebSocketMessage::Binary(bytes) => Ok(SessionMessage::Data(self.decode_data(&bytes)?)),
             WebSocketMessage::Ping(bytes) => Ok(SessionMessage::Ping(bytes)),
             WebSocketMessage::Pong(bytes) => Ok(SessionMessage::Pong(bytes)),
             WebSocketMessage::Close(_) => Ok(SessionMessage::Close),
@@ -99,7 +107,7 @@ impl SessionDecoder {
         }
     }
 
-    fn decode_bytes(&mut self, bytes: &[u8]) -> Result<Bytes, SessionError> {
+    fn decode_data(&mut self, bytes: &[u8]) -> Result<Bytes, SessionError> {
         if let Some((pad, rest)) = bytes.split_at_checked(1)
             && let pad = pad[0] as usize
             && let len = rest.len()
@@ -126,33 +134,30 @@ impl SessionEncoder {
         self.count + self.hasher.count()
     }
 
-    pub fn rekey(
-        &mut self,
-        ping: Option<&SessionMessage>,
-    ) -> Result<WebSocketMessage, SessionError> {
+    pub fn rekey(&mut self, ping_bytes: Option<&Bytes>) -> Result<SessionMessage, SessionError> {
         let key_material = rand_key();
         let key = derive_key(SESSION_KEY_CONTEXT, &key_material);
-        let message = self.encode(if matches!(ping, Some(SessionMessage::Ping(_))) {
-            SessionMessage::Pong(key_material)
+        let message = if let Some(ping_bytes) = ping_bytes {
+            SessionMessage::Pong(xor_bytes(&key_material, ping_bytes))
         } else {
             SessionMessage::Ping(key_material)
-        });
+        };
         self.count += self.hasher.count();
         self.hasher = Hasher::new_keyed(&key);
-        message
+        Ok(message)
     }
 
     pub fn encode(&mut self, message: SessionMessage) -> Result<WebSocketMessage, SessionError> {
         match message {
             SessionMessage::Control(msg) => Ok(WebSocketMessage::Text(to_json(&msg)?.into())),
-            SessionMessage::Data(bytes) => Ok(WebSocketMessage::Binary(self.encode_bytes(&bytes))),
+            SessionMessage::Data(bytes) => Ok(WebSocketMessage::Binary(self.encode_data(&bytes))),
             SessionMessage::Ping(bytes) => Ok(WebSocketMessage::Ping(bytes)),
             SessionMessage::Pong(bytes) => Ok(WebSocketMessage::Pong(bytes)),
             SessionMessage::Close => Ok(WebSocketMessage::Close(None)),
         }
     }
 
-    fn encode_bytes(&mut self, payload: &[u8]) -> Bytes {
+    fn encode_data(&mut self, payload: &[u8]) -> Bytes {
         let pad = rand_len();
         let len = 1 + payload.len() + pad as usize;
         let mut packet = BytesMut::with_capacity(len);
@@ -181,6 +186,10 @@ fn rand_len() -> u8 {
     OsRng.gen_range(8..255)
 }
 
+fn xor_bytes(x: &Bytes, y: &Bytes) -> Bytes {
+    x.iter().zip(y.iter()).map(|(x, y)| *x ^ *y).collect()
+}
+
 #[derive(Debug, Error)]
 pub enum SessionError {
     #[error("Client closed connection")]
@@ -203,6 +212,8 @@ pub enum SessionError {
     Shutdown,
     #[error("WebSocket error: {0}")]
     Tungstenite(#[from] tokio_tungstenite::tungstenite::error::Error),
+    #[error("Unsolicited ping from client")]
+    UnsolicitedPing,
 }
 
 #[cfg(test)]
@@ -213,33 +224,56 @@ mod test {
 
     #[test]
     fn round_trip_packets() {
-        let mut decoder = SessionDecoder::default();
-        let mut encoder = SessionEncoder::default();
+        let mut server_decoder = SessionDecoder::default();
+        let mut server_encoder = SessionEncoder::default();
+        let mut client_decoder = SessionDecoder::default();
+        let mut client_encoder = SessionEncoder::default();
         let mut count = 0;
         let mut rng = thread_rng();
         for i in 0..1000 {
             if i % 10 == 0 {
-                let message = encoder.rekey(None).unwrap();
-                if let Ok(SessionMessage::Ping(key_material)) = decoder.decode(message) {
-                    decoder.rekey(&key_material);
+                let key;
+                if let SessionMessage::Ping(bytes) = server_encoder.rekey(None).unwrap() {
+                    key = bytes.clone();
+                    client_decoder.rekey(bytes, None);
                 } else {
-                    panic!("invalid rekey message");
+                    panic!("invalid server rekey message");
+                }
+
+                if let SessionMessage::Pong(ckey) = client_encoder.rekey(Some(&key)).unwrap() {
+                    server_decoder.rekey(ckey, Some(key));
+                } else {
+                    panic!("invalid client rekey message");
                 }
             }
 
-            let mut bytes = BytesMut::zeroed(rng.gen_range(0..1000));
-            rng.fill_bytes(&mut bytes);
+            let mut data = BytesMut::zeroed(rng.gen_range(0..1000));
+            rng.fill_bytes(&mut data);
+            count += data.len() as u64;
 
-            let packet = encoder.encode_bytes(&bytes);
-            assert_eq!(packet[0] as usize, packet.len() - bytes.len() - 1);
-            assert_ne!(packet, bytes);
+            let server_packet = server_encoder.encode_data(&data);
+            assert_eq!(
+                server_packet[0] as usize,
+                server_packet.len() - data.len() - 1
+            );
+            assert_ne!(server_packet, data);
 
-            let decoded = decoder.decode_bytes(&packet).unwrap();
-            assert_eq!(bytes, decoded);
+            let client_decoded = client_decoder.decode_data(&server_packet).unwrap();
+            assert_eq!(data, client_decoded);
+            assert_eq!(server_encoder.count(), count);
+            assert_eq!(client_decoder.count(), count);
 
-            count += bytes.len() as u64;
-            assert_eq!(encoder.count(), count);
-            assert_eq!(decoder.count(), count);
+            let client_packet = client_encoder.encode_data(&client_decoded);
+            assert_eq!(
+                client_packet[0] as usize,
+                client_packet.len() - client_decoded.len() - 1
+            );
+            assert_ne!(client_packet, client_decoded);
+
+            let server_decoded = server_decoder.decode_data(&client_packet).unwrap();
+            assert_eq!(data, server_decoded);
+            assert_eq!(server_decoder.count(), count);
+            assert_eq!(client_encoder.count(), count);
         }
     }
 }
