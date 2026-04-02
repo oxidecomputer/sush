@@ -67,6 +67,7 @@ async fn session(
 ) -> Result<ExitStatus, SessionError> {
     let mut buffer = BytesMut::with_capacity(SESSION_BUFFER_SIZE);
     let mut client = None::<SocketStream>;
+    let mut ping = None::<SessionMessage>;
     let mut decoder = SessionDecoder::default();
     let mut encoder = SessionEncoder::default();
     let mut interval = interval(SESSION_REKEY_PERIOD);
@@ -91,8 +92,12 @@ async fn session(
 
     macro_rules! rekey_client {
         ($stream:ident) => {{
-            match $stream.send(encoder.rekey(None)?).await {
-                Ok(()) => info!(log, "rekeyed session encoder"),
+            let msg = encoder.rekey(None)?;
+            ping = Some(msg.clone());
+            match $stream.send(encoder.encode(msg)?).await {
+                Ok(()) => {
+                    info!(log, "rekeyed session encoder");
+                }
                 Err(error) => {
                     close_client!($stream, "failed to rekey client"; "error" => %error);
                 }
@@ -151,10 +156,9 @@ async fn session(
             // Handle a message from the client.
             Some(Ok(message)) = next_if_some(&mut client), if !died => {
                 match decoder.decode(message) {
-                    Err(error) => error!(log, "failed to decode client message"; "error" => %error),
                     Ok(message) => {
                         if let Some(stream) = client.as_mut() {
-                            match handle_client_message(&log, &mut pty, &mut decoder, message).await {
+                            match handle_client_message(&log, &mut pty, &mut decoder, &mut ping, message).await {
                                 Ok(()) => (),
                                 Err(SessionError::Close) => {
                                     info!(log, "client closed connection");
@@ -164,6 +168,11 @@ async fn session(
                                     close_client!(stream, "failed to handle client message"; "error" => %error);
                                 }
                             }
+                        }
+                    }
+                    Err(error) => {
+                        if let Some(stream) = client.as_mut() {
+                            close_client!(stream, "failed to decode client message"; "error" => %error);
                         }
                     }
                 }
@@ -211,6 +220,7 @@ async fn handle_client_message(
     log: &Logger,
     pty: &mut Pty,
     decoder: &mut SessionDecoder,
+    ping: &mut Option<SessionMessage>,
     message: SessionMessage,
 ) -> Result<(), SessionError> {
     match message {
@@ -218,10 +228,12 @@ async fn handle_client_message(
             SessionControl::WindowChange(size) => pty.set_window_size(size)?,
         },
         SessionMessage::Data(bytes) => pty.write_all(&bytes).await?,
-        SessionMessage::Ping(_) => (),
-        SessionMessage::Pong(bytes) => {
-            decoder.rekey(&bytes);
-            info!(log, "rekeyed session decoder");
+        SessionMessage::Ping(_) => return Err(SessionError::UnsolicitedPing),
+        SessionMessage::Pong(pong) => {
+            if let Some(SessionMessage::Ping(ping)) = ping.take() {
+                decoder.rekey(pong, Some(ping));
+                info!(log, "rekeyed session decoder");
+            }
         }
         SessionMessage::Close => return Err(SessionError::Close),
     }

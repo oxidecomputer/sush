@@ -197,7 +197,9 @@ impl JsonSchema for SshPublicKey {
 /// The `flags` and `counter` parameters are for the [`SK-*` family of SSH
 /// public keys](https://cvsweb.openbsd.org/src/usr.bin/ssh/PROTOCOL.u2f?annotate=HEAD).
 /// They should be set to 0 for other key types.
-#[derive(Clone, Debug, Deserialize, Eq, JsonSchema, Ord, PartialEq, PartialOrd, Serialize)]
+#[derive(
+    Clone, Debug, Deserialize, Eq, Hash, JsonSchema, Ord, PartialEq, PartialOrd, Serialize,
+)]
 pub struct EncodedSignature {
     pub r: String,
     pub s: String,
@@ -349,7 +351,7 @@ impl Signature {
                 counter: 0,
             }),
             Self::SkEcdsaSha256(signature) => {
-                let (signature, flags, counter) = sk_split(signature.as_bytes());
+                let (signature, flags, counter) = sk_split(signature.as_bytes())?;
                 let mut signature = BytesMut::from(signature);
                 let r = signature.try_get_mpint()?;
                 let s = signature.try_get_mpint()?;
@@ -362,7 +364,7 @@ impl Signature {
                 })
             }
             Self::SkEd25519(signature) => {
-                let (signature, flags, counter) = sk_split(signature.as_bytes());
+                let (signature, flags, counter) = sk_split(signature.as_bytes())?;
                 let signature = Ed25519Signature::from_slice(signature)?;
                 Ok(EncodedSignature {
                     r: codephrase(U256::from_be_slice(signature.r_bytes())),
@@ -421,14 +423,19 @@ impl Signature {
     }
 }
 
+/// Decode an `SK-*` signature into `(signature, flags, counter)`.
 /// See <https://cvsweb.openbsd.org/src/usr.bin/ssh/PROTOCOL.u2f?annotate=HEAD>
-fn sk_split(raw_signature: &[u8]) -> (&[u8], u8, u32) {
+fn sk_split(raw_signature: &[u8]) -> Result<(&[u8], u8, u32), KeyError> {
+    const TRAILER_LEN: usize = 1 + 4;
     let n = raw_signature.len();
-    let (signature, mut trailer) = raw_signature.split_at(n - 1 - 4);
+    if n < TRAILER_LEN {
+        return Err(KeyError::SignatureTooShort);
+    }
+    let (signature, mut trailer) = raw_signature.split_at(n - TRAILER_LEN);
     let flags = trailer.get_u8();
     let counter = trailer.get_u32();
-    assert!(trailer.is_empty());
-    (signature, flags, counter)
+    assert!(trailer.is_empty(), "leftover trailer bytes");
+    Ok((signature, flags, counter))
 }
 
 /// Extract the signature on a certificate.
@@ -889,8 +896,6 @@ pub fn pem_cert_chain(certs: Vec<Certificate>) -> Result<String, KeyError> {
 pub enum KeyError {
     #[error("DER encoding error: {0}")]
     Der(#[from] x509_cert::der::Error),
-    #[error("Ed25519 error: {0}")]
-    Ed25519(#[from] ed25519_dalek::ed25519::Error),
     #[error(transparent)]
     InvalidCodephrase(#[from] InvalidCodephrase),
     #[error("Invalid key ID")]
@@ -909,6 +914,10 @@ pub enum KeyError {
     Protocol(#[from] ProtocolError),
     #[error("Will not import a self-signed (root) certificate")]
     SelfSigned,
+    #[error("Signature error: {0}")]
+    Signature(#[from] signature::Error),
+    #[error("Invalid signature: too short")]
+    SignatureTooShort,
     #[error("Signing error: {0}")]
     Signer(String),
     #[error("SSH key error: {0}")]
@@ -918,5 +927,67 @@ pub enum KeyError {
 impl KeyError {
     fn signer(error: impl std::fmt::Display) -> Self {
         Self::Signer(error.to_string())
+    }
+}
+
+#[cfg(test)]
+mod test {
+    use std::collections::HashSet;
+    use std::time::Duration;
+
+    use crate::authn::Nonce;
+
+    use super::*;
+
+    #[test]
+    fn test_sk_split() {
+        assert!(matches!(
+            sk_split(b"").unwrap_err(),
+            KeyError::SignatureTooShort
+        ));
+        assert!(matches!(
+            sk_split(b"abcd").unwrap_err(),
+            KeyError::SignatureTooShort
+        ));
+        assert!(matches!(
+            sk_split(b"abcde").unwrap(),
+            (&[], 0x61, 0x62_63_64_65)
+        ));
+        assert!(matches!(
+            sk_split(b"sigabcde").unwrap(),
+            (&[0x73, 0x69, 0x67], 0x61, 0x62_63_64_65)
+        ));
+    }
+
+    #[tokio::test]
+    async fn signing() {
+        let mut key = EphemeralKey::new_root(
+            KeyType::P256,
+            String::from("CN=Ephemeral Test Signing Key,O=Oxide Computer Company,C=US")
+                .parse()
+                .unwrap(),
+            Validity::from_now(Duration::from_secs(60)).unwrap(),
+        )
+        .unwrap();
+        let mut signatures = HashSet::new();
+        for _ in 0..100 {
+            let nonce = Nonce::generate();
+            let signed = key.sign(nonce.as_bytes()).await.unwrap();
+            assert_eq!(signed.key_id(), key.key_id());
+            assert_eq!(*signed.payload(), nonce.as_bytes());
+            let signature = signed.signature();
+            assert!(signatures.insert(signature.clone()), "duplicate signature");
+            let signature_string = serde_json::to_string(&signature).unwrap();
+            assert!(signature_string.starts_with("{\"r\":\""));
+            assert!(signature_string.contains("\"s\":\""));
+            assert!(signature_string.ends_with("\"}"));
+            assert_eq!(
+                serde_json::from_str::<EncodedSignature>(&signature_string).unwrap(),
+                *signature
+            );
+            let verified = signed.verify_with_cert(key.cert()).unwrap();
+            assert_eq!(verified.verified_by(), key.key_id());
+            assert_eq!(verified.into_payload(), nonce.as_bytes());
+        }
     }
 }

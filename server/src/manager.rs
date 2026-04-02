@@ -52,6 +52,9 @@ pub const ROOT_CERTS: &[&[u8]] = &[
     include_bytes!("../certs/sandbox.pem"),
 ];
 
+/// Maximum certificate chain length.
+const MAX_CERT_CHAIN_LEN: usize = 10;
+
 /// Output files or ranges larger than this will not be served all at once.
 const OUTPUT_THRESHOLD: u64 = ByteSize::mb(128).as_u64();
 
@@ -131,7 +134,7 @@ impl JobManager {
         with_transaction!(self.db, |txn| import_cert(txn, cert, false))
     }
 
-    pub async fn cert_chain(&self, key_id: KeyId) -> Result<Vec<Certificate>, JobError> {
+    pub async fn cert_chain(&self, key_id: &KeyId) -> Result<Vec<Certificate>, JobError> {
         with_transaction!(self.db, |txn| get_cert_chain(txn, key_id))
     }
 
@@ -535,9 +538,15 @@ fn get_cert(db: &Connection, key_id: &KeyId) -> Result<Certificate, JobError> {
     }
 }
 
-fn get_cert_chain(db: &Connection, mut key_id: KeyId) -> Result<Vec<Certificate>, JobError> {
+/// Return the cert chain in root-to-leaf order.
+fn get_cert_chain(db: &Connection, key_id: &KeyId) -> Result<Vec<Certificate>, JobError> {
+    let mut key_id = key_id.to_owned();
     let mut chain = Vec::new();
     loop {
+        if chain.len() >= MAX_CERT_CHAIN_LEN {
+            return Err(JobError::CertChainTooLong);
+        }
+
         let cert = get_cert(db, &key_id)?;
         let self_signed = cert.tbs_certificate.subject == cert.tbs_certificate.issuer;
         key_id = KeyId::try_from(&cert.tbs_certificate.issuer)?;
@@ -561,7 +570,13 @@ fn import_cert(db: &Connection, cert: &Certificate, root: bool) -> Result<KeyId,
         }
         signature.verify_with_spki(&cert.tbs_certificate.to_der()?, spki)?;
     } else {
-        let issuer_cert = get_cert(db, &KeyId::try_from(issuer)?)?;
+        let key_id = KeyId::try_from(issuer)?;
+        let chain = get_cert_chain(db, &key_id)?;
+        let issuer_cert = match chain.len() {
+            0 => return Err(JobError::MissingCert(key_id)),
+            n if n < MAX_CERT_CHAIN_LEN => chain.last().unwrap(),
+            _ => return Err(JobError::CertChainTooLong),
+        };
         let issuer_pki = &issuer_cert.tbs_certificate.subject_public_key_info;
         signature.verify_with_spki(&cert.tbs_certificate.to_der()?, issuer_pki)?;
     }
@@ -1387,12 +1402,12 @@ mod test {
         );
         assert_eq!(mgr.import_root(&root_cert).await.unwrap(), root_key_id);
         assert_eq!(
-            mgr.cert_chain(root_key_id).await.unwrap(),
+            mgr.cert_chain(&root_key_id).await.unwrap(),
             vec![root_cert.clone()]
         );
-        assert_eq!(mgr.import_cert(child.cert()).await.unwrap(), child_key_id,);
+        assert_eq!(mgr.import_cert(child.cert()).await.unwrap(), child_key_id);
         assert_eq!(
-            mgr.cert_chain(child_key_id).await.unwrap(),
+            mgr.cert_chain(&child_key_id).await.unwrap(),
             vec![root_cert.clone(), child.cert().clone()]
         );
 

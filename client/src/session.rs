@@ -66,16 +66,17 @@ where
 
             // Handle a message from the server.
             Some(Ok(message)) = stream.next() => {
-                match &decoder.decode(message)? {
+                match decoder.decode(message)? {
                     SessionMessage::Control(control) => match control {
                         SessionControl::WindowChange { .. } => (),
                     }
                     SessionMessage::Data(bytes) => {
-                        stdout_async.write_all(bytes).await?;
+                        stdout_async.write_all(&bytes).await?;
                     }
-                    msg @ SessionMessage::Ping(bytes) => {
-                        decoder.rekey(bytes);
-                        stream.send(encoder.rekey(Some(msg))?).await?;
+                    SessionMessage::Ping(bytes) => {
+                        let pong = encoder.rekey(Some(&bytes))?;
+                        stream.send(encoder.encode(pong)?).await?;
+                        decoder.rekey(bytes, None);
                     }
                     SessionMessage::Pong(_) => (),
                     SessionMessage::Close => break,

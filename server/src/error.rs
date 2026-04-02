@@ -15,6 +15,8 @@ use sush_common::session::SessionError;
 /// What went wrong processing a client job request.
 #[derive(Debug, Error)]
 pub enum JobError {
+    #[error("Certificate chain is too long")]
+    CertChainTooLong,
     #[error("Internal communications channel was unexpectedly closed")]
     ChannelClosed,
     #[error("DER encoding error: {0}")]
@@ -161,7 +163,8 @@ impl From<JobError> for HttpError {
                     .expect("should be able to add www-authenticate header");
                 err
             }
-            InvalidCommand(_) | InvalidJobId(_) | Json(_) | MissingCert(_) | OutputPending => {
+            InvalidCommand(_) | InvalidJobId(_) | Json(_) | CertChainTooLong | MissingCert(_)
+            | OutputPending => {
                 HttpError::for_client_error(None, ClientErrorStatusCode::BAD_REQUEST, message)
             }
         }

@@ -47,7 +47,7 @@ impl SushApi for ApiServer {
         params: PathParams<KeyIdParam>,
     ) -> Result<HttpResponseOk<String>, HttpError> {
         let KeyIdParam { key_id } = params.into_inner();
-        let certs = ctx.context().cert_chain(key_id).await?;
+        let certs = ctx.context().cert_chain(&key_id).await?;
         let chain = pem_cert_chain(certs).map_err(JobError::Key)?;
         Ok(HttpResponseOk(chain))
     }
