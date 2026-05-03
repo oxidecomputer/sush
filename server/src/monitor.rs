@@ -3,11 +3,7 @@
 //!
 //! The monitor is not completely passive: it is also responsible for
 //! maintaining and, when requested, using the shutdown switches for jobs.
-//! It also maintains the interactive sessions.
-//!
-//! Unlike the manager, the monitor does *not* have direct access to the
-//! database. It communicates with the manager via a small set of requests
-//! and asynchronous events.
+//! It also maintains the interactive job sessions.
 
 use std::collections::BTreeMap;
 use std::fs::OpenOptions;
@@ -142,7 +138,6 @@ impl JobMonitor {
         &mut self,
         JobStarted {
             job,
-            time_reserved,
             time_started,
             child,
             interactive,
@@ -165,7 +160,6 @@ impl JobMonitor {
             let status = session.await.map_err(exe)?;
             let end = JobEnded {
                 job,
-                time_reserved,
                 time_started,
                 time_ended: Utc::now(),
                 status,
@@ -275,7 +269,6 @@ impl MonitorRequest {
 #[derive(Debug)]
 pub struct JobStarted {
     pub job: VerifiedJob,
-    pub time_reserved: DateTime<Utc>,
     pub time_started: DateTime<Utc>,
     pub child: Child,
     pub interactive: Option<(KeyId, Pty)>,
@@ -287,11 +280,27 @@ impl JobStarted {
     }
 }
 
+impl From<&JobStarted> for JobStatus {
+    fn from(start: &JobStarted) -> Self {
+        let JobStarted {
+            job,
+            time_started,
+            child: _,
+            interactive: _,
+        } = start;
+        Self::Started {
+            job: job.to_owned(),
+            time_started: time_started.to_owned(),
+            stdout_len: 0,
+            stderr_len: 0,
+        }
+    }
+}
+
 /// Event representing the end of a job.
 #[derive(Clone, Debug)]
 pub struct JobEnded {
     pub job: VerifiedJob,
-    pub time_reserved: DateTime<Utc>,
     pub time_started: DateTime<Utc>,
     pub time_ended: DateTime<Utc>,
     pub status: ExitStatus,
@@ -311,7 +320,6 @@ impl From<JobEnded> for JobStatus {
     fn from(end: JobEnded) -> Self {
         let JobEnded {
             job,
-            time_reserved,
             time_started,
             time_ended,
             status,
@@ -322,7 +330,6 @@ impl From<JobEnded> for JobStatus {
         } = end;
         Self::Ended {
             job,
-            time_reserved,
             time_started,
             time_ended,
             status: status.code(),

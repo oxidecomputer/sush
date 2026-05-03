@@ -34,7 +34,6 @@ rand = "0.8"
 rand_core = "0.6"
 reqwest = "0.12"
 rlimit = "0.10"
-rusqlite = { version = "0.37", features = ["blob", "chrono", "limits", "modern_sqlite", "rusqlite-macros"] }
 rustix = { version = "1", features = ["process", "pty"] }
 rustyline = "17"
 schemars = { version = "0.8", features = ["chrono", "preserve_order"] }

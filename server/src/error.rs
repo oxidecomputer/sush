@@ -70,8 +70,6 @@ pub enum JobError {
     #[error(transparent)]
     Slice(#[from] std::array::TryFromSliceError),
     #[error(transparent)]
-    Sqlite(#[from] rusqlite::Error),
-    #[error(transparent)]
     Task(#[from] tokio::task::JoinError),
     #[error("Unauthorized request")]
     Unauthorized(Nonce),
@@ -84,8 +82,8 @@ impl JobError {
         Self::ChannelClosed
     }
 
-    pub fn unauthorized() -> Self {
-        Self::Unauthorized(Nonce::generate())
+    pub fn unauthorized(nonce: Nonce) -> Self {
+        Self::Unauthorized(nonce)
     }
 
     /// Report I/O errors with the corresponding stream name.
@@ -129,7 +127,6 @@ impl From<JobError> for HttpError {
             | PublicKeyRevoked { .. }
             | Recv(_)
             | Shutdown(_)
-            | Sqlite(_)
             | Task(_)
             | Slice(_)
             | Wait => HttpError::for_internal_error(message),

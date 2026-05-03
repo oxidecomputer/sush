@@ -1,4 +1,0 @@
-CREATE TABLE IF NOT EXISTS certs(
-  key_id TEXT PRIMARY KEY NOT NULL,
-  cert BLOB NOT NULL CHECK(length(cert) > 0)
-) STRICT;

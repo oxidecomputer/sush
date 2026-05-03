@@ -1,8 +1,7 @@
 //! Manage a set of jobs.
 //!
-//! The manager has exclusive access to the SQLite database. Jobs are
-//! spawned onto new tokio tasks and passed to the monitor to wait for
-//! completion. Standard output and standard error are saved in files.
+//! Jobs are spawned onto new tokio tasks and passed to the monitor to wait
+//! for completion. Standard output and standard error are saved in files.
 
 use std::collections::BTreeMap;
 use std::fs::{DirBuilder, File, OpenOptions};
@@ -15,10 +14,9 @@ use std::sync::{Arc, Mutex};
 
 use blake3::Hasher;
 use bytesize::ByteSize;
-use chrono::{DateTime, Utc};
+use chrono::Utc;
 use http_range_header::{EndPosition, StartPosition, SyntacticallyCorrectRange as Range};
 use pwd::Passwd;
-use rusqlite::{Connection, OptionalExtension as _, Row, prepare_cached_and_bind};
 use rustix::io::close;
 use rustix::process::{ioctl_tiocsctty, setsid};
 use slog::{Logger, error, info, o};
@@ -27,20 +25,17 @@ use tokio::process::Command;
 use tokio::spawn;
 use tokio::sync::{mpsc, oneshot};
 use x509_cert::Certificate;
-use x509_cert::der::{Decode as _, DecodePem as _, Encode as _};
+use x509_cert::der::{DecodePem as _, Encode as _};
 
 use sush_api::JobStartParams;
 use sush_common::authn::{Credentials, Identity, Nonce};
-use sush_common::codephrases::generate_id;
 use sush_common::jobs::JobOutputStream::{self, Stderr, Stdout};
-use sush_common::jobs::{
-    JobId, JobOutputHash, JobStartRequest, JobStatus, JobsReserved, SignedJob, VerifiedJob,
-};
+use sush_common::jobs::{JobId, JobOutputHash, JobStartRequest, JobStatus, SignedJob, VerifiedJob};
 use sush_common::keys::{KeyError, KeyId, Signature, SshPublicKey};
 use sush_common::session::WindowSize;
 
 use crate::error::{ExecutionError, JobError};
-use crate::monitor::{ExecutionResult, JobEnded, JobMonitor, JobStarted, MonitorRequest};
+use crate::monitor::{ExecutionResult, JobMonitor, JobStarted, MonitorRequest};
 use crate::pty::Pty;
 use crate::session::SocketSender;
 
@@ -61,190 +56,276 @@ const OUTPUT_THRESHOLD: u64 = ByteSize::mb(128).as_u64();
 #[derive(Debug)]
 pub struct JobManager {
     log: Logger,
-    db: Arc<Mutex<Connection>>,
+    nonce: Arc<Mutex<Nonce>>,
+    identities: Arc<Mutex<BTreeMap<KeyId, Identity>>>,
+    certs: Arc<Mutex<BTreeMap<KeyId, Certificate>>>,
+    jobs: Arc<Mutex<BTreeMap<JobId, JobStatus>>>,
     output_dir: PathBuf,
     tx_monitor: mpsc::Sender<MonitorRequest>,
 }
 
-/// Call a closure with a new transaction, and commit it if the
-/// closure returns success. We special-case `Unauthorized` so
-/// that we may commit the new nonce.
-macro_rules! with_transaction {
-    ($db:expr, $f:expr) => {{
-        let mut db = $db.lock().unwrap();
-        let txn = db.transaction()?;
-        match $f(&txn) {
-            Ok(result) => {
-                txn.commit()?;
-                Ok(result)
-            }
-            Err(JobError::Unauthorized(nonce)) => {
-                txn.rollback()?;
-                insert_nonce(&db, &nonce)?;
-                Err(JobError::Unauthorized(nonce))
-            }
-            Err(err) => {
-                txn.rollback()?;
-                Err(err)
-            }
-        }
-    }};
-}
-
 impl JobManager {
-    pub async fn new(log: Logger, mut db: Connection, output_dir: &Path) -> Result<Self, JobError> {
-        // Import the root certificates.
-        let txn = db.transaction()?;
-        for root in ROOT_CERTS {
-            let cert = Certificate::from_pem(root).or_else(|_| Certificate::from_der(root))?;
-            let key_id = import_cert(&txn, &cert, true)?;
-            info!(log, "imported root certificate"; "key_id" => %key_id);
-        }
-        txn.commit()?;
-        let db = Arc::new(Mutex::new(db));
+    pub async fn new(log: Logger, output_dir: &Path) -> Result<Self, JobError> {
+        let jobs = Arc::new(Mutex::new(BTreeMap::new()));
 
         // Start the monitor and listen for job-end events.
         let (tx_monitor, mut rx_monitor) =
             JobMonitor::start(log.new(o!("component" => "monitor")), output_dir.to_owned());
         spawn({
-            let db = db.clone();
+            let jobs = jobs.clone();
             let output_dir = output_dir.to_owned();
             async move {
                 while let Some(end) = rx_monitor.recv().await {
-                    with_transaction!(db, |txn| job_ended(txn, &output_dir, end))?;
+                    job_ended(&mut jobs.lock().unwrap(), &output_dir, end)?;
                 }
                 Ok::<_, JobError>(())
             }
         });
 
-        Ok(Self {
+        // Create the new manager instance.
+        let new = Self {
             log: log.new(o!("component" => "manager")),
-            db,
+            nonce: Arc::new(Mutex::new(Nonce::generate())),
+            identities: Arc::new(Mutex::new(BTreeMap::new())),
+            certs: Arc::new(Mutex::new(BTreeMap::new())),
+            jobs,
             output_dir: output_dir.to_owned(),
             tx_monitor,
-        })
+        };
+
+        // Import the root certificates.
+        for root in ROOT_CERTS {
+            new.import_cert_inner(Certificate::from_pem(root)?, true)?;
+        }
+
+        Ok(new)
     }
+
+    // Certificate management requests.
 
     #[cfg(test)]
-    async fn import_root(&self, root: &Certificate) -> Result<KeyId, JobError> {
-        with_transaction!(self.db, |txn| import_cert(txn, root, true))
+    fn import_root(&self, root: Certificate) -> Result<KeyId, JobError> {
+        self.import_cert_inner(root, true)
     }
 
-    pub async fn import_cert(&self, cert: &Certificate) -> Result<KeyId, JobError> {
-        with_transaction!(self.db, |txn| import_cert(txn, cert, false))
+    pub fn import_cert(&self, _authn: &Identity, cert: Certificate) -> Result<KeyId, JobError> {
+        self.import_cert_inner(cert, false)
     }
 
-    pub async fn cert_chain(&self, key_id: &KeyId) -> Result<Vec<Certificate>, JobError> {
-        with_transaction!(self.db, |txn| get_cert_chain(txn, key_id))
+    fn import_cert_inner(&self, cert: Certificate, root_allowed: bool) -> Result<KeyId, JobError> {
+        let mut certs = self.certs.lock().unwrap();
+
+        // Verify the certificate signature.
+        let signature = Signature::try_from(&cert)?;
+        let tbs = cert.tbs_certificate.to_der()?;
+        let subject = &cert.tbs_certificate.subject;
+        let issuer = &cert.tbs_certificate.issuer;
+        let root = subject == issuer;
+        if root {
+            if root_allowed {
+                signature.verify_with_spki(&tbs, &cert.tbs_certificate.subject_public_key_info)?;
+            } else {
+                return Err(KeyError::SelfSigned.into());
+            }
+        } else {
+            let issuer_key_id = KeyId::try_from(issuer)?;
+            if let Some(issuer) = certs.get(&issuer_key_id) {
+                signature
+                    .verify_with_spki(&tbs, &issuer.tbs_certificate.subject_public_key_info)?;
+            } else {
+                return Err(JobError::MissingCert(issuer_key_id));
+            }
+        }
+
+        // Import the certificate.
+        let key_id = KeyId::try_from(subject)?;
+        certs.insert(key_id.clone(), cert);
+        info!(self.log, "imported certificate"; "key_id" => %key_id, "root" => root);
+        Ok(key_id)
     }
+
+    /// Return the cert chain for the given key in root-to-leaf order.
+    pub fn cert_chain(
+        &self,
+        _authn: &Identity,
+        key_id: &KeyId,
+    ) -> Result<Vec<Certificate>, JobError> {
+        let certs = self.certs.lock().unwrap();
+        let mut chain = Vec::new();
+        let mut key_id = key_id.to_owned();
+        loop {
+            if chain.len() >= MAX_CERT_CHAIN_LEN {
+                return Err(JobError::CertChainTooLong);
+            }
+            let Some(cert) = certs.get(&key_id) else {
+                return Err(JobError::MissingCert(key_id));
+            };
+            chain.push(cert.to_owned());
+            if cert.tbs_certificate.subject == cert.tbs_certificate.issuer {
+                break;
+            }
+            key_id = KeyId::try_from(&cert.tbs_certificate.issuer)?;
+        }
+        chain.reverse();
+        Ok(chain)
+    }
+
+    // Identity management requests.
 
     pub async fn iam(
         &self,
         authorization: Option<String>,
         public_key: Option<SshPublicKey>,
     ) -> Result<Identity, JobError> {
-        with_transaction!(self.db, |txn| iam(
-            &self.log,
-            txn,
-            authorization,
-            public_key
-        ))
+        let mut identities = self.identities.lock().unwrap();
+        let mut current_nonce = self.nonce.lock().unwrap();
+
+        // The client should (probably) not get detailed information back about
+        // authentication failures, but debugging is much easier if we log full
+        // errors here on the server.
+        macro_rules! try_authn {
+            ($expr:expr) => {
+                match $expr {
+                    Ok(value) => Ok(value),
+                    Err(error) => {
+                        error!(self.log, "authentication failed"; "error" => %error);
+                        Err(error)
+                    }
+                }
+            };
+            ($expr:expr, $error:expr) => {
+                $expr || {
+                    error!(self.log, "authentication failed"; "error" => $error);
+                    false
+                }
+            }
+        }
+
+        if let Some(authorization) = authorization
+            && let Ok(credentials) = try_authn!(authorization.parse())
+            && let Credentials { key_id, nonce, .. } = &credentials
+            && try_authn!(*nonce == *current_nonce, "invalid nonce")
+            && let identity = identities.get(key_id)
+            && try_authn!(
+                identity.map(Identity::is_still_valid).unwrap_or(true),
+                "invalid identity"
+            )
+            && let Some(key) = identity.map(|i| &i.public_key).or(public_key.as_ref())
+            && let response = credentials.into_challenge_response()
+            && let Ok(verified) = try_authn!(response.verify_with_ssh_public_key(key))
+            && let Ok(identity) = try_authn!(Identity::new(key.to_owned(), verified))
+        {
+            let Identity {
+                key_id,
+                public_key,
+                nonce,
+                time_authenticated: _,
+                time_revoked: _,
+            } = &identity;
+            assert_eq!(public_key, key, "identity key should match index key");
+            identities.insert(key_id.to_owned(), identity.to_owned());
+            info!(self.log, "authenticated credentials"; "nonce" => %nonce, "key_id" => %key_id);
+            Ok(identity)
+        } else {
+            let nonce = Nonce::generate();
+            *current_nonce = nonce.clone();
+            Err(JobError::unauthorized(nonce))
+        }
     }
 
     pub async fn identities(
         &self,
+        _authn: &Identity,
         start: Option<KeyId>,
         limit: NonZeroU32,
-        _authn: &Identity,
     ) -> Result<Vec<Identity>, JobError> {
-        with_transaction!(self.db, |txn| get_identities(txn, start, limit))
+        todo!("list identities")
     }
 
-    pub async fn revoke_identity(&self, key_id: KeyId, _authn: &Identity) -> Result<(), JobError> {
-        let sessions = with_transaction!(self.db, |txn| {
-            revoke_identity(&self.log, txn, &key_id)?;
-            get_sessions(txn, &key_id)
-        })?;
-        for job_id in sessions {
-            self.monitor(MonitorRequest::Stop(job_id)).await?;
+    pub async fn revoke_identity(&self, _authn: &Identity, key_id: KeyId) -> Result<(), JobError> {
+        if let Some(identity) = self.identities.lock().unwrap().get_mut(&key_id) {
+            identity.time_revoked = Some(Utc::now());
         }
+        // for job_id in todo!("get interactive sessions") {
+        //     self.monitor(MonitorRequest::Stop(job_id)).await?;
+        // }
         Ok(())
     }
 
-    pub async fn reserve_jobs(&self, number: u8) -> Result<JobsReserved, JobError> {
-        with_transaction!(self.db, |txn| reserve_jobs(txn, number))
-    }
+    // Job management requests.
 
-    pub async fn reserve_one(&self) -> Result<(JobId, DateTime<Utc>), JobError> {
-        let JobsReserved {
-            mut job_ids,
-            time_reserved,
-        } = self.reserve_jobs(1).await?;
-        let n = job_ids.len();
-        assert_eq!(n, 1, "requested one job, got {n}");
-        Ok((job_ids.pop().unwrap(), time_reserved))
-    }
-
-    pub async fn get_reserved(&self) -> Result<BTreeMap<JobId, DateTime<Utc>>, JobError> {
-        with_transaction!(self.db, get_reserved_jobs)
-    }
-
-    pub async fn revoke_reserved(&self, job_ids: Vec<JobId>) -> Result<Vec<JobId>, JobError> {
-        with_transaction!(self.db, |txn| revoke_reserved_jobs(txn, &job_ids))
+    pub async fn job_history(
+        &self,
+        _authn: &Identity,
+        start: Option<JobId>,
+        limit: NonZeroU32,
+    ) -> Result<Vec<JobStatus>, JobError> {
+        todo!("get_job_history(&self.output_dir, start, limit)")
     }
 
     pub async fn job_start(
         &self,
+        _authn: &Identity,
         job: SignedJob,
         params: JobStartParams,
-        authn: Option<Identity>,
     ) -> Result<Option<ExecutionResult>, JobError> {
         let wait = params.wait;
-        let started = with_transaction!(self.db, |txn| job_start(
-            &self.log,
-            txn,
-            &self.output_dir,
-            job,
-            params,
-            authn
-        ))?;
+        let started = {
+            let mut jobs = self.jobs.lock().unwrap();
+            let job_id = job.job_id().to_owned();
+            if jobs.contains_key(&job_id) {
+                return Err(JobError::InvalidJobId(job_id));
+            }
+
+            let key_id = job.key_id().to_owned();
+            let cert = self
+                .certs
+                .lock()
+                .unwrap()
+                .get(&key_id)
+                .cloned()
+                .ok_or_else(|| JobError::MissingCert(key_id))?;
+
+            let job = job.verify_with_cert(&cert)?;
+            let started = job_start(&self.log, &self.output_dir, job, params)?;
+            assert!(jobs.insert(job_id, JobStatus::from(&started)).is_none());
+            started
+        };
 
         let (tx, rx) = oneshot::channel();
         self.monitor(MonitorRequest::started(started, tx)).await?;
         if wait { Ok(Some(rx.await?)) } else { Ok(None) }
     }
 
-    pub async fn job_session(
+    pub async fn job_start_interactive_session(
         &self,
+        _authn: &Identity,
         job_id: &JobId,
-        authn: &Identity,
     ) -> Result<SocketSender, JobError> {
-        with_transaction!(self.db, |txn| {
-            let key_id = get_interactive(txn, job_id)?;
-            if authn.key_id == key_id {
-                Ok(())
-            } else {
-                error!(self.log, "incorrect identity for interactive job"; "key_id" => %key_id, "authn" => %authn.key_id);
-                Err(JobError::unauthorized())
-            }
-        })?;
-
         let (tx_sender, rx_sender) = oneshot::channel();
         self.monitor(MonitorRequest::Session(job_id.to_owned(), tx_sender))
             .await?;
         rx_sender.await?
     }
 
-    pub async fn job_status(&self, job_id: &JobId) -> Result<JobStatus, JobError> {
-        with_transaction!(self.db, |txn| get_job_status(txn, &self.output_dir, job_id))
+    pub fn job_status(&self, _authn: &Identity, job_id: &JobId) -> JobStatus {
+        self.jobs
+            .lock()
+            .unwrap()
+            .get(job_id)
+            .cloned()
+            .unwrap_or_else(|| JobStatus::Unknown {
+                job_id: job_id.to_owned(),
+            })
     }
 
-    pub async fn job_abort(&self, job_id: &JobId) -> Result<(), JobError> {
+    pub async fn job_abort(&self, _authn: &Identity, job_id: &JobId) -> Result<(), JobError> {
         self.monitor(MonitorRequest::Stop(job_id.to_owned())).await
     }
 
     pub async fn job_output(
         &self,
+        _authn: &Identity,
         job_id: &JobId,
         stream: JobOutputStream,
         range: Option<Range>,
@@ -254,24 +335,12 @@ impl JobManager {
 
     pub async fn job_output_delete(
         &self,
+        _authn: &Identity,
         job_id: &JobId,
         stream: JobOutputStream,
         range: Option<Range>,
     ) -> Result<u64, JobError> {
         delete_job_output(&self.output_dir, job_id, stream, range)
-    }
-
-    pub async fn job_history(
-        &self,
-        start: Option<JobId>,
-        limit: NonZeroU32,
-    ) -> Result<Vec<JobStatus>, JobError> {
-        with_transaction!(self.db, |txn| get_job_history(
-            txn,
-            &self.output_dir,
-            start,
-            limit
-        ))
     }
 
     async fn monitor(&self, request: MonitorRequest) -> Result<(), JobError> {
@@ -310,93 +379,61 @@ pub fn job_output_hash(
     Ok(hasher.finalize().into())
 }
 
-fn job_ended(db: &Connection, output_dir: &Path, result: ExecutionResult) -> Result<(), JobError> {
+fn job_ended(
+    jobs: &mut BTreeMap<JobId, JobStatus>,
+    output_dir: &Path,
+    result: ExecutionResult,
+) -> Result<(), JobError> {
     match result {
         Err(ExecutionError {
             job_id,
             time,
             error: _,
         }) => {
-            job_aborted(db, output_dir, &job_id, time)?;
+            if let JobStatus::Started {
+                job, time_started, ..
+            } = jobs
+                .get(&job_id)
+                .cloned()
+                .ok_or_else(|| JobError::InvalidJobId(job_id.to_owned()))?
+            {
+                assert!(
+                    jobs.insert(
+                        job_id.to_owned(),
+                        JobStatus::Ended {
+                            job,
+                            time_started,
+                            time_ended: time,
+                            status: None,
+                            stdout_len: job_output_len(output_dir, &job_id, Stdout),
+                            stderr_len: job_output_len(output_dir, &job_id, Stderr),
+                            stdout_hash: job_output_hash(output_dir, &job_id, Stdout)?,
+                            stderr_hash: job_output_hash(output_dir, &job_id, Stderr)?,
+                        }
+                    )
+                    .is_some()
+                );
+                Ok(())
+            } else {
+                Err(JobError::InvalidJobId(job_id))
+            }
         }
-        Ok(JobEnded {
-            job,
-            time_reserved: _,
-            time_started: _,
-            time_ended,
-            status,
-            stdout_len: _,
-            stderr_len: _,
-            stdout_hash,
-            stderr_hash,
-        }) => {
-            let job_id = job.job_id();
-            let status = status.code();
-            prepare_cached_and_bind!(
-                db,
-                "UPDATE jobs \
-                 SET time_ended = $time_ended, \
-                     status = $status, \
-                     stdout_hash = $stdout_hash, \
-                     stderr_hash = $stderr_hash \
-                 WHERE job_id = $job_id AND \
-                       time_started IS NOT NULL AND \
-                       time_ended IS NULL"
-            )
-            .raw_execute()?;
+        Ok(ended) => {
+            assert!(
+                jobs.insert(ended.job_id().to_owned(), ended.into())
+                    .is_some()
+            );
+            Ok(())
         }
     }
-    Ok(())
-}
-
-fn job_aborted(
-    db: &Connection,
-    output_dir: &Path,
-    job_id: &JobId,
-    time_ended: DateTime<Utc>,
-) -> Result<(), JobError> {
-    let stdout_hash = job_output_hash(output_dir, job_id, Stdout)?;
-    let stderr_hash = job_output_hash(output_dir, job_id, Stderr)?;
-    prepare_cached_and_bind!(
-        db,
-        "UPDATE jobs \
-         SET time_ended = $time_ended, \
-             stdout_hash = $stdout_hash, \
-             stderr_hash = $stderr_hash \
-         WHERE job_id = $job_id AND \
-               time_started IS NOT NULL AND \
-               time_ended IS NULL"
-    )
-    .raw_execute()?;
-    Ok(())
 }
 
 fn job_start(
     log: &Logger,
-    db: &Connection,
     output_dir: &Path,
-    job: SignedJob,
+    job: VerifiedJob,
     params: JobStartParams,
-    authn: Option<Identity>,
 ) -> Result<JobStarted, JobError> {
-    let job_id = job.job_id().to_owned();
-
-    // Verify the job request.
-    let time_reserved = verify_reservation(db, &job_id)?;
-    let cert = get_cert(db, job.key_id())?;
-    let job = job.verify_with_cert(&cert)?;
-    if let Some(key_id) = job.interactive() {
-        let Some(ref authn) = authn else {
-            return Err(JobError::unauthorized());
-        };
-        if authn.key_id != *key_id {
-            return Err(JobError::IdentityMismatch {
-                interactive: key_id.to_owned(),
-                authn: authn.key_id.to_owned(),
-            });
-        }
-    }
-
     // Set up the job.
     let JobStartParams {
         limits,
@@ -405,8 +442,6 @@ fn job_start(
         cols,
         wait: _,
     } = params;
-    let key_id = job.key_id().to_owned();
-    let signature = job.signature().to_owned();
     let JobStartRequest {
         job_id,
         command,
@@ -499,363 +534,16 @@ fn job_start(
         None
     };
 
-    // Record the job start event.
-    let time_started = Utc::now();
-    let mut stmt = prepare_cached_and_bind!(
-        db,
-        "UPDATE jobs \
-         SET key_id = $key_id, command = $command, interactive = $interactive, signature = $signature, time_started = $time_started \
-         WHERE job_id = $job_id AND time_started IS NULL"
-    );
-    if stmt.raw_execute()? != 1 {
-        return Err(JobError::InvalidJobId(job_id));
-    }
-
     // Go!
+    let time_started = Utc::now();
     let child = child.spawn().map_err(|err| JobError::io("spawn", err))?;
     info!(log, "job started"; "job_id" => %job_id);
     Ok(JobStarted {
         job,
-        time_reserved,
         time_started,
         child,
         interactive: key_and_pty,
     })
-}
-
-fn get_cert(db: &Connection, key_id: &KeyId) -> Result<Certificate, JobError> {
-    let mut stmt = db.prepare_cached(
-        "SELECT cert FROM certs WHERE key_id = ?1",
-        // `--SEARCH certs USING INDEX sqlite_autoindex_certs_1 (key_id=?)
-    )?;
-    if let Some(cert) = stmt
-        .query_one([key_id], |row| -> Result<Vec<u8>, _> { row.get(0) })
-        .optional()?
-    {
-        Ok(Certificate::from_der(&cert)?)
-    } else {
-        Err(JobError::MissingCert(key_id.to_owned()))
-    }
-}
-
-/// Return the cert chain in root-to-leaf order.
-fn get_cert_chain(db: &Connection, key_id: &KeyId) -> Result<Vec<Certificate>, JobError> {
-    let mut key_id = key_id.to_owned();
-    let mut chain = Vec::new();
-    loop {
-        if chain.len() >= MAX_CERT_CHAIN_LEN {
-            return Err(JobError::CertChainTooLong);
-        }
-
-        let cert = get_cert(db, &key_id)?;
-        let self_signed = cert.tbs_certificate.subject == cert.tbs_certificate.issuer;
-        key_id = KeyId::try_from(&cert.tbs_certificate.issuer)?;
-        chain.push(cert);
-        if self_signed {
-            break;
-        }
-    }
-    chain.reverse();
-    Ok(chain)
-}
-
-fn import_cert(db: &Connection, cert: &Certificate, root: bool) -> Result<KeyId, JobError> {
-    let subject = &cert.tbs_certificate.subject;
-    let issuer = &cert.tbs_certificate.issuer;
-    let spki = &cert.tbs_certificate.subject_public_key_info;
-    let signature = Signature::try_from(cert)?;
-    if subject == issuer {
-        if !root {
-            return Err(JobError::Key(KeyError::SelfSigned));
-        }
-        signature.verify_with_spki(&cert.tbs_certificate.to_der()?, spki)?;
-    } else {
-        let key_id = KeyId::try_from(issuer)?;
-        let chain = get_cert_chain(db, &key_id)?;
-        let issuer_cert = match chain.len() {
-            0 => return Err(JobError::MissingCert(key_id)),
-            n if n < MAX_CERT_CHAIN_LEN => chain.last().unwrap(),
-            _ => return Err(JobError::CertChainTooLong),
-        };
-        let issuer_pki = &issuer_cert.tbs_certificate.subject_public_key_info;
-        signature.verify_with_spki(&cert.tbs_certificate.to_der()?, issuer_pki)?;
-    }
-
-    let key_id = KeyId::try_from(subject)?;
-    db.execute(
-        "INSERT INTO certs(key_id, cert) VALUES(?1, ?2) \
-         ON CONFLICT(key_id) DO UPDATE SET cert = ?2",
-        (&key_id, cert.to_der()?),
-    )?;
-    Ok(key_id)
-}
-
-fn iam(
-    log: &Logger,
-    db: &Connection,
-    authorization: Option<String>,
-    key: Option<SshPublicKey>,
-) -> Result<Identity, JobError> {
-    // The client should (probably) not get detailed information back about
-    // authentication failures, but debugging is much easier if we log full
-    // errors here on the server.
-    macro_rules! try_authn {
-        ($expr:expr) => {
-            match $expr {
-                Ok(value) => Ok(value),
-                Err(error) => {
-                    error!(log, "authentication failed"; "error" => %error);
-                    Err(error)
-                }
-            }
-        }
-    }
-
-    if let Some(authorization) = authorization
-        && let Ok(credentials) = try_authn!(authorization.parse())
-        && let Credentials { key_id, nonce, .. } = &credentials
-        && let Ok(key) = try_authn!(get_public_key(db, &key, key_id.clone(), nonce.clone()))
-        && let response = credentials.into_challenge_response()
-        && let Ok(verified) = try_authn!(response.verify_with_ssh_public_key(&key))
-        && let Ok(identity) = try_authn!(Identity::new(key, verified))
-    {
-        let Identity {
-            key_id,
-            public_key,
-            nonce,
-            time_authenticated,
-            time_revoked,
-        } = &identity;
-        assert!(
-            time_revoked.is_none(),
-            "should not authenticate a revoked identity"
-        );
-        prepare_cached_and_bind!(
-            db,
-            "INSERT OR REPLACE INTO authn (key_id, public_key, nonce, time_authenticated) \
-             VALUES ($key_id, $public_key, $nonce, $time_authenticated)"
-        )
-        .raw_execute()?;
-        info!(log, "authenticated credentials"; "nonce" => %nonce, "key_id" => %key_id);
-        Ok(identity)
-    } else {
-        Err(JobError::unauthorized())
-    }
-}
-
-fn insert_nonce(db: &Connection, nonce: &Nonce) -> Result<(), JobError> {
-    prepare_cached_and_bind!(db, "INSERT INTO challenges VALUES ($nonce)").raw_execute()?;
-    Ok(())
-}
-
-fn claim_nonce(db: &Connection, nonce: Nonce) -> Result<(), JobError> {
-    let mut stmt = prepare_cached_and_bind!(db, "DELETE FROM challenges WHERE nonce = $nonce");
-    if stmt.raw_execute()? == 1 {
-        Ok(())
-    } else {
-        Err(JobError::NoSuchNonce(nonce))
-    }
-}
-
-fn get_public_key(
-    db: &Connection,
-    public_key: &Option<SshPublicKey>,
-    key_id: KeyId,
-    nonce: Nonce,
-) -> Result<SshPublicKey, JobError> {
-    if let Some((stored_key, stored_nonce, time_revoked)) = db
-        .prepare_cached(
-            "SELECT public_key, nonce, time_revoked FROM authn WHERE key_id = ?1",
-            // `--SEARCH authn USING INDEX sqlite_autoindex_authn_1 (key_id=?)
-        )?
-        .query_one(
-            [&key_id],
-            |row| -> Result<(SshPublicKey, Nonce, Option<DateTime<Utc>>), _> {
-                Ok((
-                    row.get("public_key")?,
-                    row.get("nonce")?,
-                    row.get("time_revoked")?,
-                ))
-            },
-        )
-        .optional()?
-    {
-        assert_eq!(
-            stored_key
-                .key_id()
-                .expect("stored keys should have a valid ID"),
-            key_id,
-            "stored key ID does not match public key, database may be corrupt"
-        );
-
-        if let Some(time_revoked) = time_revoked {
-            return Err(JobError::PublicKeyRevoked {
-                key_id,
-                time_revoked,
-            });
-        }
-
-        if let Some(public_key) = public_key
-            && *public_key != stored_key
-        {
-            return Err(JobError::PublicKeyMismatch(key_id.to_owned()));
-        }
-
-        if nonce != stored_nonce {
-            claim_nonce(db, nonce)?;
-        }
-
-        Ok(stored_key)
-    } else if let Some(public_key) = public_key
-        && public_key.key_id().map(|id| id == key_id).unwrap_or(false)
-    {
-        claim_nonce(db, nonce)?;
-        Ok(public_key.to_owned())
-    } else {
-        Err(JobError::PublicKeyNotFound(key_id.to_owned()))
-    }
-}
-
-fn get_interactive(db: &Connection, job_id: &JobId) -> Result<KeyId, JobError> {
-    if let Some(interactive) = db
-        .prepare_cached(
-            "SELECT interactive FROM jobs WHERE job_id = ?1 AND time_started IS NOT NULL",
-        )?
-        .query_one([job_id], |row| -> Result<KeyId, _> { row.get(0) })
-        .optional()?
-    {
-        Ok(interactive)
-    } else {
-        Err(JobError::InvalidJobId(job_id.to_owned()))
-    }
-}
-
-fn get_sessions(db: &Connection, key_id: &KeyId) -> Result<Vec<JobId>, JobError> {
-    let mut stmt = prepare_cached_and_bind!(
-        db,
-        "SELECT job_id FROM jobs \
-         WHERE interactive = $key_id AND \
-               time_started IS NOT NULL AND \
-               time_ended IS NULL"
-    );
-    // `--SCAN jobs USING COVERING INDEX current_sessions
-    let mut rows = stmt.raw_query();
-    let mut sessions = Vec::new();
-    while let Some(row) = rows.next()? {
-        sessions.push(row.get("job_id")?);
-    }
-    Ok(sessions)
-}
-
-fn get_identities(
-    db: &Connection,
-    start: Option<KeyId>,
-    limit: NonZeroU32,
-) -> Result<Vec<Identity>, JobError> {
-    let mut stmt = if let Some(start) = start {
-        prepare_cached_and_bind!(
-            db,
-            "SELECT * FROM authn WHERE key_id > $start ORDER BY key_id LIMIT $limit"
-        )
-        // `--SEARCH authn USING INDEX sqlite_autoindex_authn_1 (key_id<?)
-    } else {
-        prepare_cached_and_bind!(db, "SELECT * FROM authn ORDER BY key_id LIMIT $limit")
-        // `--SCAN authn USING INDEX sqlite_autoindex_authn_1
-    };
-    let mut rows = stmt.raw_query();
-    let mut identities = Vec::new();
-    while let Some(row) = rows.next()? {
-        identities.push(Identity {
-            key_id: row.get("key_id")?,
-            public_key: row.get("public_key")?,
-            nonce: row.get("nonce")?,
-            time_authenticated: row.get("time_authenticated")?,
-            time_revoked: row.get("time_revoked")?,
-        });
-    }
-    Ok(identities)
-}
-
-fn revoke_identity(log: &Logger, db: &Connection, key_id: &KeyId) -> Result<(), JobError> {
-    let time_revoked = Utc::now();
-    let mut stmt = prepare_cached_and_bind!(
-        db,
-        "UPDATE authn SET time_revoked = $time_revoked WHERE key_id = $key_id"
-    );
-    // `--SEARCH authn USING INDEX sqlite_autoindex_authn_1 (key_id=?)
-    if stmt.raw_execute()? == 1 {
-        info!(log, "revoked identity"; "key_id" => %key_id);
-        Ok(())
-    } else {
-        Err(JobError::PublicKeyNotFound(key_id.to_owned()))
-    }
-}
-
-fn reserve_jobs(db: &Connection, number: u8) -> Result<JobsReserved, JobError> {
-    let time_reserved = Utc::now();
-    let mut job_ids = Vec::new();
-    {
-        let mut stmt =
-            db.prepare_cached("INSERT INTO jobs(job_id, time_reserved) VALUES(?1, ?2)")?;
-        for _ in 0..number {
-            let job_id = JobId::from(&generate_id());
-            stmt.execute((&job_id, time_reserved))?;
-            job_ids.push(job_id);
-        }
-    }
-    Ok(JobsReserved {
-        job_ids,
-        time_reserved,
-    })
-}
-
-fn get_reserved_jobs(db: &Connection) -> Result<BTreeMap<JobId, DateTime<Utc>>, JobError> {
-    let mut reserved = BTreeMap::new();
-    let mut stmt = db.prepare_cached(
-        "SELECT job_id, time_reserved FROM jobs WHERE time_started IS NULL",
-        // `--SCAN jobs USING COVERING INDEX jobs_reserved_only
-    )?;
-    for row in stmt.query_map([], |row| Ok((row.get(0)?, row.get(1)?)))? {
-        let (job_id, time_reserved) = row?;
-        assert!(reserved.insert(job_id, time_reserved).is_none());
-    }
-    Ok(reserved)
-}
-
-fn revoke_reserved_jobs(db: &Connection, job_ids: &[JobId]) -> Result<Vec<JobId>, JobError> {
-    let job_ids = if !job_ids.is_empty() {
-        job_ids.to_vec()
-    } else {
-        get_reserved_jobs(db)?.keys().cloned().collect()
-    };
-    let mut revoked = Vec::new();
-    {
-        let mut stmt = db.prepare_cached(
-            "DELETE FROM jobs WHERE job_id = ?1 AND time_started IS NULL",
-            // `--SEARCH jobs USING INDEX sqlite_autoindex_jobs_1 (job_id=?)
-        )?;
-        for job_id in job_ids {
-            if stmt.execute([&job_id])? == 1 {
-                revoked.push(job_id);
-            }
-        }
-    }
-    Ok(revoked)
-}
-
-fn verify_reservation(db: &Connection, job_id: &JobId) -> Result<DateTime<Utc>, JobError> {
-    let mut stmt = db.prepare_cached(
-        "SELECT time_reserved FROM jobs WHERE job_id = ?1 AND time_started IS NULL",
-        // `--SEARCH jobs USING INDEX sqlite_autoindex_jobs_1 (job_id=?)
-    )?;
-    if let Some(time_reserved) = stmt
-        .query_one([job_id], |row| -> Result<DateTime<Utc>, _> { row.get(0) })
-        .optional()?
-    {
-        Ok(time_reserved)
-    } else {
-        Err(JobError::InvalidJobId(job_id.to_owned()))
-    }
 }
 
 fn get_job_output(
@@ -924,119 +612,6 @@ fn delete_job_output(
     }
 }
 
-fn get_job_status(
-    db: &Connection,
-    output_dir: &Path,
-    job_id: &JobId,
-) -> Result<JobStatus, JobError> {
-    let mut stmt = prepare_cached_and_bind!(
-        db,
-        "SELECT * FROM jobs NATURAL LEFT JOIN certs WHERE job_id = $job_id"
-    );
-    // |--SEARCH jobs USING INDEX sqlite_autoindex_jobs_1 (job_id=?)
-    // `--SEARCH certs USING INDEX sqlite_autoindex_certs_1 (key_id=?) LEFT-JOIN
-    let mut rows = stmt.raw_query();
-    if let Ok(Some(row)) = rows.next() {
-        let status = make_job_row_to_status(output_dir)(row)?;
-        assert!(
-            rows.next()?.is_none(),
-            "query on primary key should return at most one row"
-        );
-        Ok(status)
-    } else {
-        Err(JobError::InvalidJobId(job_id.to_owned()))
-    }
-}
-
-fn get_job_history(
-    db: &Connection,
-    output_dir: &Path,
-    start: Option<JobId>,
-    limit: NonZeroU32,
-) -> Result<Vec<JobStatus>, JobError> {
-    let mut stmt = if let Some(start) = start {
-        prepare_cached_and_bind!(
-            db,
-            "SELECT * FROM jobs NATURAL LEFT JOIN certs \
-             WHERE time_started < (SELECT time_started FROM jobs WHERE job_id=$start) \
-             ORDER by time_started DESC, time_reserved DESC \
-             LIMIT $limit"
-        )
-        // |--SEARCH jobs USING INDEX jobs_time_started (time_started<?)
-        // |--SCALAR SUBQUERY 1
-        // |  `--SEARCH jobs USING INDEX sqlite_autoindex_jobs_1 (job_id=?)
-        // |--SEARCH certs USING INDEX sqlite_autoindex_certs_1 (key_id=?) LEFT-JOIN
-        // `--USE TEMP B-TREE FOR LAST TERM OF ORDER BY
-    } else {
-        prepare_cached_and_bind!(
-            db,
-            "SELECT * FROM jobs NATURAL LEFT JOIN certs \
-             ORDER BY time_started DESC \
-             LIMIT $limit"
-        )
-        // |--SCAN jobs USING INDEX jobs_time_started
-        // `--SEARCH certs USING INDEX sqlite_autoindex_certs_1 (key_id=?) LEFT-JOIN
-    };
-
-    let job_row_to_status = make_job_row_to_status(output_dir);
-    let mut rows = stmt.raw_query();
-    let mut entries = Vec::new();
-    while let Some(row) = rows.next()? {
-        entries.push(job_row_to_status(row)?);
-    }
-    Ok(entries)
-}
-
-/// Return a closure over `output_dir` that constructs a [`JobStatus`]
-/// from a row in the `jobs` table.
-fn make_job_row_to_status(output_dir: &Path) -> impl Fn(&Row<'_>) -> Result<JobStatus, JobError> {
-    move |row| {
-        let job_id: JobId = row.get("job_id")?;
-        let get_verified_job = || -> Result<VerifiedJob, JobError> {
-            let cert = Certificate::from_der(&row.get::<_, Vec<u8>>("cert")?)?;
-            Ok(SignedJob::new(
-                JobStartRequest {
-                    job_id: job_id.clone(),
-                    command: row.get("command")?,
-                    interactive: row.get("interactive")?,
-                },
-                row.get("key_id")?,
-                row.get("signature")?,
-            )
-            .verify_with_cert(&cert)?)
-        };
-
-        if let Ok(time_ended) = row.get("time_ended") {
-            Ok(JobStatus::Ended {
-                job: get_verified_job()?,
-                time_reserved: row.get("time_reserved")?,
-                time_started: row.get("time_started")?,
-                time_ended,
-                status: row.get("status")?,
-                stdout_len: job_output_len(output_dir, &job_id, Stdout),
-                stderr_len: job_output_len(output_dir, &job_id, Stderr),
-                stdout_hash: row.get("stdout_hash")?,
-                stderr_hash: row.get("stderr_hash")?,
-            })
-        } else if let Ok(time_started) = row.get("time_started") {
-            Ok(JobStatus::Started {
-                job: get_verified_job()?,
-                time_reserved: row.get("time_reserved")?,
-                time_started,
-                stdout_len: job_output_len(output_dir, &job_id, Stdout),
-                stderr_len: job_output_len(output_dir, &job_id, Stderr),
-            })
-        } else if let Ok(time_reserved) = row.get("time_reserved") {
-            Ok(JobStatus::Reserved {
-                job_id: job_id.clone(),
-                time_reserved,
-            })
-        } else {
-            panic!("time_reserved should be NOT NULL")
-        }
-    }
-}
-
 #[cfg(test)]
 mod test {
     use std::time::Duration;
@@ -1044,7 +619,6 @@ mod test {
     use function_name::named;
     use pwd::Passwd;
     use rand_core::{OsRng, RngCore as _};
-    use rusqlite::limits::Limit;
     use slog::{Drain as _, o};
     use slog_term::{FullFormat, PlainSyncDecorator, TestStdoutWriter};
     use tempfile::TempDir;
@@ -1052,12 +626,10 @@ mod test {
     use x509_cert::name::Name;
     use x509_cert::time::Validity;
 
-    use sush_common::authn::{Challenge, ChallengeResponse};
-    use sush_common::jobs::JobLimits;
+    use sush_common::authn::{Challenge, ChallengeResponse, Credentials};
+    use sush_common::codephrases::generate_id;
+    use sush_common::jobs::{JobLimits, SessionId};
     use sush_common::keys::{EphemeralKey, KeyType, Signer as _};
-
-    #[allow(unused_imports)]
-    use crate::database::{open_database, open_database_in_memory};
 
     use super::*;
 
@@ -1114,7 +686,6 @@ mod test {
     ) {
         let JobStatus::Started {
             job,
-            time_reserved,
             time_started,
             stdout_len: _,
             stderr_len: _,
@@ -1124,7 +695,6 @@ mod test {
         };
         assert_eq!(job.job_id, *expected_job_id);
         assert_eq!(job.command, expected_command);
-        assert!(time_reserved < time_started);
         assert!(time_started < Utc::now());
         job.into_signed().verify_with_cert(cert).unwrap();
     }
@@ -1139,7 +709,6 @@ mod test {
     ) {
         let JobStatus::Ended {
             job,
-            time_reserved,
             time_started,
             time_ended,
             status,
@@ -1153,7 +722,6 @@ mod test {
         };
         assert_eq!(job.job_id, *expected_job_id);
         assert_eq!(job.command, expected_command);
-        assert!(time_reserved < time_started);
         assert!(time_started < time_ended);
         assert!(time_ended < Utc::now());
         assert_eq!(status, expected_status);
@@ -1161,29 +729,29 @@ mod test {
         assert_eq!(stderr_len, expected_stderr_len);
     }
 
-    async fn manager_and_test_root(
-        db: Option<&str>,
-        test_name: &'static str,
-    ) -> (JobManager, EphemeralKey, TempDir) {
-        let db = if let Some(db) = db {
-            open_database(db).unwrap()
-        } else {
-            open_database_in_memory().unwrap()
-        };
-        db.set_limit(Limit::SQLITE_LIMIT_LENGTH, 10_000).unwrap();
+    async fn manager_and_test_root(test_name: &'static str) -> (JobManager, EphemeralKey, TempDir) {
         let decorator = PlainSyncDecorator::new(TestStdoutWriter);
         let drain = FullFormat::new(decorator).build().fuse();
         let dir = TempDir::with_prefix("sush-").unwrap();
         let log = Logger::root(drain, o!("test" => test_name));
-        let mgr = JobManager::new(log, db, dir.path()).await.unwrap();
+        let mgr = JobManager::new(log, dir.path()).await.unwrap();
         let root = ephemeral_test_root();
-        let key_id = mgr.import_root(root.cert()).await.unwrap();
+        let key_id = mgr.import_root(root.cert().to_owned()).unwrap();
         assert_eq!(&key_id, root.key_id());
         (mgr, root, dir)
     }
 
-    async fn job_status(mgr: &JobManager, job: SignedJob) -> JobStatus {
-        mgr.job_start(job, JobStartParams::wait(), None)
+    async fn fake_identity(key: &mut EphemeralKey) -> Identity {
+        let nonce = Nonce::generate();
+        let challenge = Challenge::new(nonce.clone());
+        let response = ChallengeResponse::new(challenge);
+        let signed = key.sign(response).await.unwrap();
+        let verified = signed.verify_with_cert(key.cert()).unwrap();
+        Identity::new(key.ssh_public_key(), verified).unwrap()
+    }
+
+    async fn job_status(authn: &Identity, mgr: &JobManager, job: SignedJob) -> JobStatus {
+        mgr.job_start(authn, job, JobStartParams::wait())
             .await
             .expect("should be able to start job")
             .expect("should be waiting for job")
@@ -1191,8 +759,8 @@ mod test {
             .into()
     }
 
-    async fn job_error(mgr: &JobManager, job: SignedJob) -> JobError {
-        mgr.job_start(job, JobStartParams::wait(), None)
+    async fn job_error(authn: &Identity, mgr: &JobManager, job: SignedJob) -> JobError {
+        mgr.job_start(authn, job, JobStartParams::wait())
             .await
             .expect_err("job should end with an error")
     }
@@ -1200,49 +768,39 @@ mod test {
     #[named]
     #[tokio::test]
     async fn jobs() {
-        let (mgr, mut root, _dir) = manager_and_test_root(None, function_name!()).await;
-        let JobsReserved {
-            mut job_ids,
-            time_reserved,
-        } = mgr.reserve_jobs(5).await.unwrap();
-        assert_eq!(job_ids.len(), 5);
-        assert!(time_reserved < Utc::now());
-
-        let reserved = mgr.get_reserved().await.unwrap();
-        for job_id in &job_ids {
-            assert_eq!(reserved[job_id], time_reserved);
-        }
-
-        let job_id = job_ids.pop().unwrap();
+        let (mgr, mut root, _dir) = manager_and_test_root(function_name!()).await;
+        let authn = fake_identity(&mut root).await;
+        let session_id = SessionId::new();
+        let job_id = session_id.first_job_id();
         let job = root.sign_job_request(&job_id, "true", None).await;
         assert!(matches!(
-            mgr.job_status(&job_id).await.unwrap(),
-            JobStatus::Reserved { job_id: id, time_reserved }
-            if id == job_id && time_reserved < Utc::now(),
+            mgr.job_status(&authn, &job_id),
+            JobStatus::Unknown { job_id: id }
+            if id == job_id
         ));
-        let status = job_status(&mgr, job.clone()).await;
+        let status = job_status(&authn, &mgr, job.clone()).await;
         check_status_ended(status, &job_id, "true", Some(0), 0, 0);
 
         assert!(
             matches!(
-                job_error(&mgr, job).await,
+                job_error(&authn, &mgr, job.clone()).await,
                 JobError::InvalidJobId(ref id) if *id == job_id
             ),
             "should not be allowed to reuse a job ID"
         );
 
-        let job_id = job_ids.pop().unwrap();
+        let job_id = session_id.next_job_id(&job).unwrap();
         let job = root.sign_job_request(&job_id, "false", None).await;
-        let status = job_status(&mgr, job).await;
+        let status = job_status(&authn, &mgr, job.clone()).await;
         check_status_ended(status, &job_id, "false", Some(1), 0, 0);
 
-        let job_id = job_ids.pop().unwrap();
+        let job_id = session_id.next_job_id(&job).unwrap();
         let job_id_string = job_id.to_string();
         let job_id_bytes = job_id_string.as_bytes();
         let job = root
             .sign_job_request(&job_id, "echo -n $SUSH_JOB_ID", None)
             .await;
-        let status = job_status(&mgr, job).await;
+        let status = job_status(&authn, &mgr, job.clone()).await;
         check_status_ended(
             status,
             &job_id,
@@ -1252,11 +810,11 @@ mod test {
             0,
         );
         assert_eq!(
-            mgr.job_output(&job_id, Stdout, None).await.unwrap(),
+            mgr.job_output(&authn, &job_id, Stdout, None).await.unwrap(),
             job_id_bytes
         );
         assert!(
-            mgr.job_output(&job_id, Stderr, None)
+            mgr.job_output(&authn, &job_id, Stderr, None)
                 .await
                 .unwrap()
                 .is_empty()
@@ -1264,80 +822,35 @@ mod test {
 
         let home = Passwd::current_user().unwrap().dir;
         let pwd = format!("{home}\n");
-        let job_id = job_ids.pop().unwrap();
+        let job_id = session_id.next_job_id(&job).unwrap();
         let job = root.sign_job_request(&job_id, "pwd", None).await;
-        let status = job_status(&mgr, job).await;
+        let status = job_status(&authn, &mgr, job).await;
         check_status_ended(status, &job_id, "pwd", Some(0), pwd.len() as u64, 0);
         assert_eq!(
-            mgr.job_output(&job_id, Stdout, None).await.unwrap(),
+            mgr.job_output(&authn, &job_id, Stdout, None).await.unwrap(),
             pwd.as_bytes(),
         );
         assert!(
-            mgr.job_output(&job_id, Stderr, None)
+            mgr.job_output(&authn, &job_id, Stderr, None)
                 .await
                 .unwrap()
                 .is_empty()
         );
-
-        assert_eq!(mgr.revoke_reserved(job_ids.clone()).await.unwrap(), job_ids);
-    }
-
-    #[named]
-    #[tokio::test]
-    async fn revoke() {
-        let (mgr, mut root, _dir) = manager_and_test_root(None, function_name!()).await;
-        let (job_id, time_reserved) = mgr.reserve_one().await.unwrap();
-        let job_ids = vec![job_id.clone()];
-        assert_eq!(mgr.revoke_reserved(job_ids.clone()).await.unwrap(), job_ids);
-        assert!(mgr.revoke_reserved(job_ids).await.unwrap().is_empty());
-
-        let job = root.sign_job_request(&job_id, "false", None).await;
-        assert!(
-            matches!(
-                job_error(&mgr, job).await,
-                JobError::InvalidJobId(ref id) if *id == job_id
-            ),
-            "should not be allowed to start a revoked job"
-        );
-        assert!(
-            matches!(
-                mgr.job_status(&job_id).await.unwrap_err(),
-                JobError::InvalidJobId(id) if id == job_id
-            ),
-            "revoked jobs should not have a status"
-        );
-
-        let (new_job_id, new_time_reserved) = mgr.reserve_one().await.unwrap();
-        assert_ne!(new_job_id, job_id);
-        assert!(new_time_reserved > time_reserved);
-
-        let job_ids = vec![job_id.clone(), new_job_id.clone()];
-        assert_eq!(
-            mgr.revoke_reserved(job_ids.clone()).await.unwrap(),
-            vec![new_job_id],
-            "old job was previously revoked"
-        );
-        assert!(mgr.revoke_reserved(job_ids).await.unwrap().is_empty());
-
-        let JobsReserved {
-            job_ids,
-            time_reserved: _,
-        } = mgr.reserve_jobs(100).await.unwrap();
-        assert_eq!(mgr.revoke_reserved(job_ids.clone()).await.unwrap(), job_ids);
-        assert!(mgr.revoke_reserved(job_ids).await.unwrap().is_empty());
     }
 
     #[named]
     #[tokio::test]
     async fn abort() {
-        let (mgr, mut root, _dir) = manager_and_test_root(None, function_name!()).await;
-        let (job_id, _time_reserved) = mgr.reserve_one().await.unwrap();
+        let (mgr, mut root, _dir) = manager_and_test_root(function_name!()).await;
+        let authn = fake_identity(&mut root).await;
+        let session_id = SessionId::new();
+        let job_id = session_id.first_job_id();
 
         // Start a long-running job.
         let command = "sleep 10";
         let job = root.sign_job_request(&job_id, command, None).await;
         assert!(
-            mgr.job_start(job, JobStartParams::default(), None)
+            mgr.job_start(&authn, job, JobStartParams::default())
                 .await
                 .expect("should be able to start job")
                 .is_none(),
@@ -1345,15 +858,15 @@ mod test {
         );
 
         // Check that the job is alive.
-        let status = mgr.job_status(&job_id).await.unwrap();
+        let status = mgr.job_status(&authn, &job_id);
         check_status_started(status, root.cert(), &job_id, command);
 
         // Kill the job and wait for it to die.
-        mgr.job_abort(&job_id).await.unwrap();
+        mgr.job_abort(&authn, &job_id).await.unwrap();
         sleep(Duration::from_millis(10)).await;
 
         // Check that it's dead and that it didn't live for long.
-        let status = mgr.job_status(&job_id).await.unwrap();
+        let status = mgr.job_status(&authn, &job_id);
         assert!(status.time_elapsed().unwrap().to_std().unwrap() < Duration::from_secs(1));
         check_status_ended(status, &job_id, command, None, 0, 0);
     }
@@ -1382,50 +895,57 @@ mod test {
         assert_ne!(child.key_id(), &root_key_id);
         let child_key_id = child.key_id().to_owned();
 
-        let db = open_database_in_memory().unwrap();
+        let authn = fake_identity(&mut root).await;
         let dir = TempDir::with_prefix("sush-").unwrap();
         let log = Logger::root(slog::Discard, slog::o!("test" => function_name!()));
-        let mgr = JobManager::new(log, db, dir.path()).await.unwrap();
+        let mgr = JobManager::new(log, dir.path()).await.unwrap();
         assert!(
             matches!(
-                mgr.import_cert(&root_cert).await.unwrap_err(),
+                mgr.import_cert(&authn, root_cert.clone()).unwrap_err(),
                 JobError::Key(KeyError::SelfSigned),
             ),
             "should not accept root cert without override"
         );
         assert!(
             matches!(
-                mgr.import_cert(child.cert()).await.unwrap_err(),
+                mgr.import_cert(&authn, child.cert().clone()).unwrap_err(),
                 JobError::MissingCert(key_id) if key_id == root_key_id,
             ),
             "should not accept child cert without root"
         );
-        assert_eq!(mgr.import_root(&root_cert).await.unwrap(), root_key_id);
+        assert_eq!(mgr.import_root(root_cert.clone()).unwrap(), root_key_id);
         assert_eq!(
-            mgr.cert_chain(&root_key_id).await.unwrap(),
+            mgr.cert_chain(&authn, &root_key_id).unwrap(),
             vec![root_cert.clone()]
         );
-        assert_eq!(mgr.import_cert(child.cert()).await.unwrap(), child_key_id);
         assert_eq!(
-            mgr.cert_chain(&child_key_id).await.unwrap(),
+            mgr.import_cert(&authn, child.cert().clone()).unwrap(),
+            child_key_id
+        );
+        assert_eq!(
+            mgr.cert_chain(&authn, &child_key_id).unwrap(),
             vec![root_cert.clone(), child.cert().clone()]
         );
 
-        let (job_id, _time_reserved) = mgr.reserve_one().await.unwrap();
+        let session_id = SessionId::new();
+        let job_id = session_id.first_job_id();
         let job = child.sign_job_request(&job_id, "true", None).await;
-        let status = job_status(&mgr, job).await;
+        let status = job_status(&authn, &mgr, job).await;
         check_status_ended(status, &job_id, "true", Some(0), 0, 0);
     }
 
     #[named]
     #[tokio::test]
     async fn too_much_cpu() {
-        let (mgr, mut root, _dir) = manager_and_test_root(None, function_name!()).await;
-        let (job_id, _time_reserved) = mgr.reserve_one().await.unwrap();
+        let (mgr, mut root, _dir) = manager_and_test_root(function_name!()).await;
+        let authn = fake_identity(&mut root).await;
+        let session_id = SessionId::new();
+        let job_id = session_id.first_job_id();
         let command = "openssl speed sha1";
         let job = root.sign_job_request(&job_id, command, None).await;
         let status = JobStatus::from(
             mgr.job_start(
+                &authn,
                 job,
                 JobStartParams {
                     limits: JobLimits {
@@ -1436,7 +956,6 @@ mod test {
                     wait: true,
                     ..Default::default()
                 },
-                None,
             )
             .await
             .expect("should be able to start job")
@@ -1446,7 +965,7 @@ mod test {
         assert!(status.time_elapsed().unwrap().to_std().unwrap() < Duration::from_secs(2));
 
         // The output of `openssl speed` changed between v3.0 and v3.5.
-        let stderr = mgr.job_output(&job_id, Stderr, None).await.unwrap();
+        let stderr = mgr.job_output(&authn, &job_id, Stderr, None).await.unwrap();
         let stderr = String::from_utf8_lossy(&stderr);
         match status {
             JobStatus::Ended { stderr_len: 37, .. } => {
@@ -1464,32 +983,31 @@ mod test {
     #[named]
     #[tokio::test]
     async fn output_ranges() {
-        let (mgr, mut root, _dir) = manager_and_test_root(None, function_name!()).await;
-        let JobsReserved {
-            mut job_ids,
-            time_reserved: _,
-        } = mgr.reserve_jobs(1).await.unwrap();
+        let (mgr, mut root, _dir) = manager_and_test_root(function_name!()).await;
+        let authn = fake_identity(&mut root).await;
+        let session_id = SessionId::new();
+        let job_id = session_id.first_job_id();
 
         // Read some random bytes.
         let n = 1000;
         let command = &format!("head -c {n} /dev/urandom");
-        let job_id = job_ids.pop().unwrap();
         let job = root.sign_job_request(&job_id, command, None).await;
-        let status = job_status(&mgr, job).await;
+        let status = job_status(&authn, &mgr, job).await;
         check_status_ended(status, &job_id, command, Some(0), n, 0);
 
         // No range, i.e., full output.
-        let r = mgr.job_output(&job_id, Stdout, None).await.unwrap();
+        let r = mgr.job_output(&authn, &job_id, Stdout, None).await.unwrap();
 
         // One byte too big.
         assert!(matches!(
             mgr.job_output(
+                &authn,
                 &job_id,
                 Stdout,
                 Some(Range {
                     start: StartPosition::Index(0),
                     end: EndPosition::Index(n),
-                })
+                }),
             )
             .await
             .unwrap_err(),
@@ -1499,12 +1017,13 @@ mod test {
         // Whole range.
         assert_eq!(
             mgr.job_output(
+                &authn,
                 &job_id,
                 Stdout,
                 Some(Range {
                     start: StartPosition::Index(0),
                     end: EndPosition::Index(n - 1),
-                })
+                }),
             )
             .await
             .unwrap(),
@@ -1514,6 +1033,7 @@ mod test {
         // Two half-ranges.
         let mut o = mgr
             .job_output(
+                &authn,
                 &job_id,
                 Stdout,
                 Some(Range {
@@ -1525,6 +1045,7 @@ mod test {
             .unwrap();
         o.extend(
             mgr.job_output(
+                &authn,
                 &job_id,
                 Stdout,
                 Some(Range {
@@ -1544,6 +1065,7 @@ mod test {
             while i + l < n {
                 o.extend(
                     mgr.job_output(
+                        &authn,
                         &job_id,
                         Stdout,
                         Some(Range {
@@ -1558,6 +1080,7 @@ mod test {
             }
             o.extend(
                 mgr.job_output(
+                    &authn,
                     &job_id,
                     Stdout,
                     Some(Range {
@@ -1575,7 +1098,7 @@ mod test {
     #[named]
     #[tokio::test]
     async fn iam() {
-        let (mgr, mut root, _dir) = manager_and_test_root(None, function_name!()).await;
+        let (mgr, mut root, _dir) = manager_and_test_root(function_name!()).await;
         let JobError::Unauthorized(nonce) = mgr.iam(None, None).await.unwrap_err() else {
             panic!("should not be authorized yet");
         };
@@ -1618,7 +1141,7 @@ mod test {
         );
 
         // Revoke and check failure.
-        mgr.revoke_identity(key_id.clone(), &identity)
+        mgr.revoke_identity(&identity, key_id.clone())
             .await
             .unwrap();
         let JobError::Unauthorized(new_nonce) = mgr
@@ -1630,7 +1153,7 @@ mod test {
         };
         assert_ne!(new_nonce, nonce);
 
-        // Even fresh credentials fail.
+        // Even fresh credentials should fail.
         let challenge = Challenge::new(new_nonce);
         let response = ChallengeResponse::new(challenge);
         let signed = root.sign(response).await.unwrap();

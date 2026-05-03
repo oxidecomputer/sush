@@ -2,7 +2,6 @@
 //!
 //! Inherits most of its behavior from the (non-interactive) CLI.
 
-use std::collections::HashMap;
 use std::env;
 use std::ffi::OsString;
 use std::path::Path;
@@ -16,13 +15,13 @@ use shlex::split as split_command;
 use xdg::BaseDirectories;
 
 use sush_common::authn::Identity;
-use sush_common::jobs::{JobId, JobOutputStream, JobStatus, JobsReserved, SignedJob};
+use sush_common::jobs::{JobId, JobOutputStream, JobStatus, SignedJob};
 use sush_common::keys::{KeyId, SshPublicKey};
 
 use crate::Client;
 use crate::cli::Cli;
 use crate::commands::{
-    ClientCommand, CommandContext, CommandError, GlobalArgs, OutputFormat, Reserved, SUSH_JOB_ID,
+    ClientCommand, CommandContext, CommandError, GlobalArgs, OutputFormat, SUSH_JOB_ID,
     SUSH_OUTPUT_FORMAT, SUSH_URL,
 };
 
@@ -57,20 +56,14 @@ impl ReplCommandParser {
 #[derive(Debug, Default)]
 pub struct Repl {
     cli: Cli,
-    reserved: Vec<JobId>,
 }
 
 impl Repl {
     pub async fn run(
         mut self,
         args: &mut GlobalArgs,
-        client: Option<Client>,
+        _client: Option<Client>,
     ) -> Result<(), CommandError> {
-        if let Some(client) = client {
-            let map = client.get_reserved().send().await?.into_inner();
-            self.reserved_map(&map)?;
-        }
-
         let xdg = BaseDirectories::with_prefix(PREFIX);
         let history_file = xdg
             .place_state_file(HISTORY_FILE)
@@ -130,18 +123,6 @@ impl Repl {
         }
     }
 
-    /// Set the `SUSH_JOB_ID` environment variable to a reserved but unused job.
-    fn set_default_job_id(&mut self) {
-        self.set_job_id(self.reserved.first().cloned());
-    }
-
-    /// Remove `job_id` from the list of reserved jobs.
-    fn unreserve_job_id(&mut self, job_id: &JobId) {
-        if let Some(i) = self.reserved.iter().position(|j| j == job_id) {
-            self.reserved.remove(i);
-        }
-    }
-
     /// Make a prompt indicating online/offline status.
     fn prompt(&self, args: &GlobalArgs) -> String {
         let offline = if args.url.is_some() { "" } else { " (offline)" };
@@ -194,12 +175,6 @@ impl CommandContext for Repl {
         set_or_unset!(url, SUSH_URL, "Server URL");
     }
 
-    fn pre_parse_hook(&mut self, command: &str) {
-        if matches!(command, "job-start" | "start") {
-            self.set_default_job_id();
-        }
-    }
-
     fn ack(&mut self, url: &str, time: DateTime<Utc>) -> Result<(), CommandError> {
         self.cli.ack(url, time)
     }
@@ -215,7 +190,6 @@ impl CommandContext for Repl {
     fn job_aborted(&mut self, job_id: &JobId) -> Result<(), CommandError> {
         self.set_job_id(Some(job_id.to_owned()));
         self.cli.job_aborted(job_id)?;
-        self.unreserve_job_id(job_id);
         Ok(())
     }
 
@@ -306,53 +280,17 @@ impl CommandContext for Repl {
 
     fn job_signed(&mut self, job: &SignedJob) -> Result<(), CommandError> {
         self.cli.job_signed(job)?;
-        self.unreserve_job_id(job.job_id());
         Ok(())
     }
 
     fn job_status(&mut self, job_id: &JobId, status: &JobStatus) -> Result<(), CommandError> {
         self.set_job_id(Some(job_id.to_owned()));
         self.cli.job_status(job_id, status)?;
-        self.unreserve_job_id(job_id);
-        Ok(())
-    }
-
-    fn jobs_reserved(&mut self, reserved: &JobsReserved) -> Result<(), CommandError> {
-        self.cli.jobs_reserved(reserved)?;
-        self.reserved = reserved.job_ids.clone();
         Ok(())
     }
 
     fn read_signed_job(&mut self) -> Result<SignedJob, CommandError> {
         self.cli.read_signed_job()
-    }
-
-    fn read_reserved(&mut self) -> Result<Reserved, CommandError> {
-        self.cli.read_reserved()
-    }
-
-    fn reserved_read(&mut self, reserved: &JobsReserved) -> Result<(), CommandError> {
-        self.cli.reserved_read(reserved)?;
-        self.reserved = reserved.job_ids.clone();
-        Ok(())
-    }
-
-    fn reserved_map(
-        &mut self,
-        reserved: &HashMap<String, DateTime<Utc>>,
-    ) -> Result<(), CommandError> {
-        self.cli.reserved_map(reserved)?;
-        self.reserved = reserved.keys().map(JobId::from).collect();
-        if let Some(job_id) = self.reserved.first() {
-            self.set_job_id(Some(job_id.to_owned()));
-        }
-        Ok(())
-    }
-
-    fn revoked(&mut self, revoked: &[JobId]) -> Result<(), CommandError> {
-        self.cli.revoked(revoked)?;
-        self.reserved.retain(|j| !revoked.contains(j));
-        Ok(())
     }
 
     fn iam(&mut self, identity: &Identity) -> Result<(), CommandError> {

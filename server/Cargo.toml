@@ -25,7 +25,6 @@ memmap2.workspace = true
 p256.workspace = true
 pwd.workspace = true
 rand_core.workspace = true
-rusqlite.workspace = true
 rustix.workspace = true
 schemars.workspace = true
 serde.workspace = true

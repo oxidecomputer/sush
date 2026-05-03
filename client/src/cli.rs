@@ -1,6 +1,5 @@
 //! Possibly-interactive command-line interface.
 
-use std::collections::HashMap;
 use std::io::{self, BufRead as _, Read as _, Write as _, stderr, stdin, stdout};
 use std::path::Path;
 use std::time::Duration;
@@ -15,10 +14,10 @@ use x509_cert::Certificate;
 use x509_cert::der::Encode as _;
 
 use sush_common::authn::Identity;
-use sush_common::jobs::{JobId, JobOutputStream, JobStatus, JobsReserved, SignedJob};
+use sush_common::jobs::{JobId, JobOutputStream, JobStatus, SignedJob};
 use sush_common::keys::{KeyId, Signature, SshPublicKey};
 
-use crate::commands::{CommandContext, CommandError, GlobalArgs, OutputFormat, Reserved};
+use crate::commands::{CommandContext, CommandError, GlobalArgs, OutputFormat};
 
 #[derive(Debug, Default)]
 pub struct Cli {
@@ -120,93 +119,12 @@ impl CommandContext for Cli {
         Ok(())
     }
 
-    #[allow(clippy::print_literal)]
-    fn reserved_map(
-        &mut self,
-        reserved: &HashMap<String, DateTime<Utc>>,
-    ) -> Result<(), CommandError> {
-        match self.get_output_format() {
-            OutputFormat::Json => println!("{}", json!(reserved)),
-            OutputFormat::Text => {
-                if reserved.is_empty() {
-                    println!("✅ No reserved jobs");
-                } else {
-                    println!("✅ {} reserved jobs:", reserved.len());
-                    for job_id in reserved.keys() {
-                        println!("{job_id}");
-                    }
-                }
-            }
-        }
-        Ok(())
-    }
-
     fn read_signed_job(&mut self) -> Result<SignedJob, CommandError> {
         let input = read_input(match self.get_output_format() {
             OutputFormat::Json => "",
             OutputFormat::Text => "✅ Enter signed job request, terminated with Ctrl-D:\n",
         })?;
         Ok(serde_json::from_str(&input)?)
-    }
-
-    fn read_reserved(&mut self) -> Result<Reserved, CommandError> {
-        let input = read_input(match self.get_output_format() {
-            OutputFormat::Json => "",
-            OutputFormat::Text => "✅ Enter reserved job IDs, terminated with Ctrl-D:\n",
-        })?;
-        if input.trim_start().starts_with('{') {
-            if let Ok(jobs) = serde_json::from_str(&input) {
-                Ok(Reserved::Batch(jobs))
-            } else if let Ok(map) = serde_json::from_str(&input) {
-                Ok(Reserved::Map(map))
-            } else {
-                Err(CommandError::InvalidReservedJobs)
-            }
-        } else {
-            Ok(Reserved::Batch(JobsReserved {
-                job_ids: input
-                    .split('\n')
-                    .map(|s| s.trim())
-                    .filter(|s| !s.is_empty())
-                    .map(JobId::from)
-                    .collect::<Vec<JobId>>(),
-                time_reserved: Utc::now(),
-            }))
-        }
-    }
-
-    fn reserved_read(&mut self, reserved: &JobsReserved) -> Result<(), CommandError> {
-        match self.get_output_format() {
-            OutputFormat::Json => println!("{}", json!(reserved)),
-            OutputFormat::Text => {
-                println!("✅ Read {} reserved jobs", reserved.job_ids.len());
-            }
-        }
-        Ok(())
-    }
-
-    fn jobs_reserved(&mut self, reserved: &JobsReserved) -> Result<(), CommandError> {
-        match self.get_output_format() {
-            OutputFormat::Json => println!("{}", json!(reserved)),
-            OutputFormat::Text => {
-                let JobsReserved {
-                    job_ids,
-                    time_reserved,
-                } = reserved;
-                let n = job_ids.len();
-                match n {
-                    0 => println!("✅ No jobs reserved"),
-                    1 => println!("✅ Reserved job `{}` at {}", job_ids[0], time_reserved),
-                    _ => {
-                        println!("✅ Reserved {n} jobs at {time_reserved}:");
-                        for job_id in &reserved.job_ids {
-                            println!("{job_id}");
-                        }
-                    }
-                }
-            }
-        }
-        Ok(())
     }
 
     fn job_aborted(&mut self, job_id: &JobId) -> Result<(), CommandError> {
@@ -433,16 +351,13 @@ impl CommandContext for Cli {
         match self.get_output_format() {
             OutputFormat::Json => println!("{}", json!(status)),
             OutputFormat::Text => match status {
-                JobStatus::Reserved {
+                JobStatus::Unknown {
                     job_id,
-                    time_reserved,
                 } => println!(
                     "✅ Job ID:\t{job_id}\n   \
-                     Job status:\tReserved\n   \
-                     Reserved at:\t{time_reserved}"
+                     Job status:\tUnknown"
                 ),
                 JobStatus::Started {
-                    time_reserved,
                     time_started,
                     stdout_len,
                     stderr_len,
@@ -453,7 +368,6 @@ impl CommandContext for Cli {
                     println!(
                         "✅ Job ID:\t{job_id}\n   \
                          Job status:\tStarted\n   \
-                         Reserved at:\t{time_reserved}\n   \
                          Started at:\t{time_started}\n   \
                          Stdout len:\t{stdout_len}\n   \
                          Stderr len:\t{stderr_len}"
@@ -461,7 +375,6 @@ impl CommandContext for Cli {
                 }
                 JobStatus::Ended {
                     job: _,
-                    time_reserved,
                     time_started,
                     time_ended,
                     status: Some(exit_status),
@@ -476,7 +389,6 @@ impl CommandContext for Cli {
                     println!(
                         "✅ Job ID:\t{job_id}\n   \
                          Job status:\tEnded\n   \
-                         Reserved at:\t{time_reserved}\n   \
                          Started at:\t{time_started}\n   \
                          Ended at:\t{time_ended} ({duration})\n   \
                          Status:\t{exit_status}\n   \
@@ -488,7 +400,6 @@ impl CommandContext for Cli {
                 }
                 JobStatus::Ended {
                     job: _,
-                    time_reserved,
                     time_started,
                     time_ended,
                     status: None,
@@ -503,7 +414,6 @@ impl CommandContext for Cli {
                     println!(
                         "✅ Job ID:\t{job_id}\n   \
                          Job status:\tAborted\n   \
-                         Reserved at:\t{time_reserved}\n   \
                          Started at:\t{time_started}\n   \
                          Aborted at:\t{time_ended} ({duration})\n   \
                          Stdout len:\t{stdout_len}\n   \
@@ -513,26 +423,6 @@ impl CommandContext for Cli {
                     );
                 }
             },
-        }
-        Ok(())
-    }
-
-    fn revoked(&mut self, revoked: &[JobId]) -> Result<(), CommandError> {
-        match self.get_output_format() {
-            OutputFormat::Json => println!("{}", json!(revoked)),
-            OutputFormat::Text => {
-                let n = revoked.len();
-                match n {
-                    0 => println!("✅ No jobs revoked"),
-                    1 => println!("✅ Revoked job `{}`", revoked[0]),
-                    _ => {
-                        println!("✅ Revoked {} jobs:", revoked.len());
-                        for job_id in revoked {
-                            println!("{job_id}");
-                        }
-                    }
-                }
-            }
         }
         Ok(())
     }

@@ -2,7 +2,6 @@
 //!
 //! May be executed via either the main CLI or the interactive REPL.
 
-use std::collections::HashMap;
 use std::fmt;
 use std::fs::{File, OpenOptions};
 use std::io::{Read as _, Seek as _, SeekFrom, Write as _, stdin};
@@ -32,9 +31,7 @@ use tokio_tungstenite::tungstenite::protocol::Role;
 
 use sush_common::authn::{AuthnError, Challenge, ChallengeResponse, Credentials, Identity};
 use sush_common::jobs::JobOutputStream::{self, Stderr, Stdout};
-use sush_common::jobs::{
-    JobId, JobLimits, JobOutputHash, JobStartRequest, JobStatus, JobsReserved, SignedJob,
-};
+use sush_common::jobs::{JobId, JobLimits, JobOutputHash, JobStartRequest, JobStatus, SignedJob};
 use sush_common::keys::{KeyError, KeyId, Signer as _, SshPublicKey};
 use sush_common::session::SessionError;
 
@@ -239,21 +236,6 @@ pub enum ClientCommand {
     /// Reserve zero job slots and display the reservation time.
     Ping,
 
-    /// Reserve some job slots with fresh, globally unique IDs.
-    #[clap(alias = "reserve")]
-    ReserveJobs {
-        /// How many job slots to reserve.
-        number: u8,
-    },
-
-    /// Get reserved but unused job slots.
-    #[clap(alias = "reserved")]
-    GetReserved,
-
-    /// Revoke a set of reserved but unused job slots.
-    #[clap(alias = "revoke")]
-    RevokeReserved { job_ids: Vec<JobId> },
-
     /// Sign and start a job.
     #[clap(alias = "start")]
     JobStart {
@@ -410,11 +392,6 @@ pub struct JobStartArgs {
     wait: bool,
 }
 
-pub enum Reserved {
-    Batch(JobsReserved),
-    Map(HashMap<String, DateTime<Utc>>),
-}
-
 /// Behavior in response to command execution, e.g., printing output,
 /// maintaining (ephemeral) state.
 pub trait CommandContext: Send + Sync {
@@ -423,6 +400,9 @@ pub trait CommandContext: Send + Sync {
     fn set_output_format(&mut self, output: OutputFormat);
     fn set_globals(&mut self, _args: &mut GlobalArgs, _values: GlobalArgs) {}
     fn pre_parse_hook(&mut self, _command: &str) {}
+
+    // Connection management
+    fn ack(&mut self, url: &str, time: DateTime<Utc>) -> Result<(), CommandError>;
 
     // Job signing certificates
     fn cert_chain(&mut self, key_id: KeyId, certs: &str) -> Result<(), CommandError>;
@@ -467,18 +447,7 @@ pub trait CommandContext: Send + Sync {
     fn job_signing_finished(&mut self, id: &JobId) -> Result<(), CommandError>;
     fn job_signed(&mut self, job: &SignedJob) -> Result<(), CommandError>;
     fn job_status(&mut self, id: &JobId, status: &JobStatus) -> Result<(), CommandError>;
-
-    // Job reservations
-    fn ack(&mut self, url: &str, time: DateTime<Utc>) -> Result<(), CommandError>;
-    fn jobs_reserved(&mut self, reserved: &JobsReserved) -> Result<(), CommandError>;
     fn read_signed_job(&mut self) -> Result<SignedJob, CommandError>;
-    fn read_reserved(&mut self) -> Result<Reserved, CommandError>;
-    fn reserved_read(&mut self, reserved: &JobsReserved) -> Result<(), CommandError>;
-    fn reserved_map(
-        &mut self,
-        reserved: &HashMap<String, DateTime<Utc>>,
-    ) -> Result<(), CommandError>;
-    fn revoked(&mut self, revoked: &[JobId]) -> Result<(), CommandError>;
 
     // SSH agent and identity
     fn iam(&mut self, identity: &Identity) -> Result<(), CommandError>;
@@ -546,31 +515,6 @@ impl ClientCommand {
             (ClientCommand::Ping, Some(client)) => {
                 let reserved = client.reserve_jobs().body(0).send().await?.into_inner();
                 ctx.ack(&client.baseurl, reserved.time_reserved)
-            }
-
-            (ClientCommand::ReserveJobs { number: n }, Some(client)) => {
-                let reserved = client.reserve_jobs().body(n).send().await?.into_inner();
-                ctx.jobs_reserved(&reserved)
-            }
-
-            (ClientCommand::GetReserved, None) => match ctx.read_reserved()? {
-                Reserved::Batch(reserved) => ctx.reserved_read(&reserved),
-                Reserved::Map(map) => ctx.reserved_map(&map),
-            },
-
-            (ClientCommand::GetReserved, Some(client)) => {
-                let map = client.get_reserved().send().await?.into_inner();
-                ctx.reserved_map(&map)
-            }
-
-            (ClientCommand::RevokeReserved { job_ids }, Some(client)) => {
-                let revoked = client
-                    .revoke_reserved()
-                    .body(job_ids)
-                    .send()
-                    .await?
-                    .into_inner();
-                ctx.revoked(&revoked)
             }
 
             (
