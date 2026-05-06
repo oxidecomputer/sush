@@ -29,15 +29,17 @@ use x509_cert::der::{DecodePem as _, Encode as _};
 
 use sush_api::JobStartParams;
 use sush_common::authn::{Credentials, Identity, Nonce};
+use sush_common::interactive::WindowSize;
 use sush_common::jobs::JobOutputStream::{self, Stderr, Stdout};
-use sush_common::jobs::{JobId, JobOutputHash, JobStartRequest, JobStatus, SignedJob, VerifiedJob};
+use sush_common::jobs::{
+    JobId, JobOutputHash, JobStartRequest, JobStatus, SessionId, SignedJob, VerifiedJob,
+};
 use sush_common::keys::{KeyError, KeyId, Signature, SshPublicKey};
-use sush_common::session::WindowSize;
 
 use crate::error::{ExecutionError, JobError};
+use crate::interactive::SocketSender;
 use crate::monitor::{ExecutionResult, JobMonitor, JobStarted, MonitorRequest};
 use crate::pty::Pty;
-use crate::session::SocketSender;
 
 /// Self-signed (root) X.509 certificates. Self-signed certificates may
 /// not be imported (except in test code), and so must be included here.
@@ -59,6 +61,7 @@ pub struct JobManager {
     nonce: Arc<Mutex<Nonce>>,
     identities: Arc<Mutex<BTreeMap<KeyId, Identity>>>,
     certs: Arc<Mutex<BTreeMap<KeyId, Certificate>>>,
+    session: Arc<Mutex<Option<SessionId>>>,
     jobs: Arc<Mutex<BTreeMap<JobId, JobStatus>>>,
     output_dir: PathBuf,
     tx_monitor: mpsc::Sender<MonitorRequest>,
@@ -88,6 +91,7 @@ impl JobManager {
             nonce: Arc::new(Mutex::new(Nonce::generate())),
             identities: Arc::new(Mutex::new(BTreeMap::new())),
             certs: Arc::new(Mutex::new(BTreeMap::new())),
+            session: Arc::new(Mutex::new(None)),
             jobs,
             output_dir: output_dir.to_owned(),
             tx_monitor,
@@ -101,7 +105,7 @@ impl JobManager {
         Ok(new)
     }
 
-    // Certificate management requests.
+    // Certificate management.
 
     #[cfg(test)]
     fn import_root(&self, root: Certificate) -> Result<KeyId, JobError> {
@@ -170,7 +174,7 @@ impl JobManager {
         Ok(chain)
     }
 
-    // Identity management requests.
+    // Identity management.
 
     pub async fn iam(
         &self,
@@ -204,27 +208,25 @@ impl JobManager {
         if let Some(authorization) = authorization
             && let Ok(credentials) = try_authn!(authorization.parse())
             && let Credentials { key_id, nonce, .. } = &credentials
-            && try_authn!(*nonce == *current_nonce, "invalid nonce")
             && let identity = identities.get(key_id)
-            && try_authn!(
-                identity.map(Identity::is_still_valid).unwrap_or(true),
-                "invalid identity"
-            )
-            && let Some(key) = identity.map(|i| &i.public_key).or(public_key.as_ref())
-            && let response = credentials.into_challenge_response()
-            && let Ok(verified) = try_authn!(response.verify_with_ssh_public_key(key))
-            && let Ok(identity) = try_authn!(Identity::new(key.to_owned(), verified))
+            && let now = Utc::now()
+            && let Some(public_key) = identity
+                .and_then(|i| {
+                    (try_authn!(i.time_revoked.is_none(), "credentials revoked")
+                        && try_authn!(i.is_still_valid(&now), "credentials expired"))
+                    .then_some(i.public_key.to_owned())
+                })
+                .or_else(|| {
+                    try_authn!(*nonce == *current_nonce, "invalid nonce")
+                        .then_some(public_key)
+                        .flatten()
+                })
+            && let response = credentials.clone().into_challenge_response()
+            && let Ok(verified) = try_authn!(response.verify_with_ssh_public_key(&public_key))
+            && let Ok(identity) = try_authn!(Identity::new(public_key.to_owned(), verified, now))
         {
-            let Identity {
-                key_id,
-                public_key,
-                nonce,
-                time_authenticated: _,
-                time_revoked: _,
-            } = &identity;
-            assert_eq!(public_key, key, "identity key should match index key");
             identities.insert(key_id.to_owned(), identity.to_owned());
-            info!(self.log, "authenticated credentials"; "nonce" => %nonce, "key_id" => %key_id);
+            info!(self.log, "authenticated credentials"; "key_id" => %key_id);
             Ok(identity)
         } else {
             let nonce = Nonce::generate();
@@ -239,7 +241,22 @@ impl JobManager {
         start: Option<KeyId>,
         limit: NonZeroU32,
     ) -> Result<Vec<Identity>, JobError> {
-        todo!("list identities")
+        let identities = self.identities.lock().unwrap();
+        let start = start
+            .map(|start| {
+                identities
+                    .keys()
+                    .position(|k| *k == start)
+                    .map(|i| i + 1)
+                    .unwrap_or(identities.len() - 1)
+            })
+            .unwrap_or(0);
+        Ok(identities
+            .iter()
+            .skip(start)
+            .take(limit.get() as usize)
+            .map(|(_id, identity)| identity.to_owned())
+            .collect())
     }
 
     pub async fn revoke_identity(&self, _authn: &Identity, key_id: KeyId) -> Result<(), JobError> {
@@ -252,7 +269,36 @@ impl JobManager {
         Ok(())
     }
 
-    // Job management requests.
+    // Session management.
+
+    pub async fn session_start(&self, authn: &Identity) -> Result<SessionId, JobError> {
+        // We don't want to hold the session lock while the old session is being stopped,
+        // so instead we'll error out if another session is started between stopping the
+        // old one and assigning the new one.
+        if let Some(old_session_id) = { self.session.lock().unwrap().take() } {
+            self.session_stop(authn, &old_session_id).await?;
+        }
+
+        let mut session = self.session.lock().unwrap();
+        if session.is_some() {
+            return Err(JobError::MultipleSessions);
+        }
+        let new_session_id = SessionId::new();
+        *session = Some(new_session_id.clone());
+        Ok(new_session_id)
+    }
+
+    pub async fn session_stop(
+        &self,
+        _authn: &Identity,
+        _session_id: &SessionId,
+    ) -> Result<(), JobError> {
+        // TODO: send session stop event
+        self.session.lock().unwrap().take();
+        Ok(())
+    }
+
+    // Job management.
 
     pub async fn job_history(
         &self,
@@ -260,7 +306,7 @@ impl JobManager {
         start: Option<JobId>,
         limit: NonZeroU32,
     ) -> Result<Vec<JobStatus>, JobError> {
-        todo!("get_job_history(&self.output_dir, start, limit)")
+        todo!("get_job_history({start:?}, {limit})")
     }
 
     pub async fn job_start(
@@ -302,10 +348,10 @@ impl JobManager {
         _authn: &Identity,
         job_id: &JobId,
     ) -> Result<SocketSender, JobError> {
-        let (tx_sender, rx_sender) = oneshot::channel();
-        self.monitor(MonitorRequest::Session(job_id.to_owned(), tx_sender))
+        let (tx, rx) = oneshot::channel();
+        self.monitor(MonitorRequest::interactive_session(job_id, tx))
             .await?;
-        rx_sender.await?
+        rx.await?
     }
 
     pub fn job_status(&self, _authn: &Identity, job_id: &JobId) -> JobStatus {
@@ -319,7 +365,7 @@ impl JobManager {
             })
     }
 
-    pub async fn job_abort(&self, _authn: &Identity, job_id: &JobId) -> Result<(), JobError> {
+    pub async fn job_stop(&self, _authn: &Identity, job_id: &JobId) -> Result<(), JobError> {
         self.monitor(MonitorRequest::Stop(job_id.to_owned())).await
     }
 
@@ -484,14 +530,13 @@ fn job_start(
             .env("USER", &pwd.name);
     }
 
-    let key_and_pty = if let Some(ref key_id) = interactive {
+    let pty = if interactive {
         // Create a pseudoterminal for interactive jobs and wire
         // the child up to it.
         let (pty, pts, pts_path) = Pty::open().map_err(|err| JobError::io("pty open", err))?;
         let pts_error = JobError::file_io_for(&pts_path);
         let pts_clone = || pts.try_clone().map_err(&pts_error);
         child
-            .env("SUSH_IDENTITY", key_id.to_string())
             .env("SUSH_TTY", &pts_path)
             .stdin(pts_clone()?)
             .stdout(pts_clone()?)
@@ -521,7 +566,7 @@ fn job_start(
             }
         };
 
-        Some((key_id.to_owned(), pty))
+        Some(pty)
     } else {
         // For batch jobs, close stdin and send output directly to files.
         child
@@ -542,7 +587,7 @@ fn job_start(
         job,
         time_started,
         child,
-        interactive: key_and_pty,
+        interactive: pty,
     })
 }
 
@@ -628,7 +673,7 @@ mod test {
 
     use sush_common::authn::{Challenge, ChallengeResponse, Credentials};
     use sush_common::codephrases::generate_id;
-    use sush_common::jobs::{JobLimits, SessionId};
+    use sush_common::jobs::JobLimits;
     use sush_common::keys::{EphemeralKey, KeyType, Signer as _};
 
     use super::*;
@@ -638,7 +683,7 @@ mod test {
             &mut self,
             job_id: &JobId,
             command: S,
-            interactive: Option<KeyId>,
+            interactive: bool,
         ) -> SignedJob;
     }
 
@@ -647,7 +692,7 @@ mod test {
             &mut self,
             job_id: &JobId,
             command: S,
-            interactive: Option<KeyId>,
+            interactive: bool,
         ) -> SignedJob {
             self.sign(JobStartRequest::new(
                 job_id.to_owned(),
@@ -747,7 +792,7 @@ mod test {
         let response = ChallengeResponse::new(challenge);
         let signed = key.sign(response).await.unwrap();
         let verified = signed.verify_with_cert(key.cert()).unwrap();
-        Identity::new(key.ssh_public_key(), verified).unwrap()
+        Identity::new(key.ssh_public_key(), verified, Utc::now()).unwrap()
     }
 
     async fn job_status(authn: &Identity, mgr: &JobManager, job: SignedJob) -> JobStatus {
@@ -770,9 +815,9 @@ mod test {
     async fn jobs() {
         let (mgr, mut root, _dir) = manager_and_test_root(function_name!()).await;
         let authn = fake_identity(&mut root).await;
-        let session_id = SessionId::new();
+        let session_id = mgr.session_start(&authn).await.unwrap();
         let job_id = session_id.first_job_id();
-        let job = root.sign_job_request(&job_id, "true", None).await;
+        let job = root.sign_job_request(&job_id, "true", false).await;
         assert!(matches!(
             mgr.job_status(&authn, &job_id),
             JobStatus::Unknown { job_id: id }
@@ -790,7 +835,7 @@ mod test {
         );
 
         let job_id = session_id.next_job_id(&job).unwrap();
-        let job = root.sign_job_request(&job_id, "false", None).await;
+        let job = root.sign_job_request(&job_id, "false", false).await;
         let status = job_status(&authn, &mgr, job.clone()).await;
         check_status_ended(status, &job_id, "false", Some(1), 0, 0);
 
@@ -798,7 +843,7 @@ mod test {
         let job_id_string = job_id.to_string();
         let job_id_bytes = job_id_string.as_bytes();
         let job = root
-            .sign_job_request(&job_id, "echo -n $SUSH_JOB_ID", None)
+            .sign_job_request(&job_id, "echo -n $SUSH_JOB_ID", false)
             .await;
         let status = job_status(&authn, &mgr, job.clone()).await;
         check_status_ended(
@@ -823,7 +868,7 @@ mod test {
         let home = Passwd::current_user().unwrap().dir;
         let pwd = format!("{home}\n");
         let job_id = session_id.next_job_id(&job).unwrap();
-        let job = root.sign_job_request(&job_id, "pwd", None).await;
+        let job = root.sign_job_request(&job_id, "pwd", false).await;
         let status = job_status(&authn, &mgr, job).await;
         check_status_ended(status, &job_id, "pwd", Some(0), pwd.len() as u64, 0);
         assert_eq!(
@@ -843,12 +888,12 @@ mod test {
     async fn abort() {
         let (mgr, mut root, _dir) = manager_and_test_root(function_name!()).await;
         let authn = fake_identity(&mut root).await;
-        let session_id = SessionId::new();
+        let session_id = mgr.session_start(&authn).await.unwrap();
         let job_id = session_id.first_job_id();
 
-        // Start a long-running job.
+        // Start a (potentially) long-running job.
         let command = "sleep 10";
-        let job = root.sign_job_request(&job_id, command, None).await;
+        let job = root.sign_job_request(&job_id, command, false).await;
         assert!(
             mgr.job_start(&authn, job, JobStartParams::default())
                 .await
@@ -862,7 +907,7 @@ mod test {
         check_status_started(status, root.cert(), &job_id, command);
 
         // Kill the job and wait for it to die.
-        mgr.job_abort(&authn, &job_id).await.unwrap();
+        mgr.job_stop(&authn, &job_id).await.unwrap();
         sleep(Duration::from_millis(10)).await;
 
         // Check that it's dead and that it didn't live for long.
@@ -927,9 +972,9 @@ mod test {
             vec![root_cert.clone(), child.cert().clone()]
         );
 
-        let session_id = SessionId::new();
+        let session_id = mgr.session_start(&authn).await.unwrap();
         let job_id = session_id.first_job_id();
-        let job = child.sign_job_request(&job_id, "true", None).await;
+        let job = child.sign_job_request(&job_id, "true", false).await;
         let status = job_status(&authn, &mgr, job).await;
         check_status_ended(status, &job_id, "true", Some(0), 0, 0);
     }
@@ -939,10 +984,10 @@ mod test {
     async fn too_much_cpu() {
         let (mgr, mut root, _dir) = manager_and_test_root(function_name!()).await;
         let authn = fake_identity(&mut root).await;
-        let session_id = SessionId::new();
+        let session_id = mgr.session_start(&authn).await.unwrap();
         let job_id = session_id.first_job_id();
         let command = "openssl speed sha1";
-        let job = root.sign_job_request(&job_id, command, None).await;
+        let job = root.sign_job_request(&job_id, command, false).await;
         let status = JobStatus::from(
             mgr.job_start(
                 &authn,
@@ -985,13 +1030,13 @@ mod test {
     async fn output_ranges() {
         let (mgr, mut root, _dir) = manager_and_test_root(function_name!()).await;
         let authn = fake_identity(&mut root).await;
-        let session_id = SessionId::new();
+        let session_id = mgr.session_start(&authn).await.unwrap();
         let job_id = session_id.first_job_id();
 
         // Read some random bytes.
         let n = 1000;
         let command = &format!("head -c {n} /dev/urandom");
-        let job = root.sign_job_request(&job_id, command, None).await;
+        let job = root.sign_job_request(&job_id, command, false).await;
         let status = job_status(&authn, &mgr, job).await;
         check_status_ended(status, &job_id, command, Some(0), n, 0);
 
@@ -1140,7 +1185,7 @@ mod test {
             key_id,
         );
 
-        // Revoke and check failure.
+        // Revoke and check for failure.
         mgr.revoke_identity(&identity, key_id.clone())
             .await
             .unwrap();
@@ -1153,7 +1198,7 @@ mod test {
         };
         assert_ne!(new_nonce, nonce);
 
-        // Even fresh credentials should fail.
+        // Fresh credentials should succeed.
         let challenge = Challenge::new(new_nonce);
         let response = ChallengeResponse::new(challenge);
         let signed = root.sign(response).await.unwrap();
@@ -1162,6 +1207,6 @@ mod test {
         credentials.key_id = key_id.clone(); // override cert key ID
         mgr.iam(Some(credentials.to_string()), Some(public_key.clone()))
             .await
-            .unwrap_err();
+            .unwrap();
     }
 }

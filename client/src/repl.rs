@@ -7,23 +7,23 @@ use std::ffi::OsString;
 use std::path::Path;
 use std::time::Duration;
 
-use chrono::{DateTime, Utc};
 use clap::Parser;
 use rustyline::DefaultEditor;
 use rustyline::error::ReadlineError;
 use shlex::split as split_command;
 use xdg::BaseDirectories;
 
-use sush_common::authn::Identity;
-use sush_common::jobs::{JobId, JobOutputStream, JobStatus, SignedJob};
+use sush_common::authn::{Credentials, Identity};
+use sush_common::jobs::{JobId, JobOutputStream, JobStatus, SessionId, SignedJob};
 use sush_common::keys::{KeyId, SshPublicKey};
 
 use crate::Client;
 use crate::cli::Cli;
 use crate::commands::{
-    ClientCommand, CommandContext, CommandError, GlobalArgs, OutputFormat, SUSH_JOB_ID,
+    ClientCommand, CommandError, GlobalArgs, SSH_AUTH_SOCK, SUSH_JOB_ID, SUSH_KEY_ID,
     SUSH_OUTPUT_FORMAT, SUSH_URL,
 };
+use crate::context::{CommandContext, OutputFormat};
 
 const PREFIX: &str = "sush";
 const HISTORY_FILE: &str = "history.txt";
@@ -90,7 +90,7 @@ impl Repl {
                         Ok(ReplCommandParser { command }) => command,
                         Err(err) => perr!("{err}"),
                     };
-                    match command.execute(args, &mut self).await {
+                    match command.execute(&mut self, args).await {
                         Ok(()) => (),
                         Err(CommandError::Quit) => break,
                         Err(err) => perr!("{err}"),
@@ -133,6 +133,8 @@ impl Repl {
 /// Most of these methods simply punt to those of [`Cli`] for display.
 /// But we do update local (ephemeral) state in response to some commands.
 impl CommandContext for Repl {
+    // Context management
+
     fn get_output_format(&self) -> OutputFormat {
         self.cli.get_output_format()
     }
@@ -148,6 +150,8 @@ impl CommandContext for Repl {
             text,
             mut url,
             offline,
+            ssh_auth_sock,
+            ssh_key_id,
         } = values;
         if json {
             output = Some(OutputFormat::Json);
@@ -173,11 +177,41 @@ impl CommandContext for Repl {
         }
         set_or_unset!(output, SUSH_OUTPUT_FORMAT, "Output format");
         set_or_unset!(url, SUSH_URL, "Server URL");
+        set_or_unset!(ssh_auth_sock, SSH_AUTH_SOCK, "SSH agent socket");
+        set_or_unset!(ssh_key_id, SUSH_KEY_ID, "SSH key ID");
     }
 
-    fn ack(&mut self, url: &str, time: DateTime<Utc>) -> Result<(), CommandError> {
-        self.cli.ack(url, time)
+    fn more(&self) -> bool {
+        self.cli.more()
     }
+
+    // Session management
+
+    fn get_credentials(&self) -> Option<(Credentials, SshPublicKey)> {
+        self.cli.get_credentials()
+    }
+
+    fn set_credentials(&mut self, credentials: Option<(Credentials, SshPublicKey)>) {
+        self.cli.set_credentials(credentials)
+    }
+
+    fn session_id(&self) -> Option<&SessionId> {
+        self.cli.session_id()
+    }
+
+    fn job_id(&mut self) -> Result<JobId, CommandError> {
+        self.cli.job_id()
+    }
+
+    fn session_started(&mut self, session_id: &SessionId) -> Result<(), CommandError> {
+        self.cli.session_started(session_id)
+    }
+
+    fn session_stopped(&mut self, session_id: &SessionId) -> Result<(), CommandError> {
+        self.cli.session_stopped(session_id)
+    }
+
+    // Job signing certificates
 
     fn cert_chain(&mut self, key_id: KeyId, certs: &str) -> Result<(), CommandError> {
         self.cli.cert_chain(key_id, certs)
@@ -187,9 +221,11 @@ impl CommandContext for Repl {
         self.cli.cert_imported(path, key_id)
     }
 
-    fn job_aborted(&mut self, job_id: &JobId) -> Result<(), CommandError> {
+    // Job management
+
+    fn job_stopped(&mut self, job_id: &JobId) -> Result<(), CommandError> {
         self.set_job_id(Some(job_id.to_owned()));
-        self.cli.job_aborted(job_id)?;
+        self.cli.job_stopped(job_id)?;
         Ok(())
     }
 
@@ -278,8 +314,8 @@ impl CommandContext for Repl {
         self.cli.job_signing_finished(job_id)
     }
 
-    fn job_signed(&mut self, job: &SignedJob) -> Result<(), CommandError> {
-        self.cli.job_signed(job)?;
+    fn job_signed(&mut self, job: &SignedJob, show: bool) -> Result<(), CommandError> {
+        self.cli.job_signed(job, show)?;
         Ok(())
     }
 
@@ -292,6 +328,8 @@ impl CommandContext for Repl {
     fn read_signed_job(&mut self) -> Result<SignedJob, CommandError> {
         self.cli.read_signed_job()
     }
+
+    // SSH agent and identity
 
     fn iam(&mut self, identity: &Identity) -> Result<(), CommandError> {
         self.cli.iam(identity)

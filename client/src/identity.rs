@@ -24,9 +24,12 @@ pub struct SshAgentConnection {
 impl SshAgentConnection {
     const BUFFER_SIZE: usize = 0x1000;
 
-    pub async fn connect(path: &Path) -> Result<SshAgentConnection, IdentityError> {
-        let io_err = |err| IdentityError::file_io(path, err);
-        let path = path.to_owned();
+    pub async fn connect<P>(path: P) -> Result<SshAgentConnection, IdentityError>
+    where
+        P: AsRef<Path>,
+    {
+        let path = path.as_ref().to_owned();
+        let io_err = |err| IdentityError::file_io(&path, err);
         let sock = UnixStream::connect(&path).await.map_err(io_err)?;
         Ok(Self {
             path,

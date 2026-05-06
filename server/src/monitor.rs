@@ -19,15 +19,14 @@ use tokio::sync::{mpsc, oneshot};
 use tokio::task::JoinSet;
 use tokio::{select, spawn};
 
+use sush_common::interactive::InteractiveSessionError;
 use sush_common::jobs::JobOutputStream::{Stderr, Stdout};
 use sush_common::jobs::{JobId, JobOutputHash, JobStatus, VerifiedJob};
-use sush_common::keys::KeyId;
-use sush_common::session::SessionError;
 
 use crate::error::{ExecutionError, JobError};
+use crate::interactive::{InteractiveSession, SocketSender};
 use crate::manager::{job_output_hash, job_output_len, job_output_path};
 use crate::pty::Pty;
-use crate::session::{Session, SocketSender};
 
 /// The monitor runs as a tokio task that communicates with the manager
 /// via message passing. It does not have a connection to the database.
@@ -80,7 +79,7 @@ impl JobMonitor {
                                 }};
                             }
                             match req {
-                                MonitorRequest::Session(job_id, sender) => {
+                                MonitorRequest::InteractiveSession(job_id, sender) => {
                                     watch!(job_id, monitor, monitor.session(&job_id, sender))
                                 }
                                 MonitorRequest::Started(event, watcher) => {
@@ -129,8 +128,8 @@ impl JobMonitor {
             Ok(())
         } else {
             error!(self.log, "failed to start session, job ended"; "job_id" => %job_id);
-            let _ = sender.send(Err(JobError::Session(SessionError::JobEnded)));
-            Err(JobError::Session(SessionError::JobEnded))
+            let _ = sender.send(Err(InteractiveSessionError::JobEnded.into()));
+            Err(InteractiveSessionError::JobEnded.into())
         }
     }
 
@@ -144,8 +143,8 @@ impl JobMonitor {
         }: JobStarted,
     ) -> Result<(), JobError> {
         let job_id = job.job_id().to_owned();
-        let (session, shutdown) = if let Some((key_id, pty)) = interactive {
-            self.interactive_job(&job_id, &key_id, pty, child)?
+        let (session, shutdown) = if let Some(pty) = interactive {
+            self.interactive_job(&job_id, pty, child)?
         } else {
             self.batch_job(child)
         };
@@ -189,7 +188,6 @@ impl JobMonitor {
     fn interactive_job(
         &mut self,
         job_id: &JobId,
-        key_id: &KeyId,
         pty: Pty,
         child: Child,
     ) -> Result<(PinnedSession, Shutdown), JobError> {
@@ -200,8 +198,8 @@ impl JobMonitor {
             .write(true)
             .open(&path)
             .map_err(&io_error)?;
-        let log = self.log.new(o!("interactive" => key_id.to_string()));
-        let (session, shutdown) = Session::start(log, child, pty, output_file.into());
+        let log = self.log.new(o!("interactive" => true));
+        let (session, shutdown) = InteractiveSession::start(log, child, pty, output_file.into());
         assert!(
             self.sessions
                 .insert(job_id.to_owned(), session.clients())
@@ -245,14 +243,14 @@ type Watcher = oneshot::Sender<ExecutionResult>;
 
 /// Request sent from the manager to the monitor.
 pub enum MonitorRequest {
-    Session(JobId, SocketSenderSender),
+    InteractiveSession(JobId, SocketSenderSender),
     Started(Box<JobStarted>, Watcher),
     Stop(JobId),
 }
 
 impl MonitorRequest {
-    pub fn session(job_id: JobId, sender: SocketSenderSender) -> Self {
-        Self::Session(job_id, sender)
+    pub fn interactive_session(job_id: &JobId, sender: SocketSenderSender) -> Self {
+        Self::InteractiveSession(job_id.to_owned(), sender)
     }
 
     pub fn started(job_started: JobStarted, watcher: Watcher) -> Self {
@@ -271,7 +269,7 @@ pub struct JobStarted {
     pub job: VerifiedJob,
     pub time_started: DateTime<Utc>,
     pub child: Child,
-    pub interactive: Option<(KeyId, Pty)>,
+    pub interactive: Option<Pty>,
 }
 
 impl JobStarted {

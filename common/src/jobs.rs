@@ -18,7 +18,7 @@ use serde::{Deserialize, Serialize, Serializer};
 use thiserror::Error;
 
 use crate::codephrases::{WORD_SEPARATOR, generate_id, id_phrase};
-use crate::keys::{KeyId, Signed, ToBeSigned, Verified};
+use crate::keys::{Signed, ToBeSigned, Verified};
 
 /// A globally unique identifier for a job within a session.
 #[derive(
@@ -88,6 +88,12 @@ impl SessionId {
     }
 }
 
+impl Default for SessionId {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl Deref for SessionId {
     type Target = str;
 
@@ -102,19 +108,35 @@ impl fmt::Display for SessionId {
     }
 }
 
+impl From<&Self> for SessionId {
+    fn from(other: &Self) -> Self {
+        other.to_owned()
+    }
+}
+
+impl<S: AsRef<str>> From<S> for SessionId {
+    fn from(s: S) -> Self {
+        Self(s.as_ref().to_string())
+    }
+}
+
 /// A request to run the given `command` as `job_id`.
 #[derive(Clone, Debug, Deserialize, JsonSchema, Serialize)]
 pub struct JobStartRequest {
     pub job_id: JobId,
     pub command: String,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub interactive: Option<KeyId>,
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub interactive: bool,
+}
+
+fn is_false(x: &bool) -> bool {
+    !x
 }
 
 impl JobStartRequest {
     const TYPE_NAME: &[u8] = b"sush_common::jobs::JobStartRequest";
 
-    pub fn new<S: AsRef<str>>(job_id: JobId, command: S, interactive: Option<KeyId>) -> Self {
+    pub fn new<S: AsRef<str>>(job_id: JobId, command: S, interactive: bool) -> Self {
         Self {
             job_id,
             command: command.as_ref().to_string(),
@@ -130,8 +152,8 @@ impl JobStartRequest {
         &self.command
     }
 
-    pub fn interactive(&self) -> Option<&KeyId> {
-        self.interactive.as_ref()
+    pub fn interactive(&self) -> bool {
+        self.interactive
     }
 }
 
@@ -152,9 +174,7 @@ impl ToBeSigned for JobStartRequest {
         hash(Self::TYPE_NAME);
         hash(job_id.as_bytes());
         hash(command.as_bytes());
-        if let Some(interactive) = interactive {
-            hash(interactive.as_bytes());
-        }
+        hash(if *interactive { &[1] } else { &[0] });
         hasher.finalize().as_bytes().to_vec()
     }
 }

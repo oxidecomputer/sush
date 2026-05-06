@@ -2,10 +2,9 @@
 //!
 //! May be executed via either the main CLI or the interactive REPL.
 
-use std::fmt;
 use std::fs::{File, OpenOptions};
 use std::io::{Read as _, Seek as _, SeekFrom, Write as _, stdin};
-use std::num::{NonZeroU8, NonZeroU64};
+use std::num::{NonZeroU8, NonZeroU32, NonZeroU64};
 use std::path::{Path, PathBuf};
 use std::pin::Pin;
 use std::time::Duration;
@@ -13,10 +12,10 @@ use std::time::Duration;
 use async_recursion::async_recursion;
 use blake3::{Hasher, hash};
 use bytesize::ByteSize;
-use chrono::{DateTime, Utc};
-use clap::{Parser, Subcommand, ValueEnum};
+use clap::{Parser, Subcommand};
 use futures::{FutureExt as _, StreamExt as _};
 use futures::{TryStreamExt as _, stream};
+use http::header::WWW_AUTHENTICATE;
 use http::status::StatusCode;
 use memmap2::Mmap;
 use reqwest::Upgraded;
@@ -29,18 +28,21 @@ use tokio_tungstenite::WebSocketStream;
 use tokio_tungstenite::tungstenite::error::Error as WebSocketError;
 use tokio_tungstenite::tungstenite::protocol::Role;
 
-use sush_common::authn::{AuthnError, Challenge, ChallengeResponse, Credentials, Identity};
+use sush_common::authn::{AuthnError, Challenge, ChallengeResponse, Credentials};
+use sush_common::interactive::InteractiveSessionError;
 use sush_common::jobs::JobOutputStream::{self, Stderr, Stdout};
-use sush_common::jobs::{JobId, JobLimits, JobOutputHash, JobStartRequest, JobStatus, SignedJob};
+use sush_common::jobs::{
+    JobId, JobLimits, JobOutputHash, JobStartRequest, JobStatus, SessionId, SignedJob,
+};
 use sush_common::keys::{KeyError, KeyId, Signer as _, SshPublicKey};
-use sush_common::session::SessionError;
 
 use crate::ByteStream;
+use crate::context::{CommandContext, OutputFormat};
 use crate::identity::{IdentityError, SshAgentConnection};
+use crate::interactive::interactive_session;
 use crate::permslip::PermslipError;
 use crate::permslip::{DEFAULT_PERMSLIP_URL, PermslipSigner};
 use crate::repl::Repl;
-use crate::session::session;
 use crate::types::Error as ApiError;
 use crate::{Client, Error as ClientError};
 
@@ -60,31 +62,11 @@ pub const SUSH_URL: &str = "SUSH_URL";
 /// Default chunk size for parallel downloads of large output.
 const DEFAULT_CHUNK_SIZE: ByteSize = ByteSize::mib(32);
 
+/// Default number of elements in a page of results.
+const DEFAULT_PAGE_LIMIT: NonZeroU32 = NonZeroU32::new(100).unwrap();
+
 /// Default number of simultaneous downloads for large output.
 const PARALLEL_CHUNKS: NonZeroU8 = NonZeroU8::new(8).unwrap();
-
-/// What kind of output to emit.
-#[derive(Clone, Copy, Debug, Default, ValueEnum)]
-pub enum OutputFormat {
-    #[default]
-    Text,
-    Json,
-}
-
-impl OutputFormat {
-    pub fn as_str(&self) -> &'static str {
-        match self {
-            Self::Text => "text",
-            Self::Json => "json",
-        }
-    }
-}
-
-impl fmt::Display for OutputFormat {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "{}", self.as_str())
-    }
-}
 
 /// Process limits for job execution.
 #[derive(Clone, Debug, Parser)]
@@ -151,6 +133,14 @@ pub struct GlobalArgs {
     #[arg(long, default_value_t = false, conflicts_with = "url")]
     #[clap(global = true)]
     pub offline: bool,
+
+    /// Path to the SSH authentication agent Unix-domain socket.
+    #[arg(long, env = SSH_AUTH_SOCK)]
+    pub ssh_auth_sock: Option<String>,
+
+    /// Authenticate as this SSH identity (try `iam -l` for a list).
+    #[arg(short, long, env = SUSH_KEY_ID)]
+    pub ssh_key_id: Option<KeyId>,
 }
 
 #[derive(Debug, Parser)]
@@ -167,7 +157,7 @@ pub struct ClientArgs {
 
 impl ClientArgs {
     pub async fn execute(&mut self, ctx: &mut impl CommandContext) -> Result<(), CommandError> {
-        self.command.clone().execute(&mut self.globals, ctx).await
+        self.command.clone().execute(ctx, &mut self.globals).await
     }
 }
 
@@ -209,90 +199,37 @@ pub struct JobOutput {
 /// Support Shell job management command
 #[derive(Clone, Debug, Subcommand)]
 pub enum ClientCommand {
-    /// Import a certificate, verify its signature, and return a key ID for it.
-    ImportCert { path: PathBuf },
-
-    /// Get the certificate chain that validates a key, in root-to-leaf order.
-    CertChain { key_id: KeyId },
+    /// Job-signing certificate management.
+    Cert {
+        #[clap(subcommand)]
+        command: CertCommand,
+    },
 
     /// Identity and access management.
     #[clap(alias = "whoami")]
     Iam {
-        #[clap(flatten)]
-        identity_args: IdentityArgs,
-
         #[clap(subcommand)]
         command: Option<IdentityCommand>,
 
-        /// Shortcut for `iam register --list-available`
-        #[arg(short, long)]
-        list_available: bool,
+        /// Shortcut for `iam available`
+        #[arg(short = 'l')]
+        available: bool,
 
         /// Shortcut for `iam revoke <KEY_ID>`
-        #[arg(short, long, name = "KEY_ID", conflicts_with = "list_available")]
+        #[arg(short = 'r', name = "KEY_ID", conflicts_with = "available")]
         revoke: Option<KeyId>,
     },
 
-    /// Reserve zero job slots and display the reservation time.
-    Ping,
-
-    /// Sign and start a job.
-    #[clap(alias = "start")]
-    JobStart {
-        #[clap(flatten)]
-        start_args: JobStartArgs,
-
-        #[clap(flatten)]
-        identity_args: IdentityArgs,
+    /// Session management.
+    Session {
+        #[clap(subcommand)]
+        command: Option<SessionCommand>,
     },
 
-    /// Get the status of a started job.
-    #[clap(alias = "status")]
-    JobStatus {
-        /// The job whose status should be fetched.
-        #[clap(env = SUSH_JOB_ID)]
-        job_id: JobId,
-    },
-
-    /// Get the standard output of a job.
-    #[clap(alias = "stdout", alias = "output")]
-    JobStdout {
-        #[clap(flatten)]
-        output: JobOutput,
-    },
-
-    /// Get the standard error of a job.
-    #[clap(alias = "stderr", alias = "error")]
-    JobStderr {
-        #[clap(flatten)]
-        output: JobOutput,
-    },
-
-    /// Connect to a running interactive job.
-    #[clap(alias = "session")]
-    JobSession {
-        /// The job to connect to.
-        #[clap(env = SUSH_JOB_ID)]
-        job_id: JobId,
-
-        /// SSH identity to authenticate as.
-        #[clap(flatten)]
-        identity: IdentityArgs,
-    },
-
-    /// Abort a running job.
-    #[clap(alias = "abort")]
-    JobAbort {
-        /// The job to abort.
-        #[clap(env = SUSH_JOB_ID)]
-        job_id: JobId,
-    },
-
-    /// Show status of previously started jobs.
-    History {
-        /// How many history entries to fetch in total, or 0 for all.
-        #[arg(short, long, default_value_t = 0)]
-        limit: usize,
+    /// Job management.
+    Job {
+        #[clap(subcommand)]
+        command: JobCommand,
     },
 
     /// Arguments for subsequent interactive commands.
@@ -310,47 +247,102 @@ pub enum ClientCommand {
     Quit,
 }
 
-#[derive(Clone, Debug, Parser)]
-pub struct IdentityArgs {
-    /// Path to the SSH authentication agent Unix-domain socket.
-    #[arg(long, env = SSH_AUTH_SOCK)]
-    ssh_auth_sock: PathBuf,
+#[derive(Clone, Debug, Subcommand)]
+pub enum CertCommand {
+    /// Import a certificate, verify its signature, and return a key ID for it.
+    Import { path: PathBuf },
 
-    /// Authenticate as this SSH identity (try `iam -l` for a list).
-    #[arg(short, long, env = SUSH_KEY_ID)]
-    key_id: Option<KeyId>,
+    /// Get the certificate chain that validates a key, in root-to-leaf order.
+    Chain { key_id: KeyId },
 }
 
-#[derive(Clone, Debug, Subcommand)]
+#[derive(Clone, Debug, Default, Subcommand)]
 pub enum IdentityCommand {
+    /// List available local SSH agent identities.
+    /// Does not communicate with the server.
+    Available,
+
     /// List SSH identities registered with the server.
     List {
-        /// The number of identities to include, or 0 for all.
-        #[arg(short, long, default_value_t = 0)]
-        limit: usize,
+        /// The number of identities per page of results.
+        #[arg(short, long, default_value_t = DEFAULT_PAGE_LIMIT)]
+        limit: NonZeroU32,
     },
 
-    /// Register an SSH identity with the server.
-    Register {
-        /// List available (local) SSH agent identities,
-        /// but do not register any.
-        #[arg(short, long)]
-        list_available: bool,
-    },
+    /// Log in to the server as an SSH identity.
+    #[default]
+    Login,
 
-    /// Revoke an SSH identity previously registered with the server.
+    /// Revoke the current credentials associated with an SSH identity.
     Revoke {
         /// The identity to revoke. Defaults to the current identity.
         revoke: Option<KeyId>,
     },
 }
 
-impl Default for IdentityCommand {
-    fn default() -> Self {
-        Self::Register {
-            list_available: false,
-        }
-    }
+#[derive(Clone, Debug, Default, Subcommand)]
+pub enum SessionCommand {
+    /// Start a new support session.
+    #[default]
+    Start,
+
+    /// Stop a support session.
+    Stop {
+        /// The session to stop.
+        session_id: Option<SessionId>,
+    },
+}
+
+#[derive(Clone, Debug, Subcommand)]
+pub enum JobCommand {
+    /// Sign and start a job.
+    Start {
+        #[clap(flatten)]
+        start_args: JobStartArgs,
+    },
+
+    /// Stop a (running) job.
+    #[clap(alias = "abort")]
+    Stop {
+        /// The job to abort.
+        #[clap(env = SUSH_JOB_ID)]
+        job_id: JobId,
+    },
+
+    /// Get the status of a started job.
+    Status {
+        /// The job whose status should be fetched.
+        #[clap(env = SUSH_JOB_ID)]
+        job_id: JobId,
+    },
+
+    /// Get the standard output of a job.
+    #[clap(alias = "output")]
+    Stdout {
+        #[clap(flatten)]
+        output: JobOutput,
+    },
+
+    /// Get the standard error of a job.
+    #[clap(alias = "error")]
+    Stderr {
+        #[clap(flatten)]
+        output: JobOutput,
+    },
+
+    /// Connect to a running interactive job.
+    Session {
+        /// The job to connect to.
+        #[clap(env = SUSH_JOB_ID)]
+        job_id: JobId,
+    },
+
+    /// Show status of previously started jobs.
+    History {
+        /// How many history entries to fetch in total, or 0 for all.
+        #[arg(short, long, default_value_t = 0)]
+        limit: usize,
+    },
 }
 
 #[derive(Clone, Debug, Parser)]
@@ -363,8 +355,7 @@ pub struct JobStartArgs {
     /// Be sure to quote spaces and characters special to your shell!
     command: Option<String>,
 
-    /// Previously reserved but unused job ID.
-    #[clap(env = SUSH_JOB_ID)]
+    /// Job ID within the session.
     job_id: Option<JobId>,
 
     /// Job output is binary, not UTF-8 encoded text.
@@ -392,271 +383,62 @@ pub struct JobStartArgs {
     wait: bool,
 }
 
-/// Behavior in response to command execution, e.g., printing output,
-/// maintaining (ephemeral) state.
-pub trait CommandContext: Send + Sync {
-    // Context management
-    fn get_output_format(&self) -> OutputFormat;
-    fn set_output_format(&mut self, output: OutputFormat);
-    fn set_globals(&mut self, _args: &mut GlobalArgs, _values: GlobalArgs) {}
-    fn pre_parse_hook(&mut self, _command: &str) {}
-
-    // Connection management
-    fn ack(&mut self, url: &str, time: DateTime<Utc>) -> Result<(), CommandError>;
-
-    // Job signing certificates
-    fn cert_chain(&mut self, key_id: KeyId, certs: &str) -> Result<(), CommandError>;
-    fn cert_imported(&mut self, path: &Path, key_id: KeyId) -> Result<(), CommandError>;
-
-    // Job management
-    fn job_aborted(&mut self, id: &JobId) -> Result<(), CommandError>;
-    fn job_error(&mut self, error: CommandError) -> Result<(), CommandError>;
-    fn job_output(
-        &mut self,
-        id: &JobId,
-        stream: JobOutputStream,
-        output: &[u8],
-        binary: bool,
-    ) -> Result<(), CommandError>;
-    fn job_output_started(
-        &mut self,
-        id: &JobId,
-        stream: JobOutputStream,
-        stage: &str,
-        total_length: u64,
-    ) -> Result<(), CommandError>;
-    fn job_output_update(
-        &mut self,
-        id: &JobId,
-        stream: JobOutputStream,
-        bytes: u64,
-    ) -> Result<(), CommandError>;
-    fn job_output_finished(
-        &mut self,
-        id: &JobId,
-        stream: JobOutputStream,
-        stage: Option<&str>,
-    ) -> Result<(), CommandError>;
-    fn job_polling_started(&mut self, id: &JobId, duration: Duration) -> Result<(), CommandError>;
-    fn job_polling_update(&mut self, id: &JobId, status: &JobStatus) -> Result<(), CommandError>;
-    fn job_polling_finished(&mut self, id: &JobId) -> Result<(), CommandError>;
-    fn job_session_connected(&mut self, id: &JobId) -> Result<(), CommandError>;
-    fn job_session_disconnected(&mut self, id: &JobId) -> Result<(), CommandError>;
-    fn job_signing_started(&mut self, id: &JobId) -> Result<(), CommandError>;
-    fn job_signing_update(&mut self, id: &JobId) -> Result<(), CommandError>;
-    fn job_signing_finished(&mut self, id: &JobId) -> Result<(), CommandError>;
-    fn job_signed(&mut self, job: &SignedJob) -> Result<(), CommandError>;
-    fn job_status(&mut self, id: &JobId, status: &JobStatus) -> Result<(), CommandError>;
-    fn read_signed_job(&mut self) -> Result<SignedJob, CommandError>;
-
-    // SSH agent and identity
-    fn iam(&mut self, identity: &Identity) -> Result<(), CommandError>;
-    fn identities(&mut self, identities: &[SshPublicKey]) -> Result<(), CommandError>;
-    fn please_touch(&mut self, identity: &SshPublicKey) -> Result<(), CommandError>;
-    fn really_revoke(&mut self, key_id: KeyId) -> Result<KeyId, CommandError>;
-    fn identity_revoked(&mut self, key_id: KeyId) -> Result<(), CommandError>;
-}
-
 impl ClientCommand {
     #[async_recursion]
     pub async fn execute(
         self,
-        args: &mut GlobalArgs,
         ctx: &mut impl CommandContext,
+        args: &mut GlobalArgs,
     ) -> Result<(), CommandError> {
         if let Some(output) = args.output {
             ctx.set_output_format(output);
         }
+
+        let mut ssh_agent = if let Some(ssh_auth_sock) = &args.ssh_auth_sock {
+            SshAgentConnection::connect(ssh_auth_sock).await?
+        } else {
+            return Err(CommandError::MissingSshAuthSock);
+        };
         let client = args.url.as_ref().map(|url| Client::new(url));
         match (self, client) {
-            (ClientCommand::ImportCert { path }, Some(client)) => {
-                let io_error = |error| CommandError::io(&path, error);
-                let mut file = File::open(&path).map_err(io_error)?;
-                let mut cert = Vec::new();
-                file.read_to_end(&mut cert).map_err(io_error)?;
-                let key_id = client.import_cert().body(cert).send().await?.into_inner();
-                ctx.cert_imported(&path, key_id)
-            }
-
-            (ClientCommand::CertChain { key_id }, Some(client)) => {
-                let certs = client
-                    .cert_chain()
-                    .key_id(&key_id)
-                    .send()
-                    .await?
-                    .into_inner();
-                ctx.cert_chain(key_id, &certs)
+            (ClientCommand::Cert { command }, Some(client)) => {
+                let authz = authz(ctx, &client, &mut ssh_agent, &args.ssh_key_id).await?;
+                cert(ctx, &client, &authz, command).await
             }
 
             (
                 ClientCommand::Iam {
-                    identity_args,
                     command,
-                    list_available,
+                    available,
                     revoke,
                 },
                 Some(client),
             ) => {
                 iam(
-                    &client,
                     ctx,
-                    identity_args,
+                    &client,
                     command.unwrap_or_else(|| {
-                        if revoke.is_some() {
+                        if available {
+                            IdentityCommand::Available
+                        } else if revoke.is_some() {
                             IdentityCommand::Revoke { revoke }
                         } else {
-                            IdentityCommand::Register { list_available }
+                            IdentityCommand::default()
                         }
                     }),
+                    &mut ssh_agent,
+                    &args.ssh_key_id,
                 )
                 .await
             }
 
-            (ClientCommand::Ping, Some(client)) => {
-                let reserved = client.reserve_jobs().body(0).send().await?.into_inner();
-                ctx.ack(&client.baseurl, reserved.time_reserved)
+            (ClientCommand::Session { command }, Some(client)) => {
+                let authz = authz(ctx, &client, &mut ssh_agent, &args.ssh_key_id).await?;
+                session(ctx, &client, &authz, command.unwrap_or_default()).await
             }
 
-            (
-                ClientCommand::JobStart {
-                    start_args,
-                    identity_args,
-                },
-                Some(client),
-            ) if start_args.command.is_none() && start_args.permslip.is_none() => {
-                let job = ctx.read_signed_job()?;
-                job_start(&client, ctx, job, start_args, &identity_args).await?;
-                Ok(())
-            }
-
-            (
-                ClientCommand::JobStart {
-                    start_args: JobStartArgs { command: None, .. },
-                    ..
-                },
-                Some(_),
-            ) => Err(CommandError::MissingCommand),
-
-            (
-                ClientCommand::JobStart {
-                    start_args: JobStartArgs { permslip: None, .. },
-                    ..
-                },
-                Some(_),
-            ) => Err(CommandError::MissingKeyName),
-
-            (
-                ClientCommand::JobStart {
-                    start_args: JobStartArgs { job_id: None, .. },
-                    ..
-                },
-                _client,
-            ) => Err(CommandError::MissingJobId),
-
-            (
-                ClientCommand::JobStart {
-                    start_args:
-                        ref start_args @ JobStartArgs {
-                            command: Some(ref command),
-                            job_id: Some(ref job_id),
-                            permslip: Some(ref key_name),
-                            ref permslip_url,
-                            ref interactive,
-                            ..
-                        },
-                    identity_args:
-                        ref identity_args @ IdentityArgs {
-                            ref ssh_auth_sock,
-                            ref key_id,
-                        },
-                },
-                client,
-            ) => {
-                let mut signer = PermslipSigner::new(key_name, permslip_url).await?;
-                let mut interval = interval(Duration::from_millis(100));
-                interval.set_missed_tick_behavior(MissedTickBehavior::Skip);
-                let sign = signer.sign(JobStartRequest::new(
-                    job_id.to_owned(),
-                    command,
-                    if *interactive {
-                        let mut agent = SshAgentConnection::connect(ssh_auth_sock).await?;
-                        let public_key = agent.identity(key_id.as_ref()).await?;
-                        Some(public_key.key_id()?)
-                    } else {
-                        None
-                    },
-                ));
-                pin!(sign);
-                ctx.job_signing_started(job_id)?;
-                let job = loop {
-                    select! {
-                        job = &mut sign => {
-                            ctx.job_signing_finished(job_id)?;
-                            break job?;
-                        }
-                        _ = interval.tick() => ctx.job_signing_update(job_id)?,
-                        _ = ctrl_c() => return ctx.job_signing_finished(job_id),
-                    }
-                };
-                if let Some(client) = client {
-                    job_start(&client, ctx, job, start_args.clone(), identity_args).await
-                } else {
-                    ctx.job_signed(&job)
-                }
-            }
-
-            (ClientCommand::JobStatus { job_id }, Some(client)) => {
-                let status = client
-                    .job_status()
-                    .job_id(&job_id)
-                    .send()
-                    .await?
-                    .into_inner();
-                ctx.job_status(&job_id, &status)
-            }
-
-            (ClientCommand::JobStdout { output }, Some(client)) => {
-                job_output(&client, ctx, Stdout, output).await
-            }
-
-            (ClientCommand::JobStderr { output }, Some(client)) => {
-                job_output(&client, ctx, Stderr, output).await
-            }
-
-            (
-                ClientCommand::JobSession {
-                    job_id,
-                    identity:
-                        IdentityArgs {
-                            ssh_auth_sock,
-                            key_id,
-                        },
-                },
-                Some(client),
-            ) => {
-                let mut agent = SshAgentConnection::connect(&ssh_auth_sock).await?;
-                let (credentials, _public_key) = authn(&client, ctx, &mut agent, &key_id).await?;
-                job_session(&client, ctx, &job_id, &credentials).await?;
-                Ok(())
-            }
-
-            (ClientCommand::JobAbort { job_id }, Some(client)) => {
-                client.job_abort().job_id(&job_id).send().await?;
-                ctx.job_aborted(&job_id)
-            }
-
-            (ClientCommand::History { limit }, Some(client)) => {
-                let mut stream = client.history().stream().boxed();
-                if limit > 0 {
-                    stream = stream.take(limit).boxed();
-                }
-                loop {
-                    match stream.try_next().await {
-                        Ok(Some(status)) => ctx.job_status(status.job_id(), &status)?,
-                        Ok(None) => return Ok(()),
-                        Err(e) => return Err(e.into()),
-                    }
-                }
+            (ClientCommand::Job { command }, client) => {
+                job(ctx, &client, command, &mut ssh_agent, &args.ssh_key_id).await
             }
 
             (ClientCommand::Set { args: values }, _) => {
@@ -676,18 +458,360 @@ impl ClientCommand {
     }
 }
 
-async fn job_start(
-    client: &Client,
+/// Return fresh credentials and the SSH public key for the given identity.
+async fn authn(
     ctx: &mut impl CommandContext,
+    client: &Client,
+    ssh_agent: &mut SshAgentConnection,
+    ssh_key_id: &Option<KeyId>,
+) -> Result<(Credentials, SshPublicKey), CommandError> {
+    if let Some((credentials, public_key)) = ctx.get_credentials() {
+        return Ok((credentials, public_key));
+    }
+
+    let public_key = ssh_agent.identity(ssh_key_id.as_ref()).await?;
+    let challenge: Challenge = match client.iam().body(None).send().await {
+        Ok(_) => return Err(CommandError::InvalidAuthorization),
+        Err(ClientError::ErrorResponse(err)) if err.status() == StatusCode::UNAUTHORIZED => err
+            .headers()
+            .get(WWW_AUTHENTICATE)
+            .ok_or(CommandError::InvalidAuthorization)?
+            .to_str()
+            .map_err(|_| CommandError::InvalidAuthorization)?
+            .parse()?,
+        Err(err) => return Err(err.into()),
+    };
+
+    let response = ChallengeResponse::new(challenge);
+    ctx.please_touch(&public_key)?;
+    let signed = select! {
+        s = ssh_agent.sign(response) => s?,
+        _ = ctrl_c() => return Err(CommandError::Canceled),
+    };
+    let verified = signed.verify_with_ssh_public_key(&public_key)?;
+    let credentials = Credentials::new(verified);
+    ctx.set_credentials(Some((credentials.clone(), public_key.clone())));
+    Ok((credentials, public_key))
+}
+
+/// Typed wrapper for authorization strings.
+struct Authz(String);
+
+impl From<&Authz> for String {
+    fn from(value: &Authz) -> Self {
+        value.0.to_owned()
+    }
+}
+
+/// Return the "authorization" for a request, viz., the serialized
+/// credentials for the given identity.
+async fn authz(
+    ctx: &mut impl CommandContext,
+    client: &Client,
+    ssh_agent: &mut SshAgentConnection,
+    ssh_key_id: &Option<KeyId>,
+) -> Result<Authz, CommandError> {
+    let (credentials, _public_key) = authn(ctx, client, ssh_agent, ssh_key_id).await?;
+    Ok(Authz(credentials.to_string()))
+}
+
+async fn iam(
+    ctx: &mut impl CommandContext,
+    client: &Client,
+    command: IdentityCommand,
+    ssh_agent: &mut SshAgentConnection,
+    ssh_key_id: &Option<KeyId>,
+) -> Result<(), CommandError> {
+    match command {
+        IdentityCommand::Available => {
+            let mut keys = Vec::new();
+            for key in ssh_agent.list_identities().await? {
+                if let Some(key_id) = ssh_key_id
+                    && key.key_id()? != *key_id
+                {
+                    continue;
+                }
+                keys.push(key);
+            }
+            ctx.identities(&keys)
+        }
+
+        IdentityCommand::List { limit } => {
+            let authz = authz(ctx, client, ssh_agent, ssh_key_id).await?;
+            let mut page = client
+                .identities()
+                .limit(limit)
+                .authorization(&authz)
+                .send()
+                .await?
+                .into_inner();
+            loop {
+                for identity in &page.items {
+                    ctx.iam(identity)?;
+                }
+                if let Some(next_page) = page.next_page {
+                    page = client
+                        .identities()
+                        .authorization(&authz)
+                        .limit(limit)
+                        .page_token(&next_page)
+                        .send()
+                        .await?
+                        .into_inner();
+                    if page.items.is_empty() || !ctx.more() {
+                        break Ok(());
+                    }
+                } else {
+                    break Ok(());
+                }
+            }
+        }
+
+        IdentityCommand::Login => {
+            ctx.set_credentials(None);
+            let (credentials, public_key) = authn(ctx, client, ssh_agent, ssh_key_id).await?;
+            let identity = client
+                .iam()
+                .authorization(credentials.to_string())
+                .body(public_key.to_string())
+                .send()
+                .await?
+                .into_inner();
+            ctx.iam(&identity)
+        }
+
+        IdentityCommand::Revoke { revoke } => {
+            let revoke = ctx.really_revoke(match revoke {
+                Some(revoke) => revoke,
+                None => ssh_agent.identity(ssh_key_id.as_ref()).await?.key_id()?,
+            })?;
+            let authz = authz(ctx, client, ssh_agent, ssh_key_id).await?;
+            client
+                .revoke_identity()
+                .authorization(&authz)
+                .key_id(&revoke)
+                .send()
+                .await?;
+            ctx.identity_revoked(revoke)
+        }
+    }
+}
+
+async fn cert(
+    ctx: &mut impl CommandContext,
+    client: &Client,
+    authz: &Authz,
+    command: CertCommand,
+) -> Result<(), CommandError> {
+    match command {
+        CertCommand::Import { path } => {
+            let io_error = |error| CommandError::io(&path, error);
+            let mut file = File::open(&path).map_err(io_error)?;
+            let mut cert = Vec::new();
+            file.read_to_end(&mut cert).map_err(io_error)?;
+            let key_id = client
+                .import_cert()
+                .authorization(authz)
+                .body(cert)
+                .send()
+                .await?
+                .into_inner();
+            ctx.cert_imported(&path, key_id)
+        }
+
+        CertCommand::Chain { key_id } => {
+            let certs = client
+                .cert_chain()
+                .authorization(authz)
+                .key_id(&key_id)
+                .send()
+                .await?
+                .into_inner();
+            ctx.cert_chain(key_id, &certs)
+        }
+    }
+}
+
+async fn session(
+    ctx: &mut impl CommandContext,
+    client: &Client,
+    authz: &Authz,
+    command: SessionCommand,
+) -> Result<(), CommandError> {
+    match command {
+        SessionCommand::Start => {
+            let session_id = client
+                .session_start()
+                .authorization(authz)
+                .send()
+                .await?
+                .into_inner();
+            ctx.session_started(&session_id)?;
+            Ok(())
+        }
+
+        SessionCommand::Stop { session_id } => {
+            let ctx_session_id = ctx.session_id().cloned();
+            if let Some(session_id) = session_id.as_ref().or(ctx_session_id.as_ref()) {
+                client
+                    .session_stop()
+                    .session_id(session_id.clone())
+                    .authorization(authz)
+                    .send()
+                    .await?;
+                ctx.session_stopped(session_id)?;
+            }
+            Ok(())
+        }
+    }
+}
+
+async fn job(
+    ctx: &mut impl CommandContext,
+    client: &Option<Client>,
+    command: JobCommand,
+    ssh_agent: &mut SshAgentConnection,
+    ssh_key_id: &Option<KeyId>,
+) -> Result<(), CommandError> {
+    match (command, client) {
+        (JobCommand::Start { start_args }, Some(client))
+            if start_args.command.is_none() && start_args.permslip.is_none() =>
+        {
+            let job = ctx.read_signed_job()?;
+            let authz = authz(ctx, client, ssh_agent, ssh_key_id).await?;
+            job_start(ctx, client, &authz, job, start_args).await?;
+            Ok(())
+        }
+
+        (
+            JobCommand::Start {
+                start_args: JobStartArgs { command: None, .. },
+                ..
+            },
+            Some(_),
+        ) => Err(CommandError::MissingCommand),
+
+        (
+            JobCommand::Start {
+                start_args: JobStartArgs { permslip: None, .. },
+                ..
+            },
+            Some(_),
+        ) => Err(CommandError::MissingKeyName),
+
+        (
+            JobCommand::Start {
+                start_args:
+                    ref start_args @ JobStartArgs {
+                        command: Some(ref command),
+                        permslip: Some(ref key_name),
+                        ref job_id,
+                        ref permslip_url,
+                        ref interactive,
+                        ..
+                    },
+            },
+            client,
+        ) => {
+            let job_id = if let Some(job_id) = job_id {
+                job_id.to_owned()
+            } else {
+                ctx.job_id()?
+            };
+            let mut signer = PermslipSigner::new(key_name, permslip_url).await?;
+            let mut interval = interval(Duration::from_millis(100));
+            interval.set_missed_tick_behavior(MissedTickBehavior::Skip);
+            let sign = signer.sign(JobStartRequest::new(
+                job_id.to_owned(),
+                command,
+                *interactive,
+            ));
+            pin!(sign);
+            ctx.job_signing_started(&job_id)?;
+            let job = loop {
+                select! {
+                    job = &mut sign => {
+                        ctx.job_signing_finished(&job_id)?;
+                        break job?;
+                    }
+                    _ = interval.tick() => ctx.job_signing_update(&job_id)?,
+                    _ = ctrl_c() => return ctx.job_signing_finished(&job_id),
+                }
+            };
+            if let Some(client) = client {
+                ctx.job_signed(&job, false)?;
+                let authz = authz(ctx, client, ssh_agent, ssh_key_id).await?;
+                job_start(ctx, client, &authz, job, start_args.to_owned()).await
+            } else {
+                ctx.job_signed(&job, true)
+            }
+        }
+
+        (JobCommand::Stop { job_id }, Some(client)) => {
+            let authz = authz(ctx, client, ssh_agent, ssh_key_id).await?;
+            client
+                .job_stop()
+                .job_id(&job_id)
+                .authorization(&authz)
+                .send()
+                .await?;
+            ctx.job_stopped(&job_id)
+        }
+
+        (JobCommand::Status { job_id }, Some(client)) => {
+            let authz = authz(ctx, client, ssh_agent, ssh_key_id).await?;
+            let status = client
+                .job_status()
+                .job_id(&job_id)
+                .authorization(&authz)
+                .send()
+                .await?
+                .into_inner();
+            ctx.job_status(&job_id, &status)
+        }
+
+        (JobCommand::Stdout { output }, Some(client)) => {
+            let authz = authz(ctx, client, ssh_agent, ssh_key_id).await?;
+            job_output(ctx, client, &authz, Stdout, output).await
+        }
+
+        (JobCommand::Stderr { output }, Some(client)) => {
+            let authz = authz(ctx, client, ssh_agent, ssh_key_id).await?;
+            job_output(ctx, client, &authz, Stderr, output).await
+        }
+
+        (JobCommand::Session { job_id }, Some(client)) => {
+            let authz = authz(ctx, client, ssh_agent, ssh_key_id).await?;
+            job_start_interactive_session(ctx, client, &authz, &job_id).await
+        }
+
+        (JobCommand::History { limit }, Some(client)) => {
+            let mut stream = client.job_history().stream().boxed();
+            if limit > 0 {
+                stream = stream.take(limit).boxed();
+            }
+            loop {
+                match stream.try_next().await {
+                    Ok(Some(status)) => ctx.job_status(status.job_id(), &status)?,
+                    Ok(None) => return Ok(()),
+                    Err(e) => return Err(e.into()),
+                }
+            }
+        }
+
+        (_, None) => Err(CommandError::Offline),
+    }
+}
+
+async fn job_start(
+    ctx: &mut impl CommandContext,
+    client: &Client,
+    authz: &Authz,
     job: SignedJob,
     start_args: JobStartArgs,
-    IdentityArgs {
-        ssh_auth_sock,
-        key_id,
-    }: &IdentityArgs,
 ) -> Result<(), CommandError> {
-    let interactive = job.interactive().cloned();
     let job_id = job.job_id().to_owned();
+    let interactive = job.interactive();
     let JobStartArgs {
         limits,
         binary,
@@ -702,28 +826,13 @@ async fn job_start(
     } = limits.as_limits();
     let mut start = client
         .job_start()
+        .authorization(authz)
         .job_id(&job_id)
         .max_cpu(max_cpu)
         .max_mem(max_mem)
         .max_fsize(max_fsize)
-        .wait(wait && interactive.is_none())
+        .wait(wait && !interactive)
         .body(job);
-    let credentials = if let Some(interactive_key_id) = &interactive {
-        if let Some(key_id) = key_id
-            && key_id != interactive_key_id
-        {
-            return Err(CommandError::IdentityMismatch {
-                interactive: interactive_key_id.to_owned(),
-                key_id: key_id.to_owned(),
-            });
-        }
-        let mut agent = SshAgentConnection::connect(ssh_auth_sock).await?;
-        let (credentials, _public_key) = authn(client, ctx, &mut agent, &interactive).await?;
-        start = start.authorization(credentials.to_string());
-        Some(credentials)
-    } else {
-        None
-    };
     if let Some(term) = term {
         start = start.term(term);
         if let Ok(winsize) = tcgetwinsize(stdin()) {
@@ -734,166 +843,76 @@ async fn job_start(
     let start = start.send();
     pin!(start);
 
-    if let Some(credentials) = credentials {
+    let status = if interactive {
         start.as_mut().await?;
-        job_session(client, ctx, &job_id, &credentials).await?;
-        let status = client
+        job_start_interactive_session(ctx, client, authz, &job_id).await?;
+        client
             .job_status()
+            .authorization(authz)
             .job_id(&job_id)
             .send()
             .await?
-            .into_inner();
-        ctx.job_status(&job_id, &status)?;
-        Ok(())
+            .into_inner()
     } else {
         let mut interval = interval(Duration::from_millis(250));
         interval.set_missed_tick_behavior(MissedTickBehavior::Skip);
-        let status = loop {
+        loop {
             select! {
                 status = &mut start => {
                     ctx.job_polling_finished(&job_id)?;
                     break status?.into_inner();
                 }
                 _ = interval.tick() => {
-                    let status = client.job_status().job_id(&job_id).send().await?.into_inner();
+                    let status = client
+                        .job_status()
+                        .authorization(authz)
+                        .job_id(&job_id)
+                        .send()
+                        .await?
+                        .into_inner();
                     ctx.job_polling_started(&job_id, interval.period())?;
                     ctx.job_polling_update(&job_id, &status)?;
                 }
                 _ = ctrl_c() => {
-                    client.job_abort().job_id(&job_id).send().await?;
+                    client
+                        .job_stop()
+                        .authorization(authz)
+                        .job_id(&job_id)
+                        .send()
+                        .await?;
                     ctx.job_polling_finished(&job_id)?;
-                    ctx.job_aborted(&job_id)?;
-                    break client.job_status().job_id(&job_id).send().await?.into_inner();
-                }
-            }
-        };
-        ctx.job_status(&job_id, &status)?;
-        if wait {
-            for stream in [Stdout, Stderr] {
-                match client
-                    .job_output()
-                    .job_id(&job_id)
-                    .stream(stream)
-                    .send()
-                    .await
-                {
-                    Ok(byte_stream) => {
-                        let output = byte_stream_to_vec(byte_stream.into_inner()).await?;
-                        ctx.job_output(&job_id, stream, &output, binary)?;
-                    }
-                    Err(error) => ctx.job_error(error.into())?,
+                    ctx.job_stopped(&job_id)?;
+                    break client
+                        .job_status()
+                        .authorization(authz)
+                        .job_id(&job_id)
+                        .send()
+                        .await?
+                        .into_inner();
                 }
             }
         }
-        Ok(())
-    }
-}
-
-async fn iam(
-    client: &Client,
-    ctx: &mut impl CommandContext,
-    args: IdentityArgs,
-    command: IdentityCommand,
-) -> Result<(), CommandError> {
-    let IdentityArgs {
-        ssh_auth_sock,
-        key_id,
-    } = &args;
-    let mut agent = SshAgentConnection::connect(ssh_auth_sock).await?;
-    match command {
-        IdentityCommand::List { limit } => {
-            let (credentials, _public_key) = authn(client, ctx, &mut agent, key_id).await?;
-            let mut stream = client
-                .identities()
-                .authorization(credentials.to_string())
-                .stream()
-                .boxed();
-            if limit > 0 {
-                stream = stream.take(limit).boxed();
-            }
-            loop {
-                match stream.try_next().await {
-                    Ok(Some(identity)) => ctx.iam(&identity)?,
-                    Ok(None) => return Ok(()),
-                    Err(e) => return Err(e.into()),
-                }
-            }
-        }
-
-        IdentityCommand::Register {
-            list_available: false,
-        } => {
-            let (credentials, public_key) = authn(client, ctx, &mut agent, key_id).await?;
-            let identity = client
-                .iam()
-                .authorization(credentials.to_string())
-                .body(public_key.to_string())
+    };
+    ctx.job_status(&job_id, &status)?;
+    if wait {
+        for stream in [Stdout, Stderr] {
+            match client
+                .job_output()
+                .authorization(authz)
+                .job_id(&job_id)
+                .stream(stream)
                 .send()
-                .await?
-                .into_inner();
-            ctx.iam(&identity)
-        }
-
-        IdentityCommand::Register {
-            list_available: true,
-        } => {
-            let mut keys = Vec::new();
-            for key in agent.list_identities().await? {
-                if let Some(key_id) = key_id
-                    && key.key_id()? != *key_id
-                {
-                    continue;
+                .await
+            {
+                Ok(byte_stream) => {
+                    let output = byte_stream_to_vec(byte_stream.into_inner()).await?;
+                    ctx.job_output(&job_id, stream, &output, binary)?;
                 }
-                keys.push(key);
+                Err(error) => ctx.job_error(error.into())?,
             }
-            ctx.identities(&keys)
-        }
-
-        IdentityCommand::Revoke { revoke } => {
-            let revoke = ctx.really_revoke(match revoke {
-                Some(revoke) => revoke,
-                None => agent.identity(key_id.as_ref()).await?.key_id()?,
-            })?;
-            let (credentials, _public_key) = authn(client, ctx, &mut agent, key_id).await?;
-            client
-                .revoke_identity()
-                .authorization(credentials.to_string())
-                .key_id(&revoke)
-                .send()
-                .await?;
-            ctx.identity_revoked(revoke)
         }
     }
-}
-
-async fn authn(
-    client: &Client,
-    ctx: &mut impl CommandContext,
-    agent: &mut SshAgentConnection,
-    key_id: &Option<KeyId>,
-) -> Result<(Credentials, SshPublicKey), CommandError> {
-    let public_key = agent.identity(key_id.as_ref()).await?;
-    let challenge: Challenge = match client.iam().body(None).send().await {
-        Ok(_) => return Err(CommandError::InvalidAuthorization),
-        Err(ClientError::ErrorResponse(err)) if err.status() == StatusCode::UNAUTHORIZED => err
-            .headers()
-            .get("www-authenticate")
-            .ok_or(CommandError::InvalidAuthorization)?
-            .to_str()
-            .map_err(|_| CommandError::InvalidAuthorization)?
-            .parse()?,
-        Err(err) => return Err(err.into()),
-    };
-
-    let response = ChallengeResponse::new(challenge);
-    ctx.please_touch(&public_key)?;
-    let signed = select! {
-        s = agent.sign(response) => s?,
-        _ = ctrl_c() => return Err(CommandError::Canceled),
-    };
-    let verified = signed.verify_with_ssh_public_key(&public_key)?;
-    let credentials = Credentials::new(verified);
-    Ok((credentials, public_key))
+    Ok(())
 }
 
 /// Stream some bytes into a vector.
@@ -930,8 +949,9 @@ type FutureChunk<'a> = dyn Future<Output = Result<Chunk, CommandError>> + Send +
 
 /// Download or truncate job output.
 async fn job_output(
-    client: &Client,
     ctx: &mut impl CommandContext,
+    client: &Client,
+    authz: &Authz,
     stream: JobOutputStream,
     JobOutput {
         job_id,
@@ -947,6 +967,7 @@ async fn job_output(
     if let Some(n) = truncate.map(|n| n.as_u64()) {
         client
             .job_output_delete()
+            .authorization(authz)
             .job_id(job_id)
             .stream(stream)
             .range(format!("bytes={n}-"))
@@ -964,6 +985,7 @@ async fn job_output(
         ..
     } = client
         .job_status()
+        .authorization(authz)
         .job_id(&job_id)
         .send()
         .await?
@@ -1013,7 +1035,7 @@ async fn job_output(
 
         // Download and write the output in parallel (unordered) chunks.
         ctx.job_output_started(&job_id, stream, "Downloading", len)?;
-        let chunks = job_output_chunks(client, &job_id, stream, len, chunk_size);
+        let chunks = job_output_chunks(client, authz, &job_id, stream, len, chunk_size);
         let par = parallel.get() as usize;
         let mut chunks_par = stream::iter(chunks).buffer_unordered(par);
         while let Some(chunk) = chunks_par.next().await {
@@ -1047,6 +1069,7 @@ async fn job_output(
         // fails here, do not print any output.
         let byte_stream = client
             .job_output()
+            .authorization(authz)
             .job_id(&job_id)
             .stream(stream)
             .send()
@@ -1061,6 +1084,7 @@ async fn job_output(
 /// Prepare a vector of futures that fetch chunks of output.
 fn job_output_chunks<'a>(
     client: &'a Client,
+    authz: &'a Authz,
     job_id: &'a JobId,
     stream: JobOutputStream,
     len: u64,
@@ -1076,6 +1100,7 @@ fn job_output_chunks<'a>(
                 let bytes = range.bytes();
                 let stream = client
                     .job_output()
+                    .authorization(authz)
                     .job_id(job_id)
                     .stream(stream)
                     .range(&bytes)
@@ -1121,16 +1146,16 @@ async fn byte_stream_to_file(
 
 /// Connect via WebSockets to a running interactive job,
 /// providing authentication via an SSH agent.
-async fn job_session(
-    client: &Client,
+async fn job_start_interactive_session(
     ctx: &mut impl CommandContext,
+    client: &Client,
+    authz: &Authz,
     job_id: &JobId,
-    creds: &Credentials,
 ) -> Result<(), CommandError> {
     match client
-        .job_session()
+        .job_start_interactive_session()
+        .authorization(authz)
         .job_id(job_id)
-        .authorization(creds.to_string())
         .send()
         .await
     {
@@ -1139,7 +1164,7 @@ async fn job_session(
             ctx.job_session_connected(job_id)?;
             let socket = socket.into_inner();
             let stream = WebSocketStream::from_raw_socket(socket, Role::Client, None).await;
-            if let Err(error) = session(stream).await {
+            if let Err(error) = interactive_session(stream).await {
                 return ctx.job_error(CommandError::from(error));
             }
             ctx.job_session_disconnected(job_id)
@@ -1179,7 +1204,7 @@ pub enum CommandError {
         path: PathBuf,
         error: std::io::Error,
     },
-    #[error("❌ Authentication challenge malformed or missing")]
+    #[error("❌ Unauthorized, try `iam`")]
     InvalidAuthorization,
     #[error("❌ Leaf certificate does not match key `{0}`")]
     InvalidLeafCert(KeyId),
@@ -1197,10 +1222,12 @@ pub enum CommandError {
     LengthMismatch { expected: u64, received: u64 },
     #[error("❌ Missing job command, try `--help`")]
     MissingCommand,
-    #[error("❌ Missing job ID, try `reserve-jobs` or `get-reserved`")]
-    MissingJobId,
     #[error("❌ Missing signing key name, try `--permslip`")]
     MissingKeyName,
+    #[error("❌ Missing session ID, try `session-start`")]
+    MissingSessionId,
+    #[error("❌ Missing SSH agent socket, try `--ssh-auth-sock`")]
+    MissingSshAuthSock,
     #[error("❌ Command not supported in offline mode, try `--url`")]
     Offline,
     #[error(
@@ -1223,7 +1250,7 @@ pub enum CommandError {
     #[error("❌ Reqwest error: {0}")]
     Reqwest(#[from] reqwest::Error),
     #[error("❌ Interactive session error: {0}")]
-    Session(#[from] SessionError),
+    Session(#[from] InteractiveSessionError),
     #[error("❌ SSH signature error on key ID `{0}`")]
     Signature(KeyId),
     #[error("❌ SSH key error: {0}")]

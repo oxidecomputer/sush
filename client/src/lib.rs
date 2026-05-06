@@ -1,15 +1,17 @@
 pub mod cli;
 pub mod commands;
+pub mod context;
 pub mod identity;
+pub mod interactive;
 pub mod permslip;
 pub mod repl;
-pub mod session;
 
 progenitor::generate_api!(
     spec = "../sush.json", // must match `sush_common::OPENAPI_DOCUMENT`
     interface = Builder,
     replace = {
         Identity = sush_common::authn::Identity,
+        SessionId = sush_common::jobs::SessionId,
         JobId = sush_common::jobs::JobId,
         JobLimits = sush_common::jobs::JobLimits,
         JobOutputHash = sush_common::jobs::JobOutputHash,

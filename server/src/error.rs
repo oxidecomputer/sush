@@ -8,9 +8,9 @@ use dropshot::{ClientErrorStatusCode, HttpError};
 use thiserror::Error;
 
 use sush_common::authn::{Challenge, Nonce};
+use sush_common::interactive::InteractiveSessionError;
 use sush_common::jobs::{JobId, JobOutputHash};
 use sush_common::keys::{KeyError, KeyId};
-use sush_common::session::SessionError;
 
 /// What went wrong processing a client job request.
 #[derive(Debug, Error)]
@@ -46,6 +46,8 @@ pub enum JobError {
     Shutdown(JobId),
     #[error("Can't find certificate for key `{0}`")]
     MissingCert(KeyId),
+    #[error("Only one session may be running at a time")]
+    MultipleSessions,
     #[error("No such nonce `{0}`")]
     NoSuchNonce(Nonce),
     #[error("Job output hash mismatch, file may be corrupt")]
@@ -66,7 +68,7 @@ pub enum JobError {
     #[error("Can't receive response: sender dropped")]
     Recv(#[from] tokio::sync::oneshot::error::RecvError),
     #[error("Interactive session error: {0}")]
-    Session(#[from] SessionError),
+    InteractiveSession(#[from] InteractiveSessionError),
     #[error(transparent)]
     Slice(#[from] std::array::TryFromSliceError),
     #[error(transparent)]
@@ -137,14 +139,14 @@ impl From<JobError> for HttpError {
                     message,
                 );
                 error
-                    .add_header("content-range", format!("bytes */{length}"))
-                    .expect("should be able to add content-range header");
+                    .add_header("Content-Range", format!("bytes */{length}"))
+                    .expect("should be able to add Content-Range header");
                 error
             }
             OutputTooBig => {
                 HttpError::for_client_error(None, ClientErrorStatusCode::PAYLOAD_TOO_LARGE, message)
             }
-            Session(error) => HttpError::for_client_error(
+            InteractiveSession(error) => HttpError::for_client_error(
                 None,
                 ClientErrorStatusCode::NOT_FOUND,
                 error.to_string(),
@@ -153,15 +155,15 @@ impl From<JobError> for HttpError {
                 let mut err = HttpError::for_client_error(
                     None,
                     ClientErrorStatusCode::UNAUTHORIZED,
-                    String::from("Authentication required"),
+                    String::from("Authentication required, try `iam`"),
                 );
                 let challenge = Challenge::new(nonce);
-                err.add_header("www-authenticate", challenge)
-                    .expect("should be able to add www-authenticate header");
+                err.add_header("WWW-Authenticate", challenge)
+                    .expect("should be able to add WWW-Authenticate header");
                 err
             }
             InvalidCommand(_) | InvalidJobId(_) | Json(_) | CertChainTooLong | MissingCert(_)
-            | OutputPending => {
+            | MultipleSessions | OutputPending => {
                 HttpError::for_client_error(None, ClientErrorStatusCode::BAD_REQUEST, message)
             }
         }

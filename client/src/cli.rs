@@ -5,7 +5,6 @@ use std::path::Path;
 use std::time::Duration;
 
 use bytesize::ByteSize;
-use chrono::{DateTime, Utc};
 use humantime::format_duration;
 use indicatif::{ProgressBar, ProgressStyle};
 use rustix::io::ioctl_fionread;
@@ -13,16 +12,20 @@ use serde_json::{json, to_string as to_json_string, to_string_pretty as to_json_
 use x509_cert::Certificate;
 use x509_cert::der::Encode as _;
 
-use sush_common::authn::Identity;
-use sush_common::jobs::{JobId, JobOutputStream, JobStatus, SignedJob};
+use sush_common::authn::{Credentials, Identity};
+use sush_common::jobs::{JobId, JobOutputStream, JobStatus, SessionId, SignedJob};
 use sush_common::keys::{KeyId, Signature, SshPublicKey};
 
-use crate::commands::{CommandContext, CommandError, GlobalArgs, OutputFormat};
+use crate::commands::{CommandError, GlobalArgs};
+use crate::context::{CommandContext, OutputFormat};
 
 #[derive(Debug, Default)]
 pub struct Cli {
     output: OutputFormat,
     progress: Option<ProgressBar>,
+    session: Option<SessionId>,
+    last_job: Option<SignedJob>,
+    credentials: Option<(Credentials, SshPublicKey)>,
 }
 
 impl Cli {
@@ -30,6 +33,9 @@ impl Cli {
         Self {
             output,
             progress: None,
+            session: None,
+            last_job: None,
+            credentials: None,
         }
     }
 }
@@ -39,6 +45,8 @@ fn byte_size(len: u64) -> bytesize::Display {
 }
 
 impl CommandContext for Cli {
+    // Context management
+
     fn get_output_format(&self) -> OutputFormat {
         self.output
     }
@@ -58,13 +66,57 @@ impl CommandContext for Cli {
         }
     }
 
-    fn ack(&mut self, url: &str, time: DateTime<Utc>) -> Result<(), CommandError> {
+    fn more(&self) -> bool {
         match self.get_output_format() {
-            OutputFormat::Json => println!("{}", json!({url: time})),
-            OutputFormat::Text => println!("✅ `{}` reports time {}", url, time),
+            OutputFormat::Json => true,
+            OutputFormat::Text => read_bool("❓ More (yes/no)? ").unwrap_or(false),
+        }
+    }
+
+    // Session management
+
+    fn get_credentials(&self) -> Option<(Credentials, SshPublicKey)> {
+        self.credentials.clone()
+    }
+
+    fn set_credentials(&mut self, credentials: Option<(Credentials, SshPublicKey)>) {
+        self.credentials = credentials;
+    }
+
+    fn session_id(&self) -> Option<&SessionId> {
+        self.session.as_ref()
+    }
+
+    fn job_id(&mut self) -> Result<JobId, CommandError> {
+        let Some(session_id) = self.session.as_ref() else {
+            return Err(CommandError::MissingSessionId);
+        };
+        if let Some(job) = self.last_job.as_ref() {
+            Ok(session_id.next_job_id(job)?)
+        } else {
+            Ok(session_id.first_job_id())
+        }
+    }
+
+    fn session_started(&mut self, session_id: &SessionId) -> Result<(), CommandError> {
+        self.session = Some(session_id.to_owned());
+        match self.get_output_format() {
+            OutputFormat::Json => println!("{}", json!({"session_started": session_id})),
+            OutputFormat::Text => println!("✅ Session is now `{session_id}`"),
         }
         Ok(())
     }
+
+    fn session_stopped(&mut self, session_id: &SessionId) -> Result<(), CommandError> {
+        let _ = self.session.take();
+        match self.get_output_format() {
+            OutputFormat::Json => println!("{}", json!({"session_ended": session_id})),
+            OutputFormat::Text => println!("✅ Ended session `{session_id}`"),
+        }
+        Ok(())
+    }
+
+    // Job signing certificates
 
     fn cert_chain(&mut self, key_id: KeyId, certs: &str) -> Result<(), CommandError> {
         let chain = Certificate::load_pem_chain(certs.as_bytes())?;
@@ -119,15 +171,9 @@ impl CommandContext for Cli {
         Ok(())
     }
 
-    fn read_signed_job(&mut self) -> Result<SignedJob, CommandError> {
-        let input = read_input(match self.get_output_format() {
-            OutputFormat::Json => "",
-            OutputFormat::Text => "✅ Enter signed job request, terminated with Ctrl-D:\n",
-        })?;
-        Ok(serde_json::from_str(&input)?)
-    }
+    // Job management
 
-    fn job_aborted(&mut self, job_id: &JobId) -> Result<(), CommandError> {
+    fn job_stopped(&mut self, job_id: &JobId) -> Result<(), CommandError> {
         match self.get_output_format() {
             OutputFormat::Json => println!("{job_id}"),
             OutputFormat::Text => println!("✅ Aborted job `{job_id}`"),
@@ -339,10 +385,13 @@ impl CommandContext for Cli {
         Ok(())
     }
 
-    fn job_signed(&mut self, job: &SignedJob) -> Result<(), CommandError> {
-        match self.get_output_format() {
-            OutputFormat::Json => println!("{}", to_json_string(&job)?),
-            OutputFormat::Text => println!("{}", to_json_string_pretty(&job)?),
+    fn job_signed(&mut self, job: &SignedJob, show: bool) -> Result<(), CommandError> {
+        self.last_job = Some(job.to_owned());
+        if show {
+            match self.get_output_format() {
+                OutputFormat::Json => println!("{}", to_json_string(&job)?),
+                OutputFormat::Text => println!("{}", to_json_string_pretty(&job)?),
+            }
         }
         Ok(())
     }
@@ -351,9 +400,7 @@ impl CommandContext for Cli {
         match self.get_output_format() {
             OutputFormat::Json => println!("{}", json!(status)),
             OutputFormat::Text => match status {
-                JobStatus::Unknown {
-                    job_id,
-                } => println!(
+                JobStatus::Unknown { job_id } => println!(
                     "✅ Job ID:\t{job_id}\n   \
                      Job status:\tUnknown"
                 ),
@@ -426,6 +473,16 @@ impl CommandContext for Cli {
         }
         Ok(())
     }
+
+    fn read_signed_job(&mut self) -> Result<SignedJob, CommandError> {
+        let input = read_input(match self.get_output_format() {
+            OutputFormat::Json => "",
+            OutputFormat::Text => "✅ Enter signed job request, terminated with Ctrl-D:\n",
+        })?;
+        Ok(serde_json::from_str(&input)?)
+    }
+
+    // SSH agent and identity
 
     fn iam(&mut self, identity: &Identity) -> Result<(), CommandError> {
         match self.get_output_format() {

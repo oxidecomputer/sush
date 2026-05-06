@@ -14,10 +14,11 @@ use x509_cert::Certificate;
 use x509_cert::der::{Decode as _, DecodePem as _};
 
 use sush_api::{
-    Authorization, JobIdParam, JobOutputParams, JobStartParams, KeyIdParam, RangeRequest, SushApi,
+    Authorization, JobIdParam, JobOutputParams, JobStartParams, KeyIdParam, RangeRequest,
+    SessionIdParam, SushApi,
 };
 use sush_common::authn::Identity;
-use sush_common::jobs::{JobId, JobStatus, SignedJob};
+use sush_common::jobs::{JobId, JobStatus, SessionId, SignedJob};
 use sush_common::keys::{KeyId, SshPublicKey, pem_cert_chain};
 
 use crate::error::JobError;
@@ -114,6 +115,32 @@ impl SushApi for ApiServer {
         Ok(HttpResponseDeleted())
     }
 
+    // Session management.
+
+    async fn session_start(
+        ctx: RequestContext<Self::Context>,
+        headers: Header<Authorization>,
+    ) -> Result<HttpResponseOk<SessionId>, HttpError> {
+        let mgr = ctx.context();
+        let Authorization { authorization } = headers.into_inner();
+        let authn = mgr.iam(authorization, None).await?;
+        let session_id = mgr.session_start(&authn).await?;
+        Ok(HttpResponseOk(session_id))
+    }
+
+    async fn session_stop(
+        ctx: RequestContext<Self::Context>,
+        headers: Header<Authorization>,
+        params: PathParams<SessionIdParam>,
+    ) -> Result<HttpResponseOk<()>, HttpError> {
+        let mgr = ctx.context();
+        let Authorization { authorization } = headers.into_inner();
+        let authn = mgr.iam(authorization, None).await?;
+        let SessionIdParam { session_id } = params.into_inner();
+        mgr.session_stop(&authn, &session_id).await?;
+        Ok(HttpResponseOk(()))
+    }
+
     // Job management.
 
     async fn job_start(
@@ -143,7 +170,7 @@ impl SushApi for ApiServer {
         }
     }
 
-    async fn job_abort(
+    async fn job_stop(
         ctx: RequestContext<Self::Context>,
         headers: Header<Authorization>,
         params: PathParams<JobIdParam>,
@@ -152,7 +179,7 @@ impl SushApi for ApiServer {
         let Authorization { authorization } = headers.into_inner();
         let authn = mgr.iam(authorization, None).await?;
         let JobIdParam { job_id } = params.into_inner();
-        mgr.job_abort(&authn, &job_id).await?;
+        mgr.job_stop(&authn, &job_id).await?;
         Ok(HttpResponseOk(()))
     }
 

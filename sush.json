@@ -9,6 +9,16 @@
       "put": {
         "summary": "Import a certificate, verify its signature, and return a key ID for it.",
         "operationId": "import_cert",
+        "parameters": [
+          {
+            "in": "header",
+            "name": "authorization",
+            "description": "Authorization to access some resource, such as a signature.\n\nSee: <https://developer.mozilla.org/en-US/docs/Web/HTTP/Reference/Headers/Authorization>",
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
         "requestBody": {
           "content": {
             "application/json": {
@@ -52,6 +62,14 @@
         "operationId": "cert_chain",
         "parameters": [
           {
+            "in": "header",
+            "name": "authorization",
+            "description": "Authorization to access some resource, such as a signature.\n\nSee: <https://developer.mozilla.org/en-US/docs/Web/HTTP/Reference/Headers/Authorization>",
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
             "in": "path",
             "name": "key_id",
             "required": true,
@@ -81,58 +99,9 @@
         }
       }
     },
-    "/history": {
-      "get": {
-        "summary": "List previous jobs (paginated).",
-        "operationId": "history",
-        "parameters": [
-          {
-            "in": "query",
-            "name": "limit",
-            "description": "Maximum number of items returned by a single call",
-            "schema": {
-              "nullable": true,
-              "type": "integer",
-              "format": "uint32",
-              "minimum": 1
-            }
-          },
-          {
-            "in": "query",
-            "name": "page_token",
-            "description": "Token returned by previous call to retrieve the subsequent page",
-            "schema": {
-              "nullable": true,
-              "type": "string"
-            }
-          }
-        ],
-        "responses": {
-          "200": {
-            "description": "successful operation",
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/JobStatusResultsPage"
-                }
-              }
-            }
-          },
-          "4XX": {
-            "$ref": "#/components/responses/Error"
-          },
-          "5XX": {
-            "$ref": "#/components/responses/Error"
-          }
-        },
-        "x-dropshot-pagination": {
-          "required": []
-        }
-      }
-    },
     "/iam": {
       "get": {
-        "summary": "List authenticated identities.",
+        "summary": "List authenticated identities (paginated).",
         "operationId": "identities",
         "parameters": [
           {
@@ -266,11 +235,76 @@
         }
       }
     },
+    "/jobs": {
+      "get": {
+        "summary": "List previous jobs (paginated).",
+        "operationId": "job_history",
+        "parameters": [
+          {
+            "in": "header",
+            "name": "authorization",
+            "description": "Authorization to access some resource, such as a signature.\n\nSee: <https://developer.mozilla.org/en-US/docs/Web/HTTP/Reference/Headers/Authorization>",
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "in": "query",
+            "name": "limit",
+            "description": "Maximum number of items returned by a single call",
+            "schema": {
+              "nullable": true,
+              "type": "integer",
+              "format": "uint32",
+              "minimum": 1
+            }
+          },
+          {
+            "in": "query",
+            "name": "page_token",
+            "description": "Token returned by previous call to retrieve the subsequent page",
+            "schema": {
+              "nullable": true,
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "successful operation",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/JobStatusResultsPage"
+                }
+              }
+            }
+          },
+          "4XX": {
+            "$ref": "#/components/responses/Error"
+          },
+          "5XX": {
+            "$ref": "#/components/responses/Error"
+          }
+        },
+        "x-dropshot-pagination": {
+          "required": []
+        }
+      }
+    },
     "/jobs/{job_id}/abort": {
       "get": {
         "summary": "Abort a started job.",
-        "operationId": "job_abort",
+        "operationId": "job_stop",
         "parameters": [
+          {
+            "in": "header",
+            "name": "authorization",
+            "description": "Authorization to access some resource, such as a signature.\n\nSee: <https://developer.mozilla.org/en-US/docs/Web/HTTP/Reference/Headers/Authorization>",
+            "schema": {
+              "type": "string"
+            }
+          },
           {
             "in": "path",
             "name": "job_id",
@@ -309,6 +343,14 @@
         "summary": "Get (a subset of) the standard output or standard error of a job.",
         "operationId": "job_output",
         "parameters": [
+          {
+            "in": "header",
+            "name": "authorization",
+            "description": "Authorization to access the range.\n\nSee: <https://developer.mozilla.org/en-US/docs/Web/HTTP/Reference/Headers/Authorization>",
+            "schema": {
+              "type": "string"
+            }
+          },
           {
             "in": "header",
             "name": "range",
@@ -350,6 +392,14 @@
         "description": "Returns its new length.",
         "operationId": "job_output_delete",
         "parameters": [
+          {
+            "in": "header",
+            "name": "authorization",
+            "description": "Authorization to access the range.\n\nSee: <https://developer.mozilla.org/en-US/docs/Web/HTTP/Reference/Headers/Authorization>",
+            "schema": {
+              "type": "string"
+            }
+          },
           {
             "in": "header",
             "name": "range",
@@ -401,7 +451,7 @@
     "/jobs/{job_id}/session": {
       "get": {
         "summary": "Start a new interactive job session.",
-        "operationId": "job_session",
+        "operationId": "job_start_interactive_session",
         "parameters": [
           {
             "in": "header",
@@ -560,9 +610,17 @@
     },
     "/jobs/{job_id}/status": {
       "get": {
-        "summary": "Get the status of a started job.",
+        "summary": "Get the status of a job.",
         "operationId": "job_status",
         "parameters": [
+          {
+            "in": "header",
+            "name": "authorization",
+            "description": "Authorization to access some resource, such as a signature.\n\nSee: <https://developer.mozilla.org/en-US/docs/Web/HTTP/Reference/Headers/Authorization>",
+            "schema": {
+              "type": "string"
+            }
+          },
           {
             "in": "path",
             "name": "job_id",
@@ -592,57 +650,27 @@
         }
       }
     },
-    "/reserved": {
-      "get": {
-        "summary": "Map of job ID → time reserved for unused job slots.",
-        "operationId": "get_reserved",
-        "responses": {
-          "200": {
-            "description": "successful operation",
-            "content": {
-              "application/json": {
-                "schema": {
-                  "title": "Map_of_DateTime",
-                  "type": "object",
-                  "additionalProperties": {
-                    "type": "string",
-                    "format": "date-time"
-                  }
-                }
-              }
-            }
-          },
-          "4XX": {
-            "$ref": "#/components/responses/Error"
-          },
-          "5XX": {
-            "$ref": "#/components/responses/Error"
-          }
-        }
-      },
+    "/sessions": {
       "post": {
-        "summary": "Reserve some job slots with fresh, globally unique IDs.",
-        "operationId": "reserve_jobs",
-        "requestBody": {
-          "content": {
-            "application/json": {
-              "schema": {
-                "title": "uint8",
-                "type": "integer",
-                "format": "uint8",
-                "minimum": 0
-              }
+        "summary": "Start a new support session.",
+        "operationId": "session_start",
+        "parameters": [
+          {
+            "in": "header",
+            "name": "authorization",
+            "description": "Authorization to access some resource, such as a signature.\n\nSee: <https://developer.mozilla.org/en-US/docs/Web/HTTP/Reference/Headers/Authorization>",
+            "schema": {
+              "type": "string"
             }
-          },
-          "required": true
-        },
+          }
+        ],
         "responses": {
           "200": {
             "description": "successful operation",
             "content": {
               "application/json": {
                 "schema": {
-                  "$ref": "#/components/schemas/JobsReserved"
+                  "$ref": "#/components/schemas/SessionId"
                 }
               }
             }
@@ -654,36 +682,41 @@
             "$ref": "#/components/responses/Error"
           }
         }
-      },
-      "delete": {
-        "summary": "Revoke a set of reserved but unused job slots.",
-        "description": "Has no effect on jobs already started or finished, so it is safe to call this with a list of IDs where some have been used. If called with an empty list, revokes all reserved but unused jobs. Returns the list of jobs actually revoked.",
-        "operationId": "revoke_reserved",
-        "requestBody": {
-          "content": {
-            "application/json": {
-              "schema": {
-                "title": "Array_of_JobId",
-                "type": "array",
-                "items": {
-                  "$ref": "#/components/schemas/JobId"
-                }
-              }
+      }
+    },
+    "/sessions/{session_id}/stop": {
+      "post": {
+        "summary": "End a support session.",
+        "operationId": "session_stop",
+        "parameters": [
+          {
+            "in": "header",
+            "name": "authorization",
+            "description": "Authorization to access some resource, such as a signature.\n\nSee: <https://developer.mozilla.org/en-US/docs/Web/HTTP/Reference/Headers/Authorization>",
+            "schema": {
+              "type": "string"
             }
           },
-          "required": true
-        },
+          {
+            "in": "path",
+            "name": "session_id",
+            "required": true,
+            "schema": {
+              "$ref": "#/components/schemas/SessionId"
+            }
+          }
+        ],
         "responses": {
           "200": {
             "description": "successful operation",
             "content": {
               "application/json": {
                 "schema": {
-                  "title": "Array_of_JobId",
-                  "type": "array",
-                  "items": {
-                    "$ref": "#/components/schemas/JobId"
-                  }
+                  "title": "Null",
+                  "type": "string",
+                  "enum": [
+                    null
+                  ]
                 }
               }
             }
@@ -723,6 +756,61 @@
           "request_id"
         ]
       },
+      "IdentityResultsPage": {
+        "description": "A single page of results",
+        "type": "object",
+        "properties": {
+          "next_page": {
+            "nullable": true,
+            "description": "token used to fetch the next page of results (if any)",
+            "type": "string"
+          },
+          "items": {
+            "description": "list of items on this page of results",
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/Identity"
+            }
+          }
+        },
+        "required": [
+          "items"
+        ]
+      },
+      "Identity": {
+        "description": "An authenticated identity.",
+        "type": "object",
+        "properties": {
+          "key_id": {
+            "$ref": "#/components/schemas/KeyId"
+          },
+          "public_key": {
+            "type": "string"
+          },
+          "nonce": {
+            "$ref": "#/components/schemas/Nonce"
+          },
+          "time_authenticated": {
+            "type": "string",
+            "format": "date-time"
+          },
+          "time_revoked": {
+            "nullable": true,
+            "type": "string",
+            "format": "date-time"
+          }
+        },
+        "required": [
+          "key_id",
+          "nonce",
+          "public_key",
+          "time_authenticated"
+        ]
+      },
+      "Nonce": {
+        "description": "A unique random string. Authentication credentials have two of these: one generated by the server, and one by the client. This structure is agnostic to the syntax of the string.",
+        "type": "string"
+      },
       "JobStatusResultsPage": {
         "description": "A single page of results",
         "type": "object",
@@ -749,25 +837,20 @@
           {
             "type": "object",
             "properties": {
-              "Reserved": {
+              "Unknown": {
                 "type": "object",
                 "properties": {
                   "job_id": {
                     "$ref": "#/components/schemas/JobId"
-                  },
-                  "time_reserved": {
-                    "type": "string",
-                    "format": "date-time"
                   }
                 },
                 "required": [
-                  "job_id",
-                  "time_reserved"
+                  "job_id"
                 ]
               }
             },
             "required": [
-              "Reserved"
+              "Unknown"
             ],
             "additionalProperties": false
           },
@@ -779,10 +862,6 @@
                 "properties": {
                   "job": {
                     "$ref": "#/components/schemas/Verified_for_JobStartRequest"
-                  },
-                  "time_reserved": {
-                    "type": "string",
-                    "format": "date-time"
                   },
                   "time_started": {
                     "type": "string",
@@ -803,7 +882,6 @@
                   "job",
                   "stderr_len",
                   "stdout_len",
-                  "time_reserved",
                   "time_started"
                 ]
               }
@@ -821,10 +899,6 @@
                 "properties": {
                   "job": {
                     "$ref": "#/components/schemas/Verified_for_JobStartRequest"
-                  },
-                  "time_reserved": {
-                    "type": "string",
-                    "format": "date-time"
                   },
                   "time_started": {
                     "type": "string",
@@ -863,7 +937,6 @@
                   "stdout_hash",
                   "stdout_len",
                   "time_ended",
-                  "time_reserved",
                   "time_started"
                 ]
               }
@@ -876,6 +949,7 @@
         ]
       },
       "JobId": {
+        "description": "A globally unique identifier for a job within a session.",
         "type": "string"
       },
       "Verified_for_JobStartRequest": {
@@ -915,7 +989,7 @@
         ]
       },
       "JobStartRequest": {
-        "description": "A request to run the given `command` in the slot reserved by `job_id`.",
+        "description": "A request to run the given `command` as `job_id`.",
         "type": "object",
         "properties": {
           "job_id": {
@@ -925,12 +999,7 @@
             "type": "string"
           },
           "interactive": {
-            "nullable": true,
-            "allOf": [
-              {
-                "$ref": "#/components/schemas/KeyId"
-              }
-            ]
+            "type": "boolean"
           }
         },
         "required": [
@@ -969,82 +1038,9 @@
         "type": "string",
         "format": "hex encoded hash (32 bytes)"
       },
-      "IdentityResultsPage": {
-        "description": "A single page of results",
-        "type": "object",
-        "properties": {
-          "next_page": {
-            "nullable": true,
-            "description": "token used to fetch the next page of results (if any)",
-            "type": "string"
-          },
-          "items": {
-            "description": "list of items on this page of results",
-            "type": "array",
-            "items": {
-              "$ref": "#/components/schemas/Identity"
-            }
-          }
-        },
-        "required": [
-          "items"
-        ]
-      },
-      "Identity": {
-        "description": "An authenticated identity; i.e., a row in the `authn` table.",
-        "type": "object",
-        "properties": {
-          "key_id": {
-            "$ref": "#/components/schemas/KeyId"
-          },
-          "public_key": {
-            "type": "string"
-          },
-          "nonce": {
-            "$ref": "#/components/schemas/Nonce"
-          },
-          "time_authenticated": {
-            "type": "string",
-            "format": "date-time"
-          },
-          "time_revoked": {
-            "nullable": true,
-            "type": "string",
-            "format": "date-time"
-          }
-        },
-        "required": [
-          "key_id",
-          "nonce",
-          "public_key",
-          "time_authenticated"
-        ]
-      },
-      "Nonce": {
-        "description": "A unique random string. Authentication credentials have two of these: one generated by the server, and one by the client.",
+      "SessionId": {
+        "description": "A globally unique identifier for a session.",
         "type": "string"
-      },
-      "JobsReserved": {
-        "description": "The response to a job reservation request.",
-        "type": "object",
-        "properties": {
-          "job_ids": {
-            "description": "Fresh, globally unique job IDs.",
-            "type": "array",
-            "items": {
-              "$ref": "#/components/schemas/JobId"
-            }
-          },
-          "time_reserved": {
-            "description": "The server's idea of the time at which the job IDs were reserved.",
-            "type": "string",
-            "format": "date-time"
-          }
-        },
-        "required": [
-          "job_ids",
-          "time_reserved"
-        ]
       },
       "JobOutputStream": {
         "description": "Either the standard output or standard error of a job.",

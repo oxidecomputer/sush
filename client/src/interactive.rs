@@ -13,37 +13,42 @@ use tokio::signal::unix::{SignalKind, signal};
 use tokio_fd::AsyncFd;
 use tokio_tungstenite::WebSocketStream;
 
-use sush_common::session::{
-    SESSION_BUFFER_SIZE, SessionControl, SessionDecoder, SessionEncoder, SessionError,
-    SessionMessage, WindowSize,
+use sush_common::interactive::{
+    INTERACTIVE_SESSION_BUFFER_SIZE, InteractiveSessionControl, InteractiveSessionDecoder,
+    InteractiveSessionEncoder, InteractiveSessionError, InteractiveSessionMessage, WindowSize,
 };
 
 /// Drive an interactive job session, relaying stdin/stdout to/from a WebSocket.
 /// The terminal is put into "raw" mode for the duration of `session_inner`, and
 /// (we hope) restored when the session ends.
-pub async fn session<T>(stream: WebSocketStream<T>) -> Result<(), SessionError>
+pub async fn interactive_session<T>(
+    stream: WebSocketStream<T>,
+) -> Result<(), InteractiveSessionError>
 where
     T: AsyncRead + AsyncWrite + Send + Unpin,
 {
     let stdin = stdin();
     let stdout = stdout();
     let mode = raw_mode(&stdin)?;
-    let result = session_inner(&stdin, &stdout, stream).await;
+    let result = interactive_session_inner(&stdin, &stdout, stream).await;
     restore_mode(&stdin, mode)?;
     result
 }
 
-async fn session_inner<T>(
+async fn interactive_session_inner<T>(
     stdin: &Stdin,
     stdout: &Stdout,
     mut stream: WebSocketStream<T>,
-) -> Result<(), SessionError>
+) -> Result<(), InteractiveSessionError>
 where
     T: AsyncRead + AsyncWrite + Unpin,
 {
-    let mut buffer = BytesMut::with_capacity(SESSION_BUFFER_SIZE);
-    let mut decoder = SessionDecoder::default();
-    let mut encoder = SessionEncoder::default();
+    use InteractiveSessionControl as ISC;
+    use InteractiveSessionMessage as ISM;
+
+    let mut buffer = BytesMut::with_capacity(INTERACTIVE_SESSION_BUFFER_SIZE);
+    let mut decoder = InteractiveSessionDecoder::default();
+    let mut encoder = InteractiveSessionEncoder::default();
     let mut sighup = signal(SignalKind::hangup())?;
     let mut sigint = signal(SignalKind::interrupt())?;
     let mut sigquit = signal(SignalKind::quit())?;
@@ -59,7 +64,7 @@ where
                 if n == 0 || buffer == "" {
                     break;
                 }
-                let message = SessionMessage::Data(buffer.copy_to_bytes(n));
+                let message = ISM::Data(buffer.copy_to_bytes(n));
                 stream.send(encoder.encode(message)?).await?;
                 buffer.truncate(0);
             }
@@ -67,26 +72,26 @@ where
             // Handle a message from the server.
             Some(Ok(message)) = stream.next() => {
                 match decoder.decode(message)? {
-                    SessionMessage::Control(control) => match control {
-                        SessionControl::WindowChange { .. } => (),
+                    ISM::Control(control) => match control {
+                        ISC::WindowChange { .. } => (),
                     }
-                    SessionMessage::Data(bytes) => {
+                    ISM::Data(bytes) => {
                         stdout_async.write_all(&bytes).await?;
                     }
-                    SessionMessage::Ping(bytes) => {
+                    ISM::Ping(bytes) => {
                         let pong = encoder.rekey(Some(&bytes))?;
                         stream.send(encoder.encode(pong)?).await?;
                         decoder.rekey(bytes, None);
                     }
-                    SessionMessage::Pong(_) => (),
-                    SessionMessage::Close => break,
+                    ISM::Pong(_) => (),
+                    ISM::Close => break,
                 }
             }
 
             // Send window size on change.
             Some(()) = sigwinch.recv() => {
                 let winsize = tcgetwinsize(stdin)?;
-                let message = SessionControl::WindowChange(WindowSize {
+                let message = ISC::WindowChange(WindowSize {
                     rows: winsize.ws_row,
                     cols: winsize.ws_col,
                 }).into();
@@ -109,7 +114,7 @@ where
 /// Put the client terminal in "raw" mode. This is always a risky
 /// proposition; if an interactive job is interrupted, it may leave
 /// the terminal in a corrupted state.
-fn raw_mode(fd: impl AsFd) -> Result<Termios, SessionError> {
+fn raw_mode(fd: impl AsFd) -> Result<Termios, InteractiveSessionError> {
     let old = tcgetattr(&fd)?;
     let mut new = old.clone();
     new.make_raw();
@@ -120,7 +125,7 @@ fn raw_mode(fd: impl AsFd) -> Result<Termios, SessionError> {
 /// Restore the client terminal to its previous, "cooked" mode.
 /// Does not send any terminal escape sequences, and so may not
 /// actually reset the terminal to a good state.
-fn restore_mode(fd: impl AsFd, mode: Termios) -> Result<(), SessionError> {
+fn restore_mode(fd: impl AsFd, mode: Termios) -> Result<(), InteractiveSessionError> {
     tcsetattr(&fd, OptionalActions::Drain, &mode)?;
 
     // AsyncFd sets O_NONBLOCK, so we have to turn it back off again.

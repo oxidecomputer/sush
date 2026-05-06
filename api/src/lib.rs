@@ -15,7 +15,7 @@ use serde::Deserialize;
 use serde::de::{Deserializer, Error as DeserializeError, IntoDeserializer, MapAccess, Visitor};
 
 use sush_common::authn::Identity;
-use sush_common::jobs::{JobId, JobLimits, JobOutputStream, JobStatus, SignedJob};
+use sush_common::jobs::{JobId, JobLimits, JobOutputStream, JobStatus, SessionId, SignedJob};
 use sush_common::keys::{KeyId, SshPublicKey};
 
 /// Oxide Support Shell API
@@ -53,7 +53,7 @@ pub trait SushApi {
         body: TypedBody<Option<SshPublicKey>>,
     ) -> Result<HttpResponseOk<Identity>, HttpError>;
 
-    /// List authenticated identities.
+    /// List authenticated identities (paginated).
     #[endpoint { method = GET, path = "/iam" }]
     async fn identities(
         ctx: RequestContext<Self::Context>,
@@ -69,6 +69,23 @@ pub trait SushApi {
         params: PathParams<KeyIdParam>,
     ) -> Result<HttpResponseDeleted, HttpError>;
 
+    // Session management.
+
+    /// Start a new support session.
+    #[endpoint { method = POST, path = "/sessions" }]
+    async fn session_start(
+        ctx: RequestContext<Self::Context>,
+        headers: Header<Authorization>,
+    ) -> Result<HttpResponseOk<SessionId>, HttpError>;
+
+    /// End a support session.
+    #[endpoint { method = POST, path = "/sessions/{session_id}/stop" }]
+    async fn session_stop(
+        ctx: RequestContext<Self::Context>,
+        headers: Header<Authorization>,
+        params: PathParams<SessionIdParam>,
+    ) -> Result<HttpResponseOk<()>, HttpError>;
+
     // Job management.
 
     /// Start an authorized job.
@@ -83,7 +100,7 @@ pub trait SushApi {
 
     /// Abort a started job.
     #[endpoint { method = GET, path = "/jobs/{job_id}/abort" }]
-    async fn job_abort(
+    async fn job_stop(
         ctx: RequestContext<Self::Context>,
         headers: Header<Authorization>,
         params: PathParams<JobIdParam>,
@@ -140,10 +157,16 @@ pub struct KeyIdParam {
 }
 
 #[derive(Deserialize, JsonSchema)]
+pub struct SessionIdParam {
+    pub session_id: SessionId,
+}
+
+#[derive(Deserialize, JsonSchema)]
 pub struct JobIdParam {
     pub job_id: JobId,
 }
 
+/// Job parameters _not_ specified in the signed job request.
 #[derive(Debug, Default, Deserialize, JsonSchema)]
 pub struct JobStartParams {
     #[serde(flatten, deserialize_with = "deserialize_job_limits")]
@@ -209,7 +232,7 @@ pub struct JobOutputParams {
     pub stream: JobOutputStream,
 }
 
-/// `Range` request header.
+/// Authorized `Range` request headers.
 #[derive(Debug, Deserialize, JsonSchema)]
 pub struct RangeRequest {
     /// Authorization to access the range.

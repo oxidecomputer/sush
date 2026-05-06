@@ -19,7 +19,7 @@ use rustix::termios::{Winsize, tcsetwinsize};
 use tokio::io::unix::AsyncFd;
 use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
 
-use sush_common::session::WindowSize;
+use sush_common::interactive::WindowSize;
 
 /// Unix pseudoterminal.
 #[derive(Debug)]
