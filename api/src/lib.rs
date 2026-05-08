@@ -62,6 +62,9 @@ pub trait SushApi {
     ) -> Result<HttpResponseOk<ResultsPage<Identity>>, HttpError>;
 
     /// Revoke an authenticated identity.
+    ///
+    /// Any authenticated identity may revoke any other identity;
+    /// this is the only way to handle lost or stolen private keys.
     #[endpoint { method = DELETE, path = "/iam/{key_id}" }]
     async fn revoke_identity(
         ctx: RequestContext<Self::Context>,
@@ -72,6 +75,10 @@ pub trait SushApi {
     // Session management.
 
     /// Start a new support session.
+    ///
+    /// There may only be one session active on the rack at a time.
+    /// If a session is already running when this request is made,
+    /// the old session is stopped (regardless of ownership).
     #[endpoint { method = POST, path = "/sessions" }]
     async fn session_start(
         ctx: RequestContext<Self::Context>,
@@ -79,6 +86,10 @@ pub trait SushApi {
     ) -> Result<HttpResponseOk<SessionId>, HttpError>;
 
     /// End a support session.
+    ///
+    /// Since there may be only one session active on the rack at a time
+    /// and we do not want to prevent starting new sessions, anyone is
+    /// allowed to stop anyone else's sesssion and start their own.
     #[endpoint { method = POST, path = "/sessions/{session_id}/stop" }]
     async fn session_stop(
         ctx: RequestContext<Self::Context>,
@@ -98,8 +109,8 @@ pub trait SushApi {
         body: TypedBody<SignedJob>,
     ) -> Result<HttpResponseOk<JobStatus>, HttpError>;
 
-    /// Abort a started job.
-    #[endpoint { method = GET, path = "/jobs/{job_id}/abort" }]
+    /// Stop a (running) job.
+    #[endpoint { method = POST, path = "/jobs/{job_id}/stop" }]
     async fn job_stop(
         ctx: RequestContext<Self::Context>,
         headers: Header<Authorization>,
@@ -118,7 +129,7 @@ pub trait SushApi {
     #[endpoint { method = GET, path = "/jobs/{job_id}/output/{stream}" }]
     async fn job_output(
         ctx: RequestContext<Self::Context>,
-        headers: Header<RangeRequest>,
+        headers: Header<AuthorizedRangeRequest>,
         params: PathParams<JobOutputParams>,
     ) -> Result<Response<Body>, HttpError>;
 
@@ -127,7 +138,7 @@ pub trait SushApi {
     #[endpoint { method = DELETE, path = "/jobs/{job_id}/output/{stream}" }]
     async fn job_output_delete(
         ctx: RequestContext<Self::Context>,
-        headers: Header<RangeRequest>,
+        headers: Header<AuthorizedRangeRequest>,
         params: PathParams<JobOutputParams>,
     ) -> Result<HttpResponseOk<u64>, HttpError>;
 
@@ -234,7 +245,7 @@ pub struct JobOutputParams {
 
 /// Authorized `Range` request headers.
 #[derive(Debug, Deserialize, JsonSchema)]
-pub struct RangeRequest {
+pub struct AuthorizedRangeRequest {
     /// Authorization to access the range.
     ///
     /// See: <https://developer.mozilla.org/en-US/docs/Web/HTTP/Reference/Headers/Authorization>
@@ -246,7 +257,7 @@ pub struct RangeRequest {
     range: Option<String>,
 }
 
-impl RangeRequest {
+impl AuthorizedRangeRequest {
     /// Extract a single range from the `Range` request header.
     /// This is just to avoid the complexity of encoding multiple
     /// ranges as output, not an inherent limitation.

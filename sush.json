@@ -203,6 +203,7 @@
     "/iam/{key_id}": {
       "delete": {
         "summary": "Revoke an authenticated identity.",
+        "description": "Any authenticated identity may revoke any other identity; this is the only way to handle lost or stolen private keys.",
         "operationId": "revoke_identity",
         "parameters": [
           {
@@ -289,52 +290,6 @@
         },
         "x-dropshot-pagination": {
           "required": []
-        }
-      }
-    },
-    "/jobs/{job_id}/abort": {
-      "get": {
-        "summary": "Abort a started job.",
-        "operationId": "job_stop",
-        "parameters": [
-          {
-            "in": "header",
-            "name": "authorization",
-            "description": "Authorization to access some resource, such as a signature.\n\nSee: <https://developer.mozilla.org/en-US/docs/Web/HTTP/Reference/Headers/Authorization>",
-            "schema": {
-              "type": "string"
-            }
-          },
-          {
-            "in": "path",
-            "name": "job_id",
-            "required": true,
-            "schema": {
-              "$ref": "#/components/schemas/JobId"
-            }
-          }
-        ],
-        "responses": {
-          "200": {
-            "description": "successful operation",
-            "content": {
-              "application/json": {
-                "schema": {
-                  "title": "Null",
-                  "type": "string",
-                  "enum": [
-                    null
-                  ]
-                }
-              }
-            }
-          },
-          "4XX": {
-            "$ref": "#/components/responses/Error"
-          },
-          "5XX": {
-            "$ref": "#/components/responses/Error"
-          }
         }
       }
     },
@@ -650,9 +605,56 @@
         }
       }
     },
+    "/jobs/{job_id}/stop": {
+      "post": {
+        "summary": "Stop a (running) job.",
+        "operationId": "job_stop",
+        "parameters": [
+          {
+            "in": "header",
+            "name": "authorization",
+            "description": "Authorization to access some resource, such as a signature.\n\nSee: <https://developer.mozilla.org/en-US/docs/Web/HTTP/Reference/Headers/Authorization>",
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "in": "path",
+            "name": "job_id",
+            "required": true,
+            "schema": {
+              "$ref": "#/components/schemas/JobId"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "successful operation",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "title": "Null",
+                  "type": "string",
+                  "enum": [
+                    null
+                  ]
+                }
+              }
+            }
+          },
+          "4XX": {
+            "$ref": "#/components/responses/Error"
+          },
+          "5XX": {
+            "$ref": "#/components/responses/Error"
+          }
+        }
+      }
+    },
     "/sessions": {
       "post": {
         "summary": "Start a new support session.",
+        "description": "There may only be one session active on the rack at a time. If a session is already running when this request is made, the old session is stopped (regardless of ownership).",
         "operationId": "session_start",
         "parameters": [
           {
@@ -687,6 +689,7 @@
     "/sessions/{session_id}/stop": {
       "post": {
         "summary": "End a support session.",
+        "description": "Since there may be only one session active on the rack at a time and we do not want to prevent starting new sessions, anyone is allowed to stop anyone else's sesssion and start their own.",
         "operationId": "session_stop",
         "parameters": [
           {
@@ -863,6 +866,9 @@
                   "job": {
                     "$ref": "#/components/schemas/Verified_for_JobStartRequest"
                   },
+                  "session_id": {
+                    "$ref": "#/components/schemas/SessionId"
+                  },
                   "time_started": {
                     "type": "string",
                     "format": "date-time"
@@ -880,6 +886,7 @@
                 },
                 "required": [
                   "job",
+                  "session_id",
                   "stderr_len",
                   "stdout_len",
                   "time_started"
@@ -899,6 +906,9 @@
                 "properties": {
                   "job": {
                     "$ref": "#/components/schemas/Verified_for_JobStartRequest"
+                  },
+                  "session_id": {
+                    "$ref": "#/components/schemas/SessionId"
                   },
                   "time_started": {
                     "type": "string",
@@ -932,6 +942,7 @@
                 },
                 "required": [
                   "job",
+                  "session_id",
                   "stderr_hash",
                   "stderr_len",
                   "stdout_hash",
@@ -1033,14 +1044,14 @@
           "s"
         ]
       },
+      "SessionId": {
+        "description": "A globally unique identifier for a session.",
+        "type": "string"
+      },
       "JobOutputHash": {
         "description": "BLAKE3 hash of job output, used as a checksum.",
         "type": "string",
         "format": "hex encoded hash (32 bytes)"
-      },
-      "SessionId": {
-        "description": "A globally unique identifier for a session.",
-        "type": "string"
       },
       "JobOutputStream": {
         "description": "Either the standard output or standard error of a job.",

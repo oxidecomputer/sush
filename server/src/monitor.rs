@@ -21,7 +21,7 @@ use tokio::{select, spawn};
 
 use sush_common::interactive::InteractiveSessionError;
 use sush_common::jobs::JobOutputStream::{Stderr, Stdout};
-use sush_common::jobs::{JobId, JobOutputHash, JobStatus, VerifiedJob};
+use sush_common::jobs::{JobId, JobOutputHash, JobStatus, SessionId, VerifiedJob};
 
 use crate::error::{ExecutionError, JobError};
 use crate::interactive::{InteractiveSession, SocketSender};
@@ -137,6 +137,7 @@ impl JobMonitor {
         &mut self,
         JobStarted {
             job,
+            session_id,
             time_started,
             child,
             interactive,
@@ -159,6 +160,7 @@ impl JobMonitor {
             let status = session.await.map_err(exe)?;
             let end = JobEnded {
                 job,
+                session_id,
                 time_started,
                 time_ended: Utc::now(),
                 status,
@@ -267,6 +269,7 @@ impl MonitorRequest {
 #[derive(Debug)]
 pub struct JobStarted {
     pub job: VerifiedJob,
+    pub session_id: SessionId,
     pub time_started: DateTime<Utc>,
     pub child: Child,
     pub interactive: Option<Pty>,
@@ -282,12 +285,14 @@ impl From<&JobStarted> for JobStatus {
     fn from(start: &JobStarted) -> Self {
         let JobStarted {
             job,
+            session_id,
             time_started,
             child: _,
             interactive: _,
         } = start;
         Self::Started {
             job: job.to_owned(),
+            session_id: session_id.to_owned(),
             time_started: time_started.to_owned(),
             stdout_len: 0,
             stderr_len: 0,
@@ -299,6 +304,7 @@ impl From<&JobStarted> for JobStatus {
 #[derive(Clone, Debug)]
 pub struct JobEnded {
     pub job: VerifiedJob,
+    pub session_id: SessionId,
     pub time_started: DateTime<Utc>,
     pub time_ended: DateTime<Utc>,
     pub status: ExitStatus,
@@ -318,6 +324,7 @@ impl From<JobEnded> for JobStatus {
     fn from(end: JobEnded) -> Self {
         let JobEnded {
             job,
+            session_id,
             time_started,
             time_ended,
             status,
@@ -328,6 +335,7 @@ impl From<JobEnded> for JobStatus {
         } = end;
         Self::Ended {
             job,
+            session_id,
             time_started,
             time_ended,
             status: status.code(),

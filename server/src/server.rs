@@ -14,7 +14,7 @@ use x509_cert::Certificate;
 use x509_cert::der::{Decode as _, DecodePem as _};
 
 use sush_api::{
-    Authorization, JobIdParam, JobOutputParams, JobStartParams, KeyIdParam, RangeRequest,
+    Authorization, AuthorizedRangeRequest, JobIdParam, JobOutputParams, JobStartParams, KeyIdParam,
     SessionIdParam, SushApi,
 };
 use sush_common::authn::Identity;
@@ -166,7 +166,7 @@ impl SushApi for ApiServer {
         if let Some(Ok(end)) = mgr.job_start(&authn, job, params).await? {
             Ok(HttpResponseOk(end.into()))
         } else {
-            Ok(HttpResponseOk(mgr.job_status(&authn, &job_id)))
+            Ok(HttpResponseOk(mgr.job_status(&authn, &job_id)?))
         }
     }
 
@@ -192,12 +192,12 @@ impl SushApi for ApiServer {
         let Authorization { authorization } = headers.into_inner();
         let authn = mgr.iam(authorization, None).await?;
         let JobIdParam { job_id } = params.into_inner();
-        Ok(HttpResponseOk(mgr.job_status(&authn, &job_id)))
+        Ok(HttpResponseOk(mgr.job_status(&authn, &job_id)?))
     }
 
     async fn job_output(
         ctx: RequestContext<Self::Context>,
-        headers: Header<RangeRequest>,
+        headers: Header<AuthorizedRangeRequest>,
         params: PathParams<JobOutputParams>,
     ) -> Result<Response<Body>, HttpError> {
         let mgr = ctx.context();
@@ -211,7 +211,7 @@ impl SushApi for ApiServer {
 
     async fn job_output_delete(
         ctx: RequestContext<Self::Context>,
-        headers: Header<RangeRequest>,
+        headers: Header<AuthorizedRangeRequest>,
         params: PathParams<JobOutputParams>,
     ) -> Result<HttpResponseOk<u64>, HttpError> {
         let mgr = ctx.context();

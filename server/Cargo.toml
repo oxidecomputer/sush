@@ -21,6 +21,7 @@ futures.workspace = true
 http-range-header.workspace = true
 hyper.workspace = true
 libc.workspace = true
+lru.workspace = true
 memmap2.workspace = true
 p256.workspace = true
 pwd.workspace = true

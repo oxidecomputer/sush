@@ -18,7 +18,7 @@ use serde::{Deserialize, Serialize, Serializer};
 use thiserror::Error;
 
 use crate::codephrases::{WORD_SEPARATOR, generate_id, id_phrase};
-use crate::keys::{Signed, ToBeSigned, Verified};
+use crate::keys::{KeyId, Signed, ToBeSigned, Verified};
 
 /// A globally unique identifier for a job within a session.
 #[derive(
@@ -120,6 +120,43 @@ impl<S: AsRef<str>> From<S> for SessionId {
     }
 }
 
+#[derive(Clone, Debug, Deserialize, JsonSchema, Serialize)]
+pub struct Session {
+    session_id: SessionId,
+    key_id: KeyId,
+    last_job: Option<SignedJob>,
+}
+
+impl Session {
+    pub fn new(session_id: SessionId, key_id: KeyId) -> Self {
+        Self {
+            session_id,
+            key_id,
+            last_job: None,
+        }
+    }
+
+    pub fn session_id(&self) -> &SessionId {
+        &self.session_id
+    }
+
+    pub fn key_id(&self) -> &KeyId {
+        &self.key_id
+    }
+
+    pub fn job_started(&mut self, job: SignedJob) {
+        self.last_job = Some(job)
+    }
+
+    pub fn next_job_id(&self) -> Result<JobId, serde_json::Error> {
+        if let Some(job) = self.last_job.as_ref() {
+            Ok(self.session_id.next_job_id(job)?)
+        } else {
+            Ok(self.session_id.first_job_id())
+        }
+    }
+}
+
 /// A request to run the given `command` as `job_id`.
 #[derive(Clone, Debug, Deserialize, JsonSchema, Serialize)]
 pub struct JobStartRequest {
@@ -189,12 +226,14 @@ pub enum JobStatus {
     },
     Started {
         job: VerifiedJob,
+        session_id: SessionId,
         time_started: DateTime<Utc>,
         stdout_len: u64,
         stderr_len: u64,
     },
     Ended {
         job: VerifiedJob,
+        session_id: SessionId,
         time_started: DateTime<Utc>,
         time_ended: DateTime<Utc>,
         status: Option<i32>,
@@ -206,6 +245,14 @@ pub enum JobStatus {
 }
 
 impl JobStatus {
+    pub fn session_id(&self) -> Option<SessionId> {
+        match self {
+            Self::Unknown { .. } => None,
+            Self::Started { session_id, .. } => Some(session_id.to_owned()),
+            Self::Ended { session_id, .. } => Some(session_id.to_owned()),
+        }
+    }
+
     pub fn time_elapsed(&self) -> Option<TimeDelta> {
         match self {
             Self::Unknown { .. } => None,

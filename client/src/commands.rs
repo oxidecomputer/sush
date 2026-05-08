@@ -273,10 +273,11 @@ pub enum IdentityCommand {
     #[default]
     Login,
 
-    /// Revoke the current credentials associated with an SSH identity.
+    /// Revoke an SSH identity.
     Revoke {
-        /// The identity to revoke. Defaults to the current identity.
-        revoke: Option<KeyId>,
+        /// The identity to be revoked.
+        #[clap(name = "KEY_ID")]
+        revoke: KeyId,
     },
 }
 
@@ -285,6 +286,12 @@ pub enum SessionCommand {
     /// Start a new support session.
     #[default]
     Start,
+
+    /// A remote support session (i.e., signing-only mode).
+    Remote {
+        session_id: SessionId,
+        key_id: KeyId,
+    },
 
     /// Stop a support session.
     Stop {
@@ -394,15 +401,10 @@ impl ClientCommand {
             ctx.set_output_format(output);
         }
 
-        let mut ssh_agent = if let Some(ssh_auth_sock) = &args.ssh_auth_sock {
-            SshAgentConnection::connect(ssh_auth_sock).await?
-        } else {
-            return Err(CommandError::MissingSshAuthSock);
-        };
         let client = args.url.as_ref().map(|url| Client::new(url));
         match (self, client) {
             (ClientCommand::Cert { command }, Some(client)) => {
-                let authz = authz(ctx, &client, &mut ssh_agent, &args.ssh_key_id).await?;
+                let authz = authz(ctx, &client, &args.ssh_auth_sock, &args.ssh_key_id).await?;
                 cert(ctx, &client, &authz, command).await
             }
 
@@ -420,25 +422,31 @@ impl ClientCommand {
                     command.unwrap_or_else(|| {
                         if available {
                             IdentityCommand::Available
-                        } else if revoke.is_some() {
+                        } else if let Some(revoke) = revoke {
                             IdentityCommand::Revoke { revoke }
                         } else {
                             IdentityCommand::default()
                         }
                     }),
-                    &mut ssh_agent,
+                    &args.ssh_auth_sock,
                     &args.ssh_key_id,
                 )
                 .await
             }
 
-            (ClientCommand::Session { command }, Some(client)) => {
-                let authz = authz(ctx, &client, &mut ssh_agent, &args.ssh_key_id).await?;
-                session(ctx, &client, &authz, command.unwrap_or_default()).await
+            (ClientCommand::Session { command }, client) => {
+                session(
+                    ctx,
+                    &client,
+                    &args.ssh_auth_sock,
+                    &args.ssh_key_id,
+                    command.unwrap_or_default(),
+                )
+                .await
             }
 
             (ClientCommand::Job { command }, client) => {
-                job(ctx, &client, command, &mut ssh_agent, &args.ssh_key_id).await
+                job(ctx, &client, command, &args.ssh_auth_sock, &args.ssh_key_id).await
             }
 
             (ClientCommand::Set { args: values }, _) => {
@@ -462,13 +470,18 @@ impl ClientCommand {
 async fn authn(
     ctx: &mut impl CommandContext,
     client: &Client,
-    ssh_agent: &mut SshAgentConnection,
+    ssh_auth_sock: &Option<String>,
     ssh_key_id: &Option<KeyId>,
 ) -> Result<(Credentials, SshPublicKey), CommandError> {
     if let Some((credentials, public_key)) = ctx.get_credentials() {
         return Ok((credentials, public_key));
     }
 
+    let mut ssh_agent = if let Some(ssh_auth_sock) = ssh_auth_sock {
+        SshAgentConnection::connect(ssh_auth_sock).await?
+    } else {
+        return Err(CommandError::MissingSshAuthSock);
+    };
     let public_key = ssh_agent.identity(ssh_key_id.as_ref()).await?;
     let challenge: Challenge = match client.iam().body(None).send().await {
         Ok(_) => return Err(CommandError::InvalidAuthorization),
@@ -508,10 +521,10 @@ impl From<&Authz> for String {
 async fn authz(
     ctx: &mut impl CommandContext,
     client: &Client,
-    ssh_agent: &mut SshAgentConnection,
+    ssh_auth_sock: &Option<String>,
     ssh_key_id: &Option<KeyId>,
 ) -> Result<Authz, CommandError> {
-    let (credentials, _public_key) = authn(ctx, client, ssh_agent, ssh_key_id).await?;
+    let (credentials, _public_key) = authn(ctx, client, ssh_auth_sock, ssh_key_id).await?;
     Ok(Authz(credentials.to_string()))
 }
 
@@ -519,11 +532,16 @@ async fn iam(
     ctx: &mut impl CommandContext,
     client: &Client,
     command: IdentityCommand,
-    ssh_agent: &mut SshAgentConnection,
+    ssh_auth_sock: &Option<String>,
     ssh_key_id: &Option<KeyId>,
 ) -> Result<(), CommandError> {
     match command {
         IdentityCommand::Available => {
+            let mut ssh_agent = if let Some(ssh_auth_sock) = ssh_auth_sock {
+                SshAgentConnection::connect(ssh_auth_sock).await?
+            } else {
+                return Err(CommandError::MissingSshAuthSock);
+            };
             let mut keys = Vec::new();
             for key in ssh_agent.list_identities().await? {
                 if let Some(key_id) = ssh_key_id
@@ -537,7 +555,7 @@ async fn iam(
         }
 
         IdentityCommand::List { limit } => {
-            let authz = authz(ctx, client, ssh_agent, ssh_key_id).await?;
+            let authz = authz(ctx, client, ssh_auth_sock, ssh_key_id).await?;
             let mut page = client
                 .identities()
                 .limit(limit)
@@ -569,7 +587,7 @@ async fn iam(
 
         IdentityCommand::Login => {
             ctx.set_credentials(None);
-            let (credentials, public_key) = authn(ctx, client, ssh_agent, ssh_key_id).await?;
+            let (credentials, public_key) = authn(ctx, client, ssh_auth_sock, ssh_key_id).await?;
             let identity = client
                 .iam()
                 .authorization(credentials.to_string())
@@ -581,11 +599,8 @@ async fn iam(
         }
 
         IdentityCommand::Revoke { revoke } => {
-            let revoke = ctx.really_revoke(match revoke {
-                Some(revoke) => revoke,
-                None => ssh_agent.identity(ssh_key_id.as_ref()).await?.key_id()?,
-            })?;
-            let authz = authz(ctx, client, ssh_agent, ssh_key_id).await?;
+            let revoke = ctx.really_revoke(revoke)?;
+            let authz = authz(ctx, client, ssh_auth_sock, ssh_key_id).await?;
             client
                 .revoke_identity()
                 .authorization(&authz)
@@ -634,35 +649,48 @@ async fn cert(
 
 async fn session(
     ctx: &mut impl CommandContext,
-    client: &Client,
-    authz: &Authz,
+    client: &Option<Client>,
+    ssh_auth_sock: &Option<String>,
+    ssh_key_id: &Option<KeyId>,
     command: SessionCommand,
 ) -> Result<(), CommandError> {
-    match command {
-        SessionCommand::Start => {
+    match (command, client) {
+        (SessionCommand::Start, Some(client)) => {
+            let (credentials, _public_key) = authn(ctx, client, ssh_auth_sock, ssh_key_id).await?;
+            let authz = credentials.to_string();
             let session_id = client
                 .session_start()
-                .authorization(authz)
+                .authorization(&authz)
                 .send()
                 .await?
                 .into_inner();
-            ctx.session_started(&session_id)?;
+            ctx.session_started(&session_id, &credentials.key_id)?;
             Ok(())
         }
 
-        SessionCommand::Stop { session_id } => {
+        (SessionCommand::Remote { session_id, key_id }, _) => {
+            ctx.session_started(&session_id, &key_id)?;
+            Ok(())
+        }
+
+        (SessionCommand::Stop { session_id }, _) => {
             let ctx_session_id = ctx.session_id().cloned();
-            if let Some(session_id) = session_id.as_ref().or(ctx_session_id.as_ref()) {
+            if let Some(client) = client
+                && let Some(session_id) = session_id.as_ref().or(ctx_session_id.as_ref())
+            {
+                let authz = authz(ctx, client, ssh_auth_sock, ssh_key_id).await?;
                 client
                     .session_stop()
                     .session_id(session_id.clone())
-                    .authorization(authz)
+                    .authorization(&authz)
                     .send()
                     .await?;
                 ctx.session_stopped(session_id)?;
             }
             Ok(())
         }
+
+        (_, None) => Err(CommandError::Offline),
     }
 }
 
@@ -670,7 +698,7 @@ async fn job(
     ctx: &mut impl CommandContext,
     client: &Option<Client>,
     command: JobCommand,
-    ssh_agent: &mut SshAgentConnection,
+    ssh_auth_sock: &Option<String>,
     ssh_key_id: &Option<KeyId>,
 ) -> Result<(), CommandError> {
     match (command, client) {
@@ -678,7 +706,7 @@ async fn job(
             if start_args.command.is_none() && start_args.permslip.is_none() =>
         {
             let job = ctx.read_signed_job()?;
-            let authz = authz(ctx, client, ssh_agent, ssh_key_id).await?;
+            let authz = authz(ctx, client, ssh_auth_sock, ssh_key_id).await?;
             job_start(ctx, client, &authz, job, start_args).await?;
             Ok(())
         }
@@ -716,7 +744,7 @@ async fn job(
             let job_id = if let Some(job_id) = job_id {
                 job_id.to_owned()
             } else {
-                ctx.job_id()?
+                ctx.next_job_id()?
             };
             let mut signer = PermslipSigner::new(key_name, permslip_url).await?;
             let mut interval = interval(Duration::from_millis(100));
@@ -740,7 +768,7 @@ async fn job(
             };
             if let Some(client) = client {
                 ctx.job_signed(&job, false)?;
-                let authz = authz(ctx, client, ssh_agent, ssh_key_id).await?;
+                let authz = authz(ctx, client, ssh_auth_sock, ssh_key_id).await?;
                 job_start(ctx, client, &authz, job, start_args.to_owned()).await
             } else {
                 ctx.job_signed(&job, true)
@@ -748,7 +776,7 @@ async fn job(
         }
 
         (JobCommand::Stop { job_id }, Some(client)) => {
-            let authz = authz(ctx, client, ssh_agent, ssh_key_id).await?;
+            let authz = authz(ctx, client, ssh_auth_sock, ssh_key_id).await?;
             client
                 .job_stop()
                 .job_id(&job_id)
@@ -759,7 +787,7 @@ async fn job(
         }
 
         (JobCommand::Status { job_id }, Some(client)) => {
-            let authz = authz(ctx, client, ssh_agent, ssh_key_id).await?;
+            let authz = authz(ctx, client, ssh_auth_sock, ssh_key_id).await?;
             let status = client
                 .job_status()
                 .job_id(&job_id)
@@ -771,22 +799,23 @@ async fn job(
         }
 
         (JobCommand::Stdout { output }, Some(client)) => {
-            let authz = authz(ctx, client, ssh_agent, ssh_key_id).await?;
+            let authz = authz(ctx, client, ssh_auth_sock, ssh_key_id).await?;
             job_output(ctx, client, &authz, Stdout, output).await
         }
 
         (JobCommand::Stderr { output }, Some(client)) => {
-            let authz = authz(ctx, client, ssh_agent, ssh_key_id).await?;
+            let authz = authz(ctx, client, ssh_auth_sock, ssh_key_id).await?;
             job_output(ctx, client, &authz, Stderr, output).await
         }
 
         (JobCommand::Session { job_id }, Some(client)) => {
-            let authz = authz(ctx, client, ssh_agent, ssh_key_id).await?;
+            let authz = authz(ctx, client, ssh_auth_sock, ssh_key_id).await?;
             job_start_interactive_session(ctx, client, &authz, &job_id).await
         }
 
         (JobCommand::History { limit }, Some(client)) => {
-            let mut stream = client.job_history().stream().boxed();
+            let authz = authz(ctx, client, ssh_auth_sock, ssh_key_id).await?;
+            let mut stream = client.job_history().authorization(&authz).stream().boxed();
             if limit > 0 {
                 stream = stream.take(limit).boxed();
             }
@@ -832,7 +861,7 @@ async fn job_start(
         .max_mem(max_mem)
         .max_fsize(max_fsize)
         .wait(wait && !interactive)
-        .body(job);
+        .body(job.clone());
     if let Some(term) = term {
         start = start.term(term);
         if let Ok(winsize) = tcgetwinsize(stdin()) {
@@ -845,6 +874,7 @@ async fn job_start(
 
     let status = if interactive {
         start.as_mut().await?;
+        ctx.job_started(&job)?;
         job_start_interactive_session(ctx, client, authz, &job_id).await?;
         client
             .job_status()
@@ -856,11 +886,14 @@ async fn job_start(
     } else {
         let mut interval = interval(Duration::from_millis(250));
         interval.set_missed_tick_behavior(MissedTickBehavior::Skip);
+        ctx.job_polling_started(&job_id, interval.period())?;
         loop {
             select! {
                 status = &mut start => {
                     ctx.job_polling_finished(&job_id)?;
-                    break status?.into_inner();
+                    let status = status?.into_inner();
+                    ctx.job_started(&job)?;
+                    break status;
                 }
                 _ = interval.tick() => {
                     let status = client
@@ -870,7 +903,6 @@ async fn job_start(
                         .send()
                         .await?
                         .into_inner();
-                    ctx.job_polling_started(&job_id, interval.period())?;
                     ctx.job_polling_update(&job_id, &status)?;
                 }
                 _ = ctrl_c() => {
@@ -1224,8 +1256,8 @@ pub enum CommandError {
     MissingCommand,
     #[error("❌ Missing signing key name, try `--permslip`")]
     MissingKeyName,
-    #[error("❌ Missing session ID, try `session-start`")]
-    MissingSessionId,
+    #[error("❌ Missing session, try `session start`")]
+    MissingSession,
     #[error("❌ Missing SSH agent socket, try `--ssh-auth-sock`")]
     MissingSshAuthSock,
     #[error("❌ Command not supported in offline mode, try `--url`")]

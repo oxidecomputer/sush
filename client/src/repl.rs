@@ -179,6 +179,8 @@ impl CommandContext for Repl {
         set_or_unset!(url, SUSH_URL, "Server URL");
         set_or_unset!(ssh_auth_sock, SSH_AUTH_SOCK, "SSH agent socket");
         set_or_unset!(ssh_key_id, SUSH_KEY_ID, "SSH key ID");
+
+        self.set_credentials(None);
     }
 
     fn more(&self) -> bool {
@@ -199,12 +201,16 @@ impl CommandContext for Repl {
         self.cli.session_id()
     }
 
-    fn job_id(&mut self) -> Result<JobId, CommandError> {
-        self.cli.job_id()
+    fn next_job_id(&self) -> Result<JobId, CommandError> {
+        self.cli.next_job_id()
     }
 
-    fn session_started(&mut self, session_id: &SessionId) -> Result<(), CommandError> {
-        self.cli.session_started(session_id)
+    fn session_started(
+        &mut self,
+        session_id: &SessionId,
+        key_id: &KeyId,
+    ) -> Result<(), CommandError> {
+        self.cli.session_started(session_id, key_id)
     }
 
     fn session_stopped(&mut self, session_id: &SessionId) -> Result<(), CommandError> {
@@ -222,6 +228,10 @@ impl CommandContext for Repl {
     }
 
     // Job management
+
+    fn job_started(&mut self, job: &SignedJob) -> Result<(), CommandError> {
+        self.cli.job_started(job)
+    }
 
     fn job_stopped(&mut self, job_id: &JobId) -> Result<(), CommandError> {
         self.set_job_id(Some(job_id.to_owned()));

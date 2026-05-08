@@ -49,8 +49,12 @@ pub trait CommandContext: Send + Sync {
     fn get_credentials(&self) -> Option<(Credentials, SshPublicKey)>;
     fn set_credentials(&mut self, credentials: Option<(Credentials, SshPublicKey)>);
     fn session_id(&self) -> Option<&SessionId>;
-    fn job_id(&mut self) -> Result<JobId, CommandError>;
-    fn session_started(&mut self, session_id: &SessionId) -> Result<(), CommandError>;
+    fn next_job_id(&self) -> Result<JobId, CommandError>;
+    fn session_started(
+        &mut self,
+        session_id: &SessionId,
+        key_id: &KeyId,
+    ) -> Result<(), CommandError>;
     fn session_stopped(&mut self, session_id: &SessionId) -> Result<(), CommandError>;
 
     // Job signing certificates
@@ -58,6 +62,7 @@ pub trait CommandContext: Send + Sync {
     fn cert_imported(&mut self, path: &Path, key_id: KeyId) -> Result<(), CommandError>;
 
     // Job management
+    fn job_started(&mut self, job: &SignedJob) -> Result<(), CommandError>;
     fn job_stopped(&mut self, id: &JobId) -> Result<(), CommandError>;
     fn job_error(&mut self, error: CommandError) -> Result<(), CommandError>;
     fn job_output(

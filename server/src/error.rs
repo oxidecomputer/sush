@@ -9,7 +9,7 @@ use thiserror::Error;
 
 use sush_common::authn::{Challenge, Nonce};
 use sush_common::interactive::InteractiveSessionError;
-use sush_common::jobs::{JobId, JobOutputHash};
+use sush_common::jobs::{JobId, JobOutputHash, SessionId};
 use sush_common::keys::{KeyError, KeyId};
 
 /// What went wrong processing a client job request.
@@ -28,8 +28,10 @@ pub enum JobError {
         path: PathBuf,
         error: std::io::Error,
     },
-    #[error("Identity mismatch, expected `{interactive}`, found `{authn}`")]
-    IdentityMismatch { interactive: KeyId, authn: KeyId },
+    #[error("Identity mismatch, expected `{expected}`, found `{found}`")]
+    IdentityMismatch { expected: KeyId, found: KeyId },
+    #[error("Interactive session error: {0}")]
+    InteractiveSession(#[from] InteractiveSessionError),
     #[error("Invalid command `{0}`, must not start with `-`")]
     InvalidCommand(String),
     #[error("Invalid or duplicate job ID")]
@@ -38,6 +40,8 @@ pub enum JobError {
     InvalidRange(u64),
     #[error("I/O error during {what}: {error}")]
     Io { what: String, error: std::io::Error },
+    #[error("Job `{0}` not found")]
+    JobNotFound(JobId),
     #[error(transparent)]
     Json(#[from] serde_json::Error),
     #[error("Key error: {0}")]
@@ -48,8 +52,10 @@ pub enum JobError {
     MissingCert(KeyId),
     #[error("Only one session may be running at a time")]
     MultipleSessions,
-    #[error("No such nonce `{0}`")]
-    NoSuchNonce(Nonce),
+    #[error("No current session")]
+    NoSession,
+    #[error("Session `{0}` not found")]
+    SessionNotFound(SessionId),
     #[error("Job output hash mismatch, file may be corrupt")]
     OutputHashMismatch(JobId, JobOutputHash),
     #[error("Output not yet available")]
@@ -67,8 +73,6 @@ pub enum JobError {
     },
     #[error("Can't receive response: sender dropped")]
     Recv(#[from] tokio::sync::oneshot::error::RecvError),
-    #[error("Interactive session error: {0}")]
-    InteractiveSession(#[from] InteractiveSessionError),
     #[error(transparent)]
     Slice(#[from] std::array::TryFromSliceError),
     #[error(transparent)]
@@ -86,6 +90,13 @@ impl JobError {
 
     pub fn unauthorized(nonce: Nonce) -> Self {
         Self::Unauthorized(nonce)
+    }
+
+    pub fn identity_mismatch(expected: &KeyId, found: &KeyId) -> Self {
+        Self::IdentityMismatch {
+            expected: expected.to_owned(),
+            found: found.to_owned(),
+        }
     }
 
     /// Report I/O errors with the corresponding stream name.
@@ -120,13 +131,10 @@ impl From<JobError> for HttpError {
             | Der(_)
             | Execution(_)
             | FileIo { .. }
-            | IdentityMismatch { .. }
             | Io { .. }
-            | NoSuchNonce(_)
             | OutputHashMismatch(_, _)
             | PublicKeyNotFound(_)
             | PublicKeyMismatch(_)
-            | PublicKeyRevoked { .. }
             | Recv(_)
             | Shutdown(_)
             | Task(_)
@@ -162,8 +170,18 @@ impl From<JobError> for HttpError {
                     .expect("should be able to add WWW-Authenticate header");
                 err
             }
-            InvalidCommand(_) | InvalidJobId(_) | Json(_) | CertChainTooLong | MissingCert(_)
-            | MultipleSessions | OutputPending => {
+            IdentityMismatch { .. }
+            | InvalidCommand(_)
+            | InvalidJobId(_)
+            | JobNotFound(_)
+            | Json(_)
+            | CertChainTooLong
+            | MissingCert(_)
+            | MultipleSessions
+            | NoSession
+            | PublicKeyRevoked { .. }
+            | SessionNotFound(_)
+            | OutputPending => {
                 HttpError::for_client_error(None, ClientErrorStatusCode::BAD_REQUEST, message)
             }
         }

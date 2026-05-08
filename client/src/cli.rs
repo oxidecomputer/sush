@@ -13,7 +13,7 @@ use x509_cert::Certificate;
 use x509_cert::der::Encode as _;
 
 use sush_common::authn::{Credentials, Identity};
-use sush_common::jobs::{JobId, JobOutputStream, JobStatus, SessionId, SignedJob};
+use sush_common::jobs::{JobId, JobOutputStream, JobStatus, Session, SessionId, SignedJob};
 use sush_common::keys::{KeyId, Signature, SshPublicKey};
 
 use crate::commands::{CommandError, GlobalArgs};
@@ -23,8 +23,7 @@ use crate::context::{CommandContext, OutputFormat};
 pub struct Cli {
     output: OutputFormat,
     progress: Option<ProgressBar>,
-    session: Option<SessionId>,
-    last_job: Option<SignedJob>,
+    session: Option<Session>,
     credentials: Option<(Credentials, SshPublicKey)>,
 }
 
@@ -34,7 +33,6 @@ impl Cli {
             output,
             progress: None,
             session: None,
-            last_job: None,
             credentials: None,
         }
     }
@@ -84,22 +82,23 @@ impl CommandContext for Cli {
     }
 
     fn session_id(&self) -> Option<&SessionId> {
-        self.session.as_ref()
+        self.session.as_ref().map(|s| s.session_id())
     }
 
-    fn job_id(&mut self) -> Result<JobId, CommandError> {
-        let Some(session_id) = self.session.as_ref() else {
-            return Err(CommandError::MissingSessionId);
-        };
-        if let Some(job) = self.last_job.as_ref() {
-            Ok(session_id.next_job_id(job)?)
+    fn next_job_id(&self) -> Result<JobId, CommandError> {
+        if let Some(session) = self.session.as_ref() {
+            Ok(session.next_job_id()?)
         } else {
-            Ok(session_id.first_job_id())
+            Err(CommandError::MissingSession)
         }
     }
 
-    fn session_started(&mut self, session_id: &SessionId) -> Result<(), CommandError> {
-        self.session = Some(session_id.to_owned());
+    fn session_started(
+        &mut self,
+        session_id: &SessionId,
+        key_id: &KeyId,
+    ) -> Result<(), CommandError> {
+        self.session = Some(Session::new(session_id.to_owned(), key_id.to_owned()));
         match self.get_output_format() {
             OutputFormat::Json => println!("{}", json!({"session_started": session_id})),
             OutputFormat::Text => println!("✅ Session is now `{session_id}`"),
@@ -108,7 +107,11 @@ impl CommandContext for Cli {
     }
 
     fn session_stopped(&mut self, session_id: &SessionId) -> Result<(), CommandError> {
-        let _ = self.session.take();
+        if let Some(session) = self.session.as_ref()
+            && session.session_id() == session_id
+        {
+            let _ = self.session.take();
+        }
         match self.get_output_format() {
             OutputFormat::Json => println!("{}", json!({"session_ended": session_id})),
             OutputFormat::Text => println!("✅ Ended session `{session_id}`"),
@@ -173,10 +176,19 @@ impl CommandContext for Cli {
 
     // Job management
 
+    fn job_started(&mut self, job: &SignedJob) -> Result<(), CommandError> {
+        if let Some(session) = self.session.as_mut() {
+            session.job_started(job.to_owned());
+            Ok(())
+        } else {
+            Err(CommandError::MissingSession)
+        }
+    }
+
     fn job_stopped(&mut self, job_id: &JobId) -> Result<(), CommandError> {
         match self.get_output_format() {
-            OutputFormat::Json => println!("{job_id}"),
-            OutputFormat::Text => println!("✅ Aborted job `{job_id}`"),
+            OutputFormat::Json => println!("{}", json!(job_id)),
+            OutputFormat::Text => println!("✅ Stopped job `{job_id}`"),
         }
         Ok(())
     }
@@ -285,7 +297,7 @@ impl CommandContext for Cli {
         if matches!(self.get_output_format(), OutputFormat::Text) && self.progress.is_none() {
             let bar = ProgressBar::new_spinner();
             bar.set_elapsed(elapsed);
-            bar.set_prefix(format!("Waiting for `{job_id}`"));
+            bar.set_prefix(format!("Waiting for job `{job_id}`"));
             bar.set_style(
                 ProgressStyle::with_template(
                     "{spinner}  \
@@ -386,7 +398,6 @@ impl CommandContext for Cli {
     }
 
     fn job_signed(&mut self, job: &SignedJob, show: bool) -> Result<(), CommandError> {
-        self.last_job = Some(job.to_owned());
         if show {
             match self.get_output_format() {
                 OutputFormat::Json => println!("{}", to_json_string(&job)?),
@@ -402,9 +413,10 @@ impl CommandContext for Cli {
             OutputFormat::Text => match status {
                 JobStatus::Unknown { job_id } => println!(
                     "✅ Job ID:\t{job_id}\n   \
-                     Job status:\tUnknown"
+                     Status:\tUnknown"
                 ),
                 JobStatus::Started {
+                    session_id,
                     time_started,
                     stdout_len,
                     stderr_len,
@@ -414,7 +426,8 @@ impl CommandContext for Cli {
                     let stderr_len = byte_size(*stderr_len);
                     println!(
                         "✅ Job ID:\t{job_id}\n   \
-                         Job status:\tStarted\n   \
+                         Session ID:\t{session_id}\n   \
+                         Status:\tStarted\n   \
                          Started at:\t{time_started}\n   \
                          Stdout len:\t{stdout_len}\n   \
                          Stderr len:\t{stderr_len}"
@@ -422,6 +435,7 @@ impl CommandContext for Cli {
                 }
                 JobStatus::Ended {
                     job: _,
+                    session_id,
                     time_started,
                     time_ended,
                     status: Some(exit_status),
@@ -435,7 +449,8 @@ impl CommandContext for Cli {
                     let stderr_len = byte_size(*stderr_len);
                     println!(
                         "✅ Job ID:\t{job_id}\n   \
-                         Job status:\tEnded\n   \
+                         Session ID:\t{session_id}\n   \
+                         Status:\tEnded\n   \
                          Started at:\t{time_started}\n   \
                          Ended at:\t{time_ended} ({duration})\n   \
                          Status:\t{exit_status}\n   \
@@ -447,6 +462,7 @@ impl CommandContext for Cli {
                 }
                 JobStatus::Ended {
                     job: _,
+                    session_id,
                     time_started,
                     time_ended,
                     status: None,
@@ -460,9 +476,10 @@ impl CommandContext for Cli {
                     let stderr_len = byte_size(*stderr_len);
                     println!(
                         "✅ Job ID:\t{job_id}\n   \
-                         Job status:\tAborted\n   \
+                         Session ID:\t{session_id}\n   \
+                         Status:\tStopped\n   \
                          Started at:\t{time_started}\n   \
-                         Aborted at:\t{time_ended} ({duration})\n   \
+                         Stopped at:\t{time_ended} ({duration})\n   \
                          Stdout len:\t{stdout_len}\n   \
                          Stderr len:\t{stderr_len}\n   \
                          Stdout hash:\t{stdout_hash}\n   \
