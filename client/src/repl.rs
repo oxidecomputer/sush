@@ -205,12 +205,8 @@ impl CommandContext for Repl {
         self.cli.next_job_id()
     }
 
-    fn session_started(
-        &mut self,
-        session_id: &SessionId,
-        key_id: &KeyId,
-    ) -> Result<(), CommandError> {
-        self.cli.session_started(session_id, key_id)
+    fn session_started(&mut self, session_id: &SessionId) -> Result<(), CommandError> {
+        self.cli.session_started(session_id)
     }
 
     fn session_stopped(&mut self, session_id: &SessionId) -> Result<(), CommandError> {

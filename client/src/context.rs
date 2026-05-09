@@ -50,11 +50,7 @@ pub trait CommandContext: Send + Sync {
     fn set_credentials(&mut self, credentials: Option<(Credentials, SshPublicKey)>);
     fn session_id(&self) -> Option<&SessionId>;
     fn next_job_id(&self) -> Result<JobId, CommandError>;
-    fn session_started(
-        &mut self,
-        session_id: &SessionId,
-        key_id: &KeyId,
-    ) -> Result<(), CommandError>;
+    fn session_started(&mut self, session_id: &SessionId) -> Result<(), CommandError>;
     fn session_stopped(&mut self, session_id: &SessionId) -> Result<(), CommandError>;
 
     // Job signing certificates

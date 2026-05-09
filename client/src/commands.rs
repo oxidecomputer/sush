@@ -13,8 +13,8 @@ use async_recursion::async_recursion;
 use blake3::{Hasher, hash};
 use bytesize::ByteSize;
 use clap::{Parser, Subcommand};
+use futures::stream;
 use futures::{FutureExt as _, StreamExt as _};
-use futures::{TryStreamExt as _, stream};
 use http::header::WWW_AUTHENTICATE;
 use http::status::StatusCode;
 use memmap2::Mmap;
@@ -34,7 +34,7 @@ use sush_common::jobs::JobOutputStream::{self, Stderr, Stdout};
 use sush_common::jobs::{
     JobId, JobLimits, JobOutputHash, JobStartRequest, JobStatus, SessionId, SignedJob,
 };
-use sush_common::keys::{KeyError, KeyId, Signer as _, SshPublicKey};
+use sush_common::keys::{KeyError, KeyId, Signer as _};
 
 use crate::ByteStream;
 use crate::context::{CommandContext, OutputFormat};
@@ -281,23 +281,22 @@ pub enum IdentityCommand {
     },
 }
 
-#[derive(Clone, Debug, Default, Subcommand)]
+#[derive(Clone, Debug, Subcommand)]
 pub enum SessionCommand {
     /// Start a new support session.
-    #[default]
-    Start,
-
-    /// A remote support session (i.e., signing-only mode).
-    Remote {
-        session_id: SessionId,
-        key_id: KeyId,
-    },
+    Start { session_id: Option<SessionId> },
 
     /// Stop a support session.
     Stop {
         /// The session to stop.
         session_id: Option<SessionId>,
     },
+}
+
+impl Default for SessionCommand {
+    fn default() -> Self {
+        Self::Start { session_id: None }
+    }
 }
 
 #[derive(Clone, Debug, Subcommand)]
@@ -404,8 +403,7 @@ impl ClientCommand {
         let client = args.url.as_ref().map(|url| Client::new(url));
         match (self, client) {
             (ClientCommand::Cert { command }, Some(client)) => {
-                let authz = authz(ctx, &client, &args.ssh_auth_sock, &args.ssh_key_id).await?;
-                cert(ctx, &client, &authz, command).await
+                cert(ctx, &client, &args.ssh_auth_sock, &args.ssh_key_id, command).await
             }
 
             (
@@ -419,6 +417,8 @@ impl ClientCommand {
                 iam(
                     ctx,
                     &client,
+                    &args.ssh_auth_sock,
+                    &args.ssh_key_id,
                     command.unwrap_or_else(|| {
                         if available {
                             IdentityCommand::Available
@@ -428,8 +428,6 @@ impl ClientCommand {
                             IdentityCommand::default()
                         }
                     }),
-                    &args.ssh_auth_sock,
-                    &args.ssh_key_id,
                 )
                 .await
             }
@@ -446,7 +444,7 @@ impl ClientCommand {
             }
 
             (ClientCommand::Job { command }, client) => {
-                job(ctx, &client, command, &args.ssh_auth_sock, &args.ssh_key_id).await
+                job(ctx, &client, &args.ssh_auth_sock, &args.ssh_key_id, command).await
             }
 
             (ClientCommand::Set { args: values }, _) => {
@@ -466,74 +464,59 @@ impl ClientCommand {
     }
 }
 
-/// Return fresh credentials and the SSH public key for the given identity.
-async fn authn(
-    ctx: &mut impl CommandContext,
-    client: &Client,
-    ssh_auth_sock: &Option<String>,
-    ssh_key_id: &Option<KeyId>,
-) -> Result<(Credentials, SshPublicKey), CommandError> {
-    if let Some((credentials, public_key)) = ctx.get_credentials() {
-        return Ok((credentials, public_key));
-    }
-
-    let mut ssh_agent = if let Some(ssh_auth_sock) = ssh_auth_sock {
-        SshAgentConnection::connect(ssh_auth_sock).await?
-    } else {
-        return Err(CommandError::MissingSshAuthSock);
+macro_rules! with_authz {
+    ($ctx:ident, $client:ident, $ssh_auth_sock:expr, $ssh_key_id:expr, $authz:ident => $req:expr) => {
+        loop {
+            let $authz = $ctx
+                .get_credentials()
+                .map(|(creds, _key)| creds.to_string())
+                .unwrap_or_default();
+            match $req.await {
+                Err(ClientError::ErrorResponse(err))
+                    if err.status() == StatusCode::UNAUTHORIZED =>
+                {
+                    let mut ssh_agent = if let Some(ssh_auth_sock) = $ssh_auth_sock {
+                        SshAgentConnection::connect(ssh_auth_sock).await?
+                    } else {
+                        return Err(CommandError::MissingSshAuthSock);
+                    };
+                    let public_key = ssh_agent.identity($ssh_key_id).await?;
+                    let challenge = err
+                        .headers()
+                        .get(WWW_AUTHENTICATE)
+                        .ok_or(CommandError::InvalidAuthorization)?
+                        .to_str()
+                        .map_err(|_| CommandError::InvalidAuthorization)?
+                        .parse::<Challenge>()?;
+                    let response = ChallengeResponse::new(challenge);
+                    $ctx.please_touch(&public_key)?;
+                    let signed = select! {
+                        s = ssh_agent.sign(response) => s?,
+                        _ = ctrl_c() => return Err(CommandError::Canceled),
+                    };
+                    let verified = signed.verify_with_ssh_public_key(&public_key)?;
+                    let credentials = Credentials::new(verified);
+                    let _identity = $client
+                        .iam()
+                        .authorization(credentials.to_string())
+                        .body(public_key.to_string())
+                        .send()
+                        .await?
+                        .into_inner();
+                    $ctx.set_credentials(Some((credentials.clone(), public_key.clone())));
+                }
+                res => break res,
+            }
+        }
     };
-    let public_key = ssh_agent.identity(ssh_key_id.as_ref()).await?;
-    let challenge: Challenge = match client.iam().body(None).send().await {
-        Ok(_) => return Err(CommandError::InvalidAuthorization),
-        Err(ClientError::ErrorResponse(err)) if err.status() == StatusCode::UNAUTHORIZED => err
-            .headers()
-            .get(WWW_AUTHENTICATE)
-            .ok_or(CommandError::InvalidAuthorization)?
-            .to_str()
-            .map_err(|_| CommandError::InvalidAuthorization)?
-            .parse()?,
-        Err(err) => return Err(err.into()),
-    };
-
-    let response = ChallengeResponse::new(challenge);
-    ctx.please_touch(&public_key)?;
-    let signed = select! {
-        s = ssh_agent.sign(response) => s?,
-        _ = ctrl_c() => return Err(CommandError::Canceled),
-    };
-    let verified = signed.verify_with_ssh_public_key(&public_key)?;
-    let credentials = Credentials::new(verified);
-    ctx.set_credentials(Some((credentials.clone(), public_key.clone())));
-    Ok((credentials, public_key))
-}
-
-/// Typed wrapper for authorization strings.
-struct Authz(String);
-
-impl From<&Authz> for String {
-    fn from(value: &Authz) -> Self {
-        value.0.to_owned()
-    }
-}
-
-/// Return the "authorization" for a request, viz., the serialized
-/// credentials for the given identity.
-async fn authz(
-    ctx: &mut impl CommandContext,
-    client: &Client,
-    ssh_auth_sock: &Option<String>,
-    ssh_key_id: &Option<KeyId>,
-) -> Result<Authz, CommandError> {
-    let (credentials, _public_key) = authn(ctx, client, ssh_auth_sock, ssh_key_id).await?;
-    Ok(Authz(credentials.to_string()))
 }
 
 async fn iam(
     ctx: &mut impl CommandContext,
     client: &Client,
-    command: IdentityCommand,
     ssh_auth_sock: &Option<String>,
     ssh_key_id: &Option<KeyId>,
+    command: IdentityCommand,
 ) -> Result<(), CommandError> {
     match command {
         IdentityCommand::Available => {
@@ -555,27 +538,36 @@ async fn iam(
         }
 
         IdentityCommand::List { limit } => {
-            let authz = authz(ctx, client, ssh_auth_sock, ssh_key_id).await?;
-            let mut page = client
-                .identities()
-                .limit(limit)
-                .authorization(&authz)
-                .send()
-                .await?
-                .into_inner();
+            let mut page = with_authz!(
+                ctx,
+                client,
+                ssh_auth_sock,
+                ssh_key_id.as_ref(),
+                authz => client
+                    .identities()
+                    .limit(limit)
+                    .authorization(&authz)
+                    .send()
+            )?
+            .into_inner();
             loop {
                 for identity in &page.items {
                     ctx.iam(identity)?;
                 }
                 if let Some(next_page) = page.next_page {
-                    page = client
-                        .identities()
-                        .authorization(&authz)
-                        .limit(limit)
-                        .page_token(&next_page)
-                        .send()
-                        .await?
-                        .into_inner();
+                    page = with_authz!(
+                        ctx,
+                        client,
+                        ssh_auth_sock,
+                        ssh_key_id.as_ref(),
+                        authz => client
+                            .identities()
+                            .authorization(&authz)
+                            .limit(limit)
+                            .page_token(&next_page)
+                            .send()
+                    )?
+                    .into_inner();
                     if page.items.is_empty() || !ctx.more() {
                         break Ok(());
                     }
@@ -587,26 +579,33 @@ async fn iam(
 
         IdentityCommand::Login => {
             ctx.set_credentials(None);
-            let (credentials, public_key) = authn(ctx, client, ssh_auth_sock, ssh_key_id).await?;
-            let identity = client
-                .iam()
-                .authorization(credentials.to_string())
-                .body(public_key.to_string())
-                .send()
-                .await?
-                .into_inner();
+            let identity = with_authz!(
+                ctx,
+                client,
+                ssh_auth_sock,
+                ssh_key_id.as_ref(),
+                authz => client
+                    .iam()
+                    .authorization(&authz)
+                    .send()
+            )?
+            .into_inner();
             ctx.iam(&identity)
         }
 
         IdentityCommand::Revoke { revoke } => {
             let revoke = ctx.really_revoke(revoke)?;
-            let authz = authz(ctx, client, ssh_auth_sock, ssh_key_id).await?;
-            client
-                .revoke_identity()
-                .authorization(&authz)
-                .key_id(&revoke)
-                .send()
-                .await?;
+            with_authz!(
+                ctx,
+                client,
+                ssh_auth_sock,
+                ssh_key_id.as_ref(),
+                authz => client
+                    .revoke_identity()
+                    .authorization(&authz)
+                    .key_id(&revoke)
+                    .send()
+            )?;
             ctx.identity_revoked(revoke)
         }
     }
@@ -615,7 +614,8 @@ async fn iam(
 async fn cert(
     ctx: &mut impl CommandContext,
     client: &Client,
-    authz: &Authz,
+    ssh_auth_sock: &Option<String>,
+    ssh_key_id: &Option<KeyId>,
     command: CertCommand,
 ) -> Result<(), CommandError> {
     match command {
@@ -624,24 +624,34 @@ async fn cert(
             let mut file = File::open(&path).map_err(io_error)?;
             let mut cert = Vec::new();
             file.read_to_end(&mut cert).map_err(io_error)?;
-            let key_id = client
-                .import_cert()
-                .authorization(authz)
-                .body(cert)
-                .send()
-                .await?
-                .into_inner();
+            let key_id = with_authz!(
+                ctx,
+                client,
+                ssh_auth_sock,
+                ssh_key_id.as_ref(),
+                authz => client
+                    .import_cert()
+                    .authorization(authz)
+                    .body(cert.clone())
+                    .send()
+            )?
+            .into_inner();
             ctx.cert_imported(&path, key_id)
         }
 
         CertCommand::Chain { key_id } => {
-            let certs = client
-                .cert_chain()
-                .authorization(authz)
-                .key_id(&key_id)
-                .send()
-                .await?
-                .into_inner();
+            let certs = with_authz!(
+                ctx,
+                client,
+                ssh_auth_sock,
+                ssh_key_id.as_ref(),
+                authz => client
+                    .cert_chain()
+                    .authorization(authz)
+                    .key_id(&key_id)
+                    .send()
+            )?
+            .into_inner();
             ctx.cert_chain(key_id, &certs)
         }
     }
@@ -655,21 +665,29 @@ async fn session(
     command: SessionCommand,
 ) -> Result<(), CommandError> {
     match (command, client) {
-        (SessionCommand::Start, Some(client)) => {
-            let (credentials, _public_key) = authn(ctx, client, ssh_auth_sock, ssh_key_id).await?;
-            let authz = credentials.to_string();
-            let session_id = client
-                .session_start()
-                .authorization(&authz)
-                .send()
-                .await?
-                .into_inner();
-            ctx.session_started(&session_id, &credentials.key_id)?;
+        (SessionCommand::Start { session_id: None }, Some(client)) => {
+            let session_id = with_authz!(
+                ctx,
+                client,
+                ssh_auth_sock,
+                ssh_key_id.as_ref(),
+                authz => client
+                    .session_start()
+                    .authorization(&authz)
+                    .send()
+            )?
+            .into_inner();
+            ctx.session_started(&session_id)?;
             Ok(())
         }
 
-        (SessionCommand::Remote { session_id, key_id }, _) => {
-            ctx.session_started(&session_id, &key_id)?;
+        (
+            SessionCommand::Start {
+                session_id: Some(session_id),
+            },
+            _,
+        ) => {
+            ctx.session_started(&session_id)?;
             Ok(())
         }
 
@@ -678,13 +696,17 @@ async fn session(
             if let Some(client) = client
                 && let Some(session_id) = session_id.as_ref().or(ctx_session_id.as_ref())
             {
-                let authz = authz(ctx, client, ssh_auth_sock, ssh_key_id).await?;
-                client
-                    .session_stop()
-                    .session_id(session_id.clone())
-                    .authorization(&authz)
-                    .send()
-                    .await?;
+                with_authz!(
+                    ctx,
+                    client,
+                    ssh_auth_sock,
+                    ssh_key_id.as_ref(),
+                    authz => client
+                        .session_stop()
+                        .session_id(session_id.clone())
+                        .authorization(&authz)
+                        .send()
+                )?;
                 ctx.session_stopped(session_id)?;
             }
             Ok(())
@@ -697,17 +719,16 @@ async fn session(
 async fn job(
     ctx: &mut impl CommandContext,
     client: &Option<Client>,
-    command: JobCommand,
     ssh_auth_sock: &Option<String>,
     ssh_key_id: &Option<KeyId>,
+    command: JobCommand,
 ) -> Result<(), CommandError> {
     match (command, client) {
         (JobCommand::Start { start_args }, Some(client))
             if start_args.command.is_none() && start_args.permslip.is_none() =>
         {
             let job = ctx.read_signed_job()?;
-            let authz = authz(ctx, client, ssh_auth_sock, ssh_key_id).await?;
-            job_start(ctx, client, &authz, job, start_args).await?;
+            job_start(ctx, client, ssh_auth_sock, ssh_key_id, job, start_args).await?;
             Ok(())
         }
 
@@ -768,64 +789,65 @@ async fn job(
             };
             if let Some(client) = client {
                 ctx.job_signed(&job, false)?;
-                let authz = authz(ctx, client, ssh_auth_sock, ssh_key_id).await?;
-                job_start(ctx, client, &authz, job, start_args.to_owned()).await
+                job_start(
+                    ctx,
+                    client,
+                    ssh_auth_sock,
+                    ssh_key_id,
+                    job,
+                    start_args.to_owned(),
+                )
+                .await
             } else {
                 ctx.job_signed(&job, true)
             }
         }
 
         (JobCommand::Stop { job_id }, Some(client)) => {
-            let authz = authz(ctx, client, ssh_auth_sock, ssh_key_id).await?;
-            client
-                .job_stop()
-                .job_id(&job_id)
-                .authorization(&authz)
-                .send()
-                .await?;
+            with_authz!(
+                ctx,
+                client,
+                ssh_auth_sock,
+                ssh_key_id.as_ref(),
+                authz => client
+                    .job_stop()
+                    .job_id(&job_id)
+                    .authorization(&authz)
+                    .send()
+            )?;
             ctx.job_stopped(&job_id)
         }
 
         (JobCommand::Status { job_id }, Some(client)) => {
-            let authz = authz(ctx, client, ssh_auth_sock, ssh_key_id).await?;
-            let status = client
-                .job_status()
-                .job_id(&job_id)
-                .authorization(&authz)
-                .send()
-                .await?
-                .into_inner();
+            let status = with_authz!(
+                ctx,
+                client,
+                ssh_auth_sock,
+                ssh_key_id.as_ref(),
+                authz => client
+                    .job_status()
+                    .job_id(&job_id)
+                    .authorization(&authz)
+                    .send()
+            )?
+            .into_inner();
             ctx.job_status(&job_id, &status)
         }
 
         (JobCommand::Stdout { output }, Some(client)) => {
-            let authz = authz(ctx, client, ssh_auth_sock, ssh_key_id).await?;
-            job_output(ctx, client, &authz, Stdout, output).await
+            job_output(ctx, client, ssh_auth_sock, ssh_key_id, Stdout, output).await
         }
 
         (JobCommand::Stderr { output }, Some(client)) => {
-            let authz = authz(ctx, client, ssh_auth_sock, ssh_key_id).await?;
-            job_output(ctx, client, &authz, Stderr, output).await
+            job_output(ctx, client, ssh_auth_sock, ssh_key_id, Stderr, output).await
         }
 
         (JobCommand::Session { job_id }, Some(client)) => {
-            let authz = authz(ctx, client, ssh_auth_sock, ssh_key_id).await?;
-            job_start_interactive_session(ctx, client, &authz, &job_id).await
+            job_start_interactive_session(ctx, client, ssh_auth_sock, ssh_key_id, &job_id).await
         }
 
-        (JobCommand::History { limit }, Some(client)) => {
-            let authz = authz(ctx, client, ssh_auth_sock, ssh_key_id).await?;
-            let mut stream = client.job_history().authorization(&authz).stream().boxed();
-            if limit > 0 {
-                stream = stream.take(limit).boxed();
-            }
-            loop {
-                match stream.try_next().await {
-                    Ok(Some(status)) => ctx.job_status(status.job_id(), &status)?,
-                    Ok(None) => return Ok(()),
-                    Err(e) => return Err(e.into()),
-                }
-            }
+        (JobCommand::History { limit: _ }, Some(_client)) => {
+            todo!("paginated job history")
         }
 
         (_, None) => Err(CommandError::Offline),
@@ -835,10 +857,14 @@ async fn job(
 async fn job_start(
     ctx: &mut impl CommandContext,
     client: &Client,
-    authz: &Authz,
+    ssh_auth_sock: &Option<String>,
+    ssh_key_id: &Option<KeyId>,
     job: SignedJob,
     start_args: JobStartArgs,
 ) -> Result<(), CommandError> {
+    let Some(authz) = ctx.get_credentials().map(|(creds, _key)| creds.to_string()) else {
+        return Err(CommandError::InvalidAuthorization);
+    };
     let job_id = job.job_id().to_owned();
     let interactive = job.interactive();
     let JobStartArgs {
@@ -855,7 +881,7 @@ async fn job_start(
     } = limits.as_limits();
     let mut start = client
         .job_start()
-        .authorization(authz)
+        .authorization(&authz)
         .job_id(&job_id)
         .max_cpu(max_cpu)
         .max_mem(max_mem)
@@ -875,10 +901,10 @@ async fn job_start(
     let status = if interactive {
         start.as_mut().await?;
         ctx.job_started(&job)?;
-        job_start_interactive_session(ctx, client, authz, &job_id).await?;
+        job_start_interactive_session(ctx, client, ssh_auth_sock, ssh_key_id, &job_id).await?;
         client
             .job_status()
-            .authorization(authz)
+            .authorization(&authz)
             .job_id(&job_id)
             .send()
             .await?
@@ -898,7 +924,7 @@ async fn job_start(
                 _ = interval.tick() => {
                     let status = client
                         .job_status()
-                        .authorization(authz)
+                        .authorization(&authz)
                         .job_id(&job_id)
                         .send()
                         .await?
@@ -908,7 +934,7 @@ async fn job_start(
                 _ = ctrl_c() => {
                     client
                         .job_stop()
-                        .authorization(authz)
+                        .authorization(&authz)
                         .job_id(&job_id)
                         .send()
                         .await?;
@@ -916,7 +942,7 @@ async fn job_start(
                     ctx.job_stopped(&job_id)?;
                     break client
                         .job_status()
-                        .authorization(authz)
+                        .authorization(&authz)
                         .job_id(&job_id)
                         .send()
                         .await?
@@ -930,7 +956,7 @@ async fn job_start(
         for stream in [Stdout, Stderr] {
             match client
                 .job_output()
-                .authorization(authz)
+                .authorization(&authz)
                 .job_id(&job_id)
                 .stream(stream)
                 .send()
@@ -983,7 +1009,8 @@ type FutureChunk<'a> = dyn Future<Output = Result<Chunk, CommandError>> + Send +
 async fn job_output(
     ctx: &mut impl CommandContext,
     client: &Client,
-    authz: &Authz,
+    ssh_auth_sock: &Option<String>,
+    ssh_key_id: &Option<KeyId>,
     stream: JobOutputStream,
     JobOutput {
         job_id,
@@ -997,14 +1024,19 @@ async fn job_output(
 ) -> Result<(), CommandError> {
     // Maybe truncate instead of fetching output.
     if let Some(n) = truncate.map(|n| n.as_u64()) {
-        client
-            .job_output_delete()
-            .authorization(authz)
-            .job_id(job_id)
-            .stream(stream)
-            .range(format!("bytes={n}-"))
-            .send()
-            .await?;
+        with_authz!(
+            ctx,
+            client,
+            ssh_auth_sock,
+            ssh_key_id.as_ref(),
+            authz => client
+                .job_output_delete()
+                .authorization(&authz)
+                .job_id(&job_id)
+                .stream(stream)
+                .range(format!("bytes={n}-"))
+                .send()
+        )?;
         return Ok(());
     }
 
@@ -1015,13 +1047,18 @@ async fn job_output(
         stdout_hash,
         stderr_hash,
         ..
-    } = client
-        .job_status()
-        .authorization(authz)
-        .job_id(&job_id)
-        .send()
-        .await?
-        .into_inner()
+    } = with_authz!(
+        ctx,
+        client,
+        ssh_auth_sock,
+        ssh_key_id.as_ref(),
+        authz => client
+            .job_status()
+            .authorization(authz)
+            .job_id(&job_id)
+            .send()
+    )?
+    .into_inner()
     else {
         // TODO: emulate `tail -f` for running jobs
         return Err(CommandError::JobStillRunning(job_id.to_owned()));
@@ -1067,7 +1104,10 @@ async fn job_output(
 
         // Download and write the output in parallel (unordered) chunks.
         ctx.job_output_started(&job_id, stream, "Downloading", len)?;
-        let chunks = job_output_chunks(client, authz, &job_id, stream, len, chunk_size);
+        let Some(authz) = ctx.get_credentials().map(|(creds, _key)| creds.to_string()) else {
+            return Err(CommandError::InvalidAuthorization);
+        };
+        let chunks = job_output_chunks(client, &authz, &job_id, stream, len, chunk_size);
         let par = parallel.get() as usize;
         let mut chunks_par = stream::iter(chunks).buffer_unordered(par);
         while let Some(chunk) = chunks_par.next().await {
@@ -1099,14 +1139,19 @@ async fn job_output(
     } else {
         // Download and print the output all at once. If hash verification
         // fails here, do not print any output.
-        let byte_stream = client
-            .job_output()
-            .authorization(authz)
-            .job_id(&job_id)
-            .stream(stream)
-            .send()
-            .await?
-            .into_inner();
+        let byte_stream = with_authz!(
+            ctx,
+            client,
+            ssh_auth_sock,
+            ssh_key_id.as_ref(),
+            authz => client
+                .job_output()
+                .authorization(authz)
+                .job_id(&job_id)
+                .stream(stream)
+                .send()
+        )?
+        .into_inner();
         let bytes = byte_stream_to_vec(byte_stream).await?;
         check_hash!(hash(&bytes), None)?;
         ctx.job_output(&job_id, stream, &bytes, binary)
@@ -1116,7 +1161,7 @@ async fn job_output(
 /// Prepare a vector of futures that fetch chunks of output.
 fn job_output_chunks<'a>(
     client: &'a Client,
-    authz: &'a Authz,
+    authz: &'a str,
     job_id: &'a JobId,
     stream: JobOutputStream,
     len: u64,
@@ -1181,16 +1226,21 @@ async fn byte_stream_to_file(
 async fn job_start_interactive_session(
     ctx: &mut impl CommandContext,
     client: &Client,
-    authz: &Authz,
+    ssh_auth_sock: &Option<String>,
+    ssh_key_id: &Option<KeyId>,
     job_id: &JobId,
 ) -> Result<(), CommandError> {
-    match client
-        .job_start_interactive_session()
-        .authorization(authz)
-        .job_id(job_id)
-        .send()
-        .await
-    {
+    match with_authz!(
+        ctx,
+        client,
+        ssh_auth_sock,
+        ssh_key_id.as_ref(),
+        authz => client
+            .job_start_interactive_session()
+            .authorization(&authz)
+            .job_id(job_id)
+            .send()
+    ) {
         Err(error) => ctx.job_error(error.into()),
         Ok(socket) => {
             ctx.job_session_connected(job_id)?;

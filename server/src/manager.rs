@@ -302,7 +302,7 @@ impl JobManager {
 
     pub async fn session_start(&self, authn: &Identity) -> Result<SessionId, JobError> {
         let new_session_id = SessionId::new();
-        let new_session = Session::new(new_session_id.clone(), authn.key_id.clone());
+        let new_session = Session::new(new_session_id.clone(), Some(authn.key_id.clone()));
 
         // Don't hold the session lock while we stop any old session.
         if let Some(old_session) = { self.session.lock().unwrap().replace(new_session) } {
@@ -371,8 +371,8 @@ impl JobManager {
             let Some(session) = session_guard.as_mut() else {
                 return Err(JobError::NoSession);
             };
-            if *session.key_id() != authn.key_id {
-                return Err(JobError::identity_mismatch(session.key_id(), &authn.key_id));
+            if session.key_id() != Some(&authn.key_id) {
+                return Err(JobError::SessionWrongIdentity);
             }
             if session.next_job_id()? != job_id {
                 return Err(JobError::InvalidJobId(job_id));
@@ -407,8 +407,8 @@ impl JobManager {
         if job_session_id != *session.session_id() {
             return Err(JobError::JobNotFound(job_id.to_owned()));
         }
-        if *session.key_id() != authn.key_id {
-            return Err(JobError::identity_mismatch(session.key_id(), &authn.key_id));
+        if session.key_id() != Some(&authn.key_id) {
+            return Err(JobError::SessionWrongIdentity);
         }
         Ok(())
     }

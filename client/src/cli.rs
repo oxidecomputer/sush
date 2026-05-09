@@ -93,12 +93,8 @@ impl CommandContext for Cli {
         }
     }
 
-    fn session_started(
-        &mut self,
-        session_id: &SessionId,
-        key_id: &KeyId,
-    ) -> Result<(), CommandError> {
-        self.session = Some(Session::new(session_id.to_owned(), key_id.to_owned()));
+    fn session_started(&mut self, session_id: &SessionId) -> Result<(), CommandError> {
+        self.session = Some(Session::new(session_id.to_owned(), None));
         match self.get_output_format() {
             OutputFormat::Json => println!("{}", json!({"session_started": session_id})),
             OutputFormat::Text => println!("✅ Session is now `{session_id}`"),

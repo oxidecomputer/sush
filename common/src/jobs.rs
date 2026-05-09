@@ -123,12 +123,12 @@ impl<S: AsRef<str>> From<S> for SessionId {
 #[derive(Clone, Debug, Deserialize, JsonSchema, Serialize)]
 pub struct Session {
     session_id: SessionId,
-    key_id: KeyId,
+    key_id: Option<KeyId>,
     last_job: Option<SignedJob>,
 }
 
 impl Session {
-    pub fn new(session_id: SessionId, key_id: KeyId) -> Self {
+    pub fn new(session_id: SessionId, key_id: Option<KeyId>) -> Self {
         Self {
             session_id,
             key_id,
@@ -140,8 +140,8 @@ impl Session {
         &self.session_id
     }
 
-    pub fn key_id(&self) -> &KeyId {
-        &self.key_id
+    pub fn key_id(&self) -> Option<&KeyId> {
+        self.key_id.as_ref()
     }
 
     pub fn job_started(&mut self, job: SignedJob) {

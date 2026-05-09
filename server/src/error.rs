@@ -28,8 +28,6 @@ pub enum JobError {
         path: PathBuf,
         error: std::io::Error,
     },
-    #[error("Identity mismatch, expected `{expected}`, found `{found}`")]
-    IdentityMismatch { expected: KeyId, found: KeyId },
     #[error("Interactive session error: {0}")]
     InteractiveSession(#[from] InteractiveSessionError),
     #[error("Invalid command `{0}`, must not start with `-`")]
@@ -56,6 +54,8 @@ pub enum JobError {
     NoSession,
     #[error("Session `{0}` not found")]
     SessionNotFound(SessionId),
+    #[error("Incorrect identity for session, try `iam`")]
+    SessionWrongIdentity,
     #[error("Job output hash mismatch, file may be corrupt")]
     OutputHashMismatch(JobId, JobOutputHash),
     #[error("Output not yet available")]
@@ -90,13 +90,6 @@ impl JobError {
 
     pub fn unauthorized(nonce: Nonce) -> Self {
         Self::Unauthorized(nonce)
-    }
-
-    pub fn identity_mismatch(expected: &KeyId, found: &KeyId) -> Self {
-        Self::IdentityMismatch {
-            expected: expected.to_owned(),
-            found: found.to_owned(),
-        }
     }
 
     /// Report I/O errors with the corresponding stream name.
@@ -170,8 +163,7 @@ impl From<JobError> for HttpError {
                     .expect("should be able to add WWW-Authenticate header");
                 err
             }
-            IdentityMismatch { .. }
-            | InvalidCommand(_)
+            InvalidCommand(_)
             | InvalidJobId(_)
             | JobNotFound(_)
             | Json(_)
@@ -181,6 +173,7 @@ impl From<JobError> for HttpError {
             | NoSession
             | PublicKeyRevoked { .. }
             | SessionNotFound(_)
+            | SessionWrongIdentity
             | OutputPending => {
                 HttpError::for_client_error(None, ClientErrorStatusCode::BAD_REQUEST, message)
             }
