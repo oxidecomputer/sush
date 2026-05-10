@@ -18,6 +18,7 @@ use futures::{FutureExt as _, StreamExt as _};
 use http::header::WWW_AUTHENTICATE;
 use http::status::StatusCode;
 use memmap2::Mmap;
+use progenitor_client::ResponseValue;
 use reqwest::Upgraded;
 use rustix::termios::tcgetwinsize;
 use thiserror::Error;
@@ -28,7 +29,7 @@ use tokio_tungstenite::WebSocketStream;
 use tokio_tungstenite::tungstenite::error::Error as WebSocketError;
 use tokio_tungstenite::tungstenite::protocol::Role;
 
-use sush_common::authn::{AuthnError, Challenge, ChallengeResponse, Credentials};
+use sush_common::authn::{AuthnError, Challenge, ChallengeResponse, Credentials, Identity};
 use sush_common::interactive::InteractiveSessionError;
 use sush_common::jobs::JobOutputStream::{self, Stderr, Stdout};
 use sush_common::jobs::{
@@ -64,6 +65,9 @@ const DEFAULT_CHUNK_SIZE: ByteSize = ByteSize::mib(32);
 
 /// Default number of elements in a page of results.
 const DEFAULT_PAGE_LIMIT: NonZeroU32 = NonZeroU32::new(100).unwrap();
+
+/// Maximum number of authentication retries.
+const MAX_AUTHN_RETRIES: usize = 3;
 
 /// Default number of simultaneous downloads for large output.
 const PARALLEL_CHUNKS: NonZeroU8 = NonZeroU8::new(8).unwrap();
@@ -464,8 +468,46 @@ impl ClientCommand {
     }
 }
 
+async fn authz<E>(
+    ctx: &mut impl CommandContext,
+    client: &Client,
+    ssh_auth_sock: &Option<String>,
+    ssh_key_id: &Option<KeyId>,
+    response: ResponseValue<E>,
+) -> Result<Identity, CommandError> {
+    let mut ssh_agent = if let Some(ssh_auth_sock) = ssh_auth_sock {
+        SshAgentConnection::connect(ssh_auth_sock).await?
+    } else {
+        return Err(CommandError::MissingSshAuthSock);
+    };
+    let public_key = ssh_agent.identity(ssh_key_id.as_ref()).await?;
+    let challenge = response
+        .headers()
+        .get(WWW_AUTHENTICATE)
+        .ok_or(CommandError::InvalidAuthorization)?
+        .to_str()
+        .map_err(|_| CommandError::InvalidAuthorization)?
+        .parse::<Challenge>()?;
+    let response = ChallengeResponse::new(challenge);
+    ctx.please_touch(&public_key)?;
+    let signed = select! {
+        s = ssh_agent.sign(response) => s?,
+        _ = ctrl_c() => return Err(CommandError::Canceled),
+    };
+    let verified = signed.verify_with_ssh_public_key(&public_key)?;
+    let credentials = Credentials::new(verified);
+    Ok(client
+        .iam()
+        .authorization(credentials.to_string())
+        .body(public_key.to_string())
+        .send()
+        .await?
+        .into_inner())
+}
+
 macro_rules! with_authz {
-    ($ctx:ident, $client:ident, $ssh_auth_sock:expr, $ssh_key_id:expr, $authz:ident => $req:expr) => {
+    ($ctx:ident, $client:ident, $ssh_auth_sock:expr, $ssh_key_id:expr, $authz:ident => $req:expr) => {{
+        let mut i = 0;
         loop {
             let $authz = $ctx
                 .get_identity()
@@ -476,40 +518,18 @@ macro_rules! with_authz {
                 Err(ClientError::ErrorResponse(err))
                     if err.status() == StatusCode::UNAUTHORIZED =>
                 {
-                    let mut ssh_agent = if let Some(ssh_auth_sock) = $ssh_auth_sock {
-                        SshAgentConnection::connect(ssh_auth_sock).await?
-                    } else {
-                        return Err(CommandError::MissingSshAuthSock);
-                    };
-                    let public_key = ssh_agent.identity($ssh_key_id).await?;
-                    let challenge = err
-                        .headers()
-                        .get(WWW_AUTHENTICATE)
-                        .ok_or(CommandError::InvalidAuthorization)?
-                        .to_str()
-                        .map_err(|_| CommandError::InvalidAuthorization)?
-                        .parse::<Challenge>()?;
-                    let response = ChallengeResponse::new(challenge);
-                    $ctx.please_touch(&public_key)?;
-                    let signed = select! {
-                        s = ssh_agent.sign(response) => s?,
-                        _ = ctrl_c() => return Err(CommandError::Canceled),
-                    };
-                    let verified = signed.verify_with_ssh_public_key(&public_key)?;
-                    let credentials = Credentials::new(verified);
-                    let identity = $client
-                        .iam()
-                        .authorization(credentials.to_string())
-                        .body(public_key.to_string())
-                        .send()
-                        .await?
-                        .into_inner();
+                    let identity = authz($ctx, $client, $ssh_auth_sock, $ssh_key_id, err).await?;
                     $ctx.set_identity(Some(identity));
                 }
                 res => break res,
             }
+
+            i += 1;
+            if i == MAX_AUTHN_RETRIES {
+                return Err(CommandError::InvalidAuthorization);
+            }
         }
-    };
+    }};
 }
 
 async fn iam(
@@ -543,7 +563,7 @@ async fn iam(
                 ctx,
                 client,
                 ssh_auth_sock,
-                ssh_key_id.as_ref(),
+                ssh_key_id,
                 authz => client
                     .identities()
                     .limit(limit)
@@ -562,7 +582,7 @@ async fn iam(
                         ctx,
                         client,
                         ssh_auth_sock,
-                        ssh_key_id.as_ref(),
+                        ssh_key_id,
                         authz => client
                             .identities()
                             .authorization(&authz)
@@ -578,16 +598,16 @@ async fn iam(
         }
 
         IdentityCommand::Login => {
-            ctx.set_identity(None);
-            let identity = with_authz!(
-                ctx,
-                client,
-                ssh_auth_sock,
-                ssh_key_id.as_ref(),
-                authz => client.iam().authorization(&authz).body(None).send()
-            )?
-            .into_inner();
-            ctx.iam(&identity)
+            if let Err(ClientError::ErrorResponse(err)) = client.identities().send().await
+                && err.status() == StatusCode::UNAUTHORIZED
+            {
+                let identity = authz(ctx, client, ssh_auth_sock, ssh_key_id, err).await?;
+                ctx.iam(&identity)?;
+                ctx.set_identity(Some(identity));
+                Ok(())
+            } else {
+                Err(CommandError::InvalidAuthorization)
+            }
         }
 
         IdentityCommand::Revoke { revoke } => {
@@ -596,7 +616,7 @@ async fn iam(
                 ctx,
                 client,
                 ssh_auth_sock,
-                ssh_key_id.as_ref(),
+                ssh_key_id,
                 authz => client
                     .revoke_identity()
                     .authorization(&authz)
@@ -625,7 +645,7 @@ async fn cert(
                 ctx,
                 client,
                 ssh_auth_sock,
-                ssh_key_id.as_ref(),
+                ssh_key_id,
                 authz => client
                     .import_cert()
                     .authorization(authz)
@@ -641,7 +661,7 @@ async fn cert(
                 ctx,
                 client,
                 ssh_auth_sock,
-                ssh_key_id.as_ref(),
+                ssh_key_id,
                 authz => client
                     .cert_chain()
                     .authorization(authz)
@@ -667,7 +687,7 @@ async fn session(
                 ctx,
                 client,
                 ssh_auth_sock,
-                ssh_key_id.as_ref(),
+                ssh_key_id,
                 authz => client
                     .session_start()
                     .authorization(&authz)
@@ -682,7 +702,16 @@ async fn session(
             SessionCommand::Start {
                 session_id: Some(session_id),
             },
-            _,
+            Some(_client),
+        ) => {
+            todo!("verify server is on {session_id}")
+        }
+
+        (
+            SessionCommand::Start {
+                session_id: Some(session_id),
+            },
+            None,
         ) => {
             ctx.session_started(&session_id)?;
             Ok(())
@@ -697,7 +726,7 @@ async fn session(
                 ctx,
                 client,
                 ssh_auth_sock,
-                ssh_key_id.as_ref(),
+                ssh_key_id,
                 authz => client
                     .session_stop()
                     .session_id(session_id.clone())
@@ -804,7 +833,7 @@ async fn job(
                 ctx,
                 client,
                 ssh_auth_sock,
-                ssh_key_id.as_ref(),
+                ssh_key_id,
                 authz => client
                     .job_stop()
                     .job_id(&job_id)
@@ -819,7 +848,7 @@ async fn job(
                 ctx,
                 client,
                 ssh_auth_sock,
-                ssh_key_id.as_ref(),
+                ssh_key_id,
                 authz => client
                     .job_status()
                     .job_id(&job_id)
@@ -861,7 +890,7 @@ async fn job_start(
     let Some(identity) = ctx.get_identity() else {
         // It's ok to bail here because if we haven't got an identity in
         // the context, we also won't have a session; `job start` is only
-        // useful from the REPL.
+        // useful from the REPL right now.
         return Err(CommandError::InvalidAuthorization);
     };
     let authz = identity.into_credentials().to_string();
@@ -1028,7 +1057,7 @@ async fn job_output(
             ctx,
             client,
             ssh_auth_sock,
-            ssh_key_id.as_ref(),
+            ssh_key_id,
             authz => client
                 .job_output_delete()
                 .authorization(&authz)
@@ -1051,7 +1080,7 @@ async fn job_output(
         ctx,
         client,
         ssh_auth_sock,
-        ssh_key_id.as_ref(),
+        ssh_key_id,
         authz => client
             .job_status()
             .authorization(authz)
@@ -1144,7 +1173,7 @@ async fn job_output(
             ctx,
             client,
             ssh_auth_sock,
-            ssh_key_id.as_ref(),
+            ssh_key_id,
             authz => client
                 .job_output()
                 .authorization(authz)
@@ -1235,7 +1264,7 @@ async fn job_start_interactive_session(
         ctx,
         client,
         ssh_auth_sock,
-        ssh_key_id.as_ref(),
+        ssh_key_id,
         authz => client
             .job_start_interactive_session()
             .authorization(&authz)

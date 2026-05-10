@@ -78,13 +78,11 @@ impl SessionId {
     }
 
     pub fn next_job_id(&self, prev_job: &SignedJob) -> Result<JobId, serde_json::Error> {
-        // TODO: replace with borsh serialize
-        let prev_job = serde_json::to_string(prev_job)?;
-        Ok(
-            id_phrase(U256::from_be_slice(hash(prev_job.as_bytes()).as_bytes()))
-                .join(WORD_SEPARATOR)
-                .into(),
-        )
+        Ok(id_phrase(U256::from_be_slice(
+            hash(&prev_job.to_be_signed()).as_bytes(),
+        ))
+        .join(WORD_SEPARATOR)
+        .into())
     }
 }
 
@@ -198,7 +196,7 @@ impl ToBeSigned for JobStartRequest {
     /// BLAKE3 hash over the fields of `self`.
     fn to_be_signed(&self) -> Vec<u8> {
         let mut hasher = Hasher::new();
-        let mut hash = |data: &[u8]| {
+        let mut hash_with_len = |data: &[u8]| {
             hasher.update(&(data.len() as u64).to_be_bytes());
             hasher.update(data);
         };
@@ -208,10 +206,10 @@ impl ToBeSigned for JobStartRequest {
             command,
             interactive,
         } = self;
-        hash(Self::TYPE_NAME);
-        hash(job_id.as_bytes());
-        hash(command.as_bytes());
-        hash(if *interactive { &[1] } else { &[0] });
+        hash_with_len(Self::TYPE_NAME);
+        hash_with_len(job_id.as_bytes());
+        hash_with_len(command.as_bytes());
+        hash_with_len(if *interactive { &[1] } else { &[0] });
         hasher.finalize().as_bytes().to_vec()
     }
 }

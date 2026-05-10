@@ -231,6 +231,7 @@ impl JobManager {
             }
         }
 
+        // TODO: Simplify / refactor.
         if let Some(authorization) = authorization
             && let now = Utc::now()
             && let Ok(credentials) = try_authn!(authorization.parse())
@@ -278,17 +279,28 @@ impl JobManager {
                     "invalid public key"
                 ) =>
                 {
-                    if identities.len() == MAX_IDENTITIES {
-                        return Err(JobError::TooManyIdentities(MAX_IDENTITIES));
+                    if identities.len() >= MAX_IDENTITIES {
+                        identities.retain(|_key_id, (identity, _credentials)| {
+                            identity.is_still_valid(&now)
+                        });
+                        if identities.len() >= MAX_IDENTITIES {
+                            return Err(JobError::TooManyIdentities(MAX_IDENTITIES));
+                        }
                     }
+
                     let public_key = public_key.expect("checked in guard");
                     let response = credentials.clone().into_challenge_response();
-                    let verified = try_authn!(response.verify_with_ssh_public_key(&public_key))?;
-                    Some(try_authn!(Identity::new(
-                        public_key.to_owned(),
-                        verified,
-                        now
-                    ))?)
+                    if let Ok(verified) =
+                        try_authn!(response.verify_with_ssh_public_key(&public_key))
+                    {
+                        Some(try_authn!(Identity::new(
+                            public_key.to_owned(),
+                            verified,
+                            now
+                        ))?)
+                    } else {
+                        None
+                    }
                 }
                 _ => None,
             }
@@ -395,14 +407,13 @@ impl JobManager {
         let wait = params.wait;
         let started = {
             let job_id = job.job_id().to_owned();
-            {
-                let jobs = self.jobs.lock().unwrap();
-                if jobs.contains_key(&job_id) {
-                    return Err(JobError::InvalidJobId(job_id));
-                }
-                if jobs.len() == MAX_JOBS {
-                    return Err(JobError::TooManyJobs(MAX_JOBS));
-                }
+            let mut jobs = self.jobs.lock().unwrap();
+            if jobs.contains_key(&job_id) {
+                return Err(JobError::InvalidJobId(job_id));
+            }
+            if jobs.len() == MAX_JOBS {
+                // TODO: evict old jobs
+                return Err(JobError::TooManyJobs(MAX_JOBS));
             }
 
             let cert_key_id = job.key_id().to_owned();
@@ -432,10 +443,7 @@ impl JobManager {
                 session.session_id(),
                 params,
             )?;
-            self.jobs
-                .lock()
-                .unwrap()
-                .insert(job_id, JobStatus::from(&started));
+            jobs.insert(job_id, JobStatus::from(&started));
             session.job_started(job.into_signed());
             started
         };
@@ -572,33 +580,30 @@ fn job_ended(
                 .cloned()
                 .ok_or_else(|| JobError::InvalidJobId(job_id.to_owned()))?
             {
-                assert!(
-                    jobs.insert(
-                        job_id.to_owned(),
-                        JobStatus::Ended {
-                            job,
-                            session_id,
-                            time_started,
-                            time_ended: time,
-                            status: None,
-                            stdout_len: job_output_len(output_dir, &job_id, Stdout),
-                            stderr_len: job_output_len(output_dir, &job_id, Stderr),
-                            stdout_hash: job_output_hash(output_dir, &job_id, Stdout)?,
-                            stderr_hash: job_output_hash(output_dir, &job_id, Stderr)?,
-                        }
-                    )
-                    .is_some()
-                );
+                jobs.insert(
+                    job_id.to_owned(),
+                    JobStatus::Ended {
+                        job,
+                        session_id,
+                        time_started,
+                        time_ended: time,
+                        status: None,
+                        stdout_len: job_output_len(output_dir, &job_id, Stdout),
+                        stderr_len: job_output_len(output_dir, &job_id, Stderr),
+                        stdout_hash: job_output_hash(output_dir, &job_id, Stdout)?,
+                        stderr_hash: job_output_hash(output_dir, &job_id, Stderr)?,
+                    },
+                )
+                .ok_or_else(|| JobError::InvalidJobId(job_id))?;
                 Ok(())
             } else {
                 Err(JobError::InvalidJobId(job_id))
             }
         }
         Ok(ended) => {
-            assert!(
-                jobs.insert(ended.job_id().to_owned(), ended.into())
-                    .is_some()
-            );
+            let job_id = ended.job_id().to_owned();
+            jobs.insert(job_id.clone(), ended.into())
+                .ok_or_else(|| JobError::InvalidJobId(job_id))?;
             Ok(())
         }
     }
