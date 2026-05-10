@@ -79,7 +79,7 @@ const OUTPUT_THRESHOLD: u64 = ByteSize::mb(128).as_u64();
 pub struct JobManager {
     log: Logger,
     nonces: Arc<Mutex<LruCache<Nonce, DateTime<Utc>>>>,
-    identities: Arc<Mutex<BTreeMap<KeyId, Identity>>>,
+    identities: Arc<Mutex<BTreeMap<KeyId, (Identity, Credentials)>>>,
     certs: Arc<Mutex<BTreeMap<KeyId, Certificate>>>,
     session: Arc<Mutex<Option<Session>>>,
     jobs: Arc<Mutex<BTreeMap<JobId, JobStatus>>>,
@@ -234,43 +234,43 @@ impl JobManager {
         // TODO: Simplify / refactor.
         if let Some(authorization) = authorization
             && let now = Utc::now()
-            && let Ok(credentials) = try_authn!(authorization.parse())
+            && let Ok(credentials) = try_authn!(authorization.parse::<Credentials>())
             && let Credentials {
                 key_id,
                 nonce,
-                cnonce,
-                signature,
-            } = &credentials
-            && let Some(identity) = match identities.get(key_id) {
-                Some(Identity {
-                    time_revoked: Some(time_revoked),
-                    ..
-                }) => {
+                cnonce: _,
+                signature: _,
+            } = credentials.clone()
+            && let Some((identity, credentials)) = match identities.get(&key_id) {
+                Some((
+                    Identity {
+                        time_revoked: Some(time_revoked),
+                        ..
+                    },
+                    _,
+                )) => {
                     return try_authn!(Err(JobError::PublicKeyRevoked {
                         key_id: key_id.to_owned(),
                         time_revoked: time_revoked.to_owned(),
                     }));
                 }
-                Some(
+                Some((
                     identity @ Identity {
-                        key_id: identity_key_id,
                         nonce: n,
-                        cnonce: c,
-                        signature: s,
                         time_revoked: None,
                         ..
                     },
-                ) if try_authn!(identity.is_still_valid(&now), "credentials expired")
-                    && try_authn!(n == nonce, "invalid nonce")
-                    && try_authn!(c == cnonce, "invalid cnonce")
-                    && try_authn!(s == signature, "invalid signature") =>
+                    cached_creds,
+                )) if try_authn!(identity.is_still_valid(&now), "credentials expired")
+                    && try_authn!(*n == nonce, "invalid nonce")
+                    && try_authn!(*cached_creds == credentials, "credentials cache miss") =>
                 {
-                    assert_eq!(identity_key_id, key_id);
-                    Some(identity.to_owned())
+                    assert_eq!(identity.key_id, key_id);
+                    Some((identity.to_owned(), cached_creds.to_owned()))
                 }
                 _ if try_authn!(
                     nonces
-                        .pop(nonce)
+                        .pop(&nonce)
                         .map(|t| Nonce::is_still_valid(&t, &now))
                         .unwrap_or(false),
                     "nonce expired"
@@ -293,11 +293,10 @@ impl JobManager {
                     if let Ok(verified) =
                         try_authn!(response.verify_with_ssh_public_key(&public_key))
                     {
-                        Some(try_authn!(Identity::new(
-                            public_key.to_owned(),
-                            verified,
-                            now
-                        ))?)
+                        Some((
+                            try_authn!(Identity::new(public_key.to_owned(), verified, now))?,
+                            credentials,
+                        ))
                     } else {
                         None
                     }
@@ -305,7 +304,7 @@ impl JobManager {
                 _ => None,
             }
         {
-            identities.insert(key_id.to_owned(), identity.to_owned());
+            identities.insert(key_id.to_owned(), (identity.clone(), credentials));
             debug!(self.log, "authenticated credentials"; "key_id" => %key_id);
             Ok(identity)
         } else {
@@ -328,12 +327,12 @@ impl JobManager {
         };
         Ok(iter
             .take(limit.get() as usize)
-            .map(|(_id, identity)| identity.to_owned())
+            .map(|(_id, (identity, _credentials))| identity.to_owned())
             .collect())
     }
 
     pub async fn revoke_identity(&self, _authn: &Identity, key_id: KeyId) -> Result<(), JobError> {
-        if let Some(identity) = self.identities.lock().unwrap().get_mut(&key_id) {
+        if let Some((identity, _credentials)) = self.identities.lock().unwrap().get_mut(&key_id) {
             identity.time_revoked = Some(Utc::now());
         } else {
             return Err(JobError::PublicKeyNotFound(key_id));
@@ -457,6 +456,7 @@ impl JobManager {
     /// For jobs from previous sessions, anyone may access them; otherwise,
     /// they would be orphaned.
     fn check_job_owner(&self, authn: &Identity, job_id: &JobId) -> Result<(), JobError> {
+        // TODO: merge session & job locks to avoid potential deadlocks
         let session_guard = self.session.lock().unwrap();
         let Some(job_session_id) = self.job_status(authn, job_id)?.session_id() else {
             return Err(JobError::JobNotFound(job_id.to_owned()));
@@ -1332,15 +1332,12 @@ mod test {
             key_id: iam_key_id,
             public_key: iam_public_key,
             nonce: iam_nonce,
-            cnonce: iam_cnonce,
-            signature: _,
             time_authenticated: iam_authenticated,
             time_revoked: iam_revoked,
         } = identity.clone();
         assert_eq!(iam_key_id, key_id);
         assert_eq!(iam_public_key, public_key);
         assert_eq!(iam_nonce, credentials.nonce);
-        assert_eq!(iam_cnonce, credentials.cnonce);
         assert!(iam_authenticated <= Utc::now());
         assert!(iam_revoked.is_none());
 

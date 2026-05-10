@@ -12,7 +12,7 @@ use serde_json::{json, to_string as to_json_string, to_string_pretty as to_json_
 use x509_cert::Certificate;
 use x509_cert::der::Encode as _;
 
-use sush_common::authn::Identity;
+use sush_common::authn::{Credentials, Identity};
 use sush_common::jobs::{JobId, JobOutputStream, JobStatus, Session, SessionId, SignedJob};
 use sush_common::keys::{KeyId, Signature, SshPublicKey};
 
@@ -24,7 +24,7 @@ pub struct Cli {
     output: OutputFormat,
     progress: Option<ProgressBar>,
     session: Option<Session>,
-    identity: Option<Identity>,
+    credentials: Option<Credentials>,
 }
 
 impl Cli {
@@ -33,7 +33,7 @@ impl Cli {
             output,
             progress: None,
             session: None,
-            identity: None,
+            credentials: None,
         }
     }
 }
@@ -73,12 +73,12 @@ impl CommandContext for Cli {
 
     // Session management
 
-    fn get_identity(&self) -> Option<Identity> {
-        self.identity.clone()
+    fn get_credentials(&self) -> Option<Credentials> {
+        self.credentials.clone()
     }
 
-    fn set_identity(&mut self, identity: Option<Identity>) {
-        self.identity = identity;
+    fn set_credentials(&mut self, credentials: Option<Credentials>) {
+        self.credentials = credentials;
     }
 
     fn session_id(&self) -> Option<&SessionId> {
@@ -505,8 +505,6 @@ impl CommandContext for Cli {
                     key_id,
                     public_key,
                     nonce,
-                    cnonce: _,
-                    signature: _,
                     time_authenticated,
                     time_revoked,
                 } = identity;

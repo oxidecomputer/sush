@@ -474,7 +474,7 @@ async fn authz<E>(
     ssh_auth_sock: &Option<String>,
     ssh_key_id: &Option<KeyId>,
     response: ResponseValue<E>,
-) -> Result<Identity, CommandError> {
+) -> Result<(Identity, Credentials), CommandError> {
     let mut ssh_agent = if let Some(ssh_auth_sock) = ssh_auth_sock {
         SshAgentConnection::connect(ssh_auth_sock).await?
     } else {
@@ -496,13 +496,14 @@ async fn authz<E>(
     };
     let verified = signed.verify_with_ssh_public_key(&public_key)?;
     let credentials = Credentials::new(verified);
-    Ok(client
+    let identity = client
         .iam()
         .authorization(credentials.to_string())
         .body(public_key.to_string())
         .send()
         .await?
-        .into_inner())
+        .into_inner();
+    Ok((identity, credentials))
 }
 
 macro_rules! with_authz {
@@ -510,16 +511,17 @@ macro_rules! with_authz {
         let mut i = 0;
         loop {
             let $authz = $ctx
-                .get_identity()
-                .map(|i| i.to_owned().into_credentials().to_string())
+                .get_credentials()
+                .map(|creds| creds.to_string())
                 .unwrap_or_default();
 
             match $req.await {
                 Err(ClientError::ErrorResponse(err))
                     if err.status() == StatusCode::UNAUTHORIZED =>
                 {
-                    let identity = authz($ctx, $client, $ssh_auth_sock, $ssh_key_id, err).await?;
-                    $ctx.set_identity(Some(identity));
+                    let (_identity, credentials) =
+                        authz($ctx, $client, $ssh_auth_sock, $ssh_key_id, err).await?;
+                    $ctx.set_credentials(Some(credentials));
                 }
                 res => break res,
             }
@@ -601,9 +603,10 @@ async fn iam(
             if let Err(ClientError::ErrorResponse(err)) = client.identities().send().await
                 && err.status() == StatusCode::UNAUTHORIZED
             {
-                let identity = authz(ctx, client, ssh_auth_sock, ssh_key_id, err).await?;
+                let (identity, credentials) =
+                    authz(ctx, client, ssh_auth_sock, ssh_key_id, err).await?;
                 ctx.iam(&identity)?;
-                ctx.set_identity(Some(identity));
+                ctx.set_credentials(Some(credentials));
                 Ok(())
             } else {
                 Err(CommandError::InvalidAuthorization)
@@ -887,13 +890,13 @@ async fn job_start(
     job: SignedJob,
     start_args: JobStartArgs,
 ) -> Result<(), CommandError> {
-    let Some(identity) = ctx.get_identity() else {
+    let Some(credentials) = ctx.get_credentials() else {
         // It's ok to bail here because if we haven't got an identity in
         // the context, we also won't have a session; `job start` is only
         // useful from the REPL right now.
         return Err(CommandError::InvalidAuthorization);
     };
-    let authz = identity.into_credentials().to_string();
+    let authz = credentials.to_string();
     let job_id = job.job_id().to_owned();
     let interactive = job.interactive();
     let JobStartArgs {
@@ -1133,10 +1136,10 @@ async fn job_output(
 
         // Download and write the output in parallel (unordered) chunks.
         ctx.job_output_started(&job_id, stream, "Downloading", len)?;
-        let Some(identity) = ctx.get_identity() else {
+        let Some(credentials) = ctx.get_credentials() else {
             return Err(CommandError::InvalidAuthorization);
         };
-        let authz = identity.into_credentials().to_string();
+        let authz = credentials.to_string();
         let chunks = job_output_chunks(client, &authz, &job_id, stream, len, chunk_size);
         let par = parallel.get() as usize;
         let mut chunks_par = stream::iter(chunks).buffer_unordered(par);

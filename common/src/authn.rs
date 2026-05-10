@@ -250,8 +250,6 @@ pub struct Identity {
     pub key_id: KeyId,
     pub public_key: SshPublicKey,
     pub nonce: Nonce,
-    pub cnonce: Nonce,
-    pub signature: EncodedSignature,
     pub time_authenticated: DateTime<Utc>,
     pub time_revoked: Option<DateTime<Utc>>,
 }
@@ -262,14 +260,11 @@ impl Identity {
         response: Verified<ChallengeResponse>,
         time_authenticated: DateTime<Utc>,
     ) -> Result<Self, KeyError> {
-        let signature = response.signature().to_owned();
-        let ChallengeResponse { nonce, cnonce } = response.into_payload();
+        let ChallengeResponse { nonce, cnonce: _ } = response.into_payload();
         Ok(Self {
             key_id: public_key.key_id()?,
             public_key,
             nonce,
-            cnonce,
-            signature,
             time_authenticated,
             time_revoked: None,
         })
@@ -281,28 +276,6 @@ impl Identity {
                 .signed_duration_since(self.time_authenticated)
                 .num_seconds()
                 < IDENTITY_TTL
-    }
-
-    pub fn into_credentials(self) -> Credentials {
-        let Self {
-            key_id,
-            public_key: _,
-            nonce,
-            cnonce,
-            signature,
-            time_authenticated: _,
-            time_revoked: _,
-        } = self;
-        Credentials {
-            nonce,
-            cnonce,
-            key_id,
-            signature,
-        }
-    }
-
-    pub fn authz(&self) -> String {
-        self.clone().into_credentials().to_string()
     }
 }
 
