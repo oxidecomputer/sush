@@ -54,8 +54,23 @@ pub const ROOT_CERTS: &[&[u8]] = &[
 /// Maximum certificate chain length.
 const MAX_CERT_CHAIN_LEN: usize = 10;
 
+/// Maximum number of job signing certificates.
+/// The ideal number of certs is 1, so this need not be large.
+const MAX_CERTS: usize = 100;
+
+/// Maximum number of identities.
+const MAX_IDENTITIES: usize = 1_000;
+
+/// Maximum number of jobs in a session. Should be set to a large
+/// but reasonable value; big enough to not be annoying, but small
+/// enough to avoid filling up memory.
+const MAX_JOBS: usize = 10_000;
+
 /// Maximum number of outstanding authentication nonces.
-const MAX_OUTSTANDING_NONCES: NonZeroUsize = NonZeroUsize::new(1000).unwrap();
+/// We do not really expect more than one simultaneous user,
+/// nor do we expect hostile (DoS) requests, so a small value
+/// here is adequate.
+const MAX_OUTSTANDING_NONCES: NonZeroUsize = NonZeroUsize::new(100).unwrap();
 
 /// Output files or ranges larger than this will not be served all at once.
 const OUTPUT_THRESHOLD: u64 = ByteSize::mb(128).as_u64();
@@ -126,6 +141,9 @@ impl JobManager {
 
     fn import_cert_inner(&self, cert: Certificate, root_allowed: bool) -> Result<KeyId, JobError> {
         let mut certs = self.certs.lock().unwrap();
+        if certs.len() == MAX_CERTS {
+            return Err(JobError::TooManyCerts(MAX_CERTS));
+        }
 
         // Verify the certificate signature.
         let signature = Signature::try_from(&cert)?;
@@ -235,12 +253,14 @@ impl JobManager {
                 Some(
                     identity @ Identity {
                         key_id: identity_key_id,
+                        nonce: n,
                         cnonce: c,
                         signature: s,
                         time_revoked: None,
                         ..
                     },
                 ) if try_authn!(identity.is_still_valid(&now), "credentials expired")
+                    && try_authn!(n == nonce, "invalid nonce")
                     && try_authn!(c == cnonce, "invalid cnonce")
                     && try_authn!(s == signature, "invalid signature") =>
                 {
@@ -258,6 +278,9 @@ impl JobManager {
                     "invalid public key"
                 ) =>
                 {
+                    if identities.len() == MAX_IDENTITIES {
+                        return Err(JobError::TooManyIdentities(MAX_IDENTITIES));
+                    }
                     let public_key = public_key.expect("checked in guard");
                     let response = credentials.clone().into_challenge_response();
                     let verified = try_authn!(response.verify_with_ssh_public_key(&public_key))?;
@@ -330,9 +353,15 @@ impl JobManager {
         session_id: &SessionId,
     ) -> Result<(), JobError> {
         // Anyone is allowed to stop a session.
-        if let Some(session) = { self.session.lock().unwrap().take() }
-            && session.session_id() == session_id
-        {
+        let session = {
+            let mut session_guard = self.session.lock().unwrap();
+            if session_guard.as_ref().map(|s| s.session_id()) == Some(session_id) {
+                session_guard.take()
+            } else {
+                None
+            }
+        };
+        if let Some(session) = session {
             self.session_stop_inner(session).await
         } else {
             Err(JobError::SessionNotFound(session_id.to_owned()))
@@ -366,8 +395,14 @@ impl JobManager {
         let wait = params.wait;
         let started = {
             let job_id = job.job_id().to_owned();
-            if self.jobs.lock().unwrap().contains_key(&job_id) {
-                return Err(JobError::InvalidJobId(job_id));
+            {
+                let jobs = self.jobs.lock().unwrap();
+                if jobs.contains_key(&job_id) {
+                    return Err(JobError::InvalidJobId(job_id));
+                }
+                if jobs.len() == MAX_JOBS {
+                    return Err(JobError::TooManyJobs(MAX_JOBS));
+                }
             }
 
             let cert_key_id = job.key_id().to_owned();
@@ -410,20 +445,22 @@ impl JobManager {
         if wait { Ok(Some(rx.await?)) } else { Ok(None) }
     }
 
+    /// For jobs in the current session, only the owner is allowed access.
+    /// For jobs from previous sessions, anyone may access them; otherwise,
+    /// they would be orphaned.
     fn check_job_owner(&self, authn: &Identity, job_id: &JobId) -> Result<(), JobError> {
-        let Some(ref session) = *self.session.lock().unwrap() else {
-            return Err(JobError::NoSession);
-        };
+        let session_guard = self.session.lock().unwrap();
         let Some(job_session_id) = self.job_status(authn, job_id)?.session_id() else {
             return Err(JobError::JobNotFound(job_id.to_owned()));
         };
-        if job_session_id != *session.session_id() {
-            return Err(JobError::JobNotFound(job_id.to_owned()));
+        if let Some(session) = session_guard.as_ref()
+            && job_session_id == *session.session_id()
+            && session.key_id() != Some(&authn.key_id)
+        {
+            Err(JobError::SessionWrongIdentity)
+        } else {
+            Ok(())
         }
-        if session.key_id() != Some(&authn.key_id) {
-            return Err(JobError::SessionWrongIdentity);
-        }
-        Ok(())
     }
 
     pub async fn job_start_interactive_session(
@@ -458,12 +495,12 @@ impl JobManager {
 
     pub async fn job_output(
         &self,
-        _authn: &Identity,
+        authn: &Identity,
         job_id: &JobId,
         stream: JobOutputStream,
         range: Option<Range>,
     ) -> Result<Vec<u8>, JobError> {
-        // Anyone is allowed to read job output.
+        self.check_job_owner(authn, job_id)?;
         get_job_output(&self.output_dir, job_id, stream, range)
     }
 

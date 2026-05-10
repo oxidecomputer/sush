@@ -859,6 +859,9 @@ async fn job_start(
     start_args: JobStartArgs,
 ) -> Result<(), CommandError> {
     let Some(identity) = ctx.get_identity() else {
+        // It's ok to bail here because if we haven't got an identity in
+        // the context, we also won't have a session; `job start` is only
+        // useful from the REPL.
         return Err(CommandError::InvalidAuthorization);
     };
     let authz = identity.into_credentials().to_string();

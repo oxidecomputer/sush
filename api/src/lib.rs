@@ -89,7 +89,7 @@ pub trait SushApi {
     ///
     /// Since there may be only one session active on the rack at a time
     /// and we do not want to prevent starting new sessions, anyone is
-    /// allowed to stop anyone else's sesssion and start their own.
+    /// allowed to stop anyone else's session and start their own.
     #[endpoint { method = POST, path = "/sessions/{session_id}/stop" }]
     async fn session_stop(
         ctx: RequestContext<Self::Context>,

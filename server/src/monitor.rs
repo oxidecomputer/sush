@@ -265,7 +265,7 @@ impl MonitorRequest {
 }
 
 /// Event representing the beginning of a job. The manager spawns the child,
-/// then passses one of these to the monitor.
+/// then passes one of these to the monitor.
 #[derive(Debug)]
 pub struct JobStarted {
     pub job: VerifiedJob,

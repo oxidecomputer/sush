@@ -77,6 +77,12 @@ pub enum JobError {
     Slice(#[from] std::array::TryFromSliceError),
     #[error(transparent)]
     Task(#[from] tokio::task::JoinError),
+    #[error("Too many certificates")]
+    TooManyCerts(usize),
+    #[error("Too many identities")]
+    TooManyIdentities(usize),
+    #[error("Too many jobs in a session: {0}")]
+    TooManyJobs(usize),
     #[error("Unauthorized request")]
     Unauthorized(Nonce),
     #[error("Unable to wait for job end")]
@@ -174,7 +180,10 @@ impl From<JobError> for HttpError {
             | PublicKeyRevoked { .. }
             | SessionNotFound(_)
             | SessionWrongIdentity
-            | OutputPending => {
+            | OutputPending
+            | TooManyCerts(_)
+            | TooManyIdentities(_)
+            | TooManyJobs(_) => {
                 HttpError::for_client_error(None, ClientErrorStatusCode::BAD_REQUEST, message)
             }
         }
