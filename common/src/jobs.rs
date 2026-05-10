@@ -77,12 +77,12 @@ impl SessionId {
             .into()
     }
 
-    pub fn next_job_id(&self, prev_job: &SignedJob) -> Result<JobId, serde_json::Error> {
-        Ok(id_phrase(U256::from_be_slice(
+    pub fn next_job_id(&self, prev_job: &SignedJob) -> JobId {
+        id_phrase(U256::from_be_slice(
             hash(&prev_job.to_be_signed()).as_bytes(),
         ))
         .join(WORD_SEPARATOR)
-        .into())
+        .into()
     }
 }
 
@@ -146,11 +146,11 @@ impl Session {
         self.last_job = Some(job)
     }
 
-    pub fn next_job_id(&self) -> Result<JobId, serde_json::Error> {
+    pub fn next_job_id(&self) -> JobId {
         if let Some(job) = self.last_job.as_ref() {
-            Ok(self.session_id.next_job_id(job)?)
+            self.session_id.next_job_id(job)
         } else {
-            Ok(self.session_id.first_job_id())
+            self.session_id.first_job_id()
         }
     }
 }

@@ -432,7 +432,7 @@ impl JobManager {
             if session.key_id() != Some(&authn.key_id) {
                 return Err(JobError::SessionWrongIdentity);
             }
-            if session.next_job_id()? != job_id {
+            if session.next_job_id() != job_id {
                 return Err(JobError::InvalidJobId(job_id));
             }
             let started = job_start(
@@ -593,17 +593,14 @@ fn job_ended(
                         stdout_hash: job_output_hash(output_dir, &job_id, Stdout)?,
                         stderr_hash: job_output_hash(output_dir, &job_id, Stderr)?,
                     },
-                )
-                .ok_or_else(|| JobError::InvalidJobId(job_id))?;
+                );
                 Ok(())
             } else {
                 Err(JobError::InvalidJobId(job_id))
             }
         }
         Ok(ended) => {
-            let job_id = ended.job_id().to_owned();
-            jobs.insert(job_id.clone(), ended.into())
-                .ok_or_else(|| JobError::InvalidJobId(job_id))?;
+            jobs.insert(ended.job_id().to_owned(), ended.into());
             Ok(())
         }
     }
@@ -972,12 +969,12 @@ mod test {
             "should not be allowed to reuse a job ID"
         );
 
-        let job_id = session_id.next_job_id(&job).unwrap();
+        let job_id = session_id.next_job_id(&job);
         let job = root.sign_job_request(&job_id, "false", false).await;
         let status = job_status(&authn, &mgr, job.clone()).await;
         check_status_ended(status, &job_id, "false", Some(1), 0, 0);
 
-        let job_id = session_id.next_job_id(&job).unwrap();
+        let job_id = session_id.next_job_id(&job);
         let job_id_string = job_id.to_string();
         let job_id_bytes = job_id_string.as_bytes();
         let job = root
@@ -1005,7 +1002,7 @@ mod test {
 
         let home = Passwd::current_user().unwrap().dir;
         let output = format!("{home}\n");
-        let job_id = session_id.next_job_id(&job).unwrap();
+        let job_id = session_id.next_job_id(&job);
         let job = root.sign_job_request(&job_id, "pwd", false).await;
         let status = job_status(&authn, &mgr, job.clone()).await;
         check_status_ended(status, &job_id, "pwd", Some(0), output.len() as u64, 0);
@@ -1020,7 +1017,7 @@ mod test {
                 .is_empty()
         );
 
-        let job_id = session_id.next_job_id(&job).unwrap();
+        let job_id = session_id.next_job_id(&job);
         let job = root.sign_job_request(&job_id, "foo", false).await;
         let new_session_id = mgr.session_start(&authn).await.unwrap();
         assert_ne!(new_session_id, session_id);

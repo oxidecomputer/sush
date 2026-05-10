@@ -87,7 +87,7 @@ impl CommandContext for Cli {
 
     fn next_job_id(&self) -> Result<JobId, CommandError> {
         if let Some(session) = self.session.as_ref() {
-            Ok(session.next_job_id()?)
+            Ok(session.next_job_id())
         } else {
             Err(CommandError::MissingSession)
         }

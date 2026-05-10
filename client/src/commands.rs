@@ -506,6 +506,9 @@ async fn authz<E>(
     Ok((identity, credentials))
 }
 
+/// Retry a request with transparent authorization.
+/// This means re-evaluating the `$req` expression,
+/// which might involve cloning, etc.
 macro_rules! with_authz {
     ($ctx:ident, $client:ident, $ssh_auth_sock:expr, $ssh_key_id:expr, $authz:ident => $req:expr) => {{
         let mut i = 0;
@@ -948,9 +951,9 @@ async fn job_start(
         loop {
             select! {
                 status = &mut start => {
+                    ctx.job_started(&job)?;
                     ctx.job_polling_finished(&job_id)?;
                     let status = status?.into_inner();
-                    ctx.job_started(&job)?;
                     break status;
                 }
                 _ = interval.tick() => {

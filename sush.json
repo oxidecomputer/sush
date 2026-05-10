@@ -101,7 +101,8 @@
     },
     "/iam": {
       "get": {
-        "summary": "List authenticated identities (paginated).",
+        "summary": "List all known identities (paginated).",
+        "description": "Includes expired and revoked identities.",
         "operationId": "identities",
         "parameters": [
           {
