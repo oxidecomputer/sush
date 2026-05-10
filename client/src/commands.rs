@@ -468,9 +468,10 @@ macro_rules! with_authz {
     ($ctx:ident, $client:ident, $ssh_auth_sock:expr, $ssh_key_id:expr, $authz:ident => $req:expr) => {
         loop {
             let $authz = $ctx
-                .get_credentials()
-                .map(|(creds, _key)| creds.to_string())
+                .get_identity()
+                .map(|i| i.to_owned().into_credentials().to_string())
                 .unwrap_or_default();
+
             match $req.await {
                 Err(ClientError::ErrorResponse(err))
                     if err.status() == StatusCode::UNAUTHORIZED =>
@@ -496,14 +497,14 @@ macro_rules! with_authz {
                     };
                     let verified = signed.verify_with_ssh_public_key(&public_key)?;
                     let credentials = Credentials::new(verified);
-                    let _identity = $client
+                    let identity = $client
                         .iam()
                         .authorization(credentials.to_string())
                         .body(public_key.to_string())
                         .send()
                         .await?
                         .into_inner();
-                    $ctx.set_credentials(Some((credentials.clone(), public_key.clone())));
+                    $ctx.set_identity(Some(identity));
                 }
                 res => break res,
             }
@@ -554,7 +555,9 @@ async fn iam(
                 for identity in &page.items {
                     ctx.iam(identity)?;
                 }
-                if let Some(next_page) = page.next_page {
+                if let Some(next_page) = page.next_page
+                    && ctx.more()
+                {
                     page = with_authz!(
                         ctx,
                         client,
@@ -568,9 +571,6 @@ async fn iam(
                             .send()
                     )?
                     .into_inner();
-                    if page.items.is_empty() || !ctx.more() {
-                        break Ok(());
-                    }
                 } else {
                     break Ok(());
                 }
@@ -578,16 +578,13 @@ async fn iam(
         }
 
         IdentityCommand::Login => {
-            ctx.set_credentials(None);
+            ctx.set_identity(None);
             let identity = with_authz!(
                 ctx,
                 client,
                 ssh_auth_sock,
                 ssh_key_id.as_ref(),
-                authz => client
-                    .iam()
-                    .authorization(&authz)
-                    .send()
+                authz => client.iam().authorization(&authz).body(None).send()
             )?
             .into_inner();
             ctx.iam(&identity)
@@ -691,24 +688,23 @@ async fn session(
             Ok(())
         }
 
-        (SessionCommand::Stop { session_id }, _) => {
+        (SessionCommand::Stop { session_id }, Some(client)) => {
             let ctx_session_id = ctx.session_id().cloned();
-            if let Some(client) = client
-                && let Some(session_id) = session_id.as_ref().or(ctx_session_id.as_ref())
-            {
-                with_authz!(
-                    ctx,
-                    client,
-                    ssh_auth_sock,
-                    ssh_key_id.as_ref(),
-                    authz => client
-                        .session_stop()
-                        .session_id(session_id.clone())
-                        .authorization(&authz)
-                        .send()
-                )?;
-                ctx.session_stopped(session_id)?;
-            }
+            let Some(session_id) = session_id.as_ref().or(ctx_session_id.as_ref()) else {
+                return Err(CommandError::MissingSession);
+            };
+            with_authz!(
+                ctx,
+                client,
+                ssh_auth_sock,
+                ssh_key_id.as_ref(),
+                authz => client
+                    .session_stop()
+                    .session_id(session_id.clone())
+                    .authorization(&authz)
+                    .send()
+            )?;
+            ctx.session_stopped(session_id)?;
             Ok(())
         }
 
@@ -862,9 +858,10 @@ async fn job_start(
     job: SignedJob,
     start_args: JobStartArgs,
 ) -> Result<(), CommandError> {
-    let Some(authz) = ctx.get_credentials().map(|(creds, _key)| creds.to_string()) else {
+    let Some(identity) = ctx.get_identity() else {
         return Err(CommandError::InvalidAuthorization);
     };
+    let authz = identity.into_credentials().to_string();
     let job_id = job.job_id().to_owned();
     let interactive = job.interactive();
     let JobStartArgs {
@@ -1104,9 +1101,10 @@ async fn job_output(
 
         // Download and write the output in parallel (unordered) chunks.
         ctx.job_output_started(&job_id, stream, "Downloading", len)?;
-        let Some(authz) = ctx.get_credentials().map(|(creds, _key)| creds.to_string()) else {
+        let Some(identity) = ctx.get_identity() else {
             return Err(CommandError::InvalidAuthorization);
         };
+        let authz = identity.into_credentials().to_string();
         let chunks = job_output_chunks(client, &authz, &job_id, stream, len, chunk_size);
         let par = parallel.get() as usize;
         let mut chunks_par = stream::iter(chunks).buffer_unordered(par);

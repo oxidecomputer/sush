@@ -55,7 +55,7 @@ pub const ROOT_CERTS: &[&[u8]] = &[
 const MAX_CERT_CHAIN_LEN: usize = 10;
 
 /// Maximum number of outstanding authentication nonces.
-const MAX_OUTSTANDING_NONCES: NonZeroUsize = NonZeroUsize::new(10).unwrap();
+const MAX_OUTSTANDING_NONCES: NonZeroUsize = NonZeroUsize::new(1000).unwrap();
 
 /// Output files or ranges larger than this will not be served all at once.
 const OUTPUT_THRESHOLD: u64 = ByteSize::mb(128).as_u64();
@@ -216,48 +216,59 @@ impl JobManager {
         if let Some(authorization) = authorization
             && let now = Utc::now()
             && let Ok(credentials) = try_authn!(authorization.parse())
-            && let Credentials { key_id, nonce, .. } = &credentials
-            && let Some((public_key, time)) = {
-                let nonce_time = nonces.pop(nonce);
-                match identities.get(key_id) {
-                    Some(Identity {
-                        time_revoked: Some(time_revoked),
-                        ..
-                    }) => {
-                        return try_authn!(Err(JobError::PublicKeyRevoked {
-                            key_id: key_id.to_owned(),
-                            time_revoked: time_revoked.to_owned(),
-                        }));
-                    }
-                    Some(
-                        identity @ Identity {
-                            key_id: identity_key_id,
-                            public_key,
-                            nonce: _,
-                            time_authenticated,
-                            time_revoked: None,
-                        },
-                    ) if try_authn!(identity.is_still_valid(&now), "credentials expired") => {
-                        assert_eq!(identity_key_id, key_id);
-                        Some((public_key.to_owned(), time_authenticated.to_owned()))
-                    }
-                    _ => (try_authn!(
-                        nonce_time
-                            .map(|t| Nonce::is_still_valid(&t, &now))
-                            .unwrap_or(false),
-                        "nonce expired"
-                    ) && try_authn!(
-                        public_key.as_ref().and_then(|k| k.key_id().ok()) == Some(key_id.clone()),
-                        "invalid public key"
-                    ))
-                    .then_some(public_key)
-                    .flatten()
-                    .map(|public_key| (public_key, now)),
+            && let Credentials {
+                key_id,
+                nonce,
+                cnonce,
+                signature,
+            } = &credentials
+            && let Some(identity) = match identities.get(key_id) {
+                Some(Identity {
+                    time_revoked: Some(time_revoked),
+                    ..
+                }) => {
+                    return try_authn!(Err(JobError::PublicKeyRevoked {
+                        key_id: key_id.to_owned(),
+                        time_revoked: time_revoked.to_owned(),
+                    }));
                 }
+                Some(
+                    identity @ Identity {
+                        key_id: identity_key_id,
+                        cnonce: c,
+                        signature: s,
+                        time_revoked: None,
+                        ..
+                    },
+                ) if try_authn!(identity.is_still_valid(&now), "credentials expired")
+                    && try_authn!(c == cnonce, "invalid cnonce")
+                    && try_authn!(s == signature, "invalid signature") =>
+                {
+                    assert_eq!(identity_key_id, key_id);
+                    Some(identity.to_owned())
+                }
+                _ if try_authn!(
+                    nonces
+                        .pop(nonce)
+                        .map(|t| Nonce::is_still_valid(&t, &now))
+                        .unwrap_or(false),
+                    "nonce expired"
+                ) && try_authn!(
+                    public_key.as_ref().and_then(|k| k.key_id().ok()) == Some(key_id.clone()),
+                    "invalid public key"
+                ) =>
+                {
+                    let public_key = public_key.expect("checked in guard");
+                    let response = credentials.clone().into_challenge_response();
+                    let verified = try_authn!(response.verify_with_ssh_public_key(&public_key))?;
+                    Some(try_authn!(Identity::new(
+                        public_key.to_owned(),
+                        verified,
+                        now
+                    ))?)
+                }
+                _ => None,
             }
-            && let response = credentials.clone().into_challenge_response()
-            && let Ok(verified) = try_authn!(response.verify_with_ssh_public_key(&public_key))
-            && let Ok(identity) = try_authn!(Identity::new(public_key.to_owned(), verified, time))
         {
             identities.insert(key_id.to_owned(), identity.to_owned());
             debug!(self.log, "authenticated credentials"; "key_id" => %key_id);
@@ -306,10 +317,7 @@ impl JobManager {
 
         // Don't hold the session lock while we stop any old session.
         if let Some(old_session) = { self.session.lock().unwrap().replace(new_session) } {
-            match self.session_stop(authn, old_session.session_id()).await {
-                Ok(()) | Err(JobError::SessionNotFound(_)) => (),
-                Err(err) => return Err(err),
-            }
+            self.session_stop_inner(old_session).await?;
         }
 
         info!(self.log, "session started"; "session_id" => %new_session_id);
@@ -321,15 +329,20 @@ impl JobManager {
         _authn: &Identity,
         session_id: &SessionId,
     ) -> Result<(), JobError> {
-        let mut session = self.session.lock().unwrap();
-        if session.as_ref().map(|s| s.session_id()) == Some(session_id) {
-            // TODO: send session stop event
-            *session = None;
-            info!(self.log, "session stopped"; "session_id" => %session_id);
-            Ok(())
+        // Anyone is allowed to stop a session.
+        if let Some(session) = { self.session.lock().unwrap().take() }
+            && session.session_id() == session_id
+        {
+            self.session_stop_inner(session).await
         } else {
             Err(JobError::SessionNotFound(session_id.to_owned()))
         }
+    }
+
+    async fn session_stop_inner(&self, session: Session) -> Result<(), JobError> {
+        // TODO: send session stop event
+        info!(self.log, "session stopped"; "session_id" => %session.session_id());
+        Ok(())
     }
 
     // Job management.
@@ -401,7 +414,7 @@ impl JobManager {
         let Some(ref session) = *self.session.lock().unwrap() else {
             return Err(JobError::NoSession);
         };
-        let Some(job_session_id) = self.job_status_inner(job_id).session_id() else {
+        let Some(job_session_id) = self.job_status(authn, job_id)?.session_id() else {
             return Err(JobError::JobNotFound(job_id.to_owned()));
         };
         if job_session_id != *session.session_id() {
@@ -425,25 +438,17 @@ impl JobManager {
         rx.await?
     }
 
-    pub fn job_status(&self, authn: &Identity, job_id: &JobId) -> Result<JobStatus, JobError> {
-        if self.check_job_owner(authn, job_id).is_ok() {
-            Ok(self.job_status_inner(job_id))
-        } else {
-            Ok(JobStatus::Unknown {
-                job_id: job_id.to_owned(),
-            })
-        }
-    }
-
-    fn job_status_inner(&self, job_id: &JobId) -> JobStatus {
-        self.jobs
+    pub fn job_status(&self, _authn: &Identity, job_id: &JobId) -> Result<JobStatus, JobError> {
+        // Anyone is allowed to read job status.
+        Ok(self
+            .jobs
             .lock()
             .unwrap()
             .get(job_id)
             .cloned()
             .unwrap_or_else(|| JobStatus::Unknown {
                 job_id: job_id.to_owned(),
-            })
+            }))
     }
 
     pub async fn job_stop(&self, authn: &Identity, job_id: &JobId) -> Result<(), JobError> {
@@ -453,12 +458,12 @@ impl JobManager {
 
     pub async fn job_output(
         &self,
-        authn: &Identity,
+        _authn: &Identity,
         job_id: &JobId,
         stream: JobOutputStream,
         range: Option<Range>,
     ) -> Result<Vec<u8>, JobError> {
-        self.check_job_owner(authn, job_id)?;
+        // Anyone is allowed to read job output.
         get_job_output(&self.output_dir, job_id, stream, range)
     }
 
@@ -1285,12 +1290,15 @@ mod test {
             key_id: iam_key_id,
             public_key: iam_public_key,
             nonce: iam_nonce,
+            cnonce: iam_cnonce,
+            signature: _,
             time_authenticated: iam_authenticated,
             time_revoked: iam_revoked,
         } = identity.clone();
         assert_eq!(iam_key_id, key_id);
         assert_eq!(iam_public_key, public_key);
-        assert_eq!(iam_nonce, nonce);
+        assert_eq!(iam_nonce, credentials.nonce);
+        assert_eq!(iam_cnonce, credentials.cnonce);
         assert!(iam_authenticated <= Utc::now());
         assert!(iam_revoked.is_none());
 

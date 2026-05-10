@@ -13,7 +13,7 @@ use rustyline::error::ReadlineError;
 use shlex::split as split_command;
 use xdg::BaseDirectories;
 
-use sush_common::authn::{Credentials, Identity};
+use sush_common::authn::Identity;
 use sush_common::jobs::{JobId, JobOutputStream, JobStatus, SessionId, SignedJob};
 use sush_common::keys::{KeyId, SshPublicKey};
 
@@ -180,7 +180,7 @@ impl CommandContext for Repl {
         set_or_unset!(ssh_auth_sock, SSH_AUTH_SOCK, "SSH agent socket");
         set_or_unset!(ssh_key_id, SUSH_KEY_ID, "SSH key ID");
 
-        self.set_credentials(None);
+        self.set_identity(None);
     }
 
     fn more(&self) -> bool {
@@ -189,12 +189,12 @@ impl CommandContext for Repl {
 
     // Session management
 
-    fn get_credentials(&self) -> Option<(Credentials, SshPublicKey)> {
-        self.cli.get_credentials()
+    fn get_identity(&self) -> Option<Identity> {
+        self.cli.get_identity()
     }
 
-    fn set_credentials(&mut self, credentials: Option<(Credentials, SshPublicKey)>) {
-        self.cli.set_credentials(credentials)
+    fn set_identity(&mut self, identity: Option<Identity>) {
+        self.cli.set_identity(identity)
     }
 
     fn session_id(&self) -> Option<&SessionId> {

@@ -6,7 +6,7 @@ use std::time::Duration;
 
 use clap::ValueEnum;
 
-use sush_common::authn::{Credentials, Identity};
+use sush_common::authn::Identity;
 use sush_common::jobs::{JobId, JobOutputStream, JobStatus, SessionId, SignedJob};
 use sush_common::keys::{KeyId, SshPublicKey};
 
@@ -46,8 +46,8 @@ pub trait CommandContext: Send + Sync {
     fn more(&self) -> bool;
 
     // Session management
-    fn get_credentials(&self) -> Option<(Credentials, SshPublicKey)>;
-    fn set_credentials(&mut self, credentials: Option<(Credentials, SshPublicKey)>);
+    fn get_identity(&self) -> Option<Identity>;
+    fn set_identity(&mut self, identity: Option<Identity>);
     fn session_id(&self) -> Option<&SessionId>;
     fn next_job_id(&self) -> Result<JobId, CommandError>;
     fn session_started(&mut self, session_id: &SessionId) -> Result<(), CommandError>;
