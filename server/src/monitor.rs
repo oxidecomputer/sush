@@ -28,8 +28,8 @@ use crate::interactive::{InteractiveSession, SocketSender};
 use crate::manager::{job_output_hash, job_output_len, job_output_path};
 use crate::pty::Pty;
 
-/// The monitor runs as a tokio task that communicates with the manager
-/// via message passing. It does not have a connection to the database.
+/// The job monitor runs as a tokio task that communicates with the manager
+/// via message passing.
 #[derive(Debug)]
 pub struct JobMonitor {
     log: Logger,

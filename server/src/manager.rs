@@ -3,15 +3,13 @@
 //! Jobs are spawned onto new tokio tasks and passed to the monitor to wait
 //! for completion. Standard output and standard error are saved in files.
 
-use std::collections::BTreeMap;
 use std::fs::{DirBuilder, File, OpenOptions};
 use std::io::{Read as _, Seek as _, SeekFrom};
-use std::num::{NonZeroU32, NonZeroUsize};
-use std::ops::Bound;
+use std::num::NonZeroUsize;
 use std::os::fd::AsRawFd as _;
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, MutexGuard};
 
 use blake3::Hasher;
 use bytesize::ByteSize;
@@ -56,15 +54,13 @@ const MAX_CERT_CHAIN_LEN: usize = 10;
 
 /// Maximum number of job signing certificates.
 /// The ideal number of certs is 1, so this need not be large.
-const MAX_CERTS: usize = 100;
+const MAX_CERTS: NonZeroUsize = NonZeroUsize::new(100).unwrap();
 
 /// Maximum number of identities.
-const MAX_IDENTITIES: usize = 1_000;
+const MAX_IDENTITIES: NonZeroUsize = NonZeroUsize::new(1_000).unwrap();
 
-/// Maximum number of jobs in a session. Should be set to a large
-/// but reasonable value; big enough to not be annoying, but small
-/// enough to avoid filling up memory.
-const MAX_JOBS: usize = 10_000;
+/// Maximum number of job entries to hold in memory.
+const MAX_JOBS: NonZeroUsize = NonZeroUsize::new(10_000).unwrap();
 
 /// Maximum number of outstanding authentication nonces.
 /// We do not really expect more than one simultaneous user,
@@ -75,21 +71,25 @@ const MAX_OUTSTANDING_NONCES: NonZeroUsize = NonZeroUsize::new(100).unwrap();
 /// Output files or ranges larger than this will not be served all at once.
 const OUTPUT_THRESHOLD: u64 = ByteSize::mb(128).as_u64();
 
+type SessionGuard<'a> = MutexGuard<'a, Option<Session>>;
+
+/// NB: All tables must have a fixed maximum size!
 #[derive(Debug)]
 pub struct JobManager {
     log: Logger,
     nonces: Arc<Mutex<LruCache<Nonce, DateTime<Utc>>>>,
-    identities: Arc<Mutex<BTreeMap<KeyId, (Identity, Credentials)>>>,
-    certs: Arc<Mutex<BTreeMap<KeyId, Certificate>>>,
+    identities: Arc<Mutex<LruCache<KeyId, (Identity, Credentials)>>>,
+    certs: Arc<Mutex<LruCache<KeyId, Certificate>>>,
     session: Arc<Mutex<Option<Session>>>,
-    jobs: Arc<Mutex<BTreeMap<JobId, JobStatus>>>,
+    jobs: Arc<Mutex<LruCache<JobId, JobStatus>>>,
     output_dir: PathBuf,
     tx_monitor: mpsc::Sender<MonitorRequest>,
 }
 
 impl JobManager {
     pub async fn new(log: Logger, output_dir: &Path) -> Result<Self, JobError> {
-        let jobs = Arc::new(Mutex::new(BTreeMap::new()));
+        // The jobs table is shared between the manager and the monitor.
+        let jobs = Arc::new(Mutex::new(LruCache::new(MAX_JOBS)));
 
         // Start the monitor and listen for job-end events.
         let (tx_monitor, mut rx_monitor) =
@@ -112,8 +112,8 @@ impl JobManager {
         let new = Self {
             log: log.new(o!("component" => "manager")),
             nonces: Arc::new(Mutex::new(LruCache::new(MAX_OUTSTANDING_NONCES))),
-            identities: Arc::new(Mutex::new(BTreeMap::new())),
-            certs: Arc::new(Mutex::new(BTreeMap::new())),
+            identities: Arc::new(Mutex::new(LruCache::new(MAX_IDENTITIES))),
+            certs: Arc::new(Mutex::new(LruCache::new(MAX_CERTS))),
             session: Arc::new(Mutex::new(None)),
             jobs,
             output_dir: output_dir.to_owned(),
@@ -141,9 +141,6 @@ impl JobManager {
 
     fn import_cert_inner(&self, cert: Certificate, root_allowed: bool) -> Result<KeyId, JobError> {
         let mut certs = self.certs.lock().unwrap();
-        if certs.len() == MAX_CERTS {
-            return Err(JobError::TooManyCerts(MAX_CERTS));
-        }
 
         // Verify the certificate signature.
         let signature = Signature::try_from(&cert)?;
@@ -169,7 +166,7 @@ impl JobManager {
 
         // Import the certificate.
         let key_id = KeyId::try_from(subject)?;
-        certs.insert(key_id.clone(), cert);
+        certs.put(key_id.clone(), cert);
         info!(self.log, "imported certificate"; "key_id" => %key_id, "root" => root);
         Ok(key_id)
     }
@@ -180,7 +177,7 @@ impl JobManager {
         _authn: &Identity,
         key_id: &KeyId,
     ) -> Result<Vec<Certificate>, JobError> {
-        let certs = self.certs.lock().unwrap();
+        let mut certs = self.certs.lock().unwrap();
         let mut chain = Vec::new();
         let mut key_id = key_id.to_owned();
         loop {
@@ -208,10 +205,9 @@ impl JobManager {
         authorization: Option<String>,
         public_key: Option<SshPublicKey>,
     ) -> Result<Identity, JobError> {
-        // Ensure all authentication failures except revoked identities get
-        // a fresh nonce and a 401 Unauthorized response. What we actually
-        // want here is a generic closure, but Rust doesn't currently
-        // support those.
+        // NB: Do not use the `?` operator in this function! We must ensure
+        // that all authentication failures are logged and receive a proper
+        // 401 Unauthorized response with a fresh nonce.
         macro_rules! unauthorized {
             ($error:expr) => {{
                 error!(self.log, "authentication failed"; "error" => %$error);
@@ -221,9 +217,6 @@ impl JobManager {
             }};
         }
 
-        // The client should (probably) not get detailed information back
-        // about authentication failures, but debugging is much easier if
-        // we log full errors here on the server.
         macro_rules! try_authn {
             // $expr -> Result
             ($expr:expr) => {
@@ -271,7 +264,7 @@ impl JobManager {
                 .pop(&nonce)
                 .map(|t| Nonce::is_still_valid(&t, &now))
                 .unwrap_or(false),
-            "invalid nonce"
+            "invalid or expired nonce"
         );
 
         // Verify the supplied credentials.
@@ -285,34 +278,21 @@ impl JobManager {
         let verified = try_authn!(response.verify_with_ssh_public_key(&public_key));
         let identity = try_authn!(Identity::new(public_key.to_owned(), verified, now));
 
-        // Expire old identities as needed to make room.
-        let mut identities = self.identities.lock().unwrap();
-        if identities.len() >= MAX_IDENTITIES {
-            identities.retain(|_k, (identity, _c)| identity.is_still_valid(&now));
-            if identities.len() >= MAX_IDENTITIES {
-                return Err(JobError::TooManyIdentities(MAX_IDENTITIES));
-            }
-        }
-
         // Authenticated!
-        identities.insert(key_id.to_owned(), (identity.clone(), credentials));
         debug!(self.log, "authenticated credentials for new identity"; "key_id" => %key_id);
+        self.identities
+            .lock()
+            .unwrap()
+            .put(key_id.to_owned(), (identity.clone(), credentials));
         Ok(identity)
     }
 
-    pub async fn identities(
-        &self,
-        _authn: &Identity,
-        start: Option<KeyId>,
-        limit: NonZeroU32,
-    ) -> Result<Vec<Identity>, JobError> {
-        let identities = self.identities.lock().unwrap();
-        let iter = match start {
-            Some(start_key) => identities.range((Bound::Excluded(start_key), Bound::Unbounded)),
-            None => identities.range(..),
-        };
-        Ok(iter
-            .take(limit.get() as usize)
+    pub async fn identities(&self, _authn: &Identity) -> Result<Vec<Identity>, JobError> {
+        Ok(self
+            .identities
+            .lock()
+            .unwrap()
+            .iter()
             .map(|(_id, (identity, _credentials))| identity.to_owned())
             .collect())
     }
@@ -373,14 +353,14 @@ impl JobManager {
 
     // Job management.
 
-    pub async fn job_history(
-        &self,
-        _authn: &Identity,
-        _start: Option<JobId>,
-        _limit: NonZeroU32,
-    ) -> Result<Vec<JobStatus>, JobError> {
-        // TODO: fetch job history
-        Ok(vec![])
+    pub async fn job_history(&self, _authn: &Identity) -> Result<Vec<JobStatus>, JobError> {
+        Ok(self
+            .jobs
+            .lock()
+            .unwrap()
+            .iter()
+            .map(|(_id, status)| status.to_owned())
+            .collect())
     }
 
     pub async fn job_start(
@@ -391,15 +371,18 @@ impl JobManager {
     ) -> Result<Option<ExecutionResult>, JobError> {
         let wait = params.wait;
         let started = {
+            let mut session_guard = self.session.lock().unwrap();
+            let Some(session) = session_guard.clone() else {
+                return Err(JobError::NoSession);
+            };
+
             let job_id = job.job_id().to_owned();
-            let mut jobs = self.jobs.lock().unwrap();
-            if jobs.contains_key(&job_id) {
-                return Err(JobError::InvalidJobId(job_id));
-            }
-            if jobs.len() == MAX_JOBS {
-                // TODO: evict old jobs
-                return Err(JobError::TooManyJobs(MAX_JOBS));
-            }
+            self.with_jobs(&mut session_guard, |jobs| {
+                if jobs.contains(&job_id) {
+                    return Err(JobError::InvalidJobId(job_id.to_owned()));
+                }
+                Ok(())
+            })?;
 
             let cert_key_id = job.key_id().to_owned();
             let cert = self
@@ -411,10 +394,6 @@ impl JobManager {
                 .ok_or_else(|| JobError::MissingCert(cert_key_id))?;
 
             let job = job.verify_with_cert(&cert)?;
-            let mut session_guard = self.session.lock().unwrap();
-            let Some(session) = session_guard.as_mut() else {
-                return Err(JobError::NoSession);
-            };
             if session.key_id() != Some(&authn.key_id) {
                 return Err(JobError::SessionWrongIdentity);
             }
@@ -428,8 +407,15 @@ impl JobManager {
                 session.session_id(),
                 params,
             )?;
-            jobs.insert(job_id, JobStatus::from(&started));
-            session.job_started(job.into_signed());
+            self.with_jobs(&mut session_guard, |jobs| {
+                jobs.put(job_id, JobStatus::from(&started));
+                Ok(())
+            })?;
+
+            session_guard
+                .as_mut()
+                .unwrap()
+                .job_started(job.into_signed());
             started
         };
 
@@ -439,12 +425,14 @@ impl JobManager {
     }
 
     /// For jobs in the current session, only the owner is allowed access.
-    /// For jobs from previous sessions, anyone may access them; otherwise,
+    /// For jobs from previous sessions, anyone may access them; otherwise
     /// they would be orphaned.
     fn check_job_owner(&self, authn: &Identity, job_id: &JobId) -> Result<(), JobError> {
-        // TODO: merge session & job locks to avoid potential deadlocks
-        let session_guard = self.session.lock().unwrap();
-        let Some(job_session_id) = self.job_status(authn, job_id)?.session_id() else {
+        let mut session_guard = self.session.lock().unwrap();
+        let Some(job_session_id) = self
+            .job_status_inner(&mut session_guard, job_id)?
+            .session_id()
+        else {
             return Err(JobError::JobNotFound(job_id.to_owned()));
         };
         if let Some(session) = session_guard.as_ref()
@@ -471,15 +459,32 @@ impl JobManager {
 
     pub fn job_status(&self, _authn: &Identity, job_id: &JobId) -> Result<JobStatus, JobError> {
         // Anyone is allowed to read job status.
-        Ok(self
-            .jobs
-            .lock()
-            .unwrap()
-            .get(job_id)
-            .cloned()
-            .unwrap_or_else(|| JobStatus::Unknown {
-                job_id: job_id.to_owned(),
-            }))
+        self.job_status_inner(&mut self.session.lock().unwrap(), job_id)
+    }
+
+    fn job_status_inner(
+        &self,
+        session_guard: &mut SessionGuard,
+        job_id: &JobId,
+    ) -> Result<JobStatus, JobError> {
+        self.with_jobs(session_guard, |jobs| {
+            Ok(jobs
+                .get(job_id)
+                .cloned()
+                .unwrap_or_else(|| JobStatus::Unknown {
+                    job_id: job_id.to_owned(),
+                }))
+        })
+    }
+
+    /// The `_session_guard` argument ensures that the session is locked
+    /// before we take the job table lock.
+    fn with_jobs<T>(
+        &self,
+        _session_guard: &mut SessionGuard,
+        f: impl FnOnce(&mut LruCache<JobId, JobStatus>) -> Result<T, JobError>,
+    ) -> Result<T, JobError> {
+        f(&mut self.jobs.lock().unwrap())
     }
 
     pub async fn job_stop(&self, authn: &Identity, job_id: &JobId) -> Result<(), JobError> {
@@ -546,7 +551,7 @@ pub fn job_output_hash(
 }
 
 fn job_ended(
-    jobs: &mut BTreeMap<JobId, JobStatus>,
+    jobs: &mut LruCache<JobId, JobStatus>,
     output_dir: &Path,
     result: ExecutionResult,
 ) -> Result<(), JobError> {
@@ -566,7 +571,7 @@ fn job_ended(
                 .cloned()
                 .ok_or_else(|| JobError::InvalidJobId(job_id.to_owned()))?
             {
-                jobs.insert(
+                jobs.put(
                     job_id.to_owned(),
                     JobStatus::Ended {
                         job,
@@ -586,7 +591,7 @@ fn job_ended(
             }
         }
         Ok(ended) => {
-            jobs.insert(ended.job_id().to_owned(), ended.into());
+            jobs.put(ended.job_id().to_owned(), ended.into());
             Ok(())
         }
     }

@@ -4,9 +4,9 @@ use std::collections::BTreeMap;
 use std::fmt;
 
 use dropshot::{
-    Body, ClientErrorStatusCode, EmptyScanParams, Header, HttpError, HttpResponseDeleted,
-    HttpResponseOk, PaginationParams, Path as PathParams, Query as QueryParams, RequestContext,
-    ResultsPage, TypedBody, WebsocketEndpointResult, WebsocketUpgrade, api_description,
+    Body, ClientErrorStatusCode, Header, HttpError, HttpResponseDeleted, HttpResponseOk,
+    Path as PathParams, Query as QueryParams, RequestContext, TypedBody, WebsocketEndpointResult,
+    WebsocketUpgrade, api_description,
 };
 use http_range_header::{SyntacticallyCorrectRange as Range, parse_range_header};
 use hyper::Response;
@@ -53,15 +53,12 @@ pub trait SushApi {
         body: TypedBody<Option<SshPublicKey>>,
     ) -> Result<HttpResponseOk<Identity>, HttpError>;
 
-    /// List all known identities (paginated).
-    ///
-    /// Includes expired and revoked identities.
+    /// List all known identities, including expired and revoked identities.
     #[endpoint { method = GET, path = "/iam" }]
     async fn identities(
         ctx: RequestContext<Self::Context>,
         headers: Header<Authorization>,
-        params: QueryParams<PaginationParams<EmptyScanParams, KeyId>>,
-    ) -> Result<HttpResponseOk<ResultsPage<Identity>>, HttpError>;
+    ) -> Result<HttpResponseOk<Vec<Identity>>, HttpError>;
 
     /// Revoke an authenticated identity.
     ///
@@ -155,13 +152,12 @@ pub trait SushApi {
         upgrade: WebsocketUpgrade,
     ) -> WebsocketEndpointResult;
 
-    /// List previous jobs (paginated).
+    /// List previous jobs.
     #[endpoint { method = GET, path = "/jobs" }]
     async fn job_history(
         ctx: RequestContext<Self::Context>,
         headers: Header<Authorization>,
-        params: QueryParams<PaginationParams<EmptyScanParams, JobId>>,
-    ) -> Result<HttpResponseOk<ResultsPage<JobStatus>>, HttpError>;
+    ) -> Result<HttpResponseOk<Vec<JobStatus>>, HttpError>;
 }
 
 #[derive(Deserialize, JsonSchema)]

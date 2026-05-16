@@ -4,7 +4,7 @@
 
 use std::fs::{File, OpenOptions};
 use std::io::{Read as _, Seek as _, SeekFrom, Write as _, stdin};
-use std::num::{NonZeroU8, NonZeroU32, NonZeroU64};
+use std::num::{NonZeroU8, NonZeroU64};
 use std::path::{Path, PathBuf};
 use std::pin::Pin;
 use std::time::Duration;
@@ -62,9 +62,6 @@ pub const SUSH_URL: &str = "SUSH_URL";
 
 /// Default chunk size for parallel downloads of large output.
 const DEFAULT_CHUNK_SIZE: ByteSize = ByteSize::mib(32);
-
-/// Default number of elements in a page of results.
-const DEFAULT_PAGE_LIMIT: NonZeroU32 = NonZeroU32::new(100).unwrap();
 
 /// Maximum number of authentication retries.
 const MAX_AUTHN_RETRIES: usize = 3;
@@ -267,11 +264,7 @@ pub enum IdentityCommand {
     Available,
 
     /// List SSH identities registered with the server.
-    List {
-        /// The number of identities per page of results.
-        #[arg(short, long, default_value_t = DEFAULT_PAGE_LIMIT)]
-        limit: NonZeroU32,
-    },
+    List,
 
     /// Log in to the server as an SSH identity.
     #[default]
@@ -348,11 +341,7 @@ pub enum JobCommand {
     },
 
     /// Show status of previously started jobs.
-    History {
-        /// How many history entries to fetch in total, or 0 for all.
-        #[arg(short, long, default_value_t = 0)]
-        limit: usize,
-    },
+    History,
 }
 
 #[derive(Clone, Debug, Parser)]
@@ -563,43 +552,22 @@ async fn iam(
             ctx.identities(&keys)
         }
 
-        IdentityCommand::List { limit } => {
-            let mut page = with_authz!(
+        IdentityCommand::List => {
+            let identities = with_authz!(
                 ctx,
                 client,
                 ssh_auth_sock,
                 ssh_key_id,
                 authz => client
                     .identities()
-                    .limit(limit)
                     .authorization(&authz)
                     .send()
             )?
             .into_inner();
-            loop {
-                for identity in &page.items {
-                    ctx.iam(identity)?;
-                }
-                if let Some(next_page) = page.next_page
-                    && ctx.more()
-                {
-                    page = with_authz!(
-                        ctx,
-                        client,
-                        ssh_auth_sock,
-                        ssh_key_id,
-                        authz => client
-                            .identities()
-                            .authorization(&authz)
-                            .limit(limit)
-                            .page_token(&next_page)
-                            .send()
-                    )?
-                    .into_inner();
-                } else {
-                    break Ok(());
-                }
+            for identity in identities {
+                ctx.iam(&identity)?;
             }
+            Ok(())
         }
 
         IdentityCommand::Login => {
@@ -877,8 +845,22 @@ async fn job(
             job_start_interactive_session(ctx, client, ssh_auth_sock, ssh_key_id, &job_id).await
         }
 
-        (JobCommand::History { limit: _ }, Some(_client)) => {
-            todo!("paginated job history")
+        (JobCommand::History, Some(client)) => {
+            let history = with_authz!(
+                ctx,
+                client,
+                ssh_auth_sock,
+                ssh_key_id,
+                authz => client
+                    .job_history()
+                    .authorization(&authz)
+                    .send()
+            )?
+            .into_inner();
+            for job in history {
+                ctx.job_status(job.job_id(), &job)?;
+            }
+            Ok(())
         }
 
         (_, None) => Err(CommandError::Offline),

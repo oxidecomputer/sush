@@ -1,11 +1,9 @@
 //! API server for the Oxide Support Shell.
 
-use std::num::NonZeroU32;
-
 use dropshot::{
-    Body, ClientErrorStatusCode, EmptyScanParams, Header, HttpError, HttpResponseDeleted,
-    HttpResponseOk, PaginationParams, Path as PathParams, Query as QueryParams, RequestContext,
-    ResultsPage, TypedBody, WebsocketEndpointResult, WebsocketUpgrade, WhichPage,
+    Body, ClientErrorStatusCode, Header, HttpError, HttpResponseDeleted, HttpResponseOk,
+    Path as PathParams, Query as QueryParams, RequestContext, TypedBody, WebsocketEndpointResult,
+    WebsocketUpgrade,
 };
 use hyper::Response;
 use tokio_tungstenite::WebSocketStream;
@@ -18,7 +16,7 @@ use sush_api::{
     SessionIdParam, SushApi,
 };
 use sush_common::authn::Identity;
-use sush_common::jobs::{JobId, JobStatus, SessionId, SignedJob};
+use sush_common::jobs::{JobStatus, SessionId, SignedJob};
 use sush_common::keys::{KeyId, SshPublicKey, pem_cert_chain};
 
 use crate::error::JobError;
@@ -78,28 +76,11 @@ impl SushApi for ApiServer {
     async fn identities(
         ctx: RequestContext<Self::Context>,
         headers: Header<Authorization>,
-        params: QueryParams<PaginationParams<EmptyScanParams, KeyId>>,
-    ) -> Result<HttpResponseOk<ResultsPage<Identity>>, HttpError> {
+    ) -> Result<HttpResponseOk<Vec<Identity>>, HttpError> {
         let mgr = ctx.context();
         let Authorization { authorization } = headers.into_inner();
         let authn = mgr.iam(authorization, None).await?;
-        let pag_params = params.into_inner();
-        let Some(limit) = NonZeroU32::new(ctx.page_limit(&pag_params)?.get()) else {
-            return Err(HttpError::for_client_error(
-                None,
-                ClientErrorStatusCode::BAD_REQUEST,
-                String::from("Page limit must be non-zero"),
-            ));
-        };
-        let list = match pag_params.page {
-            WhichPage::First(..) => mgr.identities(&authn, None, limit).await?,
-            WhichPage::Next(key_id) => mgr.identities(&authn, Some(key_id), limit).await?,
-        };
-        Ok(HttpResponseOk(ResultsPage::new(
-            list,
-            &EmptyScanParams {},
-            |identity: &Identity, _| identity.key_id.to_owned(),
-        )?))
+        Ok(HttpResponseOk(mgr.identities(&authn).await?))
     }
 
     async fn revoke_identity(
@@ -253,29 +234,10 @@ impl SushApi for ApiServer {
     async fn job_history(
         ctx: RequestContext<Self::Context>,
         headers: Header<Authorization>,
-        params: QueryParams<PaginationParams<EmptyScanParams, JobId>>,
-    ) -> Result<HttpResponseOk<ResultsPage<JobStatus>>, HttpError> {
+    ) -> Result<HttpResponseOk<Vec<JobStatus>>, HttpError> {
         let mgr = ctx.context();
         let Authorization { authorization } = headers.into_inner();
         let authn = mgr.iam(authorization, None).await?;
-        let pag_params = params.into_inner();
-        let Some(limit) = NonZeroU32::new(ctx.page_limit(&pag_params)?.get()) else {
-            return Err(HttpError::for_client_error(
-                None,
-                ClientErrorStatusCode::BAD_REQUEST,
-                String::from("Page limit must be non-zero"),
-            ));
-        };
-
-        let list = match pag_params.page {
-            WhichPage::First(..) => mgr.job_history(&authn, None, limit).await?,
-            WhichPage::Next(job_id) => mgr.job_history(&authn, Some(job_id), limit).await?,
-        };
-
-        Ok(HttpResponseOk(ResultsPage::new(
-            list,
-            &EmptyScanParams {},
-            |job: &JobStatus, _| job.job_id().to_owned(),
-        )?))
+        Ok(HttpResponseOk(mgr.job_history(&authn).await?))
     }
 }
