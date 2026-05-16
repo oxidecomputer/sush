@@ -409,28 +409,31 @@ impl CommandContext for Cli {
             OutputFormat::Text => match status {
                 JobStatus::Unknown { job_id } => println!(
                     "✅ Job ID:\t{job_id}\n   \
-                     Status:\tUnknown"
+                     Job status:\tUnknown"
                 ),
                 JobStatus::Started {
+                    job,
                     session_id,
                     time_started,
                     stdout_len,
                     stderr_len,
                     ..
                 } => {
+                    let command = job.command();
                     let stdout_len = byte_size(*stdout_len);
                     let stderr_len = byte_size(*stderr_len);
                     println!(
                         "✅ Job ID:\t{job_id}\n   \
                          Session ID:\t{session_id}\n   \
-                         Status:\tStarted\n   \
+                         Job status:\tStarted\n   \
+                         Command:\t{command}\n   \
                          Started at:\t{time_started}\n   \
                          Stdout len:\t{stdout_len}\n   \
                          Stderr len:\t{stderr_len}"
                     )
                 }
                 JobStatus::Ended {
-                    job: _,
+                    job,
                     session_id,
                     time_started,
                     time_ended,
@@ -440,16 +443,18 @@ impl CommandContext for Cli {
                     stdout_hash,
                     stderr_hash,
                 } => {
+                    let command = job.command();
                     let duration = format_duration(status.time_elapsed().unwrap().to_std()?);
                     let stdout_len = byte_size(*stdout_len);
                     let stderr_len = byte_size(*stderr_len);
                     println!(
                         "✅ Job ID:\t{job_id}\n   \
                          Session ID:\t{session_id}\n   \
-                         Status:\tEnded\n   \
+                         Job status:\tEnded\n   \
+                         Command:\t{command}\n   \
                          Started at:\t{time_started}\n   \
                          Ended at:\t{time_ended} ({duration})\n   \
-                         Status:\t{exit_status}\n   \
+                         Exit status:\t{exit_status}\n   \
                          Stdout len:\t{stdout_len}\n   \
                          Stderr len:\t{stderr_len}\n   \
                          Stdout hash:\t{stdout_hash}\n   \
@@ -457,7 +462,7 @@ impl CommandContext for Cli {
                     );
                 }
                 JobStatus::Ended {
-                    job: _,
+                    job,
                     session_id,
                     time_started,
                     time_ended,
@@ -467,13 +472,15 @@ impl CommandContext for Cli {
                     stdout_hash,
                     stderr_hash,
                 } => {
+                    let command = job.command();
                     let duration = format_duration(status.time_elapsed().unwrap().to_std()?);
                     let stdout_len = byte_size(*stdout_len);
                     let stderr_len = byte_size(*stderr_len);
                     println!(
                         "✅ Job ID:\t{job_id}\n   \
                          Session ID:\t{session_id}\n   \
-                         Status:\tStopped\n   \
+                         Job status:\tStopped\n   \
+                         Command:\t{command}\n   \
                          Started at:\t{time_started}\n   \
                          Stopped at:\t{time_ended} ({duration})\n   \
                          Stdout len:\t{stdout_len}\n   \
