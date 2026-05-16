@@ -202,116 +202,102 @@ impl JobManager {
 
     // Identity management.
 
+    /// Authenticate and cache authorization credentials.
     pub async fn iam(
         &self,
         authorization: Option<String>,
         public_key: Option<SshPublicKey>,
     ) -> Result<Identity, JobError> {
-        let mut nonces = self.nonces.lock().unwrap();
-        let mut identities = self.identities.lock().unwrap();
+        // Ensure all authentication failures except revoked identities get
+        // a fresh nonce and a 401 Unauthorized response. What we actually
+        // want here is a generic closure, but Rust doesn't currently
+        // support those.
+        macro_rules! unauthorized {
+            ($error:expr) => {{
+                error!(self.log, "authentication failed"; "error" => %$error);
+                let nonce = Nonce::generate();
+                self.nonces.lock().unwrap().put(nonce.clone(), Utc::now());
+                return Err(JobError::unauthorized(nonce));
+            }};
+        }
 
-        // The client should (probably) not get detailed information back about
-        // authentication failures, but debugging is much easier if we log full
-        // errors here on the server.
+        // The client should (probably) not get detailed information back
+        // about authentication failures, but debugging is much easier if
+        // we log full errors here on the server.
         macro_rules! try_authn {
+            // $expr -> Result
             ($expr:expr) => {
                 match $expr {
-                    Ok(value) => Ok(value),
-                    Err(error) => {
-                        error!(self.log, "authentication failed"; "error" => %error);
-                        Err(error)
-                    }
+                    Ok(value) => value,
+                    Err(error) => unauthorized!(error),
                 }
             };
+            // $expr -> bool
             ($expr:expr, $error:expr) => {
-                $expr || {
-                    error!(self.log, "authentication failed"; "error" => $error);
-                    false
-                }
-            }
+                $expr || unauthorized!($error)
+            };
         }
 
-        // TODO: Simplify / refactor.
-        if let Some(authorization) = authorization
-            && let now = Utc::now()
-            && let Ok(credentials) = try_authn!(authorization.parse::<Credentials>())
-            && let Credentials {
-                key_id,
-                nonce,
-                cnonce: _,
-                signature: _,
-            } = credentials.clone()
-            && let Some((identity, credentials)) = match identities.get(&key_id) {
-                Some((
-                    Identity {
-                        time_revoked: Some(time_revoked),
-                        ..
-                    },
-                    _,
-                )) => {
-                    return try_authn!(Err(JobError::PublicKeyRevoked {
-                        key_id: key_id.to_owned(),
-                        time_revoked: time_revoked.to_owned(),
-                    }));
-                }
-                Some((
-                    identity @ Identity {
-                        nonce: n,
-                        time_revoked: None,
-                        ..
-                    },
-                    cached_creds,
-                )) if try_authn!(identity.is_still_valid(&now), "credentials expired")
-                    && try_authn!(*n == nonce, "invalid nonce")
-                    && try_authn!(*cached_creds == credentials, "credentials cache miss") =>
-                {
-                    assert_eq!(identity.key_id, key_id);
-                    Some((identity.to_owned(), cached_creds.to_owned()))
-                }
-                _ if try_authn!(
-                    nonces
-                        .pop(&nonce)
-                        .map(|t| Nonce::is_still_valid(&t, &now))
-                        .unwrap_or(false),
-                    "nonce expired"
-                ) && try_authn!(
-                    public_key.as_ref().and_then(|k| k.key_id().ok()) == Some(key_id.clone()),
-                    "invalid public key"
-                ) =>
-                {
-                    if identities.len() >= MAX_IDENTITIES {
-                        identities.retain(|_key_id, (identity, _credentials)| {
-                            identity.is_still_valid(&now)
-                        });
-                        if identities.len() >= MAX_IDENTITIES {
-                            return Err(JobError::TooManyIdentities(MAX_IDENTITIES));
-                        }
-                    }
+        let now = Utc::now();
+        let Some(authorization) = authorization else {
+            unauthorized!("missing authorization")
+        };
+        let credentials: Credentials = try_authn!(authorization.parse());
+        let Credentials {
+            key_id,
+            nonce,
+            cnonce,
+            signature,
+        } = credentials.clone();
 
-                    let public_key = public_key.expect("checked in guard");
-                    let response = credentials.clone().into_challenge_response();
-                    if let Ok(verified) =
-                        try_authn!(response.verify_with_ssh_public_key(&public_key))
-                    {
-                        Some((
-                            try_authn!(Identity::new(public_key.to_owned(), verified, now))?,
-                            credentials,
-                        ))
-                    } else {
-                        None
-                    }
-                }
-                _ => None,
-            }
+        if let Some((identity, cached_credentials)) =
+            self.identities.lock().unwrap().get(&key_id).cloned()
+            && try_authn!(identity.time_revoked.is_none(), "identity revoked")
+            && identity.is_still_valid(&now)
+            && identity.nonce == nonce
+            && cached_credentials.nonce == nonce
+            && cached_credentials.cnonce == cnonce
+            && cached_credentials.signature == signature
         {
-            identities.insert(key_id.to_owned(), (identity.clone(), credentials));
-            debug!(self.log, "authenticated credentials"; "key_id" => %key_id);
-            Ok(identity)
-        } else {
-            let nonce = Nonce::generate();
-            nonces.put(nonce.clone(), Utc::now());
-            Err(JobError::unauthorized(nonce))
+            debug!(self.log, "credentials cache hit"; "key_id" => %key_id);
+            return Ok(identity.to_owned());
         }
+
+        // Claim the nonce.
+        let _ = try_authn!(
+            self.nonces
+                .lock()
+                .unwrap()
+                .pop(&nonce)
+                .map(|t| Nonce::is_still_valid(&t, &now))
+                .unwrap_or(false),
+            "invalid nonce"
+        );
+
+        // Verify the supplied credentials.
+        let Some(public_key) = public_key else {
+            unauthorized!("missing public key");
+        };
+        if public_key.key_id().ok() != Some(key_id.clone()) {
+            unauthorized!("invalid key ID");
+        }
+        let response = credentials.clone().into_challenge_response();
+        let verified = try_authn!(response.verify_with_ssh_public_key(&public_key));
+        let identity = try_authn!(Identity::new(public_key.to_owned(), verified, now));
+
+        // Expire old identities as needed to make room.
+        let mut identities = self.identities.lock().unwrap();
+        if identities.len() >= MAX_IDENTITIES {
+            identities.retain(|_k, (identity, _c)| identity.is_still_valid(&now));
+            if identities.len() >= MAX_IDENTITIES {
+                return Err(JobError::TooManyIdentities(MAX_IDENTITIES));
+            }
+        }
+
+        // Authenticated!
+        identities.insert(key_id.to_owned(), (identity.clone(), credentials));
+        debug!(self.log, "authenticated credentials for new identity"; "key_id" => %key_id);
+        Ok(identity)
     }
 
     pub async fn identities(
@@ -1356,10 +1342,7 @@ mod test {
                 mgr.iam(Some(credentials.to_string()), None)
                     .await
                     .unwrap_err(),
-                JobError::PublicKeyRevoked {
-                    key_id: revoked_key_id,
-                    time_revoked,
-                } if revoked_key_id == key_id && time_revoked < Utc::now()
+                JobError::Unauthorized(_new_nonce),
             ),
             "should no longer be authorized"
         );
