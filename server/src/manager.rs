@@ -231,7 +231,7 @@ impl JobManager {
             };
         }
 
-        let now = Utc::now();
+        // Parse the supplied credentials.
         let Some(authorization) = authorization else {
             unauthorized!("missing authorization")
         };
@@ -243,6 +243,8 @@ impl JobManager {
             signature,
         } = credentials.clone();
 
+        // Check the cache.
+        let now = Utc::now();
         if let Some((identity, cached_credentials)) =
             self.identities.lock().unwrap().get(&key_id).cloned()
             && try_authn!(identity.time_revoked.is_none(), "identity revoked")
@@ -256,17 +258,6 @@ impl JobManager {
             return Ok(identity.to_owned());
         }
 
-        // Claim the nonce.
-        let _ = try_authn!(
-            self.nonces
-                .lock()
-                .unwrap()
-                .pop(&nonce)
-                .map(|t| Nonce::is_still_valid(&t, &now))
-                .unwrap_or(false),
-            "invalid or expired nonce"
-        );
-
         // Verify the supplied credentials.
         let Some(public_key) = public_key else {
             unauthorized!("missing public key");
@@ -278,7 +269,15 @@ impl JobManager {
         let verified = try_authn!(response.verify_with_ssh_public_key(&public_key));
         let identity = try_authn!(Identity::new(public_key.to_owned(), verified, now));
 
-        // Authenticated!
+        // Claim the nonce.
+        let Some(generated) = self.nonces.lock().unwrap().pop(&nonce) else {
+            unauthorized!("nonce not found");
+        };
+        if !Nonce::is_still_valid(&generated, &now) {
+            unauthorized!("nonce expired");
+        };
+
+        // Authenticated! Cache the credentials.
         debug!(self.log, "authenticated credentials for new identity"; "key_id" => %key_id);
         self.identities
             .lock()
