@@ -3433,11 +3433,34 @@ dependencies = [
  "ssh-key",
  "sush-api",
  "sush-common",
+ "sush-tests",
  "tempfile",
  "terminfo",
  "thiserror 1.0.69",
  "tokio",
  "tokio-tungstenite",
+ "x509-cert",
+]
+
+[[package]]
+name = "sush-tests"
+version = "0.1.0"
+dependencies = [
+ "chrono",
+ "dropshot",
+ "function_name",
+ "futures",
+ "http-range-header",
+ "pwd",
+ "rand_core 0.6.4",
+ "slog",
+ "slog-term",
+ "sush-api",
+ "sush-client",
+ "sush-common",
+ "sush-server",
+ "tempfile",
+ "tokio",
  "x509-cert",
 ]
 

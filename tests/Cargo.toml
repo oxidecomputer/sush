@@ -1,0 +1,24 @@
+[package]
+name = "sush-tests"
+description = "Oxide Support Shell Integration Tests"
+version = "0.1.0"
+edition = "2024"
+publish = false
+
+[dependencies]
+chrono.workspace = true
+dropshot.workspace = true
+function_name.workspace = true
+futures.workspace = true
+http-range-header.workspace = true
+pwd.workspace = true
+rand_core.workspace = true
+slog.workspace = true
+slog-term.workspace = true
+sush-api = { path = "../api" }
+sush-client = { path = "../client" }
+sush-common = { path = "../common" }
+sush-server = { path = "../server", features = ["import_root_for_test_only"] }
+tempfile.workspace = true
+tokio.workspace = true
+x509-cert.workspace = true
