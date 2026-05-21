@@ -19,6 +19,7 @@ use serde::{Deserialize, Serialize, Serializer};
 use thiserror::Error;
 
 use crate::codephrases::{WORD_SEPARATOR, generate_id, id_phrase};
+use crate::interactive::InteractiveSessionError;
 use crate::keys::{KeyId, Signed, ToBeSigned, Verified};
 
 /// A globally unique identifier for a job within a session.
@@ -260,6 +261,10 @@ pub enum JobStatus {
     },
 }
 
+/// What went wrong running a job's process or interactive session.
+///
+/// We currently squash inner errors into strings to avoid excessive
+/// derivation requirements, but may come to regret that decision.
 #[derive(
     BorshSerialize,
     BorshDeserialize,
@@ -277,6 +282,46 @@ pub enum ProcessError {
     Unstarted(String),
     #[error("process killed with signal {0}")]
     Killed(i32),
+    #[error("interactive session error: {0}")]
+    Interactive(String),
+    #[error("I/O error during {what}: {error}")]
+    Io { what: String, error: String },
+}
+
+/// What went wrong running a job, and when (informative).
+#[derive(Clone, Debug, Error)]
+#[error("{error}")]
+pub struct ExecutionError {
+    pub job_id: JobId,
+    pub time: DateTime<Utc>,
+    pub error: ProcessError,
+}
+
+impl ExecutionError {
+    pub fn interactive(job_id: JobId, error: InteractiveSessionError) -> Self {
+        let time = Utc::now();
+        Self {
+            job_id,
+            time,
+            error: ProcessError::Interactive(error.to_string()),
+        }
+    }
+
+    pub fn io(job_id: JobId, what: impl AsRef<str>, error: IoError) -> Self {
+        let time = Utc::now();
+        Self {
+            job_id,
+            time,
+            error: ProcessError::Io {
+                what: what.as_ref().to_owned(),
+                error: error.to_string(),
+            },
+        }
+    }
+
+    pub fn error(&self) -> ProcessError {
+        self.error.clone()
+    }
 }
 
 impl JobStatus {

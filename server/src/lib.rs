@@ -12,3 +12,7 @@ pub mod monitor;
 pub mod pty;
 pub mod server;
 pub mod state;
+
+pub use error::JobError;
+pub use manager::{JobManager, JobOutputState};
+pub use server::ApiServer;

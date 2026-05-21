@@ -3,11 +3,8 @@
 //! Executes, monitors, and halts jobs. Driven by the session state machine.
 
 use futures::Stream;
-use rumors::Rumors;
-use sled_hardware_types::BaseboardId;
 use sush_api::JobStartParams;
-use sush_common::authn::Identity;
-use sush_common::jobs::{JobId, JobOutputStream, JobStartRequest, JobStatus, SignedJob};
+use sush_common::jobs::{JobId, JobStartRequest};
 use tokio::sync::mpsc;
 use tokio_stream::wrappers::ReceiverStream;
 use tokio_util::sync::CancellationToken;
@@ -19,7 +16,7 @@ pub struct Executor {
 }
 
 impl Executor {
-    pub fn new(shutdown: CancellationToken) -> (Self, impl Stream<Item = Event> + Send + 'static) {
+    pub fn new(_shutdown: CancellationToken) -> (Self, impl Stream<Item = Event> + Send + 'static) {
         // This is an arbitrary choice; we expect to consume this very rapidly,
         // so should not experience backpressure; if we do, something is wrong.
         let (tx, rx) = mpsc::channel(16);

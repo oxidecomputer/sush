@@ -6,7 +6,6 @@ use std::path::PathBuf;
 use clap::Parser;
 use dropshot::{ConfigDropshot, ConfigLogging, ConfigLoggingLevel, HandlerTaskMode, ServerBuilder};
 
-use slog::error;
 use sush_api::sush_api_mod::api_description;
 use sush_server::manager::JobManager;
 use sush_server::server::ApiServer;
@@ -53,7 +52,7 @@ async fn main() -> Result<(), String> {
     .to_logger(ROOT_LOG_NAME)
     .map_err(|e| e.to_string())?;
 
-    let mgr = JobManager::new(log.clone(), listen_for_shutdown()?, &directory)
+    let mgr = JobManager::new(log.clone(), &directory, listen_for_shutdown()?)
         .await
         .map_err(|e| e.to_string())?;
 

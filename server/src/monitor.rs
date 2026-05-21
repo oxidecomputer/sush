@@ -21,10 +21,12 @@ use tokio::task::JoinSet;
 use tokio::{select, spawn};
 
 use sush_common::interactive::InteractiveSessionError;
-use sush_common::jobs::{JobId, JobOutputStream, JobStatus, ProcessError, SessionId, VerifiedJob};
+use sush_common::jobs::{
+    ExecutionError, JobId, JobOutputStream, JobStatus, ProcessError, SessionId, VerifiedJob,
+};
 use sush_common::keys::KeyId;
 
-use crate::error::{ExecutionError, JobError};
+use crate::error::JobError;
 use crate::interactive::{InteractiveSession, SocketSender};
 use crate::manager::{JobOutputState, job_output_path};
 use crate::pty::Pty;
@@ -35,7 +37,7 @@ use crate::pty::Pty;
 pub struct JobMonitor {
     log: Logger,
     output_dir: PathBuf,
-    tasks: JoinSet<Result<JobEnded, ExecutionError>>,
+    tasks: JoinSet<ExecutionResult>,
     sessions: BTreeMap<JobId, SocketSender>,
     shutdown: BTreeMap<JobId, Shutdown>,
     watchers: BTreeMap<JobId, Watcher>,
@@ -73,7 +75,7 @@ impl JobMonitor {
                                             if let Some(watcher) = $monitor.watchers.remove(&job_id) {
                                                 let _ = monitor.shutdown.remove(&job_id);
                                                 let _ = monitor.sessions.remove(&job_id);
-                                                let _ = watcher.send(Err(ExecutionError::new(job_id, err)));
+                                                let _ = watcher.send(Err(err));
                                             }
                                         }
                                     }
@@ -122,7 +124,11 @@ impl JobMonitor {
         (tx_req, rx_end)
     }
 
-    fn session(&mut self, job_id: &JobId, sender: SocketSenderSender) -> Result<(), JobError> {
+    fn session(
+        &mut self,
+        job_id: &JobId,
+        sender: SocketSenderSender,
+    ) -> Result<(), ExecutionError> {
         if let Some(session) = self.sessions.get(job_id) {
             info!(self.log, "started interactive session"; "job_id" => %job_id);
             let _ = sender.send(Ok(session.clone()));
@@ -130,7 +136,10 @@ impl JobMonitor {
         } else {
             error!(self.log, "failed to start session, job ended"; "job_id" => %job_id);
             let _ = sender.send(Err(InteractiveSessionError::JobEnded.into()));
-            Err(InteractiveSessionError::JobEnded.into())
+            Err(ExecutionError::interactive(
+                job_id.to_owned(),
+                InteractiveSessionError::JobEnded,
+            ))
         }
     }
 
@@ -144,12 +153,12 @@ impl JobMonitor {
             child,
             interactive,
         }: JobStarted,
-    ) -> Result<(), JobError> {
+    ) -> Result<(), ExecutionError> {
         let job_id = job.job_id().to_owned();
         let (session, shutdown) = if let Some(pty) = interactive {
             self.interactive_job(&job_id, pty, child)?
         } else {
-            self.batch_job(child)
+            self.batch_job(&job_id, child)
         };
         assert!(
             self.shutdown.insert(job_id.clone(), shutdown).is_none(),
@@ -157,8 +166,7 @@ impl JobMonitor {
         );
 
         self.tasks.spawn(async move {
-            let exe = |err| ExecutionError::new(job_id.clone(), err);
-            let status = session.await.map_err(exe)?;
+            let status = session.await?;
             let end = JobEnded {
                 job,
                 session_id,
@@ -173,16 +181,13 @@ impl JobMonitor {
         Ok(())
     }
 
-    fn stop_job(&mut self, log: &Logger, job_id: &JobId) -> Result<(), JobError> {
+    fn stop_job(&mut self, log: &Logger, job_id: &JobId) -> Result<(), ExecutionError> {
         if let Some(shutdown) = self.shutdown.remove(job_id)
             && let Ok(()) = shutdown.send(())
         {
             info!(log, "job stopped"; "job_id" => %job_id);
-            Ok(())
-        } else {
-            error!(log, "failed to stop job"; "job_id" => %job_id);
-            Err(JobError::Shutdown(job_id.to_owned()))
         }
+        Ok(())
     }
 
     fn interactive_job(
@@ -190,9 +195,11 @@ impl JobMonitor {
         job_id: &JobId,
         pty: Pty,
         child: Child,
-    ) -> Result<(PinnedSession, Shutdown), JobError> {
-        let path = job_output_path(&self.output_dir, job_id, JobOutputStream::Stdout);
-        let io_error = JobError::file_io_for(path.clone());
+    ) -> Result<(PinnedSession, Shutdown), ExecutionError> {
+        let job_id = job_id.to_owned();
+        let path = job_output_path(&self.output_dir, &job_id, JobOutputStream::Stdout);
+        let io_error =
+            |err| ExecutionError::io(job_id.clone(), path.display().to_string().as_str(), err);
         let output_file = OpenOptions::new()
             .read(true)
             .write(true)
@@ -204,22 +211,28 @@ impl JobMonitor {
         let (session, shutdown) = InteractiveSession::start(log, child, pty, output_file.into());
         assert!(
             self.sessions
-                .insert(job_id.to_owned(), session.clients())
+                .insert(job_id.clone(), session.clients())
                 .is_none(),
             "should not already have a session for a new job"
         );
-        let future = async { session.wait().await.map_err(|err| err.into()) };
+        let future = async move {
+            session
+                .wait()
+                .await
+                .map_err(|err| ExecutionError::interactive(job_id, err))
+        };
         Ok((future.boxed(), shutdown))
     }
 
-    fn batch_job(&mut self, mut child: Child) -> (PinnedSession, Shutdown) {
+    fn batch_job(&mut self, job_id: &JobId, mut child: Child) -> (PinnedSession, Shutdown) {
+        let job_id = job_id.to_owned();
         let (kill, die) = oneshot::channel();
         let future = async move {
             select! {
-                status = child.wait() => status.map_err(|err| JobError::io("wait", err)),
+                status = child.wait() => status.map_err(|err| ExecutionError::io(job_id.clone(), "wait", err)),
                 _ = die => {
-                    child.start_kill().map_err(|err| JobError::io("kill", err))?;
-                    child.wait().await.map_err(|err| JobError::io("wait", err))
+                    child.start_kill().map_err(|err| ExecutionError::io(job_id.clone(), "kill", err))?;
+                    child.wait().await.map_err(|err| ExecutionError::io(job_id.clone(), "wait", err))
                 }
             }
         };
@@ -228,7 +241,7 @@ impl JobMonitor {
 }
 
 /// A pinned interactive session.
-type PinnedSession = Pin<Box<dyn Future<Output = Result<ExitStatus, JobError>> + Send>>;
+type PinnedSession = Pin<Box<dyn Future<Output = Result<ExitStatus, ExecutionError>> + Send>>;
 
 /// An asynchronous kill signal, delivered by the `Stop` request.
 type Shutdown = oneshot::Sender<()>;
@@ -320,7 +333,7 @@ impl JobEnded {
         self.job.job_id()
     }
 
-    pub(crate) fn into_status(self, output: JobOutputState) -> JobStatus {
+    pub fn into_status(self, output: JobOutputState) -> JobStatus {
         let Self {
             job,
             session_id,

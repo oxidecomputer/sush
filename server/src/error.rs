@@ -1,7 +1,6 @@
 //! Job server errors.
 
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
 
 use chrono::{DateTime, Utc};
 use dropshot::{ClientErrorStatusCode, HttpError};
@@ -9,7 +8,7 @@ use thiserror::Error;
 
 use sush_common::authn::{Challenge, Nonce};
 use sush_common::interactive::InteractiveSessionError;
-use sush_common::jobs::{JobId, JobOutputHash, SessionId};
+use sush_common::jobs::{ExecutionError, JobId, JobOutputHash, SessionId};
 use sush_common::keys::{KeyError, KeyId};
 
 /// What went wrong processing a client job request.
@@ -21,7 +20,7 @@ pub enum JobError {
     ChannelClosed,
     #[error("DER encoding error: {0}")]
     Der(#[from] x509_cert::der::Error),
-    #[error(transparent)]
+    #[error("Execution error: {0}")]
     Execution(#[from] ExecutionError),
     #[error("File I/O error accessing `{path}`: {error}")]
     FileIo {
@@ -48,8 +47,6 @@ pub enum JobError {
     Json(#[from] serde_json::Error),
     #[error("Key error: {0}")]
     Key(#[from] KeyError),
-    #[error("Can't kill job `{0}`")]
-    Shutdown(JobId),
     #[error("Can't find certificate for key `{0}`")]
     MissingCert(KeyId),
     #[error("Only one session may be running at a time")]
@@ -139,7 +136,6 @@ impl From<JobError> for HttpError {
             | PublicKeyNotFound(_)
             | PublicKeyMismatch(_)
             | Recv(_)
-            | Shutdown(_)
             | Task(_)
             | Slice(_)
             | Wait => HttpError::for_internal_error(message),
@@ -192,26 +188,6 @@ impl From<JobError> for HttpError {
             | TooManyRevocations(_) => {
                 HttpError::for_client_error(None, ClientErrorStatusCode::BAD_REQUEST, message)
             }
-        }
-    }
-}
-
-/// What went wrong acutally running a job.
-#[derive(Clone, Debug, Error)]
-#[error("{error}")]
-pub struct ExecutionError {
-    pub job_id: JobId,
-    pub time: DateTime<Utc>,
-    pub error: Arc<JobError>,
-}
-
-impl ExecutionError {
-    pub fn new(job_id: JobId, error: JobError) -> Self {
-        let time = Utc::now();
-        Self {
-            job_id,
-            time,
-            error: Arc::new(error),
         }
     }
 }

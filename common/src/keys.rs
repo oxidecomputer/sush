@@ -458,7 +458,7 @@ impl TryFrom<SshSignature> for Signature {
 /// Produce a verifiable signature.
 #[allow(async_fn_in_trait)]
 pub trait Signer {
-    type Error: std::fmt::Display;
+    type Error: std::fmt::Debug + std::fmt::Display;
 
     async fn sign<T: ToBeSigned>(&mut self, thing: T) -> Result<Signed<T>, Self::Error>;
 }

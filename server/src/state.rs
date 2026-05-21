@@ -21,7 +21,7 @@ use tokio_util::sync::CancellationToken;
 
 use crate::executor::Executor;
 use crate::messages::{
-    Error, Event, JobEvent, JobRequest, Message, Request, RequestId, SessionRequest,
+    Error, Event, JobEvent, JobRequest, Message, Request, SessionRequest,
 };
 
 #[derive(Clone, Debug)]
@@ -249,9 +249,9 @@ impl State {
                         // TODO: evict old entries when crossing MAX_HISTORY
                         // TODO: track the job status
                     }
-                    JobEvent::JobError(process_error) => todo!(),
+                    JobEvent::JobError(_process_error) => todo!(),
                 },
-                Event::Error(error) => todo!(),
+                Event::Error(_error) => todo!(),
             },
         }
 

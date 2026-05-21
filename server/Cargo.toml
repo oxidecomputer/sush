@@ -9,6 +9,9 @@ publish = false
 name = "sush-server"
 path = "src/main.rs"
 
+[features]
+import_root_for_test_only = []
+
 [dependencies]
 blake3.workspace = true
 borsh.workspace = true
@@ -51,3 +54,4 @@ x509-cert.workspace = true
 
 [dev-dependencies]
 function_name.workspace = true
+sush-tests = { path = "../tests" }
