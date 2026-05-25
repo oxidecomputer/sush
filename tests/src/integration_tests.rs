@@ -3,22 +3,21 @@
 use dropshot::{ConfigDropshot, ServerBuilder};
 use function_name::named;
 use futures::StreamExt as _;
-use slog::{Discard, Logger, o};
 use tokio::test;
 
 use sush_api::sush_api_mod::api_description;
 use sush_client::{Client, Error as ClientError};
 use sush_common::jobs::{JobLimits, JobOutputStream, JobStatus};
-use sush_server::ApiServer;
+use sush_server::{ApiServer, ProxyServer};
 
-use crate::test_utils::{SignJobRequest as _, authz, manager_and_test_root};
+use crate::test_utils::{SignJobRequest as _, authz, manager_and_test_root, test_logger};
 
 #[named]
 #[test]
 async fn client_server() {
     // Spin up a server.
-    let log = Logger::root(Discard, o!("test" => function_name!()));
-    let (mgr, mut root, _dir) = manager_and_test_root(function_name!()).await;
+    let log = test_logger(function_name!());
+    let (mgr, mut root, _dir) = manager_and_test_root(log.clone()).await;
     let api = api_description::<ApiServer>().unwrap();
     let server = ServerBuilder::new(api, mgr, log)
         .config(ConfigDropshot::default())
@@ -98,4 +97,47 @@ async fn client_server() {
         output.next().await.unwrap().unwrap(),
         job_id.to_string().as_bytes()
     );
+}
+
+#[named]
+#[test]
+async fn client_proxy_server() {
+    // Spin up a full server.
+    let log = test_logger(function_name!());
+    let (mgr, mut root, _dir) = manager_and_test_root(log.clone()).await;
+    let api = api_description::<ApiServer>().unwrap();
+    let server = ServerBuilder::new(api, mgr, log.clone())
+        .config(ConfigDropshot::default())
+        .start()
+        .expect("failed to start server");
+    let server_addr = server.local_addr();
+
+    // Spin up a proxy server.
+    let proxy = ProxyServer::start(
+        &log,
+        "127.0.0.1:0".parse().expect("can't parse local address"),
+        server.local_addr(),
+    )
+    .await
+    .expect("can't start proxy server");
+    let proxy_addr = proxy.local_addr();
+    assert_ne!(server_addr, proxy_addr);
+
+    // Connect and authenticate to the server via the proxy.
+    let client = Client::new(&format!("http://{proxy_addr}"));
+    let ClientError::ErrorResponse(unauthz) = client.iam().body(None).send().await.unwrap_err()
+    else {
+        panic!("expected error response")
+    };
+    assert_eq!(unauthz.status(), 401, "expected 401 Unauthorized");
+    let (identity, credentials) = authz(&client, unauthz, &mut root).await;
+    let iam = client
+        .iam()
+        .authorization(credentials.to_string())
+        .body(None)
+        .send()
+        .await
+        .unwrap()
+        .into_inner();
+    assert_eq!(iam, identity, "who am I?");
 }

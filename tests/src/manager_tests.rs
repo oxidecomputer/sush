@@ -19,7 +19,7 @@ use sush_common::keys::{EphemeralKey, KeyError, KeyType, Signer as _};
 use sush_server::{JobError, JobManager};
 
 use crate::test_utils::{
-    SignJobRequest as _, ephemeral_test_subject, fake_identity, manager_and_test_root,
+    SignJobRequest as _, ephemeral_test_subject, fake_identity, manager_and_test_root, test_logger,
 };
 
 fn check_status_started(
@@ -93,7 +93,8 @@ async fn job_error(authn: &Identity, mgr: &JobManager, job: SignedJob) -> JobErr
 #[named]
 #[tokio::test]
 async fn jobs() {
-    let (mgr, mut root, _dir) = manager_and_test_root(function_name!()).await;
+    let log = test_logger(function_name!());
+    let (mgr, mut root, _dir) = manager_and_test_root(log).await;
     let authn = fake_identity(&mut root).await;
     let session_id = mgr.session_start(&authn).await.unwrap();
     let job_id = session_id.first_job_id();
@@ -196,7 +197,8 @@ async fn jobs() {
 #[named]
 #[tokio::test]
 async fn abort() {
-    let (mgr, mut root, _dir) = manager_and_test_root(function_name!()).await;
+    let log = test_logger(function_name!());
+    let (mgr, mut root, _dir) = manager_and_test_root(log).await;
     let authn = fake_identity(&mut root).await;
     let session_id = mgr.session_start(&authn).await.unwrap();
     let job_id = session_id.first_job_id();
@@ -292,7 +294,8 @@ async fn cert_chain() {
 #[named]
 #[tokio::test]
 async fn too_much_cpu() {
-    let (mgr, mut root, _dir) = manager_and_test_root(function_name!()).await;
+    let log = test_logger(function_name!());
+    let (mgr, mut root, _dir) = manager_and_test_root(log).await;
     let authn = fake_identity(&mut root).await;
     let session_id = mgr.session_start(&authn).await.unwrap();
     let job_id = session_id.first_job_id();
@@ -341,7 +344,8 @@ async fn too_much_cpu() {
 #[named]
 #[tokio::test]
 async fn output_ranges() {
-    let (mgr, mut root, _dir) = manager_and_test_root(function_name!()).await;
+    let log = test_logger(function_name!());
+    let (mgr, mut root, _dir) = manager_and_test_root(log).await;
     let authn = fake_identity(&mut root).await;
     let session_id = mgr.session_start(&authn).await.unwrap();
     let job_id = session_id.first_job_id();
@@ -459,7 +463,8 @@ async fn output_ranges() {
 #[named]
 #[tokio::test]
 async fn iam() {
-    let (mgr, mut root, _dir) = manager_and_test_root(function_name!()).await;
+    let log = test_logger(function_name!());
+    let (mgr, mut root, _dir) = manager_and_test_root(log).await;
     let JobError::Unauthorized(nonce) = mgr.iam(None, None).await.unwrap_err() else {
         panic!("should not be authorized yet");
     };
