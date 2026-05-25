@@ -64,6 +64,12 @@ pub fn ephemeral_test_root() -> EphemeralKey {
     .unwrap()
 }
 
+pub fn test_logger(test_name: &'static str) -> Logger {
+    let decorator = PlainSyncDecorator::new(TestStdoutWriter);
+    let drain = FullFormat::new(decorator).build().fuse();
+    Logger::root(drain, o!("test" => test_name))
+}
+
 pub async fn fake_identity(key: &mut EphemeralKey) -> Identity {
     let nonce = Nonce::generate();
     let challenge = Challenge::new(nonce.clone());
@@ -73,11 +79,8 @@ pub async fn fake_identity(key: &mut EphemeralKey) -> Identity {
     Identity::new(key.ssh_public_key(), verified, Utc::now()).unwrap()
 }
 
-pub async fn manager_and_test_root(test_name: &'static str) -> (JobManager, EphemeralKey, TempDir) {
-    let decorator = PlainSyncDecorator::new(TestStdoutWriter);
-    let drain = FullFormat::new(decorator).build().fuse();
+pub async fn manager_and_test_root(log: Logger) -> (JobManager, EphemeralKey, TempDir) {
     let dir = TempDir::with_prefix("sush-").unwrap();
-    let log = Logger::root(drain, o!("test" => test_name));
     let shutdown = CancellationToken::new();
     let mgr = JobManager::new(log, dir.path(), shutdown).await.unwrap();
     let root = ephemeral_test_root();

@@ -9,10 +9,12 @@ pub mod interactive;
 pub mod manager;
 pub mod messages;
 pub mod monitor;
+pub mod proxy;
 pub mod pty;
 pub mod server;
 pub mod state;
 
 pub use error::JobError;
 pub use manager::{JobManager, JobOutputState};
+pub use proxy::ProxyServer;
 pub use server::ApiServer;
