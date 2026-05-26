@@ -20,7 +20,7 @@ use lru::LruCache;
 use pwd::Passwd;
 use rustix::io::close;
 use rustix::process::{ioctl_tiocsctty, setsid};
-use slog::{Logger, debug, error, info, o};
+use slog::{Logger, debug, error, info, o, warn};
 use terminfo::Database as Terminfo;
 use tokio::process::Command;
 use tokio::spawn;
@@ -226,7 +226,7 @@ impl JobManager {
         // 401 Unauthorized response with a fresh nonce.
         macro_rules! unauthorized {
             ($error:expr) => {{
-                error!(self.log, "authentication failed"; "error" => %$error);
+                warn!(self.log, "authentication failed"; "error" => %$error);
                 let nonce = Nonce::generate();
                 self.nonces.lock().unwrap().put(nonce.clone(), Utc::now());
                 return Err(JobError::unauthorized(nonce));
@@ -265,7 +265,6 @@ impl JobManager {
         identities.retain(|_k, (i, _c)| i.is_still_valid(&now) || i.time_revoked.is_some());
         if let Some((identity, cached_credentials)) = identities.get(&key_id).cloned()
             && try_authn!(identity.time_revoked.is_none(), "identity revoked")
-            && identity.nonce == nonce
             && cached_credentials.nonce == nonce
             && cached_credentials.cnonce == cnonce
             && cached_credentials.signature == signature
