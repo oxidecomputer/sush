@@ -3,6 +3,7 @@
 //! Jobs are spawned onto new tokio tasks and passed to the monitor to wait
 //! for completion. Standard output and standard error are saved in files.
 
+use std::collections::BTreeMap;
 use std::fs::{DirBuilder, File, OpenOptions};
 use std::io::{Read as _, Seek as _, SeekFrom};
 use std::num::NonZeroUsize;
@@ -54,13 +55,16 @@ const MAX_CERT_CHAIN_LEN: usize = 10;
 
 /// Maximum number of job signing certificates.
 /// The ideal number of certs is 1, so this need not be large.
-const MAX_CERTS: NonZeroUsize = NonZeroUsize::new(100).unwrap();
+const MAX_CERTS: usize = 100;
 
-/// Maximum number of identities.
-const MAX_IDENTITIES: NonZeroUsize = NonZeroUsize::new(1_000).unwrap();
+/// Maximum number of cached/revoked identities.
+const MAX_IDENTITIES: usize = 1_000;
 
-/// Maximum number of job entries to hold in memory.
-const MAX_JOBS: NonZeroUsize = NonZeroUsize::new(10_000).unwrap();
+/// Maximum number of active jobs in a session.
+const MAX_ACTIVE_JOBS: usize = 1_000;
+
+/// Maximum number of job status entries to hold as history.
+const MAX_JOB_HISTORY: NonZeroUsize = NonZeroUsize::new(10_000).unwrap();
 
 /// Maximum number of outstanding authentication nonces.
 /// We do not really expect more than one simultaneous user,
@@ -78,29 +82,37 @@ type SessionGuard<'a> = MutexGuard<'a, Option<Session>>;
 pub struct JobManager {
     log: Logger,
     nonces: Arc<Mutex<LruCache<Nonce, DateTime<Utc>>>>,
-    identities: Arc<Mutex<LruCache<KeyId, (Identity, Credentials)>>>,
-    certs: Arc<Mutex<LruCache<KeyId, Certificate>>>,
+    identities: Arc<Mutex<BTreeMap<KeyId, (Identity, Credentials)>>>,
+    certs: Arc<Mutex<BTreeMap<KeyId, Certificate>>>,
     session: Arc<Mutex<Option<Session>>>,
-    jobs: Arc<Mutex<LruCache<JobId, JobStatus>>>,
+    active_jobs: Arc<Mutex<BTreeMap<JobId, JobStatus>>>,
+    job_history: Arc<Mutex<LruCache<JobId, JobStatus>>>,
     output_dir: PathBuf,
     tx_monitor: mpsc::Sender<MonitorRequest>,
 }
 
 impl JobManager {
     pub async fn new(log: Logger, output_dir: &Path) -> Result<Self, JobError> {
-        // The jobs table is shared between the manager and the monitor.
-        let jobs = Arc::new(Mutex::new(LruCache::new(MAX_JOBS)));
+        // Construct the job tables.
+        let active_jobs = Arc::new(Mutex::new(BTreeMap::new()));
+        let job_history = Arc::new(Mutex::new(LruCache::new(MAX_JOB_HISTORY)));
 
         // Start the monitor and listen for job-end events.
         let (tx_monitor, mut rx_monitor) =
             JobMonitor::start(log.new(o!("component" => "monitor")), output_dir.to_owned());
         spawn({
-            let jobs = jobs.clone();
+            let active_jobs = active_jobs.clone();
+            let job_history = job_history.clone();
             let output_dir = output_dir.to_owned();
             let log = log.new(o!("component" => "monitor loop"));
             async move {
                 while let Some(end) = rx_monitor.recv().await {
-                    if let Err(err) = job_ended(&mut jobs.lock().unwrap(), &output_dir, end) {
+                    if let Err(err) = job_ended(
+                        &mut active_jobs.lock().unwrap(),
+                        &mut job_history.lock().unwrap(),
+                        &output_dir,
+                        end,
+                    ) {
                         error!(log, "failed to record job end"; "err" => %err);
                     }
                 }
@@ -112,10 +124,11 @@ impl JobManager {
         let new = Self {
             log: log.new(o!("component" => "manager")),
             nonces: Arc::new(Mutex::new(LruCache::new(MAX_OUTSTANDING_NONCES))),
-            identities: Arc::new(Mutex::new(LruCache::new(MAX_IDENTITIES))),
-            certs: Arc::new(Mutex::new(LruCache::new(MAX_CERTS))),
+            identities: Arc::new(Mutex::new(BTreeMap::new())),
+            certs: Arc::new(Mutex::new(BTreeMap::new())),
             session: Arc::new(Mutex::new(None)),
-            jobs,
+            active_jobs,
+            job_history,
             output_dir: output_dir.to_owned(),
             tx_monitor,
         };
@@ -166,7 +179,10 @@ impl JobManager {
 
         // Import the certificate.
         let key_id = KeyId::try_from(subject)?;
-        certs.put(key_id.clone(), cert);
+        if certs.len() >= MAX_CERTS && !certs.contains_key(&key_id) {
+            return Err(JobError::TooManyCerts(MAX_CERTS));
+        }
+        certs.insert(key_id.clone(), cert);
         info!(self.log, "imported certificate"; "key_id" => %key_id, "root" => root);
         Ok(key_id)
     }
@@ -177,7 +193,7 @@ impl JobManager {
         _authn: &Identity,
         key_id: &KeyId,
     ) -> Result<Vec<Certificate>, JobError> {
-        let mut certs = self.certs.lock().unwrap();
+        let certs = self.certs.lock().unwrap();
         let mut chain = Vec::new();
         let mut key_id = key_id.to_owned();
         loop {
@@ -244,11 +260,11 @@ impl JobManager {
         } = credentials.clone();
 
         // Check the cache.
+        let mut identities = self.identities.lock().unwrap();
         let now = Utc::now();
-        if let Some((identity, cached_credentials)) =
-            self.identities.lock().unwrap().get(&key_id).cloned()
+        identities.retain(|_k, (i, _c)| i.is_still_valid(&now) || i.time_revoked.is_some());
+        if let Some((identity, cached_credentials)) = identities.get(&key_id).cloned()
             && try_authn!(identity.time_revoked.is_none(), "identity revoked")
-            && identity.is_still_valid(&now)
             && identity.nonce == nonce
             && cached_credentials.nonce == nonce
             && cached_credentials.cnonce == cnonce
@@ -277,12 +293,12 @@ impl JobManager {
             unauthorized!("nonce expired");
         };
 
-        // Authenticated! Cache the credentials.
+        // Authenticated! Try to cache the credentials.
         debug!(self.log, "authenticated credentials for new identity"; "key_id" => %key_id);
-        self.identities
-            .lock()
-            .unwrap()
-            .put(key_id.to_owned(), (identity.clone(), credentials));
+        if identities.len() >= MAX_IDENTITIES {
+            return Err(JobError::TooManyIdentities(MAX_IDENTITIES));
+        }
+        identities.insert(key_id.to_owned(), (identity.clone(), credentials));
         Ok(identity)
     }
 
@@ -297,10 +313,11 @@ impl JobManager {
     }
 
     pub async fn revoke_identity(&self, _authn: &Identity, key_id: KeyId) -> Result<(), JobError> {
+        let time_revoked = Utc::now();
         if let Some((identity, _credentials)) = self.identities.lock().unwrap().get_mut(&key_id) {
-            identity.time_revoked = Some(Utc::now());
+            identity.time_revoked = Some(time_revoked);
         } else {
-            return Err(JobError::PublicKeyNotFound(key_id));
+            return Err(JobError::IdentityNotFound(key_id));
         }
         // for job_id in todo!("get interactive sessions") {
         //     self.monitor(MonitorRequest::Stop(job_id)).await?;
@@ -354,7 +371,7 @@ impl JobManager {
 
     pub async fn job_history(&self, _authn: &Identity) -> Result<Vec<JobStatus>, JobError> {
         Ok(self
-            .jobs
+            .job_history
             .lock()
             .unwrap()
             .iter()
@@ -376,9 +393,17 @@ impl JobManager {
             };
 
             let job_id = job.job_id().to_owned();
-            self.with_jobs(&mut session_guard, |jobs| {
-                if jobs.contains(&job_id) {
+            self.with_jobs(&mut session_guard, |active_jobs, job_history| {
+                if active_jobs.contains_key(&job_id) || job_history.contains(&job_id) {
                     return Err(JobError::InvalidJobId(job_id.to_owned()));
+                }
+                if active_jobs
+                    .iter()
+                    .filter(|(_id, status)| status.is_active())
+                    .count()
+                    >= MAX_ACTIVE_JOBS
+                {
+                    return Err(JobError::TooManyJobs(MAX_ACTIVE_JOBS));
                 }
                 Ok(())
             })?;
@@ -406,8 +431,8 @@ impl JobManager {
                 session.session_id(),
                 params,
             )?;
-            self.with_jobs(&mut session_guard, |jobs| {
-                jobs.put(job_id, JobStatus::from(&started));
+            self.with_jobs(&mut session_guard, |active_jobs, _history| {
+                active_jobs.insert(job_id, JobStatus::from(&started));
                 Ok(())
             })?;
 
@@ -466,10 +491,11 @@ impl JobManager {
         session_guard: &mut SessionGuard,
         job_id: &JobId,
     ) -> Result<JobStatus, JobError> {
-        self.with_jobs(session_guard, |jobs| {
-            Ok(jobs
+        self.with_jobs(session_guard, |active_jobs, job_history| {
+            Ok(active_jobs
                 .get(job_id)
                 .cloned()
+                .or_else(|| job_history.get(job_id).cloned())
                 .unwrap_or_else(|| JobStatus::Unknown {
                     job_id: job_id.to_owned(),
                 }))
@@ -477,13 +503,19 @@ impl JobManager {
     }
 
     /// The `_session_guard` argument ensures that the session is locked
-    /// before we take the job table lock.
+    /// before we take the job table locks.
     fn with_jobs<T>(
         &self,
         _session_guard: &mut SessionGuard,
-        f: impl FnOnce(&mut LruCache<JobId, JobStatus>) -> Result<T, JobError>,
+        f: impl FnOnce(
+            &mut BTreeMap<JobId, JobStatus>,
+            &mut LruCache<JobId, JobStatus>,
+        ) -> Result<T, JobError>,
     ) -> Result<T, JobError> {
-        f(&mut self.jobs.lock().unwrap())
+        f(
+            &mut self.active_jobs.lock().unwrap(),
+            &mut self.job_history.lock().unwrap(),
+        )
     }
 
     pub async fn job_stop(&self, authn: &Identity, job_id: &JobId) -> Result<(), JobError> {
@@ -550,7 +582,8 @@ pub fn job_output_hash(
 }
 
 fn job_ended(
-    jobs: &mut LruCache<JobId, JobStatus>,
+    active_jobs: &mut BTreeMap<JobId, JobStatus>,
+    job_history: &mut LruCache<JobId, JobStatus>,
     output_dir: &Path,
     result: ExecutionResult,
 ) -> Result<(), JobError> {
@@ -565,12 +598,11 @@ fn job_ended(
                 session_id,
                 time_started,
                 ..
-            } = jobs
-                .get(&job_id)
-                .cloned()
+            } = active_jobs
+                .remove(&job_id)
                 .ok_or_else(|| JobError::InvalidJobId(job_id.to_owned()))?
             {
-                jobs.put(
+                job_history.put(
                     job_id.to_owned(),
                     JobStatus::Ended {
                         job,
@@ -590,7 +622,8 @@ fn job_ended(
             }
         }
         Ok(ended) => {
-            jobs.put(ended.job_id().to_owned(), ended.into());
+            active_jobs.remove(ended.job_id());
+            job_history.put(ended.job_id().to_owned(), ended.into());
             Ok(())
         }
     }

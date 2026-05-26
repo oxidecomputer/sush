@@ -269,6 +269,10 @@ impl JobStatus {
             Self::Started { job, .. } | Self::Ended { job, .. } => job.job_id(),
         }
     }
+
+    pub fn is_active(&self) -> bool {
+        matches!(self, Self::Started { .. })
+    }
 }
 
 /// BLAKE3 hash of job output, used as a checksum.

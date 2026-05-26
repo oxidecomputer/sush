@@ -28,6 +28,8 @@ pub enum JobError {
         path: PathBuf,
         error: std::io::Error,
     },
+    #[error("Identity not found")]
+    IdentityNotFound(KeyId),
     #[error("Interactive session error: {0}")]
     InteractiveSession(#[from] InteractiveSessionError),
     #[error("Invalid command `{0}`, must not start with `-`")]
@@ -77,11 +79,11 @@ pub enum JobError {
     Slice(#[from] std::array::TryFromSliceError),
     #[error(transparent)]
     Task(#[from] tokio::task::JoinError),
-    #[error("Too many certificates")]
+    #[error("Too many certificates ({0})")]
     TooManyCerts(usize),
-    #[error("Too many identities")]
+    #[error("Too many identities ({0}), try waiting for some to expire")]
     TooManyIdentities(usize),
-    #[error("Too many jobs in a session: {0}")]
+    #[error("Too many jobs in a session ({0}), try waiting for some to finish")]
     TooManyJobs(usize),
     #[error("Unauthorized request")]
     Unauthorized(Nonce),
@@ -169,7 +171,8 @@ impl From<JobError> for HttpError {
                     .expect("should be able to add WWW-Authenticate header");
                 err
             }
-            InvalidCommand(_)
+            IdentityNotFound(_)
+            | InvalidCommand(_)
             | InvalidJobId(_)
             | JobNotFound(_)
             | Json(_)
