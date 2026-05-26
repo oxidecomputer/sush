@@ -243,11 +243,11 @@ pub enum JobStatus {
 }
 
 impl JobStatus {
-    pub fn session_id(&self) -> Option<SessionId> {
+    pub fn session_id(&self) -> Option<&SessionId> {
         match self {
             Self::Unknown { .. } => None,
-            Self::Started { session_id, .. } => Some(session_id.to_owned()),
-            Self::Ended { session_id, .. } => Some(session_id.to_owned()),
+            Self::Started { session_id, .. } => Some(session_id),
+            Self::Ended { session_id, .. } => Some(session_id),
         }
     }
 

@@ -81,10 +81,10 @@ pub enum JobError {
     Task(#[from] tokio::task::JoinError),
     #[error("Too many certificates ({0})")]
     TooManyCerts(usize),
-    #[error("Too many identities ({0}), try waiting for some to expire")]
-    TooManyIdentities(usize),
     #[error("Too many jobs in a session ({0}), try waiting for some to finish")]
     TooManyJobs(usize),
+    #[error("Too many identities revoked ({0})")]
+    TooManyRevocations(usize),
     #[error("Unauthorized request")]
     Unauthorized(Nonce),
     #[error("Unable to wait for job end")]
@@ -185,8 +185,8 @@ impl From<JobError> for HttpError {
             | SessionWrongIdentity
             | OutputPending
             | TooManyCerts(_)
-            | TooManyIdentities(_)
-            | TooManyJobs(_) => {
+            | TooManyJobs(_)
+            | TooManyRevocations(_) => {
                 HttpError::for_client_error(None, ClientErrorStatusCode::BAD_REQUEST, message)
             }
         }

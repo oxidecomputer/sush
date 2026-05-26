@@ -57,8 +57,11 @@ const MAX_CERT_CHAIN_LEN: usize = 10;
 /// The ideal number of certs is 1, so this need not be large.
 const MAX_CERTS: usize = 100;
 
-/// Maximum number of cached/revoked identities.
-const MAX_IDENTITIES: usize = 1_000;
+/// Maximum number of cached identities.
+const MAX_CACHED_IDENTITIES: NonZeroUsize = NonZeroUsize::new(1_000).unwrap();
+
+/// Maximum number of revoked identities.
+const MAX_REVOKED_IDENTITIES: usize = 1_000;
 
 /// Maximum number of active jobs in a session.
 const MAX_ACTIVE_JOBS: usize = 1_000;
@@ -82,7 +85,8 @@ type SessionGuard<'a> = MutexGuard<'a, Option<Session>>;
 pub struct JobManager {
     log: Logger,
     nonces: Arc<Mutex<LruCache<Nonce, DateTime<Utc>>>>,
-    identities: Arc<Mutex<BTreeMap<KeyId, (Identity, Credentials)>>>,
+    identities: Arc<Mutex<LruCache<KeyId, (Identity, Credentials)>>>,
+    revoked_identities: Arc<Mutex<BTreeMap<KeyId, DateTime<Utc>>>>,
     certs: Arc<Mutex<BTreeMap<KeyId, Certificate>>>,
     session: Arc<Mutex<Option<Session>>>,
     active_jobs: Arc<Mutex<BTreeMap<JobId, JobStatus>>>,
@@ -124,7 +128,8 @@ impl JobManager {
         let new = Self {
             log: log.new(o!("component" => "manager")),
             nonces: Arc::new(Mutex::new(LruCache::new(MAX_OUTSTANDING_NONCES))),
-            identities: Arc::new(Mutex::new(BTreeMap::new())),
+            identities: Arc::new(Mutex::new(LruCache::new(MAX_CACHED_IDENTITIES))),
+            revoked_identities: Arc::new(Mutex::new(BTreeMap::new())),
             certs: Arc::new(Mutex::new(BTreeMap::new())),
             session: Arc::new(Mutex::new(None)),
             active_jobs,
@@ -259,11 +264,21 @@ impl JobManager {
             signature,
         } = credentials.clone();
 
+        // Check for a revoked identity.
+        if self
+            .revoked_identities
+            .lock()
+            .unwrap()
+            .contains_key(&key_id)
+        {
+            unauthorized!("identity revoked");
+        }
+
         // Check the cache.
         let mut identities = self.identities.lock().unwrap();
         let now = Utc::now();
-        identities.retain(|_k, (i, _c)| i.is_still_valid(&now) || i.time_revoked.is_some());
         if let Some((identity, cached_credentials)) = identities.get(&key_id).cloned()
+            && try_authn!(identity.is_still_valid(&now), "identity expired")
             && try_authn!(identity.time_revoked.is_none(), "identity revoked")
             && cached_credentials.nonce == nonce
             && cached_credentials.cnonce == cnonce
@@ -294,10 +309,7 @@ impl JobManager {
 
         // Authenticated! Try to cache the credentials.
         debug!(self.log, "authenticated credentials for new identity"; "key_id" => %key_id);
-        if identities.len() >= MAX_IDENTITIES {
-            return Err(JobError::TooManyIdentities(MAX_IDENTITIES));
-        }
-        identities.insert(key_id.to_owned(), (identity.clone(), credentials));
+        identities.put(key_id.to_owned(), (identity.clone(), credentials));
         Ok(identity)
     }
 
@@ -312,15 +324,30 @@ impl JobManager {
     }
 
     pub async fn revoke_identity(&self, _authn: &Identity, key_id: KeyId) -> Result<(), JobError> {
-        let time_revoked = Utc::now();
-        if let Some((identity, _credentials)) = self.identities.lock().unwrap().get_mut(&key_id) {
-            identity.time_revoked = Some(time_revoked);
-        } else {
-            return Err(JobError::IdentityNotFound(key_id));
+        {
+            let mut revoked = self.revoked_identities.lock().unwrap();
+            if revoked.len() >= MAX_REVOKED_IDENTITIES {
+                return Err(JobError::TooManyRevocations(MAX_REVOKED_IDENTITIES));
+            }
+
+            let time_revoked = Utc::now();
+            revoked.insert(key_id.clone(), time_revoked);
+
+            let mut cached = self.identities.lock().unwrap();
+            if let Some((identity, _credentials)) = cached.get_mut(&key_id) {
+                identity.time_revoked = Some(time_revoked);
+            }
         }
-        // for job_id in todo!("get interactive sessions") {
-        //     self.monitor(MonitorRequest::Stop(job_id)).await?;
-        // }
+
+        if let Some(session) = {
+            self.session
+                .lock()
+                .unwrap()
+                .take_if(|session| session.key_id() == Some(&key_id))
+        } {
+            self.session_stop_inner(session).await?;
+        }
+
         Ok(())
     }
 
@@ -347,11 +374,7 @@ impl JobManager {
         // Anyone is allowed to stop a session.
         let session = {
             let mut session_guard = self.session.lock().unwrap();
-            if session_guard.as_ref().map(|s| s.session_id()) == Some(session_id) {
-                session_guard.take()
-            } else {
-                None
-            }
+            session_guard.take_if(|session| session.session_id() == session_id)
         };
         if let Some(session) = session {
             self.session_stop_inner(session).await
@@ -361,7 +384,18 @@ impl JobManager {
     }
 
     async fn session_stop_inner(&self, session: Session) -> Result<(), JobError> {
-        // TODO: send session stop event
+        for job_id in {
+            self.active_jobs
+                .lock()
+                .unwrap()
+                .iter()
+                .filter(|(_id, status)| status.session_id() == Some(session.session_id()))
+                .map(|(id, _status)| id.to_owned())
+                .collect::<Vec<JobId>>()
+        } {
+            self.monitor(MonitorRequest::Stop(job_id.to_owned()))
+                .await?;
+        }
         info!(self.log, "session stopped"; "session_id" => %session.session_id());
         Ok(())
     }
@@ -455,6 +489,7 @@ impl JobManager {
         let Some(job_session_id) = self
             .job_status_inner(&mut session_guard, job_id)?
             .session_id()
+            .cloned()
         else {
             return Err(JobError::JobNotFound(job_id.to_owned()));
         };

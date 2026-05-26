@@ -101,7 +101,7 @@
     },
     "/iam": {
       "get": {
-        "summary": "List all known identities, including expired and revoked identities.",
+        "summary": "List cached identities.",
         "operationId": "identities",
         "parameters": [
           {

@@ -53,7 +53,7 @@ pub trait SushApi {
         body: TypedBody<Option<SshPublicKey>>,
     ) -> Result<HttpResponseOk<Identity>, HttpError>;
 
-    /// List all known identities, including expired and revoked identities.
+    /// List cached identities.
     #[endpoint { method = GET, path = "/iam" }]
     async fn identities(
         ctx: RequestContext<Self::Context>,
