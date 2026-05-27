@@ -493,7 +493,7 @@ impl JobManager {
     fn check_job_owner(&self, authn: &Identity, job_id: &JobId) -> Result<(), JobError> {
         let mut session_guard = self.session.lock().unwrap();
         let Some(job_session_id) = self
-            .job_status_inner(&mut session_guard, job_id)?
+            .job_status_inner(job_id, &mut session_guard)?
             .session_id()
             .cloned()
         else {
@@ -523,15 +523,15 @@ impl JobManager {
 
     pub fn job_status(&self, _authn: &Identity, job_id: &JobId) -> Result<JobStatus, JobError> {
         // Anyone is allowed to read job status.
-        self.job_status_inner(&mut self.session.lock().unwrap(), job_id)
+        self.job_status_inner(job_id, &mut self.session.lock().unwrap())
     }
 
     fn job_status_inner(
         &self,
-        session_guard: &mut SessionGuard,
         job_id: &JobId,
+        session_guard: &mut SessionGuard,
     ) -> Result<JobStatus, JobError> {
-        self.with_jobs(session_guard, |active_jobs, job_history| {
+        let mut status = self.with_jobs(session_guard, |active_jobs, job_history| {
             Ok(active_jobs
                 .get(job_id)
                 .cloned()
@@ -539,7 +539,17 @@ impl JobManager {
                 .unwrap_or_else(|| JobStatus::Unknown {
                     job_id: job_id.to_owned(),
                 }))
-        })
+        })?;
+        if let JobStatus::Started {
+            stdout_len,
+            stderr_len,
+            ..
+        } = &mut status
+        {
+            *stdout_len = job_output_len(&self.output_dir, job_id, Stdout);
+            *stderr_len = job_output_len(&self.output_dir, job_id, Stderr);
+        }
+        Ok(status)
     }
 
     /// The `_session_guard` argument ensures that the session is locked
@@ -574,6 +584,9 @@ impl JobManager {
         get_job_output(&self.output_dir, job_id, stream, range)
     }
 
+    /// Truncate output file and update corresponding job status length.
+    /// Does *not* update the hash, as the mismatch indicates truncation
+    /// has occurred.
     pub async fn job_output_delete(
         &self,
         authn: &Identity,
@@ -582,7 +595,32 @@ impl JobManager {
         range: Option<Range>,
     ) -> Result<u64, JobError> {
         self.check_job_owner(authn, job_id)?;
-        delete_job_output(&self.output_dir, job_id, stream, range)
+        let n = delete_job_output(&self.output_dir, job_id, stream, range)?;
+        self.with_jobs(
+            &mut self.session.lock().unwrap(),
+            |active_jobs, job_history| {
+                if let Some(JobStatus::Started {
+                    stdout_len,
+                    stderr_len,
+                    ..
+                })
+                | Some(JobStatus::Ended {
+                    stdout_len,
+                    stderr_len,
+                    ..
+                }) = active_jobs
+                    .get_mut(job_id)
+                    .or_else(|| job_history.get_mut(job_id))
+                {
+                    match stream {
+                        Stdout => *stdout_len = n,
+                        Stderr => *stderr_len = n,
+                    }
+                }
+                Ok(())
+            },
+        )?;
+        Ok(n)
     }
 
     async fn monitor(&self, request: MonitorRequest) -> Result<(), JobError> {
