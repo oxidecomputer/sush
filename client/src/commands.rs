@@ -570,19 +570,17 @@ async fn iam(
             Ok(())
         }
 
-        IdentityCommand::Login => {
-            if let Err(ClientError::ErrorResponse(err)) = client.identities().send().await
-                && err.status() == StatusCode::UNAUTHORIZED
-            {
+        IdentityCommand::Login => match client.identities().send().await {
+            Ok(_) => Ok(()),
+            Err(ClientError::ErrorResponse(err)) if err.status() == StatusCode::UNAUTHORIZED => {
                 let (identity, credentials) =
                     authz(ctx, client, ssh_auth_sock, ssh_key_id, err).await?;
                 ctx.iam(&identity)?;
                 ctx.set_credentials(Some(credentials));
                 Ok(())
-            } else {
-                Err(CommandError::InvalidAuthorization)
             }
-        }
+            Err(err) => Err(err.into()),
+        },
 
         IdentityCommand::Revoke { revoke } => {
             let revoke = ctx.really_revoke(revoke)?;
