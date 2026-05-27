@@ -277,15 +277,20 @@ impl JobManager {
         // Check the cache.
         let mut identities = self.identities.lock().unwrap();
         let now = Utc::now();
-        if let Some((identity, cached_credentials)) = identities.get(&key_id).cloned()
-            && try_authn!(identity.is_still_valid(&now), "identity expired")
-            && try_authn!(identity.time_revoked.is_none(), "identity revoked")
-            && cached_credentials.nonce == nonce
-            && cached_credentials.cnonce == cnonce
-            && cached_credentials.signature == signature
-        {
-            debug!(self.log, "credentials cache hit"; "key_id" => %key_id);
-            return Ok(identity.to_owned());
+        if let Some((identity, cached_credentials)) = identities.get(&key_id).cloned() {
+            assert!(
+                identity.time_revoked.is_none(),
+                "should be in revoked_identities"
+            );
+            if !identity.is_still_valid(&now) {
+                assert!(identities.pop(&key_id).is_some());
+            } else if cached_credentials.nonce == nonce
+                && cached_credentials.cnonce == cnonce
+                && cached_credentials.signature == signature
+            {
+                debug!(self.log, "credentials cache hit"; "key_id" => %key_id);
+                return Ok(identity.to_owned());
+            }
         }
 
         // Verify the supplied credentials.
@@ -308,7 +313,7 @@ impl JobManager {
         };
 
         // Authenticated! Try to cache the credentials.
-        debug!(self.log, "authenticated credentials for new identity"; "key_id" => %key_id);
+        debug!(self.log, "authenticated credentials for identity"; "key_id" => %key_id);
         identities.put(key_id.to_owned(), (identity.clone(), credentials));
         Ok(identity)
     }
@@ -324,9 +329,10 @@ impl JobManager {
     }
 
     pub async fn revoke_identity(&self, _authn: &Identity, key_id: KeyId) -> Result<(), JobError> {
+        // Update identity tables and drop locks before stopping a session.
         {
             let mut revoked = self.revoked_identities.lock().unwrap();
-            if revoked.len() >= MAX_REVOKED_IDENTITIES {
+            if revoked.len() >= MAX_REVOKED_IDENTITIES && !revoked.contains_key(&key_id) {
                 return Err(JobError::TooManyRevocations(MAX_REVOKED_IDENTITIES));
             }
 

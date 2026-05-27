@@ -171,6 +171,9 @@ impl From<JobError> for HttpError {
                     .expect("should be able to add WWW-Authenticate header");
                 err
             }
+            SessionWrongIdentity | PublicKeyRevoked { .. } => {
+                HttpError::for_client_error(None, ClientErrorStatusCode::FORBIDDEN, message)
+            }
             IdentityNotFound(_)
             | InvalidCommand(_)
             | InvalidJobId(_)
@@ -180,9 +183,7 @@ impl From<JobError> for HttpError {
             | MissingCert(_)
             | MultipleSessions
             | NoSession
-            | PublicKeyRevoked { .. }
             | SessionNotFound(_)
-            | SessionWrongIdentity
             | OutputPending
             | TooManyCerts(_)
             | TooManyJobs(_)
