@@ -3,7 +3,7 @@
 //! Jobs are spawned onto new tokio tasks and passed to the monitor to wait
 //! for completion. Standard output and standard error are saved in files.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashSet};
 use std::fs::{DirBuilder, File, OpenOptions};
 use std::io::{Read as _, Seek as _, SeekFrom};
 use std::num::NonZeroUsize;
@@ -274,23 +274,29 @@ impl JobManager {
             unauthorized!("identity revoked");
         }
 
-        // Check the cache.
+        // Prune the cache.
         let mut identities = self.identities.lock().unwrap();
+        let mut expired = HashSet::new();
         let now = Utc::now();
-        if let Some((identity, cached_credentials)) = identities.get(&key_id).cloned() {
-            assert!(
-                identity.time_revoked.is_none(),
-                "should be in revoked_identities"
-            );
+        for (key_id, (identity, _credentials)) in identities.iter() {
             if !identity.is_still_valid(&now) {
-                assert!(identities.pop(&key_id).is_some());
-            } else if cached_credentials.nonce == nonce
-                && cached_credentials.cnonce == cnonce
-                && cached_credentials.signature == signature
-            {
-                debug!(self.log, "credentials cache hit"; "key_id" => %key_id);
-                return Ok(identity.to_owned());
+                expired.insert(key_id.to_owned());
             }
+        }
+        for key_id in expired {
+            identities.pop(&key_id);
+        }
+
+        // Check the cached credentials.
+        if let Some((identity, cached_credentials)) = identities.get(&key_id).cloned()
+            && cached_credentials.nonce == nonce
+            && cached_credentials.cnonce == cnonce
+            && cached_credentials.signature == signature
+        {
+            assert!(identity.is_still_valid(&now));
+            assert!(identity.time_revoked.is_none());
+            debug!(self.log, "credentials cache hit"; "key_id" => %key_id);
+            return Ok(identity.to_owned());
         }
 
         // Verify the supplied credentials.
@@ -312,7 +318,7 @@ impl JobManager {
             unauthorized!("nonce expired");
         };
 
-        // Authenticated! Try to cache the credentials.
+        // Authenticated! Cache the credentials.
         debug!(self.log, "authenticated credentials for identity"; "key_id" => %key_id);
         identities.put(key_id.to_owned(), (identity.clone(), credentials));
         Ok(identity)
@@ -547,7 +553,7 @@ impl JobManager {
             Ok(active_jobs
                 .get(job_id)
                 .cloned()
-                .or_else(|| job_history.get(job_id).cloned())
+                .or_else(|| job_history.peek(job_id).cloned())
                 .unwrap_or_else(|| JobStatus::Unknown {
                     job_id: job_id.to_owned(),
                 }))
