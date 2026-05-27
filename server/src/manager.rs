@@ -359,6 +359,18 @@ impl JobManager {
 
     // Session management.
 
+    pub fn session_id(&self, authn: &Identity) -> Result<Option<SessionId>, JobError> {
+        if let Some(session) = self.session.lock().unwrap().as_ref() {
+            if session.key_id() != Some(&authn.key_id) {
+                Err(JobError::SessionWrongIdentity)
+            } else {
+                Ok(Some(session.session_id().to_owned()))
+            }
+        } else {
+            Ok(None)
+        }
+    }
+
     pub async fn session_start(&self, authn: &Identity) -> Result<SessionId, JobError> {
         let new_session_id = SessionId::new();
         let new_session = Session::new(new_session_id.clone(), Some(authn.key_id.clone()));

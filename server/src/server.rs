@@ -109,6 +109,22 @@ impl SushApi for ApiServer {
         Ok(HttpResponseOk(session_id))
     }
 
+    async fn session_ensure(
+        ctx: RequestContext<Self::Context>,
+        headers: Header<Authorization>,
+        params: PathParams<SessionIdParam>,
+    ) -> Result<HttpResponseOk<SessionId>, HttpError> {
+        let mgr = ctx.context();
+        let Authorization { authorization } = headers.into_inner();
+        let authn = mgr.iam(authorization, None).await?;
+        let SessionIdParam { session_id } = params.into_inner();
+        let current_session_id = mgr.session_id(&authn)?;
+        if current_session_id.as_ref() != Some(&session_id) {
+            return Err(JobError::SessionNotCurrent(session_id).into());
+        }
+        Ok(HttpResponseOk(session_id))
+    }
+
     async fn session_stop(
         ctx: RequestContext<Self::Context>,
         headers: Header<Authorization>,

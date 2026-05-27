@@ -54,6 +54,8 @@ pub enum JobError {
     MultipleSessions,
     #[error("No current session")]
     NoSession,
+    #[error("Session `{0}` is no longer current")]
+    SessionNotCurrent(SessionId),
     #[error("Session `{0}` not found")]
     SessionNotFound(SessionId),
     #[error("Incorrect identity for session, try `iam`")]
@@ -183,6 +185,7 @@ impl From<JobError> for HttpError {
             | MissingCert(_)
             | MultipleSessions
             | NoSession
+            | SessionNotCurrent(_)
             | SessionNotFound(_)
             | OutputPending
             | TooManyCerts(_)

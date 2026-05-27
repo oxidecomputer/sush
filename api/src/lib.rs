@@ -84,6 +84,14 @@ pub trait SushApi {
         headers: Header<Authorization>,
     ) -> Result<HttpResponseOk<SessionId>, HttpError>;
 
+    /// Verify that the given session is current from this server's point of view.
+    #[endpoint { method = POST, path = "/sessions/{session_id}" }]
+    async fn session_ensure(
+        ctx: RequestContext<Self::Context>,
+        headers: Header<Authorization>,
+        params: PathParams<SessionIdParam>,
+    ) -> Result<HttpResponseOk<SessionId>, HttpError>;
+
     /// End a support session.
     ///
     /// Since there may be only one session active on the rack at a time

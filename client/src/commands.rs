@@ -676,9 +676,25 @@ async fn session(
             SessionCommand::Start {
                 session_id: Some(session_id),
             },
-            Some(_client),
+            Some(client),
         ) => {
-            todo!("verify server is on {session_id}")
+            let server_session_id = with_authz!(
+                ctx,
+                client,
+                ssh_auth_sock,
+                ssh_key_id,
+                authz => client
+                    .session_ensure()
+                    .session_id(&session_id)
+                    .authorization(&authz)
+                    .send()
+            )?
+            .into_inner();
+            if server_session_id != session_id {
+                return Err(CommandError::MissingSession);
+            }
+            ctx.session_started(&session_id)?;
+            Ok(())
         }
 
         (
