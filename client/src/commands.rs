@@ -137,10 +137,12 @@ pub struct GlobalArgs {
 
     /// Path to the SSH authentication agent Unix-domain socket.
     #[arg(long, env = SSH_AUTH_SOCK)]
+    #[clap(global = true)]
     pub ssh_auth_sock: Option<String>,
 
     /// Authenticate as this SSH identity (try `iam -l` for a list).
     #[arg(short, long, env = SUSH_KEY_ID)]
+    #[clap(global = true)]
     pub ssh_key_id: Option<KeyId>,
 }
 
