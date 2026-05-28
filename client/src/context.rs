@@ -58,45 +58,29 @@ pub trait CommandContext: Send + Sync {
     fn cert_imported(&mut self, path: &Path, key_id: KeyId) -> Result<(), CommandError>;
 
     // Job management
-    fn job_started(&mut self, job: &SignedJob) -> Result<(), CommandError>;
-    fn job_stopped(&mut self, id: &JobId) -> Result<(), CommandError>;
-    fn job_error(&mut self, error: CommandError) -> Result<(), CommandError>;
-    fn job_output(
-        &mut self,
-        id: &JobId,
-        stream: JobOutputStream,
-        output: &[u8],
-        binary: bool,
-    ) -> Result<(), CommandError>;
+    fn job_started(&mut self, job: &SignedJob);
+    fn job_stopped(&mut self, id: &JobId);
+    fn job_error(&mut self, error: CommandError) -> CommandError;
+    fn job_output(&mut self, id: &JobId, stream: JobOutputStream, output: &[u8], binary: bool);
     fn job_output_started(
         &mut self,
         id: &JobId,
         stream: JobOutputStream,
         stage: &str,
         total_length: u64,
-    ) -> Result<(), CommandError>;
-    fn job_output_update(
-        &mut self,
-        id: &JobId,
-        stream: JobOutputStream,
-        bytes: u64,
-    ) -> Result<(), CommandError>;
-    fn job_output_finished(
-        &mut self,
-        id: &JobId,
-        stream: JobOutputStream,
-        stage: Option<&str>,
-    ) -> Result<(), CommandError>;
-    fn job_polling_started(&mut self, id: &JobId, duration: Duration) -> Result<(), CommandError>;
-    fn job_polling_update(&mut self, id: &JobId, status: &JobStatus) -> Result<(), CommandError>;
-    fn job_polling_finished(&mut self, id: &JobId) -> Result<(), CommandError>;
-    fn job_session_connected(&mut self, id: &JobId) -> Result<(), CommandError>;
-    fn job_session_disconnected(&mut self, id: &JobId) -> Result<(), CommandError>;
-    fn job_signing_started(&mut self, id: &JobId) -> Result<(), CommandError>;
-    fn job_signing_update(&mut self, id: &JobId) -> Result<(), CommandError>;
-    fn job_signing_finished(&mut self, id: &JobId) -> Result<(), CommandError>;
-    fn job_signed(&mut self, job: &SignedJob, show: bool) -> Result<(), CommandError>;
-    fn job_status(&mut self, id: &JobId, status: &JobStatus) -> Result<(), CommandError>;
+    );
+    fn job_output_update(&mut self, id: &JobId, stream: JobOutputStream, bytes: u64);
+    fn job_output_finished(&mut self, id: &JobId, stream: JobOutputStream, stage: Option<&str>);
+    fn job_polling_started(&mut self, id: &JobId, duration: Duration);
+    fn job_polling_update(&mut self, id: &JobId, status: &JobStatus);
+    fn job_polling_finished(&mut self, id: &JobId);
+    fn job_session_connected(&mut self, id: &JobId);
+    fn job_session_disconnected(&mut self, id: &JobId);
+    fn job_signing_started(&mut self, id: &JobId);
+    fn job_signing_update(&mut self, id: &JobId);
+    fn job_signing_finished(&mut self, id: &JobId);
+    fn job_signed(&mut self, job: &SignedJob, show: bool);
+    fn job_status(&mut self, id: &JobId, status: &JobStatus);
     fn read_signed_job(&mut self) -> Result<SignedJob, CommandError>;
 
     // SSH agent and identity

@@ -5,6 +5,7 @@ use std::path::Path;
 use std::time::Duration;
 
 use bytesize::ByteSize;
+use chrono::TimeDelta;
 use humantime::format_duration;
 use indicatif::{ProgressBar, ProgressStyle};
 use rustix::io::ioctl_fionread;
@@ -172,26 +173,22 @@ impl CommandContext for Cli {
 
     // Job management
 
-    fn job_started(&mut self, job: &SignedJob) -> Result<(), CommandError> {
+    fn job_started(&mut self, job: &SignedJob) {
         if let Some(session) = self.session.as_mut() {
             session.job_started(job.to_owned());
-            Ok(())
-        } else {
-            Err(CommandError::MissingSession)
         }
     }
 
-    fn job_stopped(&mut self, job_id: &JobId) -> Result<(), CommandError> {
+    fn job_stopped(&mut self, job_id: &JobId) {
         match self.get_output_format() {
             OutputFormat::Json => println!("{}", json!(job_id)),
             OutputFormat::Text => println!("✅ Stopped job `{job_id}`"),
         }
-        Ok(())
     }
 
-    fn job_error(&mut self, error: CommandError) -> Result<(), CommandError> {
+    fn job_error(&mut self, error: CommandError) -> CommandError {
         eprintln!("{error}");
-        Ok(())
+        error
     }
 
     fn job_output(
@@ -200,14 +197,14 @@ impl CommandContext for Cli {
         stream: JobOutputStream,
         output: &[u8],
         binary: bool,
-    ) -> Result<(), CommandError> {
+    ) {
         match self.get_output_format() {
             OutputFormat::Json if binary => println!("{}", json!(output)),
-            OutputFormat::Json => println!("{}", json!(String::from_utf8(output.to_vec())?)),
+            OutputFormat::Json => println!("{}", json!(String::from_utf8_lossy(output))),
             OutputFormat::Text if binary => {
-                stdout()
-                    .write(output)
-                    .map_err(|error| CommandError::io("stdout", error))?;
+                if let Err(err) = stdout().write_all(output) {
+                    eprintln!("{err}");
+                }
             }
             OutputFormat::Text if output.is_empty() => (),
             OutputFormat::Text => {
@@ -215,7 +212,7 @@ impl CommandContext for Cli {
                     JobOutputStream::Stdout => println!("✅ Job stdout:"),
                     JobOutputStream::Stderr => println!("✅ Job stderr:"),
                 };
-                let output = String::from_utf8(output.to_vec())?;
+                let output = String::from_utf8_lossy(output);
                 if output.ends_with('\n') {
                     print!("{output}");
                 } else {
@@ -223,7 +220,6 @@ impl CommandContext for Cli {
                 }
             }
         }
-        Ok(())
     }
 
     fn job_output_started(
@@ -232,7 +228,7 @@ impl CommandContext for Cli {
         stream: JobOutputStream,
         stage: &str,
         total_length: u64,
-    ) -> Result<(), CommandError> {
+    ) {
         if matches!(self.get_output_format(), OutputFormat::Text) && self.progress.is_none() {
             let bar = ProgressBar::new(total_length);
             bar.set_prefix(format!("{stage} {stream}"));
@@ -248,19 +244,12 @@ impl CommandContext for Cli {
             );
             self.progress = Some(bar);
         }
-        Ok(())
     }
 
-    fn job_output_update(
-        &mut self,
-        _id: &JobId,
-        _stream: JobOutputStream,
-        length: u64,
-    ) -> Result<(), CommandError> {
+    fn job_output_update(&mut self, _id: &JobId, _stream: JobOutputStream, length: u64) {
         if let Some(progress) = &mut self.progress {
             progress.inc(length);
         }
-        Ok(())
     }
 
     fn job_output_finished(
@@ -268,7 +257,7 @@ impl CommandContext for Cli {
         _job_id: &JobId,
         stream: JobOutputStream,
         stage: Option<&str>,
-    ) -> Result<(), CommandError> {
+    ) {
         if let Some(progress) = self.progress.take() {
             progress.finish_and_clear();
             if let Some(stage) = stage {
@@ -282,14 +271,9 @@ impl CommandContext for Cli {
                 );
             }
         }
-        Ok(())
     }
 
-    fn job_polling_started(
-        &mut self,
-        job_id: &JobId,
-        elapsed: Duration,
-    ) -> Result<(), CommandError> {
+    fn job_polling_started(&mut self, job_id: &JobId, elapsed: Duration) {
         if matches!(self.get_output_format(), OutputFormat::Text) && self.progress.is_none() {
             let bar = ProgressBar::new_spinner();
             bar.set_elapsed(elapsed);
@@ -305,14 +289,9 @@ impl CommandContext for Cli {
             );
             self.progress = Some(bar);
         }
-        Ok(())
     }
 
-    fn job_polling_update(
-        &mut self,
-        _job_id: &JobId,
-        status: &JobStatus,
-    ) -> Result<(), CommandError> {
+    fn job_polling_update(&mut self, _job_id: &JobId, status: &JobStatus) {
         if let Some(progress) = &mut self.progress {
             if let JobStatus::Started {
                 stdout_len,
@@ -331,33 +310,29 @@ impl CommandContext for Cli {
             }
             progress.tick();
         }
-        Ok(())
     }
 
-    fn job_polling_finished(&mut self, _job_id: &JobId) -> Result<(), CommandError> {
+    fn job_polling_finished(&mut self, _job_id: &JobId) {
         if let Some(progress) = self.progress.take() {
             progress.finish_and_clear();
         }
-        Ok(())
     }
 
-    fn job_session_connected(&mut self, job_id: &JobId) -> Result<(), CommandError> {
+    fn job_session_connected(&mut self, job_id: &JobId) {
         match self.get_output_format() {
             OutputFormat::Json => println!("{}", json!({"connected": job_id})),
             OutputFormat::Text => println!("✅ Connected to interactive job `{job_id}`"),
         }
-        Ok(())
     }
 
-    fn job_session_disconnected(&mut self, job_id: &JobId) -> Result<(), CommandError> {
+    fn job_session_disconnected(&mut self, job_id: &JobId) {
         match self.get_output_format() {
             OutputFormat::Json => println!("{}", json!({"disconnected": job_id})),
             OutputFormat::Text => println!("\r✅ Disconnected interactive job `{job_id}`"),
         }
-        Ok(())
     }
 
-    fn job_signing_started(&mut self, job_id: &JobId) -> Result<(), CommandError> {
+    fn job_signing_started(&mut self, job_id: &JobId) {
         if matches!(self.get_output_format(), OutputFormat::Text) && self.progress.is_none() {
             let bar = ProgressBar::new_spinner();
             bar.set_prefix(format!("Waiting for signature on `{job_id}`"));
@@ -373,37 +348,52 @@ impl CommandContext for Cli {
             bar.enable_steady_tick(Duration::from_millis(100));
             self.progress = Some(bar);
         }
-        Ok(())
     }
 
-    fn job_signing_update(&mut self, _job_id: &JobId) -> Result<(), CommandError> {
+    fn job_signing_update(&mut self, _job_id: &JobId) {
         if let Some(progress) = &mut self.progress {
             progress.tick();
         }
-        Ok(())
     }
 
-    fn job_signing_finished(&mut self, job_id: &JobId) -> Result<(), CommandError> {
+    fn job_signing_finished(&mut self, job_id: &JobId) {
         if let Some(progress) = self.progress.take() {
             progress.finish_and_clear();
         }
         if matches!(self.get_output_format(), OutputFormat::Text) {
             println!("✅ Signed request for job `{job_id}`");
         }
-        Ok(())
     }
 
-    fn job_signed(&mut self, job: &SignedJob, show: bool) -> Result<(), CommandError> {
+    fn job_signed(&mut self, job: &SignedJob, show: bool) {
         if show {
             match self.get_output_format() {
-                OutputFormat::Json => println!("{}", to_json_string(&job)?),
-                OutputFormat::Text => println!("{}", to_json_string_pretty(&job)?),
+                OutputFormat::Json => println!(
+                    "{}",
+                    to_json_string(&job).expect("job should be JSON-serializable")
+                ),
+                OutputFormat::Text => println!(
+                    "{}",
+                    to_json_string_pretty(&job).expect("job should be JSON-serializable")
+                ),
             }
         }
-        Ok(())
     }
 
-    fn job_status(&mut self, job_id: &JobId, status: &JobStatus) -> Result<(), CommandError> {
+    fn job_status(&mut self, job_id: &JobId, status: &JobStatus) {
+        fn format_elapsed_duration(duration: Option<TimeDelta>) -> String {
+            match duration {
+                None => String::from("empty duration"),
+                Some(duration) => {
+                    if let Ok(duration) = duration.to_std() {
+                        format_duration(duration).to_string()
+                    } else {
+                        String::from("negative duration, times may be unreliable")
+                    }
+                }
+            }
+        }
+
         match self.get_output_format() {
             OutputFormat::Json => println!("{}", json!(status)),
             OutputFormat::Text => match status {
@@ -444,7 +434,7 @@ impl CommandContext for Cli {
                     stderr_hash,
                 } => {
                     let command = job.command();
-                    let duration = format_duration(status.time_elapsed().unwrap().to_std()?);
+                    let duration = format_elapsed_duration(status.time_elapsed());
                     let stdout_len = byte_size(*stdout_len);
                     let stderr_len = byte_size(*stderr_len);
                     println!(
@@ -473,7 +463,7 @@ impl CommandContext for Cli {
                     stderr_hash,
                 } => {
                     let command = job.command();
-                    let duration = format_duration(status.time_elapsed().unwrap().to_std()?);
+                    let duration = format_elapsed_duration(status.time_elapsed());
                     let stdout_len = byte_size(*stdout_len);
                     let stderr_len = byte_size(*stderr_len);
                     println!(
@@ -491,7 +481,6 @@ impl CommandContext for Cli {
                 }
             },
         }
-        Ok(())
     }
 
     fn read_signed_job(&mut self) -> Result<SignedJob, CommandError> {

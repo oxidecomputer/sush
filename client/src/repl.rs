@@ -225,30 +225,22 @@ impl CommandContext for Repl {
 
     // Job management
 
-    fn job_started(&mut self, job: &SignedJob) -> Result<(), CommandError> {
-        self.cli.job_started(job)
+    fn job_started(&mut self, job: &SignedJob) {
+        self.cli.job_started(job);
     }
 
-    fn job_stopped(&mut self, job_id: &JobId) -> Result<(), CommandError> {
+    fn job_stopped(&mut self, job_id: &JobId) {
         self.set_job_id(Some(job_id.to_owned()));
-        self.cli.job_stopped(job_id)?;
-        Ok(())
+        self.cli.job_stopped(job_id);
     }
 
-    fn job_error(&mut self, error: CommandError) -> Result<(), CommandError> {
+    fn job_error(&mut self, error: CommandError) -> CommandError {
         self.cli.job_error(error)
     }
 
-    fn job_output(
-        &mut self,
-        job_id: &JobId,
-        stream: JobOutputStream,
-        output: &[u8],
-        binary: bool,
-    ) -> Result<(), CommandError> {
+    fn job_output(&mut self, job_id: &JobId, stream: JobOutputStream, output: &[u8], binary: bool) {
         self.set_job_id(Some(job_id.to_owned()));
-        self.cli.job_output(job_id, stream, output, binary)?;
-        Ok(())
+        self.cli.job_output(job_id, stream, output, binary);
     }
 
     fn job_output_started(
@@ -257,18 +249,13 @@ impl CommandContext for Repl {
         stream: JobOutputStream,
         stage: &str,
         total: u64,
-    ) -> Result<(), CommandError> {
+    ) {
         self.set_job_id(Some(job_id.to_owned()));
-        self.cli.job_output_started(job_id, stream, stage, total)
+        self.cli.job_output_started(job_id, stream, stage, total);
     }
 
-    fn job_output_update(
-        &mut self,
-        job_id: &JobId,
-        stream: JobOutputStream,
-        length: u64,
-    ) -> Result<(), CommandError> {
-        self.cli.job_output_update(job_id, stream, length)
+    fn job_output_update(&mut self, job_id: &JobId, stream: JobOutputStream, length: u64) {
+        self.cli.job_output_update(job_id, stream, length);
     }
 
     fn job_output_finished(
@@ -276,59 +263,49 @@ impl CommandContext for Repl {
         job_id: &JobId,
         stream: JobOutputStream,
         stage: Option<&str>,
-    ) -> Result<(), CommandError> {
-        self.cli.job_output_finished(job_id, stream, stage)
+    ) {
+        self.cli.job_output_finished(job_id, stream, stage);
     }
 
-    fn job_polling_started(
-        &mut self,
-        job_id: &JobId,
-        duration: Duration,
-    ) -> Result<(), CommandError> {
-        self.cli.job_polling_started(job_id, duration)
+    fn job_polling_started(&mut self, job_id: &JobId, duration: Duration) {
+        self.cli.job_polling_started(job_id, duration);
     }
 
-    fn job_polling_update(
-        &mut self,
-        job_id: &JobId,
-        status: &JobStatus,
-    ) -> Result<(), CommandError> {
-        self.cli.job_polling_update(job_id, status)
+    fn job_polling_update(&mut self, job_id: &JobId, status: &JobStatus) {
+        self.cli.job_polling_update(job_id, status);
     }
 
-    fn job_polling_finished(&mut self, job_id: &JobId) -> Result<(), CommandError> {
-        self.cli.job_polling_finished(job_id)
+    fn job_polling_finished(&mut self, job_id: &JobId) {
+        self.cli.job_polling_finished(job_id);
     }
 
-    fn job_session_connected(&mut self, job_id: &JobId) -> Result<(), CommandError> {
-        self.cli.job_session_connected(job_id)
+    fn job_session_connected(&mut self, job_id: &JobId) {
+        self.cli.job_session_connected(job_id);
     }
 
-    fn job_session_disconnected(&mut self, job_id: &JobId) -> Result<(), CommandError> {
-        self.cli.job_session_disconnected(job_id)
+    fn job_session_disconnected(&mut self, job_id: &JobId) {
+        self.cli.job_session_disconnected(job_id);
     }
 
-    fn job_signing_started(&mut self, job_id: &JobId) -> Result<(), CommandError> {
-        self.cli.job_signing_started(job_id)
+    fn job_signing_started(&mut self, job_id: &JobId) {
+        self.cli.job_signing_started(job_id);
     }
 
-    fn job_signing_update(&mut self, job_id: &JobId) -> Result<(), CommandError> {
-        self.cli.job_signing_update(job_id)
+    fn job_signing_update(&mut self, job_id: &JobId) {
+        self.cli.job_signing_update(job_id);
     }
 
-    fn job_signing_finished(&mut self, job_id: &JobId) -> Result<(), CommandError> {
-        self.cli.job_signing_finished(job_id)
+    fn job_signing_finished(&mut self, job_id: &JobId) {
+        self.cli.job_signing_finished(job_id);
     }
 
-    fn job_signed(&mut self, job: &SignedJob, show: bool) -> Result<(), CommandError> {
-        self.cli.job_signed(job, show)?;
-        Ok(())
+    fn job_signed(&mut self, job: &SignedJob, show: bool) {
+        self.cli.job_signed(job, show);
     }
 
-    fn job_status(&mut self, job_id: &JobId, status: &JobStatus) -> Result<(), CommandError> {
+    fn job_status(&mut self, job_id: &JobId, status: &JobStatus) {
         self.set_job_id(Some(job_id.to_owned()));
-        self.cli.job_status(job_id, status)?;
-        Ok(())
+        self.cli.job_status(job_id, status);
     }
 
     fn read_signed_job(&mut self) -> Result<SignedJob, CommandError> {

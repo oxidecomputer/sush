@@ -791,19 +791,22 @@ async fn job(
                 *interactive,
             ));
             pin!(sign);
-            ctx.job_signing_started(&job_id)?;
+            ctx.job_signing_started(&job_id);
             let job = loop {
                 select! {
                     job = &mut sign => {
-                        ctx.job_signing_finished(&job_id)?;
+                        ctx.job_signing_finished(&job_id);
                         break job?;
                     }
-                    _ = interval.tick() => ctx.job_signing_update(&job_id)?,
-                    _ = ctrl_c() => return ctx.job_signing_finished(&job_id),
+                    _ = interval.tick() => ctx.job_signing_update(&job_id),
+                    _ = ctrl_c() => {
+                        ctx.job_signing_finished(&job_id);
+                        return Ok(());
+                    }
                 }
             };
             if let Some(client) = client {
-                ctx.job_signed(&job, false)?;
+                ctx.job_signed(&job, false);
                 job_start(
                     ctx,
                     client,
@@ -814,7 +817,8 @@ async fn job(
                 )
                 .await
             } else {
-                ctx.job_signed(&job, true)
+                ctx.job_signed(&job, true);
+                Ok(())
             }
         }
 
@@ -830,7 +834,8 @@ async fn job(
                     .authorization(&authz)
                     .send()
             )?;
-            ctx.job_stopped(&job_id)
+            ctx.job_stopped(&job_id);
+            Ok(())
         }
 
         (JobCommand::Status { job_id }, Some(client)) => {
@@ -846,7 +851,8 @@ async fn job(
                     .send()
             )?
             .into_inner();
-            ctx.job_status(&job_id, &status)
+            ctx.job_status(&job_id, &status);
+            Ok(())
         }
 
         (JobCommand::Stdout { output }, Some(client)) => {
@@ -874,7 +880,7 @@ async fn job(
             )?
             .into_inner();
             for job in history {
-                ctx.job_status(job.job_id(), &job)?;
+                ctx.job_status(job.job_id(), &job);
             }
             Ok(())
         }
@@ -933,7 +939,7 @@ async fn job_start(
 
     let status = if interactive {
         start.as_mut().await?;
-        ctx.job_started(&job)?;
+        ctx.job_started(&job);
         job_start_interactive_session(ctx, client, ssh_auth_sock, ssh_key_id, &job_id).await?;
         client
             .job_status()
@@ -945,12 +951,12 @@ async fn job_start(
     } else {
         let mut interval = interval(Duration::from_millis(250));
         interval.set_missed_tick_behavior(MissedTickBehavior::Skip);
-        ctx.job_polling_started(&job_id, interval.period())?;
+        ctx.job_polling_started(&job_id, interval.period());
         loop {
             select! {
                 status = &mut start => {
-                    ctx.job_started(&job)?;
-                    ctx.job_polling_finished(&job_id)?;
+                    ctx.job_started(&job);
+                    ctx.job_polling_finished(&job_id);
                     let status = status?.into_inner();
                     break status;
                 }
@@ -962,7 +968,7 @@ async fn job_start(
                         .send()
                         .await?
                         .into_inner();
-                    ctx.job_polling_update(&job_id, &status)?;
+                    ctx.job_polling_update(&job_id, &status);
                 }
                 _ = ctrl_c() => {
                     client
@@ -971,8 +977,9 @@ async fn job_start(
                         .job_id(&job_id)
                         .send()
                         .await?;
-                    ctx.job_polling_finished(&job_id)?;
-                    ctx.job_stopped(&job_id)?;
+                    ctx.job_polling_finished(&job_id);
+                    ctx.job_started(&job);
+                    ctx.job_stopped(&job_id);
                     break client
                         .job_status()
                         .authorization(&authz)
@@ -984,7 +991,7 @@ async fn job_start(
             }
         }
     };
-    ctx.job_status(&job_id, &status)?;
+    ctx.job_status(&job_id, &status);
     if wait {
         for stream in [Stdout, Stderr] {
             match client
@@ -997,9 +1004,9 @@ async fn job_start(
             {
                 Ok(byte_stream) => {
                     let output = byte_stream_to_vec(byte_stream.into_inner()).await?;
-                    ctx.job_output(&job_id, stream, &output, binary)?;
+                    ctx.job_output(&job_id, stream, &output, binary);
                 }
-                Err(error) => ctx.job_error(error.into())?,
+                Err(error) => return Err(ctx.job_error(error.into())),
             }
         }
     }
@@ -1110,7 +1117,8 @@ async fn job_output(
             let expected = expected_hash;
             let received = $hash.into();
             if received == expected {
-                ctx.job_output_finished(&job_id, stream, $stage)
+                ctx.job_output_finished(&job_id, stream, $stage);
+                Ok(())
             } else {
                 let _ = ctx.job_output_finished(&job_id, stream, None);
                 Err(CommandError::OutputHashMismatch { expected, received })
@@ -1136,7 +1144,7 @@ async fn job_output(
         let mut file = options.open(&path).map_err(io_error)?;
 
         // Download and write the output in parallel (unordered) chunks.
-        ctx.job_output_started(&job_id, stream, "Downloading", len)?;
+        ctx.job_output_started(&job_id, stream, "Downloading", len);
         let Some(credentials) = ctx.get_credentials() else {
             return Err(CommandError::InvalidAuthorization);
         };
@@ -1146,11 +1154,11 @@ async fn job_output(
         let mut chunks_par = stream::iter(chunks).buffer_unordered(par);
         while let Some(chunk) = chunks_par.next().await {
             let Chunk(range, bytes) = chunk?;
-            ctx.job_output_update(&job_id, stream, range.len())?;
+            ctx.job_output_update(&job_id, stream, range.len());
             byte_stream_to_file(&mut file, &path, bytes, range).await?;
         }
         file.flush().map_err(io_error)?;
-        ctx.job_output_finished(&job_id, stream, Some("✅ Downloaded"))?;
+        ctx.job_output_finished(&job_id, stream, Some("✅ Downloaded"));
 
         // Verify the output hash. Note that even if this verification fails,
         // we will leave the file as written. This provides a way of fetching
@@ -1162,11 +1170,11 @@ async fn job_output(
             // Multi-threaded BLAKE3 is very, very fast, but still takes
             // perceptible time on multi-GB outputs. So if there's more
             // than one chunk, hash in chunks with a progress bar.
-            ctx.job_output_started(&job_id, stream, "Verifying", len)?;
+            ctx.job_output_started(&job_id, stream, "Verifying", len);
             let mut hasher = Hasher::new();
             for chunk in output.chunks(chunk_size.get() as usize) {
                 hasher.update_rayon(chunk);
-                ctx.job_output_update(&job_id, stream, chunk.len() as u64)?;
+                ctx.job_output_update(&job_id, stream, chunk.len() as u64);
             }
             check_hash!(hasher.finalize(), Some("✅ Verified"))
         }
@@ -1188,7 +1196,8 @@ async fn job_output(
         .into_inner();
         let bytes = byte_stream_to_vec(byte_stream).await?;
         check_hash!(hash(&bytes), None)?;
-        ctx.job_output(&job_id, stream, &bytes, binary)
+        ctx.job_output(&job_id, stream, &bytes, binary);
+        Ok(())
     }
 }
 
@@ -1275,15 +1284,16 @@ async fn job_start_interactive_session(
             .job_id(job_id)
             .send()
     ) {
-        Err(error) => ctx.job_error(error.into()),
+        Err(error) => Err(ctx.job_error(error.into())),
         Ok(socket) => {
-            ctx.job_session_connected(job_id)?;
+            ctx.job_session_connected(job_id);
             let socket = socket.into_inner();
             let stream = WebSocketStream::from_raw_socket(socket, Role::Client, None).await;
             if let Err(error) = interactive_session(stream).await {
-                return ctx.job_error(CommandError::from(error));
+                return Err(ctx.job_error(error.into()));
             }
-            ctx.job_session_disconnected(job_id)
+            ctx.job_session_disconnected(job_id);
+            Ok(())
         }
     }
 }
