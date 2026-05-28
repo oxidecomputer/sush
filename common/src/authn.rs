@@ -61,7 +61,7 @@ impl Nonce {
     }
 
     pub fn is_still_valid(time_generated: &DateTime<Utc>, now: &DateTime<Utc>) -> bool {
-        now.signed_duration_since(time_generated).num_seconds() < NONCE_TTL
+        (0..NONCE_TTL).contains(&now.signed_duration_since(time_generated).num_seconds())
     }
 }
 
@@ -272,10 +272,10 @@ impl Identity {
 
     pub fn is_still_valid(&self, now: &DateTime<Utc>) -> bool {
         self.time_revoked.is_none()
-            && now
-                .signed_duration_since(self.time_authenticated)
-                .num_seconds()
-                < IDENTITY_TTL
+            && (0..IDENTITY_TTL).contains(
+                &now.signed_duration_since(self.time_authenticated)
+                    .num_seconds(),
+            )
     }
 }
 
