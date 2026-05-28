@@ -82,10 +82,11 @@ type SessionGuard<'a> = MutexGuard<'a, Option<Session>>;
 
 /// NB: All tables must have a fixed maximum size!
 #[derive(Debug)]
+#[allow(clippy::type_complexity)]
 pub struct JobManager {
     log: Logger,
     nonces: Arc<Mutex<LruCache<Nonce, DateTime<Utc>>>>,
-    identities: Arc<Mutex<LruCache<KeyId, (Identity, Credentials)>>>,
+    identities: Arc<Mutex<LruCache<(KeyId, Nonce), (Identity, Credentials)>>>,
     revoked_identities: Arc<Mutex<BTreeMap<KeyId, DateTime<Utc>>>>,
     certs: Arc<Mutex<BTreeMap<KeyId, Certificate>>>,
     session: Arc<Mutex<Option<Session>>>,
@@ -288,7 +289,8 @@ impl JobManager {
         }
 
         // Check the cached credentials.
-        if let Some((identity, cached_credentials)) = identities.get(&key_id).cloned()
+        if let Some((identity, cached_credentials)) =
+            identities.get(&(key_id.clone(), nonce.clone())).cloned()
             && cached_credentials.nonce == nonce
             && cached_credentials.cnonce == cnonce
             && cached_credentials.signature == signature
@@ -320,7 +322,7 @@ impl JobManager {
 
         // Authenticated! Cache the credentials.
         debug!(self.log, "authenticated credentials for identity"; "key_id" => %key_id);
-        identities.put(key_id.to_owned(), (identity.clone(), credentials));
+        identities.put((key_id.to_owned(), nonce), (identity.clone(), credentials));
         Ok(identity)
     }
 
@@ -330,7 +332,7 @@ impl JobManager {
             .lock()
             .unwrap()
             .iter()
-            .map(|(_id, (identity, _credentials))| identity.to_owned())
+            .map(|(_, (identity, _credentials))| identity.to_owned())
             .collect())
     }
 
@@ -346,8 +348,10 @@ impl JobManager {
             revoked.insert(key_id.clone(), time_revoked);
 
             let mut cached = self.identities.lock().unwrap();
-            if let Some((identity, _credentials)) = cached.get_mut(&key_id) {
-                identity.time_revoked = Some(time_revoked);
+            for ((id, _nonce), (identity, _credentials)) in cached.iter_mut() {
+                if *id == key_id {
+                    identity.time_revoked = Some(time_revoked);
+                }
             }
         }
 
