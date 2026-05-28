@@ -961,14 +961,15 @@ async fn job_start(
                     break status;
                 }
                 _ = interval.tick() => {
-                    let status = client
+                    if let Ok(status) = client
                         .job_status()
                         .authorization(&authz)
                         .job_id(&job_id)
                         .send()
-                        .await?
-                        .into_inner();
-                    ctx.job_polling_update(&job_id, &status);
+                        .await
+                    {
+                        ctx.job_polling_update(&job_id, &status.into_inner());
+                    }
                 }
                 _ = ctrl_c() => {
                     client
