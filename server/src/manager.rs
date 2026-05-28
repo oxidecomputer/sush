@@ -385,11 +385,18 @@ impl JobManager {
         let new_session_id = SessionId::new();
         let new_session = Session::new(new_session_id.clone(), Some(authn.key_id.clone()));
 
-        // Don't hold the session lock while we stop any old session.
-        if let Some(old_session) = { self.session.lock().unwrap().replace(new_session) } {
-            self.session_stop_inner(old_session).await?;
+        // We can not hold the session lock while we stop an old session,
+        // so we may have to try more than once.
+        loop {
+            if let Some(old_session) = { self.session.lock().unwrap().take() } {
+                self.session_stop_inner(old_session).await?;
+            }
+            let mut session = self.session.lock().unwrap();
+            if session.is_none() {
+                *session = Some(new_session);
+                break;
+            }
         }
-
         info!(self.log, "session started"; "session_id" => %new_session_id);
         Ok(new_session_id)
     }
@@ -421,8 +428,11 @@ impl JobManager {
                 .map(|(id, _status)| id.to_owned())
                 .collect::<Vec<JobId>>()
         } {
-            self.monitor(MonitorRequest::Stop(job_id.to_owned()))
-                .await?;
+            if let Err(err) = self.monitor(MonitorRequest::Stop(job_id.to_owned())).await {
+                // Restore the old session on error.
+                self.session.lock().unwrap().replace(session);
+                return Err(err);
+            }
         }
         info!(self.log, "session stopped"; "session_id" => %session.session_id());
         Ok(())
