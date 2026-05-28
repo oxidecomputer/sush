@@ -1081,13 +1081,7 @@ async fn job_output(
     }
 
     // Fetch job status for output length and hash.
-    let JobStatus::Ended {
-        stdout_len,
-        stderr_len,
-        stdout_hash,
-        stderr_hash,
-        ..
-    } = with_authz!(
+    let status = with_authz!(
         ctx,
         client,
         ssh_auth_sock,
@@ -1098,10 +1092,17 @@ async fn job_output(
             .job_id(&job_id)
             .send()
     )?
-    .into_inner()
-    else {
-        // TODO: emulate `tail -f` for running jobs
-        return Err(CommandError::JobStillRunning(job_id.to_owned()));
+    .into_inner();
+    let (stdout_len, stderr_len, stdout_hash, stderr_hash) = match status {
+        JobStatus::Unknown { job_id } => return Err(CommandError::JobNotFound(job_id)),
+        JobStatus::Started { .. } => return Err(CommandError::JobStillRunning(job_id.to_owned())),
+        JobStatus::Ended {
+            stdout_len,
+            stderr_len,
+            stdout_hash,
+            stderr_hash,
+            ..
+        } => (stdout_len, stderr_len, stdout_hash, stderr_hash),
     };
     let len = match stream {
         Stdout => stdout_len,
@@ -1338,6 +1339,8 @@ pub enum CommandError {
     InvalidReservedJobs,
     #[error("❌ Root certificate is not self-signed")]
     InvalidRootCert,
+    #[error("❌ Job `{0}` not found")]
+    JobNotFound(JobId),
     #[error("❌ Job `{0}` is still running")]
     JobStillRunning(JobId),
     #[error("❌ JSON error: {0}")]
