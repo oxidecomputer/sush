@@ -15,7 +15,9 @@ use serde::Deserialize;
 use serde::de::{Deserializer, Error as DeserializeError, IntoDeserializer, MapAccess, Visitor};
 
 use sush_common::authn::Identity;
-use sush_common::jobs::{JobId, JobLimits, JobOutputStream, JobStatus, SessionId, SignedJob};
+use sush_common::jobs::{
+    JobId, JobLimits, JobOutputStream, JobStatus, Session, SessionId, SignedJob,
+};
 use sush_common::keys::{KeyId, SshPublicKey};
 
 /// Oxide Support Shell API
@@ -73,6 +75,13 @@ pub trait SushApi {
 
     // Session management.
 
+    /// Get the current session from this server's point of view.
+    #[endpoint { method = GET, path = "/sessions" }]
+    async fn session(
+        ctx: RequestContext<Self::Context>,
+        headers: Header<Authorization>,
+    ) -> Result<HttpResponseOk<Session>, HttpError>;
+
     /// Start a new support session.
     ///
     /// There may only be one session active on the rack at a time.
@@ -82,14 +91,6 @@ pub trait SushApi {
     async fn session_start(
         ctx: RequestContext<Self::Context>,
         headers: Header<Authorization>,
-    ) -> Result<HttpResponseOk<SessionId>, HttpError>;
-
-    /// Verify that the given session is current from this server's point of view.
-    #[endpoint { method = POST, path = "/sessions/{session_id}" }]
-    async fn session_ensure(
-        ctx: RequestContext<Self::Context>,
-        headers: Header<Authorization>,
-        params: PathParams<SessionIdParam>,
     ) -> Result<HttpResponseOk<SessionId>, HttpError>;
 
     /// End a support session.

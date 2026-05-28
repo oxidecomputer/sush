@@ -176,7 +176,7 @@ impl From<JobError> for HttpError {
             SessionWrongIdentity | PublicKeyRevoked { .. } => {
                 HttpError::for_client_error(None, ClientErrorStatusCode::FORBIDDEN, message)
             }
-            JobNotFound(_) | SessionNotFound(_) | SessionNotCurrent(_) => {
+            JobNotFound(_) | NoSession | SessionNotFound(_) | SessionNotCurrent(_) => {
                 HttpError::for_client_error(None, ClientErrorStatusCode::NOT_FOUND, message)
             }
             IdentityNotFound(_)
@@ -186,7 +186,6 @@ impl From<JobError> for HttpError {
             | CertChainTooLong
             | MissingCert(_)
             | MultipleSessions
-            | NoSession
             | OutputPending
             | TooManyCerts(_)
             | TooManyJobs(_)

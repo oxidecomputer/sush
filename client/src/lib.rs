@@ -11,6 +11,7 @@ progenitor::generate_api!(
     interface = Builder,
     replace = {
         Identity = sush_common::authn::Identity,
+        Session = sush_common::jobs::Session,
         SessionId = sush_common::jobs::SessionId,
         JobId = sush_common::jobs::JobId,
         JobLimits = sush_common::jobs::JobLimits,

@@ -369,12 +369,12 @@ impl JobManager {
 
     // Session management.
 
-    pub fn session_id(&self, authn: &Identity) -> Result<Option<SessionId>, JobError> {
+    pub fn session(&self, authn: &Identity) -> Result<Option<Session>, JobError> {
         if let Some(session) = self.session.lock().unwrap().as_ref() {
             if session.key_id() != Some(&authn.key_id) {
                 Err(JobError::SessionWrongIdentity)
             } else {
-                Ok(Some(session.session_id().to_owned()))
+                Ok(Some(session.clone()))
             }
         } else {
             Ok(None)

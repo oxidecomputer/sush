@@ -142,6 +142,10 @@ impl Session {
         self.key_id.as_ref()
     }
 
+    pub fn last_job(&self) -> Option<&SignedJob> {
+        self.last_job.as_ref()
+    }
+
     pub fn job_started(&mut self, job: SignedJob) {
         self.last_job = Some(job)
     }

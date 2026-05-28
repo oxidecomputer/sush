@@ -16,7 +16,7 @@ use sush_api::{
     SessionIdParam, SushApi,
 };
 use sush_common::authn::Identity;
-use sush_common::jobs::{JobStatus, SessionId, SignedJob};
+use sush_common::jobs::{JobStatus, Session, SessionId, SignedJob};
 use sush_common::keys::{KeyId, SshPublicKey, pem_cert_chain};
 
 use crate::error::JobError;
@@ -98,6 +98,20 @@ impl SushApi for ApiServer {
 
     // Session management.
 
+    async fn session(
+        ctx: RequestContext<Self::Context>,
+        headers: Header<Authorization>,
+    ) -> Result<HttpResponseOk<Session>, HttpError> {
+        let mgr = ctx.context();
+        let Authorization { authorization } = headers.into_inner();
+        let authn = mgr.iam(authorization, None).await?;
+        if let Some(session) = mgr.session(&authn)? {
+            Ok(HttpResponseOk(session))
+        } else {
+            Err(JobError::NoSession.into())
+        }
+    }
+
     async fn session_start(
         ctx: RequestContext<Self::Context>,
         headers: Header<Authorization>,
@@ -106,22 +120,6 @@ impl SushApi for ApiServer {
         let Authorization { authorization } = headers.into_inner();
         let authn = mgr.iam(authorization, None).await?;
         let session_id = mgr.session_start(&authn).await?;
-        Ok(HttpResponseOk(session_id))
-    }
-
-    async fn session_ensure(
-        ctx: RequestContext<Self::Context>,
-        headers: Header<Authorization>,
-        params: PathParams<SessionIdParam>,
-    ) -> Result<HttpResponseOk<SessionId>, HttpError> {
-        let mgr = ctx.context();
-        let Authorization { authorization } = headers.into_inner();
-        let authn = mgr.iam(authorization, None).await?;
-        let SessionIdParam { session_id } = params.into_inner();
-        let current_session_id = mgr.session_id(&authn)?;
-        if current_session_id.as_ref() != Some(&session_id) {
-            return Err(JobError::SessionNotCurrent(session_id).into());
-        }
         Ok(HttpResponseOk(session_id))
     }
 

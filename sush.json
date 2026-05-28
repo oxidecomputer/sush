@@ -614,10 +614,9 @@
       }
     },
     "/sessions": {
-      "post": {
-        "summary": "Start a new support session.",
-        "description": "There may only be one session active on the rack at a time. If a session is already running when this request is made, the old session is stopped (regardless of ownership).",
-        "operationId": "session_start",
+      "get": {
+        "summary": "Get the current session from this server's point of view.",
+        "operationId": "session",
         "parameters": [
           {
             "in": "header",
@@ -634,7 +633,7 @@
             "content": {
               "application/json": {
                 "schema": {
-                  "$ref": "#/components/schemas/SessionId"
+                  "$ref": "#/components/schemas/Session"
                 }
               }
             }
@@ -646,12 +645,11 @@
             "$ref": "#/components/responses/Error"
           }
         }
-      }
-    },
-    "/sessions/{session_id}": {
+      },
       "post": {
-        "summary": "Verify that the given session is current from this server's point of view.",
-        "operationId": "session_ensure",
+        "summary": "Start a new support session.",
+        "description": "There may only be one session active on the rack at a time. If a session is already running when this request is made, the old session is stopped (regardless of ownership).",
+        "operationId": "session_start",
         "parameters": [
           {
             "in": "header",
@@ -659,14 +657,6 @@
             "description": "Authorization to access some resource, such as a signature.\n\nSee: <https://developer.mozilla.org/en-US/docs/Web/HTTP/Reference/Headers/Authorization>",
             "schema": {
               "type": "string"
-            }
-          },
-          {
-            "in": "path",
-            "name": "session_id",
-            "required": true,
-            "schema": {
-              "$ref": "#/components/schemas/SessionId"
             }
           }
         ],
@@ -1014,6 +1004,33 @@
         "description": "BLAKE3 hash of job output, used as a checksum.",
         "type": "string",
         "format": "hex encoded hash (32 bytes)"
+      },
+      "Session": {
+        "type": "object",
+        "properties": {
+          "session_id": {
+            "$ref": "#/components/schemas/SessionId"
+          },
+          "key_id": {
+            "nullable": true,
+            "allOf": [
+              {
+                "$ref": "#/components/schemas/KeyId"
+              }
+            ]
+          },
+          "last_job": {
+            "nullable": true,
+            "allOf": [
+              {
+                "$ref": "#/components/schemas/Signed_for_JobStartRequest"
+              }
+            ]
+          }
+        },
+        "required": [
+          "session_id"
+        ]
       },
       "JobOutputStream": {
         "description": "Either the standard output or standard error of a job.",
