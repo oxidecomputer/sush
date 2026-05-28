@@ -539,8 +539,8 @@ impl JobManager {
         rx.await?
     }
 
-    pub fn job_status(&self, _authn: &Identity, job_id: &JobId) -> Result<JobStatus, JobError> {
-        // Anyone is allowed to read job status.
+    pub fn job_status(&self, authn: &Identity, job_id: &JobId) -> Result<JobStatus, JobError> {
+        self.check_job_owner(authn, job_id)?;
         self.job_status_inner(job_id, &mut self.session.lock().unwrap())
     }
 
@@ -1074,8 +1074,8 @@ mod test {
         let job_id = session_id.first_job_id();
         let job = root.sign_job_request(&job_id, "true", false).await;
         assert!(matches!(
-            mgr.job_status(&authn, &job_id).unwrap(),
-            JobStatus::Unknown { job_id: id } if id == job_id
+            mgr.job_status(&authn, &job_id).unwrap_err(),
+            JobError::JobNotFound(id) if id == job_id
         ));
         let status = job_status(&authn, &mgr, job.clone()).await;
         check_status_ended(status, &job_id, "true", Some(0), 0, 0);
