@@ -41,7 +41,7 @@ impl SushApi for ApiServer {
         let cert = Certificate::from_pem(&bytes)
             .or_else(|_| Certificate::from_der(&bytes))
             .map_err(JobError::Der)?;
-        let key_id = mgr.import_cert(&authn, cert)?;
+        let key_id = mgr.import_cert(&authn, cert).await?;
         Ok(HttpResponseOk(key_id))
     }
 
@@ -54,7 +54,7 @@ impl SushApi for ApiServer {
         let Authorization { authorization } = headers.into_inner();
         let authn = mgr.iam(authorization, None).await?;
         let KeyIdParam { key_id } = params.into_inner();
-        let certs = mgr.cert_chain(&authn, &key_id)?;
+        let certs = mgr.cert_chain(&authn, &key_id).await?;
         let chain = pem_cert_chain(certs).map_err(JobError::Key)?;
         Ok(HttpResponseOk(chain))
     }
@@ -105,7 +105,7 @@ impl SushApi for ApiServer {
         let mgr = ctx.context();
         let Authorization { authorization } = headers.into_inner();
         let authn = mgr.iam(authorization, None).await?;
-        if let Some(session) = mgr.session(&authn)? {
+        if let Some(session) = mgr.session(&authn).await? {
             Ok(HttpResponseOk(session))
         } else {
             Err(JobError::NoSession.into())
@@ -161,7 +161,7 @@ impl SushApi for ApiServer {
         if let Some(Ok(end)) = mgr.job_start(&authn, job, params).await? {
             Ok(HttpResponseOk(end.into()))
         } else {
-            Ok(HttpResponseOk(mgr.job_status(&authn, &job_id)?))
+            Ok(HttpResponseOk(mgr.job_status(&authn, &job_id).await?))
         }
     }
 
@@ -187,7 +187,7 @@ impl SushApi for ApiServer {
         let Authorization { authorization } = headers.into_inner();
         let authn = mgr.iam(authorization, None).await?;
         let JobIdParam { job_id } = params.into_inner();
-        Ok(HttpResponseOk(mgr.job_status(&authn, &job_id)?))
+        Ok(HttpResponseOk(mgr.job_status(&authn, &job_id).await?))
     }
 
     async fn job_output(

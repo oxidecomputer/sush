@@ -10,7 +10,7 @@ use std::num::NonZeroUsize;
 use std::os::fd::AsRawFd as _;
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
-use std::sync::{Arc, Mutex, MutexGuard};
+use std::sync::Arc;
 
 use blake3::Hasher;
 use bytesize::ByteSize;
@@ -24,7 +24,7 @@ use slog::{Logger, debug, error, info, o, warn};
 use terminfo::Database as Terminfo;
 use tokio::process::Command;
 use tokio::spawn;
-use tokio::sync::{mpsc, oneshot};
+use tokio::sync::{Mutex, MutexGuard, mpsc, oneshot};
 use x509_cert::Certificate;
 use x509_cert::der::{DecodePem as _, Encode as _};
 
@@ -113,8 +113,8 @@ impl JobManager {
             async move {
                 while let Some(end) = rx_monitor.recv().await {
                     if let Err(err) = job_ended(
-                        &mut active_jobs.lock().unwrap(),
-                        &mut job_history.lock().unwrap(),
+                        &mut *active_jobs.lock().await,
+                        &mut *job_history.lock().await,
                         &output_dir,
                         end,
                     ) {
@@ -141,7 +141,8 @@ impl JobManager {
 
         // Import the root certificates.
         for root in ROOT_CERTS {
-            new.import_cert_inner(Certificate::from_pem(root)?, true)?;
+            new.import_cert_inner(Certificate::from_pem(root)?, true)
+                .await?;
         }
 
         Ok(new)
@@ -150,16 +151,24 @@ impl JobManager {
     // Certificate management.
 
     #[cfg(test)]
-    fn import_root(&self, root: Certificate) -> Result<KeyId, JobError> {
-        self.import_cert_inner(root, true)
+    async fn import_root(&self, root: Certificate) -> Result<KeyId, JobError> {
+        self.import_cert_inner(root, true).await
     }
 
-    pub fn import_cert(&self, _authn: &Identity, cert: Certificate) -> Result<KeyId, JobError> {
-        self.import_cert_inner(cert, false)
+    pub async fn import_cert(
+        &self,
+        _authn: &Identity,
+        cert: Certificate,
+    ) -> Result<KeyId, JobError> {
+        self.import_cert_inner(cert, false).await
     }
 
-    fn import_cert_inner(&self, cert: Certificate, root_allowed: bool) -> Result<KeyId, JobError> {
-        let mut certs = self.certs.lock().unwrap();
+    async fn import_cert_inner(
+        &self,
+        cert: Certificate,
+        root_allowed: bool,
+    ) -> Result<KeyId, JobError> {
+        let mut certs = self.certs.lock().await;
 
         // Verify the certificate signature.
         let signature = Signature::try_from(&cert)?;
@@ -194,12 +203,12 @@ impl JobManager {
     }
 
     /// Return the cert chain for the given key in root-to-leaf order.
-    pub fn cert_chain(
+    pub async fn cert_chain(
         &self,
         _authn: &Identity,
         key_id: &KeyId,
     ) -> Result<Vec<Certificate>, JobError> {
-        let certs = self.certs.lock().unwrap();
+        let certs = self.certs.lock().await;
         let mut chain = Vec::new();
         let mut key_id = key_id.to_owned();
         loop {
@@ -234,7 +243,7 @@ impl JobManager {
             ($error:expr) => {{
                 warn!(self.log, "authentication failed"; "error" => %$error);
                 let nonce = Nonce::generate();
-                self.nonces.lock().unwrap().put(nonce.clone(), Utc::now());
+                self.nonces.lock().await.put(nonce.clone(), Utc::now());
                 return Err(JobError::unauthorized(nonce));
             }};
         }
@@ -266,17 +275,12 @@ impl JobManager {
         } = credentials.clone();
 
         // Check for a revoked identity.
-        if self
-            .revoked_identities
-            .lock()
-            .unwrap()
-            .contains_key(&key_id)
-        {
+        if self.revoked_identities.lock().await.contains_key(&key_id) {
             unauthorized!("identity revoked");
         }
 
         // Prune the cache.
-        let mut identities = self.identities.lock().unwrap();
+        let mut identities = self.identities.lock().await;
         let mut expired = HashSet::new();
         let now = Utc::now();
         for (key_id, (identity, _credentials)) in identities.iter() {
@@ -313,7 +317,7 @@ impl JobManager {
         let identity = try_authn!(Identity::new(public_key.to_owned(), verified, now));
 
         // Claim the nonce.
-        let Some(generated) = self.nonces.lock().unwrap().pop(&nonce) else {
+        let Some(generated) = self.nonces.lock().await.pop(&nonce) else {
             unauthorized!("nonce not found");
         };
         if !Nonce::is_still_valid(&generated, &now) {
@@ -330,7 +334,7 @@ impl JobManager {
         Ok(self
             .identities
             .lock()
-            .unwrap()
+            .await
             .iter()
             .map(|(_, (identity, _credentials))| identity.to_owned())
             .collect())
@@ -339,7 +343,7 @@ impl JobManager {
     pub async fn revoke_identity(&self, _authn: &Identity, key_id: KeyId) -> Result<(), JobError> {
         // Update identity tables and drop locks before stopping a session.
         {
-            let mut revoked = self.revoked_identities.lock().unwrap();
+            let mut revoked = self.revoked_identities.lock().await;
             if revoked.len() >= MAX_REVOKED_IDENTITIES && !revoked.contains_key(&key_id) {
                 return Err(JobError::TooManyRevocations(MAX_REVOKED_IDENTITIES));
             }
@@ -347,7 +351,7 @@ impl JobManager {
             let time_revoked = Utc::now();
             revoked.insert(key_id.clone(), time_revoked);
 
-            let mut cached = self.identities.lock().unwrap();
+            let mut cached = self.identities.lock().await;
             for ((id, _nonce), (identity, _credentials)) in cached.iter_mut() {
                 if *id == key_id {
                     identity.time_revoked = Some(time_revoked);
@@ -355,13 +359,12 @@ impl JobManager {
             }
         }
 
-        if let Some(session) = {
-            self.session
-                .lock()
-                .unwrap()
-                .take_if(|session| session.key_id() == Some(&key_id))
-        } {
+        let mut session_guard = self.session.lock().await;
+        if let Some(session) = session_guard.as_ref()
+            && session.key_id() == Some(&key_id)
+        {
             self.session_stop_inner(session).await?;
+            session_guard.take();
         }
 
         Ok(())
@@ -369,8 +372,8 @@ impl JobManager {
 
     // Session management.
 
-    pub fn session(&self, authn: &Identity) -> Result<Option<Session>, JobError> {
-        if let Some(session) = self.session.lock().unwrap().as_ref() {
+    pub async fn session(&self, authn: &Identity) -> Result<Option<Session>, JobError> {
+        if let Some(session) = self.session.lock().await.as_ref() {
             if session.key_id() != Some(&authn.key_id) {
                 Err(JobError::SessionWrongIdentity)
             } else {
@@ -384,19 +387,11 @@ impl JobManager {
     pub async fn session_start(&self, authn: &Identity) -> Result<SessionId, JobError> {
         let new_session_id = SessionId::new();
         let new_session = Session::new(new_session_id.clone(), Some(authn.key_id.clone()));
-
-        // We can not hold the session lock while we stop an old session,
-        // so we may have to try more than once.
-        loop {
-            if let Some(old_session) = { self.session.lock().unwrap().take() } {
-                self.session_stop_inner(old_session).await?;
-            }
-            let mut session = self.session.lock().unwrap();
-            if session.is_none() {
-                *session = Some(new_session);
-                break;
-            }
+        let mut session_guard = self.session.lock().await;
+        if let Some(old_session) = session_guard.as_ref() {
+            self.session_stop_inner(old_session).await?;
         }
+        *session_guard = Some(new_session);
         info!(self.log, "session started"; "session_id" => %new_session_id);
         Ok(new_session_id)
     }
@@ -407,32 +402,30 @@ impl JobManager {
         session_id: &SessionId,
     ) -> Result<(), JobError> {
         // Anyone is allowed to stop a session.
-        let session = {
-            let mut session_guard = self.session.lock().unwrap();
-            session_guard.take_if(|session| session.session_id() == session_id)
-        };
-        if let Some(session) = session {
-            self.session_stop_inner(session).await
+        let mut session_guard = self.session.lock().await;
+        if let Some(session) = session_guard.as_ref()
+            && session.session_id() == session_id
+        {
+            self.session_stop_inner(session).await?;
+            *session_guard = None;
+            Ok(())
         } else {
             Err(JobError::SessionNotFound(session_id.to_owned()))
         }
     }
 
-    async fn session_stop_inner(&self, session: Session) -> Result<(), JobError> {
+    async fn session_stop_inner(&self, session: &Session) -> Result<(), JobError> {
         for job_id in {
             self.active_jobs
                 .lock()
-                .unwrap()
+                .await
                 .iter()
                 .filter(|(_id, status)| status.session_id() == Some(session.session_id()))
                 .map(|(id, _status)| id.to_owned())
                 .collect::<Vec<JobId>>()
         } {
-            if let Err(err) = self.monitor(MonitorRequest::Stop(job_id.to_owned())).await {
-                // Restore the old session on error.
-                self.session.lock().unwrap().replace(session);
-                return Err(err);
-            }
+            self.monitor(MonitorRequest::Stop(job_id.to_owned()))
+                .await?;
         }
         info!(self.log, "session stopped"; "session_id" => %session.session_id());
         Ok(())
@@ -444,7 +437,7 @@ impl JobManager {
         Ok(self
             .job_history
             .lock()
-            .unwrap()
+            .await
             .iter()
             .map(|(_id, status)| status.to_owned())
             .collect())
@@ -458,7 +451,7 @@ impl JobManager {
     ) -> Result<Option<ExecutionResult>, JobError> {
         let wait = params.wait;
         let started = {
-            let mut session_guard = self.session.lock().unwrap();
+            let mut session_guard = self.session.lock().await;
             let Some(session) = session_guard.clone() else {
                 return Err(JobError::NoSession);
             };
@@ -477,13 +470,14 @@ impl JobManager {
                     return Err(JobError::TooManyJobs(MAX_ACTIVE_JOBS));
                 }
                 Ok(())
-            })?;
+            })
+            .await?;
 
             let cert_key_id = job.key_id().to_owned();
             let cert = self
                 .certs
                 .lock()
-                .unwrap()
+                .await
                 .get(&cert_key_id)
                 .cloned()
                 .ok_or_else(|| JobError::MissingCert(cert_key_id))?;
@@ -505,7 +499,8 @@ impl JobManager {
             self.with_jobs(&mut session_guard, |active_jobs, _history| {
                 active_jobs.insert(job_id, JobStatus::from(&started));
                 Ok(())
-            })?;
+            })
+            .await?;
 
             session_guard
                 .as_mut()
@@ -522,10 +517,15 @@ impl JobManager {
     /// For jobs in the current session, only the owner is allowed access.
     /// For jobs from previous sessions, anyone may access them; otherwise
     /// they would be orphaned.
-    fn check_job_owner(&self, authn: &Identity, job_id: &JobId) -> Result<(), JobError> {
-        let mut session_guard = self.session.lock().unwrap();
+    async fn check_job_owner(
+        &self,
+        session_guard: &mut SessionGuard<'_>,
+        authn: &Identity,
+        job_id: &JobId,
+    ) -> Result<(), JobError> {
         let Some(job_session_id) = self
-            .job_status_inner(job_id, &mut session_guard)?
+            .job_status_inner(job_id, session_guard)
+            .await?
             .session_id()
             .cloned()
         else {
@@ -546,32 +546,42 @@ impl JobManager {
         authn: &Identity,
         job_id: &JobId,
     ) -> Result<SocketSender, JobError> {
-        self.check_job_owner(authn, job_id)?;
+        let mut session_guard = self.session.lock().await;
+        self.check_job_owner(&mut session_guard, authn, job_id)
+            .await?;
         let (tx, rx) = oneshot::channel();
         self.monitor(MonitorRequest::interactive_session(job_id, tx))
             .await?;
         rx.await?
     }
 
-    pub fn job_status(&self, authn: &Identity, job_id: &JobId) -> Result<JobStatus, JobError> {
-        self.check_job_owner(authn, job_id)?;
-        self.job_status_inner(job_id, &mut self.session.lock().unwrap())
+    pub async fn job_status(
+        &self,
+        authn: &Identity,
+        job_id: &JobId,
+    ) -> Result<JobStatus, JobError> {
+        let mut session_guard = self.session.lock().await;
+        self.check_job_owner(&mut session_guard, authn, job_id)
+            .await?;
+        self.job_status_inner(job_id, &mut session_guard).await
     }
 
-    fn job_status_inner(
+    async fn job_status_inner(
         &self,
         job_id: &JobId,
-        session_guard: &mut SessionGuard,
+        session_guard: &mut SessionGuard<'_>,
     ) -> Result<JobStatus, JobError> {
-        let mut status = self.with_jobs(session_guard, |active_jobs, job_history| {
-            Ok(active_jobs
-                .get(job_id)
-                .cloned()
-                .or_else(|| job_history.peek(job_id).cloned())
-                .unwrap_or_else(|| JobStatus::Unknown {
-                    job_id: job_id.to_owned(),
-                }))
-        })?;
+        let mut status = self
+            .with_jobs(session_guard, |active_jobs, job_history| {
+                Ok(active_jobs
+                    .get(job_id)
+                    .cloned()
+                    .or_else(|| job_history.peek(job_id).cloned())
+                    .unwrap_or_else(|| JobStatus::Unknown {
+                        job_id: job_id.to_owned(),
+                    }))
+            })
+            .await?;
         if let JobStatus::Started {
             stdout_len,
             stderr_len,
@@ -586,22 +596,24 @@ impl JobManager {
 
     /// The `_session_guard` argument ensures that the session is locked
     /// before we take the job table locks.
-    fn with_jobs<T>(
+    async fn with_jobs<T>(
         &self,
-        _session_guard: &mut SessionGuard,
+        _session_guard: &mut SessionGuard<'_>,
         f: impl FnOnce(
             &mut BTreeMap<JobId, JobStatus>,
             &mut LruCache<JobId, JobStatus>,
         ) -> Result<T, JobError>,
     ) -> Result<T, JobError> {
         f(
-            &mut self.active_jobs.lock().unwrap(),
-            &mut self.job_history.lock().unwrap(),
+            &mut *self.active_jobs.lock().await,
+            &mut *self.job_history.lock().await,
         )
     }
 
     pub async fn job_stop(&self, authn: &Identity, job_id: &JobId) -> Result<(), JobError> {
-        self.check_job_owner(authn, job_id)?;
+        let mut session_guard = self.session.lock().await;
+        self.check_job_owner(&mut session_guard, authn, job_id)
+            .await?;
         self.monitor(MonitorRequest::Stop(job_id.to_owned())).await
     }
 
@@ -612,7 +624,9 @@ impl JobManager {
         stream: JobOutputStream,
         range: Option<Range>,
     ) -> Result<Vec<u8>, JobError> {
-        self.check_job_owner(authn, job_id)?;
+        let mut session_guard = self.session.lock().await;
+        self.check_job_owner(&mut session_guard, authn, job_id)
+            .await?;
         get_job_output(&self.output_dir, job_id, stream, range)
     }
 
@@ -626,32 +640,32 @@ impl JobManager {
         stream: JobOutputStream,
         range: Option<Range>,
     ) -> Result<u64, JobError> {
-        self.check_job_owner(authn, job_id)?;
+        let mut session_guard = self.session.lock().await;
+        self.check_job_owner(&mut session_guard, authn, job_id)
+            .await?;
         let n = delete_job_output(&self.output_dir, job_id, stream, range)?;
-        self.with_jobs(
-            &mut self.session.lock().unwrap(),
-            |active_jobs, job_history| {
-                if let Some(JobStatus::Started {
-                    stdout_len,
-                    stderr_len,
-                    ..
-                })
-                | Some(JobStatus::Ended {
-                    stdout_len,
-                    stderr_len,
-                    ..
-                }) = active_jobs
-                    .get_mut(job_id)
-                    .or_else(|| job_history.get_mut(job_id))
-                {
-                    match stream {
-                        Stdout => *stdout_len = n,
-                        Stderr => *stderr_len = n,
-                    }
+        self.with_jobs(&mut session_guard, |active_jobs, job_history| {
+            if let Some(JobStatus::Started {
+                stdout_len,
+                stderr_len,
+                ..
+            })
+            | Some(JobStatus::Ended {
+                stdout_len,
+                stderr_len,
+                ..
+            }) = active_jobs
+                .get_mut(job_id)
+                .or_else(|| job_history.get_mut(job_id))
+            {
+                match stream {
+                    Stdout => *stdout_len = n,
+                    Stderr => *stderr_len = n,
                 }
-                Ok(())
-            },
-        )?;
+            }
+            Ok(())
+        })
+        .await?;
         Ok(n)
     }
 
@@ -1050,7 +1064,7 @@ mod test {
         let log = Logger::root(drain, o!("test" => test_name));
         let mgr = JobManager::new(log, dir.path()).await.unwrap();
         let root = ephemeral_test_root();
-        let key_id = mgr.import_root(root.cert().to_owned()).unwrap();
+        let key_id = mgr.import_root(root.cert().to_owned()).await.unwrap();
         assert_eq!(&key_id, root.key_id());
         (mgr, root, dir)
     }
@@ -1088,7 +1102,7 @@ mod test {
         let job_id = session_id.first_job_id();
         let job = root.sign_job_request(&job_id, "true", false).await;
         assert!(matches!(
-            mgr.job_status(&authn, &job_id).unwrap_err(),
+            mgr.job_status(&authn, &job_id).await.unwrap_err(),
             JobError::JobNotFound(id) if id == job_id
         ));
         let status = job_status(&authn, &mgr, job.clone()).await;
@@ -1198,7 +1212,7 @@ mod test {
         );
 
         // Check that the job is alive.
-        let status = mgr.job_status(&authn, &job_id).unwrap();
+        let status = mgr.job_status(&authn, &job_id).await.unwrap();
         check_status_started(status, root.cert(), &job_id, command);
 
         // Kill the job and wait for it to die.
@@ -1206,7 +1220,7 @@ mod test {
         sleep(Duration::from_millis(10)).await;
 
         // Check that it's dead and that it didn't live for long.
-        let status = mgr.job_status(&authn, &job_id).unwrap();
+        let status = mgr.job_status(&authn, &job_id).await.unwrap();
         assert!(status.time_elapsed().unwrap().to_std().unwrap() < Duration::from_secs(1));
         check_status_ended(status, &job_id, command, None, 0, 0);
     }
@@ -1241,29 +1255,34 @@ mod test {
         let mgr = JobManager::new(log, dir.path()).await.unwrap();
         assert!(
             matches!(
-                mgr.import_cert(&authn, root_cert.clone()).unwrap_err(),
+                mgr.import_cert(&authn, root_cert.clone())
+                    .await
+                    .unwrap_err(),
                 JobError::Key(KeyError::SelfSigned),
             ),
             "should not accept root cert without override"
         );
         assert!(
             matches!(
-                mgr.import_cert(&authn, child.cert().clone()).unwrap_err(),
+                mgr.import_cert(&authn, child.cert().clone()).await.unwrap_err(),
                 JobError::MissingCert(key_id) if key_id == root_key_id,
             ),
             "should not accept child cert without root"
         );
-        assert_eq!(mgr.import_root(root_cert.clone()).unwrap(), root_key_id);
         assert_eq!(
-            mgr.cert_chain(&authn, &root_key_id).unwrap(),
+            mgr.import_root(root_cert.clone()).await.unwrap(),
+            root_key_id
+        );
+        assert_eq!(
+            mgr.cert_chain(&authn, &root_key_id).await.unwrap(),
             vec![root_cert.clone()]
         );
         assert_eq!(
-            mgr.import_cert(&authn, child.cert().clone()).unwrap(),
+            mgr.import_cert(&authn, child.cert().clone()).await.unwrap(),
             child_key_id
         );
         assert_eq!(
-            mgr.cert_chain(&authn, &child_key_id).unwrap(),
+            mgr.cert_chain(&authn, &child_key_id).await.unwrap(),
             vec![root_cert.clone(), child.cert().clone()]
         );
 
