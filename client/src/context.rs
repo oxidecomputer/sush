@@ -7,7 +7,7 @@ use std::time::Duration;
 use clap::ValueEnum;
 
 use sush_common::authn::{Credentials, Identity};
-use sush_common::jobs::{JobId, JobOutputStream, JobStatus, SessionId, SignedJob};
+use sush_common::jobs::{JobId, JobOutputStream, JobStatus, Session, SessionId, SignedJob};
 use sush_common::keys::{KeyId, SshPublicKey};
 
 use crate::commands::{CommandError, GlobalArgs};
@@ -50,7 +50,7 @@ pub trait CommandContext: Send + Sync {
     fn set_credentials(&mut self, credentials: Option<Credentials>);
     fn session_id(&self) -> Option<&SessionId>;
     fn next_job_id(&self) -> Result<JobId, CommandError>;
-    fn session_started(&mut self, session_id: &SessionId) -> Result<(), CommandError>;
+    fn session_started(&mut self, session: Session) -> Result<(), CommandError>;
     fn session_stopped(&mut self, session_id: &SessionId) -> Result<(), CommandError>;
 
     // Job signing certificates

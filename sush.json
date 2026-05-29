@@ -667,7 +667,7 @@
             "content": {
               "application/json": {
                 "schema": {
-                  "$ref": "#/components/schemas/SessionId"
+                  "$ref": "#/components/schemas/Session"
                 }
               }
             }

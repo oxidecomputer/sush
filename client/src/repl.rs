@@ -14,7 +14,7 @@ use shlex::split as split_command;
 use xdg::BaseDirectories;
 
 use sush_common::authn::{Credentials, Identity};
-use sush_common::jobs::{JobId, JobOutputStream, JobStatus, SessionId, SignedJob};
+use sush_common::jobs::{JobId, JobOutputStream, JobStatus, Session, SessionId, SignedJob};
 use sush_common::keys::{KeyId, SshPublicKey};
 
 use crate::Client;
@@ -205,8 +205,8 @@ impl CommandContext for Repl {
         self.cli.next_job_id()
     }
 
-    fn session_started(&mut self, session_id: &SessionId) -> Result<(), CommandError> {
-        self.cli.session_started(session_id)
+    fn session_started(&mut self, session: Session) -> Result<(), CommandError> {
+        self.cli.session_started(session)
     }
 
     fn session_stopped(&mut self, session_id: &SessionId) -> Result<(), CommandError> {

@@ -384,16 +384,16 @@ impl JobManager {
         }
     }
 
-    pub async fn session_start(&self, authn: &Identity) -> Result<SessionId, JobError> {
+    pub async fn session_start(&self, authn: &Identity) -> Result<Session, JobError> {
         let new_session_id = SessionId::new();
         let new_session = Session::new(new_session_id.clone(), Some(authn.key_id.clone()));
         let mut session_guard = self.session.lock().await;
         if let Some(old_session) = session_guard.as_ref() {
             self.session_stop_inner(old_session).await?;
         }
-        *session_guard = Some(new_session);
+        *session_guard = Some(new_session.clone());
         info!(self.log, "session started"; "session_id" => %new_session_id);
-        Ok(new_session_id)
+        Ok(new_session)
     }
 
     pub async fn session_stop(
@@ -1104,7 +1104,8 @@ mod test {
     async fn jobs() {
         let (mgr, mut root, _dir) = manager_and_test_root(function_name!()).await;
         let authn = fake_identity(&mut root).await;
-        let session_id = mgr.session_start(&authn).await.unwrap();
+        let session = mgr.session_start(&authn).await.unwrap();
+        let session_id = session.session_id();
         let job_id = session_id.first_job_id();
         let job = root.sign_job_request(&job_id, "true", false).await;
         assert!(matches!(
@@ -1172,8 +1173,8 @@ mod test {
 
         let job_id = session_id.next_job_id(&job);
         let job = root.sign_job_request(&job_id, "foo", false).await;
-        let new_session_id = mgr.session_start(&authn).await.unwrap();
-        assert_ne!(new_session_id, session_id);
+        let new_session = mgr.session_start(&authn).await.unwrap();
+        assert_ne!(new_session.session_id(), session_id);
         assert!(
             matches!(
                 job_error(&authn, &mgr, job).await,
@@ -1192,7 +1193,7 @@ mod test {
             "should not be able to use old session job ID in new session"
         );
 
-        let job_id = new_session_id.first_job_id();
+        let job_id = new_session.session_id().first_job_id();
         let job = root.sign_job_request(&job_id, "true", false).await;
         let status = job_status(&authn, &mgr, job).await;
         check_status_ended(status, &job_id, "true", Some(0), 0, 0);
@@ -1203,7 +1204,8 @@ mod test {
     async fn abort() {
         let (mgr, mut root, _dir) = manager_and_test_root(function_name!()).await;
         let authn = fake_identity(&mut root).await;
-        let session_id = mgr.session_start(&authn).await.unwrap();
+        let session = mgr.session_start(&authn).await.unwrap();
+        let session_id = session.session_id();
         let job_id = session_id.first_job_id();
 
         // Start a (potentially) long-running job.
@@ -1292,7 +1294,8 @@ mod test {
             vec![root_cert.clone(), child.cert().clone()]
         );
 
-        let session_id = mgr.session_start(&authn).await.unwrap();
+        let session = mgr.session_start(&authn).await.unwrap();
+        let session_id = session.session_id();
         let job_id = session_id.first_job_id();
         let job = child.sign_job_request(&job_id, "true", false).await;
         let status = job_status(&authn, &mgr, job).await;
@@ -1304,7 +1307,8 @@ mod test {
     async fn too_much_cpu() {
         let (mgr, mut root, _dir) = manager_and_test_root(function_name!()).await;
         let authn = fake_identity(&mut root).await;
-        let session_id = mgr.session_start(&authn).await.unwrap();
+        let session = mgr.session_start(&authn).await.unwrap();
+        let session_id = session.session_id();
         let job_id = session_id.first_job_id();
         let command = "openssl speed sha1";
         let job = root.sign_job_request(&job_id, command, false).await;
@@ -1350,7 +1354,8 @@ mod test {
     async fn output_ranges() {
         let (mgr, mut root, _dir) = manager_and_test_root(function_name!()).await;
         let authn = fake_identity(&mut root).await;
-        let session_id = mgr.session_start(&authn).await.unwrap();
+        let session = mgr.session_start(&authn).await.unwrap();
+        let session_id = session.session_id();
         let job_id = session_id.first_job_id();
 
         // Read some random bytes.

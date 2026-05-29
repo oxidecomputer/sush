@@ -33,7 +33,7 @@ use sush_common::authn::{AuthnError, Challenge, ChallengeResponse, Credentials, 
 use sush_common::interactive::InteractiveSessionError;
 use sush_common::jobs::JobOutputStream::{self, Stderr, Stdout};
 use sush_common::jobs::{
-    JobId, JobLimits, JobOutputHash, JobStartRequest, JobStatus, SessionId, SignedJob,
+    JobId, JobLimits, JobOutputHash, JobStartRequest, JobStatus, Session, SessionId, SignedJob,
 };
 use sush_common::keys::{KeyError, KeyId, Signer as _};
 
@@ -657,7 +657,7 @@ async fn session(
 ) -> Result<(), CommandError> {
     match (command, client) {
         (SessionCommand::Start { session_id: None }, Some(client)) => {
-            let session_id = with_authz!(
+            let session = with_authz!(
                 ctx,
                 client,
                 ssh_auth_sock,
@@ -668,7 +668,7 @@ async fn session(
                     .send()
             )?
             .into_inner();
-            ctx.session_started(&session_id)?;
+            ctx.session_started(session)?;
             Ok(())
         }
 
@@ -678,7 +678,7 @@ async fn session(
             },
             Some(client),
         ) => {
-            let server_session = with_authz!(
+            let session = with_authz!(
                 ctx,
                 client,
                 ssh_auth_sock,
@@ -689,10 +689,10 @@ async fn session(
                     .send()
             )?
             .into_inner();
-            if *server_session.session_id() != session_id {
+            if *session.session_id() != session_id {
                 return Err(CommandError::MissingSession);
             }
-            ctx.session_started(&session_id)?;
+            ctx.session_started(session)?;
             Ok(())
         }
 
@@ -702,7 +702,7 @@ async fn session(
             },
             None,
         ) => {
-            ctx.session_started(&session_id)?;
+            ctx.session_started(Session::new(session_id, None))?;
             Ok(())
         }
 

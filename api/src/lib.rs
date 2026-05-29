@@ -93,7 +93,7 @@ pub trait SushApi {
     async fn session_start(
         ctx: RequestContext<Self::Context>,
         headers: Header<Authorization>,
-    ) -> Result<HttpResponseOk<SessionId>, HttpError>;
+    ) -> Result<HttpResponseOk<Session>, HttpError>;
 
     /// End a support session.
     ///

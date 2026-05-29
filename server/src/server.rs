@@ -16,7 +16,7 @@ use sush_api::{
     SessionIdParam, SushApi,
 };
 use sush_common::authn::Identity;
-use sush_common::jobs::{JobStatus, Session, SessionId, SignedJob};
+use sush_common::jobs::{JobStatus, Session, SignedJob};
 use sush_common::keys::{KeyId, SshPublicKey, pem_cert_chain};
 
 use crate::error::JobError;
@@ -115,12 +115,12 @@ impl SushApi for ApiServer {
     async fn session_start(
         ctx: RequestContext<Self::Context>,
         headers: Header<Authorization>,
-    ) -> Result<HttpResponseOk<SessionId>, HttpError> {
+    ) -> Result<HttpResponseOk<Session>, HttpError> {
         let mgr = ctx.context();
         let Authorization { authorization } = headers.into_inner();
         let authn = mgr.iam(authorization, None).await?;
-        let session_id = mgr.session_start(&authn).await?;
-        Ok(HttpResponseOk(session_id))
+        let session = mgr.session_start(&authn).await?;
+        Ok(HttpResponseOk(session))
     }
 
     async fn session_stop(
