@@ -573,13 +573,11 @@ impl JobManager {
     ) -> Result<JobStatus, JobError> {
         let mut status = self
             .with_jobs(session_guard, |active_jobs, job_history| {
-                Ok(active_jobs
+                active_jobs
                     .get(job_id)
                     .cloned()
                     .or_else(|| job_history.peek(job_id).cloned())
-                    .unwrap_or_else(|| JobStatus::Unknown {
-                        job_id: job_id.to_owned(),
-                    }))
+                    .ok_or_else(|| JobError::JobNotFound(job_id.to_owned()))
             })
             .await?;
         if let JobStatus::Started {
@@ -1221,7 +1219,7 @@ mod test {
 
         // Check that it's dead and that it didn't live for long.
         let status = mgr.job_status(&authn, &job_id).await.unwrap();
-        assert!(status.time_elapsed().unwrap().to_std().unwrap() < Duration::from_secs(1));
+        assert!(status.time_elapsed().to_std().unwrap() < Duration::from_secs(1));
         check_status_ended(status, &job_id, command, None, 0, 0);
     }
 
@@ -1321,7 +1319,7 @@ mod test {
             .expect("should be waiting for job")
             .expect("job should end successfully"),
         );
-        assert!(status.time_elapsed().unwrap().to_std().unwrap() < Duration::from_secs(2));
+        assert!(status.time_elapsed().to_std().unwrap() < Duration::from_secs(2));
 
         // The output of `openssl speed` changed between v3.0 and v3.5.
         let stderr = mgr.job_output(&authn, &job_id, Stderr, None).await.unwrap();

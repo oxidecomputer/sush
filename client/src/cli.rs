@@ -293,7 +293,7 @@ impl CommandContext for Cli {
 
     fn job_polling_update(&mut self, _job_id: &JobId, status: &JobStatus) {
         if let Some(progress) = &mut self.progress {
-            if let JobStatus::Started {
+            let (JobStatus::Started {
                 stdout_len,
                 stderr_len,
                 ..
@@ -302,12 +302,10 @@ impl CommandContext for Cli {
                 stdout_len,
                 stderr_len,
                 ..
-            } = status
-            {
-                let stdout_len = byte_size(*stdout_len);
-                let stderr_len = byte_size(*stderr_len);
-                progress.set_message(format!("stdout: {stdout_len}, stderr: {stderr_len}"));
-            }
+            }) = status;
+            let stdout_len = byte_size(*stdout_len);
+            let stderr_len = byte_size(*stderr_len);
+            progress.set_message(format!("stdout: {stdout_len}, stderr: {stderr_len}"));
             progress.tick();
         }
     }
@@ -381,26 +379,17 @@ impl CommandContext for Cli {
     }
 
     fn job_status(&mut self, job_id: &JobId, status: &JobStatus) {
-        fn format_elapsed_duration(duration: Option<TimeDelta>) -> String {
-            match duration {
-                None => String::from("empty duration"),
-                Some(duration) => {
-                    if let Ok(duration) = duration.to_std() {
-                        format_duration(duration).to_string()
-                    } else {
-                        String::from("negative duration, times may be unreliable")
-                    }
-                }
+        fn format_elapsed_duration(duration: TimeDelta) -> String {
+            if let Ok(duration) = duration.to_std() {
+                format_duration(duration).to_string()
+            } else {
+                String::from("negative duration, times may be unreliable")
             }
         }
 
         match self.get_output_format() {
             OutputFormat::Json => println!("{}", json!(status)),
             OutputFormat::Text => match status {
-                JobStatus::Unknown { job_id } => println!(
-                    "✅ Job ID:\t{job_id}\n   \
-                     Job status:\tUnknown"
-                ),
                 JobStatus::Started {
                     job,
                     session_id,

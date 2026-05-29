@@ -223,9 +223,6 @@ pub type VerifiedJob = Verified<JobStartRequest>;
 
 #[derive(Clone, Debug, Deserialize, JsonSchema, Serialize)]
 pub enum JobStatus {
-    Unknown {
-        job_id: JobId,
-    },
     Started {
         job: VerifiedJob,
         session_id: SessionId,
@@ -249,27 +246,24 @@ pub enum JobStatus {
 impl JobStatus {
     pub fn session_id(&self) -> Option<&SessionId> {
         match self {
-            Self::Unknown { .. } => None,
             Self::Started { session_id, .. } => Some(session_id),
             Self::Ended { session_id, .. } => Some(session_id),
         }
     }
 
-    pub fn time_elapsed(&self) -> Option<TimeDelta> {
+    pub fn time_elapsed(&self) -> TimeDelta {
         match self {
-            Self::Unknown { .. } => None,
-            Self::Started { time_started, .. } => Some(Utc::now() - time_started),
+            Self::Started { time_started, .. } => Utc::now() - time_started,
             Self::Ended {
                 time_started,
                 time_ended,
                 ..
-            } => Some(*time_ended - time_started),
+            } => *time_ended - time_started,
         }
     }
 
     pub fn job_id(&self) -> &JobId {
         match self {
-            Self::Unknown { job_id, .. } => job_id,
             Self::Started { job, .. } | Self::Ended { job, .. } => job.job_id(),
         }
     }

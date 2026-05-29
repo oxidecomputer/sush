@@ -1094,7 +1094,6 @@ async fn job_output(
     )?
     .into_inner();
     let (stdout_len, stderr_len, stdout_hash, stderr_hash) = match status {
-        JobStatus::Unknown { job_id } => return Err(CommandError::JobNotFound(job_id)),
         JobStatus::Started { .. } => return Err(CommandError::JobStillRunning(job_id.to_owned())),
         JobStatus::Ended {
             stdout_len,
