@@ -433,12 +433,20 @@ impl JobManager {
 
     // Job management.
 
-    pub async fn job_history(&self, _authn: &Identity) -> Result<Vec<JobStatus>, JobError> {
+    pub async fn job_history(&self, authn: &Identity) -> Result<Vec<JobStatus>, JobError> {
+        let session_guard = self.session.lock().await;
+        let session_id = session_guard.as_ref().map(|s| s.session_id().to_owned());
+        let session_owner = session_guard
+            .as_ref()
+            .map(|s| s.key_id() == Some(&authn.key_id))
+            .unwrap_or(false);
+
         Ok(self
             .job_history
             .lock()
             .await
             .iter()
+            .filter(|(_id, status)| status.session_id() != session_id.as_ref() || session_owner)
             .map(|(_id, status)| status.to_owned())
             .collect())
     }
