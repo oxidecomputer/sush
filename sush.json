@@ -102,6 +102,7 @@
     "/iam": {
       "get": {
         "summary": "List cached identities.",
+        "description": "May include duplicate identities with different nonces.",
         "operationId": "identities",
         "parameters": [
           {
@@ -792,26 +793,6 @@
           {
             "type": "object",
             "properties": {
-              "Unknown": {
-                "type": "object",
-                "properties": {
-                  "job_id": {
-                    "$ref": "#/components/schemas/JobId"
-                  }
-                },
-                "required": [
-                  "job_id"
-                ]
-              }
-            },
-            "required": [
-              "Unknown"
-            ],
-            "additionalProperties": false
-          },
-          {
-            "type": "object",
-            "properties": {
               "Started": {
                 "type": "object",
                 "properties": {
@@ -911,10 +892,6 @@
           }
         ]
       },
-      "JobId": {
-        "description": "A globally unique identifier for a job within a session.",
-        "type": "string"
-      },
       "Verified_for_JobStartRequest": {
         "description": "An envelope whose signature has been verified.",
         "type": "object",
@@ -969,6 +946,10 @@
           "command",
           "job_id"
         ]
+      },
+      "JobId": {
+        "description": "A globally unique identifier for a job within a session.",
+        "type": "string"
       },
       "EncodedSignature": {
         "description": "Code phrase encoded signature.\n\nThe decoded phrases `r` and `s` together comprise a signature _(r, s)_ over a 256 bit elliptic curve.\n\nThe `flags` and `counter` parameters are for the [`SK-*` family of SSH public keys](https://cvsweb.openbsd.org/src/usr.bin/ssh/PROTOCOL.u2f?annotate=HEAD). They should be set to 0 for other key types.",

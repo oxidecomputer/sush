@@ -56,6 +56,8 @@ pub trait SushApi {
     ) -> Result<HttpResponseOk<Identity>, HttpError>;
 
     /// List cached identities.
+    ///
+    /// May include duplicate identities with different nonces.
     #[endpoint { method = GET, path = "/iam" }]
     async fn identities(
         ctx: RequestContext<Self::Context>,
