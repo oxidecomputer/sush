@@ -282,8 +282,11 @@ pub enum IdentityCommand {
 
 #[derive(Clone, Debug, Subcommand)]
 pub enum SessionCommand {
+    /// Attach to a current support session.
+    Attach { session_id: Option<SessionId> },
+
     /// Start a new support session.
-    Start { session_id: Option<SessionId> },
+    Start,
 
     /// Stop a support session.
     Stop {
@@ -294,7 +297,7 @@ pub enum SessionCommand {
 
 impl Default for SessionCommand {
     fn default() -> Self {
-        Self::Start { session_id: None }
+        Self::Attach { session_id: None }
     }
 }
 
@@ -656,7 +659,38 @@ async fn session(
     command: SessionCommand,
 ) -> Result<(), CommandError> {
     match (command, client) {
-        (SessionCommand::Start { session_id: None }, Some(client)) => {
+        (SessionCommand::Attach { session_id }, Some(client)) => {
+            let session = with_authz!(
+                ctx,
+                client,
+                ssh_auth_sock,
+                ssh_key_id,
+                authz => client
+                    .session()
+                    .authorization(&authz)
+                    .send()
+            )?
+            .into_inner();
+            if let Some(session_id) = session_id
+                && *session.session_id() != session_id
+            {
+                return Err(CommandError::MissingSession);
+            }
+            ctx.session_started(session)?;
+            Ok(())
+        }
+
+        (
+            SessionCommand::Attach {
+                session_id: Some(session_id),
+            },
+            None,
+        ) => {
+            ctx.session_started(Session::new(session_id, None))?;
+            Ok(())
+        }
+
+        (SessionCommand::Start, Some(client)) => {
             let session = with_authz!(
                 ctx,
                 client,
@@ -669,40 +703,6 @@ async fn session(
             )?
             .into_inner();
             ctx.session_started(session)?;
-            Ok(())
-        }
-
-        (
-            SessionCommand::Start {
-                session_id: Some(session_id),
-            },
-            Some(client),
-        ) => {
-            let session = with_authz!(
-                ctx,
-                client,
-                ssh_auth_sock,
-                ssh_key_id,
-                authz => client
-                    .session()
-                    .authorization(&authz)
-                    .send()
-            )?
-            .into_inner();
-            if *session.session_id() != session_id {
-                return Err(CommandError::MissingSession);
-            }
-            ctx.session_started(session)?;
-            Ok(())
-        }
-
-        (
-            SessionCommand::Start {
-                session_id: Some(session_id),
-            },
-            None,
-        ) => {
-            ctx.session_started(Session::new(session_id, None))?;
             Ok(())
         }
 
