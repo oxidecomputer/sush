@@ -394,6 +394,7 @@ impl CommandContext for Cli {
                 JobStatus::Started {
                     job,
                     session_id,
+                    key_id,
                     time_started,
                     stdout_len,
                     stderr_len,
@@ -405,6 +406,7 @@ impl CommandContext for Cli {
                     println!(
                         "✅ Job ID:\t{job_id}\n   \
                          Session ID:\t{session_id}\n   \
+                         Key ID:\t{key_id}\n   \
                          Job status:\tStarted\n   \
                          Command:\t{command}\n   \
                          Started at:\t{time_started}\n   \
@@ -415,6 +417,7 @@ impl CommandContext for Cli {
                 JobStatus::Ended {
                     job,
                     session_id,
+                    key_id,
                     time_started,
                     time_ended,
                     status: Some(exit_status),
@@ -430,6 +433,7 @@ impl CommandContext for Cli {
                     println!(
                         "✅ Job ID:\t{job_id}\n   \
                          Session ID:\t{session_id}\n   \
+                         Key ID:\t{key_id}\n   \
                          Job status:\tEnded\n   \
                          Command:\t{command}\n   \
                          Started at:\t{time_started}\n   \
@@ -444,6 +448,7 @@ impl CommandContext for Cli {
                 JobStatus::Ended {
                     job,
                     session_id,
+                    key_id,
                     time_started,
                     time_ended,
                     status: None,
@@ -459,6 +464,7 @@ impl CommandContext for Cli {
                     println!(
                         "✅ Job ID:\t{job_id}\n   \
                          Session ID:\t{session_id}\n   \
+                         Key ID:\t{key_id}\n   \
                          Job status:\tStopped\n   \
                          Command:\t{command}\n   \
                          Started at:\t{time_started}\n   \

@@ -433,20 +433,15 @@ impl JobManager {
 
     // Job management.
 
-    pub async fn job_history(&self, authn: &Identity) -> Result<Vec<JobStatus>, JobError> {
-        let session_guard = self.session.lock().await;
-        let session_id = session_guard.as_ref().map(|s| s.session_id().to_owned());
-        let session_owner = session_guard
-            .as_ref()
-            .map(|s| s.key_id() == Some(&authn.key_id))
-            .unwrap_or(false);
-
+    pub async fn job_history(
+        &self,
+        _authn: &Identity, // anyone may retrieve job history
+    ) -> Result<Vec<JobStatus>, JobError> {
         Ok(self
             .job_history
             .lock()
             .await
             .iter()
-            .filter(|(_id, status)| status.session_id() != session_id.as_ref() || session_owner)
             .map(|(_id, status)| status.to_owned())
             .collect())
     }
@@ -502,6 +497,7 @@ impl JobManager {
                 &self.output_dir,
                 job.clone(),
                 session.session_id(),
+                &authn.key_id,
                 params,
             )?;
             self.with_jobs(&mut session_guard, |active_jobs, _history| {
@@ -522,27 +518,14 @@ impl JobManager {
         if wait { Ok(Some(rx.await?)) } else { Ok(None) }
     }
 
-    /// For jobs in the current session, only the owner is allowed access.
-    /// For jobs from previous sessions, anyone may access them; otherwise
-    /// they would be orphaned.
     async fn check_job_owner(
         &self,
         session_guard: &mut SessionGuard<'_>,
         authn: &Identity,
         job_id: &JobId,
     ) -> Result<(), JobError> {
-        let Some(job_session_id) = self
-            .job_status_inner(job_id, session_guard)
-            .await?
-            .session_id()
-            .cloned()
-        else {
-            return Err(JobError::JobNotFound(job_id.to_owned()));
-        };
-        if let Some(session) = session_guard.as_ref()
-            && job_session_id == *session.session_id()
-            && session.key_id() != Some(&authn.key_id)
-        {
+        let status = self.job_status_inner(job_id, session_guard).await?;
+        if status.key_id() != &authn.key_id {
             Err(JobError::SessionWrongIdentity)
         } else {
             Ok(())
@@ -565,12 +548,10 @@ impl JobManager {
 
     pub async fn job_status(
         &self,
-        authn: &Identity,
+        _authn: &Identity, // anyone may check job status
         job_id: &JobId,
     ) -> Result<JobStatus, JobError> {
         let mut session_guard = self.session.lock().await;
-        self.check_job_owner(&mut session_guard, authn, job_id)
-            .await?;
         self.job_status_inner(job_id, &mut session_guard).await
     }
 
@@ -616,10 +597,7 @@ impl JobManager {
         )
     }
 
-    pub async fn job_stop(&self, authn: &Identity, job_id: &JobId) -> Result<(), JobError> {
-        let mut session_guard = self.session.lock().await;
-        self.check_job_owner(&mut session_guard, authn, job_id)
-            .await?;
+    pub async fn job_stop(&self, _authn: &Identity, job_id: &JobId) -> Result<(), JobError> {
         self.monitor(MonitorRequest::Stop(job_id.to_owned())).await
     }
 
@@ -726,6 +704,7 @@ fn job_ended(
             if let JobStatus::Started {
                 job,
                 session_id,
+                key_id,
                 time_started,
                 ..
             } = active_jobs
@@ -737,6 +716,7 @@ fn job_ended(
                     JobStatus::Ended {
                         job,
                         session_id,
+                        key_id,
                         time_started,
                         time_ended: time,
                         status: None,
@@ -764,6 +744,7 @@ fn job_start(
     output_dir: &Path,
     job: VerifiedJob,
     session_id: &SessionId,
+    key_id: &KeyId,
     params: JobStartParams,
 ) -> Result<JobStarted, JobError> {
     // Set up the job.
@@ -872,6 +853,7 @@ fn job_start(
     Ok(JobStarted {
         job,
         session_id: session_id.to_owned(),
+        key_id: key_id.to_owned(),
         time_started,
         child,
         interactive: pty,
@@ -1017,11 +999,7 @@ mod test {
         expected_command: &str,
     ) {
         let JobStatus::Started {
-            job,
-            session_id: _,
-            time_started,
-            stdout_len: _,
-            stderr_len: _,
+            job, time_started, ..
         } = status
         else {
             panic!("expected job to be started");
@@ -1042,14 +1020,12 @@ mod test {
     ) {
         let JobStatus::Ended {
             job,
-            session_id: _,
             time_started,
             time_ended,
             status,
             stdout_len,
             stderr_len,
-            stdout_hash: _,
-            stderr_hash: _,
+            ..
         } = status
         else {
             panic!("expected job to be finished");

@@ -221,6 +221,7 @@
     "/jobs": {
       "get": {
         "summary": "List previous jobs.",
+        "description": "Any authenticated identity may see the job history, regardless of ownership.",
         "operationId": "job_history",
         "parameters": [
           {
@@ -259,6 +260,7 @@
     "/jobs/{job_id}/output/{stream}": {
       "get": {
         "summary": "Get (a subset of) the standard output or standard error of a job.",
+        "description": "Only the job owner may request job output.",
         "operationId": "job_output",
         "parameters": [
           {
@@ -307,7 +309,7 @@
       },
       "delete": {
         "summary": "Truncate the standard output or standard error of a job.",
-        "description": "Returns its new length.",
+        "description": "Only the job owner may truncate job output. Returns the new length.",
         "operationId": "job_output_delete",
         "parameters": [
           {
@@ -369,6 +371,7 @@
     "/jobs/{job_id}/session": {
       "get": {
         "summary": "Start a new interactive job session.",
+        "description": "Only the job owner may start an interactive session.",
         "operationId": "job_start_interactive_session",
         "parameters": [
           {
@@ -529,6 +532,7 @@
     "/jobs/{job_id}/status": {
       "get": {
         "summary": "Get the status of a job.",
+        "description": "Any authenticated identity may see the status of any job, regardless of ownership.",
         "operationId": "job_status",
         "parameters": [
           {
@@ -571,6 +575,7 @@
     "/jobs/{job_id}/stop": {
       "post": {
         "summary": "Stop a (running) job.",
+        "description": "Any authenticated identity may stop a job, regardless of ownership.",
         "operationId": "job_stop",
         "parameters": [
           {
@@ -649,7 +654,7 @@
       },
       "post": {
         "summary": "Start a new support session.",
-        "description": "There may only be one session active on the rack at a time. If a session is already running when this request is made, the old session is stopped (regardless of ownership).",
+        "description": "There may only be one session active on the rack at a time. If a session is already running when this request is made, the old session is stopped, regardless of ownership.",
         "operationId": "session_start",
         "parameters": [
           {
@@ -802,6 +807,9 @@
                   "session_id": {
                     "$ref": "#/components/schemas/SessionId"
                   },
+                  "key_id": {
+                    "$ref": "#/components/schemas/KeyId"
+                  },
                   "time_started": {
                     "type": "string",
                     "format": "date-time"
@@ -819,6 +827,7 @@
                 },
                 "required": [
                   "job",
+                  "key_id",
                   "session_id",
                   "stderr_len",
                   "stdout_len",
@@ -842,6 +851,9 @@
                   },
                   "session_id": {
                     "$ref": "#/components/schemas/SessionId"
+                  },
+                  "key_id": {
+                    "$ref": "#/components/schemas/KeyId"
                   },
                   "time_started": {
                     "type": "string",
@@ -875,6 +887,7 @@
                 },
                 "required": [
                   "job",
+                  "key_id",
                   "session_id",
                   "stderr_hash",
                   "stderr_len",

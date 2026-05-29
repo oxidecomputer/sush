@@ -88,7 +88,7 @@ pub trait SushApi {
     ///
     /// There may only be one session active on the rack at a time.
     /// If a session is already running when this request is made,
-    /// the old session is stopped (regardless of ownership).
+    /// the old session is stopped, regardless of ownership.
     #[endpoint { method = POST, path = "/sessions" }]
     async fn session_start(
         ctx: RequestContext<Self::Context>,
@@ -120,6 +120,8 @@ pub trait SushApi {
     ) -> Result<HttpResponseOk<JobStatus>, HttpError>;
 
     /// Stop a (running) job.
+    ///
+    /// Any authenticated identity may stop a job, regardless of ownership.
     #[endpoint { method = POST, path = "/jobs/{job_id}/stop" }]
     async fn job_stop(
         ctx: RequestContext<Self::Context>,
@@ -128,6 +130,9 @@ pub trait SushApi {
     ) -> Result<HttpResponseOk<()>, HttpError>;
 
     /// Get the status of a job.
+    ///
+    /// Any authenticated identity may see the status of any job,
+    /// regardless of ownership.
     #[endpoint { method = GET, path = "/jobs/{job_id}/status" }]
     async fn job_status(
         ctx: RequestContext<Self::Context>,
@@ -136,6 +141,8 @@ pub trait SushApi {
     ) -> Result<HttpResponseOk<JobStatus>, HttpError>;
 
     /// Get (a subset of) the standard output or standard error of a job.
+    ///
+    /// Only the job owner may request job output.
     #[endpoint { method = GET, path = "/jobs/{job_id}/output/{stream}" }]
     async fn job_output(
         ctx: RequestContext<Self::Context>,
@@ -144,7 +151,9 @@ pub trait SushApi {
     ) -> Result<Response<Body>, HttpError>;
 
     /// Truncate the standard output or standard error of a job.
-    /// Returns its new length.
+    ///
+    /// Only the job owner may truncate job output.
+    /// Returns the new length.
     #[endpoint { method = DELETE, path = "/jobs/{job_id}/output/{stream}" }]
     async fn job_output_delete(
         ctx: RequestContext<Self::Context>,
@@ -153,6 +162,8 @@ pub trait SushApi {
     ) -> Result<HttpResponseOk<u64>, HttpError>;
 
     /// Start a new interactive job session.
+    ///
+    /// Only the job owner may start an interactive session.
     // This should use `channel { protocol = WEBSOCKETS, .. }`, but that
     // does not currently let us return errors before the connection upgrade.
     #[endpoint { method = GET, path = "/jobs/{job_id}/session" }]
@@ -164,6 +175,9 @@ pub trait SushApi {
     ) -> WebsocketEndpointResult;
 
     /// List previous jobs.
+    ///
+    /// Any authenticated identity may see the job history,
+    /// regardless of ownership.
     #[endpoint { method = GET, path = "/jobs" }]
     async fn job_history(
         ctx: RequestContext<Self::Context>,

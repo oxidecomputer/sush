@@ -226,6 +226,7 @@ pub enum JobStatus {
     Started {
         job: VerifiedJob,
         session_id: SessionId,
+        key_id: KeyId,
         time_started: DateTime<Utc>,
         stdout_len: u64,
         stderr_len: u64,
@@ -233,6 +234,7 @@ pub enum JobStatus {
     Ended {
         job: VerifiedJob,
         session_id: SessionId,
+        key_id: KeyId,
         time_started: DateTime<Utc>,
         time_ended: DateTime<Utc>,
         status: Option<i32>,
@@ -246,8 +248,13 @@ pub enum JobStatus {
 impl JobStatus {
     pub fn session_id(&self) -> Option<&SessionId> {
         match self {
-            Self::Started { session_id, .. } => Some(session_id),
-            Self::Ended { session_id, .. } => Some(session_id),
+            Self::Started { session_id, .. } | Self::Ended { session_id, .. } => Some(session_id),
+        }
+    }
+
+    pub fn key_id(&self) -> &KeyId {
+        match self {
+            Self::Started { key_id, .. } | Self::Ended { key_id, .. } => key_id,
         }
     }
 

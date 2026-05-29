@@ -22,6 +22,7 @@ use tokio::{select, spawn};
 use sush_common::interactive::InteractiveSessionError;
 use sush_common::jobs::JobOutputStream::{Stderr, Stdout};
 use sush_common::jobs::{JobId, JobOutputHash, JobStatus, SessionId, VerifiedJob};
+use sush_common::keys::KeyId;
 
 use crate::error::{ExecutionError, JobError};
 use crate::interactive::{InteractiveSession, SocketSender};
@@ -138,6 +139,7 @@ impl JobMonitor {
         JobStarted {
             job,
             session_id,
+            key_id,
             time_started,
             child,
             interactive,
@@ -161,6 +163,7 @@ impl JobMonitor {
             let end = JobEnded {
                 job,
                 session_id,
+                key_id,
                 time_started,
                 time_ended: Utc::now(),
                 status,
@@ -265,11 +268,13 @@ impl MonitorRequest {
 }
 
 /// Event representing the beginning of a job. The manager spawns the child,
-/// then passes one of these to the monitor.
+/// then passes one of these to the monitor. The key ID denotes the owner of
+/// the session.
 #[derive(Debug)]
 pub struct JobStarted {
     pub job: VerifiedJob,
     pub session_id: SessionId,
+    pub key_id: KeyId,
     pub time_started: DateTime<Utc>,
     pub child: Child,
     pub interactive: Option<Pty>,
@@ -286,6 +291,7 @@ impl From<&JobStarted> for JobStatus {
         let JobStarted {
             job,
             session_id,
+            key_id,
             time_started,
             child: _,
             interactive: _,
@@ -293,6 +299,7 @@ impl From<&JobStarted> for JobStatus {
         Self::Started {
             job: job.to_owned(),
             session_id: session_id.to_owned(),
+            key_id: key_id.to_owned(),
             time_started: time_started.to_owned(),
             stdout_len: 0,
             stderr_len: 0,
@@ -305,6 +312,7 @@ impl From<&JobStarted> for JobStatus {
 pub struct JobEnded {
     pub job: VerifiedJob,
     pub session_id: SessionId,
+    pub key_id: KeyId,
     pub time_started: DateTime<Utc>,
     pub time_ended: DateTime<Utc>,
     pub status: ExitStatus,
@@ -325,6 +333,7 @@ impl From<JobEnded> for JobStatus {
         let JobEnded {
             job,
             session_id,
+            key_id,
             time_started,
             time_ended,
             status,
@@ -336,6 +345,7 @@ impl From<JobEnded> for JobStatus {
         Self::Ended {
             job,
             session_id,
+            key_id,
             time_started,
             time_ended,
             status: status.code(),
