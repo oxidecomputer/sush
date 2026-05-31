@@ -1345,8 +1345,6 @@ pub enum CommandError {
     InvalidAuthorization,
     #[error("❌ Leaf certificate does not match key `{0}`")]
     InvalidLeafCert(KeyId),
-    #[error("❌ Unable to read reserved job IDs")]
-    InvalidReservedJobs,
     #[error("❌ Root certificate is not self-signed")]
     InvalidRootCert,
     #[error("❌ Job `{0}` not found")]
