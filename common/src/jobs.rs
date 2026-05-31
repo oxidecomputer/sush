@@ -258,6 +258,12 @@ impl JobStatus {
         }
     }
 
+    pub fn time_started(&self) -> DateTime<Utc> {
+        match self {
+            Self::Started { time_started, .. } | Self::Ended { time_started, .. } => *time_started,
+        }
+    }
+
     pub fn time_elapsed(&self) -> TimeDelta {
         match self {
             Self::Started { time_started, .. } => Utc::now() - time_started,

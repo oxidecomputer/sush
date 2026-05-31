@@ -437,13 +437,19 @@ impl JobManager {
         &self,
         _authn: &Identity, // anyone may retrieve job history
     ) -> Result<Vec<JobStatus>, JobError> {
-        Ok(self
-            .job_history
-            .lock()
-            .await
-            .iter()
-            .map(|(_id, status)| status.to_owned())
-            .collect())
+        let mut jobs = Vec::new();
+        self.with_jobs(
+            &mut self.session.lock().await,
+            |active_jobs, job_history| {
+                for (_id, status) in active_jobs.iter().chain(job_history.iter()) {
+                    jobs.push(status.clone());
+                }
+                Ok(())
+            },
+        )
+        .await?;
+        jobs.sort_by_key(JobStatus::time_started);
+        Ok(jobs)
     }
 
     pub async fn job_start(
