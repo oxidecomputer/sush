@@ -800,7 +800,7 @@ async fn job(
                     _ = interval.tick() => ctx.job_signing_update(&job_id),
                     _ = ctrl_c() => {
                         ctx.job_signing_finished(&job_id);
-                        return Ok(());
+                        return Err(CommandError::Canceled);
                     }
                 }
             };
@@ -954,9 +954,9 @@ async fn job_start(
         loop {
             select! {
                 status = &mut start => {
+                    let status = status?.into_inner();
                     ctx.job_started(&job);
                     ctx.job_polling_finished(&job_id);
-                    let status = status?.into_inner();
                     break status;
                 }
                 _ = interval.tick() => {
@@ -977,16 +977,17 @@ async fn job_start(
                         .job_id(&job_id)
                         .send()
                         .await?;
-                    ctx.job_polling_finished(&job_id);
-                    ctx.job_started(&job);
-                    ctx.job_stopped(&job_id);
-                    break client
+                    let status = client
                         .job_status()
                         .authorization(&authz)
                         .job_id(&job_id)
                         .send()
                         .await?
                         .into_inner();
+                    ctx.job_polling_finished(&job_id);
+                    ctx.job_started(&job);
+                    ctx.job_stopped(&job_id);
+                    break status;
                 }
             }
         }

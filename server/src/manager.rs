@@ -283,13 +283,13 @@ impl JobManager {
         let mut identities = self.identities.lock().await;
         let mut expired = HashSet::new();
         let now = Utc::now();
-        for (key_id, (identity, _credentials)) in identities.iter() {
+        for (cache_key, (identity, _credentials)) in identities.iter() {
             if !identity.is_still_valid(&now) {
-                expired.insert(key_id.to_owned());
+                expired.insert(cache_key.to_owned());
             }
         }
-        for key_id in expired {
-            identities.pop(&key_id);
+        for cache_key in expired {
+            identities.pop(&cache_key);
         }
 
         // Check the cached credentials.
@@ -398,10 +398,9 @@ impl JobManager {
 
     pub async fn session_stop(
         &self,
-        _authn: &Identity,
+        _authn: &Identity, // anyone may stop a session.
         session_id: &SessionId,
     ) -> Result<(), JobError> {
-        // Anyone is allowed to stop a session.
         let mut session_guard = self.session.lock().await;
         if let Some(session) = session_guard.as_ref()
             && session.session_id() == session_id
@@ -420,7 +419,7 @@ impl JobManager {
                 .lock()
                 .await
                 .iter()
-                .filter(|(_id, status)| status.session_id() == Some(session.session_id()))
+                .filter(|(_id, status)| status.session_id() == session.session_id())
                 .map(|(id, _status)| id.to_owned())
                 .collect::<Vec<JobId>>()
         } {
@@ -537,8 +536,7 @@ impl JobManager {
         authn: &Identity,
         job_id: &JobId,
     ) -> Result<SocketSender, JobError> {
-        let mut session_guard = self.session.lock().await;
-        self.check_job_owner(&mut session_guard, authn, job_id)
+        self.check_job_owner(&mut self.session.lock().await, authn, job_id)
             .await?;
         let (tx, rx) = oneshot::channel();
         self.monitor(MonitorRequest::interactive_session(job_id, tx))
@@ -597,7 +595,11 @@ impl JobManager {
         )
     }
 
-    pub async fn job_stop(&self, _authn: &Identity, job_id: &JobId) -> Result<(), JobError> {
+    pub async fn job_stop(
+        &self,
+        _authn: &Identity, // anyone may stop a job
+        job_id: &JobId,
+    ) -> Result<(), JobError> {
         let is_active = self
             .active_jobs
             .lock()
@@ -618,8 +620,7 @@ impl JobManager {
         stream: JobOutputStream,
         range: Option<Range>,
     ) -> Result<Vec<u8>, JobError> {
-        let mut session_guard = self.session.lock().await;
-        self.check_job_owner(&mut session_guard, authn, job_id)
+        self.check_job_owner(&mut self.session.lock().await, authn, job_id)
             .await?;
         get_job_output(&self.output_dir, job_id, stream, range)
     }
