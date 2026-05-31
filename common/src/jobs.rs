@@ -66,6 +66,7 @@ impl<S: AsRef<str>> From<S> for JobId {
 )]
 pub struct SessionId(String);
 
+#[allow(clippy::new_without_default)]
 impl SessionId {
     pub fn new() -> Self {
         Self(generate_id())
@@ -83,12 +84,6 @@ impl SessionId {
         ))
         .join(WORD_SEPARATOR)
         .into()
-    }
-}
-
-impl Default for SessionId {
-    fn default() -> Self {
-        Self::new()
     }
 }
 
