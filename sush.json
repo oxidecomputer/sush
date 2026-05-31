@@ -220,7 +220,7 @@
     },
     "/jobs": {
       "get": {
-        "summary": "List previous jobs.",
+        "summary": "List previous jobs sorted by start time, most recent first.",
         "description": "Any authenticated identity may see the job history, regardless of ownership.",
         "operationId": "job_history",
         "parameters": [
@@ -230,6 +230,26 @@
             "description": "Authorization to access some resource, such as a signature.\n\nSee: <https://developer.mozilla.org/en-US/docs/Web/HTTP/Reference/Headers/Authorization>",
             "schema": {
               "type": "string"
+            }
+          },
+          {
+            "in": "query",
+            "name": "limit",
+            "required": true,
+            "schema": {
+              "type": "integer",
+              "format": "uint32",
+              "minimum": 0
+            }
+          },
+          {
+            "in": "query",
+            "name": "offset",
+            "required": true,
+            "schema": {
+              "type": "integer",
+              "format": "uint32",
+              "minimum": 0
             }
           }
         ],

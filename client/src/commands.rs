@@ -346,7 +346,15 @@ pub enum JobCommand {
     },
 
     /// Show status of previously started jobs.
-    History,
+    History {
+        /// How many jobs' status to show.
+        #[arg(short, long, default_value_t = 100)]
+        limit: u32,
+
+        /// Where in the list of jobs to start.
+        #[arg(short, long, default_value_t = 0)]
+        offset: u32,
+    },
 }
 
 #[derive(Clone, Debug, Parser)]
@@ -866,7 +874,7 @@ async fn job(
             job_start_interactive_session(ctx, client, ssh_auth_sock, ssh_key_id, &job_id).await
         }
 
-        (JobCommand::History, Some(client)) => {
+        (JobCommand::History { limit, offset }, Some(client)) => {
             let history = with_authz!(
                 ctx,
                 client,
@@ -874,6 +882,8 @@ async fn job(
                 ssh_key_id,
                 authz => client
                     .job_history()
+                    .limit(limit)
+                    .offset(offset)
                     .authorization(&authz)
                     .send()
             )?

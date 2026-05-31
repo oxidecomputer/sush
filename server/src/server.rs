@@ -12,8 +12,8 @@ use x509_cert::Certificate;
 use x509_cert::der::{Decode as _, DecodePem as _};
 
 use sush_api::{
-    Authorization, AuthorizedRangeRequest, JobIdParam, JobOutputParams, JobStartParams, KeyIdParam,
-    SessionIdParam, SushApi,
+    Authorization, AuthorizedRangeRequest, JobHistoryParams, JobIdParam, JobOutputParams,
+    JobStartParams, KeyIdParam, SessionIdParam, SushApi,
 };
 use sush_common::authn::Identity;
 use sush_common::jobs::{JobStatus, Session, SignedJob};
@@ -248,10 +248,14 @@ impl SushApi for ApiServer {
     async fn job_history(
         ctx: RequestContext<Self::Context>,
         headers: Header<Authorization>,
+        query: QueryParams<JobHistoryParams>,
     ) -> Result<HttpResponseOk<Vec<JobStatus>>, HttpError> {
         let mgr = ctx.context();
         let Authorization { authorization } = headers.into_inner();
         let authn = mgr.iam(authorization, None).await?;
-        Ok(HttpResponseOk(mgr.job_history(&authn).await?))
+        let JobHistoryParams { limit, offset } = query.into_inner();
+        Ok(HttpResponseOk(
+            mgr.job_history(&authn, limit, offset).await?,
+        ))
     }
 }

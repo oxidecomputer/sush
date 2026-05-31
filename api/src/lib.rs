@@ -174,7 +174,7 @@ pub trait SushApi {
         upgrade: WebsocketUpgrade,
     ) -> WebsocketEndpointResult;
 
-    /// List previous jobs.
+    /// List previous jobs sorted by start time, most recent first.
     ///
     /// Any authenticated identity may see the job history,
     /// regardless of ownership.
@@ -182,6 +182,7 @@ pub trait SushApi {
     async fn job_history(
         ctx: RequestContext<Self::Context>,
         headers: Header<Authorization>,
+        query: QueryParams<JobHistoryParams>,
     ) -> Result<HttpResponseOk<Vec<JobStatus>>, HttpError>;
 }
 
@@ -226,6 +227,13 @@ impl JobStartParams {
             ..Default::default()
         }
     }
+}
+
+/// Simple pagination for history list.
+#[derive(Debug, Default, Deserialize, JsonSchema)]
+pub struct JobHistoryParams {
+    pub limit: u32,
+    pub offset: u32,
 }
 
 /// This deserialization method is a work-around for a bug in Serde; see

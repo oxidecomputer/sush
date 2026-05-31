@@ -452,6 +452,8 @@ impl JobManager {
     pub async fn job_history(
         &self,
         _authn: &Identity, // anyone may retrieve job history
+        limit: u32,
+        offset: u32,
     ) -> Result<Vec<JobStatus>, JobError> {
         let mut jobs = Vec::new();
         self.with_jobs(
@@ -465,7 +467,12 @@ impl JobManager {
         )
         .await?;
         jobs.sort_by_key(JobStatus::time_started);
-        Ok(jobs)
+        jobs.reverse();
+        Ok(jobs
+            .into_iter()
+            .skip(offset as usize)
+            .take(limit as usize)
+            .collect())
     }
 
     pub async fn job_start(
