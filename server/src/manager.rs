@@ -88,7 +88,7 @@ pub struct JobManager {
     nonces: Arc<Mutex<LruCache<Nonce, DateTime<Utc>>>>,
     identities: Arc<Mutex<LruCache<(KeyId, Nonce), (Identity, Credentials)>>>,
     revoked_identities: Arc<Mutex<BTreeMap<KeyId, DateTime<Utc>>>>,
-    certs: Arc<Mutex<BTreeMap<KeyId, Certificate>>>,
+    certs: Arc<Mutex<LruCache<KeyId, Certificate>>>,
     session: Arc<Mutex<Option<Session>>>,
     active_jobs: Arc<Mutex<BTreeMap<JobId, JobStatus>>>,
     job_history: Arc<Mutex<LruCache<JobId, JobStatus>>>,
@@ -131,7 +131,7 @@ impl JobManager {
             nonces: Arc::new(Mutex::new(LruCache::new(MAX_OUTSTANDING_NONCES))),
             identities: Arc::new(Mutex::new(LruCache::new(MAX_CACHED_IDENTITIES))),
             revoked_identities: Arc::new(Mutex::new(BTreeMap::new())),
-            certs: Arc::new(Mutex::new(BTreeMap::new())),
+            certs: Arc::new(Mutex::new(LruCache::new(MAX_CERTS))),
             session: Arc::new(Mutex::new(None)),
             active_jobs,
             job_history,
@@ -192,12 +192,28 @@ impl JobManager {
             }
         }
 
+        // Try to make room for the new cert, but do not evict roots.
+        if certs.len() == MAX_CERTS.get() {
+            let mut i = 0;
+            while let Some((lru_key_id, lru_cert)) =
+                certs.peek_lru().map(|(k, v)| (k.to_owned(), v.to_owned()))
+            {
+                if lru_cert.tbs_certificate.subject == lru_cert.tbs_certificate.issuer {
+                    certs.promote(&lru_key_id);
+                    i += 1;
+                } else {
+                    certs.pop_lru();
+                    break;
+                }
+                if i == MAX_CERTS.get() {
+                    return Err(JobError::TooManyCerts(MAX_CERTS.get()));
+                }
+            }
+        }
+
         // Import the certificate.
         let key_id = KeyId::try_from(subject)?;
-        if certs.len() >= MAX_CERTS && !certs.contains_key(&key_id) {
-            return Err(JobError::TooManyCerts(MAX_CERTS));
-        }
-        certs.insert(key_id.clone(), cert);
+        certs.put(key_id.clone(), cert);
         info!(self.log, "imported certificate"; "key_id" => %key_id, "root" => root);
         Ok(key_id)
     }
@@ -208,7 +224,7 @@ impl JobManager {
         _authn: &Identity,
         key_id: &KeyId,
     ) -> Result<Vec<Certificate>, JobError> {
-        let certs = self.certs.lock().await;
+        let mut certs = self.certs.lock().await;
         let mut chain = Vec::new();
         let mut key_id = key_id.to_owned();
         loop {
@@ -478,15 +494,12 @@ impl JobManager {
             .await?;
 
             let cert_key_id = job.key_id().to_owned();
-            let cert = self
-                .certs
-                .lock()
-                .await
-                .get(&cert_key_id)
-                .cloned()
-                .ok_or_else(|| JobError::MissingCert(cert_key_id))?;
-
-            let job = job.verify_with_cert(&cert)?;
+            let chain = self.cert_chain(authn, &cert_key_id).await?;
+            let job = if let Some(leaf) = chain.last() {
+                job.verify_with_cert(leaf)?
+            } else {
+                return Err(JobError::MissingCert(cert_key_id));
+            };
             if session.key_id() != Some(&authn.key_id) {
                 return Err(JobError::SessionWrongIdentity);
             }
