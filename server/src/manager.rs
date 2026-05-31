@@ -4,7 +4,7 @@
 //! for completion. Standard output and standard error are saved in files.
 
 use std::collections::BTreeMap;
-use std::fs::{DirBuilder, File, OpenOptions};
+use std::fs::{DirBuilder, File, OpenOptions, remove_file};
 use std::io::{Read as _, Seek as _, SeekFrom};
 use std::num::NonZeroUsize;
 use std::os::fd::AsRawFd as _;
@@ -55,7 +55,7 @@ const MAX_CERT_CHAIN_LEN: usize = 10;
 
 /// Maximum number of job signing certificates.
 /// The ideal number of certs is 1, so this need not be large.
-const MAX_CERTS: usize = 100;
+const MAX_CERTS: NonZeroUsize = NonZeroUsize::new(100).unwrap();
 
 /// Maximum number of cached identities.
 const MAX_CACHED_IDENTITIES: NonZeroUsize = NonZeroUsize::new(1_000).unwrap();
@@ -737,21 +737,22 @@ fn job_ended(
                 .remove(&job_id)
                 .ok_or_else(|| JobError::InvalidJobId(job_id.to_owned()))?
             {
-                job_history.put(
-                    job_id.to_owned(),
-                    JobStatus::Ended {
-                        job,
-                        session_id,
-                        key_id,
-                        time_started,
-                        time_ended: time,
-                        status: None,
-                        stdout_len: job_output_len(output_dir, &job_id, Stdout),
-                        stderr_len: job_output_len(output_dir, &job_id, Stderr),
-                        stdout_hash: job_output_hash(output_dir, &job_id, Stdout)?,
-                        stderr_hash: job_output_hash(output_dir, &job_id, Stderr)?,
-                    },
-                );
+                let status = JobStatus::Ended {
+                    job,
+                    session_id,
+                    key_id,
+                    time_started,
+                    time_ended: time,
+                    status: None,
+                    stdout_len: job_output_len(output_dir, &job_id, Stdout),
+                    stderr_len: job_output_len(output_dir, &job_id, Stderr),
+                    stdout_hash: job_output_hash(output_dir, &job_id, Stdout)?,
+                    stderr_hash: job_output_hash(output_dir, &job_id, Stderr)?,
+                };
+                if let Some((evicted_id, _status)) = job_history.push(job_id.to_owned(), status) {
+                    let _ = remove_file(job_output_path(output_dir, &evicted_id, Stdout));
+                    let _ = remove_file(job_output_path(output_dir, &evicted_id, Stderr));
+                }
                 Ok(())
             } else {
                 Err(JobError::InvalidJobId(job_id))
@@ -759,7 +760,13 @@ fn job_ended(
         }
         Ok(ended) => {
             active_jobs.remove(ended.job_id());
-            job_history.put(ended.job_id().to_owned(), ended.into());
+            if let Some((evicted_id, _status)) =
+                job_history.push(ended.job_id().to_owned(), ended.into())
+            {
+                let _ = remove_file(job_output_path(output_dir, &evicted_id, Stdout));
+                let _ = remove_file(job_output_path(output_dir, &evicted_id, Stderr));
+            }
+
             Ok(())
         }
     }
