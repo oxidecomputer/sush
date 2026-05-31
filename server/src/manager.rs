@@ -3,7 +3,7 @@
 //! Jobs are spawned onto new tokio tasks and passed to the monitor to wait
 //! for completion. Standard output and standard error are saved in files.
 
-use std::collections::{BTreeMap, HashSet};
+use std::collections::BTreeMap;
 use std::fs::{DirBuilder, File, OpenOptions};
 use std::io::{Read as _, Seek as _, SeekFrom};
 use std::num::NonZeroUsize;
@@ -279,30 +279,26 @@ impl JobManager {
             unauthorized!("identity revoked");
         }
 
-        // Prune the cache.
-        let mut identities = self.identities.lock().await;
-        let mut expired = HashSet::new();
+        // Check the identity cache.
         let now = Utc::now();
-        for (cache_key, (identity, _credentials)) in identities.iter() {
-            if !identity.is_still_valid(&now) {
-                expired.insert(cache_key.to_owned());
-            }
-        }
-        for cache_key in expired {
-            identities.pop(&cache_key);
-        }
-
-        // Check the cached credentials.
-        if let Some((identity, cached_credentials)) =
-            identities.get(&(key_id.clone(), nonce.clone())).cloned()
-            && cached_credentials.nonce == nonce
-            && cached_credentials.cnonce == cnonce
-            && cached_credentials.signature == signature
         {
-            assert!(identity.is_still_valid(&now));
-            assert!(identity.time_revoked.is_none());
-            debug!(self.log, "credentials cache hit"; "key_id" => %key_id);
-            return Ok(identity.to_owned());
+            let mut identities = self.identities.lock().await;
+            let cache_key = (key_id.clone(), nonce.clone());
+            if let Some((identity, cached_credentials)) = identities.get(&cache_key).cloned() {
+                if !identity.is_still_valid(&now) {
+                    assert!(identities.pop(&cache_key).is_some());
+                } else if cached_credentials.nonce == nonce
+                    && cached_credentials.cnonce == cnonce
+                    && cached_credentials.signature == signature
+                {
+                    assert!(identity.is_still_valid(&now));
+                    assert!(identity.time_revoked.is_none());
+                    debug!(self.log, "credentials cache hit"; "key_id" => %key_id);
+                    return Ok(identity.to_owned());
+                } else {
+                    unauthorized!("invalid credentials for cached identity");
+                }
+            }
         }
 
         // Verify the supplied credentials.
@@ -324,18 +320,23 @@ impl JobManager {
             unauthorized!("nonce expired");
         };
 
-        // Authenticated! Cache the credentials.
+        // Authenticated! Cache the identity & credentials.
         debug!(self.log, "authenticated credentials for identity"; "key_id" => %key_id);
-        identities.put((key_id.to_owned(), nonce), (identity.clone(), credentials));
+        self.identities
+            .lock()
+            .await
+            .put((key_id.to_owned(), nonce), (identity.clone(), credentials));
         Ok(identity)
     }
 
     pub async fn identities(&self, _authn: &Identity) -> Result<Vec<Identity>, JobError> {
+        let now = Utc::now();
         Ok(self
             .identities
             .lock()
             .await
             .iter()
+            .filter(|(_, (identity, _credentials))| identity.is_still_valid(&now))
             .map(|(_, (identity, _credentials))| identity.to_owned())
             .collect())
     }
@@ -463,12 +464,7 @@ impl JobManager {
                 if active_jobs.contains_key(&job_id) || job_history.contains(&job_id) {
                     return Err(JobError::InvalidJobId(job_id.to_owned()));
                 }
-                if active_jobs
-                    .iter()
-                    .filter(|(_id, status)| status.is_active())
-                    .count()
-                    >= MAX_ACTIVE_JOBS
-                {
+                if active_jobs.len() >= MAX_ACTIVE_JOBS {
                     return Err(JobError::TooManyJobs(MAX_ACTIVE_JOBS));
                 }
                 Ok(())
@@ -651,7 +647,7 @@ impl JobManager {
                 ..
             }) = active_jobs
                 .get_mut(job_id)
-                .or_else(|| job_history.get_mut(job_id))
+                .or_else(|| job_history.peek_mut(job_id))
             {
                 match stream {
                     Stdout => *stdout_len = n,
