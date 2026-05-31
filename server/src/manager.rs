@@ -598,7 +598,17 @@ impl JobManager {
     }
 
     pub async fn job_stop(&self, _authn: &Identity, job_id: &JobId) -> Result<(), JobError> {
-        self.monitor(MonitorRequest::Stop(job_id.to_owned())).await
+        let is_active = self
+            .active_jobs
+            .lock()
+            .await
+            .get(job_id)
+            .is_some_and(JobStatus::is_active);
+        if is_active {
+            self.monitor(MonitorRequest::Stop(job_id.to_owned())).await
+        } else {
+            Err(JobError::JobNotFound(job_id.to_owned()))
+        }
     }
 
     pub async fn job_output(
