@@ -357,7 +357,7 @@ impl JobManager {
             .collect())
     }
 
-    pub async fn revoke_identity(&self, _authn: &Identity, key_id: KeyId) -> Result<(), JobError> {
+    pub async fn revoke_identity(&self, authn: &Identity, key_id: KeyId) -> Result<(), JobError> {
         // Update identity tables and drop locks before stopping a session.
         {
             let mut revoked = self.revoked_identities.lock().await;
@@ -380,7 +380,7 @@ impl JobManager {
         if let Some(session) = session_guard.as_ref()
             && session.key_id() == Some(&key_id)
         {
-            self.session_stop_inner(session).await?;
+            self.session_stop_inner(authn, session).await;
             session_guard.take();
         }
 
@@ -406,7 +406,7 @@ impl JobManager {
         let new_session = Session::new(new_session_id.clone(), Some(authn.key_id.clone()));
         let mut session_guard = self.session.lock().await;
         if let Some(old_session) = session_guard.as_ref() {
-            self.session_stop_inner(old_session).await?;
+            self.session_stop_inner(authn, old_session).await;
         }
         *session_guard = Some(new_session.clone());
         info!(self.log, "session started"; "session_id" => %new_session_id);
@@ -415,14 +415,14 @@ impl JobManager {
 
     pub async fn session_stop(
         &self,
-        _authn: &Identity, // anyone may stop a session.
+        authn: &Identity,
         session_id: &SessionId,
     ) -> Result<(), JobError> {
         let mut session_guard = self.session.lock().await;
         if let Some(session) = session_guard.as_ref()
             && session.session_id() == session_id
         {
-            self.session_stop_inner(session).await?;
+            self.session_stop_inner(authn, session).await;
             *session_guard = None;
             Ok(())
         } else {
@@ -430,21 +430,22 @@ impl JobManager {
         }
     }
 
-    async fn session_stop_inner(&self, session: &Session) -> Result<(), JobError> {
+    async fn session_stop_inner(&self, authn: &Identity, session: &Session) {
+        let session_id = session.session_id();
         for job_id in {
             self.active_jobs
                 .lock()
                 .await
                 .iter()
-                .filter(|(_id, status)| status.session_id() == session.session_id())
+                .filter(|(_id, status)| status.session_id() == session_id)
                 .map(|(id, _status)| id.to_owned())
                 .collect::<Vec<JobId>>()
         } {
-            self.monitor(MonitorRequest::Stop(job_id.to_owned()))
-                .await?;
+            if let Err(err) = self.monitor(MonitorRequest::Stop(job_id.to_owned())).await {
+                error!(self.log, "runaway job"; "job_id" => %job_id, "session_id" => %session_id, "error" => %err);
+            }
         }
-        info!(self.log, "session stopped"; "session_id" => %session.session_id());
-        Ok(())
+        info!(self.log, "session stopped"; "session_id" => %session_id, "authn" => %authn.key_id);
     }
 
     // Job management.
