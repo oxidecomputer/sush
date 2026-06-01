@@ -362,6 +362,9 @@ impl JobManager {
         {
             let mut revoked = self.revoked_identities.lock().await;
             if revoked.len() >= MAX_REVOKED_IDENTITIES && !revoked.contains_key(&key_id) {
+                // This is not ideal, but the alternative is worse: if we evict
+                // entries, a revoked identity could easily be "unrevoked" by
+                // simply generating and then revoking many identities.
                 return Err(JobError::TooManyRevocations(MAX_REVOKED_IDENTITIES));
             }
 
