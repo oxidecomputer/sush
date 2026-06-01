@@ -158,10 +158,10 @@ impl SushApi for ApiServer {
                 String::from("Query parameter job ID does not match body"),
             ));
         }
-        if let Some(Ok(end)) = mgr.job_start(&authn, job, params).await? {
-            Ok(HttpResponseOk(end.into()))
-        } else {
-            Ok(HttpResponseOk(mgr.job_status(&authn, &job_id).await?))
+        match mgr.job_start(&authn, job, params).await? {
+            Some(Ok(end)) => Ok(HttpResponseOk(end.into())),
+            Some(Err(err)) => Err(JobError::from(err).into()),
+            None => Ok(HttpResponseOk(mgr.job_status(&authn, &job_id).await?)),
         }
     }
 
