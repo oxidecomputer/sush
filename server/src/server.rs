@@ -159,9 +159,9 @@ impl SushApi for ApiServer {
             ));
         }
         match mgr.job_start(&authn, job, params).await? {
-            Some(Ok(end)) => Ok(HttpResponseOk(end.into())),
-            Some(Err(err)) => Err(JobError::from(err).into()),
             None => Ok(HttpResponseOk(mgr.job_status(&authn, &job_id).await?)),
+            Some(Ok(end)) => Ok(HttpResponseOk(mgr.job_end_status(&authn, end).await?)),
+            Some(Err(err)) => Err(JobError::from(err).into()),
         }
     }
 

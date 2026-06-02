@@ -20,13 +20,12 @@ use tokio::task::JoinSet;
 use tokio::{select, spawn};
 
 use sush_common::interactive::InteractiveSessionError;
-use sush_common::jobs::JobOutputStream::{Stderr, Stdout};
-use sush_common::jobs::{JobId, JobOutputHash, JobStatus, SessionId, VerifiedJob};
+use sush_common::jobs::{JobId, JobOutputStream, JobStatus, SessionId, VerifiedJob};
 use sush_common::keys::KeyId;
 
 use crate::error::{ExecutionError, JobError};
 use crate::interactive::{InteractiveSession, SocketSender};
-use crate::manager::{job_output_hash, job_output_len, job_output_path};
+use crate::manager::{JobOutputState, job_output_path};
 use crate::pty::Pty;
 
 /// The job monitor runs as a tokio task that communicates with the manager
@@ -156,7 +155,6 @@ impl JobMonitor {
             "should not already have a shutdown channel for a new job"
         );
 
-        let output_dir = self.output_dir.to_owned();
         self.tasks.spawn(async move {
             let exe = |err| ExecutionError::new(job_id.clone(), err);
             let status = session.await.map_err(exe)?;
@@ -167,10 +165,6 @@ impl JobMonitor {
                 time_started,
                 time_ended: Utc::now(),
                 status,
-                stdout_len: job_output_len(&output_dir, &job_id, Stdout),
-                stderr_len: job_output_len(&output_dir, &job_id, Stderr),
-                stdout_hash: job_output_hash(&output_dir, &job_id, Stdout).map_err(exe)?,
-                stderr_hash: job_output_hash(&output_dir, &job_id, Stderr).map_err(exe)?,
             };
             Ok(end)
         });
@@ -196,7 +190,7 @@ impl JobMonitor {
         pty: Pty,
         child: Child,
     ) -> Result<(PinnedSession, Shutdown), JobError> {
-        let path = job_output_path(&self.output_dir, job_id, Stdout);
+        let path = job_output_path(&self.output_dir, job_id, JobOutputStream::Stdout);
         let io_error = JobError::file_io_for(path.clone());
         let output_file = OpenOptions::new()
             .read(true)
@@ -316,33 +310,29 @@ pub struct JobEnded {
     pub time_started: DateTime<Utc>,
     pub time_ended: DateTime<Utc>,
     pub status: ExitStatus,
-    pub stdout_len: u64,
-    pub stderr_len: u64,
-    pub stdout_hash: JobOutputHash,
-    pub stderr_hash: JobOutputHash,
 }
 
 impl JobEnded {
     pub fn job_id(&self) -> &JobId {
         self.job.job_id()
     }
-}
 
-impl From<JobEnded> for JobStatus {
-    fn from(end: JobEnded) -> Self {
-        let JobEnded {
+    pub(crate) fn into_status(self, output: JobOutputState) -> JobStatus {
+        let Self {
             job,
             session_id,
             key_id,
             time_started,
             time_ended,
             status,
+        } = self;
+        let JobOutputState {
             stdout_len,
             stderr_len,
             stdout_hash,
             stderr_hash,
-        } = end;
-        Self::Ended {
+        } = output;
+        JobStatus::Ended {
             job,
             session_id,
             key_id,

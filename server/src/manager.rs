@@ -25,6 +25,7 @@ use terminfo::Database as Terminfo;
 use tokio::process::Command;
 use tokio::spawn;
 use tokio::sync::{Mutex, MutexGuard, mpsc, oneshot};
+use tokio::task::spawn_blocking;
 use x509_cert::Certificate;
 use x509_cert::der::{DecodePem as _, Encode as _};
 
@@ -39,7 +40,7 @@ use sush_common::keys::{KeyError, KeyId, Signature, SshPublicKey};
 
 use crate::error::{ExecutionError, JobError};
 use crate::interactive::SocketSender;
-use crate::monitor::{ExecutionResult, JobMonitor, JobStarted, MonitorRequest};
+use crate::monitor::{ExecutionResult, JobEnded, JobMonitor, JobStarted, MonitorRequest};
 use crate::pty::Pty;
 
 /// Self-signed (root) X.509 certificates. Self-signed certificates may
@@ -112,13 +113,32 @@ impl JobManager {
             let log = log.new(o!("component" => "monitor loop"));
             async move {
                 while let Some(end) = rx_monitor.recv().await {
-                    if let Err(err) = job_ended(
-                        &mut *active_jobs.lock().await,
-                        &mut *job_history.lock().await,
-                        &output_dir,
-                        end,
-                    ) {
-                        error!(log, "failed to record job end"; "err" => %err);
+                    // A job has ended. Compute output length and hashes
+                    // before we take the job table locks.
+                    match spawn_blocking({
+                        let output_dir = output_dir.to_owned();
+                        let job_id = match &end {
+                            Ok(end) => end.job_id().to_owned(),
+                            Err(err) => err.job_id.to_owned(),
+                        };
+                        move || JobOutputState::new(&output_dir, &job_id)
+                    })
+                    .await
+                    {
+                        Ok(output) => {
+                            if let Err(err) = job_ended(
+                                &mut *active_jobs.lock().await,
+                                &mut *job_history.lock().await,
+                                &output_dir,
+                                end,
+                                output,
+                            ) {
+                                error!(log, "failed to record job end"; "err" => %err);
+                            }
+                        }
+                        Err(err) => {
+                            error!(log, "failed to spawn job output thread"; "error" => %err)
+                        }
                     }
                 }
                 Ok::<_, JobError>(())
@@ -690,6 +710,17 @@ impl JobManager {
         Ok(n)
     }
 
+    pub(crate) async fn job_end_status(
+        &self,
+        _authn: &Identity,
+        end: JobEnded,
+    ) -> Result<JobStatus, JobError> {
+        let output_dir = self.output_dir.to_owned();
+        let job_id = end.job_id().to_owned();
+        Ok(end
+            .into_status(spawn_blocking(move || JobOutputState::new(&output_dir, &job_id)).await?))
+    }
+
     async fn monitor(&self, request: MonitorRequest) -> Result<(), JobError> {
         self.tx_monitor
             .send(request)
@@ -698,32 +729,44 @@ impl JobManager {
     }
 }
 
-pub fn job_output_dir(base_dir: &Path, job_id: &JobId) -> PathBuf {
+pub(crate) struct JobOutputState {
+    pub(crate) stdout_len: u64,
+    pub(crate) stderr_len: u64,
+    pub(crate) stdout_hash: JobOutputHash,
+    pub(crate) stderr_hash: JobOutputHash,
+}
+
+impl JobOutputState {
+    pub(crate) fn new(base_dir: &Path, job_id: &JobId) -> Self {
+        Self {
+            stdout_len: job_output_len(base_dir, job_id, Stdout),
+            stderr_len: job_output_len(base_dir, job_id, Stderr),
+            stdout_hash: job_output_hash(base_dir, job_id, Stdout),
+            stderr_hash: job_output_hash(base_dir, job_id, Stderr),
+        }
+    }
+}
+
+fn job_output_dir(base_dir: &Path, job_id: &JobId) -> PathBuf {
     base_dir.join("jobs").join(job_id.to_string())
 }
 
-pub fn job_output_path(base_dir: &Path, job_id: &JobId, stream: JobOutputStream) -> PathBuf {
+pub(crate) fn job_output_path(base_dir: &Path, job_id: &JobId, stream: JobOutputStream) -> PathBuf {
     job_output_dir(base_dir, job_id).join(stream.as_str())
 }
 
-pub fn job_output_len(base_dir: &Path, job_id: &JobId, stream: JobOutputStream) -> u64 {
+fn job_output_len(base_dir: &Path, job_id: &JobId, stream: JobOutputStream) -> u64 {
     job_output_path(base_dir, job_id, stream)
         .metadata()
         .map(|m| m.len())
         .unwrap_or(0)
 }
 
-pub fn job_output_hash(
-    base_dir: &Path,
-    job_id: &JobId,
-    stream: JobOutputStream,
-) -> Result<JobOutputHash, JobError> {
+fn job_output_hash(base_dir: &Path, job_id: &JobId, stream: JobOutputStream) -> JobOutputHash {
     let mut hasher = Hasher::new();
     let path = job_output_path(base_dir, job_id, stream);
-    hasher
-        .update_mmap_rayon(&path)
-        .map_err(|err| JobError::file_io(path, err))?;
-    Ok(hasher.finalize().into())
+    let _ = hasher.update_mmap_rayon(&path);
+    hasher.finalize().into()
 }
 
 fn job_ended(
@@ -731,6 +774,7 @@ fn job_ended(
     job_history: &mut LruCache<JobId, JobStatus>,
     output_dir: &Path,
     result: ExecutionResult,
+    output: JobOutputState,
 ) -> Result<(), JobError> {
     match result {
         Err(ExecutionError {
@@ -757,8 +801,8 @@ fn job_ended(
                     status: None,
                     stdout_len: job_output_len(output_dir, &job_id, Stdout),
                     stderr_len: job_output_len(output_dir, &job_id, Stderr),
-                    stdout_hash: job_output_hash(output_dir, &job_id, Stdout)?,
-                    stderr_hash: job_output_hash(output_dir, &job_id, Stderr)?,
+                    stdout_hash: job_output_hash(output_dir, &job_id, Stdout),
+                    stderr_hash: job_output_hash(output_dir, &job_id, Stderr),
                 };
                 if let Some((evicted_id, _status)) = job_history.push(job_id.to_owned(), status) {
                     let _ = remove_file(job_output_path(output_dir, &evicted_id, Stdout));
@@ -771,9 +815,9 @@ fn job_ended(
         }
         Ok(ended) => {
             active_jobs.remove(ended.job_id());
-            if let Some((evicted_id, _status)) =
-                job_history.push(ended.job_id().to_owned(), ended.into())
-            {
+            let job_id = ended.job_id().to_owned();
+            let status = ended.into_status(output);
+            if let Some((evicted_id, _evicted_status)) = job_history.push(job_id, status) {
                 let _ = remove_file(job_output_path(output_dir, &evicted_id, Stdout));
                 let _ = remove_file(job_output_path(output_dir, &evicted_id, Stderr));
             }
@@ -1104,13 +1148,14 @@ mod test {
         Identity::new(key.ssh_public_key(), verified, Utc::now()).unwrap()
     }
 
-    async fn job_status(authn: &Identity, mgr: &JobManager, job: SignedJob) -> JobStatus {
+    async fn job_start(authn: &Identity, mgr: &JobManager, job: SignedJob) -> JobStatus {
+        let job_id = job.job_id().to_owned();
         mgr.job_start(authn, job, JobStartParams::wait())
             .await
             .expect("should be able to start job")
             .expect("should be waiting for job")
             .expect("job should end successfully")
-            .into()
+            .into_status(JobOutputState::new(&mgr.output_dir, &job_id))
     }
 
     async fn job_error(authn: &Identity, mgr: &JobManager, job: SignedJob) -> JobError {
@@ -1132,7 +1177,7 @@ mod test {
             mgr.job_status(&authn, &job_id).await.unwrap_err(),
             JobError::JobNotFound(id) if id == job_id
         ));
-        let status = job_status(&authn, &mgr, job.clone()).await;
+        let status = job_start(&authn, &mgr, job.clone()).await;
         check_status_ended(status, &job_id, "true", Some(0), 0, 0);
 
         assert!(
@@ -1145,7 +1190,7 @@ mod test {
 
         let job_id = session_id.next_job_id(&job);
         let job = root.sign_job_request(&job_id, "false", false).await;
-        let status = job_status(&authn, &mgr, job.clone()).await;
+        let status = job_start(&authn, &mgr, job.clone()).await;
         check_status_ended(status, &job_id, "false", Some(1), 0, 0);
 
         let job_id = session_id.next_job_id(&job);
@@ -1154,7 +1199,7 @@ mod test {
         let job = root
             .sign_job_request(&job_id, "echo -n $SUSH_JOB_ID", false)
             .await;
-        let status = job_status(&authn, &mgr, job.clone()).await;
+        let status = job_start(&authn, &mgr, job.clone()).await;
         check_status_ended(
             status,
             &job_id,
@@ -1178,7 +1223,7 @@ mod test {
         let output = format!("{home}\n");
         let job_id = session_id.next_job_id(&job);
         let job = root.sign_job_request(&job_id, "pwd", false).await;
-        let status = job_status(&authn, &mgr, job.clone()).await;
+        let status = job_start(&authn, &mgr, job.clone()).await;
         check_status_ended(status, &job_id, "pwd", Some(0), output.len() as u64, 0);
         assert_eq!(
             mgr.job_output(&authn, &job_id, Stdout, None).await.unwrap(),
@@ -1215,7 +1260,7 @@ mod test {
 
         let job_id = new_session.session_id().first_job_id();
         let job = root.sign_job_request(&job_id, "true", false).await;
-        let status = job_status(&authn, &mgr, job).await;
+        let status = job_start(&authn, &mgr, job).await;
         check_status_ended(status, &job_id, "true", Some(0), 0, 0);
     }
 
@@ -1318,7 +1363,7 @@ mod test {
         let session_id = session.session_id();
         let job_id = session_id.first_job_id();
         let job = child.sign_job_request(&job_id, "true", false).await;
-        let status = job_status(&authn, &mgr, job).await;
+        let status = job_start(&authn, &mgr, job).await;
         check_status_ended(status, &job_id, "true", Some(0), 0, 0);
     }
 
@@ -1332,10 +1377,10 @@ mod test {
         let job_id = session_id.first_job_id();
         let command = "openssl speed sha1";
         let job = root.sign_job_request(&job_id, command, false).await;
-        let status = JobStatus::from(
-            mgr.job_start(
+        let end = mgr
+            .job_start(
                 &authn,
-                job,
+                job.clone(),
                 JobStartParams {
                     limits: JobLimits {
                         max_cpu: 1,
@@ -1349,8 +1394,8 @@ mod test {
             .await
             .expect("should be able to start job")
             .expect("should be waiting for job")
-            .expect("job should end successfully"),
-        );
+            .expect("job should end successfully");
+        let status = end.into_status(JobOutputState::new(&mgr.output_dir, job.job_id()));
         assert!(status.time_elapsed().to_std().unwrap() < Duration::from_secs(2));
 
         // The output of `openssl speed` changed between v3.0 and v3.5.
@@ -1382,7 +1427,7 @@ mod test {
         let n = 1000;
         let command = &format!("head -c {n} /dev/urandom");
         let job = root.sign_job_request(&job_id, command, false).await;
-        let status = job_status(&authn, &mgr, job).await;
+        let status = job_start(&authn, &mgr, job).await;
         check_status_ended(status, &job_id, command, Some(0), n, 0);
 
         // No range, i.e., full output.
