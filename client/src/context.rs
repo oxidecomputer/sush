@@ -37,7 +37,7 @@ impl fmt::Display for OutputFormat {
 
 /// Behavior in response to command execution, e.g., printing output,
 /// maintaining (ephemeral) state.
-pub trait CommandContext: Send + Sync {
+pub trait CommandContext: Clone + Send + Sync {
     // Context management
     fn get_output_format(&self) -> OutputFormat;
     fn set_output_format(&mut self, output: OutputFormat);

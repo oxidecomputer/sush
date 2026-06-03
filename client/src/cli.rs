@@ -20,7 +20,7 @@ use sush_common::keys::{KeyId, Signature, SshPublicKey};
 use crate::commands::{CommandError, GlobalArgs};
 use crate::context::{CommandContext, OutputFormat};
 
-#[derive(Debug, Default)]
+#[derive(Clone, Debug, Default)]
 pub struct Cli {
     globals: GlobalArgs,
     output: OutputFormat,

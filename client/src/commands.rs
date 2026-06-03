@@ -63,9 +63,6 @@ pub const SUSH_URL: &str = "SUSH_URL";
 /// Default chunk size for parallel downloads of large output.
 const DEFAULT_CHUNK_SIZE: ByteSize = ByteSize::mib(32);
 
-/// Maximum number of authentication retries.
-const MAX_AUTHN_RETRIES: usize = 3;
-
 /// Default number of simultaneous downloads for large output.
 const PARALLEL_CHUNKS: NonZeroU8 = NonZeroU8::new(8).unwrap();
 
@@ -397,7 +394,7 @@ pub struct JobStartArgs {
 }
 
 impl ClientCommand {
-    #[async_recursion]
+    #[async_recursion(?Send)]
     pub async fn execute(self, ctx: &mut impl CommandContext) -> Result<(), CommandError> {
         let args = ctx.get_globals().to_owned();
         if let Some(output) = args.output {
@@ -457,7 +454,7 @@ impl ClientCommand {
     }
 }
 
-async fn authz<E>(
+async fn authenticate<E>(
     ctx: &mut impl CommandContext,
     client: &Client,
     response: ResponseValue<E>,
@@ -496,33 +493,29 @@ async fn authz<E>(
 }
 
 /// Retry a request with transparent authorization.
-/// This means re-evaluating the `$req` expression,
-/// which might involve cloning, etc.
-macro_rules! with_authz {
-    ($ctx:ident, $client:ident, $authz:ident => $req:expr) => {{
-        let mut i = 0;
-        loop {
-            let $authz = $ctx
-                .get_credentials()
-                .map(|creds| creds.to_string())
-                .unwrap_or_default();
-
-            match $req.await {
-                Err(ClientError::ErrorResponse(err))
-                    if err.status() == StatusCode::UNAUTHORIZED =>
-                {
-                    let (_identity, credentials) = authz($ctx, $client, err).await?;
-                    $ctx.set_credentials(Some(credentials));
-                }
-                res => break res,
-            }
-
-            i += 1;
-            if i == MAX_AUTHN_RETRIES {
-                return Err(CommandError::InvalidAuthorization);
-            }
+async fn with_authz<T, E, Req>(
+    ctx: &mut impl CommandContext,
+    client: &Client,
+    mut make_request: Req,
+) -> Result<T, CommandError>
+where
+    Req: AsyncFnMut(&str) -> Result<T, ClientError<E>>,
+    CommandError: From<ClientError<E>>,
+{
+    let authz = ctx
+        .get_credentials()
+        .map(|creds| creds.to_string())
+        .unwrap_or_default();
+    match make_request(&authz).await {
+        Err(ClientError::ErrorResponse(err)) if err.status() == StatusCode::UNAUTHORIZED => {
+            let (_identity, credentials) = authenticate(ctx, client, err).await?;
+            let authz = credentials.to_string();
+            ctx.set_credentials(Some(credentials));
+            Ok(make_request(&authz).await?)
         }
-    }};
+        Err(err) => Err(err.into()),
+        Ok(res) => Ok(res),
+    }
 }
 
 async fn iam(
@@ -552,14 +545,10 @@ async fn iam(
         }
 
         IdentityCommand::List => {
-            let identities = with_authz!(
-                ctx,
-                client,
-                authz => client
-                    .identities()
-                    .authorization(&authz)
-                    .send()
-            )?
+            let identities = with_authz(ctx, client, async |authz| {
+                client.identities().authorization(authz).send().await
+            })
+            .await?
             .into_inner();
             for identity in identities {
                 ctx.iam(&identity)?;
@@ -567,28 +556,26 @@ async fn iam(
             Ok(())
         }
 
-        IdentityCommand::Login => match client.identities().send().await {
-            Ok(_) => Ok(()),
-            Err(ClientError::ErrorResponse(err)) if err.status() == StatusCode::UNAUTHORIZED => {
-                let (identity, credentials) = authz(ctx, client, err).await?;
-                ctx.iam(&identity)?;
-                ctx.set_credentials(Some(credentials));
-                Ok(())
-            }
-            Err(err) => Err(err.into()),
-        },
+        IdentityCommand::Login => {
+            let identity = with_authz(ctx, client, async |authz| {
+                client.iam().authorization(authz).body(None).send().await
+            })
+            .await?
+            .into_inner();
+            ctx.iam(&identity)
+        }
 
         IdentityCommand::Revoke { revoke } => {
             let revoke = ctx.really_revoke(revoke)?;
-            with_authz!(
-                ctx,
-                client,
-                authz => client
+            with_authz(ctx, client, async |authz| {
+                client
                     .revoke_identity()
-                    .authorization(&authz)
+                    .authorization(authz)
                     .key_id(&revoke)
                     .send()
-            )?;
+                    .await
+            })
+            .await?;
             ctx.identity_revoked(revoke)
         }
     }
@@ -605,29 +592,29 @@ async fn cert(
             let mut file = File::open(&path).map_err(io_error)?;
             let mut cert = Vec::new();
             file.read_to_end(&mut cert).map_err(io_error)?;
-            let key_id = with_authz!(
-                ctx,
-                client,
-                authz => client
+            let key_id = with_authz(ctx, client, async |authz| {
+                client
                     .import_cert()
                     .authorization(authz)
                     .body(cert.clone())
                     .send()
-            )?
+                    .await
+            })
+            .await?
             .into_inner();
             ctx.cert_imported(&path, key_id)
         }
 
         CertCommand::Chain { key_id } => {
-            let certs = with_authz!(
-                ctx,
-                client,
-                authz => client
+            let certs = with_authz(ctx, client, async |authz| {
+                client
                     .cert_chain()
                     .authorization(authz)
                     .key_id(&key_id)
                     .send()
-            )?
+                    .await
+            })
+            .await?
             .into_inner();
             ctx.cert_chain(key_id, &certs)
         }
@@ -641,14 +628,10 @@ async fn session(
 ) -> Result<(), CommandError> {
     match (command, client) {
         (SessionCommand::Attach { session_id }, Some(client)) => {
-            let session = with_authz!(
-                ctx,
-                client,
-                authz => client
-                    .session()
-                    .authorization(&authz)
-                    .send()
-            )?
+            let session = with_authz(ctx, client, async |authz| {
+                client.session().authorization(authz).send().await
+            })
+            .await?
             .into_inner();
             if let Some(session_id) = session_id
                 && *session.session_id() != session_id
@@ -670,14 +653,10 @@ async fn session(
         }
 
         (SessionCommand::Start, Some(client)) => {
-            let session = with_authz!(
-                ctx,
-                client,
-                authz => client
-                    .session_start()
-                    .authorization(&authz)
-                    .send()
-            )?
+            let session = with_authz(ctx, client, async |authz| {
+                client.session_start().authorization(authz).send().await
+            })
+            .await?
             .into_inner();
             ctx.session_started(session)?;
             Ok(())
@@ -688,15 +667,15 @@ async fn session(
             let Some(session_id) = session_id.as_ref().or(ctx_session_id.as_ref()) else {
                 return Err(CommandError::MissingSession);
             };
-            with_authz!(
-                ctx,
-                client,
-                authz => client
+            with_authz(ctx, client, async |authz| {
+                client
                     .session_stop()
                     .session_id(session_id.clone())
-                    .authorization(&authz)
+                    .authorization(authz)
                     .send()
-            )?;
+                    .await
+            })
+            .await?;
             ctx.session_stopped(session_id)?;
             Ok(())
         }
@@ -787,29 +766,29 @@ async fn job(
         }
 
         (JobCommand::Stop { job_id }, Some(client)) => {
-            with_authz!(
-                ctx,
-                client,
-                authz => client
+            with_authz(ctx, client, async |authz| {
+                client
                     .job_stop()
                     .job_id(&job_id)
-                    .authorization(&authz)
+                    .authorization(authz)
                     .send()
-            )?;
+                    .await
+            })
+            .await?;
             ctx.job_stopped(&job_id);
             Ok(())
         }
 
         (JobCommand::Status { job_id }, Some(client)) => {
-            let status = with_authz!(
-                ctx,
-                client,
-                authz => client
+            let status = with_authz(ctx, client, async |authz| {
+                client
                     .job_status()
                     .job_id(&job_id)
-                    .authorization(&authz)
+                    .authorization(authz)
                     .send()
-            )?
+                    .await
+            })
+            .await?
             .into_inner();
             ctx.job_status(&job_id, &status);
             Ok(())
@@ -829,16 +808,16 @@ async fn job(
         }
 
         (JobCommand::History { limit, offset }, Some(client)) => {
-            let history = with_authz!(
-                ctx,
-                client,
-                authz => client
+            let history = with_authz(ctx, client, async |authz| {
+                client
                     .job_history()
                     .limit(limit)
                     .offset(offset)
-                    .authorization(&authz)
+                    .authorization(authz)
                     .send()
-            )?
+                    .await
+            })
+            .await?
             .into_inner();
             for job in history {
                 ctx.job_status(job.job_id(), &job);
@@ -856,13 +835,6 @@ async fn job_start(
     job: SignedJob,
     start_args: JobStartArgs,
 ) -> Result<(), CommandError> {
-    let Some(credentials) = ctx.get_credentials() else {
-        // It's ok to bail here because if we haven't got an identity in
-        // the context, we also won't have a session; `job start` is only
-        // useful from the REPL right now.
-        return Err(CommandError::InvalidAuthorization);
-    };
-    let authz = credentials.to_string();
     let job_id = job.job_id().to_owned();
     let interactive = job.interactive();
     let JobStartArgs {
@@ -877,23 +849,27 @@ async fn job_start(
         max_mem,
         max_fsize,
     } = limits.as_limits();
-    let mut start = client
-        .job_start()
-        .authorization(&authz)
-        .job_id(&job_id)
-        .max_cpu(max_cpu)
-        .max_mem(max_mem)
-        .max_fsize(max_fsize)
-        .wait(wait && !interactive)
-        .body(job.clone());
-    if let Some(term) = term {
-        start = start.term(term);
-        if let Ok(winsize) = tcgetwinsize(stdin()) {
-            start = start.rows(winsize.ws_row);
-            start = start.cols(winsize.ws_col);
+
+    let mut start_ctx = ctx.clone();
+    let start = with_authz(&mut start_ctx, client, async |authz| {
+        let mut start = client
+            .job_start()
+            .authorization(authz)
+            .job_id(&job_id)
+            .max_cpu(max_cpu)
+            .max_mem(max_mem)
+            .max_fsize(max_fsize)
+            .wait(wait && !interactive)
+            .body(job.clone());
+        if let Some(term) = term.as_ref() {
+            start = start.term(term);
+            if let Ok(winsize) = tcgetwinsize(stdin()) {
+                start = start.rows(winsize.ws_row);
+                start = start.cols(winsize.ws_col);
+            }
         }
-    }
-    let start = start.send();
+        start.send().await
+    });
     pin!(start);
 
     let mut found = true;
@@ -904,13 +880,16 @@ async fn job_start(
             InteractiveSessionOk::Established => true,
             InteractiveSessionOk::NotFound => false,
         };
-        client
-            .job_status()
-            .authorization(&authz)
-            .job_id(&job_id)
-            .send()
-            .await?
-            .into_inner()
+        with_authz(ctx, client, async |authz| {
+            client
+                .job_status()
+                .authorization(authz)
+                .job_id(&job_id)
+                .send()
+                .await
+        })
+        .await?
+        .into_inner()
     } else {
         let mut interval = interval(Duration::from_millis(250));
         interval.set_missed_tick_behavior(MissedTickBehavior::Skip);
@@ -924,30 +903,36 @@ async fn job_start(
                     break status;
                 }
                 _ = interval.tick() => {
-                    if let Ok(status) = client
-                        .job_status()
-                        .authorization(&authz)
-                        .job_id(&job_id)
-                        .send()
-                        .await
+                    if let Ok(status) = with_authz(ctx, client, async |authz| {
+                        client
+                            .job_status()
+                            .authorization(authz)
+                            .job_id(&job_id)
+                            .send()
+                            .await
+                    }).await
                     {
                         ctx.job_polling_update(&job_id, &status.into_inner());
                     }
                 }
                 _ = ctrl_c() => {
-                    client
-                        .job_stop()
-                        .authorization(&authz)
-                        .job_id(&job_id)
-                        .send()
-                        .await?;
-                    let status = client
-                        .job_status()
-                        .authorization(&authz)
-                        .job_id(&job_id)
-                        .send()
-                        .await?
-                        .into_inner();
+                    with_authz(ctx, client, async |authz| {
+                        client
+                            .job_stop()
+                            .authorization(authz)
+                            .job_id(&job_id)
+                            .send()
+                            .await
+                    }).await?;
+                    let status = with_authz(ctx, client, async |authz| {
+                        client
+                            .job_status()
+                            .authorization(authz)
+                            .job_id(&job_id)
+                            .send()
+                            .await
+                    }).await?
+                    .into_inner();
                     ctx.job_polling_finished(&job_id);
                     ctx.job_started(&job);
                     ctx.job_stopped(&job_id);
@@ -959,19 +944,22 @@ async fn job_start(
     ctx.job_status(&job_id, &status);
     if wait || !found {
         for stream in [Stdout, Stderr] {
-            match client
-                .job_output()
-                .authorization(&authz)
-                .job_id(&job_id)
-                .stream(stream)
-                .send()
-                .await
+            match with_authz(ctx, client, async |authz| {
+                client
+                    .job_output()
+                    .authorization(authz)
+                    .job_id(&job_id)
+                    .stream(stream)
+                    .send()
+                    .await
+            })
+            .await
             {
                 Ok(byte_stream) => {
                     let output = byte_stream_to_vec(byte_stream.into_inner()).await?;
                     ctx.job_output(&job_id, stream, &output, binary);
                 }
-                Err(error) => return Err(ctx.job_error(error.into())),
+                Err(error) => return Err(ctx.job_error(error)),
             }
         }
     }
@@ -1027,30 +1015,30 @@ async fn job_output(
 ) -> Result<(), CommandError> {
     // Maybe truncate instead of fetching output.
     if let Some(n) = truncate.map(|n| n.as_u64()) {
-        with_authz!(
-            ctx,
-            client,
-            authz => client
+        with_authz(ctx, client, async |authz| {
+            client
                 .job_output_delete()
-                .authorization(&authz)
+                .authorization(authz)
                 .job_id(&job_id)
                 .stream(stream)
                 .range(format!("bytes={n}-"))
                 .send()
-        )?;
+                .await
+        })
+        .await?;
         return Ok(());
     }
 
     // Fetch job status for output length and hash.
-    let status = with_authz!(
-        ctx,
-        client,
-        authz => client
+    let status = with_authz(ctx, client, async |authz| {
+        client
             .job_status()
             .authorization(authz)
             .job_id(&job_id)
             .send()
-    )?
+            .await
+    })
+    .await?
     .into_inner();
     let (stdout_len, stderr_len, stdout_hash, stderr_hash) = match status {
         JobStatus::Started { .. } => return Err(CommandError::JobStillRunning(job_id.to_owned())),
@@ -1104,11 +1092,7 @@ async fn job_output(
 
         // Download and write the output in parallel (unordered) chunks.
         ctx.job_output_started(&job_id, stream, "Downloading", len);
-        let Some(credentials) = ctx.get_credentials() else {
-            return Err(CommandError::InvalidAuthorization);
-        };
-        let authz = credentials.to_string();
-        let chunks = job_output_chunks(client, &authz, &job_id, stream, len, chunk_size);
+        let chunks = job_output_chunks(ctx, client, &job_id, stream, len, chunk_size);
         let par = parallel.get() as usize;
         let mut chunks_par = stream::iter(chunks).buffer_unordered(par);
         while let Some(chunk) = chunks_par.next().await {
@@ -1140,16 +1124,18 @@ async fn job_output(
     } else {
         // Download and print the output all at once. If hash verification
         // fails here, do not print any output.
-        let byte_stream = with_authz!(
-            ctx,
-            client,
-            authz => client
-                .job_output()
-                .authorization(authz)
-                .job_id(&job_id)
-                .stream(stream)
-                .send()
-        )?
+        let byte_stream = with_authz(ctx, client, {
+            async |authz| {
+                client
+                    .job_output()
+                    .authorization(authz)
+                    .job_id(&job_id)
+                    .stream(stream)
+                    .send()
+                    .await
+            }
+        })
+        .await?
         .into_inner();
         let bytes = byte_stream_to_vec(byte_stream).await?;
         check_hash!(hash(&bytes), None)?;
@@ -1160,8 +1146,8 @@ async fn job_output(
 
 /// Prepare a vector of futures that fetch chunks of output.
 fn job_output_chunks<'a>(
+    ctx: &mut impl CommandContext,
     client: &'a Client,
-    authz: &'a str,
     job_id: &'a JobId,
     stream: JobOutputStream,
     len: u64,
@@ -1169,15 +1155,21 @@ fn job_output_chunks<'a>(
 ) -> Vec<Pin<Box<FutureChunk<'a>>>> {
     let mut chunks = Vec::new();
     let mut start = 0;
+    // TODO: transparent authn for long downloads
+    let authz = ctx
+        .get_credentials()
+        .map(|creds| creds.to_string())
+        .unwrap_or_default();
     while start < len {
         let end = (start + chunk_size.get() - 1).min(len - 1);
         let range = Range { start, end };
-        chunks.push(
+        chunks.push({
+            let authz = authz.clone();
             async move {
                 let bytes = range.bytes();
                 let stream = client
                     .job_output()
-                    .authorization(authz)
+                    .authorization(&authz)
                     .job_id(job_id)
                     .stream(stream)
                     .range(&bytes)
@@ -1186,8 +1178,8 @@ fn job_output_chunks<'a>(
                     .into_inner();
                 Ok(Chunk(range, stream))
             }
-            .boxed(),
-        );
+            .boxed()
+        });
         start = end + 1;
     }
     chunks
@@ -1236,19 +1228,18 @@ async fn job_start_interactive_session(
     client: &Client,
     job_id: &JobId,
 ) -> Result<InteractiveSessionOk, CommandError> {
-    match with_authz!(
-        ctx,
-        client,
-        authz => client
+    match with_authz(ctx, client, async |authz| {
+        client
             .job_start_interactive_session()
-            .authorization(&authz)
+            .authorization(authz)
             .job_id(job_id)
             .send()
-    ) {
-        Err(error) if error.status() == Some(StatusCode::NOT_FOUND) => {
-            Ok(InteractiveSessionOk::NotFound)
-        }
-        Err(error) => Err(ctx.job_error(error.into())),
+            .await
+    })
+    .await
+    {
+        Err(CommandError::NotFound) => Ok(InteractiveSessionOk::NotFound),
+        Err(error) => Err(ctx.job_error(error)),
         Ok(socket) => {
             ctx.job_session_connected(job_id);
             let socket = socket.into_inner();
@@ -1318,6 +1309,8 @@ pub enum CommandError {
     MissingSession,
     #[error("❌ Missing SSH agent socket, try `--ssh-auth-sock`")]
     MissingSshAuthSock,
+    #[error("❌ Resource not found")]
+    NotFound,
     #[error("❌ Command not supported in offline mode, try `--url`")]
     Offline,
     #[error(
@@ -1372,6 +1365,7 @@ impl From<ClientError<ApiError>> for CommandError {
             InvalidRequest(e) => CommandError::Client(format!("Invalid request: {e}")),
             CommunicationError(e) => CommandError::Client(format!("Communication error: {e}")),
             InvalidUpgrade(e) => CommandError::Client(e.to_string()),
+            ErrorResponse(e) if e.status() == StatusCode::NOT_FOUND => CommandError::NotFound,
             ErrorResponse(e) => CommandError::Client(e.message.to_owned()),
             ResponseBodyError(e) => CommandError::Client(e.to_string()),
             InvalidResponsePayload(_b, e) => CommandError::Client(e.to_string()),

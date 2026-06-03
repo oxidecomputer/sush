@@ -53,7 +53,7 @@ impl ReplCommandParser {
 }
 
 /// Interactive REPL context.
-#[derive(Debug, Default)]
+#[derive(Clone, Debug, Default)]
 pub struct Repl {
     cli: Cli,
 }
