@@ -337,6 +337,14 @@ impl JobManager {
             }
         }
 
+        // Claim the nonce.
+        let Some(generated) = self.nonces.lock().await.pop(&nonce) else {
+            unauthorized!("nonce not found");
+        };
+        if !Nonce::is_still_valid(&generated, &now) {
+            unauthorized!("nonce expired");
+        };
+
         // Verify the supplied credentials.
         let Some(public_key) = public_key else {
             unauthorized!("missing public key");
@@ -347,14 +355,6 @@ impl JobManager {
         let response = credentials.clone().into_challenge_response();
         let verified = try_authn!(response.verify_with_ssh_public_key(&public_key));
         let identity = try_authn!(Identity::new(public_key.to_owned(), verified, now));
-
-        // Claim the nonce.
-        let Some(generated) = self.nonces.lock().await.pop(&nonce) else {
-            unauthorized!("nonce not found");
-        };
-        if !Nonce::is_still_valid(&generated, &now) {
-            unauthorized!("nonce expired");
-        };
 
         // Authenticated! Cache the identity & credentials.
         debug!(self.log, "authenticated credentials for identity"; "key_id" => %key_id);
