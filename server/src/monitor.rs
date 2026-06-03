@@ -195,6 +195,8 @@ impl JobMonitor {
         let output_file = OpenOptions::new()
             .read(true)
             .write(true)
+            .create(true)
+            .truncate(true)
             .open(&path)
             .map_err(&io_error)?;
         let log = self.log.new(o!("interactive" => true));
