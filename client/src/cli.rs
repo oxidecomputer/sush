@@ -22,21 +22,11 @@ use crate::context::{CommandContext, OutputFormat};
 
 #[derive(Debug, Default)]
 pub struct Cli {
+    globals: GlobalArgs,
     output: OutputFormat,
     progress: Option<ProgressBar>,
     session: Option<Session>,
     credentials: Option<Credentials>,
-}
-
-impl Cli {
-    pub fn new(output: OutputFormat) -> Self {
-        Self {
-            output,
-            progress: None,
-            session: None,
-            credentials: None,
-        }
-    }
 }
 
 fn byte_size(len: u64) -> bytesize::Display {
@@ -54,15 +44,12 @@ impl CommandContext for Cli {
         self.output = output;
     }
 
-    fn set_globals(&mut self, _args: &mut GlobalArgs, values: GlobalArgs) {
-        match self.get_output_format() {
-            OutputFormat::Json => {
-                let GlobalArgs { output, url, .. } = values;
-                let output = output.map(|o| o.as_str());
-                println!("{}", json!({"output": output, "url": url}))
-            }
-            OutputFormat::Text => println!("❌ `set` is most useful interactively, try `shell`"),
-        }
+    fn get_globals(&self) -> &GlobalArgs {
+        &self.globals
+    }
+
+    fn set_globals(&mut self, args: GlobalArgs) {
+        self.globals = args;
     }
 
     fn more(&self) -> bool {

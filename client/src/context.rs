@@ -41,7 +41,8 @@ pub trait CommandContext: Send + Sync {
     // Context management
     fn get_output_format(&self) -> OutputFormat;
     fn set_output_format(&mut self, output: OutputFormat);
-    fn set_globals(&mut self, _args: &mut GlobalArgs, _values: GlobalArgs) {}
+    fn get_globals(&self) -> &GlobalArgs;
+    fn set_globals(&mut self, _args: GlobalArgs) {}
     fn pre_parse_hook(&mut self, _command: &str) {}
     fn more(&self) -> bool;
 

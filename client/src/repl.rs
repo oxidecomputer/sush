@@ -61,9 +61,10 @@ pub struct Repl {
 impl Repl {
     pub async fn run(
         mut self,
-        args: &mut GlobalArgs,
+        args: GlobalArgs,
         _client: Option<Client>,
     ) -> Result<(), CommandError> {
+        self.set_globals(args.clone());
         let xdg = BaseDirectories::with_prefix(PREFIX);
         let history_file = xdg
             .place_state_file(HISTORY_FILE)
@@ -77,7 +78,7 @@ impl Repl {
                     continue;
                 }}
             }
-            match rl.readline(&self.prompt(args)) {
+            match rl.readline(&self.prompt(self.get_globals())) {
                 Ok(command) => {
                     if command.trim().is_empty() {
                         continue;
@@ -90,7 +91,7 @@ impl Repl {
                         Ok(ReplCommandParser { command }) => command,
                         Err(err) => perr!("{err}"),
                     };
-                    match command.execute(&mut self, args).await {
+                    match command.execute(&mut self).await {
                         Ok(()) => (),
                         Err(CommandError::Quit) => break,
                         Err(err) => perr!("{err}"),
@@ -143,7 +144,11 @@ impl CommandContext for Repl {
         self.cli.set_output_format(output)
     }
 
-    fn set_globals(&mut self, args: &mut GlobalArgs, values: GlobalArgs) {
+    fn get_globals(&self) -> &GlobalArgs {
+        self.cli.get_globals()
+    }
+
+    fn set_globals(&mut self, mut args: GlobalArgs) {
         let GlobalArgs {
             mut output,
             json,
@@ -152,7 +157,7 @@ impl CommandContext for Repl {
             offline,
             ssh_auth_sock,
             ssh_key_id,
-        } = values;
+        } = args;
         if json {
             output = Some(OutputFormat::Json);
         } else if text {
@@ -180,6 +185,7 @@ impl CommandContext for Repl {
         set_or_unset!(ssh_auth_sock, SSH_AUTH_SOCK, "SSH agent socket");
         set_or_unset!(ssh_key_id, SUSH_KEY_ID, "SSH key ID");
 
+        self.cli.set_globals(args);
         self.set_credentials(None);
     }
 

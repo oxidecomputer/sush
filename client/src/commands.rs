@@ -102,7 +102,7 @@ impl LimitArgs {
 }
 
 /// Optional global arguments, i.e., ones that apply to every command.
-#[derive(Clone, Debug, Parser)]
+#[derive(Clone, Debug, Default, Parser)]
 pub struct GlobalArgs {
     /// Output format
     #[arg(long,
@@ -160,7 +160,8 @@ pub struct ClientArgs {
 
 impl ClientArgs {
     pub async fn execute(&mut self, ctx: &mut impl CommandContext) -> Result<(), CommandError> {
-        self.command.clone().execute(ctx, &mut self.globals).await
+        ctx.set_globals(self.globals.clone());
+        self.command.clone().execute(ctx).await
     }
 }
 
@@ -397,20 +398,15 @@ pub struct JobStartArgs {
 
 impl ClientCommand {
     #[async_recursion]
-    pub async fn execute(
-        self,
-        ctx: &mut impl CommandContext,
-        args: &mut GlobalArgs,
-    ) -> Result<(), CommandError> {
+    pub async fn execute(self, ctx: &mut impl CommandContext) -> Result<(), CommandError> {
+        let args = ctx.get_globals().to_owned();
         if let Some(output) = args.output {
             ctx.set_output_format(output);
         }
 
         let client = args.url.as_ref().map(|url| Client::new(url));
         match (self, client) {
-            (ClientCommand::Cert { command }, Some(client)) => {
-                cert(ctx, &client, &args.ssh_auth_sock, &args.ssh_key_id, command).await
-            }
+            (ClientCommand::Cert { command }, Some(client)) => cert(ctx, &client, command).await,
 
             (
                 ClientCommand::Iam {
@@ -439,27 +435,18 @@ impl ClientCommand {
             }
 
             (ClientCommand::Session { command }, client) => {
-                session(
-                    ctx,
-                    &client,
-                    &args.ssh_auth_sock,
-                    &args.ssh_key_id,
-                    command.unwrap_or_default(),
-                )
-                .await
+                session(ctx, &client, command.unwrap_or_default()).await
             }
 
-            (ClientCommand::Job { command }, client) => {
-                job(ctx, &client, &args.ssh_auth_sock, &args.ssh_key_id, command).await
-            }
+            (ClientCommand::Job { command }, client) => job(ctx, &client, command).await,
 
-            (ClientCommand::Set { args: values }, _) => {
-                ctx.set_globals(args, values);
+            (ClientCommand::Set { args }, _) => {
+                ctx.set_globals(args);
                 Ok(())
             }
 
             (ClientCommand::Shell, client) => {
-                Repl::default().run(args, client).await?;
+                Repl::default().run(args.clone(), client).await?;
                 Ok(())
             }
 
@@ -473,16 +460,16 @@ impl ClientCommand {
 async fn authz<E>(
     ctx: &mut impl CommandContext,
     client: &Client,
-    ssh_auth_sock: &Option<String>,
-    ssh_key_id: &Option<KeyId>,
     response: ResponseValue<E>,
 ) -> Result<(Identity, Credentials), CommandError> {
-    let mut ssh_agent = if let Some(ssh_auth_sock) = ssh_auth_sock {
+    let mut ssh_agent = if let Some(ssh_auth_sock) = &ctx.get_globals().ssh_auth_sock {
         SshAgentConnection::connect(ssh_auth_sock).await?
     } else {
         return Err(CommandError::MissingSshAuthSock);
     };
-    let public_key = ssh_agent.identity(ssh_key_id.as_ref()).await?;
+    let public_key = ssh_agent
+        .identity(ctx.get_globals().ssh_key_id.as_ref())
+        .await?;
     let challenge = response
         .headers()
         .get(WWW_AUTHENTICATE)
@@ -512,7 +499,7 @@ async fn authz<E>(
 /// This means re-evaluating the `$req` expression,
 /// which might involve cloning, etc.
 macro_rules! with_authz {
-    ($ctx:ident, $client:ident, $ssh_auth_sock:expr, $ssh_key_id:expr, $authz:ident => $req:expr) => {{
+    ($ctx:ident, $client:ident, $authz:ident => $req:expr) => {{
         let mut i = 0;
         loop {
             let $authz = $ctx
@@ -524,8 +511,7 @@ macro_rules! with_authz {
                 Err(ClientError::ErrorResponse(err))
                     if err.status() == StatusCode::UNAUTHORIZED =>
                 {
-                    let (_identity, credentials) =
-                        authz($ctx, $client, $ssh_auth_sock, $ssh_key_id, err).await?;
+                    let (_identity, credentials) = authz($ctx, $client, err).await?;
                     $ctx.set_credentials(Some(credentials));
                 }
                 res => break res,
@@ -569,8 +555,6 @@ async fn iam(
             let identities = with_authz!(
                 ctx,
                 client,
-                ssh_auth_sock,
-                ssh_key_id,
                 authz => client
                     .identities()
                     .authorization(&authz)
@@ -586,8 +570,7 @@ async fn iam(
         IdentityCommand::Login => match client.identities().send().await {
             Ok(_) => Ok(()),
             Err(ClientError::ErrorResponse(err)) if err.status() == StatusCode::UNAUTHORIZED => {
-                let (identity, credentials) =
-                    authz(ctx, client, ssh_auth_sock, ssh_key_id, err).await?;
+                let (identity, credentials) = authz(ctx, client, err).await?;
                 ctx.iam(&identity)?;
                 ctx.set_credentials(Some(credentials));
                 Ok(())
@@ -600,8 +583,6 @@ async fn iam(
             with_authz!(
                 ctx,
                 client,
-                ssh_auth_sock,
-                ssh_key_id,
                 authz => client
                     .revoke_identity()
                     .authorization(&authz)
@@ -616,8 +597,6 @@ async fn iam(
 async fn cert(
     ctx: &mut impl CommandContext,
     client: &Client,
-    ssh_auth_sock: &Option<String>,
-    ssh_key_id: &Option<KeyId>,
     command: CertCommand,
 ) -> Result<(), CommandError> {
     match command {
@@ -629,8 +608,6 @@ async fn cert(
             let key_id = with_authz!(
                 ctx,
                 client,
-                ssh_auth_sock,
-                ssh_key_id,
                 authz => client
                     .import_cert()
                     .authorization(authz)
@@ -645,8 +622,6 @@ async fn cert(
             let certs = with_authz!(
                 ctx,
                 client,
-                ssh_auth_sock,
-                ssh_key_id,
                 authz => client
                     .cert_chain()
                     .authorization(authz)
@@ -662,8 +637,6 @@ async fn cert(
 async fn session(
     ctx: &mut impl CommandContext,
     client: &Option<Client>,
-    ssh_auth_sock: &Option<String>,
-    ssh_key_id: &Option<KeyId>,
     command: SessionCommand,
 ) -> Result<(), CommandError> {
     match (command, client) {
@@ -671,8 +644,6 @@ async fn session(
             let session = with_authz!(
                 ctx,
                 client,
-                ssh_auth_sock,
-                ssh_key_id,
                 authz => client
                     .session()
                     .authorization(&authz)
@@ -702,8 +673,6 @@ async fn session(
             let session = with_authz!(
                 ctx,
                 client,
-                ssh_auth_sock,
-                ssh_key_id,
                 authz => client
                     .session_start()
                     .authorization(&authz)
@@ -722,8 +691,6 @@ async fn session(
             with_authz!(
                 ctx,
                 client,
-                ssh_auth_sock,
-                ssh_key_id,
                 authz => client
                     .session_stop()
                     .session_id(session_id.clone())
@@ -741,8 +708,6 @@ async fn session(
 async fn job(
     ctx: &mut impl CommandContext,
     client: &Option<Client>,
-    ssh_auth_sock: &Option<String>,
-    ssh_key_id: &Option<KeyId>,
     command: JobCommand,
 ) -> Result<(), CommandError> {
     match (command, client) {
@@ -750,7 +715,7 @@ async fn job(
             if start_args.command.is_none() && start_args.permslip.is_none() =>
         {
             let job = ctx.read_signed_job()?;
-            job_start(ctx, client, ssh_auth_sock, ssh_key_id, job, start_args).await?;
+            job_start(ctx, client, job, start_args).await?;
             Ok(())
         }
 
@@ -814,15 +779,7 @@ async fn job(
             };
             if let Some(client) = client {
                 ctx.job_signed(&job, false);
-                job_start(
-                    ctx,
-                    client,
-                    ssh_auth_sock,
-                    ssh_key_id,
-                    job,
-                    start_args.to_owned(),
-                )
-                .await
+                job_start(ctx, client, job, start_args.to_owned()).await
             } else {
                 ctx.job_signed(&job, true);
                 Ok(())
@@ -833,8 +790,6 @@ async fn job(
             with_authz!(
                 ctx,
                 client,
-                ssh_auth_sock,
-                ssh_key_id,
                 authz => client
                     .job_stop()
                     .job_id(&job_id)
@@ -849,8 +804,6 @@ async fn job(
             let status = with_authz!(
                 ctx,
                 client,
-                ssh_auth_sock,
-                ssh_key_id,
                 authz => client
                     .job_status()
                     .job_id(&job_id)
@@ -863,15 +816,15 @@ async fn job(
         }
 
         (JobCommand::Stdout { output }, Some(client)) => {
-            job_output(ctx, client, ssh_auth_sock, ssh_key_id, Stdout, output).await
+            job_output(ctx, client, Stdout, output).await
         }
 
         (JobCommand::Stderr { output }, Some(client)) => {
-            job_output(ctx, client, ssh_auth_sock, ssh_key_id, Stderr, output).await
+            job_output(ctx, client, Stderr, output).await
         }
 
         (JobCommand::Session { job_id }, Some(client)) => {
-            job_start_interactive_session(ctx, client, ssh_auth_sock, ssh_key_id, &job_id).await?;
+            job_start_interactive_session(ctx, client, &job_id).await?;
             Ok(())
         }
 
@@ -879,8 +832,6 @@ async fn job(
             let history = with_authz!(
                 ctx,
                 client,
-                ssh_auth_sock,
-                ssh_key_id,
                 authz => client
                     .job_history()
                     .limit(limit)
@@ -902,8 +853,6 @@ async fn job(
 async fn job_start(
     ctx: &mut impl CommandContext,
     client: &Client,
-    ssh_auth_sock: &Option<String>,
-    ssh_key_id: &Option<KeyId>,
     job: SignedJob,
     start_args: JobStartArgs,
 ) -> Result<(), CommandError> {
@@ -951,9 +900,7 @@ async fn job_start(
     let status = if interactive {
         start.as_mut().await?;
         ctx.job_started(&job);
-        found = match job_start_interactive_session(ctx, client, ssh_auth_sock, ssh_key_id, &job_id)
-            .await?
-        {
+        found = match job_start_interactive_session(ctx, client, &job_id).await? {
             InteractiveSessionOk::Established => true,
             InteractiveSessionOk::NotFound => false,
         };
@@ -1067,8 +1014,6 @@ type FutureChunk<'a> = dyn Future<Output = Result<Chunk, CommandError>> + Send +
 async fn job_output(
     ctx: &mut impl CommandContext,
     client: &Client,
-    ssh_auth_sock: &Option<String>,
-    ssh_key_id: &Option<KeyId>,
     stream: JobOutputStream,
     JobOutput {
         job_id,
@@ -1085,8 +1030,6 @@ async fn job_output(
         with_authz!(
             ctx,
             client,
-            ssh_auth_sock,
-            ssh_key_id,
             authz => client
                 .job_output_delete()
                 .authorization(&authz)
@@ -1102,8 +1045,6 @@ async fn job_output(
     let status = with_authz!(
         ctx,
         client,
-        ssh_auth_sock,
-        ssh_key_id,
         authz => client
             .job_status()
             .authorization(authz)
@@ -1202,8 +1143,6 @@ async fn job_output(
         let byte_stream = with_authz!(
             ctx,
             client,
-            ssh_auth_sock,
-            ssh_key_id,
             authz => client
                 .job_output()
                 .authorization(authz)
@@ -1295,15 +1234,11 @@ enum InteractiveSessionOk {
 async fn job_start_interactive_session(
     ctx: &mut impl CommandContext,
     client: &Client,
-    ssh_auth_sock: &Option<String>,
-    ssh_key_id: &Option<KeyId>,
     job_id: &JobId,
 ) -> Result<InteractiveSessionOk, CommandError> {
     match with_authz!(
         ctx,
         client,
-        ssh_auth_sock,
-        ssh_key_id,
         authz => client
             .job_start_interactive_session()
             .authorization(&authz)
