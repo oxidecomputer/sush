@@ -4,7 +4,7 @@
 //! for completion. Standard output and standard error are saved in files.
 
 use std::collections::BTreeMap;
-use std::fs::{DirBuilder, File, OpenOptions, remove_file};
+use std::fs::{DirBuilder, File, OpenOptions, remove_dir, remove_file};
 use std::io::{Read as _, Seek as _, SeekFrom};
 use std::num::NonZeroUsize;
 use std::os::fd::AsRawFd as _;
@@ -776,6 +776,13 @@ fn job_ended(
     result: ExecutionResult,
     output: JobOutputState,
 ) -> Result<(), JobError> {
+    let remove_orphan_output = |evicted: Option<(JobId, JobStatus)>| {
+        if let Some((evicted_id, _evicted_status)) = evicted {
+            let _ = remove_file(job_output_path(output_dir, &evicted_id, Stdout));
+            let _ = remove_file(job_output_path(output_dir, &evicted_id, Stderr));
+            let _ = remove_dir(job_output_dir(output_dir, &evicted_id));
+        }
+    };
     match result {
         Err(ExecutionError {
             job_id,
@@ -799,15 +806,12 @@ fn job_ended(
                     time_started,
                     time_ended: time,
                     status: None,
-                    stdout_len: job_output_len(output_dir, &job_id, Stdout),
-                    stderr_len: job_output_len(output_dir, &job_id, Stderr),
-                    stdout_hash: job_output_hash(output_dir, &job_id, Stdout),
-                    stderr_hash: job_output_hash(output_dir, &job_id, Stderr),
+                    stdout_len: output.stdout_len,
+                    stderr_len: output.stderr_len,
+                    stdout_hash: output.stdout_hash,
+                    stderr_hash: output.stderr_hash,
                 };
-                if let Some((evicted_id, _status)) = job_history.push(job_id.to_owned(), status) {
-                    let _ = remove_file(job_output_path(output_dir, &evicted_id, Stdout));
-                    let _ = remove_file(job_output_path(output_dir, &evicted_id, Stderr));
-                }
+                remove_orphan_output(job_history.push(job_id.to_owned(), status));
                 Ok(())
             } else {
                 Err(JobError::InvalidJobId(job_id))
@@ -817,11 +821,7 @@ fn job_ended(
             active_jobs.remove(ended.job_id());
             let job_id = ended.job_id().to_owned();
             let status = ended.into_status(output);
-            if let Some((evicted_id, _evicted_status)) = job_history.push(job_id, status) {
-                let _ = remove_file(job_output_path(output_dir, &evicted_id, Stdout));
-                let _ = remove_file(job_output_path(output_dir, &evicted_id, Stderr));
-            }
-
+            remove_orphan_output(job_history.push(job_id, status));
             Ok(())
         }
     }
