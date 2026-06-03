@@ -507,6 +507,14 @@ impl JobManager {
     ) -> Result<Option<ExecutionResult>, JobError> {
         let wait = params.wait;
         let started = {
+            let cert_key_id = job.key_id().to_owned();
+            let chain = self.cert_chain(authn, &cert_key_id).await?;
+            let job = if let Some(leaf) = chain.last() {
+                job.verify_with_cert(leaf)?
+            } else {
+                return Err(JobError::MissingCert(cert_key_id));
+            };
+
             let mut session_guard = self.session.lock().await;
             let Some(session) = session_guard.clone() else {
                 return Err(JobError::NoSession);
@@ -524,13 +532,6 @@ impl JobManager {
             })
             .await?;
 
-            let cert_key_id = job.key_id().to_owned();
-            let chain = self.cert_chain(authn, &cert_key_id).await?;
-            let job = if let Some(leaf) = chain.last() {
-                job.verify_with_cert(leaf)?
-            } else {
-                return Err(JobError::MissingCert(cert_key_id));
-            };
             if session.key_id() != Some(&authn.key_id) {
                 return Err(JobError::SessionWrongIdentity);
             }
