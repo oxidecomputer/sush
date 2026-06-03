@@ -871,7 +871,8 @@ async fn job(
         }
 
         (JobCommand::Session { job_id }, Some(client)) => {
-            job_start_interactive_session(ctx, client, ssh_auth_sock, ssh_key_id, &job_id).await
+            job_start_interactive_session(ctx, client, ssh_auth_sock, ssh_key_id, &job_id).await?;
+            Ok(())
         }
 
         (JobCommand::History { limit, offset }, Some(client)) => {
@@ -946,10 +947,16 @@ async fn job_start(
     let start = start.send();
     pin!(start);
 
+    let mut found = true;
     let status = if interactive {
         start.as_mut().await?;
         ctx.job_started(&job);
-        job_start_interactive_session(ctx, client, ssh_auth_sock, ssh_key_id, &job_id).await?;
+        found = match job_start_interactive_session(ctx, client, ssh_auth_sock, ssh_key_id, &job_id)
+            .await?
+        {
+            InteractiveSessionOk::Established => true,
+            InteractiveSessionOk::NotFound => false,
+        };
         client
             .job_status()
             .authorization(&authz)
@@ -1003,7 +1010,7 @@ async fn job_start(
         }
     };
     ctx.job_status(&job_id, &status);
-    if wait {
+    if wait || !found {
         for stream in [Stdout, Stderr] {
             match client
                 .job_output()
@@ -1275,6 +1282,14 @@ async fn byte_stream_to_file(
     }
 }
 
+enum InteractiveSessionOk {
+    /// An interactive job session was established.
+    Established,
+
+    /// The job ended before we could establish a connection.
+    NotFound,
+}
+
 /// Connect via WebSockets to a running interactive job,
 /// providing authentication via an SSH agent.
 async fn job_start_interactive_session(
@@ -1283,7 +1298,7 @@ async fn job_start_interactive_session(
     ssh_auth_sock: &Option<String>,
     ssh_key_id: &Option<KeyId>,
     job_id: &JobId,
-) -> Result<(), CommandError> {
+) -> Result<InteractiveSessionOk, CommandError> {
     match with_authz!(
         ctx,
         client,
@@ -1295,6 +1310,9 @@ async fn job_start_interactive_session(
             .job_id(job_id)
             .send()
     ) {
+        Err(error) if error.status() == Some(StatusCode::NOT_FOUND) => {
+            Ok(InteractiveSessionOk::NotFound)
+        }
         Err(error) => Err(ctx.job_error(error.into())),
         Ok(socket) => {
             ctx.job_session_connected(job_id);
@@ -1304,7 +1322,7 @@ async fn job_start_interactive_session(
                 return Err(ctx.job_error(error.into()));
             }
             ctx.job_session_disconnected(job_id);
-            Ok(())
+            Ok(InteractiveSessionOk::Established)
         }
     }
 }
