@@ -495,11 +495,12 @@ impl JobManager {
         .await?;
         jobs.sort_by_key(JobStatus::time_started);
         jobs.reverse();
-        Ok(jobs
-            .into_iter()
-            .skip(offset as usize)
-            .take(limit as usize)
-            .collect())
+        let iter = jobs.into_iter().skip(offset as usize);
+        Ok(if limit == 0 {
+            iter.collect()
+        } else {
+            iter.take(limit as usize).collect()
+        })
     }
 
     pub async fn job_start(

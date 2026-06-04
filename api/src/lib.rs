@@ -231,7 +231,9 @@ impl JobStartParams {
 
 /// Simple pagination for history list.
 #[derive(Debug, Default, Deserialize, JsonSchema)]
+#[serde(default)]
 pub struct JobHistoryParams {
+    /// limit=0 means all jobs
     pub limit: u32,
     pub offset: u32,
 }

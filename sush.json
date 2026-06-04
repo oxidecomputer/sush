@@ -235,7 +235,7 @@
           {
             "in": "query",
             "name": "limit",
-            "required": true,
+            "description": "limit=0 means all jobs",
             "schema": {
               "type": "integer",
               "format": "uint32",
@@ -245,7 +245,6 @@
           {
             "in": "query",
             "name": "offset",
-            "required": true,
             "schema": {
               "type": "integer",
               "format": "uint32",
