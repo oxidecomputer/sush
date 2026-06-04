@@ -23,7 +23,7 @@ use reqwest::Upgraded;
 use rustix::termios::tcgetwinsize;
 use thiserror::Error;
 use tokio::signal::ctrl_c;
-use tokio::time::{MissedTickBehavior, interval};
+use tokio::time::{MissedTickBehavior, interval, sleep};
 use tokio::{pin, select};
 use tokio_tungstenite::WebSocketStream;
 use tokio_tungstenite::tungstenite::error::Error as WebSocketError;
@@ -893,6 +893,7 @@ async fn job_start(
         .into_inner()
     } else {
         let mut interval = interval(Duration::from_millis(250));
+        let mut stopped = false;
         interval.set_missed_tick_behavior(MissedTickBehavior::Skip);
         ctx.job_polling_started(&job_id, interval.period());
         loop {
@@ -900,6 +901,9 @@ async fn job_start(
                 status = &mut start => {
                     let status = status?.into_inner();
                     ctx.job_started(&job);
+                    if let JobStatus::Ended { .. } = status {
+                        ctx.job_stopped(&job_id);
+                    }
                     ctx.job_polling_finished(&job_id);
                     break status;
                 }
@@ -916,28 +920,31 @@ async fn job_start(
                         ctx.job_polling_update(&job_id, &status.into_inner());
                     }
                 }
-                _ = ctrl_c() => {
-                    with_authz(ctx, client, async |authz| {
-                        client
-                            .job_stop()
-                            .authorization(authz)
-                            .job_id(&job_id)
-                            .send()
-                            .await
-                    }).await?;
-                    let status = with_authz(ctx, client, async |authz| {
-                        client
-                            .job_status()
-                            .authorization(authz)
-                            .job_id(&job_id)
-                            .send()
-                            .await
-                    }).await?
-                    .into_inner();
-                    ctx.job_polling_finished(&job_id);
-                    ctx.job_started(&job);
-                    ctx.job_stopped(&job_id);
-                    break status;
+                _ = ctrl_c(), if !stopped => {
+                    // Stop the job, but don't break out of the select loop;
+                    // we must wait for the start future to resolve. But there
+                    // is a race here with the start request, so retry the stop
+                    // a few times if needed.
+                    for _ in 0..3 {
+                        match with_authz(ctx, client, async |authz| {
+                            client
+                                .job_stop()
+                                .authorization(authz)
+                                .job_id(&job_id)
+                                .send()
+                                .await
+                        }).await {
+                            Ok(_) => {
+                                stopped = true;
+                                break;
+                            }
+                            Err(CommandError::NotFound) => {
+                                sleep(Duration::from_millis(100)).await;
+                                continue;
+                            }
+                            Err(err) => return Err(err),
+                        }
+                    }
                 }
             }
         }
@@ -1292,8 +1299,6 @@ pub enum CommandError {
     InvalidLeafCert(KeyId),
     #[error("❌ Root certificate is not self-signed")]
     InvalidRootCert,
-    #[error("❌ Job `{0}` not found")]
-    JobNotFound(JobId),
     #[error("❌ Job `{0}` is still running")]
     JobStillRunning(JobId),
     #[error("❌ JSON error: {0}")]
