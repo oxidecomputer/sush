@@ -113,49 +113,57 @@ impl JobManager {
             let log = log.new(o!("component" => "monitor loop"));
             async move {
                 while let Some(end) = rx_monitor.recv().await {
-                    // A job has ended. Compute output length and hashes
-                    // before we take the job table locks.
-                    let output = match spawn_blocking({
+                    // A job has ended; asynchronously record that fact.
+                    spawn({
+                        let active_jobs = active_jobs.clone();
+                        let job_history = job_history.clone();
                         let output_dir = output_dir.to_owned();
-                        let job_id = match &end {
-                            Ok(end) => end.job_id().to_owned(),
-                            Err(err) => err.job_id.to_owned(),
-                        };
-                        move || JobOutputState::new(&output_dir, &job_id)
-                    })
-                    .await
-                    {
-                        Ok(Ok(output)) => output,
-                        Ok(Err(err)) => {
-                            error!(log, "failed to get job output state"; "error" => %err);
-                            JobOutputState::default()
-                        }
-                        Err(err) => {
-                            error!(log, "failed to spawn job output thread"; "error" => %err);
-                            JobOutputState::default()
-                        }
-                    };
-                    match job_ended(
-                        &mut *active_jobs.lock().await,
-                        &mut *job_history.lock().await,
-                        end,
-                        output,
-                    ) {
-                        Ok(evicted) => {
-                            if let Some((evicted_id, _evicted_status)) = evicted {
-                                warn!(log, "evicted job record"; "job_id" => %evicted_id);
-                                spawn_blocking({
-                                    let output_dir = output_dir.to_owned();
-                                    move || remove_orphan_output(&output_dir, &evicted_id)
-                                });
+                        let log = log.clone();
+                        async move {
+                            // Compute output length and hashes before we
+                            // take the job table locks.
+                            let output = match spawn_blocking({
+                                let output_dir = output_dir.to_owned();
+                                let job_id = match &end {
+                                    Ok(end) => end.job_id().to_owned(),
+                                    Err(err) => err.job_id.to_owned(),
+                                };
+                                move || JobOutputState::new(&output_dir, &job_id)
+                            })
+                            .await
+                            {
+                                Ok(Ok(output)) => output,
+                                Ok(Err(err)) => {
+                                    error!(log, "failed to get job output state"; "error" => %err);
+                                    JobOutputState::default()
+                                }
+                                Err(err) => {
+                                    error!(log, "failed to spawn job output thread"; "error" => %err);
+                                    JobOutputState::default()
+                                }
+                            };
+                            match job_ended(
+                                &mut *active_jobs.lock().await,
+                                &mut *job_history.lock().await,
+                                end,
+                                output,
+                            ) {
+                                Ok(evicted) => {
+                                    if let Some((evicted_id, _evicted_status)) = evicted {
+                                        warn!(log, "evicted job record"; "job_id" => %evicted_id);
+                                        spawn_blocking({
+                                            let output_dir = output_dir.to_owned();
+                                            move || remove_orphan_output(&output_dir, &evicted_id)
+                                        });
+                                    }
+                                }
+                                Err(err) => {
+                                    error!(log, "failed to record job end"; "err" => %err);
+                                }
                             }
                         }
-                        Err(err) => {
-                            error!(log, "failed to record job end"; "err" => %err);
-                        }
-                    }
+                    });
                 }
-                Ok::<_, JobError>(())
             }
         });
 
