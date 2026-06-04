@@ -1002,7 +1002,11 @@ fn get_job_output(
     let len = job_output_len(output_dir, job_id, stream)?;
     let path = job_output_path(output_dir, job_id, stream);
     let io_error = JobError::file_io_for(&path);
-    let mut file = File::open(&path).map_err(|_| JobError::InvalidJobId(job_id.to_owned()))?;
+    let mut file = match File::open(&path) {
+        Ok(file) => file,
+        Err(err) if len == 0 && err.kind() == io::ErrorKind::NotFound => return Ok(Vec::new()),
+        Err(err) => return Err(JobError::file_io_for(&path)(err)),
+    };
     if let Some(Range { start, end }) = range {
         // HTTP Ranges include both their endpoints.
         let start = if let StartPosition::Index(start) = start
