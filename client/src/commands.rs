@@ -761,6 +761,7 @@ async fn job(
                 job_start(ctx, client, job, start_args.to_owned()).await
             } else {
                 ctx.job_signed(&job, true);
+                ctx.job_started(&job);
                 Ok(())
             }
         }
