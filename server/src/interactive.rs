@@ -114,6 +114,7 @@ async fn interactive_session(
     }
 
     loop {
+        buffer.reserve(INTERACTIVE_SESSION_BUFFER_SIZE);
         select! {
             // Read available job output, record it, and relay it to the client
             // if there is one. We try to read regardless of whether the process

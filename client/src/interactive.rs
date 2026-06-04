@@ -57,6 +57,7 @@ where
     let mut stdin_async = AsyncFd::try_from(stdin.as_raw_fd())?;
     let mut stdout_async = AsyncFd::try_from(stdout.as_raw_fd())?;
     loop {
+        buffer.reserve(INTERACTIVE_SESSION_BUFFER_SIZE);
         select! {
             // Relay input from the terminal.
             Ok(n) = stdin_async.read_buf(&mut buffer) => {
