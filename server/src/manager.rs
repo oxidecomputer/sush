@@ -333,7 +333,7 @@ impl JobManager {
                     assert!(identity.is_still_valid(&now));
                     assert!(identity.time_revoked.is_none());
                     debug!(self.log, "credentials cache hit"; "key_id" => %key_id);
-                    return Ok(identity.to_owned());
+                    return Ok(identity);
                 } else {
                     unauthorized!("invalid credentials for cached identity");
                 }
