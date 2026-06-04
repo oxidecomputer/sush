@@ -625,23 +625,8 @@ impl JobManager {
         _authn: &Identity, // anyone may check job status
         job_id: &JobId,
     ) -> Result<JobStatus, JobError> {
-        let mut session_guard = self.session.lock().await;
-        self.job_status_inner(job_id, &mut session_guard).await
-    }
-
-    async fn job_status_inner(
-        &self,
-        job_id: &JobId,
-        session_guard: &mut SessionGuard<'_>,
-    ) -> Result<JobStatus, JobError> {
         let mut status = self
-            .with_jobs(session_guard, |active_jobs, job_history| {
-                active_jobs
-                    .get(job_id)
-                    .cloned()
-                    .or_else(|| job_history.peek(job_id).cloned())
-                    .ok_or_else(|| JobError::JobNotFound(job_id.to_owned()))
-            })
+            .job_status_inner(job_id, &mut self.session.lock().await)
             .await?;
         if let JobStatus::Started {
             stdout_len,
@@ -653,6 +638,21 @@ impl JobManager {
             *stderr_len = job_output_len(&self.output_dir, job_id, Stderr)?;
         }
         Ok(status)
+    }
+
+    async fn job_status_inner(
+        &self,
+        job_id: &JobId,
+        session_guard: &mut SessionGuard<'_>,
+    ) -> Result<JobStatus, JobError> {
+        self.with_jobs(session_guard, |active_jobs, job_history| {
+            active_jobs
+                .get(job_id)
+                .cloned()
+                .or_else(|| job_history.peek(job_id).cloned())
+                .ok_or_else(|| JobError::JobNotFound(job_id.to_owned()))
+        })
+        .await
     }
 
     /// The `_session_guard` argument ensures that the session is locked
