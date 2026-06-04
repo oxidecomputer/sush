@@ -511,14 +511,36 @@ impl JobManager {
             },
         )
         .await?;
-        jobs.sort_by_key(JobStatus::time_started);
-        jobs.reverse();
-        let iter = jobs.into_iter().skip(offset as usize);
-        Ok(if limit == 0 {
+        let jobs = spawn_blocking(move || {
+            jobs.sort_by_key(JobStatus::time_started);
+            jobs
+        })
+        .await?;
+        let iter = jobs.into_iter().rev().skip(offset as usize);
+        let mut jobs: Vec<JobStatus> = if limit == 0 {
             iter.collect()
         } else {
             iter.take(limit as usize).collect()
+        };
+        spawn_blocking({
+            let output_dir = self.output_dir.to_owned();
+            move || {
+                for job in jobs.iter_mut() {
+                    if let JobStatus::Started {
+                        job,
+                        stdout_len,
+                        stderr_len,
+                        ..
+                    } = job
+                    {
+                        *stdout_len = job_output_len(&output_dir, job.job_id(), Stdout)?;
+                        *stderr_len = job_output_len(&output_dir, job.job_id(), Stderr)?;
+                    }
+                }
+                Ok(jobs)
+            }
         })
+        .await?
     }
 
     pub async fn job_start(
