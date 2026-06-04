@@ -213,7 +213,8 @@ impl JobManager {
         }
 
         // Try to make room for the new cert, but do not evict roots.
-        if certs.len() == MAX_CERTS.get() {
+        let key_id = KeyId::try_from(subject)?;
+        if certs.len() >= MAX_CERTS.get() && !certs.contains(&key_id) {
             let mut i = 0;
             while let Some((lru_key_id, lru_cert)) =
                 certs.peek_lru().map(|(k, v)| (k.to_owned(), v.to_owned()))
@@ -232,7 +233,6 @@ impl JobManager {
         }
 
         // Import the certificate.
-        let key_id = KeyId::try_from(subject)?;
         certs.put(key_id.clone(), cert);
         info!(self.log, "imported certificate"; "key_id" => %key_id, "root" => root);
         Ok(key_id)
