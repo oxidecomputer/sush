@@ -592,7 +592,7 @@ impl JobManager {
         authn: &Identity,
         job_id: &JobId,
     ) -> Result<(), JobError> {
-        let status = self.job_status_inner(job_id, session_guard).await?;
+        let status = self.job_status_inner(session_guard, job_id).await?;
         if status.key_id() != &authn.key_id {
             Err(JobError::SessionWrongIdentity)
         } else {
@@ -619,7 +619,7 @@ impl JobManager {
         job_id: &JobId,
     ) -> Result<JobStatus, JobError> {
         let mut status = self
-            .job_status_inner(job_id, &mut self.session.lock().await)
+            .job_status_inner(&mut self.session.lock().await, job_id)
             .await?;
         if let JobStatus::Started {
             stdout_len,
@@ -635,8 +635,8 @@ impl JobManager {
 
     async fn job_status_inner(
         &self,
-        job_id: &JobId,
         session_guard: &mut SessionGuard<'_>,
+        job_id: &JobId,
     ) -> Result<JobStatus, JobError> {
         self.with_jobs(session_guard, |active_jobs, job_history| {
             active_jobs
@@ -709,14 +709,27 @@ impl JobManager {
         stream: JobOutputStream,
         range: Option<Range>,
     ) -> Result<u64, JobError> {
-        self.check_job_owner(&mut self.session.lock().await, authn, job_id)
-            .await?;
+        // Check that truncation is allowed.
+        {
+            let mut session_guard = self.session.lock().await;
+            self.check_job_owner(&mut session_guard, authn, job_id)
+                .await?;
+            if let JobStatus::Started { .. } =
+                self.job_status_inner(&mut session_guard, job_id).await?
+            {
+                return Err(JobError::JobStillRunning(job_id.to_owned()));
+            }
+        }
+
+        // Truncate.
         let n = spawn_blocking({
             let output_dir = self.output_dir.to_owned();
             let job_id = job_id.to_owned();
             move || delete_job_output(&output_dir, &job_id, stream, range)
         })
         .await??;
+
+        // Update the jobs tables with the truncated status.
         self.with_jobs(
             &mut self.session.lock().await,
             |active_jobs, job_history| {

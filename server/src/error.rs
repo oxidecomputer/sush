@@ -42,6 +42,8 @@ pub enum JobError {
     Io { what: String, error: std::io::Error },
     #[error("Job `{0}` not found")]
     JobNotFound(JobId),
+    #[error("Job `{0}` is still running, so may produce more output")]
+    JobStillRunning(JobId),
     #[error(transparent)]
     Json(#[from] serde_json::Error),
     #[error("Key error: {0}")]
@@ -62,8 +64,6 @@ pub enum JobError {
     SessionWrongIdentity,
     #[error("Job output hash mismatch, file may be corrupt")]
     OutputHashMismatch(JobId, JobOutputHash),
-    #[error("Output not yet available")]
-    OutputPending,
     #[error("Output too big, please use range requests")]
     OutputTooBig,
     #[error("Public key for `{0}` does not match stored key")]
@@ -176,17 +176,17 @@ impl From<JobError> for HttpError {
             SessionWrongIdentity | PublicKeyRevoked { .. } => {
                 HttpError::for_client_error(None, ClientErrorStatusCode::FORBIDDEN, message)
             }
-            JobNotFound(_) | NoSession | SessionNotFound(_) | SessionNotCurrent(_) => {
+            IdentityNotFound(_) | JobNotFound(_) | NoSession | SessionNotFound(_)
+            | SessionNotCurrent(_) => {
                 HttpError::for_client_error(None, ClientErrorStatusCode::NOT_FOUND, message)
             }
-            IdentityNotFound(_)
+            CertChainTooLong
             | InvalidCommand(_)
             | InvalidJobId(_)
             | Json(_)
-            | CertChainTooLong
+            | JobStillRunning(_)
             | MissingCert(_)
             | MultipleSessions
-            | OutputPending
             | TooManyCerts(_)
             | TooManyJobs(_)
             | TooManyRevocations(_) => {
