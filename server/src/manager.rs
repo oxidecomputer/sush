@@ -126,14 +126,39 @@ impl JobManager {
                     .await
                     {
                         Ok(Ok(output)) => {
-                            if let Err(err) = job_ended(
+                            match job_ended(
                                 &mut *active_jobs.lock().await,
                                 &mut *job_history.lock().await,
-                                &output_dir,
                                 end,
                                 output,
                             ) {
-                                error!(log, "failed to record job end"; "err" => %err);
+                                Ok(evicted) => {
+                                    if let Some((evicted_id, _evicted_status)) = evicted {
+                                        warn!(log, "evicted job record"; "job_id" => %evicted_id);
+                                        spawn_blocking({
+                                            let output_dir = output_dir.to_owned();
+                                            move || {
+                                                let _ = remove_file(job_output_path(
+                                                    &output_dir,
+                                                    &evicted_id,
+                                                    Stdout,
+                                                ));
+                                                let _ = remove_file(job_output_path(
+                                                    &output_dir,
+                                                    &evicted_id,
+                                                    Stderr,
+                                                ));
+                                                let _ = remove_dir(job_output_dir(
+                                                    &output_dir,
+                                                    &evicted_id,
+                                                ));
+                                            }
+                                        });
+                                    }
+                                }
+                                Err(err) => {
+                                    error!(log, "failed to record job end"; "err" => %err);
+                                }
                             }
                         }
                         Ok(Err(err)) => {
@@ -673,7 +698,12 @@ impl JobManager {
     ) -> Result<Vec<u8>, JobError> {
         self.check_job_owner(&mut self.session.lock().await, authn, job_id)
             .await?;
-        get_job_output(&self.output_dir, job_id, stream, range)
+        spawn_blocking({
+            let output_dir = self.output_dir.to_owned();
+            let job_id = job_id.to_owned();
+            move || get_job_output(&output_dir, &job_id, stream, range)
+        })
+        .await?
     }
 
     /// Truncate output file and update corresponding job status length.
@@ -686,31 +716,38 @@ impl JobManager {
         stream: JobOutputStream,
         range: Option<Range>,
     ) -> Result<u64, JobError> {
-        let mut session_guard = self.session.lock().await;
-        self.check_job_owner(&mut session_guard, authn, job_id)
+        self.check_job_owner(&mut self.session.lock().await, authn, job_id)
             .await?;
-        let n = delete_job_output(&self.output_dir, job_id, stream, range)?;
-        self.with_jobs(&mut session_guard, |active_jobs, job_history| {
-            if let Some(JobStatus::Started {
-                stdout_len,
-                stderr_len,
-                ..
-            })
-            | Some(JobStatus::Ended {
-                stdout_len,
-                stderr_len,
-                ..
-            }) = active_jobs
-                .get_mut(job_id)
-                .or_else(|| job_history.peek_mut(job_id))
-            {
-                match stream {
-                    Stdout => *stdout_len = n,
-                    Stderr => *stderr_len = n,
-                }
-            }
-            Ok(())
+        let n = spawn_blocking({
+            let output_dir = self.output_dir.to_owned();
+            let job_id = job_id.to_owned();
+            move || delete_job_output(&output_dir, &job_id, stream, range)
         })
+        .await??;
+        self.with_jobs(
+            &mut self.session.lock().await,
+            |active_jobs, job_history| {
+                if let Some(JobStatus::Started {
+                    stdout_len,
+                    stderr_len,
+                    ..
+                })
+                | Some(JobStatus::Ended {
+                    stdout_len,
+                    stderr_len,
+                    ..
+                }) = active_jobs
+                    .get_mut(job_id)
+                    .or_else(|| job_history.peek_mut(job_id))
+                {
+                    match stream {
+                        Stdout => *stdout_len = n,
+                        Stderr => *stderr_len = n,
+                    }
+                }
+                Ok(())
+            },
+        )
         .await?;
         Ok(n)
     }
@@ -791,17 +828,9 @@ fn job_output_hash(
 fn job_ended(
     active_jobs: &mut BTreeMap<JobId, JobStatus>,
     job_history: &mut LruCache<JobId, JobStatus>,
-    output_dir: &Path,
     result: ExecutionResult,
     output: JobOutputState,
-) -> Result<(), JobError> {
-    let remove_orphan_output = |evicted: Option<(JobId, JobStatus)>| {
-        if let Some((evicted_id, _evicted_status)) = evicted {
-            let _ = remove_file(job_output_path(output_dir, &evicted_id, Stdout));
-            let _ = remove_file(job_output_path(output_dir, &evicted_id, Stderr));
-            let _ = remove_dir(job_output_dir(output_dir, &evicted_id));
-        }
-    };
+) -> Result<Option<(JobId, JobStatus)>, JobError> {
     match result {
         Err(ExecutionError {
             job_id,
@@ -830,8 +859,7 @@ fn job_ended(
                     stdout_hash: output.stdout_hash,
                     stderr_hash: output.stderr_hash,
                 };
-                remove_orphan_output(job_history.push(job_id.to_owned(), status));
-                Ok(())
+                Ok(job_history.push(job_id.to_owned(), status))
             } else {
                 Err(JobError::InvalidJobId(job_id))
             }
@@ -840,8 +868,7 @@ fn job_ended(
             active_jobs.remove(ended.job_id());
             let job_id = ended.job_id().to_owned();
             let status = ended.into_status(output);
-            remove_orphan_output(job_history.push(job_id, status));
-            Ok(())
+            Ok(job_history.push(job_id, status))
         }
     }
 }
