@@ -52,13 +52,6 @@ impl CommandContext for Cli {
         self.globals = args;
     }
 
-    fn more(&self) -> bool {
-        match self.get_output_format() {
-            OutputFormat::Json => true,
-            OutputFormat::Text => read_bool("❓ More (yes/no)? ").unwrap_or(false),
-        }
-    }
-
     // Session management
 
     fn get_credentials(&self) -> Option<Credentials> {

@@ -44,7 +44,6 @@ pub trait CommandContext: Clone + Send + Sync {
     fn get_globals(&self) -> &GlobalArgs;
     fn set_globals(&mut self, _args: GlobalArgs) {}
     fn pre_parse_hook(&mut self, _command: &str) {}
-    fn more(&self) -> bool;
 
     // Session management
     fn get_credentials(&self) -> Option<Credentials>;

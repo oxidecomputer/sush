@@ -189,10 +189,6 @@ impl CommandContext for Repl {
         self.set_credentials(None);
     }
 
-    fn more(&self) -> bool {
-        self.cli.more()
-    }
-
     // Session management
 
     fn get_credentials(&self) -> Option<Credentials> {
