@@ -115,7 +115,7 @@ impl JobManager {
                 while let Some(end) = rx_monitor.recv().await {
                     // A job has ended. Compute output length and hashes
                     // before we take the job table locks.
-                    match spawn_blocking({
+                    let output = match spawn_blocking({
                         let output_dir = output_dir.to_owned();
                         let job_id = match &end {
                             Ok(end) => end.job_id().to_owned(),
@@ -125,47 +125,33 @@ impl JobManager {
                     })
                     .await
                     {
-                        Ok(Ok(output)) => {
-                            match job_ended(
-                                &mut *active_jobs.lock().await,
-                                &mut *job_history.lock().await,
-                                end,
-                                output,
-                            ) {
-                                Ok(evicted) => {
-                                    if let Some((evicted_id, _evicted_status)) = evicted {
-                                        warn!(log, "evicted job record"; "job_id" => %evicted_id);
-                                        spawn_blocking({
-                                            let output_dir = output_dir.to_owned();
-                                            move || {
-                                                let _ = remove_file(job_output_path(
-                                                    &output_dir,
-                                                    &evicted_id,
-                                                    Stdout,
-                                                ));
-                                                let _ = remove_file(job_output_path(
-                                                    &output_dir,
-                                                    &evicted_id,
-                                                    Stderr,
-                                                ));
-                                                let _ = remove_dir(job_output_dir(
-                                                    &output_dir,
-                                                    &evicted_id,
-                                                ));
-                                            }
-                                        });
-                                    }
-                                }
-                                Err(err) => {
-                                    error!(log, "failed to record job end"; "err" => %err);
-                                }
-                            }
-                        }
+                        Ok(Ok(output)) => output,
                         Ok(Err(err)) => {
-                            error!(log, "failed to get job output state"; "error" => %err)
+                            error!(log, "failed to get job output state"; "error" => %err);
+                            JobOutputState::default()
                         }
                         Err(err) => {
-                            error!(log, "failed to spawn job output thread"; "error" => %err)
+                            error!(log, "failed to spawn job output thread"; "error" => %err);
+                            JobOutputState::default()
+                        }
+                    };
+                    match job_ended(
+                        &mut *active_jobs.lock().await,
+                        &mut *job_history.lock().await,
+                        end,
+                        output,
+                    ) {
+                        Ok(evicted) => {
+                            if let Some((evicted_id, _evicted_status)) = evicted {
+                                warn!(log, "evicted job record"; "job_id" => %evicted_id);
+                                spawn_blocking({
+                                    let output_dir = output_dir.to_owned();
+                                    move || remove_orphan_output(&output_dir, &evicted_id)
+                                });
+                            }
+                        }
+                        Err(err) => {
+                            error!(log, "failed to record job end"; "err" => %err);
                         }
                     }
                 }
@@ -770,6 +756,7 @@ impl JobManager {
     }
 }
 
+#[derive(Debug, Default)]
 pub(crate) struct JobOutputState {
     pub(crate) stdout_len: u64,
     pub(crate) stderr_len: u64,
@@ -1061,6 +1048,12 @@ fn delete_job_output(
     } else {
         Err(JobError::InvalidRange(len))
     }
+}
+
+fn remove_orphan_output(output_dir: &Path, job_id: &JobId) {
+    let _ = remove_file(job_output_path(output_dir, job_id, Stdout));
+    let _ = remove_file(job_output_path(output_dir, job_id, Stderr));
+    let _ = remove_dir(job_output_dir(output_dir, job_id));
 }
 
 #[cfg(test)]

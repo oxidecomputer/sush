@@ -289,6 +289,12 @@ pub struct JobOutputHash(
     Hash,
 );
 
+impl Default for JobOutputHash {
+    fn default() -> Self {
+        Self::from(hash(&[]))
+    }
+}
+
 impl Deref for JobOutputHash {
     type Target = Hash;
 
