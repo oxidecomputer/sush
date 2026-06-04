@@ -216,8 +216,6 @@ impl JobManager {
         cert: Certificate,
         root_allowed: bool,
     ) -> Result<KeyId, JobError> {
-        let mut certs = self.certs.lock().await;
-
         // Verify the certificate signature.
         let signature = Signature::try_from(&cert)?;
         let tbs = cert.tbs_certificate.to_der()?;
@@ -232,7 +230,7 @@ impl JobManager {
             }
         } else {
             let issuer_key_id = KeyId::try_from(issuer)?;
-            if let Some(issuer) = certs.get(&issuer_key_id) {
+            if let Some(issuer) = self.certs.lock().await.get(&issuer_key_id) {
                 signature
                     .verify_with_spki(&tbs, &issuer.tbs_certificate.subject_public_key_info)?;
             } else {
@@ -242,6 +240,7 @@ impl JobManager {
 
         // Try to make room for the new cert, but do not evict roots.
         let key_id = KeyId::try_from(subject)?;
+        let mut certs = self.certs.lock().await;
         if certs.len() >= MAX_CERTS.get() && !certs.contains(&key_id) {
             let mut i = 0;
             while let Some((lru_key_id, lru_cert)) =
