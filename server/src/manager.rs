@@ -331,25 +331,23 @@ impl JobManager {
             signature,
         } = credentials.clone();
 
-        // Check for a revoked identity.
-        if self.revoked_identities.lock().await.contains_key(&key_id) {
-            unauthorized!("identity revoked");
-        }
-
         // Check the identity cache.
         let now = Utc::now();
         {
+            let revoked = self.revoked_identities.lock().await;
+            if revoked.contains_key(&key_id) {
+                unauthorized!("identity revoked");
+            }
+
             let mut identities = self.identities.lock().await;
             let cache_key = (key_id.clone(), nonce.clone());
             if let Some((identity, cached_credentials)) = identities.get(&cache_key).cloned() {
                 if !identity.is_still_valid(&now) {
                     assert!(identities.pop(&cache_key).is_some());
-                } else if cached_credentials.nonce == nonce
-                    && cached_credentials.cnonce == cnonce
+                } else if cached_credentials.cnonce == cnonce
                     && cached_credentials.signature == signature
                 {
-                    assert!(identity.is_still_valid(&now));
-                    assert!(identity.time_revoked.is_none());
+                    assert_eq!(cached_credentials.nonce, nonce);
                     debug!(self.log, "credentials cache hit"; "key_id" => %key_id);
                     return Ok(identity);
                 } else {
