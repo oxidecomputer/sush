@@ -127,8 +127,9 @@ async fn interactive_session(
                     break;
                 }
                 output.write_all(&buffer[..n]).await?;
+                let data = buffer.copy_to_bytes(n);
                 if let Some(stream) = client.as_mut() {
-                    let message = InteractiveSessionMessage::Data(buffer.copy_to_bytes(n));
+                    let message = InteractiveSessionMessage::Data(data);
                     if let Err(error) = stream.send(encoder.encode(message)?).await {
                         close_client!(stream, "failed to relay job output"; "error" => %error);
                     }
