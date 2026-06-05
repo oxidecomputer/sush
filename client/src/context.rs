@@ -41,14 +41,14 @@ pub trait CommandContext: Clone + Send + Sync {
     // Context management
     fn get_output_format(&self) -> OutputFormat;
     fn set_output_format(&mut self, output: OutputFormat);
-    fn get_globals(&self) -> &GlobalArgs;
+    fn get_globals(&self) -> GlobalArgs;
     fn set_globals(&mut self, _args: GlobalArgs) {}
     fn pre_parse_hook(&mut self, _command: &str) {}
 
     // Session management
     fn get_credentials(&self) -> Option<Credentials>;
     fn set_credentials(&mut self, credentials: Option<Credentials>);
-    fn session_id(&self) -> Option<&SessionId>;
+    fn session_id(&self) -> Option<SessionId>;
     fn next_job_id(&self) -> Result<JobId, CommandError>;
     fn session_started(&mut self, session: Session) -> Result<(), CommandError>;
     fn session_stopped(&mut self, session_id: &SessionId) -> Result<(), CommandError>;

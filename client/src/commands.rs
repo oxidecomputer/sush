@@ -663,7 +663,7 @@ async fn session(
         }
 
         (SessionCommand::Stop { session_id }, Some(client)) => {
-            let ctx_session_id = ctx.session_id().cloned();
+            let ctx_session_id = ctx.session_id();
             let Some(session_id) = session_id.as_ref().or(ctx_session_id.as_ref()) else {
                 return Err(CommandError::MissingSession);
             };
@@ -731,8 +731,28 @@ async fn job(
             let job_id = if let Some(job_id) = job_id {
                 job_id.to_owned()
             } else {
+                // Ensure we have a session for the job.
+                if ctx.session_id().is_none()
+                    && let Some(client) = client
+                {
+                    let session = match with_authz(ctx, client, async |authz| {
+                        client.session().authorization(authz).send().await
+                    })
+                    .await
+                    {
+                        Ok(resp) => resp.into_inner(),
+                        Err(CommandError::NotFound) => with_authz(ctx, client, async |authz| {
+                            client.session_start().authorization(authz).send().await
+                        })
+                        .await?
+                        .into_inner(),
+                        Err(err) => return Err(err),
+                    };
+                    ctx.session_started(session)?;
+                }
                 ctx.next_job_id()?
             };
+
             let mut signer = PermslipSigner::new(key_name, permslip_url).await?;
             let mut interval = interval(Duration::from_millis(100));
             interval.set_missed_tick_behavior(MissedTickBehavior::Skip);
@@ -899,12 +919,12 @@ async fn job_start(
         loop {
             select! {
                 status = &mut start => {
+                    ctx.job_polling_finished(&job_id);
                     let status = status?.into_inner();
                     ctx.job_started(&job);
                     if let JobStatus::Ended { .. } = status {
                         ctx.job_stopped(&job_id);
                     }
-                    ctx.job_polling_finished(&job_id);
                     break status;
                 }
                 _ = interval.tick() => {
@@ -942,7 +962,10 @@ async fn job_start(
                                 sleep(Duration::from_millis(100)).await;
                                 continue;
                             }
-                            Err(err) => return Err(err),
+                            Err(err) => {
+                                ctx.job_polling_finished(&job_id);
+                                return Err(err);
+                            }
                         }
                     }
                 }

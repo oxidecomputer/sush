@@ -2,6 +2,7 @@
 
 use std::io::{self, BufRead as _, Read as _, Write as _, stderr, stdin, stdout};
 use std::path::Path;
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use bytesize::ByteSize;
@@ -22,11 +23,11 @@ use crate::context::{CommandContext, OutputFormat};
 
 #[derive(Clone, Debug, Default)]
 pub struct Cli {
-    globals: GlobalArgs,
-    output: OutputFormat,
-    progress: Option<ProgressBar>,
-    session: Option<Session>,
-    credentials: Option<Credentials>,
+    globals: Arc<Mutex<GlobalArgs>>,
+    output: Arc<Mutex<OutputFormat>>,
+    progress: Arc<Mutex<Option<ProgressBar>>>,
+    session: Arc<Mutex<Option<Session>>>,
+    credentials: Arc<Mutex<Option<Credentials>>>,
 }
 
 fn byte_size(len: u64) -> bytesize::Display {
@@ -37,37 +38,41 @@ impl CommandContext for Cli {
     // Context management
 
     fn get_output_format(&self) -> OutputFormat {
-        self.output
+        *self.output.lock().unwrap()
     }
 
     fn set_output_format(&mut self, output: OutputFormat) {
-        self.output = output;
+        *self.output.lock().unwrap() = output;
     }
 
-    fn get_globals(&self) -> &GlobalArgs {
-        &self.globals
+    fn get_globals(&self) -> GlobalArgs {
+        self.globals.lock().unwrap().clone()
     }
 
     fn set_globals(&mut self, args: GlobalArgs) {
-        self.globals = args;
+        *self.globals.lock().unwrap() = args;
     }
 
     // Session management
 
     fn get_credentials(&self) -> Option<Credentials> {
-        self.credentials.clone()
+        self.credentials.lock().unwrap().clone()
     }
 
     fn set_credentials(&mut self, credentials: Option<Credentials>) {
-        self.credentials = credentials;
+        *self.credentials.lock().unwrap() = credentials;
     }
 
-    fn session_id(&self) -> Option<&SessionId> {
-        self.session.as_ref().map(|s| s.session_id())
+    fn session_id(&self) -> Option<SessionId> {
+        self.session
+            .lock()
+            .unwrap()
+            .as_ref()
+            .map(|s| s.session_id().to_owned())
     }
 
     fn next_job_id(&self) -> Result<JobId, CommandError> {
-        if let Some(session) = self.session.as_ref() {
+        if let Some(session) = self.session.lock().unwrap().as_ref() {
             Ok(session.next_job_id())
         } else {
             Err(CommandError::MissingSession)
@@ -76,7 +81,7 @@ impl CommandContext for Cli {
 
     fn session_started(&mut self, session: Session) -> Result<(), CommandError> {
         let session_id = session.session_id().to_owned();
-        self.session = Some(session);
+        *self.session.lock().unwrap() = Some(session);
         match self.get_output_format() {
             OutputFormat::Json => println!("{}", json!({"session_started": session_id})),
             OutputFormat::Text => println!("✅ Session is now `{session_id}`"),
@@ -85,10 +90,11 @@ impl CommandContext for Cli {
     }
 
     fn session_stopped(&mut self, session_id: &SessionId) -> Result<(), CommandError> {
-        if let Some(session) = self.session.as_ref()
+        let mut session_guard = self.session.lock().unwrap();
+        if let Some(session) = session_guard.as_ref()
             && session.session_id() == session_id
         {
-            let _ = self.session.take();
+            let _ = session_guard.take();
         }
         match self.get_output_format() {
             OutputFormat::Json => println!("{}", json!({"session_ended": session_id})),
@@ -155,7 +161,7 @@ impl CommandContext for Cli {
     // Job management
 
     fn job_started(&mut self, job: &SignedJob) {
-        if let Some(session) = self.session.as_mut() {
+        if let Some(session) = self.session.lock().unwrap().as_mut() {
             session.job_started(job.to_owned());
         }
     }
@@ -210,7 +216,8 @@ impl CommandContext for Cli {
         stage: &str,
         total_length: u64,
     ) {
-        if matches!(self.get_output_format(), OutputFormat::Text) && self.progress.is_none() {
+        let mut progress = self.progress.lock().unwrap();
+        if matches!(self.get_output_format(), OutputFormat::Text) && progress.is_none() {
             let bar = ProgressBar::new(total_length);
             bar.set_prefix(format!("{stage} {stream}"));
             bar.set_style(
@@ -223,12 +230,12 @@ impl CommandContext for Cli {
                 )
                 .unwrap(),
             );
-            self.progress = Some(bar);
+            *progress = Some(bar);
         }
     }
 
     fn job_output_update(&mut self, _id: &JobId, _stream: JobOutputStream, length: u64) {
-        if let Some(progress) = &mut self.progress {
+        if let Some(progress) = self.progress.lock().unwrap().as_mut() {
             progress.inc(length);
         }
     }
@@ -239,7 +246,7 @@ impl CommandContext for Cli {
         stream: JobOutputStream,
         stage: Option<&str>,
     ) {
-        if let Some(progress) = self.progress.take() {
+        if let Some(progress) = self.progress.lock().unwrap().take() {
             progress.finish_and_clear();
             if let Some(stage) = stage {
                 let length = ByteSize::b(progress.length().unwrap_or(0));
@@ -255,7 +262,8 @@ impl CommandContext for Cli {
     }
 
     fn job_polling_started(&mut self, job_id: &JobId, elapsed: Duration) {
-        if matches!(self.get_output_format(), OutputFormat::Text) && self.progress.is_none() {
+        let mut progress = self.progress.lock().unwrap();
+        if matches!(self.get_output_format(), OutputFormat::Text) && progress.is_none() {
             let bar = ProgressBar::new_spinner();
             bar.set_elapsed(elapsed);
             bar.set_prefix(format!("Waiting for job `{job_id}`"));
@@ -268,12 +276,12 @@ impl CommandContext for Cli {
                 )
                 .unwrap(),
             );
-            self.progress = Some(bar);
+            *progress = Some(bar);
         }
     }
 
     fn job_polling_update(&mut self, _job_id: &JobId, status: &JobStatus) {
-        if let Some(progress) = &mut self.progress {
+        if let Some(progress) = self.progress.lock().unwrap().as_mut() {
             let (JobStatus::Started {
                 stdout_len,
                 stderr_len,
@@ -292,7 +300,7 @@ impl CommandContext for Cli {
     }
 
     fn job_polling_finished(&mut self, _job_id: &JobId) {
-        if let Some(progress) = self.progress.take() {
+        if let Some(progress) = self.progress.lock().unwrap().take() {
             progress.finish_and_clear();
         }
     }
@@ -312,7 +320,8 @@ impl CommandContext for Cli {
     }
 
     fn job_signing_started(&mut self, job_id: &JobId) {
-        if matches!(self.get_output_format(), OutputFormat::Text) && self.progress.is_none() {
+        let mut progress = self.progress.lock().unwrap();
+        if matches!(self.get_output_format(), OutputFormat::Text) && progress.is_none() {
             let bar = ProgressBar::new_spinner();
             bar.set_prefix(format!("Waiting for signature on `{job_id}`"));
             bar.set_style(
@@ -325,18 +334,18 @@ impl CommandContext for Cli {
                 .unwrap(),
             );
             bar.enable_steady_tick(Duration::from_millis(100));
-            self.progress = Some(bar);
+            *progress = Some(bar);
         }
     }
 
     fn job_signing_update(&mut self, _job_id: &JobId) {
-        if let Some(progress) = &mut self.progress {
+        if let Some(progress) = self.progress.lock().unwrap().as_mut() {
             progress.tick();
         }
     }
 
     fn job_signing_finished(&mut self, job_id: &JobId) {
-        if let Some(progress) = self.progress.take() {
+        if let Some(progress) = self.progress.lock().unwrap().take() {
             progress.finish_and_clear();
         }
         if matches!(self.get_output_format(), OutputFormat::Text) {

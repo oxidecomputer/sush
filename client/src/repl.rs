@@ -78,7 +78,7 @@ impl Repl {
                     continue;
                 }}
             }
-            match rl.readline(&self.prompt(self.get_globals())) {
+            match rl.readline(&self.prompt(&self.get_globals())) {
                 Ok(command) => {
                     if command.trim().is_empty() {
                         continue;
@@ -144,7 +144,7 @@ impl CommandContext for Repl {
         self.cli.set_output_format(output)
     }
 
-    fn get_globals(&self) -> &GlobalArgs {
+    fn get_globals(&self) -> GlobalArgs {
         self.cli.get_globals()
     }
 
@@ -201,7 +201,7 @@ impl CommandContext for Repl {
         self.cli.set_credentials(credentials)
     }
 
-    fn session_id(&self) -> Option<&SessionId> {
+    fn session_id(&self) -> Option<SessionId> {
         self.cli.session_id()
     }
 
