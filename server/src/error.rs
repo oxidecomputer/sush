@@ -83,7 +83,7 @@ pub enum JobError {
     Task(#[from] tokio::task::JoinError),
     #[error("Too many certificates ({0})")]
     TooManyCerts(usize),
-    #[error("Too many jobs in a session ({0}), try waiting for some to finish")]
+    #[error("Too many active jobs ({0}), try waiting for some to finish")]
     TooManyJobs(usize),
     #[error("Too many identities revoked ({0})")]
     TooManyRevocations(usize),
