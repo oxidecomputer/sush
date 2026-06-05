@@ -166,6 +166,9 @@ impl CommandContext for Repl {
         if offline {
             url = None;
         }
+        if ssh_auth_sock.is_some() || ssh_key_id.is_some() {
+            self.set_credentials(None);
+        }
 
         macro_rules! set_or_unset {
             ($arg:ident, $var:expr, $name:literal) => {{
@@ -186,7 +189,6 @@ impl CommandContext for Repl {
         set_or_unset!(ssh_key_id, SUSH_KEY_ID, "SSH key ID");
 
         self.cli.set_globals(args);
-        self.set_credentials(None);
     }
 
     // Session management
