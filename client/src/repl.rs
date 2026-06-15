@@ -2,29 +2,28 @@
 //!
 //! Inherits most of its behavior from the (non-interactive) CLI.
 
-use std::collections::HashMap;
 use std::env;
 use std::ffi::OsString;
 use std::path::Path;
 use std::time::Duration;
 
-use chrono::{DateTime, Utc};
 use clap::Parser;
 use rustyline::DefaultEditor;
 use rustyline::error::ReadlineError;
 use shlex::split as split_command;
 use xdg::BaseDirectories;
 
-use sush_common::authn::Identity;
-use sush_common::jobs::{JobId, JobOutputStream, JobStatus, JobsReserved, SignedJob};
+use sush_common::authn::{Credentials, Identity};
+use sush_common::jobs::{JobId, JobOutputStream, JobStatus, Session, SessionId, SignedJob};
 use sush_common::keys::{KeyId, SshPublicKey};
 
 use crate::Client;
 use crate::cli::Cli;
 use crate::commands::{
-    ClientCommand, CommandContext, CommandError, GlobalArgs, OutputFormat, Reserved, SUSH_JOB_ID,
+    ClientCommand, CommandError, GlobalArgs, SSH_AUTH_SOCK, SUSH_JOB_ID, SUSH_KEY_ID,
     SUSH_OUTPUT_FORMAT, SUSH_URL,
 };
+use crate::context::{CommandContext, OutputFormat};
 
 const PREFIX: &str = "sush";
 const HISTORY_FILE: &str = "history.txt";
@@ -54,23 +53,18 @@ impl ReplCommandParser {
 }
 
 /// Interactive REPL context.
-#[derive(Debug, Default)]
+#[derive(Clone, Debug, Default)]
 pub struct Repl {
     cli: Cli,
-    reserved: Vec<JobId>,
 }
 
 impl Repl {
     pub async fn run(
         mut self,
-        args: &mut GlobalArgs,
-        client: Option<Client>,
+        args: GlobalArgs,
+        _client: Option<Client>,
     ) -> Result<(), CommandError> {
-        if let Some(client) = client {
-            let map = client.get_reserved().send().await?.into_inner();
-            self.reserved_map(&map)?;
-        }
-
+        self.set_globals(args.clone());
         let xdg = BaseDirectories::with_prefix(PREFIX);
         let history_file = xdg
             .place_state_file(HISTORY_FILE)
@@ -84,7 +78,7 @@ impl Repl {
                     continue;
                 }}
             }
-            match rl.readline(&self.prompt(args)) {
+            match rl.readline(&self.prompt(&self.get_globals())) {
                 Ok(command) => {
                     if command.trim().is_empty() {
                         continue;
@@ -97,7 +91,7 @@ impl Repl {
                         Ok(ReplCommandParser { command }) => command,
                         Err(err) => perr!("{err}"),
                     };
-                    match command.execute(args, &mut self).await {
+                    match command.execute(&mut self).await {
                         Ok(()) => (),
                         Err(CommandError::Quit) => break,
                         Err(err) => perr!("{err}"),
@@ -130,18 +124,6 @@ impl Repl {
         }
     }
 
-    /// Set the `SUSH_JOB_ID` environment variable to a reserved but unused job.
-    fn set_default_job_id(&mut self) {
-        self.set_job_id(self.reserved.first().cloned());
-    }
-
-    /// Remove `job_id` from the list of reserved jobs.
-    fn unreserve_job_id(&mut self, job_id: &JobId) {
-        if let Some(i) = self.reserved.iter().position(|j| j == job_id) {
-            self.reserved.remove(i);
-        }
-    }
-
     /// Make a prompt indicating online/offline status.
     fn prompt(&self, args: &GlobalArgs) -> String {
         let offline = if args.url.is_some() { "" } else { " (offline)" };
@@ -152,6 +134,8 @@ impl Repl {
 /// Most of these methods simply punt to those of [`Cli`] for display.
 /// But we do update local (ephemeral) state in response to some commands.
 impl CommandContext for Repl {
+    // Context management
+
     fn get_output_format(&self) -> OutputFormat {
         self.cli.get_output_format()
     }
@@ -160,14 +144,20 @@ impl CommandContext for Repl {
         self.cli.set_output_format(output)
     }
 
-    fn set_globals(&mut self, args: &mut GlobalArgs, values: GlobalArgs) {
+    fn get_globals(&self) -> GlobalArgs {
+        self.cli.get_globals()
+    }
+
+    fn set_globals(&mut self, mut args: GlobalArgs) {
         let GlobalArgs {
             mut output,
             json,
             text,
             mut url,
             offline,
-        } = values;
+            ssh_auth_sock,
+            ssh_key_id,
+        } = args;
         if json {
             output = Some(OutputFormat::Json);
         } else if text {
@@ -175,6 +165,9 @@ impl CommandContext for Repl {
         }
         if offline {
             url = None;
+        }
+        if ssh_auth_sock.is_some() || ssh_key_id.is_some() {
+            self.set_credentials(None);
         }
 
         macro_rules! set_or_unset {
@@ -192,17 +185,39 @@ impl CommandContext for Repl {
         }
         set_or_unset!(output, SUSH_OUTPUT_FORMAT, "Output format");
         set_or_unset!(url, SUSH_URL, "Server URL");
+        set_or_unset!(ssh_auth_sock, SSH_AUTH_SOCK, "SSH agent socket");
+        set_or_unset!(ssh_key_id, SUSH_KEY_ID, "SSH key ID");
+
+        self.cli.set_globals(args);
     }
 
-    fn pre_parse_hook(&mut self, command: &str) {
-        if matches!(command, "job-start" | "start") {
-            self.set_default_job_id();
-        }
+    // Session management
+
+    fn get_credentials(&self) -> Option<Credentials> {
+        self.cli.get_credentials()
     }
 
-    fn ack(&mut self, url: &str, time: DateTime<Utc>) -> Result<(), CommandError> {
-        self.cli.ack(url, time)
+    fn set_credentials(&mut self, credentials: Option<Credentials>) {
+        self.cli.set_credentials(credentials)
     }
+
+    fn session_id(&self) -> Option<SessionId> {
+        self.cli.session_id()
+    }
+
+    fn next_job_id(&self) -> Result<JobId, CommandError> {
+        self.cli.next_job_id()
+    }
+
+    fn session_started(&mut self, session: Session) -> Result<(), CommandError> {
+        self.cli.session_started(session)
+    }
+
+    fn session_stopped(&mut self, session_id: &SessionId) -> Result<(), CommandError> {
+        self.cli.session_stopped(session_id)
+    }
+
+    // Job signing certificates
 
     fn cert_chain(&mut self, key_id: KeyId, certs: &str) -> Result<(), CommandError> {
         self.cli.cert_chain(key_id, certs)
@@ -212,27 +227,24 @@ impl CommandContext for Repl {
         self.cli.cert_imported(path, key_id)
     }
 
-    fn job_aborted(&mut self, job_id: &JobId) -> Result<(), CommandError> {
-        self.set_job_id(Some(job_id.to_owned()));
-        self.cli.job_aborted(job_id)?;
-        self.unreserve_job_id(job_id);
-        Ok(())
+    // Job management
+
+    fn job_started(&mut self, job: &SignedJob) {
+        self.cli.job_started(job);
     }
 
-    fn job_error(&mut self, error: CommandError) -> Result<(), CommandError> {
+    fn job_stopped(&mut self, job_id: &JobId) {
+        self.set_job_id(Some(job_id.to_owned()));
+        self.cli.job_stopped(job_id);
+    }
+
+    fn job_error(&mut self, error: CommandError) -> CommandError {
         self.cli.job_error(error)
     }
 
-    fn job_output(
-        &mut self,
-        job_id: &JobId,
-        stream: JobOutputStream,
-        output: &[u8],
-        binary: bool,
-    ) -> Result<(), CommandError> {
+    fn job_output(&mut self, job_id: &JobId, stream: JobOutputStream, output: &[u8], binary: bool) {
         self.set_job_id(Some(job_id.to_owned()));
-        self.cli.job_output(job_id, stream, output, binary)?;
-        Ok(())
+        self.cli.job_output(job_id, stream, output, binary);
     }
 
     fn job_output_started(
@@ -241,18 +253,13 @@ impl CommandContext for Repl {
         stream: JobOutputStream,
         stage: &str,
         total: u64,
-    ) -> Result<(), CommandError> {
+    ) {
         self.set_job_id(Some(job_id.to_owned()));
-        self.cli.job_output_started(job_id, stream, stage, total)
+        self.cli.job_output_started(job_id, stream, stage, total);
     }
 
-    fn job_output_update(
-        &mut self,
-        job_id: &JobId,
-        stream: JobOutputStream,
-        length: u64,
-    ) -> Result<(), CommandError> {
-        self.cli.job_output_update(job_id, stream, length)
+    fn job_output_update(&mut self, job_id: &JobId, stream: JobOutputStream, length: u64) {
+        self.cli.job_output_update(job_id, stream, length);
     }
 
     fn job_output_finished(
@@ -260,100 +267,56 @@ impl CommandContext for Repl {
         job_id: &JobId,
         stream: JobOutputStream,
         stage: Option<&str>,
-    ) -> Result<(), CommandError> {
-        self.cli.job_output_finished(job_id, stream, stage)
+    ) {
+        self.cli.job_output_finished(job_id, stream, stage);
     }
 
-    fn job_polling_started(
-        &mut self,
-        job_id: &JobId,
-        duration: Duration,
-    ) -> Result<(), CommandError> {
-        self.cli.job_polling_started(job_id, duration)
+    fn job_polling_started(&mut self, job_id: &JobId, duration: Duration) {
+        self.cli.job_polling_started(job_id, duration);
     }
 
-    fn job_polling_update(
-        &mut self,
-        job_id: &JobId,
-        status: &JobStatus,
-    ) -> Result<(), CommandError> {
-        self.cli.job_polling_update(job_id, status)
+    fn job_polling_update(&mut self, job_id: &JobId, status: &JobStatus) {
+        self.cli.job_polling_update(job_id, status);
     }
 
-    fn job_polling_finished(&mut self, job_id: &JobId) -> Result<(), CommandError> {
-        self.cli.job_polling_finished(job_id)
+    fn job_polling_finished(&mut self, job_id: &JobId) {
+        self.cli.job_polling_finished(job_id);
     }
 
-    fn job_session_connected(&mut self, job_id: &JobId) -> Result<(), CommandError> {
-        self.cli.job_session_connected(job_id)
+    fn job_session_connected(&mut self, job_id: &JobId) {
+        self.cli.job_session_connected(job_id);
     }
 
-    fn job_session_disconnected(&mut self, job_id: &JobId) -> Result<(), CommandError> {
-        self.cli.job_session_disconnected(job_id)
+    fn job_session_disconnected(&mut self, job_id: &JobId) {
+        self.cli.job_session_disconnected(job_id);
     }
 
-    fn job_signing_started(&mut self, job_id: &JobId) -> Result<(), CommandError> {
-        self.cli.job_signing_started(job_id)
+    fn job_signing_started(&mut self, job_id: &JobId) {
+        self.cli.job_signing_started(job_id);
     }
 
-    fn job_signing_update(&mut self, job_id: &JobId) -> Result<(), CommandError> {
-        self.cli.job_signing_update(job_id)
+    fn job_signing_update(&mut self, job_id: &JobId) {
+        self.cli.job_signing_update(job_id);
     }
 
-    fn job_signing_finished(&mut self, job_id: &JobId) -> Result<(), CommandError> {
-        self.cli.job_signing_finished(job_id)
+    fn job_signing_finished(&mut self, job_id: &JobId) {
+        self.cli.job_signing_finished(job_id);
     }
 
-    fn job_signed(&mut self, job: &SignedJob) -> Result<(), CommandError> {
-        self.cli.job_signed(job)?;
-        self.unreserve_job_id(job.job_id());
-        Ok(())
+    fn job_signed(&mut self, job: &SignedJob, show: bool) {
+        self.cli.job_signed(job, show);
     }
 
-    fn job_status(&mut self, job_id: &JobId, status: &JobStatus) -> Result<(), CommandError> {
+    fn job_status(&mut self, job_id: &JobId, status: &JobStatus) {
         self.set_job_id(Some(job_id.to_owned()));
-        self.cli.job_status(job_id, status)?;
-        self.unreserve_job_id(job_id);
-        Ok(())
-    }
-
-    fn jobs_reserved(&mut self, reserved: &JobsReserved) -> Result<(), CommandError> {
-        self.cli.jobs_reserved(reserved)?;
-        self.reserved = reserved.job_ids.clone();
-        Ok(())
+        self.cli.job_status(job_id, status);
     }
 
     fn read_signed_job(&mut self) -> Result<SignedJob, CommandError> {
         self.cli.read_signed_job()
     }
 
-    fn read_reserved(&mut self) -> Result<Reserved, CommandError> {
-        self.cli.read_reserved()
-    }
-
-    fn reserved_read(&mut self, reserved: &JobsReserved) -> Result<(), CommandError> {
-        self.cli.reserved_read(reserved)?;
-        self.reserved = reserved.job_ids.clone();
-        Ok(())
-    }
-
-    fn reserved_map(
-        &mut self,
-        reserved: &HashMap<String, DateTime<Utc>>,
-    ) -> Result<(), CommandError> {
-        self.cli.reserved_map(reserved)?;
-        self.reserved = reserved.keys().map(JobId::from).collect();
-        if let Some(job_id) = self.reserved.first() {
-            self.set_job_id(Some(job_id.to_owned()));
-        }
-        Ok(())
-    }
-
-    fn revoked(&mut self, revoked: &[JobId]) -> Result<(), CommandError> {
-        self.cli.revoked(revoked)?;
-        self.reserved.retain(|j| !revoked.contains(j));
-        Ok(())
-    }
+    // SSH agent and identity
 
     fn iam(&mut self, identity: &Identity) -> Result<(), CommandError> {
         self.cli.iam(identity)

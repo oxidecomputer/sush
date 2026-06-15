@@ -22,6 +22,7 @@ hyper = "1"
 indicatif = "0.18"
 kms-agent = { git = "https://github.com/oxidecomputer/kms-agent", branch = "lib", default-features = false, features = [] }
 libc = "0.2"
+lru = "0.18"
 memmap2 = "0.9"
 p256 = { version = "0.13", features = ["ecdsa"] }
 pem-rfc7468 = { version = "0.7", features = ["std"] }
@@ -34,7 +35,6 @@ rand = "0.8"
 rand_core = "0.6"
 reqwest = "0.12"
 rlimit = "0.10"
-rusqlite = { version = "0.37", features = ["blob", "chrono", "limits", "modern_sqlite", "rusqlite-macros"] }
 rustix = { version = "1", features = ["process", "pty"] }
 rustyline = "17"
 schemars = { version = "0.8", features = ["chrono", "preserve_order"] }

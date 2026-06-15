@@ -6,20 +6,21 @@ use std::io::Error as IoError;
 use std::ops::Deref;
 use std::str::FromStr;
 
-use blake3::{Hash, Hasher};
+use blake3::{Hash, Hasher, hash};
 use bytesize::GB;
 use chrono::{DateTime, TimeDelta, Utc};
+use crypto_bigint::U256;
 use rlimit::Resource;
-use rusqlite::Result as SqlResult;
-use rusqlite::types::{FromSql, FromSqlError, FromSqlResult, ToSql, ToSqlOutput, ValueRef};
 use schemars::schema::{Schema, SchemaObject};
 use schemars::{JsonSchema, SchemaGenerator};
 use serde::de::{Deserializer, Error as DeserializeError, Visitor};
 use serde::{Deserialize, Serialize, Serializer};
 use thiserror::Error;
 
+use crate::codephrases::{WORD_SEPARATOR, generate_id, id_phrase};
 use crate::keys::{KeyId, Signed, ToBeSigned, Verified};
 
+/// A globally unique identifier for a job within a session.
 #[derive(
     Clone, Debug, Deserialize, Eq, Hash, JsonSchema, Ord, PartialEq, PartialOrd, Serialize,
 )]
@@ -59,41 +60,117 @@ impl<S: AsRef<str>> From<S> for JobId {
     }
 }
 
-impl FromSql for JobId {
-    fn column_result(value: ValueRef<'_>) -> FromSqlResult<Self> {
-        Ok(Self::from(value.as_str()?))
+/// A globally unique identifier for a session.
+#[derive(
+    Clone, Debug, Deserialize, Eq, Hash, JsonSchema, Ord, PartialEq, PartialOrd, Serialize,
+)]
+pub struct SessionId(String);
+
+#[allow(clippy::new_without_default)]
+impl SessionId {
+    pub fn new() -> Self {
+        Self(generate_id())
+    }
+
+    pub fn first_job_id(&self) -> JobId {
+        id_phrase(U256::from_be_slice(hash(self.0.as_bytes()).as_bytes()))
+            .join(WORD_SEPARATOR)
+            .into()
+    }
+
+    pub fn next_job_id(&self, prev_job: &SignedJob) -> JobId {
+        id_phrase(U256::from_be_slice(
+            hash(&prev_job.to_be_signed()).as_bytes(),
+        ))
+        .join(WORD_SEPARATOR)
+        .into()
     }
 }
 
-impl ToSql for JobId {
-    fn to_sql(&self) -> SqlResult<ToSqlOutput<'_>> {
-        Ok(ToSqlOutput::from(self.0.clone()))
+impl Deref for SessionId {
+    type Target = str;
+
+    fn deref(&self) -> &Self::Target {
+        &self.0
     }
 }
 
-/// The response to a job reservation request.
-#[derive(Debug, Deserialize, JsonSchema, Serialize)]
-pub struct JobsReserved {
-    /// Fresh, globally unique job IDs.
-    pub job_ids: Vec<JobId>,
-
-    /// The server's idea of the time at which the job IDs were reserved.
-    pub time_reserved: DateTime<Utc>,
+impl fmt::Display for SessionId {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "{}", self.0)
+    }
 }
 
-/// A request to run the given `command` in the slot reserved by `job_id`.
+impl From<&Self> for SessionId {
+    fn from(other: &Self) -> Self {
+        other.to_owned()
+    }
+}
+
+impl<S: AsRef<str>> From<S> for SessionId {
+    fn from(s: S) -> Self {
+        Self(s.as_ref().to_string())
+    }
+}
+
+#[derive(Clone, Debug, Deserialize, JsonSchema, Serialize)]
+pub struct Session {
+    session_id: SessionId,
+    key_id: Option<KeyId>,
+    last_job: Option<SignedJob>,
+}
+
+impl Session {
+    pub fn new(session_id: SessionId, key_id: Option<KeyId>) -> Self {
+        Self {
+            session_id,
+            key_id,
+            last_job: None,
+        }
+    }
+
+    pub fn session_id(&self) -> &SessionId {
+        &self.session_id
+    }
+
+    pub fn key_id(&self) -> Option<&KeyId> {
+        self.key_id.as_ref()
+    }
+
+    pub fn last_job(&self) -> Option<&SignedJob> {
+        self.last_job.as_ref()
+    }
+
+    pub fn job_started(&mut self, job: SignedJob) {
+        self.last_job = Some(job)
+    }
+
+    pub fn next_job_id(&self) -> JobId {
+        if let Some(job) = self.last_job.as_ref() {
+            self.session_id.next_job_id(job)
+        } else {
+            self.session_id.first_job_id()
+        }
+    }
+}
+
+/// A request to run the given `command` as `job_id`.
 #[derive(Clone, Debug, Deserialize, JsonSchema, Serialize)]
 pub struct JobStartRequest {
     pub job_id: JobId,
     pub command: String,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub interactive: Option<KeyId>,
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub interactive: bool,
+}
+
+fn is_false(x: &bool) -> bool {
+    !x
 }
 
 impl JobStartRequest {
     const TYPE_NAME: &[u8] = b"sush_common::jobs::JobStartRequest";
 
-    pub fn new<S: AsRef<str>>(job_id: JobId, command: S, interactive: Option<KeyId>) -> Self {
+    pub fn new<S: AsRef<str>>(job_id: JobId, command: S, interactive: bool) -> Self {
         Self {
             job_id,
             command: command.as_ref().to_string(),
@@ -109,8 +186,8 @@ impl JobStartRequest {
         &self.command
     }
 
-    pub fn interactive(&self) -> Option<&KeyId> {
-        self.interactive.as_ref()
+    pub fn interactive(&self) -> bool {
+        self.interactive
     }
 }
 
@@ -118,7 +195,7 @@ impl ToBeSigned for JobStartRequest {
     /// BLAKE3 hash over the fields of `self`.
     fn to_be_signed(&self) -> Vec<u8> {
         let mut hasher = Hasher::new();
-        let mut hash = |data: &[u8]| {
+        let mut hash_with_len = |data: &[u8]| {
             hasher.update(&(data.len() as u64).to_be_bytes());
             hasher.update(data);
         };
@@ -128,12 +205,10 @@ impl ToBeSigned for JobStartRequest {
             command,
             interactive,
         } = self;
-        hash(Self::TYPE_NAME);
-        hash(job_id.as_bytes());
-        hash(command.as_bytes());
-        if let Some(interactive) = interactive {
-            hash(interactive.as_bytes());
-        }
+        hash_with_len(Self::TYPE_NAME);
+        hash_with_len(job_id.as_bytes());
+        hash_with_len(command.as_bytes());
+        hash_with_len(if *interactive { &[1] } else { &[0] });
         hasher.finalize().as_bytes().to_vec()
     }
 }
@@ -143,20 +218,18 @@ pub type VerifiedJob = Verified<JobStartRequest>;
 
 #[derive(Clone, Debug, Deserialize, JsonSchema, Serialize)]
 pub enum JobStatus {
-    Reserved {
-        job_id: JobId,
-        time_reserved: DateTime<Utc>,
-    },
     Started {
         job: VerifiedJob,
-        time_reserved: DateTime<Utc>,
+        session_id: SessionId,
+        key_id: KeyId,
         time_started: DateTime<Utc>,
         stdout_len: u64,
         stderr_len: u64,
     },
     Ended {
         job: VerifiedJob,
-        time_reserved: DateTime<Utc>,
+        session_id: SessionId,
+        key_id: KeyId,
         time_started: DateTime<Utc>,
         time_ended: DateTime<Utc>,
         status: Option<i32>,
@@ -168,23 +241,43 @@ pub enum JobStatus {
 }
 
 impl JobStatus {
-    pub fn time_elapsed(&self) -> Option<TimeDelta> {
+    pub fn session_id(&self) -> &SessionId {
         match self {
-            Self::Reserved { .. } => None,
-            Self::Started { time_started, .. } => Some(Utc::now() - time_started),
+            Self::Started { session_id, .. } | Self::Ended { session_id, .. } => session_id,
+        }
+    }
+
+    pub fn key_id(&self) -> &KeyId {
+        match self {
+            Self::Started { key_id, .. } | Self::Ended { key_id, .. } => key_id,
+        }
+    }
+
+    pub fn time_started(&self) -> DateTime<Utc> {
+        match self {
+            Self::Started { time_started, .. } | Self::Ended { time_started, .. } => *time_started,
+        }
+    }
+
+    pub fn time_elapsed(&self) -> TimeDelta {
+        match self {
+            Self::Started { time_started, .. } => Utc::now() - time_started,
             Self::Ended {
                 time_started,
                 time_ended,
                 ..
-            } => Some(*time_ended - time_started),
+            } => *time_ended - time_started,
         }
     }
 
     pub fn job_id(&self) -> &JobId {
         match self {
-            Self::Reserved { job_id, .. } => job_id,
             Self::Started { job, .. } | Self::Ended { job, .. } => job.job_id(),
         }
+    }
+
+    pub fn is_active(&self) -> bool {
+        matches!(self, Self::Started { .. })
     }
 }
 
@@ -195,6 +288,12 @@ pub struct JobOutputHash(
     #[schemars(schema_with = "hash_schema")]
     Hash,
 );
+
+impl Default for JobOutputHash {
+    fn default() -> Self {
+        Self::from(hash(&[]))
+    }
+}
 
 impl Deref for JobOutputHash {
     type Target = Hash;
@@ -213,20 +312,6 @@ impl From<Hash> for JobOutputHash {
 impl fmt::Display for JobOutputHash {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         self.0.fmt(f)
-    }
-}
-
-impl FromSql for JobOutputHash {
-    fn column_result(value: ValueRef<'_>) -> FromSqlResult<Self> {
-        Ok(Self::from(
-            Hash::from_hex(value.as_str()?).map_err(FromSqlError::other)?,
-        ))
-    }
-}
-
-impl ToSql for JobOutputHash {
-    fn to_sql(&self) -> SqlResult<ToSqlOutput<'_>> {
-        Ok(ToSqlOutput::from(self.0.to_string()))
     }
 }
 

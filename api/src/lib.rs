@@ -3,11 +3,10 @@
 use std::collections::BTreeMap;
 use std::fmt;
 
-use chrono::{DateTime, Utc};
 use dropshot::{
-    Body, ClientErrorStatusCode, EmptyScanParams, Header, HttpError, HttpResponseDeleted,
-    HttpResponseOk, PaginationParams, Path as PathParams, Query as QueryParams, RequestContext,
-    ResultsPage, TypedBody, WebsocketEndpointResult, WebsocketUpgrade, api_description,
+    Body, ClientErrorStatusCode, Header, HttpError, HttpResponseDeleted, HttpResponseOk,
+    Path as PathParams, Query as QueryParams, RequestContext, TypedBody, WebsocketEndpointResult,
+    WebsocketUpgrade, api_description,
 };
 use http_range_header::{SyntacticallyCorrectRange as Range, parse_range_header};
 use hyper::Response;
@@ -16,7 +15,9 @@ use serde::Deserialize;
 use serde::de::{Deserializer, Error as DeserializeError, IntoDeserializer, MapAccess, Visitor};
 
 use sush_common::authn::Identity;
-use sush_common::jobs::{JobId, JobLimits, JobOutputStream, JobStatus, JobsReserved, SignedJob};
+use sush_common::jobs::{
+    JobId, JobLimits, JobOutputStream, JobStatus, Session, SessionId, SignedJob,
+};
 use sush_common::keys::{KeyId, SshPublicKey};
 
 /// Oxide Support Shell API
@@ -24,53 +25,89 @@ use sush_common::keys::{KeyId, SshPublicKey};
 pub trait SushApi {
     type Context;
 
-    // Certificate requests.
+    // Certificate management.
 
     /// Import a certificate, verify its signature, and return a key ID for it.
     #[endpoint { method = PUT, path = "/certs" }]
     async fn import_cert(
         ctx: RequestContext<Self::Context>,
+        headers: Header<Authorization>,
         params: TypedBody<Vec<u8>>,
     ) -> Result<HttpResponseOk<KeyId>, HttpError>;
 
     /// Get the certificate chain that validates a key.
     ///
-    /// Certificates are in root-to-leaf order,
-    /// PEM encoded and newline separated.
+    /// Certificates are in root-to-leaf order, PEM encoded and newline separated.
     #[endpoint { method = GET, path = "/certs/{key_id}" }]
     async fn cert_chain(
         ctx: RequestContext<Self::Context>,
+        headers: Header<Authorization>,
         params: PathParams<KeyIdParam>,
     ) -> Result<HttpResponseOk<String>, HttpError>;
 
-    // Job reservation requests.
+    // Identity management.
 
-    /// Reserve some job slots with fresh, globally unique IDs.
-    #[endpoint { method = POST, path = "/reserved" }]
-    async fn reserve_jobs(
+    /// Prove and register identity.
+    #[endpoint { method = POST, path = "/iam" }]
+    async fn iam(
         ctx: RequestContext<Self::Context>,
-        params: TypedBody<u8>,
-    ) -> Result<HttpResponseOk<JobsReserved>, HttpError>;
+        headers: Header<Authorization>,
+        body: TypedBody<Option<SshPublicKey>>,
+    ) -> Result<HttpResponseOk<Identity>, HttpError>;
 
-    /// Map of job ID → time reserved for unused job slots.
-    #[endpoint { method = GET, path = "/reserved" }]
-    async fn get_reserved(
-        ctx: RequestContext<Self::Context>,
-    ) -> Result<HttpResponseOk<BTreeMap<JobId, DateTime<Utc>>>, HttpError>;
-
-    /// Revoke a set of reserved but unused job slots.
+    /// List cached identities.
     ///
-    /// Has no effect on jobs already started or finished, so it is safe to
-    /// call this with a list of IDs where some have been used. If called with
-    /// an empty list, revokes all reserved but unused jobs. Returns the list
-    /// of jobs actually revoked.
-    #[endpoint { method = DELETE, path = "/reserved" }]
-    async fn revoke_reserved(
+    /// May include duplicate identities with different nonces.
+    #[endpoint { method = GET, path = "/iam" }]
+    async fn identities(
         ctx: RequestContext<Self::Context>,
-        params: TypedBody<Vec<JobId>>,
-    ) -> Result<HttpResponseOk<Vec<JobId>>, HttpError>;
+        headers: Header<Authorization>,
+    ) -> Result<HttpResponseOk<Vec<Identity>>, HttpError>;
 
-    // Job management requests.
+    /// Revoke an authenticated identity.
+    ///
+    /// Any authenticated identity may revoke any other identity;
+    /// this is the only way to handle lost or stolen private keys.
+    #[endpoint { method = DELETE, path = "/iam/{key_id}" }]
+    async fn revoke_identity(
+        ctx: RequestContext<Self::Context>,
+        headers: Header<Authorization>,
+        params: PathParams<KeyIdParam>,
+    ) -> Result<HttpResponseDeleted, HttpError>;
+
+    // Session management.
+
+    /// Get the current session from this server's point of view.
+    #[endpoint { method = GET, path = "/sessions" }]
+    async fn session(
+        ctx: RequestContext<Self::Context>,
+        headers: Header<Authorization>,
+    ) -> Result<HttpResponseOk<Session>, HttpError>;
+
+    /// Start a new support session.
+    ///
+    /// There may only be one session active on the rack at a time.
+    /// If a session is already running when this request is made,
+    /// the old session is stopped, regardless of ownership.
+    #[endpoint { method = POST, path = "/sessions" }]
+    async fn session_start(
+        ctx: RequestContext<Self::Context>,
+        headers: Header<Authorization>,
+    ) -> Result<HttpResponseOk<Session>, HttpError>;
+
+    /// End a support session.
+    ///
+    /// Since there may be only one session active on the rack at a time
+    /// and we do not want to prevent starting new sessions, anyone is
+    /// allowed to stop anyone else's session and start their own.
+    #[endpoint { method = POST, path = "/sessions/{session_id}/stop" }]
+    async fn session_stop(
+        ctx: RequestContext<Self::Context>,
+        headers: Header<Authorization>,
+        params: PathParams<SessionIdParam>,
+    ) -> Result<HttpResponseOk<()>, HttpError>;
+
+    // Job management.
 
     /// Start an authorized job.
     #[endpoint { method = POST, path = "/jobs/{job_id}/start" }]
@@ -82,78 +119,71 @@ pub trait SushApi {
         body: TypedBody<SignedJob>,
     ) -> Result<HttpResponseOk<JobStatus>, HttpError>;
 
-    /// Get the status of a started job.
+    /// Stop a (running) job.
+    ///
+    /// Any authenticated identity may stop a job, regardless of ownership.
+    #[endpoint { method = POST, path = "/jobs/{job_id}/stop" }]
+    async fn job_stop(
+        ctx: RequestContext<Self::Context>,
+        headers: Header<Authorization>,
+        params: PathParams<JobIdParam>,
+    ) -> Result<HttpResponseOk<()>, HttpError>;
+
+    /// Get the status of a job.
+    ///
+    /// Any authenticated identity may see the status of any job,
+    /// regardless of ownership.
     #[endpoint { method = GET, path = "/jobs/{job_id}/status" }]
     async fn job_status(
         ctx: RequestContext<Self::Context>,
+        headers: Header<Authorization>,
         params: PathParams<JobIdParam>,
     ) -> Result<HttpResponseOk<JobStatus>, HttpError>;
 
+    /// Get (a subset of) the standard output or standard error of a job.
+    ///
+    /// Only the job owner may request job output.
+    #[endpoint { method = GET, path = "/jobs/{job_id}/output/{stream}" }]
+    async fn job_output(
+        ctx: RequestContext<Self::Context>,
+        headers: Header<AuthorizedRangeRequest>,
+        params: PathParams<JobOutputParams>,
+    ) -> Result<Response<Body>, HttpError>;
+
+    /// Truncate the standard output or standard error of a job.
+    ///
+    /// Only the job owner may truncate job output.
+    /// Returns the new length.
+    #[endpoint { method = DELETE, path = "/jobs/{job_id}/output/{stream}" }]
+    async fn job_output_delete(
+        ctx: RequestContext<Self::Context>,
+        headers: Header<AuthorizedRangeRequest>,
+        params: PathParams<JobOutputParams>,
+    ) -> Result<HttpResponseOk<u64>, HttpError>;
+
     /// Start a new interactive job session.
+    ///
+    /// Only the job owner may start an interactive session.
     // This should use `channel { protocol = WEBSOCKETS, .. }`, but that
     // does not currently let us return errors before the connection upgrade.
     #[endpoint { method = GET, path = "/jobs/{job_id}/session" }]
-    async fn job_session(
+    async fn job_start_interactive_session(
         ctx: RequestContext<Self::Context>,
         headers: Header<Authorization>,
         params: PathParams<JobIdParam>,
         upgrade: WebsocketUpgrade,
     ) -> WebsocketEndpointResult;
 
-    /// Abort a started job.
-    #[endpoint { method = GET, path = "/jobs/{job_id}/abort" }]
-    async fn job_abort(
-        ctx: RequestContext<Self::Context>,
-        params: PathParams<JobIdParam>,
-    ) -> Result<HttpResponseOk<()>, HttpError>;
-
-    /// Get (a subset of) the standard output or standard error of a job.
-    #[endpoint { method = GET, path = "/jobs/{job_id}/output/{stream}" }]
-    async fn job_output(
-        ctx: RequestContext<Self::Context>,
-        headers: Header<RangeRequest>,
-        params: PathParams<JobOutputParams>,
-    ) -> Result<Response<Body>, HttpError>;
-
-    /// Truncate the standard output or standard error of a job.
-    /// Returns its new length.
-    #[endpoint { method = DELETE, path = "/jobs/{job_id}/output/{stream}" }]
-    async fn job_output_delete(
-        ctx: RequestContext<Self::Context>,
-        headers: Header<RangeRequest>,
-        params: PathParams<JobOutputParams>,
-    ) -> Result<HttpResponseOk<u64>, HttpError>;
-
-    /// List previous jobs (paginated).
-    #[endpoint { method = GET, path = "/history" }]
-    async fn history(
-        ctx: RequestContext<Self::Context>,
-        params: QueryParams<PaginationParams<EmptyScanParams, JobId>>,
-    ) -> Result<HttpResponseOk<ResultsPage<JobStatus>>, HttpError>;
-
-    /// Prove and register identity.
-    #[endpoint { method = POST, path = "/iam" }]
-    async fn iam(
+    /// List previous jobs sorted by start time, most recent first.
+    ///
+    /// Any authenticated identity may see the job history,
+    /// regardless of ownership.
+    #[endpoint { method = GET, path = "/jobs" }]
+    async fn job_history(
         ctx: RequestContext<Self::Context>,
         headers: Header<Authorization>,
-        body: TypedBody<Option<SshPublicKey>>,
-    ) -> Result<HttpResponseOk<Identity>, HttpError>;
-
-    /// List authenticated identities.
-    #[endpoint { method = GET, path = "/iam" }]
-    async fn identities(
-        ctx: RequestContext<Self::Context>,
-        headers: Header<Authorization>,
-        params: QueryParams<PaginationParams<EmptyScanParams, KeyId>>,
-    ) -> Result<HttpResponseOk<ResultsPage<Identity>>, HttpError>;
-
-    /// Revoke an authenticated identity.
-    #[endpoint { method = DELETE, path = "/iam/{key_id}" }]
-    async fn revoke_identity(
-        ctx: RequestContext<Self::Context>,
-        headers: Header<Authorization>,
-        params: PathParams<KeyIdParam>,
-    ) -> Result<HttpResponseDeleted, HttpError>;
+        query: QueryParams<JobHistoryParams>,
+    ) -> Result<HttpResponseOk<Vec<JobStatus>>, HttpError>;
 }
 
 #[derive(Deserialize, JsonSchema)]
@@ -162,10 +192,16 @@ pub struct KeyIdParam {
 }
 
 #[derive(Deserialize, JsonSchema)]
+pub struct SessionIdParam {
+    pub session_id: SessionId,
+}
+
+#[derive(Deserialize, JsonSchema)]
 pub struct JobIdParam {
     pub job_id: JobId,
 }
 
+/// Job parameters _not_ specified in the signed job request.
 #[derive(Debug, Default, Deserialize, JsonSchema)]
 pub struct JobStartParams {
     #[serde(flatten, deserialize_with = "deserialize_job_limits")]
@@ -193,9 +229,18 @@ impl JobStartParams {
     }
 }
 
+/// Simple pagination for history list.
+#[derive(Debug, Default, Deserialize, JsonSchema)]
+#[serde(default)]
+pub struct JobHistoryParams {
+    /// limit=0 means all jobs
+    pub limit: u32,
+    pub offset: u32,
+}
+
 /// This deserialization method is a work-around for a bug in Serde; see
-/// <https://github.com/oxidecomputer/sush/pull/3#discussion_r2613036692>,
-/// <https://github.com/serde-rs/serde/issues/1183#issuecomment-668315831>.
+/// [sush#3](https://github.com/oxidecomputer/sush/pull/3#discussion_r2613036692) and
+/// [serde#1183](https://github.com/serde-rs/serde/issues/1183#issuecomment-668315831).
 /// Luckily limits are homogeneous, so it's pretty simple.
 fn deserialize_job_limits<'de, D>(de: D) -> Result<JobLimits, D::Error>
 where
@@ -231,16 +276,21 @@ pub struct JobOutputParams {
     pub stream: JobOutputStream,
 }
 
-/// `Range` request header.
+/// Authorized `Range` request headers.
 #[derive(Debug, Deserialize, JsonSchema)]
-pub struct RangeRequest {
+pub struct AuthorizedRangeRequest {
+    /// Authorization to access the range.
+    ///
+    /// See: <https://developer.mozilla.org/en-US/docs/Web/HTTP/Reference/Headers/Authorization>
+    pub authorization: Option<String>,
+
     /// A request to access a portion of the resource, such as `bytes=0-499`
     ///
     /// See: <https://developer.mozilla.org/en-US/docs/Web/HTTP/Reference/Headers/Range>
     range: Option<String>,
 }
 
-impl RangeRequest {
+impl AuthorizedRangeRequest {
     /// Extract a single range from the `Range` request header.
     /// This is just to avoid the complexity of encoding multiple
     /// ranges as output, not an inherent limitation.
@@ -269,9 +319,6 @@ impl RangeRequest {
 }
 
 /// HTTP "Authorization" header.
-///
-/// Note that this is misnamed, as it actually carries _authentication_
-/// credentials.
 #[derive(Debug, Deserialize, JsonSchema)]
 pub struct Authorization {
     /// Authorization to access some resource, such as a signature.

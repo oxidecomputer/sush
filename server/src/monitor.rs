@@ -3,11 +3,7 @@
 //!
 //! The monitor is not completely passive: it is also responsible for
 //! maintaining and, when requested, using the shutdown switches for jobs.
-//! It also maintains the interactive sessions.
-//!
-//! Unlike the manager, the monitor does *not* have direct access to the
-//! database. It communicates with the manager via a small set of requests
-//! and asynchronous events.
+//! It also maintains the interactive job sessions.
 
 use std::collections::BTreeMap;
 use std::fs::OpenOptions;
@@ -23,18 +19,17 @@ use tokio::sync::{mpsc, oneshot};
 use tokio::task::JoinSet;
 use tokio::{select, spawn};
 
-use sush_common::jobs::JobOutputStream::{Stderr, Stdout};
-use sush_common::jobs::{JobId, JobOutputHash, JobStatus, VerifiedJob};
+use sush_common::interactive::InteractiveSessionError;
+use sush_common::jobs::{JobId, JobOutputStream, JobStatus, SessionId, VerifiedJob};
 use sush_common::keys::KeyId;
-use sush_common::session::SessionError;
 
 use crate::error::{ExecutionError, JobError};
-use crate::manager::{job_output_hash, job_output_len, job_output_path};
+use crate::interactive::{InteractiveSession, SocketSender};
+use crate::manager::{JobOutputState, job_output_path};
 use crate::pty::Pty;
-use crate::session::{Session, SocketSender};
 
-/// The monitor runs as a tokio task that communicates with the manager
-/// via message passing. It does not have a connection to the database.
+/// The job monitor runs as a tokio task that communicates with the manager
+/// via message passing.
 #[derive(Debug)]
 pub struct JobMonitor {
     log: Logger,
@@ -84,7 +79,7 @@ impl JobMonitor {
                                 }};
                             }
                             match req {
-                                MonitorRequest::Session(job_id, sender) => {
+                                MonitorRequest::InteractiveSession(job_id, sender) => {
                                     watch!(job_id, monitor, monitor.session(&job_id, sender))
                                 }
                                 MonitorRequest::Started(event, watcher) => {
@@ -133,8 +128,8 @@ impl JobMonitor {
             Ok(())
         } else {
             error!(self.log, "failed to start session, job ended"; "job_id" => %job_id);
-            let _ = sender.send(Err(JobError::Session(SessionError::JobEnded)));
-            Err(JobError::Session(SessionError::JobEnded))
+            let _ = sender.send(Err(InteractiveSessionError::JobEnded.into()));
+            Err(InteractiveSessionError::JobEnded.into())
         }
     }
 
@@ -142,15 +137,16 @@ impl JobMonitor {
         &mut self,
         JobStarted {
             job,
-            time_reserved,
+            session_id,
+            key_id,
             time_started,
             child,
             interactive,
         }: JobStarted,
     ) -> Result<(), JobError> {
         let job_id = job.job_id().to_owned();
-        let (session, shutdown) = if let Some((key_id, pty)) = interactive {
-            self.interactive_job(&job_id, &key_id, pty, child)?
+        let (session, shutdown) = if let Some(pty) = interactive {
+            self.interactive_job(&job_id, pty, child)?
         } else {
             self.batch_job(child)
         };
@@ -159,20 +155,16 @@ impl JobMonitor {
             "should not already have a shutdown channel for a new job"
         );
 
-        let output_dir = self.output_dir.to_owned();
         self.tasks.spawn(async move {
             let exe = |err| ExecutionError::new(job_id.clone(), err);
             let status = session.await.map_err(exe)?;
             let end = JobEnded {
                 job,
-                time_reserved,
+                session_id,
+                key_id,
                 time_started,
                 time_ended: Utc::now(),
                 status,
-                stdout_len: job_output_len(&output_dir, &job_id, Stdout),
-                stderr_len: job_output_len(&output_dir, &job_id, Stderr),
-                stdout_hash: job_output_hash(&output_dir, &job_id, Stdout).map_err(exe)?,
-                stderr_hash: job_output_hash(&output_dir, &job_id, Stderr).map_err(exe)?,
             };
             Ok(end)
         });
@@ -195,19 +187,20 @@ impl JobMonitor {
     fn interactive_job(
         &mut self,
         job_id: &JobId,
-        key_id: &KeyId,
         pty: Pty,
         child: Child,
     ) -> Result<(PinnedSession, Shutdown), JobError> {
-        let path = job_output_path(&self.output_dir, job_id, Stdout);
+        let path = job_output_path(&self.output_dir, job_id, JobOutputStream::Stdout);
         let io_error = JobError::file_io_for(path.clone());
         let output_file = OpenOptions::new()
             .read(true)
             .write(true)
+            .create(true)
+            .truncate(true)
             .open(&path)
             .map_err(&io_error)?;
-        let log = self.log.new(o!("interactive" => key_id.to_string()));
-        let (session, shutdown) = Session::start(log, child, pty, output_file.into());
+        let log = self.log.new(o!("interactive" => true));
+        let (session, shutdown) = InteractiveSession::start(log, child, pty, output_file.into());
         assert!(
             self.sessions
                 .insert(job_id.to_owned(), session.clients())
@@ -251,14 +244,14 @@ type Watcher = oneshot::Sender<ExecutionResult>;
 
 /// Request sent from the manager to the monitor.
 pub enum MonitorRequest {
-    Session(JobId, SocketSenderSender),
+    InteractiveSession(JobId, SocketSenderSender),
     Started(Box<JobStarted>, Watcher),
     Stop(JobId),
 }
 
 impl MonitorRequest {
-    pub fn session(job_id: JobId, sender: SocketSenderSender) -> Self {
-        Self::Session(job_id, sender)
+    pub fn interactive_session(job_id: &JobId, sender: SocketSenderSender) -> Self {
+        Self::InteractiveSession(job_id.to_owned(), sender)
     }
 
     pub fn started(job_started: JobStarted, watcher: Watcher) -> Self {
@@ -271,14 +264,16 @@ impl MonitorRequest {
 }
 
 /// Event representing the beginning of a job. The manager spawns the child,
-/// then passses one of these to the monitor.
+/// then passes one of these to the monitor. The key ID denotes the owner of
+/// the session.
 #[derive(Debug)]
 pub struct JobStarted {
     pub job: VerifiedJob,
-    pub time_reserved: DateTime<Utc>,
+    pub session_id: SessionId,
+    pub key_id: KeyId,
     pub time_started: DateTime<Utc>,
     pub child: Child,
-    pub interactive: Option<(KeyId, Pty)>,
+    pub interactive: Option<Pty>,
 }
 
 impl JobStarted {
@@ -287,42 +282,62 @@ impl JobStarted {
     }
 }
 
+impl From<&JobStarted> for JobStatus {
+    fn from(start: &JobStarted) -> Self {
+        let JobStarted {
+            job,
+            session_id,
+            key_id,
+            time_started,
+            child: _,
+            interactive: _,
+        } = start;
+        Self::Started {
+            job: job.to_owned(),
+            session_id: session_id.to_owned(),
+            key_id: key_id.to_owned(),
+            time_started: time_started.to_owned(),
+            stdout_len: 0,
+            stderr_len: 0,
+        }
+    }
+}
+
 /// Event representing the end of a job.
 #[derive(Clone, Debug)]
 pub struct JobEnded {
     pub job: VerifiedJob,
-    pub time_reserved: DateTime<Utc>,
+    pub session_id: SessionId,
+    pub key_id: KeyId,
     pub time_started: DateTime<Utc>,
     pub time_ended: DateTime<Utc>,
     pub status: ExitStatus,
-    pub stdout_len: u64,
-    pub stderr_len: u64,
-    pub stdout_hash: JobOutputHash,
-    pub stderr_hash: JobOutputHash,
 }
 
 impl JobEnded {
     pub fn job_id(&self) -> &JobId {
         self.job.job_id()
     }
-}
 
-impl From<JobEnded> for JobStatus {
-    fn from(end: JobEnded) -> Self {
-        let JobEnded {
+    pub(crate) fn into_status(self, output: JobOutputState) -> JobStatus {
+        let Self {
             job,
-            time_reserved,
+            session_id,
+            key_id,
             time_started,
             time_ended,
             status,
+        } = self;
+        let JobOutputState {
             stdout_len,
             stderr_len,
             stdout_hash,
             stderr_hash,
-        } = end;
-        Self::Ended {
+        } = output;
+        JobStatus::Ended {
             job,
-            time_reserved,
+            session_id,
+            key_id,
             time_started,
             time_ended,
             status: status.code(),

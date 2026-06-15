@@ -1,12 +1,12 @@
 //! Possibly-interactive command-line interface.
 
-use std::collections::HashMap;
 use std::io::{self, BufRead as _, Read as _, Write as _, stderr, stdin, stdout};
 use std::path::Path;
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use bytesize::ByteSize;
-use chrono::{DateTime, Utc};
+use chrono::TimeDelta;
 use humantime::format_duration;
 use indicatif::{ProgressBar, ProgressStyle};
 use rustix::io::ioctl_fionread;
@@ -14,25 +14,20 @@ use serde_json::{json, to_string as to_json_string, to_string_pretty as to_json_
 use x509_cert::Certificate;
 use x509_cert::der::Encode as _;
 
-use sush_common::authn::Identity;
-use sush_common::jobs::{JobId, JobOutputStream, JobStatus, JobsReserved, SignedJob};
+use sush_common::authn::{Credentials, Identity};
+use sush_common::jobs::{JobId, JobOutputStream, JobStatus, Session, SessionId, SignedJob};
 use sush_common::keys::{KeyId, Signature, SshPublicKey};
 
-use crate::commands::{CommandContext, CommandError, GlobalArgs, OutputFormat, Reserved};
+use crate::commands::{CommandError, GlobalArgs};
+use crate::context::{CommandContext, OutputFormat};
 
-#[derive(Debug, Default)]
+#[derive(Clone, Debug, Default)]
 pub struct Cli {
-    output: OutputFormat,
-    progress: Option<ProgressBar>,
-}
-
-impl Cli {
-    pub fn new(output: OutputFormat) -> Self {
-        Self {
-            output,
-            progress: None,
-        }
-    }
+    globals: Arc<Mutex<GlobalArgs>>,
+    output: Arc<Mutex<OutputFormat>>,
+    progress: Arc<Mutex<Option<ProgressBar>>>,
+    session: Arc<Mutex<Option<Session>>>,
+    credentials: Arc<Mutex<Option<Credentials>>>,
 }
 
 fn byte_size(len: u64) -> bytesize::Display {
@@ -40,32 +35,75 @@ fn byte_size(len: u64) -> bytesize::Display {
 }
 
 impl CommandContext for Cli {
+    // Context management
+
     fn get_output_format(&self) -> OutputFormat {
-        self.output
+        *self.output.lock().unwrap()
     }
 
     fn set_output_format(&mut self, output: OutputFormat) {
-        self.output = output;
+        *self.output.lock().unwrap() = output;
     }
 
-    fn set_globals(&mut self, _args: &mut GlobalArgs, values: GlobalArgs) {
-        match self.get_output_format() {
-            OutputFormat::Json => {
-                let GlobalArgs { output, url, .. } = values;
-                let output = output.map(|o| o.as_str());
-                println!("{}", json!({"output": output, "url": url}))
-            }
-            OutputFormat::Text => println!("❌ `set` is most useful interactively, try `shell`"),
+    fn get_globals(&self) -> GlobalArgs {
+        self.globals.lock().unwrap().clone()
+    }
+
+    fn set_globals(&mut self, args: GlobalArgs) {
+        *self.globals.lock().unwrap() = args;
+    }
+
+    // Session management
+
+    fn get_credentials(&self) -> Option<Credentials> {
+        self.credentials.lock().unwrap().clone()
+    }
+
+    fn set_credentials(&mut self, credentials: Option<Credentials>) {
+        *self.credentials.lock().unwrap() = credentials;
+    }
+
+    fn session_id(&self) -> Option<SessionId> {
+        self.session
+            .lock()
+            .unwrap()
+            .as_ref()
+            .map(|s| s.session_id().to_owned())
+    }
+
+    fn next_job_id(&self) -> Result<JobId, CommandError> {
+        if let Some(session) = self.session.lock().unwrap().as_ref() {
+            Ok(session.next_job_id())
+        } else {
+            Err(CommandError::MissingSession)
         }
     }
 
-    fn ack(&mut self, url: &str, time: DateTime<Utc>) -> Result<(), CommandError> {
+    fn session_started(&mut self, session: Session) -> Result<(), CommandError> {
+        let session_id = session.session_id().to_owned();
+        *self.session.lock().unwrap() = Some(session);
         match self.get_output_format() {
-            OutputFormat::Json => println!("{}", json!({url: time})),
-            OutputFormat::Text => println!("✅ `{}` reports time {}", url, time),
+            OutputFormat::Json => println!("{}", json!({"session_started": session_id})),
+            OutputFormat::Text => println!("✅ Session is now `{session_id}`"),
         }
         Ok(())
     }
+
+    fn session_stopped(&mut self, session_id: &SessionId) -> Result<(), CommandError> {
+        let mut session_guard = self.session.lock().unwrap();
+        if let Some(session) = session_guard.as_ref()
+            && session.session_id() == session_id
+        {
+            let _ = session_guard.take();
+        }
+        match self.get_output_format() {
+            OutputFormat::Json => println!("{}", json!({"session_ended": session_id})),
+            OutputFormat::Text => println!("✅ Ended session `{session_id}`"),
+        }
+        Ok(())
+    }
+
+    // Job signing certificates
 
     fn cert_chain(&mut self, key_id: KeyId, certs: &str) -> Result<(), CommandError> {
         let chain = Certificate::load_pem_chain(certs.as_bytes())?;
@@ -120,106 +158,24 @@ impl CommandContext for Cli {
         Ok(())
     }
 
-    #[allow(clippy::print_literal)]
-    fn reserved_map(
-        &mut self,
-        reserved: &HashMap<String, DateTime<Utc>>,
-    ) -> Result<(), CommandError> {
+    // Job management
+
+    fn job_started(&mut self, job: &SignedJob) {
+        if let Some(session) = self.session.lock().unwrap().as_mut() {
+            session.job_started(job.to_owned());
+        }
+    }
+
+    fn job_stopped(&mut self, job_id: &JobId) {
         match self.get_output_format() {
-            OutputFormat::Json => println!("{}", json!(reserved)),
-            OutputFormat::Text => {
-                if reserved.is_empty() {
-                    println!("✅ No reserved jobs");
-                } else {
-                    println!("✅ {} reserved jobs:", reserved.len());
-                    for job_id in reserved.keys() {
-                        println!("{job_id}");
-                    }
-                }
-            }
-        }
-        Ok(())
-    }
-
-    fn read_signed_job(&mut self) -> Result<SignedJob, CommandError> {
-        let input = read_input(match self.get_output_format() {
-            OutputFormat::Json => "",
-            OutputFormat::Text => "✅ Enter signed job request, terminated with Ctrl-D:\n",
-        })?;
-        Ok(serde_json::from_str(&input)?)
-    }
-
-    fn read_reserved(&mut self) -> Result<Reserved, CommandError> {
-        let input = read_input(match self.get_output_format() {
-            OutputFormat::Json => "",
-            OutputFormat::Text => "✅ Enter reserved job IDs, terminated with Ctrl-D:\n",
-        })?;
-        if input.trim_start().starts_with('{') {
-            if let Ok(jobs) = serde_json::from_str(&input) {
-                Ok(Reserved::Batch(jobs))
-            } else if let Ok(map) = serde_json::from_str(&input) {
-                Ok(Reserved::Map(map))
-            } else {
-                Err(CommandError::InvalidReservedJobs)
-            }
-        } else {
-            Ok(Reserved::Batch(JobsReserved {
-                job_ids: input
-                    .split('\n')
-                    .map(|s| s.trim())
-                    .filter(|s| !s.is_empty())
-                    .map(JobId::from)
-                    .collect::<Vec<JobId>>(),
-                time_reserved: Utc::now(),
-            }))
+            OutputFormat::Json => println!("{}", json!(job_id)),
+            OutputFormat::Text => println!("✅ Stopped job `{job_id}`"),
         }
     }
 
-    fn reserved_read(&mut self, reserved: &JobsReserved) -> Result<(), CommandError> {
-        match self.get_output_format() {
-            OutputFormat::Json => println!("{}", json!(reserved)),
-            OutputFormat::Text => {
-                println!("✅ Read {} reserved jobs", reserved.job_ids.len());
-            }
-        }
-        Ok(())
-    }
-
-    fn jobs_reserved(&mut self, reserved: &JobsReserved) -> Result<(), CommandError> {
-        match self.get_output_format() {
-            OutputFormat::Json => println!("{}", json!(reserved)),
-            OutputFormat::Text => {
-                let JobsReserved {
-                    job_ids,
-                    time_reserved,
-                } = reserved;
-                let n = job_ids.len();
-                match n {
-                    0 => println!("✅ No jobs reserved"),
-                    1 => println!("✅ Reserved job `{}` at {}", job_ids[0], time_reserved),
-                    _ => {
-                        println!("✅ Reserved {n} jobs at {time_reserved}:");
-                        for job_id in &reserved.job_ids {
-                            println!("{job_id}");
-                        }
-                    }
-                }
-            }
-        }
-        Ok(())
-    }
-
-    fn job_aborted(&mut self, job_id: &JobId) -> Result<(), CommandError> {
-        match self.get_output_format() {
-            OutputFormat::Json => println!("{job_id}"),
-            OutputFormat::Text => println!("✅ Aborted job `{job_id}`"),
-        }
-        Ok(())
-    }
-
-    fn job_error(&mut self, error: CommandError) -> Result<(), CommandError> {
+    fn job_error(&mut self, error: CommandError) -> CommandError {
         eprintln!("{error}");
-        Ok(())
+        error
     }
 
     fn job_output(
@@ -228,14 +184,14 @@ impl CommandContext for Cli {
         stream: JobOutputStream,
         output: &[u8],
         binary: bool,
-    ) -> Result<(), CommandError> {
+    ) {
         match self.get_output_format() {
             OutputFormat::Json if binary => println!("{}", json!(output)),
-            OutputFormat::Json => println!("{}", json!(String::from_utf8(output.to_vec())?)),
+            OutputFormat::Json => println!("{}", json!(String::from_utf8_lossy(output))),
             OutputFormat::Text if binary => {
-                stdout()
-                    .write(output)
-                    .map_err(|error| CommandError::io("stdout", error))?;
+                if let Err(err) = stdout().write_all(output) {
+                    eprintln!("{err}");
+                }
             }
             OutputFormat::Text if output.is_empty() => (),
             OutputFormat::Text => {
@@ -243,7 +199,7 @@ impl CommandContext for Cli {
                     JobOutputStream::Stdout => println!("✅ Job stdout:"),
                     JobOutputStream::Stderr => println!("✅ Job stderr:"),
                 };
-                let output = String::from_utf8(output.to_vec())?;
+                let output = String::from_utf8_lossy(output);
                 if output.ends_with('\n') {
                     print!("{output}");
                 } else {
@@ -251,7 +207,6 @@ impl CommandContext for Cli {
                 }
             }
         }
-        Ok(())
     }
 
     fn job_output_started(
@@ -260,8 +215,9 @@ impl CommandContext for Cli {
         stream: JobOutputStream,
         stage: &str,
         total_length: u64,
-    ) -> Result<(), CommandError> {
-        if matches!(self.get_output_format(), OutputFormat::Text) && self.progress.is_none() {
+    ) {
+        let mut progress = self.progress.lock().unwrap();
+        if matches!(self.get_output_format(), OutputFormat::Text) && progress.is_none() {
             let bar = ProgressBar::new(total_length);
             bar.set_prefix(format!("{stage} {stream}"));
             bar.set_style(
@@ -274,21 +230,14 @@ impl CommandContext for Cli {
                 )
                 .unwrap(),
             );
-            self.progress = Some(bar);
+            *progress = Some(bar);
         }
-        Ok(())
     }
 
-    fn job_output_update(
-        &mut self,
-        _id: &JobId,
-        _stream: JobOutputStream,
-        length: u64,
-    ) -> Result<(), CommandError> {
-        if let Some(progress) = &mut self.progress {
+    fn job_output_update(&mut self, _id: &JobId, _stream: JobOutputStream, length: u64) {
+        if let Some(progress) = self.progress.lock().unwrap().as_mut() {
             progress.inc(length);
         }
-        Ok(())
     }
 
     fn job_output_finished(
@@ -296,8 +245,8 @@ impl CommandContext for Cli {
         _job_id: &JobId,
         stream: JobOutputStream,
         stage: Option<&str>,
-    ) -> Result<(), CommandError> {
-        if let Some(progress) = self.progress.take() {
+    ) {
+        if let Some(progress) = self.progress.lock().unwrap().take() {
             progress.finish_and_clear();
             if let Some(stage) = stage {
                 let length = ByteSize::b(progress.length().unwrap_or(0));
@@ -310,18 +259,14 @@ impl CommandContext for Cli {
                 );
             }
         }
-        Ok(())
     }
 
-    fn job_polling_started(
-        &mut self,
-        job_id: &JobId,
-        elapsed: Duration,
-    ) -> Result<(), CommandError> {
-        if matches!(self.get_output_format(), OutputFormat::Text) && self.progress.is_none() {
+    fn job_polling_started(&mut self, job_id: &JobId, elapsed: Duration) {
+        let mut progress = self.progress.lock().unwrap();
+        if matches!(self.get_output_format(), OutputFormat::Text) && progress.is_none() {
             let bar = ProgressBar::new_spinner();
             bar.set_elapsed(elapsed);
-            bar.set_prefix(format!("Waiting for `{job_id}`"));
+            bar.set_prefix(format!("Waiting for job `{job_id}`"));
             bar.set_style(
                 ProgressStyle::with_template(
                     "{spinner}  \
@@ -331,18 +276,13 @@ impl CommandContext for Cli {
                 )
                 .unwrap(),
             );
-            self.progress = Some(bar);
+            *progress = Some(bar);
         }
-        Ok(())
     }
 
-    fn job_polling_update(
-        &mut self,
-        _job_id: &JobId,
-        status: &JobStatus,
-    ) -> Result<(), CommandError> {
-        if let Some(progress) = &mut self.progress {
-            if let JobStatus::Started {
+    fn job_polling_update(&mut self, _job_id: &JobId, status: &JobStatus) {
+        if let Some(progress) = self.progress.lock().unwrap().as_mut() {
+            let (JobStatus::Started {
                 stdout_len,
                 stderr_len,
                 ..
@@ -351,42 +291,37 @@ impl CommandContext for Cli {
                 stdout_len,
                 stderr_len,
                 ..
-            } = status
-            {
-                let stdout_len = byte_size(*stdout_len);
-                let stderr_len = byte_size(*stderr_len);
-                progress.set_message(format!("stdout: {stdout_len}, stderr: {stderr_len}"));
-            }
+            }) = status;
+            let stdout_len = byte_size(*stdout_len);
+            let stderr_len = byte_size(*stderr_len);
+            progress.set_message(format!("stdout: {stdout_len}, stderr: {stderr_len}"));
             progress.tick();
         }
-        Ok(())
     }
 
-    fn job_polling_finished(&mut self, _job_id: &JobId) -> Result<(), CommandError> {
-        if let Some(progress) = self.progress.take() {
+    fn job_polling_finished(&mut self, _job_id: &JobId) {
+        if let Some(progress) = self.progress.lock().unwrap().take() {
             progress.finish_and_clear();
         }
-        Ok(())
     }
 
-    fn job_session_connected(&mut self, job_id: &JobId) -> Result<(), CommandError> {
+    fn job_session_connected(&mut self, job_id: &JobId) {
         match self.get_output_format() {
             OutputFormat::Json => println!("{}", json!({"connected": job_id})),
             OutputFormat::Text => println!("✅ Connected to interactive job `{job_id}`"),
         }
-        Ok(())
     }
 
-    fn job_session_disconnected(&mut self, job_id: &JobId) -> Result<(), CommandError> {
+    fn job_session_disconnected(&mut self, job_id: &JobId) {
         match self.get_output_format() {
             OutputFormat::Json => println!("{}", json!({"disconnected": job_id})),
             OutputFormat::Text => println!("\r✅ Disconnected interactive job `{job_id}`"),
         }
-        Ok(())
     }
 
-    fn job_signing_started(&mut self, job_id: &JobId) -> Result<(), CommandError> {
-        if matches!(self.get_output_format(), OutputFormat::Text) && self.progress.is_none() {
+    fn job_signing_started(&mut self, job_id: &JobId) {
+        let mut progress = self.progress.lock().unwrap();
+        if matches!(self.get_output_format(), OutputFormat::Text) && progress.is_none() {
             let bar = ProgressBar::new_spinner();
             bar.set_prefix(format!("Waiting for signature on `{job_id}`"));
             bar.set_style(
@@ -399,69 +334,79 @@ impl CommandContext for Cli {
                 .unwrap(),
             );
             bar.enable_steady_tick(Duration::from_millis(100));
-            self.progress = Some(bar);
+            *progress = Some(bar);
         }
-        Ok(())
     }
 
-    fn job_signing_update(&mut self, _job_id: &JobId) -> Result<(), CommandError> {
-        if let Some(progress) = &mut self.progress {
+    fn job_signing_update(&mut self, _job_id: &JobId) {
+        if let Some(progress) = self.progress.lock().unwrap().as_mut() {
             progress.tick();
         }
-        Ok(())
     }
 
-    fn job_signing_finished(&mut self, job_id: &JobId) -> Result<(), CommandError> {
-        if let Some(progress) = self.progress.take() {
+    fn job_signing_finished(&mut self, job_id: &JobId) {
+        if let Some(progress) = self.progress.lock().unwrap().take() {
             progress.finish_and_clear();
         }
         if matches!(self.get_output_format(), OutputFormat::Text) {
             println!("✅ Signed request for job `{job_id}`");
         }
-        Ok(())
     }
 
-    fn job_signed(&mut self, job: &SignedJob) -> Result<(), CommandError> {
-        match self.get_output_format() {
-            OutputFormat::Json => println!("{}", to_json_string(&job)?),
-            OutputFormat::Text => println!("{}", to_json_string_pretty(&job)?),
+    fn job_signed(&mut self, job: &SignedJob, show: bool) {
+        if show {
+            match self.get_output_format() {
+                OutputFormat::Json => println!(
+                    "{}",
+                    to_json_string(&job).expect("job should be JSON-serializable")
+                ),
+                OutputFormat::Text => println!(
+                    "{}",
+                    to_json_string_pretty(&job).expect("job should be JSON-serializable")
+                ),
+            }
         }
-        Ok(())
     }
 
-    fn job_status(&mut self, job_id: &JobId, status: &JobStatus) -> Result<(), CommandError> {
+    fn job_status(&mut self, job_id: &JobId, status: &JobStatus) {
+        fn format_elapsed_duration(duration: TimeDelta) -> String {
+            if let Ok(duration) = duration.to_std() {
+                format_duration(duration).to_string()
+            } else {
+                String::from("negative duration, times may be unreliable")
+            }
+        }
+
         match self.get_output_format() {
             OutputFormat::Json => println!("{}", json!(status)),
             OutputFormat::Text => match status {
-                JobStatus::Reserved {
-                    job_id,
-                    time_reserved,
-                } => println!(
-                    "✅ Job ID:\t{job_id}\n   \
-                     Job status:\tReserved\n   \
-                     Reserved at:\t{time_reserved}"
-                ),
                 JobStatus::Started {
-                    time_reserved,
+                    job,
+                    session_id,
+                    key_id,
                     time_started,
                     stdout_len,
                     stderr_len,
                     ..
                 } => {
+                    let command = job.command();
                     let stdout_len = byte_size(*stdout_len);
                     let stderr_len = byte_size(*stderr_len);
                     println!(
                         "✅ Job ID:\t{job_id}\n   \
+                         Session ID:\t{session_id}\n   \
+                         Key ID:\t{key_id}\n   \
                          Job status:\tStarted\n   \
-                         Reserved at:\t{time_reserved}\n   \
+                         Command:\t{command}\n   \
                          Started at:\t{time_started}\n   \
                          Stdout len:\t{stdout_len}\n   \
                          Stderr len:\t{stderr_len}"
                     )
                 }
                 JobStatus::Ended {
-                    job: _,
-                    time_reserved,
+                    job,
+                    session_id,
+                    key_id,
                     time_started,
                     time_ended,
                     status: Some(exit_status),
@@ -470,16 +415,19 @@ impl CommandContext for Cli {
                     stdout_hash,
                     stderr_hash,
                 } => {
-                    let duration = format_duration(status.time_elapsed().unwrap().to_std()?);
+                    let command = job.command();
+                    let duration = format_elapsed_duration(status.time_elapsed());
                     let stdout_len = byte_size(*stdout_len);
                     let stderr_len = byte_size(*stderr_len);
                     println!(
                         "✅ Job ID:\t{job_id}\n   \
+                         Session ID:\t{session_id}\n   \
+                         Key ID:\t{key_id}\n   \
                          Job status:\tEnded\n   \
-                         Reserved at:\t{time_reserved}\n   \
+                         Command:\t{command}\n   \
                          Started at:\t{time_started}\n   \
                          Ended at:\t{time_ended} ({duration})\n   \
-                         Status:\t{exit_status}\n   \
+                         Exit status:\t{exit_status}\n   \
                          Stdout len:\t{stdout_len}\n   \
                          Stderr len:\t{stderr_len}\n   \
                          Stdout hash:\t{stdout_hash}\n   \
@@ -487,8 +435,9 @@ impl CommandContext for Cli {
                     );
                 }
                 JobStatus::Ended {
-                    job: _,
-                    time_reserved,
+                    job,
+                    session_id,
+                    key_id,
                     time_started,
                     time_ended,
                     status: None,
@@ -497,15 +446,18 @@ impl CommandContext for Cli {
                     stdout_hash,
                     stderr_hash,
                 } => {
-                    let duration = format_duration(status.time_elapsed().unwrap().to_std()?);
+                    let command = job.command();
+                    let duration = format_elapsed_duration(status.time_elapsed());
                     let stdout_len = byte_size(*stdout_len);
                     let stderr_len = byte_size(*stderr_len);
                     println!(
                         "✅ Job ID:\t{job_id}\n   \
-                         Job status:\tAborted\n   \
-                         Reserved at:\t{time_reserved}\n   \
+                         Session ID:\t{session_id}\n   \
+                         Key ID:\t{key_id}\n   \
+                         Job status:\tStopped\n   \
+                         Command:\t{command}\n   \
                          Started at:\t{time_started}\n   \
-                         Aborted at:\t{time_ended} ({duration})\n   \
+                         Stopped at:\t{time_ended} ({duration})\n   \
                          Stdout len:\t{stdout_len}\n   \
                          Stderr len:\t{stderr_len}\n   \
                          Stdout hash:\t{stdout_hash}\n   \
@@ -514,28 +466,17 @@ impl CommandContext for Cli {
                 }
             },
         }
-        Ok(())
     }
 
-    fn revoked(&mut self, revoked: &[JobId]) -> Result<(), CommandError> {
-        match self.get_output_format() {
-            OutputFormat::Json => println!("{}", json!(revoked)),
-            OutputFormat::Text => {
-                let n = revoked.len();
-                match n {
-                    0 => println!("✅ No jobs revoked"),
-                    1 => println!("✅ Revoked job `{}`", revoked[0]),
-                    _ => {
-                        println!("✅ Revoked {} jobs:", revoked.len());
-                        for job_id in revoked {
-                            println!("{job_id}");
-                        }
-                    }
-                }
-            }
-        }
-        Ok(())
+    fn read_signed_job(&mut self) -> Result<SignedJob, CommandError> {
+        let input = read_input(match self.get_output_format() {
+            OutputFormat::Json => "",
+            OutputFormat::Text => "✅ Enter signed job request, terminated with Ctrl-D:\n",
+        })?;
+        Ok(serde_json::from_str(&input)?)
     }
+
+    // SSH agent and identity
 
     fn iam(&mut self, identity: &Identity) -> Result<(), CommandError> {
         match self.get_output_format() {

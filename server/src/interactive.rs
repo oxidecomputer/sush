@@ -19,9 +19,10 @@ use tokio::time::{MissedTickBehavior, interval, sleep};
 use tokio::{select, spawn};
 use tokio_tungstenite::WebSocketStream;
 
-use sush_common::session::{
-    SESSION_BUFFER_SIZE, SESSION_REKEY_PERIOD, SessionControl, SessionDecoder, SessionEncoder,
-    SessionError, SessionMessage,
+use sush_common::interactive::{
+    INTERACTIVE_SESSION_BUFFER_SIZE, INTERACTIVE_SESSION_REKEY_PERIOD, InteractiveSessionControl,
+    InteractiveSessionDecoder, InteractiveSessionEncoder, InteractiveSessionError,
+    InteractiveSessionMessage,
 };
 
 use crate::pty::Pty;
@@ -30,16 +31,23 @@ pub type ShutdownSession = oneshot::Sender<()>;
 pub type SocketStream = WebSocketStream<WebsocketConnectionRaw>;
 pub type SocketSender = mpsc::Sender<SocketStream>;
 
-pub struct Session {
-    task: JoinHandle<Result<ExitStatus, SessionError>>,
+pub struct InteractiveSession {
+    task: JoinHandle<Result<ExitStatus, InteractiveSessionError>>,
     tx_client: SocketSender,
 }
 
-impl Session {
+impl InteractiveSession {
     pub fn start(log: Logger, child: Child, pty: Pty, output: File) -> (Self, ShutdownSession) {
         let (tx_client, rx_client) = mpsc::channel::<SocketStream>(1);
         let (tx_shutdown, rx_shutdown) = oneshot::channel();
-        let task = spawn(session(log, child, pty, output, rx_client, rx_shutdown));
+        let task = spawn(interactive_session(
+            log,
+            child,
+            pty,
+            output,
+            rx_client,
+            rx_shutdown,
+        ));
         (Self { task, tx_client }, tx_shutdown)
     }
 
@@ -47,7 +55,7 @@ impl Session {
         self.tx_client.clone()
     }
 
-    pub async fn wait(self) -> Result<ExitStatus, SessionError> {
+    pub async fn wait(self) -> Result<ExitStatus, InteractiveSessionError> {
         self.task.await?
     }
 }
@@ -57,20 +65,20 @@ const SESSION_DRAIN_TIMEOUT: Duration = Duration::from_millis(10);
 
 /// Run an interactive job that allows, but does not require,
 /// a client connection via WebSocket.
-async fn session(
+async fn interactive_session(
     log: Logger,
     mut child: Child,
     mut pty: Pty,
     mut output: File,
     mut rx_client: mpsc::Receiver<SocketStream>,
     mut rx_shutdown: oneshot::Receiver<()>,
-) -> Result<ExitStatus, SessionError> {
-    let mut buffer = BytesMut::with_capacity(SESSION_BUFFER_SIZE);
+) -> Result<ExitStatus, InteractiveSessionError> {
+    let mut buffer = BytesMut::with_capacity(INTERACTIVE_SESSION_BUFFER_SIZE);
     let mut client = None::<SocketStream>;
-    let mut ping = None::<SessionMessage>;
-    let mut decoder = SessionDecoder::default();
-    let mut encoder = SessionEncoder::default();
-    let mut interval = interval(SESSION_REKEY_PERIOD);
+    let mut ping = None::<InteractiveSessionMessage>;
+    let mut decoder = InteractiveSessionDecoder::default();
+    let mut encoder = InteractiveSessionEncoder::default();
+    let mut interval = interval(INTERACTIVE_SESSION_REKEY_PERIOD);
     interval.set_missed_tick_behavior(MissedTickBehavior::Skip);
     let mut sigchld = signal(SignalKind::child())?;
     let mut shutdown = false;
@@ -106,6 +114,7 @@ async fn session(
     }
 
     loop {
+        buffer.reserve(INTERACTIVE_SESSION_BUFFER_SIZE);
         select! {
             // Read available job output, record it, and relay it to the client
             // if there is one. We try to read regardless of whether the process
@@ -118,8 +127,9 @@ async fn session(
                     break;
                 }
                 output.write_all(&buffer[..n]).await?;
+                let data = buffer.copy_to_bytes(n);
                 if let Some(stream) = client.as_mut() {
-                    let message = SessionMessage::Data(buffer.copy_to_bytes(n));
+                    let message = InteractiveSessionMessage::Data(data);
                     if let Err(error) = stream.send(encoder.encode(message)?).await {
                         close_client!(stream, "failed to relay job output"; "error" => %error);
                     }
@@ -138,9 +148,9 @@ async fn session(
             // Accept a new client, rekey it, and play back the last buffer.
             Some(mut stream) = rx_client.recv(), if !died => {
                 rekey_client!(stream);
-                if let Some(playback) = playback_buffer(&mut output, SESSION_BUFFER_SIZE).await? {
+                if let Some(playback) = playback_buffer(&mut output, INTERACTIVE_SESSION_BUFFER_SIZE).await? {
                     let playback_len = playback.len();
-                    let message = SessionMessage::Data(playback);
+                    let message = InteractiveSessionMessage::Data(playback);
                     match stream.send(encoder.encode(message)?).await {
                         Ok(()) => {
                             info!(log, "played back output"; "bytes" => playback_len);
@@ -160,7 +170,7 @@ async fn session(
                         if let Some(stream) = client.as_mut() {
                             match handle_client_message(&log, &mut pty, &mut decoder, &mut ping, message).await {
                                 Ok(()) => (),
-                                Err(SessionError::Close) => {
+                                Err(InteractiveSessionError::Close) => {
                                     info!(log, "client closed connection");
                                     client = None;
                                 }
@@ -219,23 +229,24 @@ async fn session(
 async fn handle_client_message(
     log: &Logger,
     pty: &mut Pty,
-    decoder: &mut SessionDecoder,
-    ping: &mut Option<SessionMessage>,
-    message: SessionMessage,
-) -> Result<(), SessionError> {
+    decoder: &mut InteractiveSessionDecoder,
+    ping: &mut Option<InteractiveSessionMessage>,
+    message: InteractiveSessionMessage,
+) -> Result<(), InteractiveSessionError> {
+    use InteractiveSessionMessage as ISM;
     match message {
-        SessionMessage::Control(message) => match message {
-            SessionControl::WindowChange(size) => pty.set_window_size(size)?,
+        ISM::Control(message) => match message {
+            InteractiveSessionControl::WindowChange(size) => pty.set_window_size(size)?,
         },
-        SessionMessage::Data(bytes) => pty.write_all(&bytes).await?,
-        SessionMessage::Ping(_) => return Err(SessionError::UnsolicitedPing),
-        SessionMessage::Pong(pong) => {
-            if let Some(SessionMessage::Ping(ping)) = ping.take() {
+        ISM::Data(bytes) => pty.write_all(&bytes).await?,
+        ISM::Ping(_) => return Err(InteractiveSessionError::UnsolicitedPing),
+        ISM::Pong(pong) => {
+            if let Some(ISM::Ping(ping)) = ping.take() {
                 decoder.rekey(pong, Some(ping));
                 info!(log, "rekeyed session decoder");
             }
         }
-        SessionMessage::Close => return Err(SessionError::Close),
+        ISM::Close => return Err(InteractiveSessionError::Close),
     }
     Ok(())
 }
@@ -302,7 +313,7 @@ mod test {
                 .spawn()
                 .unwrap();
             let (session, shutdown) =
-                Session::start(log, child, pty, output_file.reopen().unwrap().into());
+                InteractiveSession::start(log, child, pty, output_file.reopen().unwrap().into());
             assert!(session.wait().await.unwrap().success());
             assert!(shutdown.send(()).is_err());
 

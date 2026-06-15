@@ -26,7 +26,6 @@ serde.workspace = true
 serde_json.workspace = true
 signature.workspace = true
 ssh-key.workspace = true
-rusqlite.workspace = true
 sha2.workspace = true
 tempfile.workspace = true
 thiserror.workspace = true

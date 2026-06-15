@@ -4,16 +4,13 @@ use std::net::SocketAddr;
 use std::path::PathBuf;
 
 use clap::Parser;
-use clap::builder::PathBufValueParser;
 use dropshot::{ConfigDropshot, ConfigLogging, ConfigLoggingLevel, HandlerTaskMode, ServerBuilder};
 
 use sush_api::sush_api_mod::api_description;
-use sush_server::database::open_database;
 use sush_server::manager::JobManager;
 use sush_server::server::ApiServer;
 
 const DEFAULT_ADDRESS: &str = "0.0.0.0:44444";
-const DEFAULT_DATABASE: &str = "sush.db";
 const ROOT_LOG_NAME: &str = "sush";
 const REQUEST_MAX_BODY_BYTES: usize = 0xFFFF;
 
@@ -24,10 +21,6 @@ struct ServerArgs {
     /// Address for HTTP API listener
     #[arg(short = 'a', long, default_value_t = DEFAULT_ADDRESS.parse().unwrap())]
     address: SocketAddr,
-
-    /// Path to the jobs database
-    #[arg(short = 'd', long, default_value = DEFAULT_DATABASE, value_parser = PathBufValueParser::new())]
-    database: PathBuf,
 
     /// Enable debug log messages
     #[arg(short = 'D', long, default_value_t = false)]
@@ -42,7 +35,6 @@ struct ServerArgs {
 async fn main() -> Result<(), String> {
     let ServerArgs {
         address,
-        database,
         debug,
         directory,
     } = ServerArgs::parse();
@@ -56,8 +48,7 @@ async fn main() -> Result<(), String> {
     .to_logger(ROOT_LOG_NAME)
     .map_err(|e| e.to_string())?;
 
-    let db = open_database(database).map_err(|e| e.to_string())?;
-    let mgr = JobManager::new(log.clone(), db, &directory)
+    let mgr = JobManager::new(log.clone(), &directory)
         .await
         .map_err(|e| e.to_string())?;
 

@@ -8,9 +8,9 @@ use dropshot::{ClientErrorStatusCode, HttpError};
 use thiserror::Error;
 
 use sush_common::authn::{Challenge, Nonce};
-use sush_common::jobs::{JobId, JobOutputHash};
+use sush_common::interactive::InteractiveSessionError;
+use sush_common::jobs::{JobId, JobOutputHash, SessionId};
 use sush_common::keys::{KeyError, KeyId};
-use sush_common::session::SessionError;
 
 /// What went wrong processing a client job request.
 #[derive(Debug, Error)]
@@ -28,8 +28,10 @@ pub enum JobError {
         path: PathBuf,
         error: std::io::Error,
     },
-    #[error("Identity mismatch, expected `{interactive}`, found `{authn}`")]
-    IdentityMismatch { interactive: KeyId, authn: KeyId },
+    #[error("Identity not found")]
+    IdentityNotFound(KeyId),
+    #[error("Interactive session error: {0}")]
+    InteractiveSession(#[from] InteractiveSessionError),
     #[error("Invalid command `{0}`, must not start with `-`")]
     InvalidCommand(String),
     #[error("Invalid or duplicate job ID")]
@@ -38,6 +40,10 @@ pub enum JobError {
     InvalidRange(u64),
     #[error("I/O error during {what}: {error}")]
     Io { what: String, error: std::io::Error },
+    #[error("Job `{0}` not found")]
+    JobNotFound(JobId),
+    #[error("Job `{0}` is still running, so may produce more output")]
+    JobStillRunning(JobId),
     #[error(transparent)]
     Json(#[from] serde_json::Error),
     #[error("Key error: {0}")]
@@ -46,12 +52,18 @@ pub enum JobError {
     Shutdown(JobId),
     #[error("Can't find certificate for key `{0}`")]
     MissingCert(KeyId),
-    #[error("No such nonce `{0}`")]
-    NoSuchNonce(Nonce),
+    #[error("Only one session may be running at a time")]
+    MultipleSessions,
+    #[error("No current session")]
+    NoSession,
+    #[error("Session `{0}` is no longer current")]
+    SessionNotCurrent(SessionId),
+    #[error("Session `{0}` not found")]
+    SessionNotFound(SessionId),
+    #[error("Incorrect identity for session, try `iam`")]
+    SessionWrongIdentity,
     #[error("Job output hash mismatch, file may be corrupt")]
     OutputHashMismatch(JobId, JobOutputHash),
-    #[error("Output not yet available")]
-    OutputPending,
     #[error("Output too big, please use range requests")]
     OutputTooBig,
     #[error("Public key for `{0}` does not match stored key")]
@@ -65,14 +77,16 @@ pub enum JobError {
     },
     #[error("Can't receive response: sender dropped")]
     Recv(#[from] tokio::sync::oneshot::error::RecvError),
-    #[error("Interactive session error: {0}")]
-    Session(#[from] SessionError),
     #[error(transparent)]
     Slice(#[from] std::array::TryFromSliceError),
     #[error(transparent)]
-    Sqlite(#[from] rusqlite::Error),
-    #[error(transparent)]
     Task(#[from] tokio::task::JoinError),
+    #[error("Too many certificates ({0})")]
+    TooManyCerts(usize),
+    #[error("Too many active jobs ({0}), try waiting for some to finish")]
+    TooManyJobs(usize),
+    #[error("Too many identities revoked ({0})")]
+    TooManyRevocations(usize),
     #[error("Unauthorized request")]
     Unauthorized(Nonce),
     #[error("Unable to wait for job end")]
@@ -84,8 +98,8 @@ impl JobError {
         Self::ChannelClosed
     }
 
-    pub fn unauthorized() -> Self {
-        Self::Unauthorized(Nonce::generate())
+    pub fn unauthorized(nonce: Nonce) -> Self {
+        Self::Unauthorized(nonce)
     }
 
     /// Report I/O errors with the corresponding stream name.
@@ -120,16 +134,12 @@ impl From<JobError> for HttpError {
             | Der(_)
             | Execution(_)
             | FileIo { .. }
-            | IdentityMismatch { .. }
             | Io { .. }
-            | NoSuchNonce(_)
             | OutputHashMismatch(_, _)
             | PublicKeyNotFound(_)
             | PublicKeyMismatch(_)
-            | PublicKeyRevoked { .. }
             | Recv(_)
             | Shutdown(_)
-            | Sqlite(_)
             | Task(_)
             | Slice(_)
             | Wait => HttpError::for_internal_error(message),
@@ -140,14 +150,14 @@ impl From<JobError> for HttpError {
                     message,
                 );
                 error
-                    .add_header("content-range", format!("bytes */{length}"))
-                    .expect("should be able to add content-range header");
+                    .add_header("Content-Range", format!("bytes */{length}"))
+                    .expect("should be able to add Content-Range header");
                 error
             }
             OutputTooBig => {
                 HttpError::for_client_error(None, ClientErrorStatusCode::PAYLOAD_TOO_LARGE, message)
             }
-            Session(error) => HttpError::for_client_error(
+            InteractiveSession(error) => HttpError::for_client_error(
                 None,
                 ClientErrorStatusCode::NOT_FOUND,
                 error.to_string(),
@@ -156,15 +166,30 @@ impl From<JobError> for HttpError {
                 let mut err = HttpError::for_client_error(
                     None,
                     ClientErrorStatusCode::UNAUTHORIZED,
-                    String::from("Authentication required"),
+                    String::from("Authentication required, try `iam`"),
                 );
                 let challenge = Challenge::new(nonce);
-                err.add_header("www-authenticate", challenge)
-                    .expect("should be able to add www-authenticate header");
+                err.add_header("WWW-Authenticate", challenge)
+                    .expect("should be able to add WWW-Authenticate header");
                 err
             }
-            InvalidCommand(_) | InvalidJobId(_) | Json(_) | CertChainTooLong | MissingCert(_)
-            | OutputPending => {
+            SessionWrongIdentity | PublicKeyRevoked { .. } => {
+                HttpError::for_client_error(None, ClientErrorStatusCode::FORBIDDEN, message)
+            }
+            IdentityNotFound(_) | JobNotFound(_) | NoSession | SessionNotFound(_)
+            | SessionNotCurrent(_) => {
+                HttpError::for_client_error(None, ClientErrorStatusCode::NOT_FOUND, message)
+            }
+            CertChainTooLong
+            | InvalidCommand(_)
+            | InvalidJobId(_)
+            | Json(_)
+            | JobStillRunning(_)
+            | MissingCert(_)
+            | MultipleSessions
+            | TooManyCerts(_)
+            | TooManyJobs(_)
+            | TooManyRevocations(_) => {
                 HttpError::for_client_error(None, ClientErrorStatusCode::BAD_REQUEST, message)
             }
         }

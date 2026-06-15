@@ -40,30 +40,30 @@ use serde_json::{from_str as from_json, to_string as to_json};
 use thiserror::Error;
 use tokio_tungstenite::tungstenite::protocol::Message as WebSocketMessage;
 
-pub const SESSION_BUFFER_SIZE: usize = 0x10000;
-pub const SESSION_KEY_CONTEXT: &str = "Oxide Support Shell Session Encoding v1";
-pub const SESSION_KEY_LEN: usize = 32;
-pub const SESSION_REKEY_PERIOD: Duration = Duration::from_secs(30);
+pub const INTERACTIVE_SESSION_BUFFER_SIZE: usize = 0x10000;
+pub const INTERACTIVE_SESSION_KEY_CONTEXT: &str = "Oxide Support Shell Session Encoding v1";
+pub const INTERACTIVE_SESSION_KEY_LEN: usize = 32;
+pub const INTERACTIVE_SESSION_REKEY_PERIOD: Duration = Duration::from_secs(30);
 
 /// An interactive session message.
 #[derive(Clone, Debug)]
-pub enum SessionMessage {
-    Control(SessionControl),
+pub enum InteractiveSessionMessage {
+    Control(InteractiveSessionControl),
     Data(Bytes),
     Ping(Bytes),
     Pong(Bytes),
     Close,
 }
 
-impl From<SessionControl> for SessionMessage {
-    fn from(message: SessionControl) -> Self {
+impl From<InteractiveSessionControl> for InteractiveSessionMessage {
+    fn from(message: InteractiveSessionControl) -> Self {
         Self::Control(message)
     }
 }
 
 /// A session control message.
 #[derive(Clone, Debug, Deserialize, Serialize)]
-pub enum SessionControl {
+pub enum InteractiveSessionControl {
     WindowChange(WindowSize),
 }
 
@@ -77,12 +77,12 @@ pub struct WindowSize {
 
 /// Data packet decoder.
 #[derive(Debug, Default)]
-pub struct SessionDecoder {
+pub struct InteractiveSessionDecoder {
     count: u64,
     hasher: Hasher,
 }
 
-impl SessionDecoder {
+impl InteractiveSessionDecoder {
     pub fn count(&self) -> u64 {
         self.count + self.hasher.count()
     }
@@ -91,23 +91,28 @@ impl SessionDecoder {
         if let Some(mask) = mask {
             key_material = xor_bytes(&key_material, &mask);
         }
-        let key = derive_key(SESSION_KEY_CONTEXT, &key_material);
+        let key = derive_key(INTERACTIVE_SESSION_KEY_CONTEXT, &key_material);
         self.count += self.hasher.count();
         self.hasher = Hasher::new_keyed(&key);
     }
 
-    pub fn decode(&mut self, message: WebSocketMessage) -> Result<SessionMessage, SessionError> {
+    pub fn decode(
+        &mut self,
+        message: WebSocketMessage,
+    ) -> Result<InteractiveSessionMessage, InteractiveSessionError> {
+        use InteractiveSessionMessage as ISM;
+        use WebSocketMessage as WSM;
         match message {
-            WebSocketMessage::Text(message) => Ok(SessionMessage::Control(from_json(&message)?)),
-            WebSocketMessage::Binary(bytes) => Ok(SessionMessage::Data(self.decode_data(&bytes)?)),
-            WebSocketMessage::Ping(bytes) => Ok(SessionMessage::Ping(bytes)),
-            WebSocketMessage::Pong(bytes) => Ok(SessionMessage::Pong(bytes)),
-            WebSocketMessage::Close(_) => Ok(SessionMessage::Close),
-            WebSocketMessage::Frame(_) => Err(SessionError::Decode),
+            WSM::Text(message) => Ok(ISM::Control(from_json(&message)?)),
+            WSM::Binary(bytes) => Ok(ISM::Data(self.decode_data(&bytes)?)),
+            WSM::Ping(bytes) => Ok(ISM::Ping(bytes)),
+            WSM::Pong(bytes) => Ok(ISM::Pong(bytes)),
+            WSM::Close(_) => Ok(ISM::Close),
+            WSM::Frame(_) => Err(InteractiveSessionError::Decode),
         }
     }
 
-    fn decode_data(&mut self, bytes: &[u8]) -> Result<Bytes, SessionError> {
+    fn decode_data(&mut self, bytes: &[u8]) -> Result<Bytes, InteractiveSessionError> {
         if let Some((pad, rest)) = bytes.split_at_checked(1)
             && let pad = pad[0] as usize
             && let len = rest.len()
@@ -117,43 +122,51 @@ impl SessionDecoder {
         {
             Ok(Bytes::copy_from_slice(payload))
         } else {
-            Err(SessionError::Decode)
+            Err(InteractiveSessionError::Decode)
         }
     }
 }
 
 /// Data packet encoder.
 #[derive(Debug, Default)]
-pub struct SessionEncoder {
+pub struct InteractiveSessionEncoder {
     count: u64,
     hasher: Hasher,
 }
 
-impl SessionEncoder {
+impl InteractiveSessionEncoder {
     pub fn count(&self) -> u64 {
         self.count + self.hasher.count()
     }
 
-    pub fn rekey(&mut self, ping_bytes: Option<&Bytes>) -> Result<SessionMessage, SessionError> {
+    pub fn rekey(
+        &mut self,
+        ping_bytes: Option<&Bytes>,
+    ) -> Result<InteractiveSessionMessage, InteractiveSessionError> {
         let key_material = rand_key();
-        let key = derive_key(SESSION_KEY_CONTEXT, &key_material);
+        let key = derive_key(INTERACTIVE_SESSION_KEY_CONTEXT, &key_material);
         let message = if let Some(ping_bytes) = ping_bytes {
-            SessionMessage::Pong(xor_bytes(&key_material, ping_bytes))
+            InteractiveSessionMessage::Pong(xor_bytes(&key_material, ping_bytes))
         } else {
-            SessionMessage::Ping(key_material)
+            InteractiveSessionMessage::Ping(key_material)
         };
         self.count += self.hasher.count();
         self.hasher = Hasher::new_keyed(&key);
         Ok(message)
     }
 
-    pub fn encode(&mut self, message: SessionMessage) -> Result<WebSocketMessage, SessionError> {
+    pub fn encode(
+        &mut self,
+        message: InteractiveSessionMessage,
+    ) -> Result<WebSocketMessage, InteractiveSessionError> {
+        use InteractiveSessionMessage as ISM;
+        use WebSocketMessage as WSM;
         match message {
-            SessionMessage::Control(msg) => Ok(WebSocketMessage::Text(to_json(&msg)?.into())),
-            SessionMessage::Data(bytes) => Ok(WebSocketMessage::Binary(self.encode_data(&bytes))),
-            SessionMessage::Ping(bytes) => Ok(WebSocketMessage::Ping(bytes)),
-            SessionMessage::Pong(bytes) => Ok(WebSocketMessage::Pong(bytes)),
-            SessionMessage::Close => Ok(WebSocketMessage::Close(None)),
+            ISM::Control(msg) => Ok(WSM::Text(to_json(&msg)?.into())),
+            ISM::Data(bytes) => Ok(WSM::Binary(self.encode_data(&bytes))),
+            ISM::Ping(bytes) => Ok(WSM::Ping(bytes)),
+            ISM::Pong(bytes) => Ok(WSM::Pong(bytes)),
+            ISM::Close => Ok(WSM::Close(None)),
         }
     }
 
@@ -177,7 +190,7 @@ fn hash_xof(hasher: &mut Hasher, input: &[u8], output_len: usize) -> Bytes {
 }
 
 fn rand_key() -> Bytes {
-    let mut key = BytesMut::zeroed(SESSION_KEY_LEN);
+    let mut key = BytesMut::zeroed(INTERACTIVE_SESSION_KEY_LEN);
     OsRng.fill_bytes(&mut key);
     key.freeze()
 }
@@ -191,7 +204,7 @@ fn xor_bytes(x: &Bytes, y: &Bytes) -> Bytes {
 }
 
 #[derive(Debug, Error)]
-pub enum SessionError {
+pub enum InteractiveSessionError {
     #[error("Client closed connection")]
     Close,
     #[error("Can't decode data packet, session synchronization lost")]
@@ -224,23 +237,26 @@ mod test {
 
     #[test]
     fn round_trip_packets() {
-        let mut server_decoder = SessionDecoder::default();
-        let mut server_encoder = SessionEncoder::default();
-        let mut client_decoder = SessionDecoder::default();
-        let mut client_encoder = SessionEncoder::default();
+        let mut server_decoder = InteractiveSessionDecoder::default();
+        let mut server_encoder = InteractiveSessionEncoder::default();
+        let mut client_decoder = InteractiveSessionDecoder::default();
+        let mut client_encoder = InteractiveSessionEncoder::default();
         let mut count = 0;
         let mut rng = thread_rng();
         for i in 0..1000 {
             if i % 10 == 0 {
                 let key;
-                if let SessionMessage::Ping(bytes) = server_encoder.rekey(None).unwrap() {
+                if let InteractiveSessionMessage::Ping(bytes) = server_encoder.rekey(None).unwrap()
+                {
                     key = bytes.clone();
                     client_decoder.rekey(bytes, None);
                 } else {
                     panic!("invalid server rekey message");
                 }
 
-                if let SessionMessage::Pong(ckey) = client_encoder.rekey(Some(&key)).unwrap() {
+                if let InteractiveSessionMessage::Pong(ckey) =
+                    client_encoder.rekey(Some(&key)).unwrap()
+                {
                     server_decoder.rekey(ckey, Some(key));
                 } else {
                     panic!("invalid client rekey message");

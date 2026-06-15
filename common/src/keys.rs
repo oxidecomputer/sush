@@ -15,8 +15,6 @@ use ed25519_dalek::{
 use kms_agent_lib::protocol::{ProtocolError, SshBufReader as _, SshBufWriter as _};
 use p256::{SecretKey as P256SecretKey, ecdsa};
 use rand_core::OsRng;
-use rusqlite::types::{FromSql, FromSqlError, FromSqlResult, ToSql, ToSqlOutput, ValueRef};
-use rusqlite::{Error as SqlError, Result as SqlResult};
 use schemars::schema::Schema;
 use schemars::{JsonSchema, SchemaGenerator};
 use serde::{Deserialize, Serialize};
@@ -101,18 +99,6 @@ impl TryFrom<&ssh_key::PublicKey> for KeyId {
     }
 }
 
-impl FromSql for KeyId {
-    fn column_result(value: ValueRef<'_>) -> Result<Self, FromSqlError> {
-        Ok(Self(value.as_str()?.to_string()))
-    }
-}
-
-impl ToSql for KeyId {
-    fn to_sql(&self) -> Result<ToSqlOutput<'_>, SqlError> {
-        Ok(ToSqlOutput::from(self.0.clone()))
-    }
-}
-
 /// A (de)serializable wrapper around [`ssh_key::PublicKey`].
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 pub struct SshPublicKey(ssh_key::PublicKey);
@@ -156,22 +142,6 @@ impl Deref for SshPublicKey {
 
     fn deref(&self) -> &Self::Target {
         &self.0
-    }
-}
-
-impl FromSql for SshPublicKey {
-    fn column_result(value: ValueRef<'_>) -> FromSqlResult<Self> {
-        Ok(Self(
-            ssh_key::PublicKey::from_openssh(value.as_str()?).map_err(FromSqlError::other)?,
-        ))
-    }
-}
-
-impl ToSql for SshPublicKey {
-    fn to_sql(&self) -> SqlResult<ToSqlOutput<'_>> {
-        Ok(ToSqlOutput::from(
-            self.0.to_openssh().map_err(FromSqlError::other)?,
-        ))
     }
 }
 
@@ -295,23 +265,6 @@ impl EncodedSignature {
             }
             _ => Err(KeyError::InvalidPublicKeyAlgorithm),
         }
-    }
-}
-
-// Use JSON to encode signatures values for storage. Keeps the database
-// consistent with the wire protocol, but we might regret it later.
-
-impl FromSql for EncodedSignature {
-    fn column_result(value: ValueRef<'_>) -> Result<Self, FromSqlError> {
-        serde_json::from_str(value.as_str()?).map_err(FromSqlError::other)
-    }
-}
-
-impl ToSql for EncodedSignature {
-    fn to_sql(&self) -> Result<ToSqlOutput<'_>, SqlError> {
-        Ok(ToSqlOutput::from(
-            serde_json::to_string(self).map_err(FromSqlError::other)?,
-        ))
     }
 }
 
@@ -738,8 +691,7 @@ impl EphemeralKey {
         let cert = Self::self_signed_cert(&key, subject, validity)?;
         let subject = cert.tbs_certificate.subject.to_owned();
         let key_id = KeyId::try_from(&subject)?;
-        let signature = Signature::try_from(&cert)?;
-        signature.verify_with_spki(
+        Signature::try_from(&cert)?.verify_with_spki(
             &cert.tbs_certificate.to_der()?,
             &cert.tbs_certificate.subject_public_key_info,
         )?;
