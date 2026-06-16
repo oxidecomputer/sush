@@ -6,6 +6,7 @@ edition = "2024"
 publish = false
 
 [dependencies]
+borsh.workspace = true
 chrono.workspace = true
 dropshot.workspace = true
 http-range-header.workspace = true

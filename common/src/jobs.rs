@@ -1,12 +1,13 @@
 //! Signed job requests.
 
 use std::convert::Infallible;
-use std::fmt;
 use std::io::Error as IoError;
 use std::ops::Deref;
 use std::str::FromStr;
+use std::{fmt, io};
 
 use blake3::{Hash, Hasher, hash};
+use borsh::{BorshDeserialize, BorshSerialize};
 use bytesize::GB;
 use chrono::{DateTime, TimeDelta, Utc};
 use crypto_bigint::U256;
@@ -22,7 +23,18 @@ use crate::keys::{KeyId, Signed, ToBeSigned, Verified};
 
 /// A globally unique identifier for a job within a session.
 #[derive(
-    Clone, Debug, Deserialize, Eq, Hash, JsonSchema, Ord, PartialEq, PartialOrd, Serialize,
+    BorshDeserialize,
+    BorshSerialize,
+    Clone,
+    Debug,
+    Deserialize,
+    Eq,
+    Hash,
+    JsonSchema,
+    Ord,
+    PartialEq,
+    PartialOrd,
+    Serialize,
 )]
 pub struct JobId(String);
 
@@ -62,7 +74,18 @@ impl<S: AsRef<str>> From<S> for JobId {
 
 /// A globally unique identifier for a session.
 #[derive(
-    Clone, Debug, Deserialize, Eq, Hash, JsonSchema, Ord, PartialEq, PartialOrd, Serialize,
+    BorshDeserialize,
+    BorshSerialize,
+    Clone,
+    Debug,
+    Deserialize,
+    Eq,
+    Hash,
+    JsonSchema,
+    Ord,
+    PartialEq,
+    PartialOrd,
+    Serialize,
 )]
 pub struct SessionId(String);
 
@@ -116,25 +139,19 @@ impl<S: AsRef<str>> From<S> for SessionId {
 #[derive(Clone, Debug, Deserialize, JsonSchema, Serialize)]
 pub struct Session {
     session_id: SessionId,
-    key_id: Option<KeyId>,
     last_job: Option<SignedJob>,
 }
 
 impl Session {
-    pub fn new(session_id: SessionId, key_id: Option<KeyId>) -> Self {
+    pub fn new(session_id: SessionId) -> Self {
         Self {
             session_id,
-            key_id,
             last_job: None,
         }
     }
 
     pub fn session_id(&self) -> &SessionId {
         &self.session_id
-    }
-
-    pub fn key_id(&self) -> Option<&KeyId> {
-        self.key_id.as_ref()
     }
 
     pub fn last_job(&self) -> Option<&SignedJob> {
@@ -155,7 +172,7 @@ impl Session {
 }
 
 /// A request to run the given `command` as `job_id`.
-#[derive(Clone, Debug, Deserialize, JsonSchema, Serialize)]
+#[derive(BorshDeserialize, BorshSerialize, Clone, Debug, Deserialize, JsonSchema, Serialize)]
 pub struct JobStartRequest {
     pub job_id: JobId,
     pub command: String,
@@ -216,12 +233,13 @@ impl ToBeSigned for JobStartRequest {
 pub type SignedJob = Signed<JobStartRequest>;
 pub type VerifiedJob = Verified<JobStartRequest>;
 
-#[derive(Clone, Debug, Deserialize, JsonSchema, Serialize)]
+#[derive(BorshDeserialize, BorshSerialize, Clone, Debug, Deserialize, JsonSchema, Serialize)]
 pub enum JobStatus {
     Started {
         job: VerifiedJob,
         session_id: SessionId,
         key_id: KeyId,
+        #[borsh(serialize_with = "datetime_ser", deserialize_with = "datetime_de")]
         time_started: DateTime<Utc>,
         stdout_len: u64,
         stderr_len: u64,
@@ -230,14 +248,26 @@ pub enum JobStatus {
         job: VerifiedJob,
         session_id: SessionId,
         key_id: KeyId,
+        #[borsh(serialize_with = "datetime_ser", deserialize_with = "datetime_de")]
         time_started: DateTime<Utc>,
+        #[borsh(serialize_with = "datetime_ser", deserialize_with = "datetime_de")]
         time_ended: DateTime<Utc>,
-        status: Option<i32>,
+        status: Result<i32, ProcessError>,
         stdout_len: u64,
         stderr_len: u64,
         stdout_hash: JobOutputHash,
         stderr_hash: JobOutputHash,
     },
+}
+
+#[derive(
+    Clone, Debug, BorshDeserialize, Serialize, BorshSerialize, Deserialize, JsonSchema, Error,
+)]
+pub enum ProcessError {
+    #[error("could not start process: {0}")]
+    Unstarted(String),
+    #[error("process killed with signal {0}")]
+    Killed(i32),
 }
 
 impl JobStatus {
@@ -282,10 +312,21 @@ impl JobStatus {
 }
 
 /// BLAKE3 hash of job output, used as a checksum.
-#[derive(Clone, Debug, Deserialize, Eq, JsonSchema, PartialEq, Serialize)]
+#[derive(
+    BorshDeserialize,
+    BorshSerialize,
+    Clone,
+    Debug,
+    Deserialize,
+    Eq,
+    JsonSchema,
+    PartialEq,
+    Serialize,
+)]
 pub struct JobOutputHash(
     #[serde(serialize_with = "hash_ser", deserialize_with = "hash_de")]
     #[schemars(schema_with = "hash_schema")]
+    #[borsh(serialize_with = "hash_borsh_ser", deserialize_with = "hash_borsh_de")]
     Hash,
 );
 
@@ -352,8 +393,46 @@ fn hash_schema(g: &mut SchemaGenerator) -> Schema {
     schema.into()
 }
 
+/// Borsh-encode a [`Hash`] as its 32 raw bytes.
+///
+/// `blake3::Hash` has no native Borsh impl; the wire form is the fixed-width
+/// digest with no length prefix.
+fn hash_borsh_ser<W: borsh::io::Write>(hash: &Hash, writer: &mut W) -> borsh::io::Result<()> {
+    writer.write_all(hash.as_bytes())
+}
+
+fn hash_borsh_de<R: borsh::io::Read>(reader: &mut R) -> borsh::io::Result<Hash> {
+    let mut bytes = [0u8; blake3::OUT_LEN];
+    reader.read_exact(&mut bytes)?;
+    Ok(Hash::from(bytes))
+}
+
+/// Borsh-encode a [`DateTime<Utc>`] as `(timestamp_seconds, subsec_nanos)`.
+///
+/// `chrono` exposes no Borsh feature, so we encode the two integer components
+/// directly. The nanosecond part may reach 1_999_999_999 during a leap second;
+/// [`DateTime::from_timestamp`] accepts that range, so the pair round-trips.
+fn datetime_ser<W: borsh::io::Write>(
+    time: &DateTime<Utc>,
+    writer: &mut W,
+) -> borsh::io::Result<()> {
+    BorshSerialize::serialize(&time.timestamp(), writer)?;
+    BorshSerialize::serialize(&time.timestamp_subsec_nanos(), writer)
+}
+
+fn datetime_de<R: borsh::io::Read>(reader: &mut R) -> borsh::io::Result<DateTime<Utc>> {
+    let secs = i64::deserialize_reader(reader)?;
+    let nanos = u32::deserialize_reader(reader)?;
+    DateTime::from_timestamp(secs, nanos).ok_or_else(|| {
+        borsh::io::Error::new(
+            borsh::io::ErrorKind::InvalidData,
+            "timestamp out of representable range",
+        )
+    })
+}
+
 /// Limits on job processes.
-#[derive(Clone, Debug, Deserialize, JsonSchema, Serialize)]
+#[derive(BorshDeserialize, BorshSerialize, Clone, Debug, Deserialize, JsonSchema, Serialize)]
 pub struct JobLimits {
     /// Maximum CPU use in seconds.
     pub max_cpu: u64,
@@ -396,7 +475,9 @@ impl Default for JobLimits {
 }
 
 /// Either the standard output or standard error of a job.
-#[derive(Clone, Copy, Debug, Deserialize, JsonSchema, Serialize)]
+#[derive(
+    Clone, Copy, Debug, Deserialize, JsonSchema, Serialize, BorshDeserialize, BorshSerialize,
+)]
 #[serde(rename_all = "lowercase")]
 pub enum JobOutputStream {
     Stdout,

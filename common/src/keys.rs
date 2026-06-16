@@ -6,6 +6,7 @@
 use std::fmt;
 use std::ops::Deref;
 
+use borsh::{BorshDeserialize, BorshSerialize};
 use bytes::{Buf as _, BufMut as _, BytesMut};
 use crypto_bigint::{ArrayEncoding as _, Random as _, U128, U256};
 use ed25519_dalek::{
@@ -40,7 +41,18 @@ use crate::codephrases::{InvalidCodephrase, WORD_SEPARATOR, codephrase, decode_p
 /// SHA-256 of a certificate subject or an identity public key,
 /// encoded as a pseudorandom code phrase for storage & transport.
 #[derive(
-    Clone, Debug, Deserialize, Eq, Hash, JsonSchema, Ord, PartialEq, PartialOrd, Serialize,
+    BorshDeserialize,
+    BorshSerialize,
+    Clone,
+    Debug,
+    Deserialize,
+    Eq,
+    Hash,
+    JsonSchema,
+    Ord,
+    PartialEq,
+    PartialOrd,
+    Serialize,
 )]
 pub struct KeyId(String);
 
@@ -168,7 +180,18 @@ impl JsonSchema for SshPublicKey {
 /// public keys](https://cvsweb.openbsd.org/src/usr.bin/ssh/PROTOCOL.u2f?annotate=HEAD).
 /// They should be set to 0 for other key types.
 #[derive(
-    Clone, Debug, Deserialize, Eq, Hash, JsonSchema, Ord, PartialEq, PartialOrd, Serialize,
+    BorshDeserialize,
+    BorshSerialize,
+    Clone,
+    Debug,
+    Deserialize,
+    Eq,
+    Hash,
+    JsonSchema,
+    Ord,
+    PartialEq,
+    PartialOrd,
+    Serialize,
 )]
 pub struct EncodedSignature {
     pub r: String,
@@ -453,7 +476,7 @@ impl<T: AsRef<[u8]>> ToBeSigned for T {
 }
 
 /// A signed envelope around some data.
-#[derive(Clone, Debug, Deserialize, JsonSchema, Serialize)]
+#[derive(BorshDeserialize, BorshSerialize, Clone, Debug, Deserialize, JsonSchema, Serialize)]
 pub struct Signed<T> {
     payload: T,
     key_id: KeyId,
@@ -566,7 +589,7 @@ impl<T: ToBeSigned> Signed<T> {
 }
 
 /// An envelope whose signature has been verified.
-#[derive(Clone, Debug, Deserialize, JsonSchema, Serialize)]
+#[derive(BorshDeserialize, BorshSerialize, Clone, Debug, Deserialize, JsonSchema, Serialize)]
 pub struct Verified<T> {
     signed: Signed<T>,
     verified_by: KeyId,

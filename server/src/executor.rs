@@ -2,39 +2,42 @@
 //!
 //! Executes, monitors, and halts jobs. Driven by the session state machine.
 
+use rumors::Rumors;
+use sled_hardware_types::BaseboardId;
 use sush_api::JobStartParams;
 use sush_common::authn::Identity;
-use sush_common::jobs::{JobId, JobStatus, SignedJob};
+use sush_common::jobs::{JobId, JobOutputStream, JobStartRequest, JobStatus, SignedJob};
 
 use crate::interactive::SocketSender;
-use crate::messages::Error;
+use crate::messages::{Error, Message};
 use crate::monitor::ExecutionResult;
 
-pub struct Executor {}
+pub struct Executor {
+    own_baseboard: BaseboardId,
+    rumors: Rumors<Message>,
+}
 
 impl Executor {
-    pub async fn job_start(
-        &self,
-        _authn: &Identity,
-        _job: SignedJob,
-        _params: JobStartParams,
-    ) -> Result<Option<ExecutionResult>, Error> {
+    pub fn new(own_baseboard: BaseboardId, rumors: Rumors<Message>) -> Self {
+        Self {
+            own_baseboard,
+            rumors,
+        }
+    }
+
+    pub fn job_start(&self, _job: &JobStartRequest, _params: &JobStartParams) {
         todo!()
     }
 
-    pub async fn job_start_interactive(
-        &self,
-        _authn: &Identity,
-        _job_id: &JobId,
-    ) -> Result<SocketSender, Error> {
+    pub fn job_attach(&self, _job_id: &JobId) {
         todo!()
     }
 
-    pub async fn job_status(&self, _authn: &Identity, _job_id: &JobId) -> Result<JobStatus, Error> {
+    pub fn job_status(&self, _job_id: &JobId) {
         todo!()
     }
 
-    pub async fn job_stop(&self, _authn: &Identity, _job_id: &JobId) -> Result<(), Error> {
+    pub fn job_stop(&self, _job_id: &JobId) {
         todo!()
     }
 }

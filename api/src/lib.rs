@@ -3,6 +3,7 @@
 use std::collections::BTreeMap;
 use std::fmt;
 
+use borsh::{BorshDeserialize, BorshSerialize};
 use dropshot::{
     Body, ClientErrorStatusCode, Header, HttpError, HttpResponseDeleted, HttpResponseOk,
     Path as PathParams, Query as QueryParams, RequestContext, TypedBody, WebsocketEndpointResult,
@@ -202,7 +203,7 @@ pub struct JobIdParam {
 }
 
 /// Job parameters _not_ specified in the signed job request.
-#[derive(Debug, Default, Deserialize, JsonSchema)]
+#[derive(Clone, Debug, Default, Deserialize, JsonSchema, BorshSerialize, BorshDeserialize)]
 pub struct JobStartParams {
     #[serde(flatten, deserialize_with = "deserialize_job_limits")]
     pub limits: JobLimits,
@@ -263,7 +264,7 @@ where
             while let Some((key, value)) = map.next_entry::<String, String>()? {
                 limits.insert(key, value.parse().map_err(DeserializeError::custom)?);
             }
-            JobLimits::deserialize(limits.into_deserializer())
+            <JobLimits as Deserialize>::deserialize(limits.into_deserializer())
         }
     }
 
