@@ -41,6 +41,7 @@ terminfo.workspace = true
 thiserror.workspace = true
 tokio.workspace = true
 tokio-tungstenite.workspace = true
+uuid.workspace = true
 x509-cert.workspace = true
 
 [dev-dependencies]

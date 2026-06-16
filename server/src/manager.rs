@@ -1,7 +1,5 @@
-//! Manage a set of jobs.
-//!
-//! Jobs are spawned onto new tokio tasks and passed to the monitor to wait
-//! for completion. Standard output and standard error are saved in files.
+//! Manage authentication, job signature verification, and the session
+//! state machine. Does not manage jobs directly.
 
 use std::collections::BTreeMap;
 use std::fs::{DirBuilder, File, OpenOptions, remove_dir, remove_file};
