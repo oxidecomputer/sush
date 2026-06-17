@@ -5,9 +5,9 @@ use std::fmt;
 
 use borsh::{BorshDeserialize, BorshSerialize};
 use dropshot::{
-    Body, ClientErrorStatusCode, Header, HttpError, HttpResponseDeleted, HttpResponseOk,
-    Path as PathParams, Query as QueryParams, RequestContext, TypedBody, WebsocketEndpointResult,
-    WebsocketUpgrade, api_description,
+    Body, ClientErrorStatusCode, Header, HttpError, HttpResponseOk, Path as PathParams,
+    Query as QueryParams, RequestContext, TypedBody, WebsocketEndpointResult, WebsocketUpgrade,
+    api_description,
 };
 use http_range_header::{SyntacticallyCorrectRange as Range, parse_range_header};
 use hyper::Response;
@@ -64,17 +64,6 @@ pub trait SushApi {
         ctx: RequestContext<Self::Context>,
         headers: Header<Authorization>,
     ) -> Result<HttpResponseOk<Vec<Identity>>, HttpError>;
-
-    /// Revoke an authenticated identity.
-    ///
-    /// Any authenticated identity may revoke any other identity;
-    /// this is the only way to handle lost or stolen private keys.
-    #[endpoint { method = DELETE, path = "/iam/{key_id}" }]
-    async fn revoke_identity(
-        ctx: RequestContext<Self::Context>,
-        headers: Header<Authorization>,
-        params: PathParams<KeyIdParam>,
-    ) -> Result<HttpResponseDeleted, HttpError>;
 
     // Session management.
 

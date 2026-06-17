@@ -59,9 +59,6 @@ const MAX_CERTS: NonZeroUsize = NonZeroUsize::new(100).unwrap();
 /// Maximum number of cached identities.
 const MAX_CACHED_IDENTITIES: NonZeroUsize = NonZeroUsize::new(1_000).unwrap();
 
-/// Maximum number of revoked identities.
-const MAX_REVOKED_IDENTITIES: usize = 1_000;
-
 /// Maximum number of active jobs in a session.
 const MAX_ACTIVE_JOBS: usize = 1_000;
 
@@ -86,7 +83,6 @@ pub struct JobManager {
     log: Logger,
     nonces: Arc<Mutex<LruCache<Nonce, DateTime<Utc>>>>,
     identities: Arc<Mutex<LruCache<(KeyId, Nonce), (Identity, Credentials)>>>,
-    revoked_identities: Arc<Mutex<BTreeMap<KeyId, DateTime<Utc>>>>,
     certs: Arc<Mutex<LruCache<KeyId, Certificate>>>,
     session: Arc<Mutex<Option<Session>>>,
     active_jobs: Arc<Mutex<BTreeMap<JobId, JobStatus>>>,
@@ -170,7 +166,6 @@ impl JobManager {
             log: log.new(o!("component" => "manager")),
             nonces: Arc::new(Mutex::new(LruCache::new(MAX_OUTSTANDING_NONCES))),
             identities: Arc::new(Mutex::new(LruCache::new(MAX_CACHED_IDENTITIES))),
-            revoked_identities: Arc::new(Mutex::new(BTreeMap::new())),
             certs: Arc::new(Mutex::new(LruCache::new(MAX_CERTS))),
             session: Arc::new(Mutex::new(None)),
             active_jobs,
@@ -332,11 +327,6 @@ impl JobManager {
         // Check the identity cache.
         let now = Utc::now();
         {
-            let revoked = self.revoked_identities.lock().await;
-            if revoked.contains_key(&key_id) {
-                unauthorized!("identity revoked");
-            }
-
             let mut identities = self.identities.lock().await;
             let cache_key = (key_id.clone(), nonce.clone());
             if let Some((identity, cached_credentials)) = identities.get(&cache_key).cloned() {
@@ -392,39 +382,6 @@ impl JobManager {
             .filter(|(_, (identity, _credentials))| identity.is_still_valid(&now))
             .map(|(_, (identity, _credentials))| identity.to_owned())
             .collect())
-    }
-
-    pub async fn revoke_identity(&self, authn: &Identity, key_id: KeyId) -> Result<(), JobError> {
-        // Update identity tables and drop locks before stopping a session.
-        {
-            let mut revoked = self.revoked_identities.lock().await;
-            if revoked.len() >= MAX_REVOKED_IDENTITIES && !revoked.contains_key(&key_id) {
-                // This is not ideal, but the alternative is worse: if we evict
-                // entries, a revoked identity could easily be "unrevoked" by
-                // simply generating and then revoking many identities.
-                return Err(JobError::TooManyRevocations(MAX_REVOKED_IDENTITIES));
-            }
-
-            let time_revoked = Utc::now();
-            revoked.insert(key_id.clone(), time_revoked);
-
-            let mut cached = self.identities.lock().await;
-            for ((id, _nonce), (identity, _credentials)) in cached.iter_mut() {
-                if *id == key_id {
-                    identity.time_revoked = Some(time_revoked);
-                }
-            }
-        }
-
-        let mut session_guard = self.session.lock().await;
-        if let Some(session) = session_guard.as_ref()
-            && session.key_id() == Some(&key_id)
-        {
-            self.session_stop_inner(authn, session).await;
-            session_guard.take();
-        }
-
-        Ok(())
     }
 
     // Session management.
@@ -1660,33 +1617,5 @@ mod test {
                 .key_id,
             key_id,
         );
-
-        // Revoke and check for failure.
-        mgr.revoke_identity(&identity, key_id.clone())
-            .await
-            .unwrap();
-        assert!(
-            matches!(
-                mgr.iam(Some(credentials.to_string()), None)
-                    .await
-                    .unwrap_err(),
-                JobError::Unauthorized(_new_nonce),
-            ),
-            "should no longer be authorized"
-        );
-
-        // Even fresh credentials should now fail.
-        let JobError::Unauthorized(new_nonce) = mgr.iam(None, None).await.unwrap_err() else {
-            panic!("should not be authorized");
-        };
-        let challenge = Challenge::new(new_nonce);
-        let response = ChallengeResponse::new(challenge);
-        let signed = root.sign(response).await.unwrap();
-        let verified = signed.verify_with_cert(root.cert()).unwrap();
-        let mut credentials = Credentials::new(verified);
-        credentials.key_id = key_id.clone(); // override cert key ID
-        mgr.iam(Some(credentials.to_string()), Some(public_key.clone()))
-            .await
-            .unwrap_err();
     }
 }

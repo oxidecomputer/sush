@@ -215,10 +215,6 @@ pub enum ClientCommand {
         /// Shortcut for `iam available`
         #[arg(short = 'l')]
         available: bool,
-
-        /// Shortcut for `iam revoke <KEY_ID>`
-        #[arg(short = 'r', name = "KEY_ID", conflicts_with = "available")]
-        revoke: Option<KeyId>,
     },
 
     /// Session management.
@@ -269,13 +265,6 @@ pub enum IdentityCommand {
     /// Log in to the server as an SSH identity.
     #[default]
     Login,
-
-    /// Revoke an SSH identity.
-    Revoke {
-        /// The identity to be revoked.
-        #[clap(name = "KEY_ID")]
-        revoke: KeyId,
-    },
 }
 
 #[derive(Clone, Debug, Subcommand)]
@@ -405,14 +394,7 @@ impl ClientCommand {
         match (self, client) {
             (ClientCommand::Cert { command }, Some(client)) => cert(ctx, &client, command).await,
 
-            (
-                ClientCommand::Iam {
-                    command,
-                    available,
-                    revoke,
-                },
-                Some(client),
-            ) => {
+            (ClientCommand::Iam { command, available }, Some(client)) => {
                 iam(
                     ctx,
                     &client,
@@ -421,8 +403,6 @@ impl ClientCommand {
                     command.unwrap_or_else(|| {
                         if available {
                             IdentityCommand::Available
-                        } else if let Some(revoke) = revoke {
-                            IdentityCommand::Revoke { revoke }
                         } else {
                             IdentityCommand::default()
                         }
@@ -564,20 +544,6 @@ async fn iam(
             .into_inner();
             ctx.iam(&identity)
         }
-
-        IdentityCommand::Revoke { revoke } => {
-            let revoke = ctx.really_revoke(revoke)?;
-            with_authz(ctx, client, async |authz| {
-                client
-                    .revoke_identity()
-                    .authorization(authz)
-                    .key_id(&revoke)
-                    .send()
-                    .await
-            })
-            .await?;
-            ctx.identity_revoked(revoke)
-        }
     }
 }
 
@@ -648,7 +614,7 @@ async fn session(
             },
             None,
         ) => {
-            ctx.session_started(Session::new(session_id, None))?;
+            ctx.session_started(Session::new(session_id))?;
             Ok(())
         }
 

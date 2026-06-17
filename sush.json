@@ -182,42 +182,6 @@
         }
       }
     },
-    "/iam/{key_id}": {
-      "delete": {
-        "summary": "Revoke an authenticated identity.",
-        "description": "Any authenticated identity may revoke any other identity; this is the only way to handle lost or stolen private keys.",
-        "operationId": "revoke_identity",
-        "parameters": [
-          {
-            "in": "header",
-            "name": "authorization",
-            "description": "Authorization to access some resource, such as a signature.\n\nSee: <https://developer.mozilla.org/en-US/docs/Web/HTTP/Reference/Headers/Authorization>",
-            "schema": {
-              "type": "string"
-            }
-          },
-          {
-            "in": "path",
-            "name": "key_id",
-            "required": true,
-            "schema": {
-              "$ref": "#/components/schemas/KeyId"
-            }
-          }
-        ],
-        "responses": {
-          "204": {
-            "description": "successful deletion"
-          },
-          "4XX": {
-            "$ref": "#/components/responses/Error"
-          },
-          "5XX": {
-            "$ref": "#/components/responses/Error"
-          }
-        }
-      }
-    },
     "/jobs": {
       "get": {
         "summary": "List previous jobs sorted by start time, most recent first.",

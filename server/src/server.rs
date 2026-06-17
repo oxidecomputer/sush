@@ -1,9 +1,8 @@
 //! API server for the Oxide Support Shell.
 
 use dropshot::{
-    Body, ClientErrorStatusCode, Header, HttpError, HttpResponseDeleted, HttpResponseOk,
-    Path as PathParams, Query as QueryParams, RequestContext, TypedBody, WebsocketEndpointResult,
-    WebsocketUpgrade,
+    Body, ClientErrorStatusCode, Header, HttpError, HttpResponseOk, Path as PathParams,
+    Query as QueryParams, RequestContext, TypedBody, WebsocketEndpointResult, WebsocketUpgrade,
 };
 use hyper::Response;
 use tokio_tungstenite::WebSocketStream;
@@ -81,19 +80,6 @@ impl SushApi for ApiServer {
         let Authorization { authorization } = headers.into_inner();
         let authn = mgr.iam(authorization, None).await?;
         Ok(HttpResponseOk(mgr.identities(&authn).await?))
-    }
-
-    async fn revoke_identity(
-        ctx: RequestContext<Self::Context>,
-        headers: Header<Authorization>,
-        params: PathParams<KeyIdParam>,
-    ) -> Result<HttpResponseDeleted, HttpError> {
-        let mgr = ctx.context();
-        let Authorization { authorization } = headers.into_inner();
-        let authn = mgr.iam(authorization, None).await?;
-        let KeyIdParam { key_id } = params.into_inner();
-        mgr.revoke_identity(&authn, key_id).await?;
-        Ok(HttpResponseDeleted())
     }
 
     // Session management.
