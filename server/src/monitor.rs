@@ -7,6 +7,7 @@
 
 use std::collections::BTreeMap;
 use std::fs::OpenOptions;
+use std::os::unix::process::ExitStatusExt as _;
 use std::path::PathBuf;
 use std::pin::Pin;
 use std::process::ExitStatus;
@@ -20,7 +21,7 @@ use tokio::task::JoinSet;
 use tokio::{select, spawn};
 
 use sush_common::interactive::InteractiveSessionError;
-use sush_common::jobs::{JobId, JobOutputStream, JobStatus, SessionId, VerifiedJob};
+use sush_common::jobs::{JobId, JobOutputStream, JobStatus, ProcessError, SessionId, VerifiedJob};
 use sush_common::keys::KeyId;
 
 use crate::error::{ExecutionError, JobError};
@@ -340,7 +341,9 @@ impl JobEnded {
             key_id,
             time_started,
             time_ended,
-            status: status.code(),
+            status: status
+                .code()
+                .ok_or_else(|| ProcessError::Killed(status.signal().expect("process was killed"))),
             stdout_len,
             stderr_len,
             stdout_hash,

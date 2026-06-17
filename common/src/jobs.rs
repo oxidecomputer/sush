@@ -1,10 +1,10 @@
 //! Signed job requests.
 
 use std::convert::Infallible;
+use std::fmt;
 use std::io::Error as IoError;
 use std::ops::Deref;
 use std::str::FromStr;
-use std::{fmt, io};
 
 use blake3::{Hash, Hasher, hash};
 use borsh::{BorshDeserialize, BorshSerialize};
@@ -261,7 +261,16 @@ pub enum JobStatus {
 }
 
 #[derive(
-    Clone, Debug, BorshDeserialize, Serialize, BorshSerialize, Deserialize, JsonSchema, Error,
+    BorshSerialize,
+    BorshDeserialize,
+    Clone,
+    Debug,
+    Deserialize,
+    Eq,
+    Error,
+    JsonSchema,
+    PartialEq,
+    Serialize,
 )]
 pub enum ProcessError {
     #[error("could not start process: {0}")]

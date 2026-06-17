@@ -386,21 +386,13 @@ impl JobManager {
 
     // Session management.
 
-    pub async fn session(&self, authn: &Identity) -> Result<Option<Session>, JobError> {
-        if let Some(session) = self.session.lock().await.as_ref() {
-            if session.key_id() != Some(&authn.key_id) {
-                Err(JobError::SessionWrongIdentity)
-            } else {
-                Ok(Some(session.clone()))
-            }
-        } else {
-            Ok(None)
-        }
+    pub async fn session(&self, _authn: &Identity) -> Result<Option<Session>, JobError> {
+        todo!("get current session")
     }
 
     pub async fn session_start(&self, authn: &Identity) -> Result<Session, JobError> {
         let new_session_id = SessionId::new();
-        let new_session = Session::new(new_session_id.clone(), Some(authn.key_id.clone()));
+        let new_session = Session::new(new_session_id.clone());
         let mut session_guard = self.session.lock().await;
         if let Some(old_session) = session_guard.as_ref() {
             self.session_stop_inner(authn, old_session).await;
@@ -529,9 +521,6 @@ impl JobManager {
             })
             .await?;
 
-            if session.key_id() != Some(&authn.key_id) {
-                return Err(JobError::SessionWrongIdentity);
-            }
             if session.next_job_id() != job_id {
                 return Err(JobError::InvalidJobId(job_id));
             }
@@ -835,7 +824,7 @@ fn job_ended(
                     key_id,
                     time_started,
                     time_ended: time,
-                    status: None,
+                    status: todo!("coerce error"),
                     stdout_len: output.stdout_len,
                     stderr_len: output.stderr_len,
                     stdout_hash: output.stdout_hash,
@@ -1068,10 +1057,14 @@ mod test {
 
     use sush_common::authn::{Challenge, ChallengeResponse, Credentials};
     use sush_common::codephrases::generate_id;
-    use sush_common::jobs::JobLimits;
+    use sush_common::jobs::{JobLimits, ProcessError};
     use sush_common::keys::{EphemeralKey, KeyType, Signer as _};
 
     use super::*;
+
+    // Signal numbers for killed jobs.
+    const SIGKILL: i32 = 9;
+    const SIGXCPU: i32 = 24;
 
     trait SignJobRequest {
         async fn sign_job_request<S: AsRef<str>>(
@@ -1140,7 +1133,7 @@ mod test {
         status: JobStatus,
         expected_job_id: &JobId,
         expected_command: &str,
-        expected_status: Option<i32>,
+        expected_status: Result<i32, ProcessError>,
         expected_stdout_len: u64,
         expected_stderr_len: u64,
     ) {
@@ -1221,7 +1214,7 @@ mod test {
             JobError::JobNotFound(id) if id == job_id
         ));
         let status = job_start(&authn, &mgr, job.clone()).await.unwrap();
-        check_status_ended(status, &job_id, "true", Some(0), 0, 0);
+        check_status_ended(status, &job_id, "true", Ok(0), 0, 0);
 
         assert!(
             matches!(
@@ -1234,7 +1227,7 @@ mod test {
         let job_id = session_id.next_job_id(&job);
         let job = root.sign_job_request(&job_id, "false", false).await;
         let status = job_start(&authn, &mgr, job.clone()).await.unwrap();
-        check_status_ended(status, &job_id, "false", Some(1), 0, 0);
+        check_status_ended(status, &job_id, "false", Ok(1), 0, 0);
 
         let job_id = session_id.next_job_id(&job);
         let job_id_string = job_id.to_string();
@@ -1247,7 +1240,7 @@ mod test {
             status,
             &job_id,
             "echo -n $SUSH_JOB_ID",
-            Some(0),
+            Ok(0),
             job_id_bytes.len() as u64,
             0,
         );
@@ -1267,7 +1260,7 @@ mod test {
         let job_id = session_id.next_job_id(&job);
         let job = root.sign_job_request(&job_id, "pwd", false).await;
         let status = job_start(&authn, &mgr, job.clone()).await.unwrap();
-        check_status_ended(status, &job_id, "pwd", Some(0), output.len() as u64, 0);
+        check_status_ended(status, &job_id, "pwd", Ok(0), output.len() as u64, 0);
         assert_eq!(
             mgr.job_output(&authn, &job_id, Stdout, None).await.unwrap(),
             output.as_bytes(),
@@ -1304,7 +1297,7 @@ mod test {
         let job_id = new_session.session_id().first_job_id();
         let job = root.sign_job_request(&job_id, "true", false).await;
         let status = job_start(&authn, &mgr, job).await.unwrap();
-        check_status_ended(status, &job_id, "true", Some(0), 0, 0);
+        check_status_ended(status, &job_id, "true", Ok(0), 0, 0);
     }
 
     #[named]
@@ -1338,7 +1331,14 @@ mod test {
         // Check that it's dead and that it didn't live for long.
         let status = mgr.job_status(&authn, &job_id).await.unwrap();
         assert!(status.time_elapsed().to_std().unwrap() < Duration::from_secs(1));
-        check_status_ended(status, &job_id, command, None, 0, 0);
+        check_status_ended(
+            status,
+            &job_id,
+            command,
+            Err(ProcessError::Killed(SIGKILL)),
+            0,
+            0,
+        );
     }
 
     #[named]
@@ -1407,7 +1407,7 @@ mod test {
         let job_id = session_id.first_job_id();
         let job = child.sign_job_request(&job_id, "true", false).await;
         let status = job_start(&authn, &mgr, job).await.unwrap();
-        check_status_ended(status, &job_id, "true", Some(0), 0, 0);
+        check_status_ended(status, &job_id, "true", Ok(0), 0, 0);
     }
 
     #[named]
@@ -1446,11 +1446,25 @@ mod test {
         let stderr = String::from_utf8_lossy(&stderr);
         match status {
             JobStatus::Ended { stderr_len: 37, .. } => {
-                check_status_ended(status, &job_id, command, None, 0, 37);
+                check_status_ended(
+                    status,
+                    &job_id,
+                    command,
+                    Err(ProcessError::Killed(SIGXCPU)),
+                    0,
+                    37,
+                );
                 assert_eq!(stderr, "Doing sha1 for 3s on 16 size blocks: ");
             }
             JobStatus::Ended { stderr_len: 41, .. } => {
-                check_status_ended(status, &job_id, command, None, 0, 41);
+                check_status_ended(
+                    status,
+                    &job_id,
+                    command,
+                    Err(ProcessError::Killed(SIGXCPU)),
+                    0,
+                    41,
+                );
                 assert_eq!(stderr, "Doing sha1 ops for 3s on 16 size blocks: ");
             }
             _ => todo!("what does `{command}` produce on your system?"),
@@ -1471,7 +1485,7 @@ mod test {
         let command = &format!("head -c {n} /dev/urandom");
         let job = root.sign_job_request(&job_id, command, false).await;
         let status = job_start(&authn, &mgr, job).await.unwrap();
-        check_status_ended(status, &job_id, command, Some(0), n, 0);
+        check_status_ended(status, &job_id, command, Ok(0), n, 0);
 
         // No range, i.e., full output.
         let r = mgr.job_output(&authn, &job_id, Stdout, None).await.unwrap();

@@ -409,7 +409,7 @@ impl CommandContext for Cli {
                     key_id,
                     time_started,
                     time_ended,
-                    status: Some(exit_status),
+                    status: Ok(exit_status),
                     stdout_len,
                     stderr_len,
                     stdout_hash,
@@ -440,7 +440,7 @@ impl CommandContext for Cli {
                     key_id,
                     time_started,
                     time_ended,
-                    status: None,
+                    status: Err(err),
                     stdout_len,
                     stderr_len,
                     stdout_hash,
@@ -454,7 +454,7 @@ impl CommandContext for Cli {
                         "✅ Job ID:\t{job_id}\n   \
                          Session ID:\t{session_id}\n   \
                          Key ID:\t{key_id}\n   \
-                         Job status:\tStopped\n   \
+                         Job status:\t{err}\n   \
                          Command:\t{command}\n   \
                          Started at:\t{time_started}\n   \
                          Stopped at:\t{time_ended} ({duration})\n   \
