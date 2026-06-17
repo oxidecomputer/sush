@@ -19,15 +19,6 @@ pub struct RequestId(pub Uuid);
 #[derive(Clone, Debug, BorshDeserialize, BorshSerialize)]
 pub enum Message {
     Request(RequestId, Request),
-    Error(
-        #[borsh(
-            serialize_with = "borsh_serialize_baseboard_id",
-            deserialize_with = "borsh_deserialize_baseboard_id"
-        )]
-        BaseboardId,
-        RequestId,
-        Error,
-    ),
     Event(
         #[borsh(
             serialize_with = "borsh_serialize_baseboard_id",
@@ -59,6 +50,7 @@ pub enum JobRequest {
 #[derive(Clone, Debug, BorshDeserialize, BorshSerialize)]
 pub enum Event {
     Job(JobEvent),
+    Error(Error),
 }
 
 #[derive(Clone, Debug, BorshDeserialize, BorshSerialize)]
@@ -72,11 +64,11 @@ pub enum JobEvent {
         DateTime<Utc>,
     ),
     JobEnd(JobId),
+    JobError(ProcessError),
 }
 
 #[derive(Clone, Debug, BorshDeserialize, BorshSerialize)]
 pub enum Error {
-    Process(ProcessError),
     ConcurrentSessions {
         own_session: SessionId,
         own_version: Version,
@@ -113,9 +105,7 @@ pub(crate) fn borsh_serialize_datetime<W: io::Write>(
     value.timestamp_subsec_nanos().serialize(writer)
 }
 
-pub(crate) fn borsh_deserialize_datetime<R: io::Read>(
-    reader: &mut R,
-) -> io::Result<DateTime<Utc>> {
+pub(crate) fn borsh_deserialize_datetime<R: io::Read>(reader: &mut R) -> io::Result<DateTime<Utc>> {
     let secs = i64::deserialize_reader(reader)?;
     let nanos = u32::deserialize_reader(reader)?;
     DateTime::from_timestamp(secs, nanos).ok_or_else(|| {

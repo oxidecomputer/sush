@@ -2,27 +2,27 @@
 //!
 //! Executes, monitors, and halts jobs. Driven by the session state machine.
 
+use futures::Stream;
 use rumors::Rumors;
 use sled_hardware_types::BaseboardId;
 use sush_api::JobStartParams;
 use sush_common::authn::Identity;
 use sush_common::jobs::{JobId, JobOutputStream, JobStartRequest, JobStatus, SignedJob};
+use tokio::sync::mpsc;
+use tokio_stream::wrappers::ReceiverStream;
 
-use crate::interactive::SocketSender;
-use crate::messages::{Error, Message};
-use crate::monitor::ExecutionResult;
+use crate::messages::Event;
 
 pub struct Executor {
-    own_baseboard: BaseboardId,
-    rumors: Rumors<Message>,
+    events: mpsc::Sender<Event>,
 }
 
 impl Executor {
-    pub fn new(own_baseboard: BaseboardId, rumors: Rumors<Message>) -> Self {
-        Self {
-            own_baseboard,
-            rumors,
-        }
+    pub fn new() -> (Self, impl Stream<Item = Event> + Send + 'static) {
+        // This is an arbitrary choice; we expect to consume this very rapidly,
+        // so should not experience backpressure; if we do, something is wrong.
+        let (tx, rx) = mpsc::channel(16);
+        (Self { events: tx }, ReceiverStream::new(rx))
     }
 
     pub fn job_start(&self, _job: &JobStartRequest, _params: &JobStartParams) {

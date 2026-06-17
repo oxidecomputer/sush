@@ -18,7 +18,9 @@ use tokio::sync::watch;
 use tokio::{select, spawn};
 
 use crate::executor::Executor;
-use crate::messages::{Error, Event, JobEvent, JobRequest, Message, Request, SessionRequest};
+use crate::messages::{
+    Error, Event, JobEvent, JobRequest, Message, Request, RequestId, SessionRequest,
+};
 
 #[derive(Clone, Debug)]
 pub struct State {
@@ -51,14 +53,13 @@ impl State {
 impl State {
     pub fn update(
         &mut self,
-        rumors: &Rumors<Message>,
         executor: &Executor,
         // We don't use the `key` here because we only redact messages once
         // they're committed to persistent storage:
         _key: Key,
         incoming_version: &Version,
         message: &Arc<Message>,
-    ) {
+    ) -> Result<(), Error> {
         use SessionState::*;
 
         match message.as_ref() {
@@ -98,17 +99,14 @@ impl State {
                             // decision, so as a partition resolves, both
                             // sessions will be killed everywhere.
                             None => {
-                                rumors.send(Message::Error(
-                                    self.own_baseboard.clone(),
-                                    request_id.clone(),
-                                    Error::ConcurrentSessions {
-                                        own_session: session.session_id().clone(),
-                                        own_version: created.clone(),
-                                        incoming_session: session_id.clone(),
-                                        incoming_version: incoming_version.clone(),
-                                    },
-                                ));
+                                let error = Error::ConcurrentSessions {
+                                    own_session: session.session_id().clone(),
+                                    own_version: created.clone(),
+                                    incoming_session: session_id.clone(),
+                                    incoming_version: incoming_version.clone(),
+                                };
                                 self.session = Inactive;
+                                return Err(error);
                             }
                             // No sessions can have equal creation times,
                             // because rumors guarantees that no messages have
@@ -216,18 +214,13 @@ impl State {
                     JobEvent::JobEnd(job_id) => {
                         self.running.remove(&(job_id.clone(), baseboard_id.clone()));
                     }
+                    JobEvent::JobError(process_error) => todo!(),
                 },
-            },
-            Message::Error(baseboard_id, request_id, error) => match error {
-                Error::Process(process_error) => todo!(),
-                Error::ConcurrentSessions {
-                    own_session,
-                    own_version,
-                    incoming_session,
-                    incoming_version,
-                } => todo!(),
+                Event::Error(error) => todo!(),
             },
         }
+
+        Ok(())
     }
 }
 
@@ -247,12 +240,17 @@ impl StateManager {
     /// Run the state machine over all locally-injected `messages` and
     /// remote-received gossip messages, immediately terminating when `messages`
     /// returns `None` (no further state updates past this point).
-    pub fn run<M>(self, mut messages: M) -> watch::Receiver<State>
+    pub fn run<R>(self, mut requests: R) -> watch::Receiver<State>
     where
-        M: Stream<Item = Message> + Send + Unpin + 'static,
+        R: Stream<Item = (RequestId, Request)> + Send + Unpin + 'static,
     {
+        let Self {
+            own_baseboard,
+            rumors,
+        } = self;
+
         // We report our current state through a watch channel.
-        let (tx, rx) = watch::channel(State::new(self.own_baseboard.clone()));
+        let (tx, rx) = watch::channel(State::new(own_baseboard.clone()));
 
         // We process messages in causal order, so that we can rely on
         // things like "the session stop happens after its corresponding
@@ -260,26 +258,54 @@ impl StateManager {
         // and computation, but makes it much easier to ensure that our
         // state machine is correct, because it now only has to be correct
         // in the face of arbitrary *causal* reorderings.
-        let mut incoming = self.rumors.causal_messages();
+        let mut causal_messages = rumors.causal_messages();
 
         // The executor needs to have access to send messages back.
-        let executor = Executor::new(self.own_baseboard, self.rumors.clone());
+        let (executor, mut events) = Executor::new();
+
+        // We will drop this once we want to drain the remaining messages.
+        let mut rumors = Some(rumors);
 
         spawn(async move {
             loop {
-                let to_send = messages.next();
-                let received = incoming.borrow_next();
+                let to_send = requests.next();
+                let event = events.next();
+                let mut requests_empty = false;
+                let mut events_empty = false;
+
+                let message = causal_messages.borrow_next();
+
+                // Once we drain the requests and events, we drop `rumors` so
+                // that if there are no outstanding copies elsewhere, we will
+                // drain it and then break.
+                //
+                // If there are still gossip sessions happening, those will
+                // complete and we will process their messages into the state.
+                if requests_empty && events_empty {
+                    rumors = None;
+                }
+
                 select! {
                     // Forward all locally-input messages into the rumors state, so they are
                     // processed by the state machine.
                     next = to_send => match next {
-                        // We break when there's nothing left to send, which
-                        // drops `self.rumors`, and the executor which also
-                        // closes over it.
-                        None => break,
-                        Some(message) => { self.rumors.send(message); },
+                        // When our incoming stream of locally injected messages
+                        // ends, we have no more local messages to process, but
+                        // we need to let all spawned tasks by the executor
+                        // quiesce, updating the state all the way.
+                        None => requests_empty = true,
+                        Some((id, request)) => if let Some(rumors) = &rumors {
+                            rumors.send(Message::Request(id, request));
+                        },
                     },
-                    next = received => match next {
+                    next = event => match next {
+                        // If there are no more events to process
+                        None => events_empty = true,
+                        Some(event) => if let Some(rumors) = &rumors {
+                            rumors.send(Message::Event(own_baseboard.clone(), event));
+                        },
+                    },
+                    next = message => match next {
                         // This can only happen when the rumor set is dropped,
                         // which it can't be because we're holding it. Still, we
                         // handle the case sensibly, by stopping.
@@ -291,9 +317,13 @@ impl StateManager {
                             // would rather be safe against future code changes than
                             // manually tracking precisely which messages *don't* modify
                             // state. The cost is a few spurious wakeups.
+                            let mut output = Ok(());
                             tx.send_modify(|state| {
-                                state.update(&self.rumors, &executor, key, version, message)
+                                output = state.update(&executor, key, version, message);
                             });
+                            if let Err(error) = output && let Some(rumors) = &rumors {
+                                rumors.send(Message::Event(own_baseboard.clone(), Event::Error(error)));
+                            }
                         },
                     },
                 }
