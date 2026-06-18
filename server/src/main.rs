@@ -6,9 +6,13 @@ use std::path::PathBuf;
 use clap::Parser;
 use dropshot::{ConfigDropshot, ConfigLogging, ConfigLoggingLevel, HandlerTaskMode, ServerBuilder};
 
+use slog::error;
 use sush_api::sush_api_mod::api_description;
 use sush_server::manager::JobManager;
 use sush_server::server::ApiServer;
+use tokio::signal::unix::{SignalKind, signal};
+use tokio::{select, spawn};
+use tokio_util::sync::CancellationToken;
 
 const DEFAULT_ADDRESS: &str = "0.0.0.0:44444";
 const ROOT_LOG_NAME: &str = "sush";
@@ -38,6 +42,7 @@ async fn main() -> Result<(), String> {
         debug,
         directory,
     } = ServerArgs::parse();
+
     let log = ConfigLogging::StderrTerminal {
         level: if debug {
             ConfigLoggingLevel::Debug
@@ -48,7 +53,7 @@ async fn main() -> Result<(), String> {
     .to_logger(ROOT_LOG_NAME)
     .map_err(|e| e.to_string())?;
 
-    let mgr = JobManager::new(log.clone(), &directory)
+    let mgr = JobManager::new(log.clone(), listen_for_shutdown()?, &directory)
         .await
         .map_err(|e| e.to_string())?;
 
@@ -66,4 +71,29 @@ async fn main() -> Result<(), String> {
         .await?;
 
     Ok(())
+}
+
+fn listen_for_shutdown() -> Result<CancellationToken, String> {
+    // Wait for a signal.
+    let Ok(mut sighup) = signal(SignalKind::hangup()) else {
+        return Err("can't get SIGHUP listener".to_string());
+    };
+    let Ok(mut sigint) = signal(SignalKind::interrupt()) else {
+        return Err("can't get SIGINT listener".to_string());
+    };
+    let Ok(mut sigterm) = signal(SignalKind::terminate()) else {
+        return Err("can't get SIGTERM listener".to_string());
+    };
+    let shutdown = CancellationToken::new();
+    let trigger_shutdown = shutdown.clone();
+    spawn(async move {
+        select! {
+            _ = sighup.recv() => (),
+            _ = sigint.recv() => (),
+            _ = sigterm.recv() => (),
+        }
+        trigger_shutdown.cancel();
+    });
+
+    Ok(shutdown)
 }

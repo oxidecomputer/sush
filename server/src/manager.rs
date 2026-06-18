@@ -24,6 +24,7 @@ use tokio::process::Command;
 use tokio::spawn;
 use tokio::sync::{Mutex, MutexGuard, mpsc, oneshot};
 use tokio::task::spawn_blocking;
+use tokio_util::sync::CancellationToken;
 use x509_cert::Certificate;
 use x509_cert::der::{DecodePem as _, Encode as _};
 
@@ -92,7 +93,11 @@ pub struct JobManager {
 }
 
 impl JobManager {
-    pub async fn new(log: Logger, output_dir: &Path) -> Result<Self, JobError> {
+    pub async fn new(
+        log: Logger,
+        shutdown: CancellationToken,
+        output_dir: &Path,
+    ) -> Result<Self, JobError> {
         // Construct the job tables.
         let active_jobs = Arc::new(Mutex::new(BTreeMap::new()));
         let job_history = Arc::new(Mutex::new(LruCache::new(MAX_JOB_HISTORY)));
@@ -1163,7 +1168,9 @@ mod test {
         let drain = FullFormat::new(decorator).build().fuse();
         let dir = TempDir::with_prefix("sush-").unwrap();
         let log = Logger::root(drain, o!("test" => test_name));
-        let mgr = JobManager::new(log, dir.path()).await.unwrap();
+        let mgr = JobManager::new(log, CancellationToken::new(), dir.path())
+            .await
+            .unwrap();
         let root = ephemeral_test_root();
         let key_id = mgr.import_root(root.cert().to_owned()).await.unwrap();
         assert_eq!(&key_id, root.key_id());
@@ -1368,7 +1375,9 @@ mod test {
         let authn = fake_identity(&mut root).await;
         let dir = TempDir::with_prefix("sush-").unwrap();
         let log = Logger::root(slog::Discard, slog::o!("test" => function_name!()));
-        let mgr = JobManager::new(log, dir.path()).await.unwrap();
+        let mgr = JobManager::new(log, CancellationToken::new(), dir.path())
+            .await
+            .unwrap();
         assert!(
             matches!(
                 mgr.import_cert(&authn, root_cert.clone())

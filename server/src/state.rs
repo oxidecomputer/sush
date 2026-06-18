@@ -4,18 +4,20 @@
 //! messages via the gossip protocol.
 
 use std::cmp::Ordering;
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Arc;
 
 use chrono::{DateTime, Utc};
 use futures::{Stream, StreamExt};
+use rumors::before::Rank;
 use rumors::{Key, Rumors, Version};
 use sled_hardware_types::BaseboardId;
 use sush_api::JobStartParams;
-use sush_common::jobs::{JobId, JobStartRequest, Session};
+use sush_common::jobs::{JobId, JobStartRequest, JobStatus, Session};
 use sush_common::keys::Signed;
 use tokio::sync::watch;
 use tokio::{select, spawn};
+use tokio_util::sync::CancellationToken;
 
 use crate::executor::Executor;
 use crate::messages::{
@@ -24,10 +26,27 @@ use crate::messages::{
 
 #[derive(Clone, Debug)]
 pub struct State {
+    /// The local baseboard ID of this sled, used so that the executor reports
+    /// events tagged with its own location.
     own_baseboard: BaseboardId,
+    /// The set of running jobs *everywhere*, tagged by start wall-clock time.
     running: BTreeMap<(JobId, BaseboardId), DateTime<Utc>>,
+    /// The set of *all* jobs (running or stopped) *everywhere*, causally
+    /// ordered; we use causal ordering to garbage-collect jobs which are the
+    /// causally oldest, once the memory representation of our state gets big.
+    causal_jobs: BTreeSet<(Rank, JobId, BaseboardId)>,
+    /// Lookup table for job status of *all* jobs *everywhere*, pruned by the
+    /// causal ordering in `causal_jobs`, and indexed first by job ID so that
+    /// it's possible to ask "what's the status of this job across the rack?"
+    job_status: BTreeMap<JobId, BTreeMap<BaseboardId, JobStatus>>,
+    /// The current state of the active session, if any.
     session: SessionState,
 }
+
+/// Maximum number of historical job statuses to retain before evicting them.
+/// This is specified as 32 (maximum sleds per rack) times 2,048 (maximum
+/// "scrollback" per sled).
+const MAX_HISTORY: usize = 32 * 2048;
 
 #[derive(Clone, Debug, Default)]
 pub enum SessionState {
@@ -45,6 +64,8 @@ impl State {
         Self {
             own_baseboard,
             running: BTreeMap::new(),
+            causal_jobs: BTreeSet::new(),
+            job_status: BTreeMap::new(),
             session: SessionState::default(),
         }
     }
@@ -63,7 +84,7 @@ impl State {
         use SessionState::*;
 
         match message.as_ref() {
-            Message::Request(request_id, request) => match request {
+            Message::Request(request) => match request {
                 Request::Session(session_request) => match session_request {
                     SessionRequest::Start(session_id) => match &mut self.session {
                         Inactive => {
@@ -210,9 +231,23 @@ impl State {
                     JobEvent::JobStart(job_id, when) => {
                         self.running
                             .insert((job_id.clone(), baseboard_id.clone()), *when);
+                        self.causal_jobs.insert((
+                            incoming_version.rank(),
+                            job_id.clone(),
+                            baseboard_id.clone(),
+                        ));
+                        // TODO: evict old entries when crossing MAX_HISTORY
+                        // TODO: track the job status
                     }
                     JobEvent::JobEnd(job_id) => {
                         self.running.remove(&(job_id.clone(), baseboard_id.clone()));
+                        self.causal_jobs.insert((
+                            incoming_version.rank(),
+                            job_id.clone(),
+                            baseboard_id.clone(),
+                        ));
+                        // TODO: evict old entries when crossing MAX_HISTORY
+                        // TODO: track the job status
                     }
                     JobEvent::JobError(process_error) => todo!(),
                 },
@@ -227,13 +262,19 @@ impl State {
 pub struct StateManager {
     own_baseboard: BaseboardId,
     rumors: Rumors<Message>,
+    shutdown: CancellationToken,
 }
 
 impl StateManager {
-    pub fn new(own_baseboard: BaseboardId, rumors: Rumors<Message>) -> Self {
+    pub fn new(
+        own_baseboard: BaseboardId,
+        rumors: Rumors<Message>,
+        shutdown: CancellationToken,
+    ) -> Self {
         Self {
             own_baseboard,
             rumors,
+            shutdown,
         }
     }
 
@@ -242,11 +283,12 @@ impl StateManager {
     /// returns `None` (no further state updates past this point).
     pub fn run<R>(self, mut requests: R) -> watch::Receiver<State>
     where
-        R: Stream<Item = (RequestId, Request)> + Send + Unpin + 'static,
+        R: Stream<Item = Request> + Send + Unpin + 'static,
     {
         let Self {
             own_baseboard,
             rumors,
+            shutdown,
         } = self;
 
         // We report our current state through a watch channel.
@@ -261,17 +303,24 @@ impl StateManager {
         let mut causal_messages = rumors.causal_messages();
 
         // The executor needs to have access to send messages back.
-        let (executor, mut events) = Executor::new();
+        let (executor, mut events) = Executor::new(shutdown);
 
         // We will drop this once we want to drain the remaining messages.
         let mut rumors = Some(rumors);
 
         spawn(async move {
+            // These flip both to `true` once our two input streams (local
+            // requests and local events from the executor) terminate; at this
+            // point, we must drop `rumors` and thereby permit its own
+            // `unordered_messages` stream to eventually be drained; we do this
+            // so that we fully update the local state until nothing more is
+            // left to do.
+            let mut requests_empty = false;
+            let mut events_empty = false;
+
             loop {
                 let to_send = requests.next();
                 let event = events.next();
-                let mut requests_empty = false;
-                let mut events_empty = false;
 
                 let message = causal_messages.borrow_next();
 
@@ -286,16 +335,16 @@ impl StateManager {
                 }
 
                 select! {
-                    // Forward all locally-input messages into the rumors state, so they are
-                    // processed by the state machine.
+                    // Forward all locally-input messages into the rumors state,
+                    // so they are processed by the state machine.
                     next = to_send => match next {
                         // When our incoming stream of locally injected messages
                         // ends, we have no more local messages to process, but
                         // we need to let all spawned tasks by the executor
                         // quiesce, updating the state all the way.
                         None => requests_empty = true,
-                        Some((id, request)) => if let Some(rumors) = &rumors {
-                            rumors.send(Message::Request(id, request));
+                        Some(request) => if let Some(rumors) = &rumors {
+                            rumors.send(Message::Request(request));
                         },
                     },
                     next = event => match next {

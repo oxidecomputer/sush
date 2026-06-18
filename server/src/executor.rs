@@ -10,6 +10,7 @@ use sush_common::authn::Identity;
 use sush_common::jobs::{JobId, JobOutputStream, JobStartRequest, JobStatus, SignedJob};
 use tokio::sync::mpsc;
 use tokio_stream::wrappers::ReceiverStream;
+use tokio_util::sync::CancellationToken;
 
 use crate::messages::Event;
 
@@ -18,7 +19,7 @@ pub struct Executor {
 }
 
 impl Executor {
-    pub fn new() -> (Self, impl Stream<Item = Event> + Send + 'static) {
+    pub fn new(shutdown: CancellationToken) -> (Self, impl Stream<Item = Event> + Send + 'static) {
         // This is an arbitrary choice; we expect to consume this very rapidly,
         // so should not experience backpressure; if we do, something is wrong.
         let (tx, rx) = mpsc::channel(16);

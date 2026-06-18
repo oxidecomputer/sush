@@ -18,7 +18,7 @@ pub struct RequestId(pub Uuid);
 
 #[derive(Clone, Debug, BorshDeserialize, BorshSerialize)]
 pub enum Message {
-    Request(RequestId, Request),
+    Request(Request),
     Event(
         #[borsh(
             serialize_with = "borsh_serialize_baseboard_id",
