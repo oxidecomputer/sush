@@ -20,9 +20,7 @@ use tokio::{select, spawn};
 use tokio_util::sync::CancellationToken;
 
 use crate::executor::Executor;
-use crate::messages::{
-    Error, Event, JobEvent, JobRequest, Message, Request, SessionRequest,
-};
+use crate::messages::{Error, Event, JobEvent, JobRequest, Message, Request, SessionRequest};
 
 #[derive(Clone, Debug)]
 pub struct State {
@@ -53,7 +51,7 @@ pub enum SessionState {
     #[default]
     Inactive,
     Active {
-        session: Session,
+        session: Box<Session>,
         session_start: Version,
         queued_jobs: BTreeMap<JobId, (Signed<JobStartRequest>, JobStartParams)>,
     },
@@ -89,7 +87,7 @@ impl State {
                     SessionRequest::Start(session_id) => match &mut self.session {
                         Inactive => {
                             self.session = Active {
-                                session: Session::new(session_id.clone()),
+                                session: Box::new(Session::new(session_id.clone())),
                                 session_start: incoming_version.clone(),
                                 queued_jobs: BTreeMap::new(),
                             }
@@ -106,7 +104,7 @@ impl State {
                             // the network entirely.
                             Some(Ordering::Less) => {
                                 self.session = Active {
-                                    session: Session::new(session_id.clone()),
+                                    session: Box::new(Session::new(session_id.clone())),
                                     session_start: incoming_version.clone(),
                                     queued_jobs: BTreeMap::new(),
                                 }
