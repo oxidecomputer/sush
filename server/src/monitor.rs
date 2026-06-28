@@ -27,8 +27,8 @@ use sush_common::jobs::{
 use sush_common::keys::KeyId;
 
 use crate::error::JobError;
+use crate::executor::JobOutputState;
 use crate::interactive::{InteractiveSession, SocketSender};
-use crate::manager::{JobOutputState, job_output_path};
 use crate::pty::Pty;
 
 /// The job monitor runs as a tokio task that communicates with the manager
@@ -197,7 +197,8 @@ impl JobMonitor {
         child: Child,
     ) -> Result<(PinnedSession, Shutdown), ExecutionError> {
         let job_id = job_id.to_owned();
-        let path = job_output_path(&self.output_dir, &job_id, JobOutputStream::Stdout);
+        let path: PathBuf =
+            todo!("job_output_path(&self.output_dir, &job_id, JobOutputStream::Stdout)");
         let io_error =
             |err| ExecutionError::io(job_id.clone(), path.display().to_string().as_str(), err);
         let output_file = OpenOptions::new()

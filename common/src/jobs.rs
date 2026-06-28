@@ -155,12 +155,16 @@ impl Session {
         &self.session_id
     }
 
-    pub fn last_job(&self) -> Option<&SignedJob> {
-        self.last_job.as_ref()
+    pub fn into_session_id(self) -> SessionId {
+        self.session_id
     }
 
-    pub fn job_started(&mut self, job: SignedJob) {
-        self.last_job = Some(job)
+    pub fn last_job(&self) -> Option<SignedJob> {
+        self.last_job.clone()
+    }
+
+    pub fn job_started(&mut self, job: VerifiedJob) {
+        self.last_job = Some(job.into_signed())
     }
 
     pub fn next_job_id(&self) -> JobId {
@@ -284,7 +288,7 @@ pub enum ProcessError {
     Killed(i32),
     #[error("interactive session error: {0}")]
     Interactive(String),
-    #[error("I/O error during {what}: {error}")]
+    #[error("I/O error {what}: {error}")]
     Io { what: String, error: String },
 }
 

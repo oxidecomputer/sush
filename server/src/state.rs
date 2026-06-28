@@ -5,6 +5,7 @@
 
 use std::cmp::Ordering;
 use std::collections::{BTreeMap, BTreeSet};
+use std::path::PathBuf;
 use std::sync::Arc;
 
 use chrono::{DateTime, Utc};
@@ -13,8 +14,7 @@ use rumors::before::Rank;
 use rumors::{Key, Rumors, Version};
 use sled_hardware_types::BaseboardId;
 use sush_api::JobStartParams;
-use sush_common::jobs::{JobId, JobStartRequest, JobStatus, Session};
-use sush_common::keys::Signed;
+use sush_common::jobs::{JobId, JobStatus, Session, VerifiedJob};
 use tokio::sync::watch;
 use tokio::{select, spawn};
 use tokio_util::sync::CancellationToken;
@@ -53,7 +53,7 @@ pub enum SessionState {
     Active {
         session: Box<Session>,
         session_start: Version,
-        queued_jobs: BTreeMap<JobId, (Signed<JobStartRequest>, JobStartParams)>,
+        queued_jobs: BTreeMap<JobId, (VerifiedJob, JobStartParams)>,
     },
 }
 
@@ -67,10 +67,17 @@ impl State {
             session: SessionState::default(),
         }
     }
-}
 
-impl State {
-    pub fn update(
+    pub fn session(&self) -> Option<Session> {
+        use SessionState::*;
+
+        match &self.session {
+            Inactive => None,
+            Active { session, .. } => Some(*session.clone()),
+        }
+    }
+
+    fn update(
         &mut self,
         executor: &Executor,
         // We don't use the `key` here because we only redact messages once
@@ -197,9 +204,11 @@ impl State {
                             // newly-ready-to-run jobs after it in the queue.
                             // Once we reach a fixed point, we have nothing
                             // further to do.
-                            while let Some(ready) = queued_jobs.remove(&session.next_job_id()) {
-                                executor.job_start(ready.0.payload(), &ready.1);
-                                session.job_started(ready.0);
+                            while let Some((request, params)) =
+                                queued_jobs.remove(&session.next_job_id())
+                            {
+                                executor.job_start(request.payload().clone(), params);
+                                session.job_started(request);
                             }
                         }
                     }
@@ -220,6 +229,9 @@ impl State {
                             // the job, because it could be from another session.
                             executor.job_stop(job_id);
                         }
+                    }
+                    JobRequest::Attach(job_id) => {
+                        todo!("attach a new interactive session to {job_id}")
                     }
                 },
             },
@@ -257,38 +269,23 @@ impl State {
     }
 }
 
-pub struct StateManager {
-    own_baseboard: BaseboardId,
-    rumors: Rumors<Message>,
-    shutdown: CancellationToken,
-}
+#[derive(Debug)]
+pub struct StateManager {}
 
 impl StateManager {
-    pub fn new(
+    /// Run the state machine over all locally-injected `messages` and
+    /// remote-received gossip messages, terminating when no further
+    /// requests, events, or messages can be received.
+    pub fn run<R>(
+        output_dir: PathBuf,
         own_baseboard: BaseboardId,
+        mut requests: R,
         rumors: Rumors<Message>,
         shutdown: CancellationToken,
-    ) -> Self {
-        Self {
-            own_baseboard,
-            rumors,
-            shutdown,
-        }
-    }
-
-    /// Run the state machine over all locally-injected `messages` and
-    /// remote-received gossip messages, immediately terminating when `messages`
-    /// returns `None` (no further state updates past this point).
-    pub fn run<R>(self, mut requests: R) -> watch::Receiver<State>
+    ) -> watch::Receiver<State>
     where
         R: Stream<Item = Request> + Send + Unpin + 'static,
     {
-        let Self {
-            own_baseboard,
-            rumors,
-            shutdown,
-        } = self;
-
         // We report our current state through a watch channel.
         let (tx, rx) = watch::channel(State::new(own_baseboard.clone()));
 
@@ -301,25 +298,24 @@ impl StateManager {
         let mut causal_messages = rumors.causal_messages();
 
         // The executor needs to have access to send messages back.
-        let (executor, mut events) = Executor::new(shutdown);
+        let (executor, mut events) = Executor::new(output_dir, shutdown);
 
         // We will drop this once we want to drain the remaining messages.
         let mut rumors = Some(rumors);
 
         spawn(async move {
             // These flip both to `true` once our two input streams (local
-            // requests and local events from the executor) terminate; at this
-            // point, we must drop `rumors` and thereby permit its own
-            // `unordered_messages` stream to eventually be drained; we do this
-            // so that we fully update the local state until nothing more is
-            // left to do.
+            // requests and local events from the executor) terminate. At
+            // this point, we must drop `rumors` and thereby permit its own
+            // `unordered_messages` stream to eventually be drained; we do
+            // this so that we fully update the local state until nothing
+            // more is left to do.
             let mut requests_empty = false;
             let mut events_empty = false;
 
             loop {
                 let to_send = requests.next();
                 let event = events.next();
-
                 let message = causal_messages.borrow_next();
 
                 // Once we drain the requests and events, we drop `rumors` so
@@ -345,18 +341,19 @@ impl StateManager {
                             rumors.send(Message::Request(request));
                         },
                     },
+                    // Handle events produced by the executor.
                     next = event => match next {
-                        // If there are no more events to process
                         None => events_empty = true,
                         Some(event) => if let Some(rumors) = &rumors {
                             rumors.send(Message::Event(own_baseboard.clone(), event));
                         },
                     },
                     next = message => match next {
-                        // This can only happen when the rumor set is dropped,
-                        // which it can't be because we're holding it. Still, we
-                        // handle the case sensibly, by stopping.
-                        None => break,
+                        None => {
+                            // There are no more events, requests, or messages from
+                            // the gossip network. We're done.
+                            break;
+                        }
                         Some((key, version, message)) => {
                             // We unconditionally mark the watch sender as modified,
                             // even though it might not be, because *most* of the

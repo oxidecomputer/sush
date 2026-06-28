@@ -1,47 +1,33 @@
 //! Manage authentication, job signature verification, and the session
 //! state machine. Does not manage jobs directly.
 
-use std::collections::BTreeMap;
-use std::fs::{DirBuilder, File, OpenOptions, remove_dir, remove_file};
-use std::io::{self, Read as _, Seek as _, SeekFrom};
 use std::num::NonZeroUsize;
-use std::os::fd::AsRawFd as _;
-use std::path::{Path, PathBuf};
-use std::process::Stdio;
+use std::path::PathBuf;
 use std::sync::Arc;
 
-use blake3::Hasher;
 use bytesize::ByteSize;
 use chrono::{DateTime, Utc};
-use http_range_header::{EndPosition, StartPosition, SyntacticallyCorrectRange as Range};
+use http_range_header::SyntacticallyCorrectRange as Range;
 use lru::LruCache;
-use pwd::Passwd;
-use rustix::io::close;
-use rustix::process::{ioctl_tiocsctty, setsid};
-use slog::{Logger, debug, error, info, o, warn};
-use terminfo::Database as Terminfo;
-use tokio::process::Command;
-use tokio::spawn;
-use tokio::sync::{Mutex, MutexGuard, mpsc, oneshot};
-use tokio::task::spawn_blocking;
+use rumors::Rumors;
+use sled_hardware_types::BaseboardId;
+use slog::{Logger, debug, info, o, warn};
+use tokio::sync::{Mutex, MutexGuard, mpsc, watch};
+use tokio_stream::wrappers::ReceiverStream;
 use tokio_util::sync::CancellationToken;
 use x509_cert::Certificate;
 use x509_cert::der::{DecodePem as _, Encode as _};
 
 use sush_api::JobStartParams;
 use sush_common::authn::{Credentials, Identity, Nonce};
-use sush_common::interactive::WindowSize;
-use sush_common::jobs::JobOutputStream::{self, Stderr, Stdout};
-use sush_common::jobs::{
-    ExecutionError, JobId, JobOutputHash, JobStartRequest, JobStatus, Session, SessionId,
-    SignedJob, VerifiedJob,
-};
+use sush_common::jobs::JobOutputStream::{self};
+use sush_common::jobs::{JobId, JobStatus, Session, SessionId, SignedJob};
 use sush_common::keys::{KeyError, KeyId, Signature, SshPublicKey};
 
 use crate::error::JobError;
 use crate::interactive::SocketSender;
-use crate::monitor::{ExecutionResult, JobEnded, JobMonitor, JobStarted, MonitorRequest};
-use crate::pty::Pty;
+use crate::messages::{JobRequest, Message, Request, SessionRequest};
+use crate::state::{State, StateManager};
 
 /// Self-signed (root) X.509 certificates. Self-signed certificates may
 /// not be imported (except in test code), and so must be included here.
@@ -60,12 +46,6 @@ const MAX_CERTS: NonZeroUsize = NonZeroUsize::new(100).unwrap();
 
 /// Maximum number of cached identities.
 const MAX_CACHED_IDENTITIES: NonZeroUsize = NonZeroUsize::new(1_000).unwrap();
-
-/// Maximum number of active jobs in a session.
-const MAX_ACTIVE_JOBS: usize = 1_000;
-
-/// Maximum number of job status entries to hold as history.
-const MAX_JOB_HISTORY: NonZeroUsize = NonZeroUsize::new(10_000).unwrap();
 
 /// Maximum number of outstanding authentication nonces.
 /// We do not really expect more than one simultaneous user,
@@ -86,98 +66,30 @@ pub struct JobManager {
     nonces: Arc<Mutex<LruCache<Nonce, DateTime<Utc>>>>,
     identities: Arc<Mutex<LruCache<(KeyId, Nonce), (Identity, Credentials)>>>,
     certs: Arc<Mutex<LruCache<KeyId, Certificate>>>,
-    session: Arc<Mutex<Option<Session>>>,
-    active_jobs: Arc<Mutex<BTreeMap<JobId, JobStatus>>>,
-    job_history: Arc<Mutex<LruCache<JobId, JobStatus>>>,
     output_dir: PathBuf,
-    tx_monitor: mpsc::Sender<MonitorRequest>,
+    state: watch::Receiver<State>,
+    tx_req: mpsc::Sender<Request>,
 }
 
 impl JobManager {
     pub async fn new(
         log: Logger,
-        output_dir: &Path,
-        _shutdown: CancellationToken,
+        output_dir: PathBuf,
+        own_baseboard: BaseboardId,
+        rumors: Rumors<Message>,
+        shutdown: CancellationToken,
     ) -> Result<Self, JobError> {
-        // Construct the job tables.
-        let active_jobs = Arc::new(Mutex::new(BTreeMap::new()));
-        let job_history = Arc::new(Mutex::new(LruCache::new(MAX_JOB_HISTORY)));
-
-        // Start the monitor and listen for job-end events.
-        let (tx_monitor, mut rx_monitor) =
-            JobMonitor::start(log.new(o!("component" => "monitor")), output_dir.to_owned());
-        spawn({
-            let active_jobs = active_jobs.clone();
-            let job_history = job_history.clone();
-            let output_dir = output_dir.to_owned();
-            let log = log.new(o!("component" => "monitor loop"));
-            async move {
-                while let Some(end) = rx_monitor.recv().await {
-                    // A job has ended; asynchronously record that fact.
-                    spawn({
-                        let active_jobs = active_jobs.clone();
-                        let job_history = job_history.clone();
-                        let output_dir = output_dir.to_owned();
-                        let log = log.clone();
-                        async move {
-                            // Compute output length and hashes before we
-                            // take the job table locks.
-                            let output = match spawn_blocking({
-                                let output_dir = output_dir.to_owned();
-                                let job_id = match &end {
-                                    Ok(end) => end.job_id().to_owned(),
-                                    Err(err) => err.job_id.to_owned(),
-                                };
-                                move || JobOutputState::new(&output_dir, &job_id)
-                            })
-                            .await
-                            {
-                                Ok(Ok(output)) => output,
-                                Ok(Err(err)) => {
-                                    error!(log, "failed to get job output state"; "error" => %err);
-                                    JobOutputState::default()
-                                }
-                                Err(err) => {
-                                    error!(log, "failed to spawn job output thread"; "error" => %err);
-                                    JobOutputState::default()
-                                }
-                            };
-                            match job_ended(
-                                &mut *active_jobs.lock().await,
-                                &mut *job_history.lock().await,
-                                end,
-                                output,
-                            ) {
-                                Ok(evicted) => {
-                                    if let Some((evicted_id, _evicted_status)) = evicted {
-                                        warn!(log, "evicted job record"; "job_id" => %evicted_id);
-                                        spawn_blocking({
-                                            let output_dir = output_dir.to_owned();
-                                            move || remove_orphan_output(&output_dir, &evicted_id)
-                                        });
-                                    }
-                                }
-                                Err(err) => {
-                                    error!(log, "failed to record job end"; "err" => %err);
-                                }
-                            }
-                        }
-                    });
-                }
-            }
-        });
-
-        // Create the new manager instance.
+        // Make the new manager instance.
+        let (tx_req, rx_req) = mpsc::channel(16);
+        let requests = ReceiverStream::new(rx_req);
         let new = Self {
             log: log.new(o!("component" => "manager")),
             nonces: Arc::new(Mutex::new(LruCache::new(MAX_OUTSTANDING_NONCES))),
             identities: Arc::new(Mutex::new(LruCache::new(MAX_CACHED_IDENTITIES))),
             certs: Arc::new(Mutex::new(LruCache::new(MAX_CERTS))),
-            session: Arc::new(Mutex::new(None)),
-            active_jobs,
-            job_history,
-            output_dir: output_dir.to_owned(),
-            tx_monitor,
+            output_dir: output_dir.clone(),
+            state: StateManager::run(output_dir, own_baseboard, requests, rumors, shutdown),
+            tx_req,
         };
 
         // Import the root certificates.
@@ -187,10 +99,6 @@ impl JobManager {
         }
 
         Ok(new)
-    }
-
-    pub fn output_dir(&self) -> &Path {
-        &self.output_dir
     }
 
     // Certificate management.
@@ -398,182 +306,100 @@ impl JobManager {
 
     // Session management.
 
-    pub async fn session(&self, _authn: &Identity) -> Result<Option<Session>, JobError> {
-        todo!("get current session")
+    pub fn session(&self, _authn: &Identity) -> Option<Session> {
+        self.state.borrow().session()
     }
 
-    pub async fn session_start(&self, authn: &Identity) -> Result<Session, JobError> {
-        let new_session_id = SessionId::new();
-        let new_session = Session::new(new_session_id.clone());
-        let mut session_guard = self.session.lock().await;
-        if let Some(old_session) = session_guard.as_ref() {
-            self.session_stop_inner(authn, old_session).await;
-        }
-        *session_guard = Some(new_session.clone());
-        info!(self.log, "session started"; "session_id" => %new_session_id);
-        Ok(new_session)
+    pub fn session_id(&self, authn: &Identity) -> Result<SessionId, JobError> {
+        let Some(session) = self.session(authn) else {
+            return Err(JobError::NoSession);
+        };
+        Ok(session.into_session_id())
+    }
+
+    pub async fn session_start(
+        &self,
+        _authn: &Identity,
+        session_id: SessionId,
+    ) -> Result<(), JobError> {
+        self.tx_req
+            .send(Request::Session(SessionRequest::Start(session_id)))
+            .await
+            .map_err(|_| JobError::ChannelClosed)?;
+        Ok(())
     }
 
     pub async fn session_stop(
         &self,
-        authn: &Identity,
-        session_id: &SessionId,
+        _authn: &Identity,
+        session_id: SessionId,
     ) -> Result<(), JobError> {
-        let mut session_guard = self.session.lock().await;
-        if let Some(session) = session_guard.as_ref()
-            && session.session_id() == session_id
-        {
-            self.session_stop_inner(authn, session).await;
-            *session_guard = None;
-            Ok(())
-        } else {
-            Err(JobError::SessionNotFound(session_id.to_owned()))
-        }
-    }
-
-    async fn session_stop_inner(&self, authn: &Identity, session: &Session) {
-        let session_id = session.session_id();
-        for job_id in {
-            self.active_jobs
-                .lock()
-                .await
-                .iter()
-                .filter(|(_id, status)| status.session_id() == session_id)
-                .map(|(id, _status)| id.to_owned())
-                .collect::<Vec<JobId>>()
-        } {
-            if let Err(err) = self.monitor(MonitorRequest::Stop(job_id.to_owned())).await {
-                error!(self.log, "runaway job"; "job_id" => %job_id, "session_id" => %session_id, "error" => %err);
-            }
-        }
-        info!(self.log, "session stopped"; "session_id" => %session_id, "authn" => %authn.key_id);
+        self.tx_req
+            .send(Request::Session(SessionRequest::Stop(session_id)))
+            .await
+            .map_err(|_| JobError::ChannelClosed)?;
+        Ok(())
     }
 
     // Job management.
-
-    pub async fn job_history(
-        &self,
-        _authn: &Identity, // anyone may retrieve job history
-        limit: u32,
-        offset: u32,
-    ) -> Result<Vec<JobStatus>, JobError> {
-        let mut jobs = Vec::new();
-        self.with_jobs(
-            &mut self.session.lock().await,
-            |active_jobs, job_history| {
-                for (_id, status) in active_jobs.iter().chain(job_history.iter()) {
-                    jobs.push(status.clone());
-                }
-                Ok(())
-            },
-        )
-        .await?;
-        let jobs = spawn_blocking(move || {
-            jobs.sort_by_key(JobStatus::time_started);
-            jobs
-        })
-        .await?;
-        let iter = jobs.into_iter().rev().skip(offset as usize);
-        let mut jobs: Vec<JobStatus> = if limit == 0 {
-            iter.collect()
-        } else {
-            iter.take(limit as usize).collect()
-        };
-        spawn_blocking({
-            let output_dir = self.output_dir.to_owned();
-            move || {
-                for job in jobs.iter_mut() {
-                    if let JobStatus::Started {
-                        job,
-                        stdout_len,
-                        stderr_len,
-                        ..
-                    } = job
-                    {
-                        *stdout_len = job_output_len(&output_dir, job.job_id(), Stdout)?;
-                        *stderr_len = job_output_len(&output_dir, job.job_id(), Stderr)?;
-                    }
-                }
-                Ok(jobs)
-            }
-        })
-        .await?
-    }
 
     pub async fn job_start(
         &self,
         authn: &Identity,
         job: SignedJob,
         params: JobStartParams,
-    ) -> Result<Option<ExecutionResult>, JobError> {
-        let wait = params.wait;
-        let started = {
-            let cert_key_id = job.key_id().to_owned();
-            let chain = self.cert_chain(authn, &cert_key_id).await?;
-            let job = if let Some(leaf) = chain.last() {
-                job.verify_with_cert(leaf)?
-            } else {
-                return Err(JobError::MissingCert(cert_key_id));
-            };
-
-            let mut session_guard = self.session.lock().await;
-            let Some(session) = session_guard.clone() else {
-                return Err(JobError::NoSession);
-            };
-
-            let job_id = job.job_id().to_owned();
-            self.with_jobs(&mut session_guard, |active_jobs, job_history| {
-                if active_jobs.contains_key(&job_id) || job_history.contains(&job_id) {
-                    return Err(JobError::InvalidJobId(job_id.to_owned()));
-                }
-                if active_jobs.len() >= MAX_ACTIVE_JOBS {
-                    return Err(JobError::TooManyJobs(MAX_ACTIVE_JOBS));
-                }
-                Ok(())
-            })
-            .await?;
-
-            if session.next_job_id() != job_id {
-                return Err(JobError::InvalidJobId(job_id));
-            }
-            let started = job_start(
-                &self.log,
-                &self.output_dir,
-                job.clone(),
-                session.session_id(),
-                &authn.key_id,
-                params,
-            )?;
-            self.with_jobs(&mut session_guard, |active_jobs, _history| {
-                active_jobs.insert(job_id, JobStatus::from(&started));
-                Ok(())
-            })
-            .await?;
-
-            session_guard
-                .as_mut()
-                .unwrap()
-                .job_started(job.into_signed());
-            started
+    ) -> Result<(), JobError> {
+        // Verify the job request.
+        if job.command.starts_with('-') {
+            return Err(JobError::InvalidCommand(job.into_payload().command));
+        }
+        let cert_key_id = job.key_id().to_owned();
+        let chain = self.cert_chain(authn, &cert_key_id).await?;
+        let job = if let Some(leaf) = chain.last() {
+            job.verify_with_cert(leaf)?
+        } else {
+            return Err(JobError::MissingCert(cert_key_id));
         };
 
-        let (tx, rx) = oneshot::channel();
-        self.monitor(MonitorRequest::started(started, tx)).await?;
-        if wait { Ok(Some(rx.await?)) } else { Ok(None) }
+        // Submit the job for execution.
+        self.tx_req
+            .send(Request::Job(
+                self.session_id(authn)?,
+                JobRequest::Start(job, params),
+            ))
+            .await
+            .map_err(|_| JobError::ChannelClosed)?;
+
+        Ok(())
     }
 
-    async fn check_job_owner(
+    pub async fn job_stop(&self, authn: &Identity, job_id: &JobId) -> Result<(), JobError> {
+        self.tx_req
+            .send(Request::Job(
+                self.session_id(authn)?,
+                JobRequest::Stop(job_id.to_owned()),
+            ))
+            .await
+            .map_err(|_| JobError::ChannelClosed)?;
+        Ok(())
+    }
+
+    pub async fn job_status(
         &self,
-        session_guard: &mut SessionGuard<'_>,
-        authn: &Identity,
+        _authn: &Identity,
         job_id: &JobId,
-    ) -> Result<(), JobError> {
-        let status = self.job_status_inner(session_guard, job_id).await?;
-        if status.key_id() != &authn.key_id {
-            Err(JobError::SessionWrongIdentity)
-        } else {
-            Ok(())
-        }
+    ) -> Result<JobStatus, JobError> {
+        todo!("get job status for {job_id}")
+    }
+
+    pub async fn job_output(
+        &self,
+        _authn: &Identity,
+        job_id: &JobId,
+        stream: JobOutputStream,
+        range: Option<Range>,
+    ) -> Result<Vec<u8>, JobError> {
+        todo!("get job {stream} for {job_id}: {range:?}")
     }
 
     pub async fn job_start_interactive_session(
@@ -581,476 +407,24 @@ impl JobManager {
         authn: &Identity,
         job_id: &JobId,
     ) -> Result<SocketSender, JobError> {
-        self.check_job_owner(&mut self.session.lock().await, authn, job_id)
-            .await?;
-        let (tx, rx) = oneshot::channel();
-        self.monitor(MonitorRequest::interactive_session(job_id, tx))
-            .await?;
-        rx.await?
-    }
-
-    pub async fn job_status(
-        &self,
-        _authn: &Identity, // anyone may check job status
-        job_id: &JobId,
-    ) -> Result<JobStatus, JobError> {
-        let mut status = self
-            .job_status_inner(&mut self.session.lock().await, job_id)
-            .await?;
-        if let JobStatus::Started {
-            stdout_len,
-            stderr_len,
-            ..
-        } = &mut status
-        {
-            *stdout_len = job_output_len(&self.output_dir, job_id, Stdout)?;
-            *stderr_len = job_output_len(&self.output_dir, job_id, Stderr)?;
-        }
-        Ok(status)
-    }
-
-    async fn job_status_inner(
-        &self,
-        session_guard: &mut SessionGuard<'_>,
-        job_id: &JobId,
-    ) -> Result<JobStatus, JobError> {
-        self.with_jobs(session_guard, |active_jobs, job_history| {
-            active_jobs
-                .get(job_id)
-                .cloned()
-                .or_else(|| job_history.peek(job_id).cloned())
-                .ok_or_else(|| JobError::JobNotFound(job_id.to_owned()))
-        })
-        .await
-    }
-
-    /// The `_session_guard` argument ensures that the session is locked
-    /// before we take the job table locks.
-    async fn with_jobs<T>(
-        &self,
-        _session_guard: &mut SessionGuard<'_>,
-        f: impl FnOnce(
-            &mut BTreeMap<JobId, JobStatus>,
-            &mut LruCache<JobId, JobStatus>,
-        ) -> Result<T, JobError>,
-    ) -> Result<T, JobError> {
-        f(
-            &mut *self.active_jobs.lock().await,
-            &mut *self.job_history.lock().await,
-        )
-    }
-
-    pub async fn job_stop(
-        &self,
-        _authn: &Identity, // anyone may stop a job
-        job_id: &JobId,
-    ) -> Result<(), JobError> {
-        let is_active = self
-            .active_jobs
-            .lock()
+        self.tx_req
+            .send(Request::Job(
+                self.session_id(authn)?,
+                JobRequest::Attach(job_id.to_owned()),
+            ))
             .await
-            .get(job_id)
-            .is_some_and(JobStatus::is_active);
-        if is_active {
-            self.monitor(MonitorRequest::Stop(job_id.to_owned())).await
-        } else {
-            Err(JobError::JobNotFound(job_id.to_owned()))
-        }
+            .map_err(|_| JobError::ChannelClosed)?;
+        todo!("get interactive session socket sender somehow")
     }
 
-    pub async fn job_output(
-        &self,
-        authn: &Identity,
-        job_id: &JobId,
-        stream: JobOutputStream,
-        range: Option<Range>,
-    ) -> Result<Vec<u8>, JobError> {
-        self.check_job_owner(&mut self.session.lock().await, authn, job_id)
-            .await?;
-        spawn_blocking({
-            let output_dir = self.output_dir.to_owned();
-            let job_id = job_id.to_owned();
-            move || get_job_output(&output_dir, &job_id, stream, range)
-        })
-        .await?
-    }
-
-    /// Truncate output file and update corresponding job status length.
-    /// Does *not* update the hash, as the mismatch indicates truncation
-    /// has occurred.
-    pub async fn job_output_delete(
-        &self,
-        authn: &Identity,
-        job_id: &JobId,
-        stream: JobOutputStream,
-        range: Option<Range>,
-    ) -> Result<u64, JobError> {
-        // Check that truncation is allowed.
-        {
-            let mut session_guard = self.session.lock().await;
-            self.check_job_owner(&mut session_guard, authn, job_id)
-                .await?;
-            if let JobStatus::Started { .. } =
-                self.job_status_inner(&mut session_guard, job_id).await?
-            {
-                return Err(JobError::JobStillRunning(job_id.to_owned()));
-            }
-        }
-
-        // Truncate.
-        let n = spawn_blocking({
-            let output_dir = self.output_dir.to_owned();
-            let job_id = job_id.to_owned();
-            move || delete_job_output(&output_dir, &job_id, stream, range)
-        })
-        .await??;
-
-        // Update the jobs tables with the truncated status.
-        self.with_jobs(
-            &mut self.session.lock().await,
-            |active_jobs, job_history| {
-                if let Some(JobStatus::Started {
-                    stdout_len,
-                    stderr_len,
-                    ..
-                })
-                | Some(JobStatus::Ended {
-                    stdout_len,
-                    stderr_len,
-                    ..
-                }) = active_jobs
-                    .get_mut(job_id)
-                    .or_else(|| job_history.peek_mut(job_id))
-                {
-                    match stream {
-                        Stdout => *stdout_len = n,
-                        Stderr => *stderr_len = n,
-                    }
-                }
-                Ok(())
-            },
-        )
-        .await?;
-        Ok(n)
-    }
-
-    pub(crate) async fn job_end_status(
+    pub async fn job_history(
         &self,
         _authn: &Identity,
-        end: JobEnded,
-    ) -> Result<JobStatus, JobError> {
-        let output_dir = self.output_dir.to_owned();
-        let job_id = end.job_id().to_owned();
-        Ok(end
-            .into_status(spawn_blocking(move || JobOutputState::new(&output_dir, &job_id)).await??))
+        _limit: u32,
+        _offset: u32,
+    ) -> Result<Vec<JobStatus>, JobError> {
+        todo!("get job history from state")
     }
-
-    async fn monitor(&self, request: MonitorRequest) -> Result<(), JobError> {
-        self.tx_monitor
-            .send(request)
-            .await
-            .map_err(JobError::closed)
-    }
-}
-
-#[derive(Debug, Default)]
-pub struct JobOutputState {
-    pub stdout_len: u64,
-    pub stderr_len: u64,
-    pub stdout_hash: JobOutputHash,
-    pub stderr_hash: JobOutputHash,
-}
-
-impl JobOutputState {
-    pub fn new(base_dir: &Path, job_id: &JobId) -> Result<Self, JobError> {
-        Ok(Self {
-            stdout_len: job_output_len(base_dir, job_id, Stdout)?,
-            stderr_len: job_output_len(base_dir, job_id, Stderr)?,
-            stdout_hash: job_output_hash(base_dir, job_id, Stdout)?,
-            stderr_hash: job_output_hash(base_dir, job_id, Stderr)?,
-        })
-    }
-}
-
-fn job_output_dir(base_dir: &Path, job_id: &JobId) -> PathBuf {
-    base_dir.join("jobs").join(job_id.to_string())
-}
-
-pub(crate) fn job_output_path(base_dir: &Path, job_id: &JobId, stream: JobOutputStream) -> PathBuf {
-    job_output_dir(base_dir, job_id).join(stream.as_str())
-}
-
-fn job_output_len(
-    base_dir: &Path,
-    job_id: &JobId,
-    stream: JobOutputStream,
-) -> Result<u64, JobError> {
-    let path = job_output_path(base_dir, job_id, stream);
-    match path.metadata().map(|m| m.len()) {
-        Ok(len) => Ok(len),
-        Err(err) if err.kind() == io::ErrorKind::NotFound => Ok(0),
-        Err(err) => Err(JobError::file_io_for(&path)(err)),
-    }
-}
-
-fn job_output_hash(
-    base_dir: &Path,
-    job_id: &JobId,
-    stream: JobOutputStream,
-) -> Result<JobOutputHash, JobError> {
-    let mut hasher = Hasher::new();
-    let path = job_output_path(base_dir, job_id, stream);
-    match hasher.update_mmap_rayon(&path) {
-        Ok(_) => (),
-        Err(err) if err.kind() == io::ErrorKind::NotFound => (),
-        Err(err) => return Err(JobError::file_io_for(&path)(err)),
-    }
-    Ok(hasher.finalize().into())
-}
-
-fn job_ended(
-    active_jobs: &mut BTreeMap<JobId, JobStatus>,
-    job_history: &mut LruCache<JobId, JobStatus>,
-    result: ExecutionResult,
-    output: JobOutputState,
-) -> Result<Option<(JobId, JobStatus)>, JobError> {
-    match result {
-        Err(ExecutionError {
-            job_id,
-            time,
-            error,
-        }) => {
-            if let JobStatus::Started {
-                job,
-                session_id,
-                key_id,
-                time_started,
-                ..
-            } = active_jobs
-                .remove(&job_id)
-                .ok_or_else(|| JobError::InvalidJobId(job_id.to_owned()))?
-            {
-                let status = JobStatus::Ended {
-                    job,
-                    session_id,
-                    key_id,
-                    time_started,
-                    time_ended: time,
-                    status: Err(error),
-                    stdout_len: output.stdout_len,
-                    stderr_len: output.stderr_len,
-                    stdout_hash: output.stdout_hash,
-                    stderr_hash: output.stderr_hash,
-                };
-                Ok(job_history.push(job_id.to_owned(), status))
-            } else {
-                Err(JobError::InvalidJobId(job_id))
-            }
-        }
-        Ok(ended) => {
-            active_jobs.remove(ended.job_id());
-            let job_id = ended.job_id().to_owned();
-            let status = ended.into_status(output);
-            Ok(job_history.push(job_id, status))
-        }
-    }
-}
-
-fn job_start(
-    log: &Logger,
-    output_dir: &Path,
-    job: VerifiedJob,
-    session_id: &SessionId,
-    key_id: &KeyId,
-    params: JobStartParams,
-) -> Result<JobStarted, JobError> {
-    // Set up the job.
-    let JobStartParams {
-        limits,
-        term,
-        rows,
-        cols,
-        wait: _,
-    } = params;
-    let JobStartRequest {
-        job_id,
-        command,
-        interactive,
-    } = job.clone().into_payload();
-    if command.starts_with('-') {
-        return Err(JobError::InvalidCommand(command));
-    }
-
-    // Set up output files.
-    let job_dir = job_output_dir(output_dir, &job_id);
-    DirBuilder::new()
-        .recursive(true)
-        .create(&job_dir)
-        .map_err(|err| JobError::file_io(job_dir, err))?;
-    let stdout_path = job_output_path(output_dir, &job_id, Stdout);
-    let stderr_path = job_output_path(output_dir, &job_id, Stderr);
-    let stdout_file =
-        File::create_new(&stdout_path).map_err(|err| JobError::file_io(&stdout_path, err))?;
-    let stderr_file =
-        File::create_new(&stderr_path).map_err(|err| JobError::file_io(&stderr_path, err))?;
-
-    // Set up the job child process.
-    let mut child = Command::new("bash");
-    child
-        .arg("-c")
-        .arg(&command)
-        .env_clear()
-        .env("SSH_CLIENT", "sush") // read bashrc
-        .env("SUSH_JOB_ID", job_id.to_string())
-        .env("SUSH_COMMAND", &command)
-        .kill_on_drop(true);
-
-    // Set basic user environment.
-    if let Some(pwd) = Passwd::current_user() {
-        child
-            .current_dir(&pwd.dir)
-            .env("HOME", &pwd.dir)
-            .env("LOGNAME", &pwd.name)
-            .env("USER", &pwd.name);
-    }
-
-    let pty = if interactive {
-        // Create a pseudoterminal for interactive jobs and wire
-        // the child up to it.
-        let (pty, pts, pts_path) = Pty::open().map_err(|err| JobError::io("pty open", err))?;
-        let pts_error = JobError::file_io_for(&pts_path);
-        let pts_clone = || pts.try_clone().map_err(&pts_error);
-        child
-            .env("SUSH_TTY", &pts_path)
-            .stdin(pts_clone()?)
-            .stdout(pts_clone()?)
-            .stderr(pts_clone()?);
-
-        unsafe {
-            let pty = pty.as_raw_fd();
-            child.pre_exec(move || {
-                close(pty); // not needed in the child
-                setsid()?; // create new process session
-                ioctl_tiocsctty(&pts)?; // set controlling terminal
-                limits.apply() // set process limits
-            });
-        }
-
-        // If it has a valid terminfo database, set `TERM` and the
-        // initial pseudoterminal window size.
-        if let Some(term) = term
-            && Terminfo::from_name(&term).is_ok()
-        {
-            child.env("TERM", term);
-            if let Some(rows) = rows
-                && let Some(cols) = cols
-            {
-                pty.set_window_size(WindowSize { rows, cols })
-                    .map_err(|err| JobError::io("pty window resize", err))?;
-            }
-        };
-
-        Some(pty)
-    } else {
-        // For batch jobs, close stdin and send output directly to files.
-        child
-            .stdin(Stdio::null())
-            .stdout(stdout_file)
-            .stderr(stderr_file);
-        unsafe {
-            child.pre_exec(move || limits.apply());
-        }
-        None
-    };
-
-    // Go!
-    let time_started = Utc::now();
-    let child = child.spawn().map_err(|err| JobError::io("spawn", err))?;
-    info!(log, "job started"; "job_id" => %job_id);
-    Ok(JobStarted {
-        job,
-        session_id: session_id.to_owned(),
-        key_id: key_id.to_owned(),
-        time_started,
-        child,
-        interactive: pty,
-    })
-}
-
-fn get_job_output(
-    output_dir: &Path,
-    job_id: &JobId,
-    stream: JobOutputStream,
-    range: Option<Range>,
-) -> Result<Vec<u8>, JobError> {
-    let len = job_output_len(output_dir, job_id, stream)?;
-    let path = job_output_path(output_dir, job_id, stream);
-    let io_error = JobError::file_io_for(&path);
-    let mut file = match File::open(&path) {
-        Ok(file) => file,
-        Err(err) if len == 0 && err.kind() == io::ErrorKind::NotFound => return Ok(Vec::new()),
-        Err(err) => return Err(JobError::file_io_for(&path)(err)),
-    };
-    if let Some(Range { start, end }) = range {
-        // HTTP Ranges include both their endpoints.
-        let start = if let StartPosition::Index(start) = start
-            && start < len
-        {
-            file.seek(SeekFrom::Start(start)).map_err(&io_error)?
-        } else {
-            return Err(JobError::InvalidRange(len));
-        };
-        let n = match end {
-            EndPosition::Index(end) => end - start + 1,
-            EndPosition::LastByte => len - start + 1,
-        };
-        if n > len.min(OUTPUT_THRESHOLD) {
-            Err(JobError::InvalidRange(len))
-        } else if n == 0 {
-            Ok(vec![])
-        } else {
-            let mut buf = vec![0; n as usize];
-            file.read_exact(&mut buf).map_err(&io_error)?;
-            Ok(buf)
-        }
-    } else if len > OUTPUT_THRESHOLD {
-        Err(JobError::OutputTooBig)
-    } else {
-        let mut buf = Vec::with_capacity(len as usize);
-        file.read_to_end(&mut buf).map_err(&io_error)?;
-        Ok(buf)
-    }
-}
-
-fn delete_job_output(
-    output_dir: &Path,
-    job_id: &JobId,
-    stream: JobOutputStream,
-    range: Option<Range>,
-) -> Result<u64, JobError> {
-    let len = job_output_len(output_dir, job_id, stream)?;
-    if let Some(Range {
-        start: StartPosition::Index(n),
-        end: EndPosition::LastByte,
-    }) = range
-        && n <= len
-    {
-        let path = job_output_path(output_dir, job_id, stream);
-        let Ok(file) = OpenOptions::new().write(true).open(&path) else {
-            return Ok(0);
-        };
-        file.set_len(n)
-            .map_err(|err| JobError::file_io(&path, err))?;
-        Ok(n)
-    } else {
-        Err(JobError::InvalidRange(len))
-    }
-}
-
-fn remove_orphan_output(output_dir: &Path, job_id: &JobId) {
-    let _ = remove_file(job_output_path(output_dir, job_id, Stdout));
-    let _ = remove_file(job_output_path(output_dir, job_id, Stderr));
-    let _ = remove_dir(job_output_dir(output_dir, job_id));
 }
 
 // See tests in `tests/src/manager_tests.rs`

@@ -15,6 +15,7 @@ pub mod server;
 pub mod state;
 
 pub use error::JobError;
-pub use manager::{JobManager, JobOutputState};
+pub use executor::JobOutputState;
+pub use manager::JobManager;
 pub use proxy::ProxyServer;
 pub use server::ApiServer;

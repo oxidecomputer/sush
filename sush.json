@@ -185,7 +185,6 @@
     "/jobs": {
       "get": {
         "summary": "List previous jobs sorted by start time, most recent first.",
-        "description": "Any authenticated identity may see the job history, regardless of ownership.",
         "operationId": "job_history",
         "parameters": [
           {
@@ -243,7 +242,6 @@
     "/jobs/{job_id}/output/{stream}": {
       "get": {
         "summary": "Get (a subset of) the standard output or standard error of a job.",
-        "description": "Only the job owner may request job output.",
         "operationId": "job_output",
         "parameters": [
           {
@@ -289,72 +287,11 @@
             }
           }
         }
-      },
-      "delete": {
-        "summary": "Truncate the standard output or standard error of a job.",
-        "description": "Only the job owner may truncate job output. Returns the new length.",
-        "operationId": "job_output_delete",
-        "parameters": [
-          {
-            "in": "header",
-            "name": "authorization",
-            "description": "Authorization to access the range.\n\nSee: <https://developer.mozilla.org/en-US/docs/Web/HTTP/Reference/Headers/Authorization>",
-            "schema": {
-              "type": "string"
-            }
-          },
-          {
-            "in": "header",
-            "name": "range",
-            "description": "A request to access a portion of the resource, such as `bytes=0-499`\n\nSee: <https://developer.mozilla.org/en-US/docs/Web/HTTP/Reference/Headers/Range>",
-            "schema": {
-              "type": "string"
-            }
-          },
-          {
-            "in": "path",
-            "name": "job_id",
-            "required": true,
-            "schema": {
-              "$ref": "#/components/schemas/JobId"
-            }
-          },
-          {
-            "in": "path",
-            "name": "stream",
-            "required": true,
-            "schema": {
-              "$ref": "#/components/schemas/JobOutputStream"
-            }
-          }
-        ],
-        "responses": {
-          "200": {
-            "description": "successful operation",
-            "content": {
-              "application/json": {
-                "schema": {
-                  "title": "uint64",
-                  "type": "integer",
-                  "format": "uint64",
-                  "minimum": 0
-                }
-              }
-            }
-          },
-          "4XX": {
-            "$ref": "#/components/responses/Error"
-          },
-          "5XX": {
-            "$ref": "#/components/responses/Error"
-          }
-        }
       }
     },
     "/jobs/{job_id}/session": {
       "get": {
         "summary": "Start a new interactive job session.",
-        "description": "Only the job owner may start an interactive session.",
         "operationId": "job_start_interactive_session",
         "parameters": [
           {
@@ -441,15 +378,6 @@
           },
           {
             "in": "query",
-            "name": "wait",
-            "description": "Keep the request open until the batch job ends.",
-            "required": true,
-            "schema": {
-              "type": "boolean"
-            }
-          },
-          {
-            "in": "query",
             "name": "max_cpu",
             "description": "Maximum CPU use in seconds.",
             "required": true,
@@ -498,7 +426,11 @@
             "content": {
               "application/json": {
                 "schema": {
-                  "$ref": "#/components/schemas/JobStatus"
+                  "title": "Null",
+                  "type": "string",
+                  "enum": [
+                    null
+                  ]
                 }
               }
             }
@@ -515,7 +447,6 @@
     "/jobs/{job_id}/status": {
       "get": {
         "summary": "Get the status of a job.",
-        "description": "Any authenticated identity may see the status of any job, regardless of ownership.",
         "operationId": "job_status",
         "parameters": [
           {
@@ -558,7 +489,6 @@
     "/jobs/{job_id}/stop": {
       "post": {
         "summary": "Stop a (running) job.",
-        "description": "Any authenticated identity may stop a job, regardless of ownership.",
         "operationId": "job_stop",
         "parameters": [
           {
@@ -634,10 +564,12 @@
             "$ref": "#/components/responses/Error"
           }
         }
-      },
+      }
+    },
+    "/sessions/{session_id}/start": {
       "post": {
         "summary": "Start a new support session.",
-        "description": "There may only be one session active on the rack at a time. If a session is already running when this request is made, the old session is stopped, regardless of ownership.",
+        "description": "There may only be one session active on the rack at a time. If a session is already running when this request is made, the old session is stopped.",
         "operationId": "session_start",
         "parameters": [
           {
@@ -647,6 +579,14 @@
             "schema": {
               "type": "string"
             }
+          },
+          {
+            "in": "path",
+            "name": "session_id",
+            "required": true,
+            "schema": {
+              "$ref": "#/components/schemas/SessionId"
+            }
           }
         ],
         "responses": {
@@ -655,7 +595,11 @@
             "content": {
               "application/json": {
                 "schema": {
-                  "$ref": "#/components/schemas/Session"
+                  "title": "Null",
+                  "type": "string",
+                  "enum": [
+                    null
+                  ]
                 }
               }
             }
@@ -672,7 +616,6 @@
     "/sessions/{session_id}/stop": {
       "post": {
         "summary": "End a support session.",
-        "description": "Since there may be only one session active on the rack at a time and we do not want to prevent starting new sessions, anyone is allowed to stop anyone else's session and start their own.",
         "operationId": "session_stop",
         "parameters": [
           {
@@ -847,9 +790,7 @@
                     "format": "date-time"
                   },
                   "status": {
-                    "nullable": true,
-                    "type": "integer",
-                    "format": "int32"
+                    "$ref": "#/components/schemas/Result_of_int32_or_ProcessError"
                   },
                   "stdout_len": {
                     "type": "integer",
@@ -872,6 +813,7 @@
                   "job",
                   "key_id",
                   "session_id",
+                  "status",
                   "stderr_hash",
                   "stderr_len",
                   "stdout_hash",
@@ -977,6 +919,99 @@
         "description": "A globally unique identifier for a session.",
         "type": "string"
       },
+      "Result_of_int32_or_ProcessError": {
+        "oneOf": [
+          {
+            "type": "object",
+            "properties": {
+              "Ok": {
+                "type": "integer",
+                "format": "int32"
+              }
+            },
+            "required": [
+              "Ok"
+            ]
+          },
+          {
+            "type": "object",
+            "properties": {
+              "Err": {
+                "$ref": "#/components/schemas/ProcessError"
+              }
+            },
+            "required": [
+              "Err"
+            ]
+          }
+        ]
+      },
+      "ProcessError": {
+        "description": "What went wrong running a job's process or interactive session.\n\nWe currently squash inner errors into strings to avoid excessive derivation requirements, but may come to regret that decision.",
+        "oneOf": [
+          {
+            "type": "object",
+            "properties": {
+              "Unstarted": {
+                "type": "string"
+              }
+            },
+            "required": [
+              "Unstarted"
+            ],
+            "additionalProperties": false
+          },
+          {
+            "type": "object",
+            "properties": {
+              "Killed": {
+                "type": "integer",
+                "format": "int32"
+              }
+            },
+            "required": [
+              "Killed"
+            ],
+            "additionalProperties": false
+          },
+          {
+            "type": "object",
+            "properties": {
+              "Interactive": {
+                "type": "string"
+              }
+            },
+            "required": [
+              "Interactive"
+            ],
+            "additionalProperties": false
+          },
+          {
+            "type": "object",
+            "properties": {
+              "Io": {
+                "type": "object",
+                "properties": {
+                  "what": {
+                    "type": "string"
+                  },
+                  "error": {
+                    "type": "string"
+                  }
+                },
+                "required": [
+                  "error",
+                  "what"
+                ]
+              }
+            },
+            "required": [
+              "Io"
+            ],
+            "additionalProperties": false
+          }
+        ]
+      },
       "JobOutputHash": {
         "description": "BLAKE3 hash of job output, used as a checksum.",
         "type": "string",
@@ -987,14 +1022,6 @@
         "properties": {
           "session_id": {
             "$ref": "#/components/schemas/SessionId"
-          },
-          "key_id": {
-            "nullable": true,
-            "allOf": [
-              {
-                "$ref": "#/components/schemas/KeyId"
-              }
-            ]
           },
           "last_job": {
             "nullable": true,

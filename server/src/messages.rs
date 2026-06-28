@@ -11,7 +11,7 @@ use sled_hardware_types::BaseboardId;
 use sush_api::JobStartParams;
 use uuid::Uuid;
 
-use sush_common::jobs::{JobId, ProcessError, SessionId, SignedJob};
+use sush_common::jobs::{JobId, ProcessError, SessionId, VerifiedJob};
 
 #[derive(BorshDeserialize, BorshSerialize, Copy, Clone, Debug, Eq, PartialEq)]
 pub struct RequestId(pub Uuid);
@@ -43,8 +43,9 @@ pub enum SessionRequest {
 
 #[derive(Clone, Debug, BorshDeserialize, BorshSerialize)]
 pub enum JobRequest {
-    Start(SignedJob, JobStartParams),
+    Start(VerifiedJob, JobStartParams),
     Stop(JobId),
+    Attach(JobId),
 }
 
 #[derive(Clone, Debug, BorshDeserialize, BorshSerialize)]
