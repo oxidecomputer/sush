@@ -216,7 +216,7 @@ checksum = "55248b47b0caf0546f7988906588779981c43bb1bc9d0c44087278f80cdb44ba"
 [[package]]
 name = "before"
 version = "0.1.0"
-source = "git+https://github.com/oxidecomputer/rumors#58857e815ad71248b0d0b4615e238d4cc5cf8872"
+source = "git+https://github.com/oxidecomputer/rumors#61ddf3a5781d76ef03534f60d518e39b9bf1292c"
 dependencies = [
  "bitvec",
  "borsh",
@@ -2899,8 +2899,9 @@ dependencies = [
 [[package]]
 name = "rumors"
 version = "0.1.0"
-source = "git+https://github.com/oxidecomputer/rumors#58857e815ad71248b0d0b4615e238d4cc5cf8872"
+source = "git+https://github.com/oxidecomputer/rumors#61ddf3a5781d76ef03534f60d518e39b9bf1292c"
 dependencies = [
+ "async-stream",
  "before",
  "blake3",
  "borsh",
@@ -2917,6 +2918,7 @@ dependencies = [
  "thiserror 2.0.18",
  "tinyvec",
  "tokio",
+ "tokio-stream",
  "tokio-util",
 ]
 
@@ -3644,6 +3646,7 @@ dependencies = [
  "serde_json",
  "shlex",
  "signature",
+ "sled-hardware-types",
  "ssh-key",
  "sush-common",
  "thiserror 1.0.69",
@@ -3679,6 +3682,7 @@ dependencies = [
  "serde_json",
  "sha2",
  "signature",
+ "sled-hardware-types",
  "ssh-key",
  "tempfile",
  "thiserror 1.0.69",
@@ -3744,6 +3748,8 @@ dependencies = [
  "http-range-header",
  "pwd",
  "rand_core 0.6.4",
+ "rumors",
+ "sled-hardware-types",
  "slog",
  "slog-term",
  "sush-api",

@@ -8,14 +8,13 @@ pub mod executor;
 pub mod interactive;
 pub mod manager;
 pub mod messages;
-pub mod monitor;
+pub mod output;
 pub mod proxy;
 pub mod pty;
 pub mod server;
 pub mod state;
 
 pub use error::JobError;
-pub use executor::JobOutputState;
 pub use manager::JobManager;
 pub use proxy::ProxyServer;
 pub use server::ApiServer;

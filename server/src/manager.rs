@@ -5,14 +5,13 @@ use std::num::NonZeroUsize;
 use std::path::PathBuf;
 use std::sync::Arc;
 
-use bytesize::ByteSize;
 use chrono::{DateTime, Utc};
 use http_range_header::SyntacticallyCorrectRange as Range;
 use lru::LruCache;
 use rumors::Rumors;
 use sled_hardware_types::BaseboardId;
 use slog::{Logger, debug, info, o, warn};
-use tokio::sync::{Mutex, MutexGuard, mpsc, watch};
+use tokio::sync::{Mutex, RwLock, mpsc};
 use tokio_stream::wrappers::ReceiverStream;
 use tokio_util::sync::CancellationToken;
 use x509_cert::Certificate;
@@ -21,12 +20,13 @@ use x509_cert::der::{DecodePem as _, Encode as _};
 use sush_api::JobStartParams;
 use sush_common::authn::{Credentials, Identity, Nonce};
 use sush_common::jobs::JobOutputStream::{self};
-use sush_common::jobs::{JobId, JobStatus, Session, SessionId, SignedJob};
+use sush_common::jobs::{JobId, JobStatusMap, Session, SessionId, SignedJob};
 use sush_common::keys::{KeyError, KeyId, Signature, SshPublicKey};
 
 use crate::error::JobError;
 use crate::interactive::SocketSender;
 use crate::messages::{JobRequest, Message, Request, SessionRequest};
+use crate::output::JobOutputDir;
 use crate::state::{State, StateManager};
 
 /// Self-signed (root) X.509 certificates. Self-signed certificates may
@@ -53,11 +53,6 @@ const MAX_CACHED_IDENTITIES: NonZeroUsize = NonZeroUsize::new(1_000).unwrap();
 /// here is adequate.
 const MAX_OUTSTANDING_NONCES: NonZeroUsize = NonZeroUsize::new(100).unwrap();
 
-/// Output files or ranges larger than this will not be served all at once.
-const OUTPUT_THRESHOLD: u64 = ByteSize::mb(128).as_u64();
-
-type SessionGuard<'a> = MutexGuard<'a, Option<Session>>;
-
 /// NB: All tables must have a fixed maximum size!
 #[derive(Debug)]
 #[allow(clippy::type_complexity)]
@@ -66,9 +61,10 @@ pub struct JobManager {
     nonces: Arc<Mutex<LruCache<Nonce, DateTime<Utc>>>>,
     identities: Arc<Mutex<LruCache<(KeyId, Nonce), (Identity, Credentials)>>>,
     certs: Arc<Mutex<LruCache<KeyId, Certificate>>>,
-    output_dir: PathBuf,
-    state: watch::Receiver<State>,
-    tx_req: mpsc::Sender<Request>,
+    output_dir: JobOutputDir,
+    own_baseboard: BaseboardId,
+    state: Arc<RwLock<State>>,     // from the state manager
+    tx_req: mpsc::Sender<Request>, // to the state manager
 }
 
 impl JobManager {
@@ -80,15 +76,24 @@ impl JobManager {
         shutdown: CancellationToken,
     ) -> Result<Self, JobError> {
         // Make the new manager instance.
+        let output_dir = JobOutputDir::new(output_dir);
         let (tx_req, rx_req) = mpsc::channel(16);
         let requests = ReceiverStream::new(rx_req);
         let new = Self {
-            log: log.new(o!("component" => "manager")),
+            log: log.new(o!("component" => "job manager")),
             nonces: Arc::new(Mutex::new(LruCache::new(MAX_OUTSTANDING_NONCES))),
             identities: Arc::new(Mutex::new(LruCache::new(MAX_CACHED_IDENTITIES))),
             certs: Arc::new(Mutex::new(LruCache::new(MAX_CERTS))),
+            own_baseboard: own_baseboard.clone(),
             output_dir: output_dir.clone(),
-            state: StateManager::run(output_dir, own_baseboard, requests, rumors, shutdown),
+            state: StateManager::run(
+                log.new(o!("component" => "state manager")),
+                output_dir,
+                own_baseboard,
+                requests,
+                rumors,
+                shutdown,
+            ),
             tx_req,
         };
 
@@ -99,6 +104,26 @@ impl JobManager {
         }
 
         Ok(new)
+    }
+
+    pub fn own_baseboard(&self) -> &BaseboardId {
+        &self.own_baseboard
+    }
+
+    async fn session_request(&self, request: SessionRequest) -> Result<(), JobError> {
+        self.tx_req
+            .send(Request::session(request))
+            .await
+            .map_err(|_| JobError::ChannelClosed)?;
+        Ok(())
+    }
+
+    async fn job_request(&self, _authn: &Identity, request: JobRequest) -> Result<(), JobError> {
+        self.tx_req
+            .send(Request::job(request))
+            .await
+            .map_err(|_| JobError::ChannelClosed)?;
+        Ok(())
     }
 
     // Certificate management.
@@ -306,12 +331,12 @@ impl JobManager {
 
     // Session management.
 
-    pub fn session(&self, _authn: &Identity) -> Option<Session> {
-        self.state.borrow().session()
+    pub async fn session(&self, _authn: &Identity) -> Option<Session> {
+        self.state.read().await.session()
     }
 
-    pub fn session_id(&self, authn: &Identity) -> Result<SessionId, JobError> {
-        let Some(session) = self.session(authn) else {
+    pub async fn session_id(&self, authn: &Identity) -> Result<SessionId, JobError> {
+        let Some(session) = self.session(authn).await else {
             return Err(JobError::NoSession);
         };
         Ok(session.into_session_id())
@@ -322,10 +347,8 @@ impl JobManager {
         _authn: &Identity,
         session_id: SessionId,
     ) -> Result<(), JobError> {
-        self.tx_req
-            .send(Request::Session(SessionRequest::Start(session_id)))
-            .await
-            .map_err(|_| JobError::ChannelClosed)?;
+        self.session_request(SessionRequest::Start(session_id))
+            .await?;
         Ok(())
     }
 
@@ -334,11 +357,7 @@ impl JobManager {
         _authn: &Identity,
         session_id: SessionId,
     ) -> Result<(), JobError> {
-        self.tx_req
-            .send(Request::Session(SessionRequest::Stop(session_id)))
-            .await
-            .map_err(|_| JobError::ChannelClosed)?;
-        Ok(())
+        self.session_request(SessionRequest::Stop(session_id)).await
     }
 
     // Job management.
@@ -349,7 +368,7 @@ impl JobManager {
         job: SignedJob,
         params: JobStartParams,
     ) -> Result<(), JobError> {
-        // Verify the job request.
+        // Validate the job request.
         if job.command.starts_with('-') {
             return Err(JobError::InvalidCommand(job.into_payload().command));
         }
@@ -362,34 +381,25 @@ impl JobManager {
         };
 
         // Submit the job for execution.
-        self.tx_req
-            .send(Request::Job(
-                self.session_id(authn)?,
-                JobRequest::Start(job, params),
-            ))
+        self.job_request(authn, JobRequest::Start(job, params))
             .await
-            .map_err(|_| JobError::ChannelClosed)?;
-
-        Ok(())
     }
 
     pub async fn job_stop(&self, authn: &Identity, job_id: &JobId) -> Result<(), JobError> {
-        self.tx_req
-            .send(Request::Job(
-                self.session_id(authn)?,
-                JobRequest::Stop(job_id.to_owned()),
-            ))
+        self.job_request(authn, JobRequest::Stop(job_id.to_owned()))
             .await
-            .map_err(|_| JobError::ChannelClosed)?;
-        Ok(())
     }
 
     pub async fn job_status(
         &self,
         _authn: &Identity,
         job_id: &JobId,
-    ) -> Result<JobStatus, JobError> {
-        todo!("get job status for {job_id}")
+    ) -> Result<JobStatusMap, JobError> {
+        if let Some(status) = self.state.read().await.get_job_status(job_id) {
+            Ok(status.to_owned())
+        } else {
+            Err(JobError::JobNotFound(job_id.to_owned()))
+        }
     }
 
     pub async fn job_output(
@@ -399,21 +409,16 @@ impl JobManager {
         stream: JobOutputStream,
         range: Option<Range>,
     ) -> Result<Vec<u8>, JobError> {
-        todo!("get job {stream} for {job_id}: {range:?}")
+        self.output_dir.job_output(job_id, stream, range).await
     }
 
-    pub async fn job_start_interactive_session(
+    pub async fn job_attach(
         &self,
         authn: &Identity,
         job_id: &JobId,
     ) -> Result<SocketSender, JobError> {
-        self.tx_req
-            .send(Request::Job(
-                self.session_id(authn)?,
-                JobRequest::Attach(job_id.to_owned()),
-            ))
-            .await
-            .map_err(|_| JobError::ChannelClosed)?;
+        self.job_request(authn, JobRequest::Attach(job_id.to_owned()))
+            .await?;
         todo!("get interactive session socket sender somehow")
     }
 
@@ -422,7 +427,7 @@ impl JobManager {
         _authn: &Identity,
         _limit: u32,
         _offset: u32,
-    ) -> Result<Vec<JobStatus>, JobError> {
+    ) -> Result<Vec<JobStatusMap>, JobError> {
         todo!("get job history from state")
     }
 }

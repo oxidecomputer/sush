@@ -5,13 +5,15 @@ use std::path::PathBuf;
 
 use clap::Parser;
 use dropshot::{ConfigDropshot, ConfigLogging, ConfigLoggingLevel, HandlerTaskMode, ServerBuilder};
+use rumors::Peer;
+use sled_hardware_types::BaseboardId;
+use tokio::signal::unix::{SignalKind, signal};
+use tokio::{select, spawn};
+use tokio_util::sync::CancellationToken;
 
 use sush_api::sush_api_mod::api_description;
 use sush_server::manager::JobManager;
 use sush_server::server::ApiServer;
-use tokio::signal::unix::{SignalKind, signal};
-use tokio::{select, spawn};
-use tokio_util::sync::CancellationToken;
 
 const DEFAULT_ADDRESS: &str = "0.0.0.0:44444";
 const ROOT_LOG_NAME: &str = "sush";
@@ -52,9 +54,24 @@ async fn main() -> Result<(), String> {
     .to_logger(ROOT_LOG_NAME)
     .map_err(|e| e.to_string())?;
 
-    let mgr = JobManager::new(log.clone(), &directory, listen_for_shutdown()?)
-        .await
-        .map_err(|e| e.to_string())?;
+    // TODO: get actual baseboard ID
+    let baseboard = BaseboardId {
+        part_number: "a part".to_string(),
+        serial_number: "0001".to_string(),
+    };
+
+    // TODO: get/seed Rumors network
+    let gossip = Peer::seed().into_rumors();
+
+    let mgr = JobManager::new(
+        log.clone(),
+        directory,
+        baseboard,
+        gossip,
+        listen_for_shutdown()?,
+    )
+    .await
+    .map_err(|e| e.to_string())?;
 
     let api = api_description::<ApiServer>()
         .map_err(|error| format!("failed to get API description: {error}"))?;
@@ -72,8 +89,8 @@ async fn main() -> Result<(), String> {
     Ok(())
 }
 
+/// Trigger a cancellation token on receipt of a terminal Unix signal(7).
 fn listen_for_shutdown() -> Result<CancellationToken, String> {
-    // Wait for a signal.
     let Ok(mut sighup) = signal(SignalKind::hangup()) else {
         return Err("can't get SIGHUP listener".to_string());
     };
@@ -93,6 +110,5 @@ fn listen_for_shutdown() -> Result<CancellationToken, String> {
         }
         trigger_shutdown.cancel();
     });
-
     Ok(shutdown)
 }

@@ -17,7 +17,7 @@ use serde::de::{Deserializer, Error as DeserializeError, IntoDeserializer, MapAc
 
 use sush_common::authn::Identity;
 use sush_common::jobs::{
-    JobId, JobLimits, JobOutputStream, JobStatus, Session, SessionId, SignedJob,
+    JobId, JobLimits, JobOutputStream, JsonJobStatusMap, Session, SessionId, SignedJob,
 };
 use sush_common::keys::{KeyId, SshPublicKey};
 
@@ -114,13 +114,13 @@ pub trait SushApi {
         params: PathParams<JobIdParam>,
     ) -> Result<HttpResponseOk<()>, HttpError>;
 
-    /// Get the status of a job.
+    /// Get the status of a job across the rack.
     #[endpoint { method = GET, path = "/jobs/{job_id}/status" }]
     async fn job_status(
         ctx: RequestContext<Self::Context>,
         headers: Header<Authorization>,
         params: PathParams<JobIdParam>,
-    ) -> Result<HttpResponseOk<JobStatus>, HttpError>;
+    ) -> Result<HttpResponseOk<JsonJobStatusMap>, HttpError>;
 
     /// Get (a subset of) the standard output or standard error of a job.
     #[endpoint { method = GET, path = "/jobs/{job_id}/output/{stream}" }]
@@ -130,12 +130,12 @@ pub trait SushApi {
         params: PathParams<JobOutputParams>,
     ) -> Result<Response<Body>, HttpError>;
 
-    /// Start a new interactive job session.
+    /// Attach to an interactive job.
     // This should use `channel { protocol = WEBSOCKETS, .. }`, but that
     // does not currently let us return (unauthorized) errors before the
     // connection upgrade.
-    #[endpoint { method = GET, path = "/jobs/{job_id}/session" }]
-    async fn job_start_interactive_session(
+    #[endpoint { method = GET, path = "/jobs/{job_id}/attach" }]
+    async fn job_attach(
         ctx: RequestContext<Self::Context>,
         headers: Header<Authorization>,
         params: PathParams<JobIdParam>,
@@ -148,7 +148,7 @@ pub trait SushApi {
         ctx: RequestContext<Self::Context>,
         headers: Header<Authorization>,
         query: QueryParams<JobHistoryParams>,
-    ) -> Result<HttpResponseOk<Vec<JobStatus>>, HttpError>;
+    ) -> Result<HttpResponseOk<Vec<JsonJobStatusMap>>, HttpError>;
 }
 
 #[derive(Deserialize, JsonSchema)]

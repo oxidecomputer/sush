@@ -4,6 +4,8 @@ use std::time::Duration;
 
 use chrono::Utc;
 use rand_core::{OsRng, RngCore as _};
+use rumors::Peer;
+use sled_hardware_types::BaseboardId;
 use slog::{Drain as _, Logger, o};
 use slog_term::{FullFormat, PlainSyncDecorator, TestStdoutWriter};
 use tempfile::TempDir;
@@ -14,7 +16,7 @@ use x509_cert::time::Validity;
 use sush_client::{Client, ResponseValue};
 use sush_common::authn::{Challenge, ChallengeResponse, Credentials, Identity, Nonce};
 use sush_common::codephrases::generate_id;
-use sush_common::jobs::{JobId, JobStartRequest, SignedJob};
+use sush_common::jobs::{JobId, JobStartRequest, VerifiedJob};
 use sush_common::keys::{EphemeralKey, KeyType, Signer};
 use sush_server::JobManager;
 
@@ -25,7 +27,7 @@ pub trait SignJobRequest {
         job_id: &JobId,
         command: S,
         interactive: bool,
-    ) -> SignedJob;
+    ) -> VerifiedJob;
 }
 
 impl SignJobRequest for EphemeralKey {
@@ -34,14 +36,16 @@ impl SignJobRequest for EphemeralKey {
         job_id: &JobId,
         command: S,
         interactive: bool,
-    ) -> SignedJob {
+    ) -> VerifiedJob {
         self.sign(JobStartRequest::new(
             job_id.to_owned(),
             command,
             interactive,
         ))
         .await
-        .unwrap()
+        .expect("failed to sign job")
+        .verify_with_cert(self.cert())
+        .expect("failed to verify job signature")
     }
 }
 
@@ -81,8 +85,15 @@ pub async fn fake_identity(key: &mut EphemeralKey) -> Identity {
 
 pub async fn manager_and_test_root(log: Logger) -> (JobManager, EphemeralKey, TempDir) {
     let dir = TempDir::with_prefix("sush-").unwrap();
+    let baseboard = BaseboardId {
+        part_number: "test part".to_string(),
+        serial_number: "0000".to_string(),
+    };
+    let gossip = Peer::seed().into_rumors();
     let shutdown = CancellationToken::new();
-    let mgr = JobManager::new(log, dir.path(), shutdown).await.unwrap();
+    let mgr = JobManager::new(log, dir.path().to_owned(), baseboard, gossip, shutdown)
+        .await
+        .unwrap();
     let root = ephemeral_test_root();
     let key_id = mgr.import_root(root.cert().to_owned()).await.unwrap();
     assert_eq!(&key_id, root.key_id());

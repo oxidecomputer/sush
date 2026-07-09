@@ -1,5 +1,6 @@
 //! Signed job requests.
 
+use std::collections::{BTreeMap, HashMap};
 use std::convert::Infallible;
 use std::fmt;
 use std::io::Error as IoError;
@@ -16,11 +17,12 @@ use schemars::schema::{Schema, SchemaObject};
 use schemars::{JsonSchema, SchemaGenerator};
 use serde::de::{Deserializer, Error as DeserializeError, Visitor};
 use serde::{Deserialize, Serialize, Serializer};
+use sled_hardware_types::{BaseboardId, BaseboardIdParseError};
 use thiserror::Error;
 
 use crate::codephrases::{WORD_SEPARATOR, generate_id, id_phrase};
 use crate::interactive::InteractiveSessionError;
-use crate::keys::{KeyId, Signed, ToBeSigned, Verified};
+use crate::keys::{Signed, ToBeSigned, Verified};
 
 /// A globally unique identifier for a job within a session.
 #[derive(
@@ -137,7 +139,7 @@ impl<S: AsRef<str>> From<S> for SessionId {
     }
 }
 
-#[derive(Clone, Debug, Deserialize, JsonSchema, Serialize)]
+#[derive(Clone, Debug, Deserialize, Eq, JsonSchema, PartialEq, Serialize)]
 pub struct Session {
     session_id: SessionId,
     last_job: Option<SignedJob>,
@@ -177,7 +179,17 @@ impl Session {
 }
 
 /// A request to run the given `command` as `job_id`.
-#[derive(BorshDeserialize, BorshSerialize, Clone, Debug, Deserialize, JsonSchema, Serialize)]
+#[derive(
+    BorshDeserialize,
+    BorshSerialize,
+    Clone,
+    Debug,
+    Deserialize,
+    Eq,
+    JsonSchema,
+    PartialEq,
+    Serialize,
+)]
 pub struct JobStartRequest {
     pub job_id: JobId,
     pub command: String,
@@ -241,18 +253,12 @@ pub type VerifiedJob = Verified<JobStartRequest>;
 #[derive(BorshDeserialize, BorshSerialize, Clone, Debug, Deserialize, JsonSchema, Serialize)]
 pub enum JobStatus {
     Started {
-        job: VerifiedJob,
-        session_id: SessionId,
-        key_id: KeyId,
+        job_id: JobId,
         #[borsh(serialize_with = "datetime_ser", deserialize_with = "datetime_de")]
         time_started: DateTime<Utc>,
-        stdout_len: u64,
-        stderr_len: u64,
     },
     Ended {
-        job: VerifiedJob,
-        session_id: SessionId,
-        key_id: KeyId,
+        job_id: JobId,
         #[borsh(serialize_with = "datetime_ser", deserialize_with = "datetime_de")]
         time_started: DateTime<Utc>,
         #[borsh(serialize_with = "datetime_ser", deserialize_with = "datetime_de")]
@@ -263,6 +269,38 @@ pub enum JobStatus {
         stdout_hash: JobOutputHash,
         stderr_hash: JobOutputHash,
     },
+}
+
+impl JobStatus {
+    pub fn is_started(&self) -> bool {
+        matches!(self, Self::Started { .. })
+    }
+
+    pub fn is_ended(&self) -> bool {
+        matches!(self, Self::Ended { .. })
+    }
+}
+
+pub type JobStatusMap = BTreeMap<BaseboardId, JobStatus>;
+pub type JsonJobStatusMap = HashMap<String, JobStatus>;
+
+pub fn job_status_map_de(
+    json_map: JsonJobStatusMap,
+) -> Result<JobStatusMap, BaseboardIdParseError> {
+    let mut new = JobStatusMap::new();
+    for (k, v) in json_map.into_iter() {
+        new.insert(BaseboardId::from_str(&k)?, v);
+    }
+    Ok(new)
+}
+
+/// And this one infallibly encodes a job status map into a JSON-compatible map.
+pub fn job_status_map_en(status_map: JobStatusMap) -> JsonJobStatusMap {
+    let mut new = HashMap::new();
+    for (k, v) in status_map.into_iter() {
+        new.insert(k.to_string(), v);
+    }
+    new
 }
 
 /// What went wrong running a job's process or interactive session.
@@ -282,6 +320,8 @@ pub enum JobStatus {
     Serialize,
 )]
 pub enum ProcessError {
+    #[error("the fate of the process is unknown")]
+    Unknown,
     #[error("could not start process: {0}")]
     Unstarted(String),
     #[error("process killed with signal {0}")]
@@ -290,6 +330,15 @@ pub enum ProcessError {
     Interactive(String),
     #[error("I/O error {what}: {error}")]
     Io { what: String, error: String },
+}
+
+impl ProcessError {
+    pub fn io(what: impl AsRef<str>, error: IoError) -> Self {
+        Self::Io {
+            what: what.as_ref().to_owned(),
+            error: error.to_string(),
+        }
+    }
 }
 
 /// What went wrong running a job, and when (informative).
@@ -329,18 +378,6 @@ impl ExecutionError {
 }
 
 impl JobStatus {
-    pub fn session_id(&self) -> &SessionId {
-        match self {
-            Self::Started { session_id, .. } | Self::Ended { session_id, .. } => session_id,
-        }
-    }
-
-    pub fn key_id(&self) -> &KeyId {
-        match self {
-            Self::Started { key_id, .. } | Self::Ended { key_id, .. } => key_id,
-        }
-    }
-
     pub fn time_started(&self) -> DateTime<Utc> {
         match self {
             Self::Started { time_started, .. } | Self::Ended { time_started, .. } => *time_started,
@@ -360,7 +397,7 @@ impl JobStatus {
 
     pub fn job_id(&self) -> &JobId {
         match self {
-            Self::Started { job, .. } | Self::Ended { job, .. } => job.job_id(),
+            Self::Started { job_id, .. } | Self::Ended { job_id, .. } => job_id,
         }
     }
 

@@ -13,6 +13,8 @@ futures.workspace = true
 http-range-header.workspace = true
 pwd.workspace = true
 rand_core.workspace = true
+rumors.workspace = true
+sled-hardware-types.workspace = true
 slog.workspace = true
 slog-term.workspace = true
 sush-api = { path = "../api" }

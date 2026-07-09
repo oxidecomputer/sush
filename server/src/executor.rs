@@ -1,14 +1,16 @@
 //! Job execution engine.
 //!
-//! Executes, monitors, and halts jobs. Driven by the session state machine.
+//! Executes, monitors, and halts jobs. Driven by the session state machine,
+//! and session agnostic.
 
+use std::collections::BTreeMap;
 use std::fs::{DirBuilder, File};
 use std::io;
 use std::os::fd::AsRawFd as _;
-use std::path::PathBuf;
+use std::os::unix::process::ExitStatusExt as _;
 use std::process::Stdio;
 
-use blake3::Hasher;
+use chrono::Utc;
 use futures::Stream;
 use pwd::Passwd;
 use rustix::io::close;
@@ -16,25 +18,31 @@ use rustix::process::{ioctl_tiocsctty, setsid};
 use terminfo::Database as Terminfo;
 use tokio::process::Command;
 use tokio::sync::mpsc;
+use tokio::{select, spawn};
 use tokio_stream::wrappers::ReceiverStream;
 use tokio_util::sync::CancellationToken;
 
 use sush_api::JobStartParams;
 use sush_common::interactive::WindowSize;
-use sush_common::jobs::{ExecutionError, JobId, JobOutputHash, JobOutputStream, JobStartRequest};
+use sush_common::jobs::{JobId, JobOutputStream, JobStartRequest, ProcessError};
 
-use crate::messages::Event;
+use crate::messages::{Event, JobEvent};
+use crate::output::JobOutputDir;
 use crate::pty::Pty;
 
 pub struct Executor {
     events: mpsc::Sender<Event>,
-    output_dir: PathBuf,
+    output_dir: JobOutputDir,
+    shutdown: CancellationToken,
+    kill: BTreeMap<JobId, CancellationToken>,
+    ptys: BTreeMap<JobId, Pty>,
 }
 
+/// Executor methods should be infallible; errors are reported via events.
 impl Executor {
     pub fn new(
-        output_dir: PathBuf,
-        _shutdown: CancellationToken,
+        output_dir: JobOutputDir,
+        shutdown: CancellationToken,
     ) -> (Self, impl Stream<Item = Event> + Send + 'static) {
         // This queue size is an arbitrary choice. We expect to consume
         // messages from the channel very rapidly, so should not
@@ -44,16 +52,16 @@ impl Executor {
             Self {
                 events: tx,
                 output_dir,
+                shutdown,
+                kill: BTreeMap::new(),
+                ptys: BTreeMap::new(),
             },
             ReceiverStream::new(rx),
         )
     }
 
-    pub fn job_start(
-        &self,
-        request: JobStartRequest,
-        params: JobStartParams,
-    ) -> Result<(), ExecutionError> {
+    pub async fn job_start(&mut self, request: JobStartRequest, params: JobStartParams) {
+        use JobOutputStream::*;
         let JobStartRequest {
             job_id,
             command,
@@ -66,31 +74,39 @@ impl Executor {
             cols,
         } = params;
 
-        // Report I/O errors.
-        let io_err = {
-            let job_id = job_id.to_owned();
-            |what: String| move |err| ExecutionError::io(job_id.to_owned(), &what, err)
-        };
+        // Report I/O errors as job events.
+        let io_err = |what| move |err: io::Error| ProcessError::io(what, err);
+        macro_rules! with_io_err {
+            ($expr:expr, $err:expr) => {
+                match $expr.map_err(io_err($err)) {
+                    Ok(value) => value,
+                    Err(err) => {
+                        let _ = self
+                            .events
+                            .send(Event::Job(JobEvent::JobError(job_id, err)))
+                            .await;
+                        return;
+                    }
+                }
+            };
+        }
 
         // Set up output files.
-        let job_dir = self.job_output_dir(&job_id);
-        DirBuilder::new()
-            .recursive(true)
-            .create(&job_dir)
-            .map_err(io_err.clone()(format!(
-                "creating job output directory `{}`",
-                job_dir.display()
-            )))?;
-        let stdout_path = self.job_output_path(&job_id, JobOutputStream::Stdout);
-        let stderr_path = self.job_output_path(&job_id, JobOutputStream::Stderr);
-        let stdout_file = File::create_new(&stdout_path).map_err(io_err.clone()(format!(
-            "creating job stdout file `{}`",
-            stdout_path.display()
-        )))?;
-        let stderr_file = File::create_new(&stderr_path).map_err(io_err.clone()(format!(
-            "creating job stderr file `{}`",
-            stderr_path.display()
-        )))?;
+        let job_dir = self.output_dir.job_output_dir(&job_id);
+        with_io_err!(
+            DirBuilder::new().recursive(true).create(&job_dir),
+            format!("creating job output directory `{}`", job_dir.display())
+        );
+        let stdout_path = self.output_dir.job_output_path(&job_id, Stdout);
+        let stderr_path = self.output_dir.job_output_path(&job_id, Stderr);
+        let stdout_file = with_io_err!(
+            File::create_new(&stdout_path),
+            format!("creating job stdout file `{}`", stdout_path.display())
+        );
+        let stderr_file = with_io_err!(
+            File::create_new(&stderr_path),
+            format!("creating job stderr file `{}`", stderr_path.display())
+        );
 
         // Set up the job child process.
         let mut child = Command::new("bash");
@@ -111,20 +127,21 @@ impl Executor {
                 .env("USER", &pwd.name);
         }
 
-        let pty = if interactive {
+        if interactive {
             // Create a pseudoterminal for interactive jobs and wire
             // the child up to it.
             let (pty, pts, pts_path) =
-                Pty::open().map_err(io_err.clone()("opening pseudoterminal".to_string()))?;
-            let pts_clone = || {
-                pts.try_clone()
-                    .map_err(io_err.clone()("cloning pseudoterminal".to_string()))
-            };
+                with_io_err!(Pty::open(), "opening pseudoterminal".to_string());
+            macro_rules! pts_clone {
+                () => {
+                    with_io_err!(pts.try_clone(), "cloning pseudoterminal".to_string())
+                };
+            }
             child
                 .env("SUSH_TTY", &pts_path)
-                .stdin(pts_clone()?)
-                .stdout(pts_clone()?)
-                .stderr(pts_clone()?);
+                .stdin(pts_clone!())
+                .stdout(pts_clone!())
+                .stderr(pts_clone!());
 
             unsafe {
                 let pty = pty.as_raw_fd();
@@ -145,12 +162,14 @@ impl Executor {
                 if let Some(rows) = rows
                     && let Some(cols) = cols
                 {
-                    pty.set_window_size(WindowSize { rows, cols })
-                        .map_err(io_err.clone()("resizing pseudoterminal window".to_string()))?;
+                    with_io_err!(
+                        pty.set_window_size(WindowSize { rows, cols }),
+                        "resizing pseudoterminal window".to_string()
+                    );
                 }
             };
 
-            Some(pty)
+            self.ptys.insert(job_id.clone(), pty);
         } else {
             // For batch jobs, close stdin and send output directly to files.
             child
@@ -160,14 +179,70 @@ impl Executor {
             unsafe {
                 child.pre_exec(move || limits.apply());
             }
-            None
         };
 
         // Execute!
-        let child = child
-            .spawn()
-            .map_err(io_err("spawning job process".to_string()))?;
-        Ok(())
+        let mut child = with_io_err!(child.spawn(), "spawning job process".to_string());
+
+        // Notify interested parties of birth.
+        let _ = self
+            .events
+            .send(Event::Job(JobEvent::JobStart(job_id.clone(), Utc::now())))
+            .await;
+
+        // Wait for or induce death, and notify interested parties.
+        let events = self.events.clone();
+        let shutdown = self.shutdown.child_token();
+        self.kill.insert(job_id.clone(), shutdown.clone());
+        let mut killed = false;
+        spawn(async move {
+            loop {
+                select! {
+                    _kill = shutdown.cancelled(), if !killed => {
+                        match child.kill().await {
+                            Ok(()) => {
+                                killed = true;
+                                continue;
+                            }
+                            Err(err) => {
+                                let _ = events
+                                    .send(Event::Job(JobEvent::JobEnd(
+                                        job_id,
+                                        Err(ProcessError::io("killing job", err)),
+                                    )))
+                                    .await;
+                                break;
+                            }
+                        }
+                    }
+                    exit_status = child.wait() => {
+                        let _ = events
+                            .send(Event::Job(JobEvent::JobEnd(
+                                job_id,
+                                match exit_status {
+                                    Ok(exit_status) => {
+                                        if let Some(code) = exit_status.code() {
+                                            Ok(code)
+                                        } else if let Some(signal) = exit_status.signal() {
+                                            Err(ProcessError::Killed(signal))
+                                        } else {
+                                            // Processes should either exit with a code or
+                                            // be killed by a signal; there is no third option
+                                            // on Unix. But since the type system does not
+                                            // guarantee that, this branch is technically
+                                            // reachable, but impossible in practice.
+                                            Err(ProcessError::Unknown)
+                                        }
+                                    }
+                                    Err(err) => Err(ProcessError::io("waiting", err)),
+                                },
+                            )))
+                            .await;
+                        break;
+                    }
+                }
+            }
+        });
     }
 
     pub fn job_attach(&self, _job_id: &JobId) {
@@ -178,70 +253,13 @@ impl Executor {
         todo!()
     }
 
-    pub fn job_stop(&self, _job_id: &JobId) {
-        todo!()
-    }
-
-    fn job_output_dir(&self, job_id: &JobId) -> PathBuf {
-        self.output_dir.join("jobs").join(job_id.to_string())
-    }
-
-    fn job_output_path(&self, job_id: &JobId, stream: JobOutputStream) -> PathBuf {
-        self.job_output_dir(job_id).join(stream.as_str())
-    }
-
-    fn job_output_len(
-        &self,
-        job_id: &JobId,
-        stream: JobOutputStream,
-    ) -> Result<u64, ExecutionError> {
-        let path = self.job_output_path(job_id, stream);
-        match path.metadata().map(|m| m.len()) {
-            Ok(len) => Ok(len),
-            Err(err) if err.kind() == io::ErrorKind::NotFound => Ok(0),
-            Err(err) => Err(ExecutionError::io(
-                job_id.clone(),
-                &format!("getting length of {}", path.display()),
-                err,
-            )),
+    pub fn job_stop(&self, job_id: &JobId) {
+        if let Some(kill) = self.kill.get(job_id) {
+            kill.cancel();
         }
     }
 
-    fn job_output_hash(
-        &self,
-        job_id: &JobId,
-        stream: JobOutputStream,
-    ) -> Result<JobOutputHash, ExecutionError> {
-        let mut hasher = Hasher::new();
-        let path = self.job_output_path(job_id, stream);
-        match hasher.update_mmap_rayon(&path) {
-            Ok(_) => (),
-            Err(err) if err.kind() == io::ErrorKind::NotFound => (),
-            Err(err) => {
-                return Err(ExecutionError::io(
-                    job_id.clone(),
-                    &format!("getting length of {}", path.display()),
-                    err,
-                ));
-            }
-        }
-        Ok(hasher.finalize().into())
+    pub fn output_dir(&self) -> &JobOutputDir {
+        &self.output_dir
     }
-
-    pub fn job_output_state(&self, job_id: &JobId) -> Result<JobOutputState, ExecutionError> {
-        Ok(JobOutputState {
-            stdout_len: self.job_output_len(job_id, JobOutputStream::Stdout)?,
-            stderr_len: self.job_output_len(job_id, JobOutputStream::Stderr)?,
-            stdout_hash: self.job_output_hash(job_id, JobOutputStream::Stdout)?,
-            stderr_hash: self.job_output_hash(job_id, JobOutputStream::Stderr)?,
-        })
-    }
-}
-
-#[derive(Debug, Default)]
-pub struct JobOutputState {
-    pub stdout_len: u64,
-    pub stderr_len: u64,
-    pub stdout_hash: JobOutputHash,
-    pub stderr_hash: JobOutputHash,
 }

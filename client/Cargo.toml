@@ -39,6 +39,7 @@ serde.workspace = true
 serde_json.workspace = true
 shlex.workspace = true
 signature.workspace = true
+sled-hardware-types.workspace = true
 ssh-key.workspace = true
 sush-common = { path = "../common" }
 thiserror.workspace = true

@@ -15,7 +15,9 @@ use x509_cert::Certificate;
 use x509_cert::der::Encode as _;
 
 use sush_common::authn::{Credentials, Identity};
-use sush_common::jobs::{JobId, JobOutputStream, JobStatus, Session, SessionId, SignedJob};
+use sush_common::jobs::{
+    JobId, JobOutputStream, JobStatus, JobStatusMap, Session, SessionId, SignedJob, VerifiedJob,
+};
 use sush_common::keys::{KeyId, Signature, SshPublicKey};
 
 use crate::commands::{CommandError, GlobalArgs};
@@ -105,8 +107,8 @@ impl CommandContext for Cli {
 
     // Job signing certificates
 
-    fn cert_chain(&mut self, key_id: KeyId, certs: &str) -> Result<(), CommandError> {
-        let chain = Certificate::load_pem_chain(certs.as_bytes())?;
+    fn cert_chain(&mut self, key_id: KeyId, certs: &str) -> Result<Certificate, CommandError> {
+        let mut chain = Certificate::load_pem_chain(certs.as_bytes())?;
         let Some((root, rest)) = chain.split_first() else {
             return Err(CommandError::EmptyCertChain);
         };
@@ -140,10 +142,7 @@ impl CommandContext for Cli {
             return Err(CommandError::InvalidLeafCert(key_id));
         }
 
-        if matches!(self.get_output_format(), OutputFormat::Json) {
-            println!("{}", json!(certs));
-        }
-        Ok(())
+        chain.pop().ok_or(CommandError::EmptyCertChain)
     }
 
     fn cert_imported(&mut self, path: &Path, key_id: KeyId) -> Result<(), CommandError> {
@@ -160,7 +159,7 @@ impl CommandContext for Cli {
 
     // Job management
 
-    fn job_started(&mut self, job: &SignedJob) {
+    fn job_started(&mut self, job: &VerifiedJob) {
         if let Some(session) = self.session.lock().unwrap().as_mut() {
             session.job_started(job.to_owned());
         }
@@ -280,21 +279,9 @@ impl CommandContext for Cli {
         }
     }
 
-    fn job_polling_update(&mut self, _job_id: &JobId, status: &JobStatus) {
+    fn job_polling_update(&mut self, _job_id: &JobId, _status: &JobStatusMap) {
         if let Some(progress) = self.progress.lock().unwrap().as_mut() {
-            let (JobStatus::Started {
-                stdout_len,
-                stderr_len,
-                ..
-            }
-            | JobStatus::Ended {
-                stdout_len,
-                stderr_len,
-                ..
-            }) = status;
-            let stdout_len = byte_size(*stdout_len);
-            let stderr_len = byte_size(*stderr_len);
-            progress.set_message(format!("stdout: {stdout_len}, stderr: {stderr_len}"));
+            // TODO: use status map
             progress.tick();
         }
     }
@@ -368,7 +355,7 @@ impl CommandContext for Cli {
         }
     }
 
-    fn job_status(&mut self, job_id: &JobId, status: &JobStatus) {
+    fn job_status(&mut self, _job_id: &JobId, status: &JobStatusMap) {
         fn format_elapsed_duration(duration: TimeDelta) -> String {
             if let Ok(duration) = duration.to_std() {
                 format_duration(duration).to_string()
@@ -377,94 +364,75 @@ impl CommandContext for Cli {
             }
         }
 
-        match self.get_output_format() {
-            OutputFormat::Json => println!("{}", json!(status)),
-            OutputFormat::Text => match status {
-                JobStatus::Started {
-                    job,
-                    session_id,
-                    key_id,
-                    time_started,
-                    stdout_len,
-                    stderr_len,
-                    ..
-                } => {
-                    let command = job.command();
-                    let stdout_len = byte_size(*stdout_len);
-                    let stderr_len = byte_size(*stderr_len);
-                    println!(
-                        "✅ Job ID:\t{job_id}\n   \
-                         Session ID:\t{session_id}\n   \
-                         Key ID:\t{key_id}\n   \
-                         Job status:\tStarted\n   \
-                         Command:\t{command}\n   \
-                         Started at:\t{time_started}\n   \
-                         Stdout len:\t{stdout_len}\n   \
-                         Stderr len:\t{stderr_len}"
-                    )
-                }
-                JobStatus::Ended {
-                    job,
-                    session_id,
-                    key_id,
-                    time_started,
-                    time_ended,
-                    status: Ok(exit_status),
-                    stdout_len,
-                    stderr_len,
-                    stdout_hash,
-                    stderr_hash,
-                } => {
-                    let command = job.command();
-                    let duration = format_elapsed_duration(status.time_elapsed());
-                    let stdout_len = byte_size(*stdout_len);
-                    let stderr_len = byte_size(*stderr_len);
-                    println!(
-                        "✅ Job ID:\t{job_id}\n   \
-                         Session ID:\t{session_id}\n   \
-                         Key ID:\t{key_id}\n   \
-                         Job status:\tEnded\n   \
-                         Command:\t{command}\n   \
-                         Started at:\t{time_started}\n   \
-                         Ended at:\t{time_ended} ({duration})\n   \
-                         Exit status:\t{exit_status}\n   \
-                         Stdout len:\t{stdout_len}\n   \
-                         Stderr len:\t{stderr_len}\n   \
-                         Stdout hash:\t{stdout_hash}\n   \
-                         Stderr hash:\t{stderr_hash}",
-                    );
-                }
-                JobStatus::Ended {
-                    job,
-                    session_id,
-                    key_id,
-                    time_started,
-                    time_ended,
-                    status: Err(err),
-                    stdout_len,
-                    stderr_len,
-                    stdout_hash,
-                    stderr_hash,
-                } => {
-                    let command = job.command();
-                    let duration = format_elapsed_duration(status.time_elapsed());
-                    let stdout_len = byte_size(*stdout_len);
-                    let stderr_len = byte_size(*stderr_len);
-                    println!(
-                        "✅ Job ID:\t{job_id}\n   \
-                         Session ID:\t{session_id}\n   \
-                         Key ID:\t{key_id}\n   \
-                         Job status:\t{err}\n   \
-                         Command:\t{command}\n   \
-                         Started at:\t{time_started}\n   \
-                         Stopped at:\t{time_ended} ({duration})\n   \
-                         Stdout len:\t{stdout_len}\n   \
-                         Stderr len:\t{stderr_len}\n   \
-                         Stdout hash:\t{stdout_hash}\n   \
-                         Stderr hash:\t{stderr_hash}",
-                    );
-                }
-            },
+        // TODO: parallel status display
+        for (baseboard_id, status) in status {
+            match self.get_output_format() {
+                OutputFormat::Json => println!("{}", json!(status)),
+                OutputFormat::Text => match status {
+                    JobStatus::Started {
+                        job_id,
+                        time_started,
+                    } => {
+                        println!(
+                            "✅ Job ID:\t{job_id}\n   \
+                             Target:\t{baseboard_id}\n   \
+                             Job status:\tStarted\n   \
+                             Started at:\t{time_started}"
+                        )
+                    }
+                    JobStatus::Ended {
+                        job_id,
+                        time_started,
+                        time_ended,
+                        status: Ok(exit_status),
+                        stdout_len,
+                        stderr_len,
+                        stdout_hash,
+                        stderr_hash,
+                    } => {
+                        let duration = format_elapsed_duration(status.time_elapsed());
+                        let stdout_len = byte_size(*stdout_len);
+                        let stderr_len = byte_size(*stderr_len);
+                        println!(
+                            "✅ Job ID:\t{job_id}\n   \
+                             Target:\t{baseboard_id}\n   \
+                             Job status:\tEnded\n   \
+                             Started at:\t{time_started}\n   \
+                             Ended at:\t{time_ended} ({duration})\n   \
+                             Exit status:\t{exit_status}\n   \
+                             Stdout len:\t{stdout_len}\n   \
+                             Stderr len:\t{stderr_len}\n   \
+                             Stdout hash:\t{stdout_hash}\n   \
+                             Stderr hash:\t{stderr_hash}",
+                        );
+                    }
+                    JobStatus::Ended {
+                        job_id,
+                        time_started,
+                        time_ended,
+                        status: Err(err),
+                        stdout_len,
+                        stderr_len,
+                        stdout_hash,
+                        stderr_hash,
+                    } => {
+                        let duration = format_elapsed_duration(status.time_elapsed());
+                        let stdout_len = byte_size(*stdout_len);
+                        let stderr_len = byte_size(*stderr_len);
+                        println!(
+                            "✅ Job ID:\t{job_id}\n   \
+                             Target:\t{baseboard_id}\n   \
+                             Job status:\t{err}\n   \
+                             Started at:\t{time_started}\n   \
+                             Stopped at:\t{time_ended} ({duration})\n   \
+                             Stdout len:\t{stdout_len}\n   \
+                             Stderr len:\t{stderr_len}\n   \
+                             Stdout hash:\t{stdout_hash}\n   \
+                             Stderr hash:\t{stderr_hash}",
+                        );
+                    }
+                },
+            }
         }
     }
 

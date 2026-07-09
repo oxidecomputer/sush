@@ -5,7 +5,6 @@
 
 use std::cmp::Ordering;
 use std::collections::{BTreeMap, BTreeSet};
-use std::path::PathBuf;
 use std::sync::Arc;
 
 use chrono::{DateTime, Utc};
@@ -13,20 +12,19 @@ use futures::{Stream, StreamExt};
 use rumors::before::Rank;
 use rumors::{Key, Rumors, Version};
 use sled_hardware_types::BaseboardId;
+use slog::{Logger, debug, info};
 use sush_api::JobStartParams;
-use sush_common::jobs::{JobId, JobStatus, Session, VerifiedJob};
-use tokio::sync::watch;
+use sush_common::jobs::{JobId, JobStatus, JobStatusMap, Session, VerifiedJob};
+use tokio::sync::RwLock;
 use tokio::{select, spawn};
 use tokio_util::sync::CancellationToken;
 
 use crate::executor::Executor;
 use crate::messages::{Error, Event, JobEvent, JobRequest, Message, Request, SessionRequest};
+use crate::output::{JobOutputDir, JobOutputState};
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, Default)]
 pub struct State {
-    /// The local baseboard ID of this sled, used so that the executor reports
-    /// events tagged with its own location.
-    own_baseboard: BaseboardId,
     /// The set of running jobs *everywhere*, tagged by start wall-clock time.
     running: BTreeMap<(JobId, BaseboardId), DateTime<Utc>>,
     /// The set of *all* jobs (running or stopped) *everywhere*, causally
@@ -36,9 +34,34 @@ pub struct State {
     /// Lookup table for job status of *all* jobs *everywhere*, pruned by the
     /// causal ordering in `causal_jobs`, and indexed first by job ID so that
     /// it's possible to ask "what's the status of this job across the rack?"
-    job_status: BTreeMap<JobId, BTreeMap<BaseboardId, JobStatus>>,
+    job_status: BTreeMap<JobId, JobStatusMap>,
     /// The current state of the active session, if any.
     session: SessionState,
+}
+
+impl State {
+    pub fn get_job_status(&self, job_id: &JobId) -> Option<&JobStatusMap> {
+        self.job_status.get(job_id)
+    }
+
+    pub fn set_job_status(
+        &mut self,
+        job_id: &JobId,
+        baseboard_id: &BaseboardId,
+        status: JobStatus,
+    ) {
+        let set_status = |map: &mut BTreeMap<BaseboardId, JobStatus>| {
+            map.insert(baseboard_id.clone(), status.clone());
+        };
+        self.job_status
+            .entry(job_id.to_owned())
+            .and_modify(set_status)
+            .or_insert_with(|| {
+                let mut status = BTreeMap::new();
+                set_status(&mut status);
+                status
+            });
+    }
 }
 
 /// Maximum number of historical job statuses to retain before evicting them.
@@ -57,29 +80,24 @@ pub enum SessionState {
     },
 }
 
-impl State {
-    pub fn new(own_baseboard: BaseboardId) -> Self {
-        Self {
-            own_baseboard,
-            running: BTreeMap::new(),
-            causal_jobs: BTreeSet::new(),
-            job_status: BTreeMap::new(),
-            session: SessionState::default(),
-        }
-    }
-
+impl SessionState {
     pub fn session(&self) -> Option<Session> {
         use SessionState::*;
-
-        match &self.session {
+        match self {
             Inactive => None,
             Active { session, .. } => Some(*session.clone()),
         }
     }
+}
 
-    fn update(
+impl State {
+    pub fn session(&self) -> Option<Session> {
+        self.session.session()
+    }
+
+    async fn update(
         &mut self,
-        executor: &Executor,
+        executor: &mut Executor,
         // We don't use the `key` here because we only redact messages once
         // they're committed to persistent storage:
         _key: Key,
@@ -90,7 +108,7 @@ impl State {
 
         match message.as_ref() {
             Message::Request(request) => match request {
-                Request::Session(session_request) => match session_request {
+                Request::Session(session_request) => match session_request.as_ref() {
                     SessionRequest::Start(session_id) => match &mut self.session {
                         Inactive => {
                             self.session = Active {
@@ -159,7 +177,7 @@ impl State {
                         }
                     }
                 },
-                Request::Job(session_id, job_request) => match job_request {
+                Request::Job(job_request) => match job_request.as_ref() {
                     JobRequest::Start(signed, params) => {
                         // TODO: When we implement
                         // https://github.com/oxidecomputer/sush/issues/23, we
@@ -189,7 +207,6 @@ impl State {
                             queued_jobs,
                             ..
                         } = &mut self.session
-                            && session.session_id() == session_id
                         {
                             let payload = signed.payload().clone();
 
@@ -207,7 +224,7 @@ impl State {
                             while let Some((request, params)) =
                                 queued_jobs.remove(&session.next_job_id())
                             {
-                                executor.job_start(request.payload().clone(), params);
+                                executor.job_start(request.payload().clone(), params).await;
                                 session.job_started(request);
                             }
                         }
@@ -221,9 +238,8 @@ impl State {
                             // state, because this is updated asynchronously, so
                             // we unconditionally tell the executor to stop the
                             // job, even if it may not have ever existed.
-                            if queued_jobs.remove(job_id).is_none() {
-                                executor.job_stop(job_id);
-                            }
+                            queued_jobs.remove(job_id);
+                            executor.job_stop(job_id);
                         } else {
                             // If we don't have a session, we still want to stop
                             // the job, because it could be from another session.
@@ -247,9 +263,16 @@ impl State {
                             baseboard_id.clone(),
                         ));
                         // TODO: evict old entries when crossing MAX_HISTORY
-                        // TODO: track the job status
+                        self.set_job_status(
+                            job_id,
+                            baseboard_id,
+                            JobStatus::Started {
+                                job_id: job_id.clone(),
+                                time_started: *when,
+                            },
+                        );
                     }
-                    JobEvent::JobEnd(job_id) => {
+                    JobEvent::JobEnd(job_id, status) => {
                         self.running.remove(&(job_id.clone(), baseboard_id.clone()));
                         self.causal_jobs.insert((
                             incoming_version.rank(),
@@ -257,9 +280,44 @@ impl State {
                             baseboard_id.clone(),
                         ));
                         // TODO: evict old entries when crossing MAX_HISTORY
-                        // TODO: track the job status
+                        if let Some(JobStatus::Started {
+                            job_id,
+                            time_started,
+                        }) = self
+                            .get_job_status(job_id)
+                            .and_then(|m| m.get(baseboard_id))
+                            .cloned()
+                        {
+                            let JobOutputState {
+                                stdout_len,
+                                stderr_len,
+                                stdout_hash,
+                                stderr_hash,
+                            } = match executor.output_dir().job_output_state(&job_id) {
+                                Ok(output) => output,
+                                Err(err) => {
+                                    todo!("report error collecting output state of {job_id}: {err}")
+                                }
+                            };
+                            self.set_job_status(
+                                &job_id,
+                                baseboard_id,
+                                JobStatus::Ended {
+                                    job_id: job_id.clone(),
+                                    time_started,
+                                    time_ended: Utc::now(),
+                                    status: status.clone(),
+                                    stdout_len,
+                                    stderr_len,
+                                    stdout_hash,
+                                    stderr_hash,
+                                },
+                            );
+                        }
                     }
-                    JobEvent::JobError(_process_error) => todo!(),
+                    JobEvent::JobError(job_id, process_error) => {
+                        todo!("report error for {job_id}: {process_error}")
+                    }
                 },
                 Event::Error(_error) => todo!(),
             },
@@ -277,17 +335,17 @@ impl StateManager {
     /// remote-received gossip messages, terminating when no further
     /// requests, events, or messages can be received.
     pub fn run<R>(
-        output_dir: PathBuf,
+        log: Logger,
+        output_dir: JobOutputDir,
         own_baseboard: BaseboardId,
         mut requests: R,
         rumors: Rumors<Message>,
         shutdown: CancellationToken,
-    ) -> watch::Receiver<State>
+    ) -> Arc<RwLock<State>>
     where
         R: Stream<Item = Request> + Send + Unpin + 'static,
     {
-        // We report our current state through a watch channel.
-        let (tx, rx) = watch::channel(State::new(own_baseboard.clone()));
+        let state = Arc::new(RwLock::new(State::default()));
 
         // We process messages in causal order, so that we can rely on
         // things like "the session stop happens after its corresponding
@@ -298,82 +356,83 @@ impl StateManager {
         let mut causal_messages = rumors.causal_messages();
 
         // The executor needs to have access to send messages back.
-        let (executor, mut events) = Executor::new(output_dir, shutdown);
+        let (mut executor, mut events) = Executor::new(output_dir, shutdown);
 
         // We will drop this once we want to drain the remaining messages.
         let mut rumors = Some(rumors);
 
-        spawn(async move {
-            // These flip both to `true` once our two input streams (local
-            // requests and local events from the executor) terminate. At
-            // this point, we must drop `rumors` and thereby permit its own
-            // `unordered_messages` stream to eventually be drained; we do
-            // this so that we fully update the local state until nothing
-            // more is left to do.
-            let mut requests_empty = false;
-            let mut events_empty = false;
+        spawn({
+            let state = state.clone();
+            async move {
+                info!(log, "managing state");
 
-            loop {
-                let to_send = requests.next();
-                let event = events.next();
-                let message = causal_messages.borrow_next();
+                // These flip both to `true` once our two input streams (local
+                // requests and local events from the executor) terminate. At
+                // this point, we must drop `rumors` and thereby permit its own
+                // `unordered_messages` stream to eventually be drained; we do
+                // this so that we fully update the local state until nothing
+                // more is left to do.
+                let mut requests_empty = false;
+                let mut events_empty = false;
 
-                // Once we drain the requests and events, we drop `rumors` so
-                // that if there are no outstanding copies elsewhere, we will
-                // drain it and then break.
-                //
-                // If there are still gossip sessions happening, those will
-                // complete and we will process their messages into the state.
-                if requests_empty && events_empty {
-                    rumors = None;
-                }
+                loop {
+                    let to_send = requests.next();
+                    let event = events.next();
+                    let message = causal_messages.borrow_next();
 
-                select! {
-                    // Forward all locally-input messages into the rumors state,
-                    // so they are processed by the state machine.
-                    next = to_send => match next {
-                        // When our incoming stream of locally injected messages
-                        // ends, we have no more local messages to process, but
-                        // we need to let all spawned tasks by the executor
-                        // quiesce, updating the state all the way.
-                        None => requests_empty = true,
-                        Some(request) => if let Some(rumors) = &rumors {
-                            rumors.send(Message::Request(request));
+                    // Once we drain the requests and events, we drop `rumors` so
+                    // that if there are no outstanding copies elsewhere, we will
+                    // drain it and then break.
+                    //
+                    // If there are still gossip sessions happening, those will
+                    // complete and we will process their messages into the state.
+                    if requests_empty && events_empty {
+                        rumors = None;
+                    }
+
+                    select! {
+                        // Forward local requests into the rumors state,
+                        // so they are processed by the state machine.
+                        next = to_send => match next {
+                            // When our incoming stream of locally injected messages
+                            // ends, we have no more local messages to process, but
+                            // we need to let all spawned tasks by the executor
+                            // quiesce, updating the state all the way.
+                            None => requests_empty = true,
+                            Some(request) => if let Some(rumors) = &rumors {
+                                debug!(log, "forwarding request to gossip network"; "request" => ?request);
+                                rumors.send(Message::Request(request));
+                            },
                         },
-                    },
-                    // Handle events produced by the executor.
-                    next = event => match next {
-                        None => events_empty = true,
-                        Some(event) => if let Some(rumors) = &rumors {
-                            rumors.send(Message::Event(own_baseboard.clone(), event));
+                        // Handle events produced by the executor.
+                        next = event => match next {
+                            None => events_empty = true,
+                            Some(event) => if let Some(rumors) = &rumors {
+                                debug!(log, "forwarding event to gossip network"; "event" => ?event);
+                                rumors.send(Message::Event(own_baseboard.clone(), event));
+                            },
                         },
-                    },
-                    next = message => match next {
-                        None => {
-                            // There are no more events, requests, or messages from
-                            // the gossip network. We're done.
-                            break;
-                        }
-                        Some((key, version, message)) => {
-                            // We unconditionally mark the watch sender as modified,
-                            // even though it might not be, because *most* of the
-                            // messages cause *some* modification of the state, and we
-                            // would rather be safe against future code changes than
-                            // manually tracking precisely which messages *don't* modify
-                            // state. The cost is a few spurious wakeups.
-                            let mut output = Ok(());
-                            tx.send_modify(|state| {
-                                output = state.update(&executor, key, version, message);
-                            });
-                            if let Err(error) = output && let Some(rumors) = &rumors {
-                                rumors.send(Message::Event(own_baseboard.clone(), Event::Error(error)));
+                        // Handle messages from the gossip network.
+                        next = message => match next {
+                            None => {
+                                // There are no more events, requests, or messages from
+                                // the gossip network. We're done.
+                                info!(log, "gossip network quiescent");
+                                break;
                             }
+                            Some((key, version, message)) => {
+                                let result = state.write().await.update(&mut executor, key, version, message).await;
+                                if let Err(error) = result && let Some(rumors) = &rumors {
+                                    debug!(log, "sending error to gossip network"; "error" => ?error);
+                                    rumors.send(Message::Event(own_baseboard.clone(), Event::Error(error)));
+                                }
+                            },
                         },
-                    },
+                    }
                 }
             }
         });
 
-        rx
+        state
     }
 }

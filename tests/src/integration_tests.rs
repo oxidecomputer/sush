@@ -1,13 +1,16 @@
 //! Oxide Support Shell integration tests.
 
+use std::time::Duration;
+
 use dropshot::{ConfigDropshot, ServerBuilder};
 use function_name::named;
 use futures::StreamExt as _;
 use tokio::test;
+use tokio::time::sleep;
 
 use sush_api::sush_api_mod::api_description;
 use sush_client::{Client, Error as ClientError};
-use sush_common::jobs::{JobLimits, JobOutputStream, JobStatus};
+use sush_common::jobs::{JobLimits, JobOutputStream, JobStatus, Session, SessionId};
 use sush_server::{ApiServer, ProxyServer};
 
 use crate::test_utils::{SignJobRequest as _, authz, manager_and_test_root, test_logger};
@@ -44,13 +47,14 @@ async fn client_server() {
     assert_eq!(iam, identity, "who am I?");
 
     // Start a session and run a job.
-    let session = client
+    let session = Session::new(SessionId::new());
+    client
         .session_start()
+        .session_id(session.session_id())
         .authorization(credentials.to_string())
         .send()
         .await
-        .unwrap()
-        .into_inner();
+        .unwrap();
     let job_id = session.next_job_id();
     let job = root
         .sign_job_request(&job_id, "echo -n $SUSH_JOB_ID", false)
@@ -60,28 +64,43 @@ async fn client_server() {
         max_mem,
         max_fsize,
     } = JobLimits::default();
-    let status = client
+    client
         .job_start()
         .authorization(credentials.to_string())
         .job_id(&job_id)
         .max_cpu(max_cpu)
         .max_mem(max_mem)
         .max_fsize(max_fsize)
-        .wait(true)
-        .body(job)
+        .body(job.into_signed())
         .send()
         .await
-        .unwrap()
-        .into_inner();
-    assert!(matches!(
-        status,
-        JobStatus::Ended {
-            job: j,
-            session_id: sid,
-            status: Ok(0),
-            ..
-        } if *j.job_id() == job_id && sid == *session.session_id()
-    ));
+        .unwrap();
+
+    // Poll for the job to end.
+    let mut ended = false;
+    for _ in 0..5 {
+        let status = client
+            .job_status()
+            .authorization(credentials.to_string())
+            .job_id(&job_id)
+            .send()
+            .await
+            .expect("should be able to get job status");
+        if matches!(
+            status.into_inner().values().next().expect("should have a job status"),
+            JobStatus::Ended {
+                job_id: jid,
+                status: Ok(0),
+                ..
+            } if *jid == job_id
+        ) {
+            ended = true;
+            break;
+        } else {
+            sleep(Duration::from_millis(100)).await;
+        }
+    }
+    assert!(ended, "could not get job status");
 
     // Check the job output.
     let mut output = client

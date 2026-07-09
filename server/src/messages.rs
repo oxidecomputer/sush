@@ -31,8 +31,18 @@ pub enum Message {
 
 #[derive(Clone, Debug, BorshDeserialize, BorshSerialize)]
 pub enum Request {
-    Session(SessionRequest),
-    Job(SessionId, JobRequest),
+    Session(Box<SessionRequest>),
+    Job(Box<JobRequest>),
+}
+
+impl Request {
+    pub fn session(request: SessionRequest) -> Self {
+        Self::Session(Box::new(request))
+    }
+
+    pub fn job(request: JobRequest) -> Self {
+        Self::Job(Box::new(request))
+    }
 }
 
 #[derive(Clone, Debug, BorshDeserialize, BorshSerialize)]
@@ -64,8 +74,8 @@ pub enum JobEvent {
         )]
         DateTime<Utc>,
     ),
-    JobEnd(JobId),
-    JobError(ProcessError),
+    JobEnd(JobId, Result<i32, ProcessError>),
+    JobError(JobId, ProcessError),
 }
 
 #[derive(Clone, Debug, BorshDeserialize, BorshSerialize)]

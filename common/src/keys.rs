@@ -476,7 +476,17 @@ impl<T: AsRef<[u8]>> ToBeSigned for T {
 }
 
 /// A signed envelope around some data.
-#[derive(BorshDeserialize, BorshSerialize, Clone, Debug, Deserialize, JsonSchema, Serialize)]
+#[derive(
+    BorshDeserialize,
+    BorshSerialize,
+    Clone,
+    Debug,
+    Deserialize,
+    Eq,
+    JsonSchema,
+    PartialEq,
+    Serialize,
+)]
 pub struct Signed<T> {
     payload: T,
     key_id: KeyId,

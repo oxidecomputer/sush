@@ -15,7 +15,7 @@ use sush_api::{
     JobStartParams, KeyIdParam, SessionIdParam, SushApi,
 };
 use sush_common::authn::Identity;
-use sush_common::jobs::{JobStatus, Session, SignedJob};
+use sush_common::jobs::{JsonJobStatusMap, Session, SignedJob, job_status_map_en};
 use sush_common::keys::{KeyId, SshPublicKey, pem_cert_chain};
 
 use crate::error::JobError;
@@ -91,7 +91,7 @@ impl SushApi for ApiServer {
         let mgr = ctx.context();
         let Authorization { authorization } = headers.into_inner();
         let authn = mgr.iam(authorization, None).await?;
-        if let Some(session) = mgr.session(&authn) {
+        if let Some(session) = mgr.session(&authn).await {
             Ok(HttpResponseOk(session))
         } else {
             Err(JobError::NoSession.into())
@@ -167,12 +167,14 @@ impl SushApi for ApiServer {
         ctx: RequestContext<Self::Context>,
         headers: Header<Authorization>,
         params: PathParams<JobIdParam>,
-    ) -> Result<HttpResponseOk<JobStatus>, HttpError> {
+    ) -> Result<HttpResponseOk<JsonJobStatusMap>, HttpError> {
         let mgr = ctx.context();
         let Authorization { authorization } = headers.into_inner();
         let authn = mgr.iam(authorization, None).await?;
         let JobIdParam { job_id } = params.into_inner();
-        Ok(HttpResponseOk(mgr.job_status(&authn, &job_id).await?))
+        Ok(HttpResponseOk(job_status_map_en(
+            mgr.job_status(&authn, &job_id).await?,
+        )))
     }
 
     async fn job_output(
@@ -189,7 +191,7 @@ impl SushApi for ApiServer {
         Ok(Response::new(stdout.into()))
     }
 
-    async fn job_start_interactive_session(
+    async fn job_attach(
         ctx: RequestContext<Self::Context>,
         headers: Header<Authorization>,
         params: PathParams<JobIdParam>,
@@ -199,11 +201,11 @@ impl SushApi for ApiServer {
         let Authorization { authorization } = headers.into_inner();
         let authn = mgr.iam(authorization, None).await?;
         let JobIdParam { job_id } = params.into_inner();
-        let session = mgr.job_start_interactive_session(&authn, &job_id).await?;
+        let socket_sender = mgr.job_attach(&authn, &job_id).await?;
         upgrade.handle(async move |conn| {
             let socket = conn.into_inner();
             let stream = WebSocketStream::from_raw_socket(socket, Role::Server, None).await;
-            session.try_send(stream).map_err(|_| {
+            socket_sender.try_send(stream).map_err(|_| {
                 HttpError::for_client_error(
                     None,
                     ClientErrorStatusCode::NOT_FOUND,
@@ -218,13 +220,17 @@ impl SushApi for ApiServer {
         ctx: RequestContext<Self::Context>,
         headers: Header<Authorization>,
         query: QueryParams<JobHistoryParams>,
-    ) -> Result<HttpResponseOk<Vec<JobStatus>>, HttpError> {
+    ) -> Result<HttpResponseOk<Vec<JsonJobStatusMap>>, HttpError> {
         let mgr = ctx.context();
         let Authorization { authorization } = headers.into_inner();
         let authn = mgr.iam(authorization, None).await?;
         let JobHistoryParams { limit, offset } = query.into_inner();
         Ok(HttpResponseOk(
-            mgr.job_history(&authn, limit, offset).await?,
+            mgr.job_history(&authn, limit, offset)
+                .await?
+                .into_iter()
+                .map(job_status_map_en)
+                .collect(),
         ))
     }
 }

@@ -5,9 +5,12 @@ use std::path::Path;
 use std::time::Duration;
 
 use clap::ValueEnum;
+use x509_cert::Certificate;
 
 use sush_common::authn::{Credentials, Identity};
-use sush_common::jobs::{JobId, JobOutputStream, JobStatus, Session, SessionId, SignedJob};
+use sush_common::jobs::{
+    JobId, JobOutputStream, JobStatusMap, Session, SessionId, SignedJob, VerifiedJob,
+};
 use sush_common::keys::{KeyId, SshPublicKey};
 
 use crate::commands::{CommandError, GlobalArgs};
@@ -54,11 +57,11 @@ pub trait CommandContext: Clone + Send + Sync {
     fn session_stopped(&mut self, session_id: &SessionId) -> Result<(), CommandError>;
 
     // Job signing certificates
-    fn cert_chain(&mut self, key_id: KeyId, certs: &str) -> Result<(), CommandError>;
+    fn cert_chain(&mut self, key_id: KeyId, certs: &str) -> Result<Certificate, CommandError>;
     fn cert_imported(&mut self, path: &Path, key_id: KeyId) -> Result<(), CommandError>;
 
     // Job management
-    fn job_started(&mut self, job: &SignedJob);
+    fn job_started(&mut self, job: &VerifiedJob);
     fn job_stopped(&mut self, id: &JobId);
     fn job_error(&mut self, error: CommandError) -> CommandError;
     fn job_output(&mut self, id: &JobId, stream: JobOutputStream, output: &[u8], binary: bool);
@@ -72,7 +75,7 @@ pub trait CommandContext: Clone + Send + Sync {
     fn job_output_update(&mut self, id: &JobId, stream: JobOutputStream, bytes: u64);
     fn job_output_finished(&mut self, id: &JobId, stream: JobOutputStream, stage: Option<&str>);
     fn job_polling_started(&mut self, id: &JobId, duration: Duration);
-    fn job_polling_update(&mut self, id: &JobId, status: &JobStatus);
+    fn job_polling_update(&mut self, id: &JobId, status: &JobStatusMap);
     fn job_polling_finished(&mut self, id: &JobId);
     fn job_session_connected(&mut self, id: &JobId);
     fn job_session_disconnected(&mut self, id: &JobId);
@@ -80,7 +83,7 @@ pub trait CommandContext: Clone + Send + Sync {
     fn job_signing_update(&mut self, id: &JobId);
     fn job_signing_finished(&mut self, id: &JobId);
     fn job_signed(&mut self, job: &SignedJob, show: bool);
-    fn job_status(&mut self, id: &JobId, status: &JobStatus);
+    fn job_status(&mut self, id: &JobId, status: &JobStatusMap);
     fn read_signed_job(&mut self) -> Result<SignedJob, CommandError>;
 
     // SSH agent and identity
