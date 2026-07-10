@@ -63,19 +63,20 @@ async fn main() -> Result<(), String> {
     // TODO: get/seed Rumors network
     let gossip = Peer::seed().into_rumors();
 
+    let shutdown = listen_for_shutdown()?;
     let mgr = JobManager::new(
         log.clone(),
         directory,
         baseboard,
         gossip,
-        listen_for_shutdown()?,
+        shutdown.clone(),
     )
     .await
     .map_err(|e| e.to_string())?;
 
     let api = api_description::<ApiServer>()
         .map_err(|error| format!("failed to get API description: {error}"))?;
-    ServerBuilder::new(api, mgr, log)
+    let server = ServerBuilder::new(api, mgr, log)
         .config(ConfigDropshot {
             bind_address: address,
             default_request_body_max_bytes: REQUEST_MAX_BODY_BYTES,
@@ -83,10 +84,10 @@ async fn main() -> Result<(), String> {
             log_headers: vec![],
         })
         .start()
-        .map_err(|error| format!("failed to start server: {error}"))?
-        .await?;
+        .map_err(|error| format!("failed to start server: {error}"))?;
 
-    Ok(())
+    shutdown.cancelled().await;
+    server.close().await
 }
 
 /// Trigger a cancellation token on receipt of a terminal Unix signal(7).
@@ -97,16 +98,12 @@ fn listen_for_shutdown() -> Result<CancellationToken, String> {
     let Ok(mut sigint) = signal(SignalKind::interrupt()) else {
         return Err("can't get SIGINT listener".to_string());
     };
-    let Ok(mut sigterm) = signal(SignalKind::terminate()) else {
-        return Err("can't get SIGTERM listener".to_string());
-    };
     let shutdown = CancellationToken::new();
     let trigger_shutdown = shutdown.clone();
     spawn(async move {
         select! {
             _ = sighup.recv() => (),
             _ = sigint.recv() => (),
-            _ = sigterm.recv() => (),
         }
         trigger_shutdown.cancel();
     });
