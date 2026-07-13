@@ -24,7 +24,7 @@ use rustix::termios::tcgetwinsize;
 use sled_hardware_types::{BaseboardId, BaseboardIdParseError};
 use thiserror::Error;
 use tokio::signal::ctrl_c;
-use tokio::time::{MissedTickBehavior, interval, sleep};
+use tokio::time::{MissedTickBehavior, interval};
 use tokio::{pin, select};
 use tokio_tungstenite::WebSocketStream;
 use tokio_tungstenite::tungstenite::error::Error as WebSocketError;
@@ -362,7 +362,7 @@ pub struct JobStartArgs {
     job_id: Option<JobId>,
 
     /// Job output is binary, not UTF-8 encoded text.
-    #[arg(short, long, default_value_t = false, requires = "wait")]
+    #[arg(short, long, default_value_t = false)]
     binary: bool,
 
     /// Run the job with a pseudoterminal and allow interactive sessions.
@@ -380,10 +380,6 @@ pub struct JobStartArgs {
     /// Terminal type for interactive jobs.
     #[arg(long, env = "TERM")]
     term: Option<String>,
-
-    /// Wait for the job to end and display its output.
-    #[arg(short, long, default_value_if("interactive", "true", "true"))]
-    wait: bool,
 }
 
 impl ClientCommand {
@@ -908,27 +904,17 @@ async fn job_start(
     job: VerifiedJob,
     start_args: JobStartArgs,
 ) -> Result<(), CommandError> {
-    let job_id = job.job_id().to_owned();
-    let interactive = job.interactive();
-    let JobStartArgs {
-        limits,
-        binary,
-        term,
-        wait,
-        ..
-    } = start_args;
+    let JobStartArgs { limits, term, .. } = start_args;
     let JobLimits {
         max_cpu,
         max_mem,
         max_fsize,
     } = limits.as_limits();
-
-    let mut start_ctx = ctx.clone();
-    let start = with_authz(&mut start_ctx, client, async |authz| {
+    with_authz(ctx, client, async |authz| {
         let mut start = client
             .job_start()
             .authorization(authz)
-            .job_id(&job_id)
+            .job_id(job.job_id())
             .max_cpu(max_cpu)
             .max_mem(max_mem)
             .max_fsize(max_fsize)
@@ -941,113 +927,9 @@ async fn job_start(
             }
         }
         start.send().await
-    });
-    pin!(start);
-
-    let mut found = true;
-    if interactive {
-        start.as_mut().await?;
-        ctx.job_started(&job);
-        found = match job_start_interactive_session(ctx, client, &job_id).await? {
-            InteractiveSessionOk::Established => true,
-            InteractiveSessionOk::NotFound => false,
-        };
-    } else {
-        let mut interval = interval(Duration::from_millis(250));
-        let mut stopped = false;
-        interval.set_missed_tick_behavior(MissedTickBehavior::Skip);
-        ctx.job_polling_started(&job_id, interval.period());
-        loop {
-            select! {
-                _ = &mut start => {
-                    ctx.job_polling_finished(&job_id);
-                    ctx.job_started(&job);
-                    break;
-                }
-                _ = interval.tick() => {
-                    if let Ok(status) = with_authz(ctx, client, async |authz| {
-                        client
-                            .job_status()
-                            .authorization(authz)
-                            .job_id(&job_id)
-                            .send()
-                            .await
-                    }).await
-                    {
-                        ctx.job_polling_update(
-                            &job_id,
-                            &job_status_map_de(status.into_inner())
-                                .map_err(CommandError::BaseboardIdParseError)?
-                        );
-                    }
-                }
-                _ = ctrl_c(), if !stopped => {
-                    // Stop the job, but don't break out of the select loop;
-                    // we must wait for the start future to resolve. But there
-                    // is a race here with the start request, so retry the stop
-                    // a few times if needed.
-                    for _ in 0..3 {
-                        match with_authz(ctx, client, async |authz| {
-                            client
-                                .job_stop()
-                                .authorization(authz)
-                                .job_id(&job_id)
-                                .send()
-                                .await
-                        }).await {
-                            Ok(_) => {
-                                stopped = true;
-                                break;
-                            }
-                            Err(CommandError::NotFound) => {
-                                sleep(Duration::from_millis(100)).await;
-                                continue;
-                            }
-                            Err(err) => {
-                                ctx.job_polling_finished(&job_id);
-                                return Err(err);
-                            }
-                        }
-                    }
-                }
-            }
-        }
-    };
-    let status = with_authz(ctx, client, async |authz| {
-        client
-            .job_status()
-            .authorization(authz)
-            .job_id(&job_id)
-            .send()
-            .await
     })
-    .await?
-    .into_inner();
-    ctx.job_status(
-        &job_id,
-        &job_status_map_de(status).map_err(CommandError::BaseboardIdParseError)?,
-    );
-    if wait || !found {
-        for stream in [Stdout, Stderr] {
-            match with_authz(ctx, client, async |authz| {
-                client
-                    .job_output()
-                    .authorization(authz)
-                    .job_id(&job_id)
-                    .stream(stream)
-                    .send()
-                    .await
-            })
-            .await
-            {
-                Ok(byte_stream) => {
-                    let output = byte_stream_to_vec(byte_stream.into_inner()).await?;
-                    ctx.job_output(&job_id, stream, &output, binary);
-                }
-                Err(error) => return Err(ctx.job_error(error)),
-            }
-        }
-    }
+    .await?;
+    ctx.job_started(&job);
     Ok(())
 }
 
