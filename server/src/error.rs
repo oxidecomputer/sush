@@ -7,7 +7,7 @@ use dropshot::{ClientErrorStatusCode, HttpError};
 use thiserror::Error;
 
 use sush_common::authn::{Challenge, Nonce};
-use sush_common::interactive::InteractiveSessionError;
+use sush_common::interactive::InteractiveJobError;
 use sush_common::jobs::{ExecutionError, JobId, JobOutputHash, SessionId};
 use sush_common::keys::{KeyError, KeyId};
 
@@ -30,7 +30,7 @@ pub enum JobError {
     #[error("Identity not found")]
     IdentityNotFound(KeyId),
     #[error("Interactive session error: {0}")]
-    InteractiveSession(#[from] InteractiveSessionError),
+    InteractiveJob(#[from] InteractiveJobError),
     #[error("Invalid command `{0}`, must not start with `-`")]
     InvalidCommand(String),
     #[error("Invalid or duplicate job ID")]
@@ -153,7 +153,7 @@ impl From<JobError> for HttpError {
             OutputTooBig => {
                 HttpError::for_client_error(None, ClientErrorStatusCode::PAYLOAD_TOO_LARGE, message)
             }
-            InteractiveSession(error) => HttpError::for_client_error(
+            InteractiveJob(error) => HttpError::for_client_error(
                 None,
                 ClientErrorStatusCode::NOT_FOUND,
                 error.to_string(),

@@ -1,4 +1,12 @@
-//! Interactive job sessions, server side.
+//! Interactive jobs, server side.
+//!
+//! When a client attaches to an interactive job, what that means on the
+//! server is that we have a new (stream made from a) WebSocket connection
+//! with the (authenticated) client on the other end. So an _attachment
+//! point_ is an MPSC channel over which we send the WebSocket stream,
+//! i.e., a [`SocketSender`]. The interactive job `select!` loop will
+//! receive the new socket and begin processing/relaying messages from/to
+//! it.
 
 use std::future::pending;
 use std::io::{self, SeekFrom};
@@ -12,76 +20,73 @@ use slog::{Logger, error, info};
 use tokio::fs::File;
 use tokio::io::{AsyncReadExt as _, AsyncSeekExt as _, AsyncWriteExt as _};
 use tokio::process::Child;
-use tokio::signal::unix::{SignalKind, signal};
-use tokio::sync::{mpsc, oneshot};
+use tokio::sync::mpsc;
 use tokio::task::JoinHandle;
 use tokio::time::{MissedTickBehavior, interval, sleep};
 use tokio::{select, spawn};
 use tokio_tungstenite::WebSocketStream;
 
 use sush_common::interactive::{
-    INTERACTIVE_SESSION_BUFFER_SIZE, INTERACTIVE_SESSION_REKEY_PERIOD, InteractiveSessionControl,
-    InteractiveSessionDecoder, InteractiveSessionEncoder, InteractiveSessionError,
-    InteractiveSessionMessage,
+    INTERACTIVE_JOB_BUFFER_SIZE, INTERACTIVE_JOB_REKEY_PERIOD, InteractiveJobControl,
+    InteractiveJobDecoder, InteractiveJobEncoder, InteractiveJobError, InteractiveJobMessage,
 };
+use tokio_util::sync::CancellationToken;
 
 use crate::pty::Pty;
 
-pub type ShutdownSession = oneshot::Sender<()>;
 pub type SocketStream = WebSocketStream<WebsocketConnectionRaw>;
 pub type SocketSender = mpsc::Sender<SocketStream>;
+pub type SocketReceiver = mpsc::Receiver<SocketStream>;
 
-pub struct InteractiveSession {
-    task: JoinHandle<Result<ExitStatus, InteractiveSessionError>>,
+pub struct InteractiveJob {
+    task: JoinHandle<Result<ExitStatus, InteractiveJobError>>,
     tx_client: SocketSender,
 }
 
-impl InteractiveSession {
-    pub fn start(log: Logger, child: Child, pty: Pty, output: File) -> (Self, ShutdownSession) {
+impl InteractiveJob {
+    pub fn start(
+        log: Logger,
+        child: Child,
+        pty: Pty,
+        output: File,
+        stop: CancellationToken,
+    ) -> Self {
         let (tx_client, rx_client) = mpsc::channel::<SocketStream>(1);
-        let (tx_shutdown, rx_shutdown) = oneshot::channel();
-        let task = spawn(interactive_session(
-            log,
-            child,
-            pty,
-            output,
-            rx_client,
-            rx_shutdown,
-        ));
-        (Self { task, tx_client }, tx_shutdown)
+        Self {
+            task: spawn(interactive_job(log, child, pty, output, rx_client, stop)),
+            tx_client,
+        }
     }
 
-    pub fn clients(&self) -> SocketSender {
+    pub fn attachment(&self) -> SocketSender {
         self.tx_client.clone()
     }
 
-    pub async fn wait(self) -> Result<ExitStatus, InteractiveSessionError> {
+    pub async fn wait(self) -> Result<ExitStatus, InteractiveJobError> {
         self.task.await?
     }
 }
 
-/// How long to continue trying to read from a dead process.
-const SESSION_DRAIN_TIMEOUT: Duration = Duration::from_millis(10);
+/// How long to continue trying to read from a dead job.
+const DRAIN_TIMEOUT: Duration = Duration::from_millis(10);
 
 /// Run an interactive job that allows, but does not require,
 /// a client connection via WebSocket.
-async fn interactive_session(
+async fn interactive_job(
     log: Logger,
     mut child: Child,
     mut pty: Pty,
     mut output: File,
     mut rx_client: mpsc::Receiver<SocketStream>,
-    mut rx_shutdown: oneshot::Receiver<()>,
-) -> Result<ExitStatus, InteractiveSessionError> {
-    let mut buffer = BytesMut::with_capacity(INTERACTIVE_SESSION_BUFFER_SIZE);
+    stop: CancellationToken,
+) -> Result<ExitStatus, InteractiveJobError> {
+    let mut buffer = BytesMut::with_capacity(INTERACTIVE_JOB_BUFFER_SIZE);
     let mut client = None::<SocketStream>;
-    let mut ping = None::<InteractiveSessionMessage>;
-    let mut decoder = InteractiveSessionDecoder::default();
-    let mut encoder = InteractiveSessionEncoder::default();
-    let mut interval = interval(INTERACTIVE_SESSION_REKEY_PERIOD);
+    let mut ping = None::<InteractiveJobMessage>;
+    let mut decoder = InteractiveJobDecoder::default();
+    let mut encoder = InteractiveJobEncoder::default();
+    let mut interval = interval(INTERACTIVE_JOB_REKEY_PERIOD);
     interval.set_missed_tick_behavior(MissedTickBehavior::Skip);
-    let mut sigchld = signal(SignalKind::child())?;
-    let mut shutdown = false;
     let mut died = false;
 
     // Client-induced errors must not break the loop;
@@ -104,7 +109,7 @@ async fn interactive_session(
             ping = Some(msg.clone());
             match $stream.send(encoder.encode(msg)?).await {
                 Ok(()) => {
-                    info!(log, "rekeyed session encoder");
+                    info!(log, "rekeyed interactive job encoder");
                 }
                 Err(error) => {
                     close_client!($stream, "failed to rekey client"; "error" => %error);
@@ -114,13 +119,13 @@ async fn interactive_session(
     }
 
     loop {
-        buffer.reserve(INTERACTIVE_SESSION_BUFFER_SIZE);
+        buffer.reserve(INTERACTIVE_JOB_BUFFER_SIZE);
         select! {
             // Read available job output, record it, and relay it to the client
             // if there is one. We try to read regardless of whether the process
-            // is known to be dead. It is essential to drain output that may be
-            // sent before the process dies, but which arrives after the signal
-            // of its death; the dead cannot speak, yet they may still be heard.
+            // is known to be dead; it is essential to drain output that may be
+            // sent before the process dies, but which arrives after detection
+            // of its death.
             Ok(n) = pty.read_buf(&mut buffer) => {
                 if n == 0 {
                     info!(log, "EOF from job process");
@@ -129,7 +134,7 @@ async fn interactive_session(
                 output.write_all(&buffer[..n]).await?;
                 let data = buffer.copy_to_bytes(n);
                 if let Some(stream) = client.as_mut() {
-                    let message = InteractiveSessionMessage::Data(data);
+                    let message = InteractiveJobMessage::Data(data);
                     if let Err(error) = stream.send(encoder.encode(message)?).await {
                         close_client!(stream, "failed to relay job output"; "error" => %error);
                     }
@@ -137,20 +142,12 @@ async fn interactive_session(
                 buffer.truncate(0);
             }
 
-            // Give output a chance to drain from a dead process. It would
-            // be great if there were a reliable, non-timeout way of doing
-            // this, but it appears there is not. OpenSSH does this too, FWIW.
-            _ = sleep(SESSION_DRAIN_TIMEOUT), if died || child.try_wait()?.is_some() => {
-                info!(log, "job output drained");
-                break;
-            }
-
             // Accept a new client, rekey it, and play back the last buffer.
             Some(mut stream) = rx_client.recv(), if !died => {
                 rekey_client!(stream);
-                if let Some(playback) = playback_buffer(&mut output, INTERACTIVE_SESSION_BUFFER_SIZE).await? {
+                if let Some(playback) = playback_buffer(&mut output, INTERACTIVE_JOB_BUFFER_SIZE).await? {
                     let playback_len = playback.len();
-                    let message = InteractiveSessionMessage::Data(playback);
+                    let message = InteractiveJobMessage::Data(playback);
                     match stream.send(encoder.encode(message)?).await {
                         Ok(()) => {
                             info!(log, "played back output"; "bytes" => playback_len);
@@ -170,7 +167,7 @@ async fn interactive_session(
                         if let Some(stream) = client.as_mut() {
                             match handle_client_message(&log, &mut pty, &mut decoder, &mut ping, message).await {
                                 Ok(()) => (),
-                                Err(InteractiveSessionError::Close) => {
+                                Err(InteractiveJobError::Close) => {
                                     info!(log, "client closed connection");
                                     client = None;
                                 }
@@ -195,24 +192,32 @@ async fn interactive_session(
                 }
             }
 
+            // Stop job on cancellation signal, but only once.
+            _ = stop.cancelled(), if !died => {
+                child.kill().await?;
+                info!(log, "job stopped by request");
+                died = true;
+            }
+
             // Notice when the job dies, but do not exit the loop;
             // we must continue reading output until we hit EOF or
             // the drain timeout expires.
-            _ = sigchld.recv(), if !died => {
+            _ = child.wait(), if !died => {
                 info!(log, "job process died");
                 died = true;
             }
 
-            // Kill job on shutdown signal, but only once.
-            Ok(()) = &mut rx_shutdown, if !died && !shutdown => {
-                info!(log, "job shutdown on signal");
-                child.start_kill()?;
-                shutdown = true;
+            // Give output a chance to drain from a dead process. It would
+            // be great if there were a reliable, non-timeout way of doing
+            // this, but it appears there is not. OpenSSH does this too, FWIW.
+            _ = sleep(DRAIN_TIMEOUT), if died => {
+                info!(log, "job output drained");
+                break;
             }
         }
     }
 
-    // Reap the job and collect its exit status.
+    // Reap the process.
     let status = child.wait().await?;
     if let Some(stream) = client.as_mut() {
         close_client!(stream);
@@ -229,24 +234,24 @@ async fn interactive_session(
 async fn handle_client_message(
     log: &Logger,
     pty: &mut Pty,
-    decoder: &mut InteractiveSessionDecoder,
-    ping: &mut Option<InteractiveSessionMessage>,
-    message: InteractiveSessionMessage,
-) -> Result<(), InteractiveSessionError> {
-    use InteractiveSessionMessage as ISM;
+    decoder: &mut InteractiveJobDecoder,
+    ping: &mut Option<InteractiveJobMessage>,
+    message: InteractiveJobMessage,
+) -> Result<(), InteractiveJobError> {
+    use InteractiveJobMessage as Message;
     match message {
-        ISM::Control(message) => match message {
-            InteractiveSessionControl::WindowChange(size) => pty.set_window_size(size)?,
+        Message::Control(message) => match message {
+            InteractiveJobControl::WindowChange(size) => pty.set_window_size(size)?,
         },
-        ISM::Data(bytes) => pty.write_all(&bytes).await?,
-        ISM::Ping(_) => return Err(InteractiveSessionError::UnsolicitedPing),
-        ISM::Pong(pong) => {
-            if let Some(ISM::Ping(ping)) = ping.take() {
+        Message::Data(bytes) => pty.write_all(&bytes).await?,
+        Message::Ping(_) => return Err(InteractiveJobError::UnsolicitedPing),
+        Message::Pong(pong) => {
+            if let Some(Message::Ping(ping)) = ping.take() {
                 decoder.rekey(pong, Some(ping));
-                info!(log, "rekeyed session decoder");
+                info!(log, "rekeyed interactive job decoder");
             }
         }
-        ISM::Close => return Err(InteractiveSessionError::Close),
+        Message::Close => return Err(InteractiveJobError::Close),
     }
     Ok(())
 }
@@ -266,7 +271,7 @@ where
 
 /// Fetch the last few bytes of the output file for client play back.
 /// Errors here indicate problems with the output file, and so should
-/// be treated as session-ending.
+/// be treated as job-ending.
 async fn playback_buffer(
     output_file: &mut File,
     output_bytes: usize,
@@ -312,10 +317,14 @@ mod test {
                 .stdout(pts.try_clone().unwrap())
                 .spawn()
                 .unwrap();
-            let (session, shutdown) =
-                InteractiveSession::start(log, child, pty, output_file.reopen().unwrap().into());
-            assert!(session.wait().await.unwrap().success());
-            assert!(shutdown.send(()).is_err());
+            let job = InteractiveJob::start(
+                log,
+                child,
+                pty,
+                output_file.reopen().unwrap().into(),
+                CancellationToken::new(),
+            );
+            assert!(job.wait().await.unwrap().success());
 
             // The output of `tty` on GNU/Linux is written using puts(3),
             // which uses two write(2) calls: one for the string, and one

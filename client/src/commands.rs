@@ -21,7 +21,6 @@ use memmap2::Mmap;
 use progenitor_client::ResponseValue;
 use reqwest::Upgraded;
 use rustix::termios::tcgetwinsize;
-use sled_hardware_types::{BaseboardId, BaseboardIdParseError};
 use thiserror::Error;
 use tokio::signal::ctrl_c;
 use tokio::time::{MissedTickBehavior, interval};
@@ -31,7 +30,7 @@ use tokio_tungstenite::tungstenite::error::Error as WebSocketError;
 use tokio_tungstenite::tungstenite::protocol::Role;
 
 use sush_common::authn::{AuthnError, Challenge, ChallengeResponse, Credentials, Identity};
-use sush_common::interactive::InteractiveSessionError;
+use sush_common::interactive::InteractiveJobError;
 use sush_common::jobs::JobOutputStream::{self, Stderr, Stdout};
 use sush_common::jobs::{
     JobId, JobLimits, JobOutputHash, JobStartRequest, JobStatus, Session, SessionId, SignedJob,
@@ -42,7 +41,7 @@ use sush_common::keys::{KeyError, KeyId, Signer as _};
 use crate::ByteStream;
 use crate::context::{CommandContext, OutputFormat};
 use crate::identity::{IdentityError, SshAgentConnection};
-use crate::interactive::interactive_session;
+use crate::interactive::interactive_job;
 use crate::permslip::PermslipError;
 use crate::permslip::{DEFAULT_PERMSLIP_URL, PermslipSigner};
 use crate::repl::Repl;
@@ -312,7 +311,7 @@ pub enum JobCommand {
     /// Get the standard output of a job.
     #[clap(alias = "output")]
     Stdout {
-        #[arg(short, long)]
+        #[arg(short, long, default_value = "*")]
         target: String,
 
         #[clap(flatten)]
@@ -322,16 +321,16 @@ pub enum JobCommand {
     /// Get the standard error of a job.
     #[clap(alias = "error")]
     Stderr {
-        #[arg(short, long)]
+        #[arg(short, long, default_value = "*")]
         target: String,
 
         #[clap(flatten)]
         output: JobOutput,
     },
 
-    /// Connect to a running interactive job.
-    Session {
-        /// The job to connect to.
+    /// Attach to an interactive job.
+    Attach {
+        /// The interactive job to attach to.
         #[clap(env = SUSH_JOB_ID)]
         job_id: JobId,
     },
@@ -806,46 +805,16 @@ async fn job(
             Ok(())
         }
 
-        (
-            JobCommand::Stdout {
-                target: baseboard_id,
-                output,
-            },
-            Some(client),
-        ) => {
-            job_output(
-                ctx,
-                client,
-                &baseboard_id
-                    .parse()
-                    .map_err(CommandError::BaseboardIdParseError)?,
-                Stdout,
-                output,
-            )
-            .await
+        (JobCommand::Stdout { target, output }, Some(client)) => {
+            job_output(ctx, client, &target, Stdout, output).await
         }
 
-        (
-            JobCommand::Stderr {
-                target: baseboard_id,
-                output,
-            },
-            Some(client),
-        ) => {
-            job_output(
-                ctx,
-                client,
-                &baseboard_id
-                    .parse()
-                    .map_err(CommandError::BaseboardIdParseError)?,
-                Stderr,
-                output,
-            )
-            .await
+        (JobCommand::Stderr { target, output }, Some(client)) => {
+            job_output(ctx, client, &target, Stderr, output).await
         }
 
-        (JobCommand::Session { job_id }, Some(client)) => {
-            job_start_interactive_session(ctx, client, &job_id).await?;
+        (JobCommand::Attach { job_id }, Some(client)) => {
+            job_attach(ctx, client, &job_id).await?;
             Ok(())
         }
 
@@ -969,7 +938,7 @@ type FutureChunk<'a> = dyn Future<Output = Result<Chunk, CommandError>> + Send +
 async fn job_output(
     ctx: &mut impl CommandContext,
     client: &Client,
-    baseboard_id: &BaseboardId,
+    target: &str,
     stream: JobOutputStream,
     JobOutput {
         job_id,
@@ -994,7 +963,19 @@ async fn job_output(
         .into_inner(),
     )
     .map_err(CommandError::BaseboardIdParseError)?;
-    let (stdout_len, stderr_len, stdout_hash, stderr_hash) = match status.get(baseboard_id) {
+
+    let baseboard_id = if target == "*" {
+        match status.len() {
+            1 => status.keys().next().unwrap().to_owned(),
+            0 => return Err(CommandError::NotFound),
+            _ => return Err(CommandError::MissingTarget),
+        }
+    } else {
+        target
+            .parse()
+            .map_err(CommandError::BaseboardIdParseError)?
+    };
+    let (stdout_len, stderr_len, stdout_hash, stderr_hash) = match status.get(&baseboard_id) {
         None => return Err(CommandError::NotFound),
         Some(JobStatus::Started { .. }) => {
             return Err(CommandError::JobStillRunning(job_id.to_owned()));
@@ -1170,7 +1151,7 @@ async fn byte_stream_to_file(
     }
 }
 
-enum InteractiveSessionOk {
+enum InteractiveJobOk {
     /// An interactive job session was established.
     Established,
 
@@ -1178,13 +1159,12 @@ enum InteractiveSessionOk {
     NotFound,
 }
 
-/// Connect via WebSockets to a running interactive job,
-/// providing authentication via an SSH agent.
-async fn job_start_interactive_session(
+/// Connect via WebSockets to a running interactive job.
+async fn job_attach(
     ctx: &mut impl CommandContext,
     client: &Client,
     job_id: &JobId,
-) -> Result<InteractiveSessionOk, CommandError> {
+) -> Result<InteractiveJobOk, CommandError> {
     match with_authz(ctx, client, async |authz| {
         client
             .job_attach()
@@ -1195,17 +1175,17 @@ async fn job_start_interactive_session(
     })
     .await
     {
-        Err(CommandError::NotFound) => Ok(InteractiveSessionOk::NotFound),
+        Err(CommandError::NotFound) => Ok(InteractiveJobOk::NotFound),
         Err(error) => Err(ctx.job_error(error)),
         Ok(socket) => {
-            ctx.job_session_connected(job_id);
+            ctx.job_attached(job_id);
             let socket = socket.into_inner();
             let stream = WebSocketStream::from_raw_socket(socket, Role::Client, None).await;
-            if let Err(error) = interactive_session(stream).await {
+            if let Err(error) = interactive_job(stream).await {
                 return Err(ctx.job_error(error.into()));
             }
-            ctx.job_session_disconnected(job_id);
-            Ok(InteractiveSessionOk::Established)
+            ctx.job_detached(job_id);
+            Ok(InteractiveJobOk::Established)
         }
     }
 }
@@ -1237,6 +1217,8 @@ pub enum CommandError {
              as `{key_id}`"
     )]
     IdentityMismatch { interactive: KeyId, key_id: KeyId },
+    #[error("❌ Interactive job error: {0}")]
+    Interactive(#[from] InteractiveJobError),
     #[error("❌ I/O error accessing `{path}`: {error}")]
     Io {
         path: PathBuf,
@@ -1264,6 +1246,8 @@ pub enum CommandError {
     MissingSession,
     #[error("❌ Missing SSH agent socket, try `--ssh-auth-sock`")]
     MissingSshAuthSock,
+    #[error("❌ Missing job target, try `--target`")]
+    MissingTarget,
     #[error("❌ Resource not found")]
     NotFound,
     #[error("❌ Command not supported in offline mode, try `--url`")]
@@ -1287,12 +1271,10 @@ pub enum CommandError {
     Recursive(#[from] Box<Self>),
     #[error("❌ Reqwest error: {0}")]
     Reqwest(#[from] reqwest::Error),
-    #[error("❌ Interactive session error: {0}")]
-    Session(#[from] InteractiveSessionError),
     #[error("❌ SSH signature error on key ID `{0}`")]
     Signature(KeyId),
-    #[error("❌ Can't parse baseboard ID: {0}")]
-    BaseboardIdParseError(BaseboardIdParseError),
+    #[error("❌ Can't parse target baseboard ID: {0}")]
+    BaseboardIdParseError(sled_hardware_types::BaseboardIdParseError),
     #[error("❌ SSH key error: {0}")]
     SshKey(#[from] kms_agent_lib::ssh_key::Error),
     #[error("❌ Too much output to display on terminal, try `--file`")]

@@ -12,7 +12,7 @@ use futures::{Stream, StreamExt};
 use rumors::before::Rank;
 use rumors::{Key, Rumors, Version};
 use sled_hardware_types::BaseboardId;
-use slog::{Logger, debug, info};
+use slog::{Logger, debug, info, o};
 use sush_api::JobStartParams;
 use sush_common::jobs::{JobId, JobStatus, JobStatusMap, Session, VerifiedJob};
 use tokio::sync::RwLock;
@@ -20,6 +20,7 @@ use tokio::{select, spawn};
 use tokio_util::sync::CancellationToken;
 
 use crate::executor::Executor;
+use crate::interactive::SocketSender;
 use crate::messages::{Error, Event, JobEvent, JobRequest, Message, Request, SessionRequest};
 use crate::output::{JobOutputDir, JobOutputState};
 
@@ -37,6 +38,8 @@ pub struct State {
     job_status: BTreeMap<JobId, JobStatusMap>,
     /// The current state of the active session, if any.
     session: SessionState,
+    /// Attachment points (socket senders) for interactive jobs.
+    attachments: BTreeMap<JobId, SocketSender>,
 }
 
 impl State {
@@ -50,6 +53,7 @@ impl State {
         baseboard_id: &BaseboardId,
         status: JobStatus,
     ) {
+        // TODO: evict old entries when crossing MAX_HISTORY
         let set_status = |map: &mut BTreeMap<BaseboardId, JobStatus>| {
             map.insert(baseboard_id.clone(), status.clone());
         };
@@ -62,11 +66,16 @@ impl State {
                 status
             });
     }
+
+    pub fn get_attachment(&self, job_id: &JobId) -> Option<&SocketSender> {
+        self.attachments.get(job_id)
+    }
 }
 
 /// Maximum number of historical job statuses to retain before evicting them.
 /// This is specified as 32 (maximum sleds per rack) times 2,048 (maximum
 /// "scrollback" per sled).
+#[allow(dead_code)]
 const MAX_HISTORY: usize = 32 * 2048;
 
 #[derive(Clone, Debug, Default)]
@@ -202,11 +211,16 @@ impl State {
                         // receive a job from a session before that
                         // session's own start (since each session is
                         // linearized by its accepting server).
-                        if let Active {
-                            session,
-                            queued_jobs,
+                        if let Self {
+                            session:
+                                Active {
+                                    session,
+                                    queued_jobs,
+                                    ..
+                                },
+                            attachments: interactive_jobs,
                             ..
-                        } = &mut self.session
+                        } = self
                         {
                             let payload = signed.payload().clone();
 
@@ -224,7 +238,11 @@ impl State {
                             while let Some((request, params)) =
                                 queued_jobs.remove(&session.next_job_id())
                             {
-                                executor.job_start(request.payload().clone(), params).await;
+                                if let Some(attach) =
+                                    executor.job_start(request.payload().clone(), params).await
+                                {
+                                    interactive_jobs.insert(request.job_id().clone(), attach);
+                                }
                                 session.job_started(request);
                             }
                         }
@@ -246,8 +264,9 @@ impl State {
                             executor.job_stop(job_id);
                         }
                     }
-                    JobRequest::Attach(job_id) => {
-                        todo!("attach a new interactive session to {job_id}")
+                    JobRequest::Attach(_job_id) => {
+                        // Attachment is handled locally; it is a request for
+                        // for logging purposes only.
                     }
                 },
             },
@@ -262,7 +281,6 @@ impl State {
                             job_id.clone(),
                             baseboard_id.clone(),
                         ));
-                        // TODO: evict old entries when crossing MAX_HISTORY
                         self.set_job_status(
                             job_id,
                             baseboard_id,
@@ -273,13 +291,14 @@ impl State {
                         );
                     }
                     JobEvent::JobEnd(job_id, status) => {
+                        executor.job_stopped(job_id);
+                        self.attachments.remove(job_id);
                         self.running.remove(&(job_id.clone(), baseboard_id.clone()));
                         self.causal_jobs.insert((
                             incoming_version.rank(),
                             job_id.clone(),
                             baseboard_id.clone(),
                         ));
-                        // TODO: evict old entries when crossing MAX_HISTORY
                         if let Some(JobStatus::Started {
                             job_id,
                             time_started,
@@ -333,7 +352,9 @@ pub struct StateManager {}
 impl StateManager {
     /// Run the state machine over all locally-injected `messages` and
     /// remote-received gossip messages, terminating when no further
-    /// requests, events, or messages can be received.
+    /// requests, events, or messages can be received. Returns a shared
+    /// `State` that will be asynchronously updated in response to
+    /// messages and events.
     pub fn run<R>(
         log: Logger,
         output_dir: JobOutputDir,
@@ -356,7 +377,8 @@ impl StateManager {
         let mut causal_messages = rumors.causal_messages();
 
         // The executor needs to have access to send messages back.
-        let (mut executor, mut events) = Executor::new(output_dir, shutdown);
+        let (mut executor, mut events) =
+            Executor::new(log.new(o!("component" => "executor")), output_dir, shutdown);
 
         // We will drop this once we want to drain the remaining messages.
         let mut rumors = Some(rumors);
@@ -421,6 +443,7 @@ impl StateManager {
                                 break;
                             }
                             Some((key, version, message)) => {
+                                // Update the shared state.
                                 let result = state.write().await.update(&mut executor, key, version, message).await;
                                 if let Err(error) = result && let Some(rumors) = &rumors {
                                     debug!(log, "sending error to gossip network"; "error" => ?error);

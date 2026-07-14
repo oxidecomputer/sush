@@ -77,8 +77,8 @@ pub trait CommandContext: Clone + Send + Sync {
     fn job_polling_started(&mut self, id: &JobId, duration: Duration);
     fn job_polling_update(&mut self, id: &JobId, status: &JobStatusMap);
     fn job_polling_finished(&mut self, id: &JobId);
-    fn job_session_connected(&mut self, id: &JobId);
-    fn job_session_disconnected(&mut self, id: &JobId);
+    fn job_attached(&mut self, id: &JobId);
+    fn job_detached(&mut self, id: &JobId);
     fn job_signing_started(&mut self, id: &JobId);
     fn job_signing_update(&mut self, id: &JobId);
     fn job_signing_finished(&mut self, id: &JobId);

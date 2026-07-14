@@ -412,14 +412,18 @@ impl JobManager {
         self.output_dir.job_output(job_id, stream, range).await
     }
 
-    pub async fn job_attach(
+    pub async fn job_attachment(
         &self,
         authn: &Identity,
         job_id: &JobId,
     ) -> Result<SocketSender, JobError> {
         self.job_request(authn, JobRequest::Attach(job_id.to_owned()))
             .await?;
-        todo!("get interactive session socket sender somehow")
+        if let Some(attachment) = self.state.read().await.get_attachment(job_id) {
+            Ok(attachment.to_owned())
+        } else {
+            Err(JobError::JobNotFound(job_id.to_owned()))
+        }
     }
 
     pub async fn job_history(

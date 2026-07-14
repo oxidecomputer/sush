@@ -27,6 +27,7 @@ serde.workspace = true
 serde_json.workspace = true
 signature.workspace = true
 sled-hardware-types.workspace = true
+slog.workspace = true
 ssh-key.workspace = true
 sha2.workspace = true
 tempfile.workspace = true

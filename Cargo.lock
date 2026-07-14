@@ -3683,6 +3683,7 @@ dependencies = [
  "sha2",
  "signature",
  "sled-hardware-types",
+ "slog",
  "ssh-key",
  "tempfile",
  "thiserror 1.0.69",
@@ -3741,6 +3742,7 @@ dependencies = [
 name = "sush-tests"
 version = "0.1.0"
 dependencies = [
+ "bytes",
  "chrono",
  "dropshot",
  "function_name",
@@ -3758,6 +3760,7 @@ dependencies = [
  "sush-server",
  "tempfile",
  "tokio",
+ "tokio-tungstenite",
  "tokio-util",
  "x509-cert",
 ]

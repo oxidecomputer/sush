@@ -64,15 +64,9 @@ async fn main() -> Result<(), String> {
     let gossip = Peer::seed().into_rumors();
 
     let shutdown = listen_for_shutdown()?;
-    let mgr = JobManager::new(
-        log.clone(),
-        directory,
-        baseboard,
-        gossip,
-        shutdown.clone(),
-    )
-    .await
-    .map_err(|e| e.to_string())?;
+    let mgr = JobManager::new(log.clone(), directory, baseboard, gossip, shutdown.clone())
+        .await
+        .map_err(|e| e.to_string())?;
 
     let api = api_description::<ApiServer>()
         .map_err(|error| format!("failed to get API description: {error}"))?;

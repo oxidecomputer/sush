@@ -21,7 +21,7 @@ use sled_hardware_types::{BaseboardId, BaseboardIdParseError};
 use thiserror::Error;
 
 use crate::codephrases::{WORD_SEPARATOR, generate_id, id_phrase};
-use crate::interactive::InteractiveSessionError;
+use crate::interactive::InteractiveJobError;
 use crate::keys::{Signed, ToBeSigned, Verified};
 
 /// A globally unique identifier for a job within a session.
@@ -72,6 +72,17 @@ impl From<&Self> for JobId {
 impl<S: AsRef<str>> From<S> for JobId {
     fn from(s: S) -> Self {
         Self(s.as_ref().to_string())
+    }
+}
+
+impl slog::Value for JobId {
+    fn serialize(
+        &self,
+        _rec: &slog::Record,
+        key: slog::Key,
+        serializer: &mut dyn slog::Serializer,
+    ) -> slog::Result {
+        serializer.emit_str(key, self)
     }
 }
 
@@ -351,7 +362,7 @@ pub struct ExecutionError {
 }
 
 impl ExecutionError {
-    pub fn interactive(job_id: JobId, error: InteractiveSessionError) -> Self {
+    pub fn interactive(job_id: JobId, error: InteractiveJobError) -> Self {
         let time = Utc::now();
         Self {
             job_id,

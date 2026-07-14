@@ -201,16 +201,12 @@ impl SushApi for ApiServer {
         let Authorization { authorization } = headers.into_inner();
         let authn = mgr.iam(authorization, None).await?;
         let JobIdParam { job_id } = params.into_inner();
-        let socket_sender = mgr.job_attach(&authn, &job_id).await?;
+        let attachment = mgr.job_attachment(&authn, &job_id).await?;
         upgrade.handle(async move |conn| {
             let socket = conn.into_inner();
             let stream = WebSocketStream::from_raw_socket(socket, Role::Server, None).await;
-            socket_sender.try_send(stream).map_err(|_| {
-                HttpError::for_client_error(
-                    None,
-                    ClientErrorStatusCode::NOT_FOUND,
-                    String::from("Interactive session unavailable"),
-                )
+            attachment.try_send(stream).map_err(|_| {
+                HttpError::for_internal_error(String::from("Unable to attach to interactive job"))
             })?;
             Ok(())
         })

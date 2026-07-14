@@ -292,17 +292,19 @@ impl CommandContext for Cli {
         }
     }
 
-    fn job_session_connected(&mut self, job_id: &JobId) {
+    fn job_attached(&mut self, job_id: &JobId) {
         match self.get_output_format() {
-            OutputFormat::Json => println!("{}", json!({"connected": job_id})),
-            OutputFormat::Text => println!("✅ Connected to interactive job `{job_id}`"),
+            OutputFormat::Json => println!("{}", json!({"attached": job_id})),
+            OutputFormat::Text => {
+                println!("✅ Attached to interactive job `{job_id}`, detach with `^]`")
+            }
         }
     }
 
-    fn job_session_disconnected(&mut self, job_id: &JobId) {
+    fn job_detached(&mut self, job_id: &JobId) {
         match self.get_output_format() {
-            OutputFormat::Json => println!("{}", json!({"disconnected": job_id})),
-            OutputFormat::Text => println!("\r✅ Disconnected interactive job `{job_id}`"),
+            OutputFormat::Json => println!("{}", json!({"detached": job_id})),
+            OutputFormat::Text => println!("✅ Detached from interactive job `{job_id}`"),
         }
     }
 
@@ -365,73 +367,75 @@ impl CommandContext for Cli {
         }
 
         // TODO: parallel status display
-        for (baseboard_id, status) in status {
-            match self.get_output_format() {
-                OutputFormat::Json => println!("{}", json!(status)),
-                OutputFormat::Text => match status {
-                    JobStatus::Started {
-                        job_id,
-                        time_started,
-                    } => {
-                        println!(
-                            "✅ Job ID:\t{job_id}\n   \
-                             Target:\t{baseboard_id}\n   \
-                             Job status:\tStarted\n   \
-                             Started at:\t{time_started}"
-                        )
+        match self.get_output_format() {
+            OutputFormat::Json => println!("{}", json!(status)),
+            OutputFormat::Text => {
+                for (baseboard_id, status) in status {
+                    match status {
+                        JobStatus::Started {
+                            job_id,
+                            time_started,
+                        } => {
+                            println!(
+                                "✅ Job ID:\t{job_id}\n   \
+                                    Target:\t{baseboard_id}\n   \
+                                    Job status:\tStarted\n   \
+                                    Started at:\t{time_started}"
+                            )
+                        }
+                        JobStatus::Ended {
+                            job_id,
+                            time_started,
+                            time_ended,
+                            status: Ok(exit_status),
+                            stdout_len,
+                            stderr_len,
+                            stdout_hash,
+                            stderr_hash,
+                        } => {
+                            let duration = format_elapsed_duration(status.time_elapsed());
+                            let stdout_len = byte_size(*stdout_len);
+                            let stderr_len = byte_size(*stderr_len);
+                            println!(
+                                "✅ Job ID:\t{job_id}\n   \
+                                    Target:\t{baseboard_id}\n   \
+                                    Job status:\tEnded\n   \
+                                    Started at:\t{time_started}\n   \
+                                    Ended at:\t{time_ended} ({duration})\n   \
+                                    Exit status:\t{exit_status}\n   \
+                                    Stdout len:\t{stdout_len}\n   \
+                                    Stderr len:\t{stderr_len}\n   \
+                                    Stdout hash:\t{stdout_hash}\n   \
+                                    Stderr hash:\t{stderr_hash}",
+                            );
+                        }
+                        JobStatus::Ended {
+                            job_id,
+                            time_started,
+                            time_ended,
+                            status: Err(err),
+                            stdout_len,
+                            stderr_len,
+                            stdout_hash,
+                            stderr_hash,
+                        } => {
+                            let duration = format_elapsed_duration(status.time_elapsed());
+                            let stdout_len = byte_size(*stdout_len);
+                            let stderr_len = byte_size(*stderr_len);
+                            println!(
+                                "✅ Job ID:\t{job_id}\n   \
+                                    Target:\t{baseboard_id}\n   \
+                                    Job status:\t{err}\n   \
+                                    Started at:\t{time_started}\n   \
+                                    Stopped at:\t{time_ended} ({duration})\n   \
+                                    Stdout len:\t{stdout_len}\n   \
+                                    Stderr len:\t{stderr_len}\n   \
+                                    Stdout hash:\t{stdout_hash}\n   \
+                                    Stderr hash:\t{stderr_hash}",
+                            );
+                        }
                     }
-                    JobStatus::Ended {
-                        job_id,
-                        time_started,
-                        time_ended,
-                        status: Ok(exit_status),
-                        stdout_len,
-                        stderr_len,
-                        stdout_hash,
-                        stderr_hash,
-                    } => {
-                        let duration = format_elapsed_duration(status.time_elapsed());
-                        let stdout_len = byte_size(*stdout_len);
-                        let stderr_len = byte_size(*stderr_len);
-                        println!(
-                            "✅ Job ID:\t{job_id}\n   \
-                             Target:\t{baseboard_id}\n   \
-                             Job status:\tEnded\n   \
-                             Started at:\t{time_started}\n   \
-                             Ended at:\t{time_ended} ({duration})\n   \
-                             Exit status:\t{exit_status}\n   \
-                             Stdout len:\t{stdout_len}\n   \
-                             Stderr len:\t{stderr_len}\n   \
-                             Stdout hash:\t{stdout_hash}\n   \
-                             Stderr hash:\t{stderr_hash}",
-                        );
-                    }
-                    JobStatus::Ended {
-                        job_id,
-                        time_started,
-                        time_ended,
-                        status: Err(err),
-                        stdout_len,
-                        stderr_len,
-                        stdout_hash,
-                        stderr_hash,
-                    } => {
-                        let duration = format_elapsed_duration(status.time_elapsed());
-                        let stdout_len = byte_size(*stdout_len);
-                        let stderr_len = byte_size(*stderr_len);
-                        println!(
-                            "✅ Job ID:\t{job_id}\n   \
-                             Target:\t{baseboard_id}\n   \
-                             Job status:\t{err}\n   \
-                             Started at:\t{time_started}\n   \
-                             Stopped at:\t{time_ended} ({duration})\n   \
-                             Stdout len:\t{stdout_len}\n   \
-                             Stderr len:\t{stderr_len}\n   \
-                             Stdout hash:\t{stdout_hash}\n   \
-                             Stderr hash:\t{stderr_hash}",
-                        );
-                    }
-                },
+                }
             }
         }
     }

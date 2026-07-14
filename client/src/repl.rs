@@ -287,12 +287,12 @@ impl CommandContext for Repl {
         self.cli.job_polling_finished(job_id);
     }
 
-    fn job_session_connected(&mut self, job_id: &JobId) {
-        self.cli.job_session_connected(job_id);
+    fn job_attached(&mut self, job_id: &JobId) {
+        self.cli.job_attached(job_id);
     }
 
-    fn job_session_disconnected(&mut self, job_id: &JobId) {
-        self.cli.job_session_disconnected(job_id);
+    fn job_detached(&mut self, job_id: &JobId) {
+        self.cli.job_detached(job_id);
     }
 
     fn job_signing_started(&mut self, job_id: &JobId) {
