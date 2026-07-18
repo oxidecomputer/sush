@@ -20,6 +20,7 @@ use serde::{Deserialize, Serialize, Serializer};
 use sled_hardware_types::{BaseboardId, BaseboardIdParseError};
 use thiserror::Error;
 
+use crate::borsh::{borsh_de_datetime, borsh_de_hash, borsh_ser_datetime, borsh_ser_hash};
 use crate::codephrases::{WORD_SEPARATOR, generate_id, id_phrase};
 use crate::interactive::InteractiveJobError;
 use crate::keys::{Signed, ToBeSigned, Verified};
@@ -265,14 +266,23 @@ pub type VerifiedJob = Verified<JobStartRequest>;
 pub enum JobStatus {
     Started {
         job_id: JobId,
-        #[borsh(serialize_with = "datetime_ser", deserialize_with = "datetime_de")]
+        #[borsh(
+            serialize_with = "borsh_ser_datetime",
+            deserialize_with = "borsh_de_datetime"
+        )]
         time_started: DateTime<Utc>,
     },
     Ended {
         job_id: JobId,
-        #[borsh(serialize_with = "datetime_ser", deserialize_with = "datetime_de")]
+        #[borsh(
+            serialize_with = "borsh_ser_datetime",
+            deserialize_with = "borsh_de_datetime"
+        )]
         time_started: DateTime<Utc>,
-        #[borsh(serialize_with = "datetime_ser", deserialize_with = "datetime_de")]
+        #[borsh(
+            serialize_with = "borsh_ser_datetime",
+            deserialize_with = "borsh_de_datetime"
+        )]
         time_ended: DateTime<Utc>,
         status: Result<i32, ProcessError>,
         stdout_len: u64,
@@ -432,7 +442,7 @@ impl JobStatus {
 pub struct JobOutputHash(
     #[serde(serialize_with = "hash_ser", deserialize_with = "hash_de")]
     #[schemars(schema_with = "hash_schema")]
-    #[borsh(serialize_with = "hash_borsh_ser", deserialize_with = "hash_borsh_de")]
+    #[borsh(serialize_with = "borsh_ser_hash", deserialize_with = "borsh_de_hash")]
     Hash,
 );
 
@@ -497,44 +507,6 @@ fn hash_schema(g: &mut SchemaGenerator) -> Schema {
     let mut schema: SchemaObject = <String>::json_schema(g).into();
     schema.format = Some("hex encoded hash (32 bytes)".to_owned());
     schema.into()
-}
-
-/// Borsh-encode a [`Hash`] as its 32 raw bytes.
-///
-/// `blake3::Hash` has no native Borsh impl; the wire form is the fixed-width
-/// digest with no length prefix.
-fn hash_borsh_ser<W: borsh::io::Write>(hash: &Hash, writer: &mut W) -> borsh::io::Result<()> {
-    writer.write_all(hash.as_bytes())
-}
-
-fn hash_borsh_de<R: borsh::io::Read>(reader: &mut R) -> borsh::io::Result<Hash> {
-    let mut bytes = [0u8; blake3::OUT_LEN];
-    reader.read_exact(&mut bytes)?;
-    Ok(Hash::from(bytes))
-}
-
-/// Borsh-encode a [`DateTime<Utc>`] as `(timestamp_seconds, subsec_nanos)`.
-///
-/// `chrono` exposes no Borsh feature, so we encode the two integer components
-/// directly. The nanosecond part may reach 1_999_999_999 during a leap second;
-/// [`DateTime::from_timestamp`] accepts that range, so the pair round-trips.
-fn datetime_ser<W: borsh::io::Write>(
-    time: &DateTime<Utc>,
-    writer: &mut W,
-) -> borsh::io::Result<()> {
-    BorshSerialize::serialize(&time.timestamp(), writer)?;
-    BorshSerialize::serialize(&time.timestamp_subsec_nanos(), writer)
-}
-
-fn datetime_de<R: borsh::io::Read>(reader: &mut R) -> borsh::io::Result<DateTime<Utc>> {
-    let secs = i64::deserialize_reader(reader)?;
-    let nanos = u32::deserialize_reader(reader)?;
-    DateTime::from_timestamp(secs, nanos).ok_or_else(|| {
-        borsh::io::Error::new(
-            borsh::io::ErrorKind::InvalidData,
-            "timestamp out of representable range",
-        )
-    })
 }
 
 /// Limits on job processes.
