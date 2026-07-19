@@ -9,10 +9,11 @@ use sled_hardware_types::BaseboardId;
 use sush_api::JobStartParams;
 use uuid::Uuid;
 
-use sush_common::borsh::{
-    borsh_de_baseboard_id, borsh_de_datetime, borsh_ser_baseboard_id, borsh_ser_datetime,
-};
 use sush_common::jobs::{JobId, ProcessError, SessionId, SignedJob};
+use sush_common::{
+    borsh::{borsh_de_baseboard_id, borsh_de_datetime, borsh_ser_baseboard_id, borsh_ser_datetime},
+    jobs::JobOutputState,
+};
 
 #[derive(BorshDeserialize, BorshSerialize, Copy, Clone, Debug, Eq, PartialEq)]
 pub struct RequestId(pub Uuid);
@@ -75,7 +76,7 @@ pub enum JobEvent {
         )]
         DateTime<Utc>,
     ),
-    End(
+    Stop(
         JobId,
         #[borsh(
             serialize_with = "borsh_ser_datetime",
@@ -83,6 +84,7 @@ pub enum JobEvent {
         )]
         DateTime<Utc>,
         Result<i32, ProcessError>,
+        JobOutputState,
     ),
     Error(
         JobId,

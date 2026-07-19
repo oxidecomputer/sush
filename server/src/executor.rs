@@ -119,9 +119,36 @@ impl Executor {
             format!("creating job stderr file `{}`", stderr_path.display())
         );
 
+        let get_output_state = {
+            let job_id = job_id.clone();
+            let events = self.events.clone();
+            let output_dir = self.output_dir.clone();
+            async move || match output_dir.job_output_state(&job_id).await {
+                Ok(output) => Ok(output),
+                Err(err) => {
+                    let _ = events
+                        .send(Event::Job(JobEvent::Error(job_id, Utc::now(), err.error())))
+                        .await;
+                    Err(err)
+                }
+            }
+        };
+
+        // Validate the job command.
+        if command.starts_with('-') {
+            let _ = self
+                .events
+                .send(Event::Job(JobEvent::Error(
+                    job_id,
+                    Utc::now(),
+                    ProcessError::InvalidCommand,
+                )))
+                .await;
+            return None;
+        }
+
         // Set up the job command.
         let mut cmd = Command::new("bash");
-        assert!(!command.starts_with('-'), "should have validated command");
         cmd.arg("-c").arg(&command);
 
         // Set up basic environment.
@@ -145,7 +172,7 @@ impl Executor {
         let stop = self.shutdown.child_token();
         self.stop.insert(job_id.clone(), stop.clone());
 
-        let attachment = if interactive {
+        if interactive {
             // Create a pseudoterminal and wire the child up to it.
             let (pty, pts, pts_path) =
                 with_io_err!(Pty::open(), "opening pseudoterminal".to_string());
@@ -185,13 +212,17 @@ impl Executor {
                 }
             };
 
-            // Start the interactive job.
+            // Start and report the interactive job.
             let child = with_io_err!(cmd.spawn(), "spawning job process".to_string());
             let log = self
                 .log
                 .new(o!("interactive" => true, "job_id" => job_id.clone()));
             let job = InteractiveJob::start(log, child, pty, stdout_file, stop);
             let attachment = job.attachment();
+            let _ = self
+                .events
+                .send(Event::Job(JobEvent::Start(job_id.clone(), Utc::now())))
+                .await;
 
             spawn({
                 // Wait for the interactive job to end, and send an event when it does.
@@ -203,8 +234,14 @@ impl Executor {
                         Err(err) => Err(ProcessError::Interactive(err.to_string())),
                     };
                     let _ = events
-                        .send(Event::Job(JobEvent::End(job_id, Utc::now(), result)))
+                        .send(Event::Job(JobEvent::Stop(
+                            job_id,
+                            Utc::now(),
+                            result,
+                            get_output_state().await.map_err(|e| e.error())?,
+                        )))
                         .await;
+                    Ok::<_, ProcessError>(())
                 }
             });
 
@@ -215,8 +252,12 @@ impl Executor {
                 .stdout(stdout_file.into_std().await)
                 .stderr(stderr_file.into_std().await);
 
-            // Execute!
+            // Start and report.
             let mut child = with_io_err!(cmd.spawn(), "spawning job process".to_string());
+            let _ = self
+                .events
+                .send(Event::Job(JobEvent::Start(job_id.clone(), Utc::now())))
+                .await;
 
             // Wait for or induce death, and send an event when that happens.
             spawn({
@@ -225,6 +266,7 @@ impl Executor {
                 let mut stopped = false;
                 async move {
                     loop {
+                        let get_output_state = get_output_state.clone();
                         select! {
                             _ = stop.cancelled(), if !stopped => {
                                 match child.kill().await {
@@ -233,29 +275,35 @@ impl Executor {
                                         continue;
                                     }
                                     Err(err) => {
-                                        let _ = events
-                                            .send(Event::Job(JobEvent::End(
-                                                job_id,
-                                                Utc::now(),
-                                                Err(ProcessError::io("stopping job process", err)),
-                                            )))
-                                            .await;
+                                        if let Ok(output_state) = get_output_state().await {
+                                            let _ = events
+                                                .send(Event::Job(JobEvent::Stop(
+                                                    job_id,
+                                                    Utc::now(),
+                                                    Err(ProcessError::io("stopping job process", err)),
+                                                    output_state,
+                                                )))
+                                                .await;
+                                        }
                                         break;
                                     }
                                 }
                             }
                             exit_status = child.wait() => {
-                                let _ = events
-                                    .send(Event::Job(JobEvent::End(
-                                        job_id,
-                                        Utc::now(),
-                                        match exit_status {
-                                            Ok(exit_status) => process_exit(exit_status),
-                                            Err(err) => Err(ProcessError::io("waiting for job process", err)),
-                                        },
-                                    )))
-                                    .await;
-                                break;
+                                if let Ok(output_state) = get_output_state().await {
+                                    let _ = events
+                                        .send(Event::Job(JobEvent::Stop(
+                                            job_id,
+                                            Utc::now(),
+                                            match exit_status {
+                                                Ok(exit_status) => process_exit(exit_status),
+                                                Err(err) => Err(ProcessError::io("waiting for job process", err)),
+                                            },
+                                            output_state,
+                                        )))
+                                        .await;
+                                    break;
+                                }
                             }
                         }
                     }
@@ -263,15 +311,7 @@ impl Executor {
             });
 
             None
-        };
-
-        // Announce the job start.
-        let _ = self
-            .events
-            .send(Event::Job(JobEvent::Start(job_id.clone(), Utc::now())))
-            .await;
-
-        attachment
+        }
     }
 
     pub fn job_stop(&mut self, job_id: &JobId) {

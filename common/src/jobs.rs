@@ -340,12 +340,12 @@ pub fn job_status_map_en(status_map: JobStatusMap) -> JsonJobStatusMap {
 pub enum ProcessError {
     #[error("the fate of the process is unknown")]
     Unknown,
-    #[error("could not start process: {0}")]
-    Unstarted(String),
     #[error("process killed with signal {0}")]
     Killed(i32),
     #[error("interactive session error: {0}")]
     Interactive(String),
+    #[error("the command must not begin with `-`")]
+    InvalidCommand,
     #[error("I/O error {what}: {error}")]
     Io { what: String, error: String },
 }

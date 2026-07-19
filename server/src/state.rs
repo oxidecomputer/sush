@@ -294,7 +294,7 @@ impl State {
                         };
                         self.set_job_status(job_id, baseboard_id, status.clone());
                     }
-                    JobEvent::End(job_id, when, result) => {
+                    JobEvent::Stop(job_id, when, result, output) => {
                         self.running.remove(&(job_id.clone(), baseboard_id.clone()));
                         self.causal_jobs.insert((
                             incoming_version.rank(),
@@ -302,24 +302,18 @@ impl State {
                             baseboard_id.clone(),
                         ));
 
-                        // Handle a local processes ending.
-                        if *baseboard_id == self.own_baseboard
-                            && let Some(JobStatus::Started {
-                                job_id,
-                                time_started,
-                            }) = self
-                                .get_job_status(job_id)
-                                .and_then(|m| m.get(baseboard_id))
-                                .cloned()
+                        if let Some(JobStatus::Started {
+                            job_id,
+                            time_started,
+                        }) = self
+                            .get_job_status(job_id)
+                            .and_then(|m| m.get(baseboard_id))
+                            .cloned()
                         {
                             executor.job_stopped(&job_id);
-                            self.attachments.remove(&job_id);
-                            let output = match executor.output_dir().job_output_state(&job_id).await {
-                                Ok(output) => output,
-                                Err(err) => {
-                                    todo!("report error collecting output state of {job_id}: {err}")
-                                }
-                            };
+                            if *baseboard_id == self.own_baseboard {
+                                self.attachments.remove(&job_id);
+                            }
 
                             // Update status.
                             let status = JobStatus::Stopped {
@@ -327,7 +321,7 @@ impl State {
                                 time_started,
                                 time_stopped: *when,
                                 result: result.clone(),
-                                output,
+                                output: output.clone(),
                             };
                             self.set_job_status(&job_id, baseboard_id, status);
                         }
