@@ -381,6 +381,15 @@
           },
           {
             "in": "query",
+            "name": "wait",
+            "description": "Wait for the job to start or stop.",
+            "required": true,
+            "schema": {
+              "$ref": "#/components/schemas/JobWait"
+            }
+          },
+          {
+            "in": "query",
             "name": "max_cpu",
             "description": "Maximum CPU use in seconds.",
             "required": true,
@@ -512,6 +521,15 @@
             "required": true,
             "schema": {
               "$ref": "#/components/schemas/JobId"
+            }
+          },
+          {
+            "in": "query",
+            "name": "wait",
+            "description": "Wait for the job process to end.",
+            "required": true,
+            "schema": {
+              "$ref": "#/components/schemas/JobWait"
             }
           }
         ],
@@ -756,7 +774,7 @@
           {
             "type": "object",
             "properties": {
-              "Ended": {
+              "Stopped": {
                 "type": "object",
                 "properties": {
                   "job_id": {
@@ -766,44 +784,28 @@
                     "type": "string",
                     "format": "date-time"
                   },
-                  "time_ended": {
+                  "time_stopped": {
                     "type": "string",
                     "format": "date-time"
                   },
-                  "status": {
+                  "result": {
                     "$ref": "#/components/schemas/Result_of_int32_or_ProcessError"
                   },
-                  "stdout_len": {
-                    "type": "integer",
-                    "format": "uint64",
-                    "minimum": 0
-                  },
-                  "stderr_len": {
-                    "type": "integer",
-                    "format": "uint64",
-                    "minimum": 0
-                  },
-                  "stdout_hash": {
-                    "$ref": "#/components/schemas/JobOutputHash"
-                  },
-                  "stderr_hash": {
-                    "$ref": "#/components/schemas/JobOutputHash"
+                  "output": {
+                    "$ref": "#/components/schemas/JobOutputState"
                   }
                 },
                 "required": [
                   "job_id",
-                  "status",
-                  "stderr_hash",
-                  "stderr_len",
-                  "stdout_hash",
-                  "stdout_len",
-                  "time_ended",
-                  "time_started"
+                  "output",
+                  "result",
+                  "time_started",
+                  "time_stopped"
                 ]
               }
             },
             "required": [
-              "Ended"
+              "Stopped"
             ],
             "additionalProperties": false
           }
@@ -912,6 +914,33 @@
           }
         ]
       },
+      "JobOutputState": {
+        "type": "object",
+        "properties": {
+          "stdout_len": {
+            "type": "integer",
+            "format": "uint64",
+            "minimum": 0
+          },
+          "stderr_len": {
+            "type": "integer",
+            "format": "uint64",
+            "minimum": 0
+          },
+          "stdout_hash": {
+            "$ref": "#/components/schemas/JobOutputHash"
+          },
+          "stderr_hash": {
+            "$ref": "#/components/schemas/JobOutputHash"
+          }
+        },
+        "required": [
+          "stderr_hash",
+          "stderr_len",
+          "stdout_hash",
+          "stdout_len"
+        ]
+      },
       "JobOutputHash": {
         "description": "BLAKE3 hash of job output, used as a checksum.",
         "type": "string",
@@ -1011,6 +1040,15 @@
         "enum": [
           "stdout",
           "stderr"
+        ]
+      },
+      "JobWait": {
+        "description": "Whether and until what state is reached to wait for a job start/stop request.",
+        "type": "string",
+        "enum": [
+          "None",
+          "Start",
+          "Stop"
         ]
       }
     },

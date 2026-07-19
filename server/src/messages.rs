@@ -12,7 +12,7 @@ use uuid::Uuid;
 use sush_common::borsh::{
     borsh_de_baseboard_id, borsh_de_datetime, borsh_ser_baseboard_id, borsh_ser_datetime,
 };
-use sush_common::jobs::{JobId, ProcessError, SessionId, VerifiedJob};
+use sush_common::jobs::{JobId, ProcessError, SessionId, SignedJob};
 
 #[derive(BorshDeserialize, BorshSerialize, Copy, Clone, Debug, Eq, PartialEq)]
 pub struct RequestId(pub Uuid);
@@ -54,7 +54,7 @@ pub enum SessionRequest {
 
 #[derive(Clone, Debug, BorshDeserialize, BorshSerialize)]
 pub enum JobRequest {
-    Start(VerifiedJob, JobStartParams),
+    Start(SignedJob, JobStartParams),
     Stop(JobId),
     Attach(JobId),
 }
@@ -67,7 +67,7 @@ pub enum Event {
 
 #[derive(Clone, Debug, BorshDeserialize, BorshSerialize)]
 pub enum JobEvent {
-    JobStart(
+    Start(
         JobId,
         #[borsh(
             serialize_with = "borsh_ser_datetime",
@@ -75,8 +75,24 @@ pub enum JobEvent {
         )]
         DateTime<Utc>,
     ),
-    JobEnd(JobId, Result<i32, ProcessError>),
-    JobError(JobId, ProcessError),
+    End(
+        JobId,
+        #[borsh(
+            serialize_with = "borsh_ser_datetime",
+            deserialize_with = "borsh_de_datetime"
+        )]
+        DateTime<Utc>,
+        Result<i32, ProcessError>,
+    ),
+    Error(
+        JobId,
+        #[borsh(
+            serialize_with = "borsh_ser_datetime",
+            deserialize_with = "borsh_de_datetime"
+        )]
+        DateTime<Utc>,
+        ProcessError,
+    ),
 }
 
 #[derive(Clone, Debug, BorshDeserialize, BorshSerialize)]

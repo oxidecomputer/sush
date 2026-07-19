@@ -3610,7 +3610,9 @@ dependencies = [
  "hyper 1.8.1",
  "schemars",
  "serde",
+ "sled-hardware-types",
  "sush-common",
+ "thiserror 1.0.69",
 ]
 
 [[package]]
@@ -3648,6 +3650,7 @@ dependencies = [
  "signature",
  "sled-hardware-types",
  "ssh-key",
+ "sush-api",
  "sush-common",
  "thiserror 1.0.69",
  "tokio",

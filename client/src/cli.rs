@@ -16,7 +16,7 @@ use x509_cert::der::Encode as _;
 
 use sush_common::authn::{Credentials, Identity};
 use sush_common::jobs::{
-    JobId, JobOutputStream, JobStatus, JobStatusMap, Session, SessionId, SignedJob, VerifiedJob,
+    JobId, JobOutputState, JobOutputStream, JobStatus, JobStatusMap, Session, SessionId, SignedJob,
 };
 use sush_common::keys::{KeyId, Signature, SshPublicKey};
 
@@ -100,7 +100,7 @@ impl CommandContext for Cli {
         }
         match self.get_output_format() {
             OutputFormat::Json => println!("{}", json!({"session_ended": session_id})),
-            OutputFormat::Text => println!("✅ Ended session `{session_id}`"),
+            OutputFormat::Text => println!("✅ Stopped session `{session_id}`"),
         }
         Ok(())
     }
@@ -159,7 +159,7 @@ impl CommandContext for Cli {
 
     // Job management
 
-    fn job_started(&mut self, job: &VerifiedJob) {
+    fn job_started(&mut self, job: &SignedJob) {
         if let Some(session) = self.session.lock().unwrap().as_mut() {
             session.job_started(job.to_owned());
         }
@@ -383,15 +383,18 @@ impl CommandContext for Cli {
                                     Started at:\t{time_started}"
                             )
                         }
-                        JobStatus::Ended {
+                        JobStatus::Stopped {
                             job_id,
                             time_started,
-                            time_ended,
-                            status: Ok(exit_status),
-                            stdout_len,
-                            stderr_len,
-                            stdout_hash,
-                            stderr_hash,
+                            time_stopped,
+                            result: Ok(exit_status),
+                            output:
+                                JobOutputState {
+                                    stdout_len,
+                                    stderr_len,
+                                    stdout_hash,
+                                    stderr_hash,
+                                },
                         } => {
                             let duration = format_elapsed_duration(status.time_elapsed());
                             let stdout_len = byte_size(*stdout_len);
@@ -399,9 +402,9 @@ impl CommandContext for Cli {
                             println!(
                                 "✅ Job ID:\t{job_id}\n   \
                                     Target:\t{baseboard_id}\n   \
-                                    Job status:\tEnded\n   \
+                                    Job status:\tStopped\n   \
                                     Started at:\t{time_started}\n   \
-                                    Ended at:\t{time_ended} ({duration})\n   \
+                                    Stopped at:\t{time_stopped} ({duration})\n   \
                                     Exit status:\t{exit_status}\n   \
                                     Stdout len:\t{stdout_len}\n   \
                                     Stderr len:\t{stderr_len}\n   \
@@ -409,15 +412,18 @@ impl CommandContext for Cli {
                                     Stderr hash:\t{stderr_hash}",
                             );
                         }
-                        JobStatus::Ended {
+                        JobStatus::Stopped {
                             job_id,
                             time_started,
-                            time_ended,
-                            status: Err(err),
-                            stdout_len,
-                            stderr_len,
-                            stdout_hash,
-                            stderr_hash,
+                            time_stopped,
+                            result: Err(err),
+                            output:
+                                JobOutputState {
+                                    stdout_len,
+                                    stderr_len,
+                                    stdout_hash,
+                                    stderr_hash,
+                                },
                         } => {
                             let duration = format_elapsed_duration(status.time_elapsed());
                             let stdout_len = byte_size(*stdout_len);
@@ -427,7 +433,7 @@ impl CommandContext for Cli {
                                     Target:\t{baseboard_id}\n   \
                                     Job status:\t{err}\n   \
                                     Started at:\t{time_started}\n   \
-                                    Stopped at:\t{time_ended} ({duration})\n   \
+                                    Stopped at:\t{time_stopped} ({duration})\n   \
                                     Stdout len:\t{stdout_len}\n   \
                                     Stderr len:\t{stderr_len}\n   \
                                     Stdout hash:\t{stdout_hash}\n   \

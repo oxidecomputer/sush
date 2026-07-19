@@ -1,95 +1,28 @@
 //! Oxide Support Shell integration tests.
 
 use std::net::SocketAddr;
-use std::time::Duration;
 
 use bytes::Bytes;
-use chrono::Utc;
 use dropshot::{ConfigDropshot, ServerBuilder};
 use function_name::named;
 use futures::{SinkExt as _, StreamExt as _};
 use tokio::test;
-use tokio::time::sleep;
 use tokio_tungstenite::WebSocketStream;
 use tokio_tungstenite::tungstenite::protocol::Role;
 
+use sush_api::JobWait;
 use sush_api::sush_api_mod::api_description;
 use sush_client::{Client, Error as ClientError};
-use sush_common::authn::Credentials;
 use sush_common::interactive::{
     InteractiveJobDecoder, InteractiveJobEncoder, InteractiveJobMessage,
 };
-use sush_common::jobs::{JobId, JobLimits, JobOutputStream, JobStatus, Session, SessionId};
+use sush_common::jobs::{JobLimits, JobOutputStream, Session, SessionId};
 use sush_server::{ApiServer, ProxyServer};
 
 use crate::test_utils::{SignJobRequest as _, authz, manager_and_test_root, test_logger};
 
-const POLL_INTERVAL: Duration = Duration::from_millis(10);
-const POLL_MAX_RETRIES: usize = 10;
-
 fn local_addr() -> SocketAddr {
     "127.0.0.1:0".parse().unwrap()
-}
-
-async fn poll_job_start(client: &Client, credentials: &Credentials, job_id: &JobId) {
-    let mut started = false;
-    for _ in 0..POLL_MAX_RETRIES {
-        let status = match client
-            .job_status()
-            .authorization(credentials.to_string())
-            .job_id(job_id)
-            .send()
-            .await
-        {
-            Ok(status) => status,
-            Err(err) if err.status().is_some_and(|s| s.is_client_error()) => continue,
-            Err(err) => panic!("can't get job status: {err}"),
-        };
-        if matches!(
-            status.into_inner().values().next().expect("should have a job status"),
-            JobStatus::Started {
-                job_id: jid,
-                time_started,
-            } if jid == job_id && *time_started < Utc::now()
-        ) {
-            started = true;
-            break;
-        } else {
-            sleep(POLL_INTERVAL).await;
-        }
-    }
-    assert!(started, "job does not appear to have started, giving up");
-}
-
-async fn poll_job_end(client: &Client, credentials: &Credentials, job_id: &JobId) {
-    let mut ended = false;
-    for _ in 0..POLL_MAX_RETRIES {
-        let status = match client
-            .job_status()
-            .authorization(credentials.to_string())
-            .job_id(job_id)
-            .send()
-            .await
-        {
-            Ok(status) => status,
-            Err(err) if err.status().is_some_and(|s| s.is_client_error()) => continue,
-            Err(err) => panic!("can't get job status: {err}"),
-        };
-        if matches!(
-            status.into_inner().values().next().expect("should have a job status"),
-            JobStatus::Ended {
-                job_id: jid,
-                time_ended,
-                ..
-            } if jid == job_id && *time_ended < Utc::now()
-        ) {
-            ended = true;
-            break;
-        } else {
-            sleep(POLL_INTERVAL).await;
-        }
-    }
-    assert!(ended, "job does not appear to have ended, giving up");
 }
 
 #[named]
@@ -151,12 +84,11 @@ async fn client_server() {
         .max_cpu(max_cpu)
         .max_mem(max_mem)
         .max_fsize(max_fsize)
+        .wait(JobWait::Stop)
         .body(job.into_signed())
         .send()
         .await
         .expect("can't start job");
-
-    poll_job_end(&client, &credentials, &job_id).await;
 
     // Check the job output.
     let mut output = client
@@ -279,12 +211,11 @@ async fn interactive_job() {
         .max_cpu(max_cpu)
         .max_mem(max_mem)
         .max_fsize(max_fsize)
+        .wait(JobWait::Start)
         .body(job.into_signed())
         .send()
         .await
         .expect("can't start job");
-
-    poll_job_start(&client, &credentials, &job_id).await;
 
     // Attach to the job and rekey.
     let socket = client
@@ -348,11 +279,10 @@ async fn interactive_job() {
         .job_stop()
         .authorization(credentials.to_string())
         .job_id(&job_id)
+        .wait(JobWait::Stop)
         .send()
         .await
         .expect("can't stop job");
-
-    poll_job_end(&client, &credentials, &job_id).await;
 
     // Check the output for our message.
     let mut output = client

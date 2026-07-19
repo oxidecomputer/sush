@@ -177,8 +177,8 @@ impl Session {
         self.last_job.clone()
     }
 
-    pub fn job_started(&mut self, job: VerifiedJob) {
-        self.last_job = Some(job.into_signed())
+    pub fn job_started(&mut self, job: SignedJob) {
+        self.last_job = Some(job)
     }
 
     pub fn next_job_id(&self) -> JobId {
@@ -272,7 +272,7 @@ pub enum JobStatus {
         )]
         time_started: DateTime<Utc>,
     },
-    Ended {
+    Stopped {
         job_id: JobId,
         #[borsh(
             serialize_with = "borsh_ser_datetime",
@@ -283,12 +283,9 @@ pub enum JobStatus {
             serialize_with = "borsh_ser_datetime",
             deserialize_with = "borsh_de_datetime"
         )]
-        time_ended: DateTime<Utc>,
-        status: Result<i32, ProcessError>,
-        stdout_len: u64,
-        stderr_len: u64,
-        stdout_hash: JobOutputHash,
-        stderr_hash: JobOutputHash,
+        time_stopped: DateTime<Utc>,
+        result: Result<i32, ProcessError>,
+        output: JobOutputState,
     },
 }
 
@@ -297,8 +294,8 @@ impl JobStatus {
         matches!(self, Self::Started { .. })
     }
 
-    pub fn is_ended(&self) -> bool {
-        matches!(self, Self::Ended { .. })
+    pub fn is_stopped(&self) -> bool {
+        matches!(self, Self::Stopped { .. })
     }
 }
 
@@ -399,32 +396,44 @@ impl ExecutionError {
 }
 
 impl JobStatus {
-    pub fn time_started(&self) -> DateTime<Utc> {
-        match self {
-            Self::Started { time_started, .. } | Self::Ended { time_started, .. } => *time_started,
-        }
-    }
-
     pub fn time_elapsed(&self) -> TimeDelta {
         match self {
             Self::Started { time_started, .. } => Utc::now() - time_started,
-            Self::Ended {
+            Self::Stopped {
                 time_started,
-                time_ended,
+                time_stopped,
                 ..
-            } => *time_ended - time_started,
+            } => *time_stopped - time_started,
         }
     }
 
     pub fn job_id(&self) -> &JobId {
         match self {
-            Self::Started { job_id, .. } | Self::Ended { job_id, .. } => job_id,
+            Self::Started { job_id, .. } | Self::Stopped { job_id, .. } => job_id,
         }
     }
 
     pub fn is_active(&self) -> bool {
         matches!(self, Self::Started { .. })
     }
+}
+
+#[derive(
+    BorshDeserialize,
+    BorshSerialize,
+    Clone,
+    Debug,
+    Deserialize,
+    Eq,
+    JsonSchema,
+    PartialEq,
+    Serialize,
+)]
+pub struct JobOutputState {
+    pub stdout_len: u64,
+    pub stderr_len: u64,
+    pub stdout_hash: JobOutputHash,
+    pub stderr_hash: JobOutputHash,
 }
 
 /// BLAKE3 hash of job output, used as a checksum.

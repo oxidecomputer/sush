@@ -72,8 +72,6 @@ pub enum JobError {
         key_id: KeyId,
         time_revoked: DateTime<Utc>,
     },
-    #[error("Can't receive response: sender dropped")]
-    Recv(#[from] tokio::sync::oneshot::error::RecvError),
     #[error(transparent)]
     Slice(#[from] std::array::TryFromSliceError),
     #[error(transparent)]
@@ -135,7 +133,6 @@ impl From<JobError> for HttpError {
             | OutputHashMismatch(_, _)
             | PublicKeyNotFound(_)
             | PublicKeyMismatch(_)
-            | Recv(_)
             | Task(_)
             | Slice(_)
             | Wait => HttpError::for_internal_error(message),

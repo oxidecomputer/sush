@@ -10,14 +10,13 @@ use rumors::Peer;
 use sled_hardware_types::BaseboardId;
 use slog::{Discard, Logger, o};
 use tempfile::TempDir;
-use tokio::time::sleep;
 use tokio_util::sync::CancellationToken;
 use x509_cert::time::Validity;
 
-use sush_api::JobStartParams;
+use sush_api::{JobStartParams, JobStopParams, JobWait};
 use sush_common::authn::{Challenge, ChallengeResponse, Credentials, Identity};
 use sush_common::jobs::{
-    JobId, JobLimits, JobOutputStream, JobStatus, ProcessError, Session, SessionId, VerifiedJob,
+    JobId, JobLimits, JobOutputState, JobOutputStream, JobStatus, ProcessError, Session, SessionId,
 };
 use sush_common::keys::{EphemeralKey, KeyError, KeyType, Signer as _};
 use sush_server::{JobError, JobManager};
@@ -45,66 +44,34 @@ fn check_status_started(status: JobStatus, expected_job_id: &JobId) {
 }
 
 #[track_caller]
-fn check_status_ended(
+fn check_status_stopped(
     status: JobStatus,
     expected_job_id: &JobId,
-    expected_status: Result<i32, ProcessError>,
+    expected_result: Result<i32, ProcessError>,
     expected_stdout_len: u64,
     expected_stderr_len: u64,
 ) {
-    let JobStatus::Ended {
+    let JobStatus::Stopped {
         job_id,
         time_started,
-        time_ended,
-        status,
-        stdout_len,
-        stderr_len,
-        ..
+        time_stopped,
+        result,
+        output:
+            JobOutputState {
+                stdout_len,
+                stderr_len,
+                ..
+            },
     } = status
     else {
         panic!("expected job to be finished");
     };
     assert_eq!(job_id, *expected_job_id);
-    assert!(time_started < time_ended);
-    assert!(time_ended < Utc::now());
-    assert_eq!(status, expected_status);
+    assert!(time_started < time_stopped);
+    assert!(time_stopped < Utc::now());
+    assert_eq!(result, expected_result);
     assert_eq!(stdout_len, expected_stdout_len);
     assert_eq!(stderr_len, expected_stderr_len);
-}
-
-const STATUS_POLL_RETRIES: u8 = 100;
-const STATUS_POLL_DELAY: Duration = Duration::from_millis(10);
-
-async fn poll_job_until(
-    authn: &Identity,
-    mgr: &JobManager,
-    session: &mut Session,
-    job: VerifiedJob,
-    f: impl Fn(&JobStatus) -> bool,
-) -> JobStatus {
-    let job_id = job.job_id().to_owned();
-    mgr.job_start(authn, job.clone().into_signed(), JobStartParams::default())
-        .await
-        .expect("should be able to start job");
-    session.job_started(job);
-
-    for _ in 0..STATUS_POLL_RETRIES {
-        match mgr.job_status(authn, &job_id).await {
-            Ok(status) => {
-                if let Some(status) = status.get(mgr.own_baseboard())
-                    && f(status)
-                {
-                    return status.to_owned();
-                } else {
-                    sleep(STATUS_POLL_DELAY).await;
-                    continue;
-                }
-            }
-            Err(JobError::JobNotFound(j)) if j == job_id => sleep(STATUS_POLL_DELAY).await,
-            Err(error) => panic!("can't get job status: {error}"),
-        }
-    }
-    panic!("unexpected job status after {STATUS_POLL_RETRIES} retries");
 }
 
 #[named]
@@ -123,13 +90,35 @@ async fn jobs() {
         mgr.job_status(&authn, &job_id).await.unwrap_err(),
         JobError::JobNotFound(jid) if jid == job_id
     ));
-    let status = poll_job_until(&authn, &mgr, &mut session, job.clone(), JobStatus::is_ended).await;
-    check_status_ended(status, &job_id, Ok(0), 0, 0);
+    mgr.job_start(
+        &authn,
+        job.clone().into_signed(),
+        JobStartParams {
+            wait: JobWait::Stop,
+            ..Default::default()
+        },
+    )
+    .await
+    .unwrap();
+    session.job_started(job.clone().into_signed());
+    let status = mgr.job_status(&authn, &job_id).await.unwrap()[mgr.own_baseboard()].clone();
+    check_status_stopped(status, &job_id, Ok(0), 0, 0);
 
     let job_id = session.next_job_id();
     let job = root.sign_job_request(&job_id, "false", false).await;
-    let status = poll_job_until(&authn, &mgr, &mut session, job.clone(), JobStatus::is_ended).await;
-    check_status_ended(status, &job_id, Ok(1), 0, 0);
+    mgr.job_start(
+        &authn,
+        job.clone().into_signed(),
+        JobStartParams {
+            wait: JobWait::Stop,
+            ..Default::default()
+        },
+    )
+    .await
+    .unwrap();
+    session.job_started(job.clone().into_signed());
+    let status = mgr.job_status(&authn, &job_id).await.unwrap()[mgr.own_baseboard()].clone();
+    check_status_stopped(status, &job_id, Ok(1), 0, 0);
 
     let job_id = session.next_job_id();
     let job_id_string = job_id.to_string();
@@ -137,8 +126,19 @@ async fn jobs() {
     let job = root
         .sign_job_request(&job_id, "echo -n $SUSH_JOB_ID", false)
         .await;
-    let status = poll_job_until(&authn, &mgr, &mut session, job.clone(), JobStatus::is_ended).await;
-    check_status_ended(status, &job_id, Ok(0), job_id_bytes.len() as u64, 0);
+    mgr.job_start(
+        &authn,
+        job.clone().into_signed(),
+        JobStartParams {
+            wait: JobWait::Stop,
+            ..Default::default()
+        },
+    )
+    .await
+    .unwrap();
+    session.job_started(job.clone().into_signed());
+    let status = mgr.job_status(&authn, &job_id).await.unwrap()[mgr.own_baseboard()].clone();
+    check_status_stopped(status, &job_id, Ok(0), job_id_bytes.len() as u64, 0);
     assert_eq!(
         mgr.job_output(&authn, &job_id, JobOutputStream::Stdout, None)
             .await
@@ -156,8 +156,19 @@ async fn jobs() {
     let output = format!("{home}\n");
     let job_id = session.next_job_id();
     let job = root.sign_job_request(&job_id, "pwd", false).await;
-    let status = poll_job_until(&authn, &mgr, &mut session, job.clone(), JobStatus::is_ended).await;
-    check_status_ended(status, &job_id, Ok(0), output.len() as u64, 0);
+    mgr.job_start(
+        &authn,
+        job.clone().into_signed(),
+        JobStartParams {
+            wait: JobWait::Stop,
+            ..Default::default()
+        },
+    )
+    .await
+    .unwrap();
+    session.job_started(job.clone().into_signed());
+    let status = mgr.job_status(&authn, &job_id).await.unwrap()[mgr.own_baseboard()].clone();
+    check_status_stopped(status, &job_id, Ok(0), output.len() as u64, 0);
     assert_eq!(
         mgr.job_output(&authn, &job_id, JobOutputStream::Stdout, None)
             .await
@@ -186,17 +197,32 @@ async fn job_stop() {
     // Start a (potentially) long-running job.
     let command = "sleep 10";
     let job = root.sign_job_request(&job_id, command, false).await;
-    mgr.job_start(&authn, job.clone().into_signed(), JobStartParams::default())
-        .await
-        .expect("should be able to start job");
+    mgr.job_start(
+        &authn,
+        job.clone().into_signed(),
+        JobStartParams {
+            wait: JobWait::Start,
+            ..Default::default()
+        },
+    )
+    .await
+    .unwrap();
+    session.job_started(job.clone().into_signed());
 
     // Check that the job is alive.
-    let status = poll_job_until(&authn, &mgr, &mut session, job, JobStatus::is_started).await;
+    let status = mgr.job_status(&authn, &job_id).await.unwrap()[mgr.own_baseboard()].clone();
     check_status_started(status, &job_id);
 
     // Kill the job and wait for it to die.
-    mgr.job_stop(&authn, &job_id).await.unwrap();
-    sleep(Duration::from_millis(10)).await;
+    mgr.job_stop(
+        &authn,
+        &job_id,
+        JobStopParams {
+            wait: JobWait::Stop,
+        },
+    )
+    .await
+    .unwrap();
 
     // Check that it's dead and that it didn't live for long.
     let status = mgr
@@ -206,7 +232,7 @@ async fn job_stop() {
         .remove(mgr.own_baseboard())
         .expect("should have job status");
     assert!(status.time_elapsed().to_std().unwrap() < Duration::from_secs(1));
-    check_status_ended(status, &job_id, Err(ProcessError::Killed(SIGKILL)), 0, 0);
+    check_status_stopped(status, &job_id, Err(ProcessError::Killed(SIGKILL)), 0, 0);
 }
 
 #[named]
@@ -283,8 +309,19 @@ async fn cert_chain() {
     mgr.session_start(&authn, session_id).await.unwrap();
     let job_id = session.next_job_id();
     let job = child.sign_job_request(&job_id, "true", false).await;
-    let status = poll_job_until(&authn, &mgr, &mut session, job, JobStatus::is_ended).await;
-    check_status_ended(status, &job_id, Ok(0), 0, 0);
+    mgr.job_start(
+        &authn,
+        job.clone().into_signed(),
+        JobStartParams {
+            wait: JobWait::Stop,
+            ..Default::default()
+        },
+    )
+    .await
+    .unwrap();
+    session.job_started(job.clone().into_signed());
+    let status = mgr.job_status(&authn, &job_id).await.unwrap()[mgr.own_baseboard()].clone();
+    check_status_stopped(status, &job_id, Ok(0), 0, 0);
 }
 
 #[named]
@@ -294,7 +331,7 @@ async fn too_much_cpu() {
     let (mgr, mut root, _dir) = manager_and_test_root(log).await;
     let authn = fake_identity(&mut root).await;
     let session_id = SessionId::new();
-    let mut session = Session::new(session_id.clone());
+    let session = Session::new(session_id.clone());
     mgr.session_start(&authn, session_id.clone()).await.unwrap();
     let job_id = session.next_job_id();
     let command = "openssl speed sha1";
@@ -314,7 +351,17 @@ async fn too_much_cpu() {
     )
     .await
     .expect("should be able to start job");
-    let status = poll_job_until(&authn, &mgr, &mut session, job, JobStatus::is_ended).await;
+    mgr.job_start(
+        &authn,
+        job.clone().into_signed(),
+        JobStartParams {
+            wait: JobWait::Stop,
+            ..Default::default()
+        },
+    )
+    .await
+    .unwrap();
+    let status = mgr.job_status(&authn, &job_id).await.unwrap()[mgr.own_baseboard()].clone();
     assert!(status.time_elapsed().to_std().unwrap() < Duration::from_secs(2));
 
     // The output of `openssl speed` changed between v3.0 and v3.5.
@@ -324,12 +371,18 @@ async fn too_much_cpu() {
         .unwrap();
     let stderr = String::from_utf8_lossy(&stderr);
     match status {
-        JobStatus::Ended { stderr_len: 37, .. } => {
-            check_status_ended(status, &job_id, Err(ProcessError::Killed(SIGXCPU)), 0, 37);
+        JobStatus::Stopped {
+            output: JobOutputState { stderr_len: 37, .. },
+            ..
+        } => {
+            check_status_stopped(status, &job_id, Err(ProcessError::Killed(SIGXCPU)), 0, 37);
             assert_eq!(stderr, "Doing sha1 for 3s on 16 size blocks: ");
         }
-        JobStatus::Ended { stderr_len: 41, .. } => {
-            check_status_ended(status, &job_id, Err(ProcessError::Killed(SIGXCPU)), 0, 41);
+        JobStatus::Stopped {
+            output: JobOutputState { stderr_len: 41, .. },
+            ..
+        } => {
+            check_status_stopped(status, &job_id, Err(ProcessError::Killed(SIGXCPU)), 0, 41);
             assert_eq!(stderr, "Doing sha1 ops for 3s on 16 size blocks: ");
         }
         _ => todo!("what does `{command}` produce on your system?"),
@@ -343,7 +396,7 @@ async fn output_ranges() {
     let (mgr, mut root, _dir) = manager_and_test_root(log).await;
     let authn = fake_identity(&mut root).await;
     let session_id = SessionId::new();
-    let mut session = Session::new(session_id.clone());
+    let session = Session::new(session_id.clone());
     mgr.session_start(&authn, session_id.clone()).await.unwrap();
     let job_id = session.next_job_id();
 
@@ -351,8 +404,18 @@ async fn output_ranges() {
     let n = 1000;
     let command = &format!("head -c {n} /dev/urandom");
     let job = root.sign_job_request(&job_id, command, false).await;
-    let status = poll_job_until(&authn, &mgr, &mut session, job, JobStatus::is_ended).await;
-    check_status_ended(status, &job_id, Ok(0), n, 0);
+    mgr.job_start(
+        &authn,
+        job.clone().into_signed(),
+        JobStartParams {
+            wait: JobWait::Stop,
+            ..Default::default()
+        },
+    )
+    .await
+    .unwrap();
+    let status = mgr.job_status(&authn, &job_id).await.unwrap()[mgr.own_baseboard()].clone();
+    check_status_stopped(status, &job_id, Ok(0), n, 0);
 
     // No range, i.e., full output.
     let r = mgr

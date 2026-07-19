@@ -12,7 +12,7 @@ use tokio::io;
 use tokio::io::{AsyncReadExt as _, AsyncSeekExt as _, SeekFrom};
 use tokio::task::spawn_blocking;
 
-use sush_common::jobs::{ExecutionError, JobId, JobOutputHash, JobOutputStream};
+use sush_common::jobs::{ExecutionError, JobId, JobOutputHash, JobOutputState, JobOutputStream};
 
 use crate::JobError;
 
@@ -140,12 +140,4 @@ impl JobOutputDir {
             stderr_hash: self.job_output_hash(job_id, Stderr).await?,
         })
     }
-}
-
-#[derive(Clone, Debug)]
-pub struct JobOutputState {
-    pub stdout_len: u64,
-    pub stderr_len: u64,
-    pub stdout_hash: JobOutputHash,
-    pub stderr_hash: JobOutputHash,
 }

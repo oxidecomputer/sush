@@ -224,7 +224,7 @@ async fn interactive_job(
     }
     info!(
         log,
-        "interactive job ended";
+        "interactive job stopped";
         "encoded_bytes" => encoder.count(),
         "decoded_bytes" => decoder.count()
     );

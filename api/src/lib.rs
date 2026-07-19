@@ -2,6 +2,7 @@
 
 use std::collections::BTreeMap;
 use std::fmt;
+use std::str::FromStr;
 
 use borsh::{BorshDeserialize, BorshSerialize};
 use dropshot::{
@@ -12,12 +13,13 @@ use dropshot::{
 use http_range_header::{SyntacticallyCorrectRange as Range, parse_range_header};
 use hyper::Response;
 use schemars::JsonSchema;
-use serde::Deserialize;
 use serde::de::{Deserializer, Error as DeserializeError, IntoDeserializer, MapAccess, Visitor};
+use serde::{Deserialize, Serialize};
+use thiserror::Error;
 
 use sush_common::authn::Identity;
 use sush_common::jobs::{
-    JobId, JobLimits, JobOutputStream, JsonJobStatusMap, Session, SessionId, SignedJob,
+    JobId, JobLimits, JobOutputStream, JobStatus, JsonJobStatusMap, Session, SessionId, SignedJob,
 };
 use sush_common::keys::{KeyId, SshPublicKey};
 
@@ -112,6 +114,7 @@ pub trait SushApi {
         ctx: RequestContext<Self::Context>,
         headers: Header<Authorization>,
         params: PathParams<JobIdParam>,
+        query: QueryParams<JobStopParams>,
     ) -> Result<HttpResponseOk<()>, HttpError>;
 
     /// Get the status of a job across the rack.
@@ -180,6 +183,92 @@ pub struct JobStartParams {
 
     /// Terminal window width for interactive jobs.
     pub cols: Option<u16>,
+
+    /// Wait for the job to start or stop.
+    pub wait: JobWait,
+}
+
+/// Whether and until what state is reached to wait for a job start/stop request.
+#[derive(
+    Clone,
+    Copy,
+    Debug,
+    Default,
+    Deserialize,
+    JsonSchema,
+    BorshSerialize,
+    BorshDeserialize,
+    Serialize,
+)]
+pub enum JobWait {
+    #[default]
+    None,
+    Start,
+    Stop,
+}
+
+impl JobWait {
+    pub fn is_none(&self) -> bool {
+        matches!(self, Self::None)
+    }
+
+    pub fn is_some(&self) -> bool {
+        !self.is_none()
+    }
+
+    pub fn matches_status(&self, status: &JobStatus) -> bool {
+        match self {
+            Self::None | Self::Start => true,
+            Self::Stop => status.is_stopped(),
+        }
+    }
+}
+
+impl fmt::Display for JobWait {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(
+            f,
+            "{}",
+            match self {
+                Self::None => "none",
+                Self::Start => "start",
+                Self::Stop => "stop",
+            }
+        )
+    }
+}
+
+#[derive(
+    Clone,
+    Debug,
+    Default,
+    Deserialize,
+    Error,
+    JsonSchema,
+    BorshSerialize,
+    BorshDeserialize,
+    Serialize,
+)]
+#[error("invalid job wait specification `{0}`")]
+pub struct JobWaitParseError(String);
+
+impl FromStr for JobWait {
+    type Err = JobWaitParseError;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        match s.to_ascii_lowercase().as_ref() {
+            "none" => Ok(Self::None),
+            "start" => Ok(Self::Start),
+            "stop" => Ok(Self::Stop),
+            _ => Err(JobWaitParseError(s.to_string())),
+        }
+    }
+}
+
+#[derive(Clone, Debug, Default, Deserialize, JsonSchema, BorshSerialize, BorshDeserialize)]
+pub struct JobStopParams {
+    /// Wait for the job process to end.
+    pub wait: JobWait,
 }
 
 /// Simple pagination for history list.

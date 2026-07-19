@@ -15,9 +15,7 @@ use x509_cert::Certificate;
 use xdg::BaseDirectories;
 
 use sush_common::authn::{Credentials, Identity};
-use sush_common::jobs::{
-    JobId, JobOutputStream, JobStatusMap, Session, SessionId, SignedJob, VerifiedJob,
-};
+use sush_common::jobs::{JobId, JobOutputStream, JobStatusMap, Session, SessionId, SignedJob};
 use sush_common::keys::{KeyId, SshPublicKey};
 
 use crate::Client;
@@ -232,7 +230,7 @@ impl CommandContext for Repl {
 
     // Job management
 
-    fn job_started(&mut self, job: &VerifiedJob) {
+    fn job_started(&mut self, job: &SignedJob) {
         self.set_job_id(Some(job.job_id().to_owned()));
         self.cli.job_started(job);
     }

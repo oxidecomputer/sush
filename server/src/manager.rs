@@ -11,13 +11,13 @@ use lru::LruCache;
 use rumors::Rumors;
 use sled_hardware_types::BaseboardId;
 use slog::{Logger, debug, info, o, warn};
-use tokio::sync::{Mutex, RwLock, mpsc};
+use tokio::sync::{Mutex, mpsc, watch};
 use tokio_stream::wrappers::ReceiverStream;
 use tokio_util::sync::CancellationToken;
 use x509_cert::Certificate;
 use x509_cert::der::{DecodePem as _, Encode as _};
 
-use sush_api::JobStartParams;
+use sush_api::{JobStartParams, JobStopParams, JobWait};
 use sush_common::authn::{Credentials, Identity, Nonce};
 use sush_common::jobs::JobOutputStream::{self};
 use sush_common::jobs::{JobId, JobStatusMap, Session, SessionId, SignedJob};
@@ -63,7 +63,7 @@ pub struct JobManager {
     certs: Arc<Mutex<LruCache<KeyId, Certificate>>>,
     output_dir: JobOutputDir,
     own_baseboard: BaseboardId,
-    state: Arc<RwLock<State>>,     // from the state manager
+    state: watch::Receiver<State>, // from the state manager
     tx_req: mpsc::Sender<Request>, // to the state manager
 }
 
@@ -114,16 +114,14 @@ impl JobManager {
         self.tx_req
             .send(Request::session(request))
             .await
-            .map_err(|_| JobError::ChannelClosed)?;
-        Ok(())
+            .map_err(|_| JobError::ChannelClosed)
     }
 
     async fn job_request(&self, _authn: &Identity, request: JobRequest) -> Result<(), JobError> {
         self.tx_req
             .send(Request::job(request))
             .await
-            .map_err(|_| JobError::ChannelClosed)?;
-        Ok(())
+            .map_err(|_| JobError::ChannelClosed)
     }
 
     // Certificate management.
@@ -332,7 +330,7 @@ impl JobManager {
     // Session management.
 
     pub async fn session(&self, _authn: &Identity) -> Option<Session> {
-        self.state.read().await.session()
+        self.state.borrow().session()
     }
 
     pub async fn session_id(&self, authn: &Identity) -> Result<SessionId, JobError> {
@@ -348,8 +346,7 @@ impl JobManager {
         session_id: SessionId,
     ) -> Result<(), JobError> {
         self.session_request(SessionRequest::Start(session_id))
-            .await?;
-        Ok(())
+            .await
     }
 
     pub async fn session_stop(
@@ -361,6 +358,27 @@ impl JobManager {
     }
 
     // Job management.
+
+    fn wait_for(&self, job_id: &JobId, wait: JobWait) -> impl FnMut(&State) -> bool {
+        move |state| {
+            state
+                .get_job_status(job_id)
+                .and_then(|map| map.get(self.own_baseboard()))
+                .map(|status| wait.matches_status(status))
+                .unwrap_or(false)
+        }
+    }
+
+    async fn maybe_wait(&self, job_id: &JobId, wait: JobWait) -> Result<(), JobError> {
+        if wait.is_some() {
+            self.state
+                .clone()
+                .wait_for(self.wait_for(job_id, wait))
+                .await
+                .map_err(|_| JobError::ChannelClosed)?;
+        }
+        Ok(())
+    }
 
     pub async fn job_start(
         &self,
@@ -379,15 +397,26 @@ impl JobManager {
         } else {
             return Err(JobError::MissingCert(cert_key_id));
         };
+        let job_id = job.job_id().to_owned();
+        let wait = params.wait.to_owned();
 
         // Submit the job for execution.
-        self.job_request(authn, JobRequest::Start(job, params))
-            .await
+        self.job_request(authn, JobRequest::Start(job.into_signed(), params))
+            .await?;
+
+        self.maybe_wait(&job_id, wait).await
     }
 
-    pub async fn job_stop(&self, authn: &Identity, job_id: &JobId) -> Result<(), JobError> {
+    pub async fn job_stop(
+        &self,
+        authn: &Identity,
+        job_id: &JobId,
+        JobStopParams { wait }: JobStopParams,
+    ) -> Result<(), JobError> {
         self.job_request(authn, JobRequest::Stop(job_id.to_owned()))
-            .await
+            .await?;
+
+        self.maybe_wait(job_id, wait).await
     }
 
     pub async fn job_status(
@@ -395,7 +424,7 @@ impl JobManager {
         _authn: &Identity,
         job_id: &JobId,
     ) -> Result<JobStatusMap, JobError> {
-        if let Some(status) = self.state.read().await.get_job_status(job_id) {
+        if let Some(status) = self.state.borrow().get_job_status(job_id) {
             Ok(status.to_owned())
         } else {
             Err(JobError::JobNotFound(job_id.to_owned()))
@@ -419,7 +448,7 @@ impl JobManager {
     ) -> Result<SocketSender, JobError> {
         self.job_request(authn, JobRequest::Attach(job_id.to_owned()))
             .await?;
-        if let Some(attachment) = self.state.read().await.get_attachment(job_id) {
+        if let Some(attachment) = self.state.borrow().get_attachment(job_id) {
             Ok(attachment.to_owned())
         } else {
             Err(JobError::JobNotFound(job_id.to_owned()))

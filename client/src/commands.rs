@@ -29,12 +29,13 @@ use tokio_tungstenite::WebSocketStream;
 use tokio_tungstenite::tungstenite::error::Error as WebSocketError;
 use tokio_tungstenite::tungstenite::protocol::Role;
 
+use sush_api::JobWait;
 use sush_common::authn::{AuthnError, Challenge, ChallengeResponse, Credentials, Identity};
 use sush_common::interactive::InteractiveJobError;
 use sush_common::jobs::JobOutputStream::{self, Stderr, Stdout};
 use sush_common::jobs::{
-    JobId, JobLimits, JobOutputHash, JobStartRequest, JobStatus, Session, SessionId, SignedJob,
-    VerifiedJob, job_status_map_de,
+    JobId, JobLimits, JobOutputHash, JobOutputState, JobStartRequest, JobStatus, Session,
+    SessionId, SignedJob, job_status_map_de,
 };
 use sush_common::keys::{KeyError, KeyId, Signer as _};
 
@@ -379,6 +380,10 @@ pub struct JobStartArgs {
     /// Terminal type for interactive jobs.
     #[arg(long, env = "TERM")]
     term: Option<String>,
+
+    /// Whether to wait for job start/stop.
+    #[arg(short, long, default_value_t = Default::default())]
+    wait: JobWait,
 }
 
 impl ClientCommand {
@@ -670,7 +675,6 @@ async fn job(
             if start_args.command.is_none() && start_args.permslip.is_none() =>
         {
             let job = ctx.read_signed_job()?;
-            let job = verify_job(ctx, Some(client), job).await?;
             job_start(ctx, client, job, start_args).await?;
             Ok(())
         }
@@ -763,11 +767,9 @@ async fn job(
             };
             if let Some(client) = client {
                 ctx.job_signed(&job, false);
-                let job = verify_job(ctx, Some(client), job).await?;
                 job_start(ctx, client, job, start_args.to_owned()).await
             } else {
                 ctx.job_signed(&job, true);
-                let job = verify_job(ctx, None, job).await?;
                 ctx.job_started(&job);
                 Ok(())
             }
@@ -843,37 +845,15 @@ async fn job(
     }
 }
 
-async fn verify_job(
-    ctx: &mut impl CommandContext,
-    client: Option<&Client>,
-    job: SignedJob,
-) -> Result<VerifiedJob, CommandError> {
-    let cert_key_id = job.key_id().to_owned();
-    let chain = if let Some(client) = client {
-        with_authz(ctx, client, async |authz| {
-            client
-                .cert_chain()
-                .key_id(&cert_key_id)
-                .authorization(authz)
-                .send()
-                .await
-        })
-        .await?
-        .into_inner()
-    } else {
-        todo!("get offline cert for {cert_key_id}")
-    };
-    let leaf = ctx.cert_chain(cert_key_id, &chain)?;
-    Ok(job.verify_with_cert(&leaf)?)
-}
-
 async fn job_start(
     ctx: &mut impl CommandContext,
     client: &Client,
-    job: VerifiedJob,
+    job: SignedJob,
     start_args: JobStartArgs,
 ) -> Result<(), CommandError> {
-    let JobStartArgs { limits, term, .. } = start_args;
+    let JobStartArgs {
+        limits, term, wait, ..
+    } = start_args;
     let JobLimits {
         max_cpu,
         max_mem,
@@ -887,7 +867,8 @@ async fn job_start(
             .max_cpu(max_cpu)
             .max_mem(max_mem)
             .max_fsize(max_fsize)
-            .body(job.clone().into_signed());
+            .wait(wait)
+            .body(job.clone());
         if let Some(term) = term.as_ref() {
             start = start.term(term);
             if let Ok(winsize) = tcgetwinsize(stdin()) {
@@ -975,18 +956,17 @@ async fn job_output(
             .parse()
             .map_err(CommandError::BaseboardIdParseError)?
     };
-    let (stdout_len, stderr_len, stdout_hash, stderr_hash) = match status.get(&baseboard_id) {
+    let JobOutputState {
+        stdout_len,
+        stderr_len,
+        stdout_hash,
+        stderr_hash,
+    } = match status.get(&baseboard_id) {
         None => return Err(CommandError::NotFound),
-        Some(JobStatus::Started { .. }) => {
+        Some(JobStatus::Started { job_id, .. }) => {
             return Err(CommandError::JobStillRunning(job_id.to_owned()));
         }
-        Some(JobStatus::Ended {
-            stdout_len,
-            stderr_len,
-            stdout_hash,
-            stderr_hash,
-            ..
-        }) => (stdout_len, stderr_len, stdout_hash, stderr_hash),
+        Some(JobStatus::Stopped { output, .. }) => output,
     };
     let len = match stream {
         Stdout => stdout_len,
@@ -1155,7 +1135,7 @@ enum InteractiveJobOk {
     /// An interactive job session was established.
     Established,
 
-    /// The job ended before we could establish a connection.
+    /// The job stopped before we could establish a connection.
     NotFound,
 }
 

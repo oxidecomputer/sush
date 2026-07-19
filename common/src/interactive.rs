@@ -215,8 +215,6 @@ pub enum InteractiveJobError {
     Io(#[from] std::io::Error),
     #[error("I/O error: {0}")]
     IoErrno(#[from] rustix::io::Errno),
-    #[error("Job ended")]
-    JobEnded,
     #[error("Can't join task: {0}")]
     Join(#[from] tokio::task::JoinError),
     #[error("Can't (de)serialize JSON control message: {0}")]

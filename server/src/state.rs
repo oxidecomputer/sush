@@ -12,20 +12,22 @@ use futures::{Stream, StreamExt};
 use rumors::before::Rank;
 use rumors::{Key, Rumors, Version};
 use sled_hardware_types::BaseboardId;
-use slog::{Logger, debug, info, o};
+use slog::{Logger, debug, error, info, o};
 use sush_api::JobStartParams;
-use sush_common::jobs::{JobId, JobStatus, JobStatusMap, Session, VerifiedJob};
-use tokio::sync::RwLock;
+use sush_common::jobs::{JobId, JobStatus, JobStatusMap, Session, SignedJob};
+use tokio::sync::watch;
 use tokio::{select, spawn};
 use tokio_util::sync::CancellationToken;
 
 use crate::executor::Executor;
 use crate::interactive::SocketSender;
 use crate::messages::{Error, Event, JobEvent, JobRequest, Message, Request, SessionRequest};
-use crate::output::{JobOutputDir, JobOutputState};
+use crate::output::JobOutputDir;
 
-#[derive(Clone, Debug, Default)]
+#[derive(Clone, Debug)]
 pub struct State {
+    /// The ID of the baseboard (sled) the server is running on.
+    own_baseboard: BaseboardId,
     /// The set of running jobs *everywhere*, tagged by start wall-clock time.
     running: BTreeMap<(JobId, BaseboardId), DateTime<Utc>>,
     /// The set of *all* jobs (running or stopped) *everywhere*, causally
@@ -43,6 +45,17 @@ pub struct State {
 }
 
 impl State {
+    pub fn new(own_baseboard: BaseboardId) -> Self {
+        Self {
+            own_baseboard,
+            running: Default::default(),
+            causal_jobs: Default::default(),
+            job_status: Default::default(),
+            session: Default::default(),
+            attachments: Default::default(),
+        }
+    }
+
     pub fn get_job_status(&self, job_id: &JobId) -> Option<&JobStatusMap> {
         self.job_status.get(job_id)
     }
@@ -57,7 +70,7 @@ impl State {
         self.job_status
             .entry(job_id.to_owned())
             .or_default()
-            .insert(baseboard_id.clone(), status);
+            .insert(baseboard_id.clone(), status.clone());
     }
 
     pub fn get_attachment(&self, job_id: &JobId) -> Option<&SocketSender> {
@@ -78,7 +91,7 @@ pub enum SessionState {
     Active {
         session: Box<Session>,
         session_start: Version,
-        queued_jobs: BTreeMap<JobId, (VerifiedJob, JobStartParams)>,
+        queued_jobs: BTreeMap<JobId, (SignedJob, JobStartParams)>,
     },
 }
 
@@ -231,10 +244,11 @@ impl State {
                             while let Some((request, params)) =
                                 queued_jobs.remove(&session.next_job_id())
                             {
+                                let job_id = request.job_id().clone();
                                 if let Some(attach) =
                                     executor.job_start(request.payload().clone(), params).await
                                 {
-                                    interactive_jobs.insert(request.job_id().clone(), attach);
+                                    interactive_jobs.insert(job_id.clone(), attach);
                                 }
                                 session.job_started(request);
                             }
@@ -264,7 +278,7 @@ impl State {
             // Track the active set of known-running jobs anywhere in the rack:
             Message::Event(baseboard_id, event) => match event {
                 Event::Job(job_event) => match job_event {
-                    JobEvent::JobStart(job_id, when) => {
+                    JobEvent::Start(job_id, when) => {
                         self.running
                             .insert((job_id.clone(), baseboard_id.clone()), *when);
                         self.causal_jobs.insert((
@@ -272,61 +286,54 @@ impl State {
                             job_id.clone(),
                             baseboard_id.clone(),
                         ));
-                        self.set_job_status(
-                            job_id,
-                            baseboard_id,
-                            JobStatus::Started {
-                                job_id: job_id.clone(),
-                                time_started: *when,
-                            },
-                        );
+
+                        // Update job status.
+                        let status = JobStatus::Started {
+                            job_id: job_id.clone(),
+                            time_started: *when,
+                        };
+                        self.set_job_status(job_id, baseboard_id, status.clone());
                     }
-                    JobEvent::JobEnd(job_id, status) => {
-                        executor.job_stopped(job_id);
-                        self.attachments.remove(job_id);
+                    JobEvent::End(job_id, when, result) => {
                         self.running.remove(&(job_id.clone(), baseboard_id.clone()));
                         self.causal_jobs.insert((
                             incoming_version.rank(),
                             job_id.clone(),
                             baseboard_id.clone(),
                         ));
-                        if let Some(JobStatus::Started {
-                            job_id,
-                            time_started,
-                        }) = self
-                            .get_job_status(job_id)
-                            .and_then(|m| m.get(baseboard_id))
-                            .cloned()
+
+                        // Handle a local processes ending.
+                        if *baseboard_id == self.own_baseboard
+                            && let Some(JobStatus::Started {
+                                job_id,
+                                time_started,
+                            }) = self
+                                .get_job_status(job_id)
+                                .and_then(|m| m.get(baseboard_id))
+                                .cloned()
                         {
-                            let JobOutputState {
-                                stdout_len,
-                                stderr_len,
-                                stdout_hash,
-                                stderr_hash,
-                            } = match executor.output_dir().job_output_state(&job_id).await {
+                            executor.job_stopped(&job_id);
+                            self.attachments.remove(&job_id);
+                            let output = match executor.output_dir().job_output_state(&job_id).await {
                                 Ok(output) => output,
                                 Err(err) => {
                                     todo!("report error collecting output state of {job_id}: {err}")
                                 }
                             };
-                            self.set_job_status(
-                                &job_id,
-                                baseboard_id,
-                                JobStatus::Ended {
-                                    job_id: job_id.clone(),
-                                    time_started,
-                                    time_ended: Utc::now(),
-                                    status: status.clone(),
-                                    stdout_len,
-                                    stderr_len,
-                                    stdout_hash,
-                                    stderr_hash,
-                                },
-                            );
+
+                            // Update status.
+                            let status = JobStatus::Stopped {
+                                job_id: job_id.clone(),
+                                time_started,
+                                time_stopped: *when,
+                                result: result.clone(),
+                                output,
+                            };
+                            self.set_job_status(&job_id, baseboard_id, status);
                         }
                     }
-                    JobEvent::JobError(job_id, process_error) => {
-                        todo!("report error for {job_id}: {process_error}")
+                    JobEvent::Error(job_id, when, error) => {
+                        todo!("report error for {job_id} at {when}: {error}")
                     }
                 },
                 Event::Error(_error) => todo!(),
@@ -353,11 +360,12 @@ impl StateManager {
         mut requests: R,
         rumors: Rumors<Message>,
         shutdown: CancellationToken,
-    ) -> Arc<RwLock<State>>
+    ) -> watch::Receiver<State>
     where
         R: Stream<Item = Request> + Send + Unpin + 'static,
     {
-        let state = Arc::new(RwLock::new(State::default()));
+        // We report our current state through a watch channel.
+        let (tx_state, rx_state) = watch::channel(State::new(own_baseboard.clone()));
 
         // We process messages in causal order, so that we can rely on
         // things like "the session stop happens after its corresponding
@@ -375,7 +383,7 @@ impl StateManager {
         let mut rumors = Some(rumors);
 
         spawn({
-            let state = state.clone();
+            let rx_state = rx_state.clone();
             async move {
                 info!(log, "managing state");
 
@@ -432,11 +440,28 @@ impl StateManager {
                                 break;
                             }
                             Some((key, version, message)) => {
-                                // Update the shared state.
-                                let result = state.write().await.update(&mut executor, key, version, message).await;
-                                if let Err(error) = result && let Some(rumors) = &rumors {
-                                    debug!(log, "sending error to gossip network"; "error" => ?error);
-                                    rumors.send(Message::Event(own_baseboard.clone(), Event::Error(error)));
+                                // This clone isn't great, but it's the easiest way to
+                                // keep our mutable access to the executor. We can work
+                                // out something better later if it becomes a problem.
+                                let mut state = rx_state.borrow().clone();
+
+                                // We unconditionally mark the watch sender as modified
+                                // even though it might not be, because *most* of the
+                                // messages cause *some* modification of the state, and we
+                                // would rather be safe against future code changes than
+                                // manually tracking precisely which messages *don't* modify
+                                // state. The cost is a few spurious wakeups.
+                                match state.update(&mut executor, key, version, message).await {
+                                    Ok(()) => {
+                                        tx_state.send_replace(state);
+                                    }
+                                    Err(error) => {
+                                        error!(log, "state update failed"; "error" => ?error);
+                                        if let Some(rumors) = &rumors {
+                                            debug!(log, "sending error to gossip network"; "error" => ?error);
+                                            rumors.send(Message::Event(own_baseboard.clone(), Event::Error(error)));
+                                        }
+                                    }
                                 }
                             },
                         },
@@ -445,6 +470,6 @@ impl StateManager {
             }
         });
 
-        state
+        rx_state
     }
 }

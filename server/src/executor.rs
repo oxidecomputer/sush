@@ -63,7 +63,7 @@ impl Executor {
         )
     }
 
-    /// Spawn a process for a job, and return an attachment point if it is
+    /// Spawn a process for a job and return an attachment point if it is
     /// interactive. Assumes the job request has already been validated,
     /// e.g., as by [`crate::JobManager::job_start`].
     pub async fn job_start(
@@ -82,6 +82,7 @@ impl Executor {
             term,
             rows,
             cols,
+            wait: _,
         } = params;
 
         // Report I/O errors as job events.
@@ -93,7 +94,7 @@ impl Executor {
                     Err(err) => {
                         let _ = self
                             .events
-                            .send(Event::Job(JobEvent::JobError(job_id, err)))
+                            .send(Event::Job(JobEvent::Error(job_id, Utc::now(), err)))
                             .await;
                         return None;
                     }
@@ -184,25 +185,25 @@ impl Executor {
                 }
             };
 
-            // Spawn the interactive job.
+            // Start the interactive job.
             let child = with_io_err!(cmd.spawn(), "spawning job process".to_string());
             let log = self
                 .log
                 .new(o!("interactive" => true, "job_id" => job_id.clone()));
-            let job = InteractiveJob::start(log, child, pty, stdout_file.into(), stop);
+            let job = InteractiveJob::start(log, child, pty, stdout_file, stop);
             let attachment = job.attachment();
 
-            // Wait for the interactive job to end, and send an event when it does.
             spawn({
+                // Wait for the interactive job to end, and send an event when it does.
                 let events = self.events.clone();
                 let job_id = job_id.clone();
                 async move {
-                    let exit_status = match job.wait().await {
+                    let result = match job.wait().await {
                         Ok(exit_status) => process_exit(exit_status),
                         Err(err) => Err(ProcessError::Interactive(err.to_string())),
                     };
                     let _ = events
-                        .send(Event::Job(JobEvent::JobEnd(job_id, exit_status)))
+                        .send(Event::Job(JobEvent::End(job_id, Utc::now(), result)))
                         .await;
                 }
             });
@@ -233,9 +234,10 @@ impl Executor {
                                     }
                                     Err(err) => {
                                         let _ = events
-                                            .send(Event::Job(JobEvent::JobEnd(
+                                            .send(Event::Job(JobEvent::End(
                                                 job_id,
-                                                Err(ProcessError::io("stopping job", err)),
+                                                Utc::now(),
+                                                Err(ProcessError::io("stopping job process", err)),
                                             )))
                                             .await;
                                         break;
@@ -244,11 +246,12 @@ impl Executor {
                             }
                             exit_status = child.wait() => {
                                 let _ = events
-                                    .send(Event::Job(JobEvent::JobEnd(
+                                    .send(Event::Job(JobEvent::End(
                                         job_id,
+                                        Utc::now(),
                                         match exit_status {
                                             Ok(exit_status) => process_exit(exit_status),
-                                            Err(err) => Err(ProcessError::io("waiting", err)),
+                                            Err(err) => Err(ProcessError::io("waiting for job process", err)),
                                         },
                                     )))
                                     .await;
@@ -262,10 +265,10 @@ impl Executor {
             None
         };
 
-        // Notify interested parties of birth.
+        // Announce the job start.
         let _ = self
             .events
-            .send(Event::Job(JobEvent::JobStart(job_id.clone(), Utc::now())))
+            .send(Event::Job(JobEvent::Start(job_id.clone(), Utc::now())))
             .await;
 
         attachment

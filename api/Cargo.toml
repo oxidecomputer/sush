@@ -13,4 +13,6 @@ http-range-header.workspace = true
 hyper.workspace = true
 schemars.workspace = true
 serde.workspace = true
+sled-hardware-types.workspace = true
 sush-common = { path = "../common" }
+thiserror.workspace = true

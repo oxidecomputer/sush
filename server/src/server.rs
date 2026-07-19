@@ -12,7 +12,7 @@ use x509_cert::der::{Decode as _, DecodePem as _};
 
 use sush_api::{
     Authorization, AuthorizedRangeRequest, JobHistoryParams, JobIdParam, JobOutputParams,
-    JobStartParams, KeyIdParam, SessionIdParam, SushApi,
+    JobStartParams, JobStopParams, KeyIdParam, SessionIdParam, SushApi,
 };
 use sush_common::authn::Identity;
 use sush_common::jobs::{JsonJobStatusMap, Session, SignedJob, job_status_map_en};
@@ -137,7 +137,6 @@ impl SushApi for ApiServer {
         let Authorization { authorization } = headers.into_inner();
         let authn = mgr.iam(authorization, None).await?;
         let JobIdParam { job_id } = params.into_inner();
-        let params = query.into_inner();
         let job = body.into_inner();
         if *job.job_id() != job_id {
             return Err(HttpError::for_client_error(
@@ -146,7 +145,7 @@ impl SushApi for ApiServer {
                 String::from("Query parameter job ID does not match body"),
             ));
         }
-        mgr.job_start(&authn, job, params).await?;
+        mgr.job_start(&authn, job, query.into_inner()).await?;
         Ok(HttpResponseOk(()))
     }
 
@@ -154,12 +153,13 @@ impl SushApi for ApiServer {
         ctx: RequestContext<Self::Context>,
         headers: Header<Authorization>,
         params: PathParams<JobIdParam>,
+        query: QueryParams<JobStopParams>,
     ) -> Result<HttpResponseOk<()>, HttpError> {
         let mgr = ctx.context();
         let Authorization { authorization } = headers.into_inner();
         let authn = mgr.iam(authorization, None).await?;
         let JobIdParam { job_id } = params.into_inner();
-        mgr.job_stop(&authn, &job_id).await?;
+        mgr.job_stop(&authn, &job_id, query.into_inner()).await?;
         Ok(HttpResponseOk(()))
     }
 

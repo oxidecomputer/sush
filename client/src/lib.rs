@@ -18,6 +18,7 @@ progenitor::generate_api!(
         JobOutputHash = sush_common::jobs::JobOutputHash,
         JobOutputStream = sush_common::jobs::JobOutputStream,
         JobStatus = sush_common::jobs::JobStatus,
+        JobWait = sush_api::JobWait,
         KeyId = sush_common::keys::KeyId,
         Signature = sush_common::keys::Signature,
         SignedForJobStartRequest = sush_common::jobs::SignedJob,
