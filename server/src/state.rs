@@ -54,17 +54,10 @@ impl State {
         status: JobStatus,
     ) {
         // TODO: evict old entries when crossing MAX_HISTORY
-        let set_status = |map: &mut BTreeMap<BaseboardId, JobStatus>| {
-            map.insert(baseboard_id.clone(), status.clone());
-        };
         self.job_status
             .entry(job_id.to_owned())
-            .and_modify(set_status)
-            .or_insert_with(|| {
-                let mut status = BTreeMap::new();
-                set_status(&mut status);
-                status
-            });
+            .or_default()
+            .insert(baseboard_id.clone(), status);
     }
 
     pub fn get_attachment(&self, job_id: &JobId) -> Option<&SocketSender> {
@@ -248,21 +241,19 @@ impl State {
                         }
                     }
                     JobRequest::Stop(job_id) => {
+                        // If we can't remove the job from the queued jobs,
+                        // then it's possible it has been already executed
+                        // (or is starting to be). We cannot rely on it
+                        // already being present in the started jobs state,
+                        // because this is updated asynchronously, so we
+                        // unconditionally tell the executor to stop the
+                        // job, even if it may not have ever existed. If we
+                        // don't have a session, we still want to stop the
+                        // job, because it could be from another session.
                         if let Active { queued_jobs, .. } = &mut self.session {
-                            // If we couldn't remove the job from the queued
-                            // jobs, then it's possible it has been already
-                            // executed (or is starting to be). We cannot rely
-                            // on it already being present in the started jobs
-                            // state, because this is updated asynchronously, so
-                            // we unconditionally tell the executor to stop the
-                            // job, even if it may not have ever existed.
                             queued_jobs.remove(job_id);
-                            executor.job_stop(job_id);
-                        } else {
-                            // If we don't have a session, we still want to stop
-                            // the job, because it could be from another session.
-                            executor.job_stop(job_id);
                         }
+                        executor.job_stop(job_id);
                     }
                     JobRequest::Attach(_job_id) => {
                         // Attachment is handled locally; it is a request for
@@ -312,7 +303,7 @@ impl State {
                                 stderr_len,
                                 stdout_hash,
                                 stderr_hash,
-                            } = match executor.output_dir().job_output_state(&job_id) {
+                            } = match executor.output_dir().job_output_state(&job_id).await {
                                 Ok(output) => output,
                                 Err(err) => {
                                     todo!("report error collecting output state of {job_id}: {err}")
@@ -398,8 +389,6 @@ impl StateManager {
                 let mut events_empty = false;
 
                 loop {
-                    let to_send = requests.next();
-                    let event = events.next();
                     let message = causal_messages.borrow_next();
 
                     // Once we drain the requests and events, we drop `rumors` so
@@ -415,7 +404,7 @@ impl StateManager {
                     select! {
                         // Forward local requests into the rumors state,
                         // so they are processed by the state machine.
-                        next = to_send => match next {
+                        next = requests.next(), if !requests_empty => match next {
                             // When our incoming stream of locally injected messages
                             // ends, we have no more local messages to process, but
                             // we need to let all spawned tasks by the executor
@@ -427,7 +416,7 @@ impl StateManager {
                             },
                         },
                         // Handle events produced by the executor.
-                        next = event => match next {
+                        next = events.next(), if !events_empty => match next {
                             None => events_empty = true,
                             Some(event) => if let Some(rumors) = &rumors {
                                 debug!(log, "forwarding event to gossip network"; "event" => ?event);

@@ -64,13 +64,17 @@ async fn poll_job_start(client: &Client, credentials: &Credentials, job_id: &Job
 async fn poll_job_end(client: &Client, credentials: &Credentials, job_id: &JobId) {
     let mut ended = false;
     for _ in 0..POLL_MAX_RETRIES {
-        let status = client
+        let status = match client
             .job_status()
             .authorization(credentials.to_string())
             .job_id(job_id)
             .send()
             .await
-            .expect("can't get job status");
+        {
+            Ok(status) => status,
+            Err(err) if err.status().is_some_and(|s| s.is_client_error()) => continue,
+            Err(err) => panic!("can't get job status: {err}"),
+        };
         if matches!(
             status.into_inner().values().next().expect("should have a job status"),
             JobStatus::Ended {

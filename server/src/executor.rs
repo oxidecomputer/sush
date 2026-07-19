@@ -4,7 +4,6 @@
 //! machine, but session agnostic.
 
 use std::collections::BTreeMap;
-use std::fs::{DirBuilder, File};
 use std::io;
 use std::os::fd::AsRawFd as _;
 use std::os::unix::process::ExitStatusExt as _;
@@ -17,6 +16,7 @@ use rustix::io::close;
 use rustix::process::{ioctl_tiocsctty, setsid};
 use slog::{Logger, o};
 use terminfo::Database as Terminfo;
+use tokio::fs::{DirBuilder, File};
 use tokio::process::Command;
 use tokio::sync::mpsc;
 use tokio::{select, spawn};
@@ -104,17 +104,17 @@ impl Executor {
         // Set up output files.
         let job_dir = self.output_dir.job_output_dir(&job_id);
         with_io_err!(
-            DirBuilder::new().recursive(true).create(&job_dir),
+            DirBuilder::new().recursive(true).create(&job_dir).await,
             format!("creating job output directory `{}`", job_dir.display())
         );
         let stdout_path = self.output_dir.job_output_path(&job_id, Stdout);
         let stderr_path = self.output_dir.job_output_path(&job_id, Stderr);
         let stdout_file = with_io_err!(
-            File::create_new(&stdout_path),
+            File::create_new(&stdout_path).await,
             format!("creating job stdout file `{}`", stdout_path.display())
         );
         let stderr_file = with_io_err!(
-            File::create_new(&stderr_path),
+            File::create_new(&stderr_path).await,
             format!("creating job stderr file `{}`", stderr_path.display())
         );
 
@@ -211,8 +211,8 @@ impl Executor {
         } else {
             // For batch jobs, close stdin and send output directly to files.
             cmd.stdin(Stdio::null())
-                .stdout(stdout_file)
-                .stderr(stderr_file);
+                .stdout(stdout_file.into_std().await)
+                .stderr(stderr_file.into_std().await);
 
             // Execute!
             let mut child = with_io_err!(cmd.spawn(), "spawning job process".to_string());

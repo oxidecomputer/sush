@@ -62,7 +62,7 @@ async fn listen(
             result = listener.accept() => {
                 match result {
                     Ok((client, client_addr)) => {
-                        accept(&log, client, client_addr, remote_addr).await;
+                        spawn(accept(log.clone(), client, client_addr, remote_addr));
                     }
                     Err(err) => {
                         error!(log, "accept failed"; "error" => %err);
@@ -79,7 +79,7 @@ async fn listen(
 }
 
 async fn accept(
-    log: &Logger,
+    log: Logger,
     mut client: TcpStream,
     client_addr: SocketAddr,
     server_addr: SocketAddr,
