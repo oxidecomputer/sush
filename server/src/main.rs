@@ -92,12 +92,16 @@ fn listen_for_shutdown() -> Result<CancellationToken, String> {
     let Ok(mut sigint) = signal(SignalKind::interrupt()) else {
         return Err("can't get SIGINT listener".to_string());
     };
+    let Ok(mut sigterm) = signal(SignalKind::terminate()) else {
+        return Err("can't get SIGTERM listener".to_string());
+    };
     let shutdown = CancellationToken::new();
     let trigger_shutdown = shutdown.clone();
     spawn(async move {
         select! {
             _ = sighup.recv() => (),
             _ = sigint.recv() => (),
+            _ = sigterm.recv() => (),
         }
         trigger_shutdown.cancel();
     });
