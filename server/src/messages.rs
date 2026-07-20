@@ -7,6 +7,7 @@ use rumors::{
 };
 use sled_hardware_types::BaseboardId;
 use sush_api::JobStartParams;
+use thiserror::Error;
 use uuid::Uuid;
 
 use sush_common::jobs::{JobId, ProcessError, SessionId, SignedJob};
@@ -97,8 +98,13 @@ pub enum JobEvent {
     ),
 }
 
-#[derive(Clone, Debug, BorshDeserialize, BorshSerialize)]
+#[derive(BorshDeserialize, BorshSerialize, Clone, Debug, Error)]
 pub enum Error {
+    #[error(
+        "Concurrent sessions detected: \
+         ours is {own_session}@{own_version}, \
+         incoming is {incoming_session}@{incoming_version}"
+    )]
     ConcurrentSessions {
         own_session: SessionId,
         own_version: Version,

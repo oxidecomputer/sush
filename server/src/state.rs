@@ -112,6 +112,7 @@ impl State {
 
     async fn update(
         &mut self,
+        log: &Logger,
         executor: &mut Executor,
         // We don't use the `key` here because we only redact messages once
         // they're committed to persistent storage:
@@ -327,10 +328,12 @@ impl State {
                         }
                     }
                     JobEvent::Error(job_id, when, error) => {
-                        todo!("report error for {job_id} at {when}: {error}")
+                        error!(log, "job error"; "job_id" => %job_id, "when" => %when, "error" => %error);
                     }
                 },
-                Event::Error(_error) => todo!(),
+                Event::Error(error) => {
+                    error!(log, "session error"; "error" => %error);
+                }
             },
         }
 
@@ -445,7 +448,7 @@ impl StateManager {
                                 // would rather be safe against future code changes than
                                 // manually tracking precisely which messages *don't* modify
                                 // state. The cost is a few spurious wakeups.
-                                match state.update(&mut executor, key, version, message).await {
+                                match state.update(&log, &mut executor, key, version, message).await {
                                     Ok(()) => {
                                         tx_state.send_replace(state);
                                     }
