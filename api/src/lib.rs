@@ -200,6 +200,7 @@ pub struct JobStartParams {
     BorshDeserialize,
     Serialize,
 )]
+#[serde(rename_all = "lowercase")]
 pub enum JobWait {
     #[default]
     None,
@@ -238,17 +239,7 @@ impl fmt::Display for JobWait {
     }
 }
 
-#[derive(
-    Clone,
-    Debug,
-    Default,
-    Deserialize,
-    Error,
-    JsonSchema,
-    BorshSerialize,
-    BorshDeserialize,
-    Serialize,
-)]
+#[derive(Clone, Debug, Error)]
 #[error("invalid job wait specification `{0}`")]
 pub struct JobWaitParseError(String);
 

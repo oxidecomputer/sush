@@ -848,20 +848,9 @@
           {
             "type": "string",
             "enum": [
-              "Unknown"
+              "Unknown",
+              "InvalidCommand"
             ]
-          },
-          {
-            "type": "object",
-            "properties": {
-              "Unstarted": {
-                "type": "string"
-              }
-            },
-            "required": [
-              "Unstarted"
-            ],
-            "additionalProperties": false
           },
           {
             "type": "object",
@@ -1046,9 +1035,9 @@
         "description": "Whether and until what state is reached to wait for a job start/stop request.",
         "type": "string",
         "enum": [
-          "None",
-          "Start",
-          "Stop"
+          "none",
+          "start",
+          "stop"
         ]
       }
     },
