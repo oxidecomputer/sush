@@ -443,11 +443,9 @@ impl JobManager {
 
     pub async fn job_attachment(
         &self,
-        authn: &Identity,
+        _authn: &Identity,
         job_id: &JobId,
     ) -> Result<SocketSender, JobError> {
-        self.job_request(authn, JobRequest::Attach(job_id.to_owned()))
-            .await?;
         if let Some(attachment) = self.state.borrow().get_attachment(job_id) {
             Ok(attachment.to_owned())
         } else {

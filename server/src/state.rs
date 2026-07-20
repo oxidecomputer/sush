@@ -41,7 +41,7 @@ pub struct State {
     /// The current state of the active session, if any.
     session: SessionState,
     /// Attachment points (socket senders) for interactive jobs.
-    attachments: BTreeMap<JobId, SocketSender>,
+    attachments: BTreeMap<JobId, watch::Receiver<Option<SocketSender>>>,
 }
 
 impl State {
@@ -73,8 +73,8 @@ impl State {
             .insert(baseboard_id.clone(), status.clone());
     }
 
-    pub fn get_attachment(&self, job_id: &JobId) -> Option<&SocketSender> {
-        self.attachments.get(job_id)
+    pub fn get_attachment(&self, job_id: &JobId) -> Option<SocketSender> {
+        self.attachments.get(job_id)?.borrow().to_owned()
     }
 }
 
@@ -110,7 +110,7 @@ impl State {
         self.session.session()
     }
 
-    async fn update(
+    fn update(
         &mut self,
         log: &Logger,
         executor: &mut Executor,
@@ -225,7 +225,6 @@ impl State {
                                     queued_jobs,
                                     ..
                                 },
-                            attachments: interactive_jobs,
                             ..
                         } = self
                         {
@@ -245,12 +244,14 @@ impl State {
                             while let Some((request, params)) =
                                 queued_jobs.remove(&session.next_job_id())
                             {
-                                let job_id = request.job_id().clone();
-                                if let Some(attach) =
-                                    executor.job_start(request.payload().clone(), params).await
-                                {
-                                    interactive_jobs.insert(job_id.clone(), attach);
-                                }
+                                let (tx_attachment, rx_attachment) = watch::channel(None);
+                                executor.job_start(
+                                    request.payload().clone(),
+                                    params,
+                                    tx_attachment,
+                                );
+                                self.attachments
+                                    .insert(request.payload().job_id.clone(), rx_attachment);
                                 session.job_started(request);
                             }
                         }
@@ -269,10 +270,6 @@ impl State {
                             queued_jobs.remove(job_id);
                         }
                         executor.job_stop(job_id);
-                    }
-                    JobRequest::Attach(_job_id) => {
-                        // Attachment is handled locally; it is a request for
-                        // for logging purposes only.
                     }
                 },
             },
@@ -296,6 +293,7 @@ impl State {
                         self.set_job_status(job_id, baseboard_id, status.clone());
                     }
                     JobEvent::Stop(job_id, when, result, output) => {
+                        self.attachments.remove(job_id);
                         self.running.remove(&(job_id.clone(), baseboard_id.clone()));
                         self.causal_jobs.insert((
                             incoming_version.rank(),
@@ -312,9 +310,8 @@ impl State {
                             .cloned()
                         {
                             if *baseboard_id == self.own_baseboard {
-                                // The stopped job is local; drop handles.
+                                // The stopped job is local.
                                 executor.job_stopped(&job_id);
-                                self.attachments.remove(&job_id);
                             }
 
                             // Update status.
@@ -381,7 +378,6 @@ impl StateManager {
         let mut rumors = Some(rumors);
 
         spawn({
-            let rx_state = rx_state.clone();
             async move {
                 info!(log, "managing state");
 
@@ -438,24 +434,21 @@ impl StateManager {
                                 break;
                             }
                             Some((key, version, message)) => {
-                                // Update the state. The clone isn't great, but it's the
-                                // easiest way to keep our mutable access to the executor.
-                                let mut state = rx_state.borrow().clone();
-                                if let Err(error) = state.update(&log, &mut executor, key, version, message).await {
-                                    error!(log, "state update failed"; "error" => ?error);
-                                    if let Some(rumors) = &rumors {
-                                        debug!(log, "sending error to gossip network"; "error" => ?error);
-                                        rumors.send(Message::Event(own_baseboard.clone(), Event::Error(error)));
-                                    }
-                                }
-
                                 // We unconditionally mark the watch sender as modified
                                 // even though it might not be, because *most* of the
                                 // messages cause *some* modification of the state, and we
                                 // would rather be safe against future code changes than
                                 // manually tracking precisely which messages *don't* modify
                                 // state. The cost is a few spurious wakeups.
-                                tx_state.send_replace(state);
+                                tx_state.send_modify(|state| {
+                                    if let Err(error) = state.update(&log, &mut executor, key, version, message) {
+                                        error!(log, "state update failed"; "error" => ?error);
+                                        if let Some(rumors) = &rumors {
+                                            debug!(log, "sending error to gossip network"; "error" => ?error);
+                                            rumors.send(Message::Event(own_baseboard.clone(), Event::Error(error)));
+                                        }
+                                    }
+                                });
                             },
                         },
                     }

@@ -14,11 +14,11 @@ use futures::Stream;
 use pwd::Passwd;
 use rustix::io::close;
 use rustix::process::{ioctl_tiocsctty, setsid};
-use slog::{Logger, o};
+use slog::{Logger, error, o};
 use terminfo::Database as Terminfo;
 use tokio::fs::{DirBuilder, File};
 use tokio::process::Command;
-use tokio::sync::mpsc;
+use tokio::sync::{mpsc, watch};
 use tokio::{select, spawn};
 use tokio_stream::wrappers::ReceiverStream;
 use tokio_util::sync::CancellationToken;
@@ -63,243 +63,23 @@ impl Executor {
         )
     }
 
-    /// Spawn a process for a job and return an attachment point if it is
-    /// interactive. Assumes the job request has already been validated,
-    /// e.g., as by [`crate::JobManager::job_start`].
-    pub async fn job_start(
+    pub fn job_start(
         &mut self,
         request: JobStartRequest,
         params: JobStartParams,
-    ) -> Option<SocketSender> {
-        use JobOutputStream::*;
-        let JobStartRequest {
-            job_id,
-            command,
-            interactive,
-        } = request;
-        let JobStartParams {
-            limits,
-            term,
-            rows,
-            cols,
-            wait: _,
-        } = params;
-
-        // Report I/O errors as job events.
-        let io_err = |what| move |err: io::Error| ProcessError::io(what, err);
-        macro_rules! with_io_err {
-            ($expr:expr, $err:expr) => {
-                match $expr.map_err(io_err($err)) {
-                    Ok(value) => value,
-                    Err(err) => {
-                        self.stop.remove(&job_id);
-                        let _ = self
-                            .events
-                            .send(Event::Job(JobEvent::Error(job_id, Utc::now(), err)))
-                            .await;
-                        return None;
-                    }
-                }
-            };
-        }
-
-        // Set up output files.
-        let job_dir = self.output_dir.job_output_dir(&job_id);
-        with_io_err!(
-            DirBuilder::new().recursive(true).create(&job_dir).await,
-            format!("creating job output directory `{}`", job_dir.display())
-        );
-        let stdout_path = self.output_dir.job_output_path(&job_id, Stdout);
-        let stderr_path = self.output_dir.job_output_path(&job_id, Stderr);
-        let stdout_file = with_io_err!(
-            File::create_new(&stdout_path).await,
-            format!("creating job stdout file `{}`", stdout_path.display())
-        );
-        let stderr_file = with_io_err!(
-            File::create_new(&stderr_path).await,
-            format!("creating job stderr file `{}`", stderr_path.display())
-        );
-
-        let get_output_state = {
-            let job_id = job_id.clone();
-            let events = self.events.clone();
-            let output_dir = self.output_dir.clone();
-            async move || match output_dir.job_output_state(&job_id).await {
-                Ok(output) => Ok(output),
-                Err(err) => {
-                    let _ = events
-                        .send(Event::Job(JobEvent::Error(job_id, Utc::now(), err.error())))
-                        .await;
-                    Err(err)
-                }
-            }
-        };
-
-        // Set up the job command.
-        let mut cmd = Command::new("bash");
-        cmd.arg("-c").arg(&command);
-
-        // Set up basic environment.
-        cmd.env_clear();
-        if let Some(pwd) = Passwd::current_user() {
-            cmd.current_dir(&pwd.dir)
-                .env("HOME", &pwd.dir)
-                .env("LOGNAME", &pwd.name)
-                .env("USER", &pwd.name);
-        }
-        cmd.env("SSH_CLIENT", "sush") // read bashrc
-            .env("SUSH_JOB_ID", job_id.to_string())
-            .env("SUSH_COMMAND", &command);
-
-        // Set process limits.
-        unsafe {
-            cmd.pre_exec(move || limits.apply());
-        }
-
-        // Prepare to stop the job on request or shutdown.
+        tx_attachment: watch::Sender<Option<SocketSender>>,
+    ) {
         let stop = self.shutdown.child_token();
-        self.stop.insert(job_id.clone(), stop.clone());
-
-        if interactive {
-            // Create a pseudoterminal and wire the child up to it.
-            let (pty, pts, pts_path) =
-                with_io_err!(Pty::open(), "opening pseudoterminal".to_string());
-            macro_rules! pts_clone {
-                () => {
-                    with_io_err!(pts.try_clone(), "cloning pseudoterminal".to_string())
-                };
-            }
-            cmd.env("SUSH_TTY", &pts_path)
-                .stdin(pts_clone!())
-                .stdout(pts_clone!())
-                .stderr(pts_clone!());
-
-            unsafe {
-                let pty = pty.as_raw_fd();
-                cmd.pre_exec(move || {
-                    close(pty); // not needed in the child
-                    setsid()?; // create new process session
-                    ioctl_tiocsctty(&pts)?; // set controlling terminal
-                    Ok(())
-                });
-            }
-
-            // If it has a valid terminfo database, set `TERM` and the
-            // initial pseudoterminal window size.
-            if let Some(term) = term
-                && Terminfo::from_name(&term).is_ok()
-            {
-                cmd.env("TERM", term);
-                if let Some(rows) = rows
-                    && let Some(cols) = cols
-                {
-                    with_io_err!(
-                        pty.set_window_size(WindowSize { rows, cols }),
-                        "resizing pseudoterminal window".to_string()
-                    );
-                }
-            };
-
-            // Start and report the interactive job.
-            let child = with_io_err!(cmd.spawn(), "spawning job process".to_string());
-            let log = self
-                .log
-                .new(o!("interactive" => true, "job_id" => job_id.clone()));
-            let job = InteractiveJob::start(log, child, pty, stdout_file, stop);
-            let attachment = job.attachment();
-            let _ = self
-                .events
-                .send(Event::Job(JobEvent::Start(job_id.clone(), Utc::now())))
-                .await;
-
-            spawn({
-                // Wait for the interactive job to end, and send an event when it does.
-                let events = self.events.clone();
-                let job_id = job_id.clone();
-                async move {
-                    let result = match job.wait().await {
-                        Ok(exit_status) => process_exit(exit_status),
-                        Err(err) => Err(ProcessError::Interactive(err.to_string())),
-                    };
-                    let _ = events
-                        .send(Event::Job(JobEvent::Stop(
-                            job_id,
-                            Utc::now(),
-                            result,
-                            get_output_state().await.map_err(|e| e.error())?,
-                        )))
-                        .await;
-                    Ok::<_, ProcessError>(())
-                }
-            });
-
-            Some(attachment)
-        } else {
-            // For batch jobs, close stdin and send output directly to files.
-            cmd.stdin(Stdio::null())
-                .stdout(stdout_file.into_std().await)
-                .stderr(stderr_file.into_std().await);
-
-            // Start and report.
-            let mut child = with_io_err!(cmd.spawn(), "spawning job process".to_string());
-            let _ = self
-                .events
-                .send(Event::Job(JobEvent::Start(job_id.clone(), Utc::now())))
-                .await;
-
-            // Wait for or induce death, and send an event when that happens.
-            spawn({
-                let events = self.events.clone();
-                let job_id = job_id.clone();
-                let mut stopped = false;
-                async move {
-                    loop {
-                        let get_output_state = get_output_state.clone();
-                        select! {
-                            _ = stop.cancelled(), if !stopped => {
-                                match child.kill().await {
-                                    Ok(()) => {
-                                        stopped = true;
-                                        continue;
-                                    }
-                                    Err(err) => {
-                                        if let Ok(output_state) = get_output_state().await {
-                                            let _ = events
-                                                .send(Event::Job(JobEvent::Stop(
-                                                    job_id,
-                                                    Utc::now(),
-                                                    Err(ProcessError::io("stopping job process", err)),
-                                                    output_state,
-                                                )))
-                                                .await;
-                                        }
-                                        break;
-                                    }
-                                }
-                            }
-                            exit_status = child.wait() => {
-                                if let Ok(output_state) = get_output_state().await {
-                                    let _ = events
-                                        .send(Event::Job(JobEvent::Stop(
-                                            job_id,
-                                            Utc::now(),
-                                            match exit_status {
-                                                Ok(exit_status) => process_exit(exit_status),
-                                                Err(err) => Err(ProcessError::io("waiting for job process", err)),
-                                            },
-                                            output_state,
-                                        )))
-                                        .await;
-                                }
-                                break;
-                            }
-                        }
-                    }
-                }
-            });
-
-            None
-        }
+        self.stop.insert(request.job_id().clone(), stop.clone());
+        spawn(job_spawn(
+            self.log.new(o!("job_id" => request.job_id().clone())),
+            self.events.clone(),
+            self.output_dir.clone(),
+            request,
+            params,
+            tx_attachment,
+            stop,
+        ));
     }
 
     pub fn job_stop(&mut self, job_id: &JobId) {
@@ -317,6 +97,242 @@ impl Executor {
     }
 }
 
+/// Spawn a process for a job and return an attachment point if it is
+/// interactive. Assumes the job request has already been validated,
+/// e.g., as by [`crate::JobManager::job_start`].
+async fn job_spawn(
+    log: Logger,
+    events: mpsc::Sender<Event>,
+    output_dir: JobOutputDir,
+    request: JobStartRequest,
+    params: JobStartParams,
+    tx_attachment: watch::Sender<Option<SocketSender>>,
+    stop: CancellationToken,
+) {
+    use JobOutputStream::*;
+    let JobStartRequest {
+        job_id,
+        command,
+        interactive,
+    } = request;
+    let JobStartParams {
+        limits,
+        term,
+        rows,
+        cols,
+        wait: _,
+    } = params;
+
+    // Report I/O errors as job events.
+    let io_err = |what| move |err: io::Error| ProcessError::io(what, err);
+    macro_rules! with_io_err {
+        ($expr:expr, $err:expr) => {
+            match $expr.map_err(io_err($err)) {
+                Ok(value) => value,
+                Err(err) => {
+                    send_error(&log, &job_id, &events, err).await;
+                    if tx_attachment.send(None).is_err() {
+                        error!(log, "can't send interactive job attachment");
+                    }
+                    return;
+                }
+            }
+        };
+    }
+
+    // Set up output files.
+    let job_dir = output_dir.job_output_dir(&job_id);
+    with_io_err!(
+        DirBuilder::new().recursive(true).create(&job_dir).await,
+        format!("creating job output directory `{}`", job_dir.display())
+    );
+    let stdout_path = output_dir.job_output_path(&job_id, Stdout);
+    let stderr_path = output_dir.job_output_path(&job_id, Stderr);
+    let stdout_file = with_io_err!(
+        File::create_new(&stdout_path).await,
+        format!("creating job stdout file `{}`", stdout_path.display())
+    );
+    let stderr_file = with_io_err!(
+        File::create_new(&stderr_path).await,
+        format!("creating job stderr file `{}`", stderr_path.display())
+    );
+
+    let get_output_state = {
+        let log = log.clone();
+        let job_id = job_id.clone();
+        let events = events.clone();
+        let output_dir = output_dir.clone();
+        async move || match output_dir.job_output_state(&job_id).await {
+            Ok(output) => Ok(output),
+            Err(err) => {
+                send_error(&log, &job_id, &events, err.error()).await;
+                Err(err)
+            }
+        }
+    };
+
+    // Set up the job command.
+    let mut cmd = Command::new("bash");
+    cmd.arg("-c").arg(&command);
+
+    // Set up basic environment.
+    cmd.env_clear();
+    if let Some(pwd) = Passwd::current_user() {
+        cmd.current_dir(&pwd.dir)
+            .env("HOME", &pwd.dir)
+            .env("LOGNAME", &pwd.name)
+            .env("USER", &pwd.name);
+    }
+    cmd.env("SSH_CLIENT", "sush") // read bashrc
+        .env("SUSH_JOB_ID", job_id.to_string())
+        .env("SUSH_COMMAND", &command);
+
+    // Set process limits.
+    unsafe {
+        cmd.pre_exec(move || limits.apply());
+    }
+
+    let attachment = if interactive {
+        // Create a pseudoterminal and wire the child up to it.
+        let (pty, pts, pts_path) = with_io_err!(Pty::open(), "opening pseudoterminal".to_string());
+        macro_rules! pts_clone {
+            () => {
+                with_io_err!(pts.try_clone(), "cloning pseudoterminal".to_string())
+            };
+        }
+        cmd.env("SUSH_TTY", &pts_path)
+            .stdin(pts_clone!())
+            .stdout(pts_clone!())
+            .stderr(pts_clone!());
+
+        unsafe {
+            let pty = pty.as_raw_fd();
+            cmd.pre_exec(move || {
+                close(pty); // not needed in the child
+                setsid()?; // create new process session
+                ioctl_tiocsctty(&pts)?; // set controlling terminal
+                Ok(())
+            });
+        }
+
+        // If it has a valid terminfo database, set `TERM` and the
+        // initial pseudoterminal window size.
+        if let Some(term) = term
+            && Terminfo::from_name(&term).is_ok()
+        {
+            cmd.env("TERM", term);
+            if let Some(rows) = rows
+                && let Some(cols) = cols
+            {
+                with_io_err!(
+                    pty.set_window_size(WindowSize { rows, cols }),
+                    "resizing pseudoterminal window".to_string()
+                );
+            }
+        };
+
+        // Start and report the interactive job.
+        let child = with_io_err!(cmd.spawn(), "spawning job process".to_string());
+        let log = log.new(o!("interactive" => true));
+        let job = InteractiveJob::start(log, child, pty, stdout_file, stop);
+        let attachment = job.attachment();
+        let _ = events
+            .send(Event::Job(JobEvent::Start(job_id.clone(), Utc::now())))
+            .await;
+
+        spawn({
+            // Wait for the interactive job to end, and send an event when it does.
+            let events = events.clone();
+            let job_id = job_id.clone();
+            async move {
+                let result = match job.wait().await {
+                    Ok(exit_status) => process_exit(exit_status),
+                    Err(err) => Err(ProcessError::Interactive(err.to_string())),
+                };
+                let _ = events
+                    .send(Event::Job(JobEvent::Stop(
+                        job_id,
+                        Utc::now(),
+                        result,
+                        get_output_state().await.map_err(|e| e.error())?,
+                    )))
+                    .await;
+                Ok::<_, ProcessError>(())
+            }
+        });
+
+        Some(attachment)
+    } else {
+        // For batch jobs, close stdin and send output directly to files.
+        cmd.stdin(Stdio::null())
+            .stdout(stdout_file.into_std().await)
+            .stderr(stderr_file.into_std().await);
+
+        // Start and report.
+        let mut child = with_io_err!(cmd.spawn(), "spawning job process".to_string());
+        let _ = events
+            .send(Event::Job(JobEvent::Start(job_id.clone(), Utc::now())))
+            .await;
+
+        // Wait for or induce death, and send an event when that happens.
+        spawn({
+            let events = events.clone();
+            let job_id = job_id.clone();
+            let mut stopped = false;
+            async move {
+                loop {
+                    let get_output_state = get_output_state.clone();
+                    select! {
+                        _ = stop.cancelled(), if !stopped => {
+                            match child.kill().await {
+                                Ok(()) => {
+                                    stopped = true;
+                                    continue;
+                                }
+                                Err(err) => {
+                                    if let Ok(output_state) = get_output_state().await {
+                                        let _ = events
+                                            .send(Event::Job(JobEvent::Stop(
+                                                job_id,
+                                                Utc::now(),
+                                                Err(ProcessError::io("stopping job process", err)),
+                                                output_state,
+                                            )))
+                                            .await;
+                                    }
+                                    break;
+                                }
+                            }
+                        }
+                        exit_status = child.wait() => {
+                            if let Ok(output_state) = get_output_state().await {
+                                let _ = events
+                                    .send(Event::Job(JobEvent::Stop(
+                                        job_id,
+                                        Utc::now(),
+                                        match exit_status {
+                                            Ok(exit_status) => process_exit(exit_status),
+                                            Err(err) => Err(ProcessError::io("waiting for job process", err)),
+                                        },
+                                        output_state,
+                                    )))
+                                    .await;
+                            }
+                            break;
+                        }
+                    }
+                }
+            }
+        });
+
+        None
+    };
+
+    if tx_attachment.send(attachment).is_err() {
+        error!(log, "can't send interactive job attachment point");
+    }
+}
+
 fn process_exit(exit_status: ExitStatus) -> Result<i32, ProcessError> {
     if let Some(code) = exit_status.code() {
         Ok(code)
@@ -329,5 +345,23 @@ fn process_exit(exit_status: ExitStatus) -> Result<i32, ProcessError> {
         // guarantee that, this branch is technically
         // reachable, but impossible in practice.
         Err(ProcessError::Unknown)
+    }
+}
+
+async fn send_error(
+    log: &Logger,
+    job_id: &JobId,
+    events: &mpsc::Sender<Event>,
+    error: ProcessError,
+) {
+    if let Err(send_error) = events
+        .send(Event::Job(JobEvent::Error(
+            job_id.to_owned(),
+            Utc::now(),
+            error,
+        )))
+        .await
+    {
+        error!(log, "can't send error event"; "error" => %send_error);
     }
 }

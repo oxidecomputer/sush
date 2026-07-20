@@ -58,7 +58,6 @@ pub enum SessionRequest {
 pub enum JobRequest {
     Start(SignedJob, JobStartParams),
     Stop(JobId),
-    Attach(JobId),
 }
 
 #[derive(Clone, Debug, BorshDeserialize, BorshSerialize)]
