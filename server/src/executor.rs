@@ -92,6 +92,7 @@ impl Executor {
                 match $expr.map_err(io_err($err)) {
                     Ok(value) => value,
                     Err(err) => {
+                        self.stop.remove(&job_id);
                         let _ = self
                             .events
                             .send(Event::Job(JobEvent::Error(job_id, Utc::now(), err)))
@@ -133,19 +134,6 @@ impl Executor {
                 }
             }
         };
-
-        // Validate the job command.
-        if command.starts_with('-') {
-            let _ = self
-                .events
-                .send(Event::Job(JobEvent::Error(
-                    job_id,
-                    Utc::now(),
-                    ProcessError::InvalidCommand,
-                )))
-                .await;
-            return None;
-        }
 
         // Set up the job command.
         let mut cmd = Command::new("bash");
@@ -302,8 +290,8 @@ impl Executor {
                                             output_state,
                                         )))
                                         .await;
-                                    break;
                                 }
+                                break;
                             }
                         }
                     }

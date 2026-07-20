@@ -311,8 +311,9 @@ impl State {
                             .and_then(|m| m.get(baseboard_id))
                             .cloned()
                         {
-                            executor.job_stopped(&job_id);
                             if *baseboard_id == self.own_baseboard {
+                                // The stopped job is local; drop handles.
+                                executor.job_stopped(&job_id);
                                 self.attachments.remove(&job_id);
                             }
 
@@ -437,10 +438,16 @@ impl StateManager {
                                 break;
                             }
                             Some((key, version, message)) => {
-                                // This clone isn't great, but it's the easiest way to
-                                // keep our mutable access to the executor. We can work
-                                // out something better later if it becomes a problem.
+                                // Update the state. The clone isn't great, but it's the
+                                // easiest way to keep our mutable access to the executor.
                                 let mut state = rx_state.borrow().clone();
+                                if let Err(error) = state.update(&log, &mut executor, key, version, message).await {
+                                    error!(log, "state update failed"; "error" => ?error);
+                                    if let Some(rumors) = &rumors {
+                                        debug!(log, "sending error to gossip network"; "error" => ?error);
+                                        rumors.send(Message::Event(own_baseboard.clone(), Event::Error(error)));
+                                    }
+                                }
 
                                 // We unconditionally mark the watch sender as modified
                                 // even though it might not be, because *most* of the
@@ -448,18 +455,7 @@ impl StateManager {
                                 // would rather be safe against future code changes than
                                 // manually tracking precisely which messages *don't* modify
                                 // state. The cost is a few spurious wakeups.
-                                match state.update(&log, &mut executor, key, version, message).await {
-                                    Ok(()) => {
-                                        tx_state.send_replace(state);
-                                    }
-                                    Err(error) => {
-                                        error!(log, "state update failed"; "error" => ?error);
-                                        if let Some(rumors) = &rumors {
-                                            debug!(log, "sending error to gossip network"; "error" => ?error);
-                                            rumors.send(Message::Event(own_baseboard.clone(), Event::Error(error)));
-                                        }
-                                    }
-                                }
+                                tx_state.send_replace(state);
                             },
                         },
                     }
