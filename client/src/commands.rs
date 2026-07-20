@@ -586,7 +586,7 @@ async fn cert(
             })
             .await?
             .into_inner();
-            let _leaf = ctx.cert_chain(key_id, &certs);
+            ctx.cert_chain(key_id, &certs)?;
             Ok(())
         }
     }
