@@ -11,7 +11,6 @@
 use std::future::pending;
 use std::io::{self, SeekFrom};
 use std::process::ExitStatus;
-use std::time::Duration;
 
 use bytes::{Buf as _, Bytes, BytesMut};
 use dropshot::WebsocketConnectionRaw;
@@ -22,8 +21,8 @@ use tokio::io::{AsyncReadExt as _, AsyncSeekExt as _, AsyncWriteExt as _};
 use tokio::process::Child;
 use tokio::sync::mpsc;
 use tokio::task::JoinHandle;
-use tokio::time::{MissedTickBehavior, interval, sleep};
-use tokio::{select, spawn};
+use tokio::time::{Duration, Instant, MissedTickBehavior, interval, sleep};
+use tokio::{pin, select, spawn};
 use tokio_tungstenite::WebSocketStream;
 
 use sush_common::interactive::{
@@ -87,7 +86,6 @@ async fn interactive_job(
     let mut encoder = InteractiveJobEncoder::default();
     let mut interval = interval(INTERACTIVE_JOB_REKEY_PERIOD);
     interval.set_missed_tick_behavior(MissedTickBehavior::Skip);
-    let mut died = false;
 
     // Client-induced errors must not break the loop;
     // close the client, log the error, and continue.
@@ -118,6 +116,18 @@ async fn interactive_job(
         }};
     }
 
+    // Set up death watch and output drain timer.
+    let mut dead = false;
+    let drain_timeout = sleep(Duration::MAX);
+    pin!(drain_timeout);
+    macro_rules! died {
+        () => {
+            dead = true;
+            drain_timeout.as_mut().reset(Instant::now() + DRAIN_TIMEOUT);
+        };
+    }
+
+    // Handle interactive job events.
     loop {
         buffer.reserve(INTERACTIVE_JOB_BUFFER_SIZE);
         select! {
@@ -143,7 +153,7 @@ async fn interactive_job(
             }
 
             // Accept a new client, rekey it, and play back the last buffer.
-            Some(mut stream) = rx_client.recv(), if !died => {
+            Some(mut stream) = rx_client.recv(), if !dead => {
                 rekey_client!(stream);
                 if let Some(playback) = playback_buffer(&mut output, INTERACTIVE_JOB_BUFFER_SIZE).await? {
                     let playback_len = playback.len();
@@ -161,7 +171,7 @@ async fn interactive_job(
             }
 
             // Handle a message from the client.
-            Some(Ok(message)) = next_if_some(&mut client), if !died => {
+            Some(Ok(message)) = next_if_some(&mut client), if !dead => {
                 match decoder.decode(message) {
                     Ok(message) => {
                         if let Some(stream) = client.as_mut() {
@@ -193,24 +203,24 @@ async fn interactive_job(
             }
 
             // Stop job on cancellation signal, but only once.
-            _ = stop.cancelled(), if !died => {
-                child.kill().await?;
+            _ = stop.cancelled(), if !dead => {
+                child.kill().await?; // also waits
                 info!(log, "job stopped by request");
-                died = true;
+                died!();
             }
 
             // Notice when the job dies, but do not exit the loop;
             // we must continue reading output until we hit EOF or
             // the drain timeout expires.
-            _ = child.wait(), if !died => {
+            _ = child.wait(), if !dead => {
                 info!(log, "job process died");
-                died = true;
+                died!();
             }
 
             // Give output a chance to drain from a dead process. It would
             // be great if there were a reliable, non-timeout way of doing
             // this, but it appears there is not. OpenSSH does this too, FWIW.
-            _ = sleep(DRAIN_TIMEOUT), if died => {
+            _ = &mut drain_timeout, if dead => {
                 info!(log, "job output drained");
                 break;
             }
