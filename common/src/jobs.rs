@@ -357,8 +357,6 @@ pub enum ProcessError {
     Killed(i32),
     #[error("interactive session error: {0}")]
     Interactive(String),
-    #[error("the command must not begin with `-`")]
-    InvalidCommand,
     #[error("I/O error {what}: {error}")]
     Io { what: String, error: String },
 }

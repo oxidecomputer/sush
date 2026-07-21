@@ -833,8 +833,7 @@
           {
             "type": "string",
             "enum": [
-              "Unknown",
-              "InvalidCommand"
+              "Unknown"
             ]
           },
           {
