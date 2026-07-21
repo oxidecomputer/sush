@@ -130,10 +130,10 @@ async fn job_spawn(
             match $expr.map_err(io_err($err)) {
                 Ok(value) => value,
                 Err(err) => {
-                    send_error(&log, &job_id, &events, err).await;
                     if tx_attachment.send(None).is_err() {
-                        error!(log, "can't send interactive job attachment");
+                        error!(log, "can't clear attachment point");
                     }
+                    send_error(&log, &job_id, &events, err).await;
                     return;
                 }
             }
@@ -192,7 +192,7 @@ async fn job_spawn(
         cmd.pre_exec(move || limits.apply());
     }
 
-    let attachment = if interactive {
+    if interactive {
         // Create a pseudoterminal and wire the child up to it.
         let (pty, pts, pts_path) = with_io_err!(Pty::open(), "opening pseudoterminal".to_string());
         macro_rules! pts_clone {
@@ -231,11 +231,18 @@ async fn job_spawn(
             }
         };
 
-        // Start and report the interactive job.
+        // Start the interactive job and send the attachment point and notification.
         let child = with_io_err!(cmd.spawn(), "spawning job process".to_string());
-        let log = log.new(o!("interactive" => true));
-        let job = InteractiveJob::start(log, child, pty, stdout_file, stop);
-        let attachment = job.attachment();
+        let job = InteractiveJob::start(
+            log.new(o!("interactive" => true)),
+            child,
+            pty,
+            stdout_file,
+            stop,
+        );
+        if tx_attachment.send(Some(job.attachment())).is_err() {
+            error!(log, "can't send attachment point");
+        }
         let _ = events
             .send(Event::Job(JobEvent::Start(job_id.clone(), Utc::now())))
             .await;
@@ -259,13 +266,16 @@ async fn job_spawn(
                     .await;
             }
         });
-
-        Some(attachment)
     } else {
         // For batch jobs, close stdin and send output directly to files.
         cmd.stdin(Stdio::null())
             .stdout(stdout_file.into_std().await)
             .stderr(stderr_file.into_std().await);
+
+        // Batch jobs are not attachable.
+        if tx_attachment.send(None).is_err() {
+            error!(log, "can't clear attachment point");
+        }
 
         // Start and report.
         let mut child = with_io_err!(cmd.spawn(), "spawning job process".to_string());
@@ -323,12 +333,6 @@ async fn job_spawn(
                 }
             }
         });
-
-        None
-    };
-
-    if tx_attachment.send(attachment).is_err() {
-        error!(log, "can't send interactive job attachment point");
     }
 }
 
