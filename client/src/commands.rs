@@ -1077,6 +1077,9 @@ async fn job_output(
             return Err(CommandError::JobStillRunning(job_id.to_owned()));
         }
         Some(JobStatus::Stopped { output, .. }) => output,
+        Some(JobStatus::Error { error, .. }) => {
+            return Err(CommandError::Process(error.to_owned()));
+        }
     };
     let len = match stream {
         Stdout => stdout_len,
@@ -1353,6 +1356,8 @@ pub enum CommandError {
     },
     #[error("❌ permslip error: {0}")]
     Permslip(#[from] PermslipError),
+    #[error("❌ Job process error: {0}")]
+    Process(#[from] sush_common::jobs::ProcessError),
     #[error("👋 Goodbye!")]
     Quit,
     #[error("❌ {0}")]

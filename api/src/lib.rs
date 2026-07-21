@@ -218,7 +218,7 @@ impl JobWait {
     pub fn matches_status(&self, status: &JobStatus) -> bool {
         match self {
             Self::None | Self::Start => true,
-            Self::Stop => status.is_stopped(),
+            Self::Stop => status.is_stopped() || status.is_error(),
         }
     }
 }

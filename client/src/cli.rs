@@ -440,6 +440,19 @@ impl CommandContext for Cli {
                                     Stderr hash:\t{stderr_hash}",
                             );
                         }
+                        JobStatus::Error {
+                            job_id,
+                            time_error,
+                            error,
+                        } => {
+                            println!(
+                                "✅ Job ID:\t{job_id}\n   \
+                                    Target:\t{baseboard_id}\n   \
+                                    Job status:\tError\n   \
+                                    Error at:\t{time_error}\n   \
+                                    Error:\t{error}"
+                            )
+                        }
                     }
                 }
             }

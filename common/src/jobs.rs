@@ -287,6 +287,15 @@ pub enum JobStatus {
         result: Result<i32, ProcessError>,
         output: JobOutputState,
     },
+    Error {
+        job_id: JobId,
+        #[borsh(
+            serialize_with = "borsh_ser_datetime",
+            deserialize_with = "borsh_de_datetime"
+        )]
+        time_error: DateTime<Utc>,
+        error: ProcessError,
+    },
 }
 
 impl JobStatus {
@@ -296,6 +305,10 @@ impl JobStatus {
 
     pub fn is_stopped(&self) -> bool {
         matches!(self, Self::Stopped { .. })
+    }
+
+    pub fn is_error(&self) -> bool {
+        matches!(self, Self::Error { .. })
     }
 }
 
@@ -404,12 +417,15 @@ impl JobStatus {
                 time_stopped,
                 ..
             } => *time_stopped - time_started,
+            Self::Error { .. } => TimeDelta::zero(),
         }
     }
 
     pub fn job_id(&self) -> &JobId {
         match self {
-            Self::Started { job_id, .. } | Self::Stopped { job_id, .. } => job_id,
+            Self::Started { job_id, .. }
+            | Self::Stopped { job_id, .. }
+            | Self::Error { job_id, .. } => job_id,
         }
     }
 

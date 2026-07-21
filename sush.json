@@ -808,6 +808,35 @@
               "Stopped"
             ],
             "additionalProperties": false
+          },
+          {
+            "type": "object",
+            "properties": {
+              "Error": {
+                "type": "object",
+                "properties": {
+                  "job_id": {
+                    "$ref": "#/components/schemas/JobId"
+                  },
+                  "time_error": {
+                    "type": "string",
+                    "format": "date-time"
+                  },
+                  "error": {
+                    "$ref": "#/components/schemas/ProcessError"
+                  }
+                },
+                "required": [
+                  "error",
+                  "job_id",
+                  "time_error"
+                ]
+              }
+            },
+            "required": [
+              "Error"
+            ],
+            "additionalProperties": false
           }
         ]
       },

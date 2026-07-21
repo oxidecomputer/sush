@@ -327,6 +327,15 @@ impl State {
                     }
                     JobEvent::Error(job_id, when, error) => {
                         error!(log, "job error"; "job_id" => %job_id, "when" => %when, "error" => %error);
+                        self.set_job_status(
+                            job_id,
+                            baseboard_id,
+                            JobStatus::Error {
+                                job_id: job_id.to_owned(),
+                                time_error: *when,
+                                error: error.to_owned(),
+                            },
+                        )
                     }
                 },
                 Event::Error(error) => {
