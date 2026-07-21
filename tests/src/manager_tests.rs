@@ -505,6 +505,56 @@ async fn output_ranges() {
     );
     assert_eq!(o, r);
 
+    // The first ten bytes, then the rest.
+    let mut o = vec![];
+    o.extend(
+        mgr.job_output(
+            &authn,
+            &job_id,
+            baseboard_id,
+            JobOutputStream::Stdout,
+            Some(Range {
+                start: StartPosition::Index(0),
+                end: EndPosition::Index(9),
+            }),
+        )
+        .await
+        .unwrap(),
+    );
+    o.extend(
+        mgr.job_output(
+            &authn,
+            &job_id,
+            baseboard_id,
+            JobOutputStream::Stdout,
+            Some(Range {
+                start: StartPosition::Index(10),
+                end: EndPosition::LastByte,
+            }),
+        )
+        .await
+        .unwrap(),
+    );
+    assert_eq!(o, r);
+
+    // Just the last byte.
+    let mut o = vec![];
+    o.extend(
+        mgr.job_output(
+            &authn,
+            &job_id,
+            baseboard_id,
+            JobOutputStream::Stdout,
+            Some(Range {
+                start: StartPosition::Index(n - 1),
+                end: EndPosition::LastByte,
+            }),
+        )
+        .await
+        .unwrap(),
+    );
+    assert_eq!(o, r[(n - 1) as usize..]);
+
     // Various ranges, from one byte to half.
     for l in 1..n / 2 {
         let mut i = 0;

@@ -112,8 +112,9 @@ impl JobOutputDir {
                 return Err(JobError::InvalidRange(len));
             };
             let n = match end {
-                EndPosition::Index(end) => end - start + 1,
-                EndPosition::LastByte => len - start + 1,
+                EndPosition::Index(end) if end < len && end >= start => end - start + 1,
+                EndPosition::LastByte => len - start,
+                _ => return Err(JobError::InvalidRange(len)),
             };
             if n > len.min(OUTPUT_THRESHOLD) {
                 Err(JobError::InvalidRange(len))
