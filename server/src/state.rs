@@ -273,10 +273,11 @@ impl State {
                     }
                 },
             },
-            // Track the active set of known-running jobs anywhere in the rack:
             Message::Event(baseboard_id, event) => match event {
+                // Track the active set of known-running jobs anywhere in the rack.
                 Event::Job(job_event) => match job_event {
                     JobEvent::Start(job_id, when) => {
+                        info!(log, "job started"; "job_id" => %job_id, "when" => %when);
                         self.running
                             .insert((job_id.clone(), baseboard_id.clone()), *when);
                         self.causal_jobs.insert((
@@ -284,15 +285,17 @@ impl State {
                             job_id.clone(),
                             baseboard_id.clone(),
                         ));
-
-                        // Update job status.
-                        let status = JobStatus::Started {
-                            job_id: job_id.clone(),
-                            time_started: *when,
-                        };
-                        self.set_job_status(job_id, baseboard_id, status.clone());
+                        self.set_job_status(
+                            job_id,
+                            baseboard_id,
+                            JobStatus::Started {
+                                job_id: job_id.clone(),
+                                time_started: *when,
+                            },
+                        );
                     }
                     JobEvent::Stop(job_id, when, result, output) => {
+                        info!(log, "job stopped"; "job_id" => %job_id, "when" => %when, "result" => ?result);
                         self.attachments.remove(job_id);
                         self.running.remove(&(job_id.clone(), baseboard_id.clone()));
                         self.causal_jobs.insert((
@@ -309,24 +312,26 @@ impl State {
                             .and_then(|m| m.get(baseboard_id))
                             .cloned()
                         {
+                            self.set_job_status(
+                                &job_id,
+                                baseboard_id,
+                                JobStatus::Stopped {
+                                    job_id: job_id.clone(),
+                                    time_started,
+                                    time_stopped: *when,
+                                    result: result.clone(),
+                                    output: output.clone(),
+                                },
+                            );
                             if *baseboard_id == self.own_baseboard {
-                                // The stopped job is local.
                                 executor.job_stopped(&job_id);
                             }
-
-                            // Update status.
-                            let status = JobStatus::Stopped {
-                                job_id: job_id.clone(),
-                                time_started,
-                                time_stopped: *when,
-                                result: result.clone(),
-                                output: output.clone(),
-                            };
-                            self.set_job_status(&job_id, baseboard_id, status);
                         }
                     }
                     JobEvent::Error(job_id, when, error) => {
                         error!(log, "job error"; "job_id" => %job_id, "when" => %when, "error" => %error);
+                        self.attachments.remove(job_id);
+                        self.running.remove(&(job_id.clone(), baseboard_id.clone()));
                         self.set_job_status(
                             job_id,
                             baseboard_id,
@@ -335,7 +340,10 @@ impl State {
                                 time_error: *when,
                                 error: error.to_owned(),
                             },
-                        )
+                        );
+                        if *baseboard_id == self.own_baseboard {
+                            executor.job_stopped(&job_id);
+                        }
                     }
                 },
                 Event::Error(error) => {
