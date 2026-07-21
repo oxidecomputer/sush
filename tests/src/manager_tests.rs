@@ -194,6 +194,20 @@ async fn job_stop() {
     mgr.session_start(&authn, session_id.clone()).await.unwrap();
     let job_id = session.next_job_id();
 
+    // Stopping a not-yet-extant job should fail (even with a wait).
+    assert!(matches!(
+        mgr.job_stop(
+            &authn,
+            &job_id,
+            JobStopParams {
+                wait: JobWait::Stop
+            }
+        )
+        .await
+        .expect_err("should not find job"),
+        JobError::JobNotFound(jid) if jid == job_id
+    ));
+
     // Start a (potentially) long-running job.
     let command = "sleep 10";
     let job = root.sign_job_request(&job_id, command, false).await;

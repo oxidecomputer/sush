@@ -413,9 +413,9 @@ impl JobManager {
         job_id: &JobId,
         JobStopParams { wait }: JobStopParams,
     ) -> Result<(), JobError> {
+        let _status = self.job_status(authn, job_id).await?;
         self.job_request(authn, JobRequest::Stop(job_id.to_owned()))
             .await?;
-
         self.maybe_wait(job_id, wait).await
     }
 
@@ -433,11 +433,12 @@ impl JobManager {
 
     pub async fn job_output(
         &self,
-        _authn: &Identity,
+        authn: &Identity,
         job_id: &JobId,
         stream: JobOutputStream,
         range: Option<Range>,
     ) -> Result<Vec<u8>, JobError> {
+        let _status = self.job_status(authn, job_id).await?;
         self.output_dir.job_output(job_id, stream, range).await
     }
 
