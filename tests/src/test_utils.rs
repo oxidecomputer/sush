@@ -1,5 +1,6 @@
 //! Integration test utilities.
 
+use std::sync::OnceLock;
 use std::time::Duration;
 
 use chrono::Utc;
@@ -19,6 +20,17 @@ use sush_common::codephrases::generate_id;
 use sush_common::jobs::{JobId, JobStartRequest, VerifiedJob};
 use sush_common::keys::{EphemeralKey, KeyType, Signer};
 use sush_server::JobManager;
+
+static TEST_BASEBOARD_ID: OnceLock<BaseboardId> = OnceLock::new();
+
+pub fn test_baseboard_id() -> BaseboardId {
+    TEST_BASEBOARD_ID
+        .get_or_init(|| BaseboardId {
+            part_number: "test part".to_string(),
+            serial_number: "0000".to_string(),
+        })
+        .clone()
+}
 
 #[allow(async_fn_in_trait)]
 pub trait SignJobRequest {
@@ -85,15 +97,17 @@ pub async fn fake_identity(key: &mut EphemeralKey) -> Identity {
 
 pub async fn manager_and_test_root(log: Logger) -> (JobManager, EphemeralKey, TempDir) {
     let dir = TempDir::with_prefix("sush-").unwrap();
-    let baseboard = BaseboardId {
-        part_number: "test part".to_string(),
-        serial_number: "0000".to_string(),
-    };
     let gossip = Peer::seed().into_rumors();
     let shutdown = CancellationToken::new();
-    let mgr = JobManager::new(log, dir.path().to_owned(), baseboard, gossip, shutdown)
-        .await
-        .unwrap();
+    let mgr = JobManager::new(
+        log,
+        dir.path().to_owned(),
+        test_baseboard_id(),
+        gossip,
+        shutdown,
+    )
+    .await
+    .unwrap();
     let root = ephemeral_test_root();
     let key_id = mgr.import_root(root.cert().to_owned()).await.unwrap();
     assert_eq!(&key_id, root.key_id());

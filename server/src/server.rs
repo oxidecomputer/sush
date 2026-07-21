@@ -6,14 +6,15 @@ use dropshot::{
     WebsocketUpgrade,
 };
 use hyper::Response;
+use sled_hardware_types::BaseboardId;
 use tokio_tungstenite::WebSocketStream;
 use tokio_tungstenite::tungstenite::protocol::Role;
 use x509_cert::Certificate;
 use x509_cert::der::{Decode as _, DecodePem as _};
 
 use sush_api::{
-    Authorization, AuthorizedRangeRequest, JobHistoryParams, JobIdParam, JobOutputParams,
-    JobStartParams, JobStopParams, KeyIdParam, SessionIdParam, SushApi,
+    Authorization, AuthorizedRangeRequest, JobAttachParams, JobHistoryParams, JobIdParam,
+    JobOutputParams, JobStartParams, JobStopParams, KeyIdParam, SessionIdParam, SushApi,
 };
 use sush_common::authn::Identity;
 use sush_common::jobs::{JsonJobStatusMap, Session, SignedJob, job_status_map_en};
@@ -187,22 +188,50 @@ impl SushApi for ApiServer {
         let headers = headers.into_inner();
         let range = headers.range()?;
         let authn = mgr.iam(headers.authorization, None).await?;
-        let JobOutputParams { job_id, stream } = params.into_inner();
-        let stdout = mgr.job_output(&authn, &job_id, stream, range).await?;
+        let JobOutputParams {
+            job_id,
+            stream,
+            target,
+        } = params.into_inner();
+        let target = if target == "*" {
+            mgr.own_baseboard().clone()
+        } else {
+            target.parse().map_err(|_| {
+                HttpError::for_client_error(
+                    None,
+                    ClientErrorStatusCode::BAD_REQUEST,
+                    String::from("Unable to parse target as baseboard ID"),
+                )
+            })?
+        };
+        let stdout = mgr
+            .job_output(&authn, &job_id, &target, stream, range)
+            .await?;
         Ok(Response::new(stdout.into()))
     }
 
     async fn job_attach(
         ctx: RequestContext<Self::Context>,
         headers: Header<Authorization>,
-        params: PathParams<JobIdParam>,
+        params: PathParams<JobAttachParams>,
         upgrade: WebsocketUpgrade,
     ) -> WebsocketEndpointResult {
         let mgr = ctx.context();
         let Authorization { authorization } = headers.into_inner();
         let authn = mgr.iam(authorization, None).await?;
-        let JobIdParam { job_id } = params.into_inner();
-        let attachment = mgr.job_attachment(&authn, &job_id).await?;
+        let JobAttachParams { job_id, target } = params.into_inner();
+        let target = if target == "*" {
+            mgr.own_baseboard().clone()
+        } else {
+            target.parse().map_err(|_| {
+                HttpError::for_client_error(
+                    None,
+                    ClientErrorStatusCode::BAD_REQUEST,
+                    String::from("Unable to parse target as baseboard ID"),
+                )
+            })?
+        };
+        let attachment = mgr.job_attachment(&authn, &job_id, &target).await?;
         upgrade.handle(async move |conn| {
             let socket = conn.into_inner();
             let stream = WebSocketStream::from_raw_socket(socket, Role::Server, None).await;
@@ -229,5 +258,15 @@ impl SushApi for ApiServer {
                 .map(job_status_map_en)
                 .collect(),
         ))
+    }
+
+    async fn target(
+        ctx: RequestContext<Self::Context>,
+        headers: Header<Authorization>,
+    ) -> Result<HttpResponseOk<BaseboardId>, HttpError> {
+        let mgr = ctx.context();
+        let Authorization { authorization } = headers.into_inner();
+        let _authn = mgr.iam(authorization, None).await?;
+        Ok(HttpResponseOk(mgr.own_baseboard().to_owned()))
     }
 }

@@ -21,6 +21,7 @@ use memmap2::Mmap;
 use progenitor_client::ResponseValue;
 use reqwest::Upgraded;
 use rustix::termios::tcgetwinsize;
+use sled_hardware_types::BaseboardId;
 use thiserror::Error;
 use tokio::signal::ctrl_c;
 use tokio::time::{MissedTickBehavior, interval, sleep};
@@ -312,6 +313,7 @@ pub enum JobCommand {
     /// Get the standard output of a job.
     #[clap(alias = "output")]
     Stdout {
+        /// The baseboard ID of the sled from which output should be fetched.
         #[arg(short, long, default_value = "*")]
         target: String,
 
@@ -322,6 +324,7 @@ pub enum JobCommand {
     /// Get the standard error of a job.
     #[clap(alias = "error")]
     Stderr {
+        /// The baseboard ID of the sled from which output should be fetched.
         #[arg(short, long, default_value = "*")]
         target: String,
 
@@ -334,6 +337,10 @@ pub enum JobCommand {
         /// The interactive job to attach to.
         #[clap(env = SUSH_JOB_ID)]
         job_id: JobId,
+
+        /// The baseboard ID of the sled to attach to.
+        #[arg(short, long, default_value = "*")]
+        target: String,
     },
 
     /// Show status of previously started jobs.
@@ -793,15 +800,18 @@ async fn job(
         (JobCommand::Status { job_id }, Some(client)) => job_status(ctx, client, &job_id).await,
 
         (JobCommand::Stdout { target, output }, Some(client)) => {
+            let target = resolve_target(ctx, client, &target).await?;
             job_output(ctx, client, &target, Stdout, output).await
         }
 
         (JobCommand::Stderr { target, output }, Some(client)) => {
+            let target = resolve_target(ctx, client, &target).await?;
             job_output(ctx, client, &target, Stderr, output).await
         }
 
-        (JobCommand::Attach { job_id }, Some(client)) => {
-            job_attach(ctx, client, &job_id).await?;
+        (JobCommand::Attach { job_id, target }, Some(client)) => {
+            let target = resolve_target(ctx, client, &target).await?;
+            job_attach(ctx, client, &job_id, &target).await?;
             Ok(())
         }
 
@@ -836,6 +846,11 @@ async fn job_start(
     job: SignedJob,
     start_args: JobStartArgs,
 ) -> Result<(), CommandError> {
+    // Eventually, the target will be embedded in the signed job request.
+    // But for now, just get it from the server.
+    let target = resolve_target(ctx, client, "*").await?;
+
+    // Set up the job request and parameters.
     let job_id = job.job_id().to_owned();
     let JobStartArgs {
         binary,
@@ -881,7 +896,7 @@ async fn job_start(
 
     if interactive {
         start.await?;
-        job_attach(ctx, client, &job_id).await?;
+        job_attach(ctx, client, &job_id, &target).await?;
     } else if wait.is_some() {
         let mut interval = interval(Duration::from_millis(250));
         let mut stopped = false;
@@ -949,6 +964,7 @@ async fn job_start(
                 client
                     .job_output()
                     .job_id(&job_id)
+                    .target(target.to_string())
                     .stream(stream)
                     .authorization(authz)
                     .send()
@@ -1028,7 +1044,7 @@ type FutureChunk<'a> = dyn Future<Output = Result<Chunk, CommandError>> + Send +
 async fn job_output(
     ctx: &mut impl CommandContext,
     client: &Client,
-    target: &str,
+    target: &BaseboardId,
     stream: JobOutputStream,
     JobOutput {
         job_id,
@@ -1054,23 +1070,12 @@ async fn job_output(
     )
     .map_err(CommandError::BaseboardIdParseError)?;
 
-    let baseboard_id = if target == "*" {
-        match status.len() {
-            1 => status.keys().next().unwrap().to_owned(),
-            0 => return Err(CommandError::NotFound),
-            _ => return Err(CommandError::MissingTarget),
-        }
-    } else {
-        target
-            .parse()
-            .map_err(CommandError::BaseboardIdParseError)?
-    };
     let JobOutputState {
         stdout_len,
         stderr_len,
         stdout_hash,
         stderr_hash,
-    } = match status.get(&baseboard_id) {
+    } = match status.get(target) {
         None => return Err(CommandError::NotFound),
         Some(JobStatus::Started { job_id, .. }) => {
             return Err(CommandError::JobStillRunning(job_id.to_owned()));
@@ -1122,7 +1127,7 @@ async fn job_output(
 
         // Download and write the output in parallel (unordered) chunks.
         ctx.job_output_started(&job_id, stream, "Downloading", *len);
-        let chunks = job_output_chunks(ctx, client, &job_id, stream, *len, chunk_size);
+        let chunks = job_output_chunks(ctx, client, &job_id, target, stream, *len, chunk_size);
         let par = parallel.get() as usize;
         let mut chunks_par = stream::iter(chunks).buffer_unordered(par);
         while let Some(chunk) = chunks_par.next().await {
@@ -1159,6 +1164,7 @@ async fn job_output(
                 client
                     .job_output()
                     .job_id(&job_id)
+                    .target(target.to_string())
                     .stream(stream)
                     .authorization(authz)
                     .send()
@@ -1179,6 +1185,7 @@ fn job_output_chunks<'a>(
     ctx: &mut impl CommandContext,
     client: &'a Client,
     job_id: &'a JobId,
+    target: &'a BaseboardId,
     stream: JobOutputStream,
     len: u64,
     chunk_size: NonZeroU64,
@@ -1200,6 +1207,7 @@ fn job_output_chunks<'a>(
                 let stream = client
                     .job_output()
                     .job_id(job_id)
+                    .target(target.to_string())
                     .stream(stream)
                     .range(&bytes)
                     .authorization(&authz)
@@ -1256,11 +1264,13 @@ async fn job_attach(
     ctx: &mut impl CommandContext,
     client: &Client,
     job_id: &JobId,
+    target: &BaseboardId,
 ) -> Result<InteractiveJobOk, CommandError> {
     match with_authz(ctx, client, async |authz| {
         client
             .job_attach()
             .job_id(job_id)
+            .target(target.to_string())
             .authorization(authz)
             .send()
             .await
@@ -1280,6 +1290,26 @@ async fn job_attach(
             Ok(InteractiveJobOk::Established)
         }
     }
+}
+
+async fn resolve_target(
+    ctx: &mut impl CommandContext,
+    client: &Client,
+    target: &str,
+) -> Result<BaseboardId, CommandError> {
+    // Eventually, "*" will mean "all sleds", but for now
+    // we take it as "the current sled".
+    Ok(if target == "*" {
+        with_authz(ctx, client, async |authz| {
+            client.target().authorization(authz).send().await
+        })
+        .await?
+        .into_inner()
+    } else {
+        target
+            .parse()
+            .map_err(CommandError::BaseboardIdParseError)?
+    })
 }
 
 /// What went wrong parsing, preparing, or executing a client command.

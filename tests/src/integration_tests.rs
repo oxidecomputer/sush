@@ -19,7 +19,9 @@ use sush_common::interactive::{
 use sush_common::jobs::{JobLimits, JobOutputStream, Session, SessionId};
 use sush_server::{ApiServer, ProxyServer};
 
-use crate::test_utils::{SignJobRequest as _, authz, manager_and_test_root, test_logger};
+use crate::test_utils::{
+    SignJobRequest as _, authz, manager_and_test_root, test_baseboard_id, test_logger,
+};
 
 fn local_addr() -> SocketAddr {
     "127.0.0.1:0".parse().unwrap()
@@ -93,9 +95,10 @@ async fn client_server() {
     // Check the job output.
     let mut output = client
         .job_output()
-        .authorization(credentials.to_string())
         .job_id(&job_id)
         .stream(JobOutputStream::Stdout)
+        .target("*")
+        .authorization(credentials.to_string())
         .send()
         .await
         .expect("can't get job output")
@@ -220,8 +223,9 @@ async fn interactive_job() {
     // Attach to the job and rekey.
     let socket = client
         .job_attach()
-        .authorization(credentials.to_string())
         .job_id(&job_id)
+        .target(test_baseboard_id().to_string())
+        .authorization(credentials.to_string())
         .send()
         .await
         .expect("can't attach to job")
@@ -290,6 +294,7 @@ async fn interactive_job() {
         .authorization(credentials.to_string())
         .job_id(&job_id)
         .stream(JobOutputStream::Stdout)
+        .target(test_baseboard_id().to_string())
         .send()
         .await
         .expect("can't get job output")

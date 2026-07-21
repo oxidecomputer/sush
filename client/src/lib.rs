@@ -10,6 +10,7 @@ progenitor::generate_api!(
     spec = "../sush.json", // must match `sush_common::OPENAPI_DOCUMENT`
     interface = Builder,
     replace = {
+        BaseboardId = sled_hardware_types::BaseboardId,
         Identity = sush_common::authn::Identity,
         Session = sush_common::jobs::Session,
         SessionId = sush_common::jobs::SessionId,

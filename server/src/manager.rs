@@ -433,21 +433,28 @@ impl JobManager {
 
     pub async fn job_output(
         &self,
-        authn: &Identity,
+        _authn: &Identity,
         job_id: &JobId,
+        target: &BaseboardId,
         stream: JobOutputStream,
         range: Option<Range>,
     ) -> Result<Vec<u8>, JobError> {
-        let _status = self.job_status(authn, job_id).await?;
-        self.output_dir.job_output(job_id, stream, range).await
+        if self.own_baseboard() == target && self.state.borrow().get_job_status(job_id).is_some() {
+            self.output_dir.job_output(job_id, stream, range).await
+        } else {
+            Err(JobError::JobNotFound(job_id.to_owned()))
+        }
     }
 
     pub async fn job_attachment(
         &self,
         _authn: &Identity,
         job_id: &JobId,
+        target: &BaseboardId,
     ) -> Result<SocketSender, JobError> {
-        if let Some(attachment) = self.state.borrow().get_attachment(job_id) {
+        if self.own_baseboard() == target
+            && let Some(attachment) = self.state.borrow().get_attachment(job_id)
+        {
             Ok(attachment.to_owned())
         } else {
             Err(JobError::JobNotFound(job_id.to_owned()))

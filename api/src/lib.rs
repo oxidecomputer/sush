@@ -14,6 +14,7 @@ use hyper::Response;
 use schemars::JsonSchema;
 use serde::de::{Deserializer, Error as DeserializeError, IntoDeserializer, MapAccess, Visitor};
 use serde::{Deserialize, Serialize};
+use sled_hardware_types::BaseboardId;
 
 use sush_common::authn::Identity;
 use sush_common::jobs::{
@@ -124,7 +125,7 @@ pub trait SushApi {
     ) -> Result<HttpResponseOk<JsonJobStatusMap>, HttpError>;
 
     /// Get (a subset of) the standard output or standard error of a job.
-    #[endpoint { method = GET, path = "/jobs/{job_id}/output/{stream}" }]
+    #[endpoint { method = GET, path = "/jobs/{job_id}/output/{target}/{stream}" }]
     async fn job_output(
         ctx: RequestContext<Self::Context>,
         headers: Header<AuthorizedRangeRequest>,
@@ -135,11 +136,11 @@ pub trait SushApi {
     // This should use `channel { protocol = WEBSOCKETS, .. }`, but that
     // does not currently let us return (unauthorized) errors before the
     // connection upgrade.
-    #[endpoint { method = GET, path = "/jobs/{job_id}/attach" }]
+    #[endpoint { method = GET, path = "/jobs/{job_id}/attach/{target}" }]
     async fn job_attach(
         ctx: RequestContext<Self::Context>,
         headers: Header<Authorization>,
-        params: PathParams<JobIdParam>,
+        params: PathParams<JobAttachParams>,
         upgrade: WebsocketUpgrade,
     ) -> WebsocketEndpointResult;
 
@@ -150,6 +151,13 @@ pub trait SushApi {
         headers: Header<Authorization>,
         query: QueryParams<JobHistoryParams>,
     ) -> Result<HttpResponseOk<Vec<JsonJobStatusMap>>, HttpError>;
+
+    /// Get the baseboard ID of the sled handling this request.
+    #[endpoint { method = GET, path = "/target" }]
+    async fn target(
+        ctx: RequestContext<Self::Context>,
+        headers: Header<Authorization>,
+    ) -> Result<HttpResponseOk<BaseboardId>, HttpError>;
 }
 
 #[derive(Deserialize, JsonSchema)]
@@ -165,6 +173,15 @@ pub struct SessionIdParam {
 #[derive(Deserialize, JsonSchema)]
 pub struct JobIdParam {
     pub job_id: JobId,
+}
+
+#[derive(Deserialize, JsonSchema)]
+pub struct JobAttachParams {
+    /// Which job to attach to.
+    pub job_id: JobId,
+
+    /// To be used by Nexus for routing.
+    pub target: String,
 }
 
 /// Job parameters _not_ specified in the signed job request.
@@ -273,6 +290,7 @@ where
 #[derive(Deserialize, JsonSchema)]
 pub struct JobOutputParams {
     pub job_id: JobId,
+    pub target: String,
     pub stream: JobOutputStream,
 }
 

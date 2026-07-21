@@ -242,7 +242,7 @@
         }
       }
     },
-    "/jobs/{job_id}/attach": {
+    "/jobs/{job_id}/attach/{target}": {
       "get": {
         "summary": "Attach to an interactive job.",
         "operationId": "job_attach",
@@ -258,9 +258,19 @@
           {
             "in": "path",
             "name": "job_id",
+            "description": "Which job to attach to.",
             "required": true,
             "schema": {
               "$ref": "#/components/schemas/JobId"
+            }
+          },
+          {
+            "in": "path",
+            "name": "target",
+            "description": "To be used by Nexus for routing.",
+            "required": true,
+            "schema": {
+              "type": "string"
             }
           }
         ],
@@ -277,7 +287,7 @@
         "x-dropshot-websocket": {}
       }
     },
-    "/jobs/{job_id}/output/{stream}": {
+    "/jobs/{job_id}/output/{target}/{stream}": {
       "get": {
         "summary": "Get (a subset of) the standard output or standard error of a job.",
         "operationId": "job_output",
@@ -304,6 +314,14 @@
             "required": true,
             "schema": {
               "$ref": "#/components/schemas/JobId"
+            }
+          },
+          {
+            "in": "path",
+            "name": "target",
+            "required": true,
+            "schema": {
+              "type": "string"
             }
           },
           {
@@ -630,6 +648,40 @@
         "responses": {
           "204": {
             "description": "resource updated"
+          },
+          "4XX": {
+            "$ref": "#/components/responses/Error"
+          },
+          "5XX": {
+            "$ref": "#/components/responses/Error"
+          }
+        }
+      }
+    },
+    "/target": {
+      "get": {
+        "summary": "Get the baseboard ID of the sled handling this request.",
+        "operationId": "target",
+        "parameters": [
+          {
+            "in": "header",
+            "name": "authorization",
+            "description": "Authorization to access some resource, such as a signature.\n\nSee: <https://developer.mozilla.org/en-US/docs/Web/HTTP/Reference/Headers/Authorization>",
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "successful operation",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/BaseboardId"
+                }
+              }
+            }
           },
           "4XX": {
             "$ref": "#/components/responses/Error"
@@ -1006,6 +1058,24 @@
       "SessionId": {
         "description": "A globally unique identifier for a session.",
         "type": "string"
+      },
+      "BaseboardId": {
+        "description": "A representation of a Baseboard ID as used in the inventory subsystem.\n\nThis type is essentially the same as a `Baseboard` except it doesn't have a revision or HW type (Gimlet, PC, Unknown).",
+        "type": "object",
+        "properties": {
+          "part_number": {
+            "description": "Oxide Part Number",
+            "type": "string"
+          },
+          "serial_number": {
+            "description": "Serial number (unique for a given part number)",
+            "type": "string"
+          }
+        },
+        "required": [
+          "part_number",
+          "serial_number"
+        ]
       },
       "JobOutputStream": {
         "description": "Either the standard output or standard error of a job.",

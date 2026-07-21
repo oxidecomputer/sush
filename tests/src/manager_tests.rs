@@ -79,6 +79,7 @@ fn check_status_stopped(
 async fn jobs() {
     let log = test_logger(function_name!());
     let (mgr, mut root, _dir) = manager_and_test_root(log).await;
+    let baseboard_id = mgr.own_baseboard();
     let authn = fake_identity(&mut root).await;
     let session_id = SessionId::new();
     let mut session = Session::new(session_id.clone());
@@ -137,16 +138,16 @@ async fn jobs() {
     .await
     .unwrap();
     session.job_started(job.clone().into_signed());
-    let status = mgr.job_status(&authn, &job_id).await.unwrap()[mgr.own_baseboard()].clone();
+    let status = mgr.job_status(&authn, &job_id).await.unwrap()[baseboard_id].clone();
     check_status_stopped(status, &job_id, Ok(0), job_id_bytes.len() as u64, 0);
     assert_eq!(
-        mgr.job_output(&authn, &job_id, JobOutputStream::Stdout, None)
+        mgr.job_output(&authn, &job_id, baseboard_id, JobOutputStream::Stdout, None)
             .await
             .unwrap(),
         job_id_bytes
     );
     assert!(
-        mgr.job_output(&authn, &job_id, JobOutputStream::Stderr, None)
+        mgr.job_output(&authn, &job_id, baseboard_id, JobOutputStream::Stderr, None)
             .await
             .unwrap()
             .is_empty()
@@ -167,16 +168,16 @@ async fn jobs() {
     .await
     .unwrap();
     session.job_started(job.clone().into_signed());
-    let status = mgr.job_status(&authn, &job_id).await.unwrap()[mgr.own_baseboard()].clone();
+    let status = mgr.job_status(&authn, &job_id).await.unwrap()[baseboard_id].clone();
     check_status_stopped(status, &job_id, Ok(0), output.len() as u64, 0);
     assert_eq!(
-        mgr.job_output(&authn, &job_id, JobOutputStream::Stdout, None)
+        mgr.job_output(&authn, &job_id, baseboard_id, JobOutputStream::Stdout, None)
             .await
             .unwrap(),
         output.as_bytes(),
     );
     assert!(
-        mgr.job_output(&authn, &job_id, JobOutputStream::Stderr, None)
+        mgr.job_output(&authn, &job_id, baseboard_id, JobOutputStream::Stderr, None)
             .await
             .unwrap()
             .is_empty()
@@ -188,6 +189,7 @@ async fn jobs() {
 async fn job_stop() {
     let log = test_logger(function_name!());
     let (mgr, mut root, _dir) = manager_and_test_root(log).await;
+    let baseboard_id = mgr.own_baseboard();
     let authn = fake_identity(&mut root).await;
     let session_id = SessionId::new();
     let mut session = Session::new(session_id.clone());
@@ -224,7 +226,7 @@ async fn job_stop() {
     session.job_started(job.clone().into_signed());
 
     // Check that the job is alive.
-    let status = mgr.job_status(&authn, &job_id).await.unwrap()[mgr.own_baseboard()].clone();
+    let status = mgr.job_status(&authn, &job_id).await.unwrap()[baseboard_id].clone();
     check_status_started(status, &job_id);
 
     // Kill the job and wait for it to die.
@@ -243,7 +245,7 @@ async fn job_stop() {
         .job_status(&authn, &job_id)
         .await
         .expect("should be able to get status")
-        .remove(mgr.own_baseboard())
+        .remove(baseboard_id)
         .expect("should have job status");
     assert!(status.time_elapsed().to_std().unwrap() < Duration::from_secs(1));
     check_status_stopped(status, &job_id, Err(ProcessError::Killed(SIGKILL)), 0, 0);
@@ -343,6 +345,7 @@ async fn cert_chain() {
 async fn too_much_cpu() {
     let log = test_logger(function_name!());
     let (mgr, mut root, _dir) = manager_and_test_root(log).await;
+    let baseboard_id = mgr.own_baseboard();
     let authn = fake_identity(&mut root).await;
     let session_id = SessionId::new();
     let session = Session::new(session_id.clone());
@@ -380,7 +383,7 @@ async fn too_much_cpu() {
 
     // The output of `openssl speed` changed between v3.0 and v3.5.
     let stderr = mgr
-        .job_output(&authn, &job_id, JobOutputStream::Stderr, None)
+        .job_output(&authn, &job_id, baseboard_id, JobOutputStream::Stderr, None)
         .await
         .unwrap();
     let stderr = String::from_utf8_lossy(&stderr);
@@ -408,6 +411,7 @@ async fn too_much_cpu() {
 async fn output_ranges() {
     let log = test_logger(function_name!());
     let (mgr, mut root, _dir) = manager_and_test_root(log).await;
+    let baseboard_id = mgr.own_baseboard();
     let authn = fake_identity(&mut root).await;
     let session_id = SessionId::new();
     let session = Session::new(session_id.clone());
@@ -433,7 +437,7 @@ async fn output_ranges() {
 
     // No range, i.e., full output.
     let r = mgr
-        .job_output(&authn, &job_id, JobOutputStream::Stdout, None)
+        .job_output(&authn, &job_id, baseboard_id, JobOutputStream::Stdout, None)
         .await
         .unwrap();
 
@@ -442,6 +446,7 @@ async fn output_ranges() {
         mgr.job_output(
             &authn,
             &job_id,
+                    baseboard_id,
             JobOutputStream::Stdout,
             Some(Range {
                 start: StartPosition::Index(0),
@@ -458,6 +463,7 @@ async fn output_ranges() {
         mgr.job_output(
             &authn,
             &job_id,
+            baseboard_id,
             JobOutputStream::Stdout,
             Some(Range {
                 start: StartPosition::Index(0),
@@ -474,6 +480,7 @@ async fn output_ranges() {
         .job_output(
             &authn,
             &job_id,
+            baseboard_id,
             JobOutputStream::Stdout,
             Some(Range {
                 start: StartPosition::Index(0),
@@ -486,6 +493,7 @@ async fn output_ranges() {
         mgr.job_output(
             &authn,
             &job_id,
+            baseboard_id,
             JobOutputStream::Stdout,
             Some(Range {
                 start: StartPosition::Index(n / 2),
@@ -506,6 +514,7 @@ async fn output_ranges() {
                 mgr.job_output(
                     &authn,
                     &job_id,
+                    baseboard_id,
                     JobOutputStream::Stdout,
                     Some(Range {
                         start: StartPosition::Index(i),
@@ -521,6 +530,7 @@ async fn output_ranges() {
             mgr.job_output(
                 &authn,
                 &job_id,
+                baseboard_id,
                 JobOutputStream::Stdout,
                 Some(Range {
                     start: StartPosition::Index(i),
