@@ -14,7 +14,7 @@ use futures::Stream;
 use pwd::Passwd;
 use rustix::io::close;
 use rustix::process::{ioctl_tiocsctty, setsid};
-use slog::{Logger, error, o};
+use slog::{Logger, debug, error, o};
 use terminfo::Database as Terminfo;
 use tokio::fs::{DirBuilder, File};
 use tokio::process::Command;
@@ -287,45 +287,44 @@ async fn job_spawn(
         spawn({
             let events = events.clone();
             let job_id = job_id.clone();
-            let mut stopped = false;
+            let mut killed = false;
             async move {
                 loop {
                     let get_output_state = get_output_state.clone();
                     select! {
-                        _ = stop.cancelled(), if !stopped => {
-                            match child.kill().await {
-                                Ok(()) => {
-                                    stopped = true;
-                                    continue;
-                                }
-                                Err(err) => {
-                                    if let Ok(output_state) = get_output_state().await {
-                                        let _ = events
-                                            .send(Event::Job(JobEvent::Stop(
-                                                job_id,
-                                                Utc::now(),
-                                                Err(ProcessError::io("stopping job process", err)),
-                                                output_state,
-                                            )))
-                                            .await;
-                                    }
-                                    break;
-                                }
+                        _ = stop.cancelled(), if !killed => {
+                            match child.start_kill() {
+                                Ok(()) => debug!(log, "killed job processes"),
+                                Err(err) => error!(log, "unable to kill job"; "error" => %err),
                             }
+                            killed = true;
                         }
                         exit_status = child.wait() => {
-                            if let Ok(output_state) = get_output_state().await {
-                                let _ = events
-                                    .send(Event::Job(JobEvent::Stop(
-                                        job_id,
-                                        Utc::now(),
-                                        match exit_status {
-                                            Ok(exit_status) => process_exit(exit_status),
-                                            Err(err) => Err(ProcessError::io("waiting for job process", err)),
-                                        },
-                                        output_state,
-                                    )))
-                                    .await;
+                            match get_output_state().await {
+                                Ok(output_state) => {
+                                    debug!(log, "reaped job process");
+                                    let _ = events
+                                        .send(Event::Job(JobEvent::Stop(
+                                            job_id,
+                                            Utc::now(),
+                                            match exit_status {
+                                                Ok(exit_status) => process_exit(exit_status),
+                                                Err(err) => Err(ProcessError::io("waiting for job process", err)),
+                                            },
+                                            output_state,
+                                        )))
+                                        .await;
+                                }
+                                Err(err) => {
+                                    error!(log, "unable to get output state"; "error" => %err);
+                                    let _ = events
+                                        .send(Event::Job(JobEvent::Error(
+                                            job_id,
+                                            Utc::now(),
+                                            err.error(),
+                                        )))
+                                        .await;
+                                }
                             }
                             break;
                         }

@@ -15,7 +15,7 @@ use std::process::ExitStatus;
 use bytes::{Buf as _, Bytes, BytesMut};
 use dropshot::WebsocketConnectionRaw;
 use futures::{SinkExt as _, Stream, StreamExt as _};
-use slog::{Logger, error, info};
+use slog::{Logger, debug, error, info};
 use tokio::fs::File;
 use tokio::io::{AsyncReadExt as _, AsyncSeekExt as _, AsyncWriteExt as _};
 use tokio::process::Child;
@@ -117,15 +117,10 @@ async fn interactive_job(
     }
 
     // Set up death watch and output drain timer.
+    let mut killed = false;
     let mut dead = false;
     let drain_timeout = sleep(Duration::MAX);
     pin!(drain_timeout);
-    macro_rules! died {
-        () => {
-            dead = true;
-            drain_timeout.as_mut().reset(Instant::now() + DRAIN_TIMEOUT);
-        };
-    }
 
     // Handle interactive job events.
     loop {
@@ -203,25 +198,29 @@ async fn interactive_job(
             }
 
             // Stop job on cancellation signal, but only once.
-            _ = stop.cancelled(), if !dead => {
-                child.kill().await?; // also waits
-                info!(log, "job stopped by request");
-                died!();
+            _ = stop.cancelled(), if !killed => {
+                match child.start_kill() {
+                    Ok(()) => debug!(log, "killed job processes"),
+                    Err(err) => error!(log, "unable to kill job"; "error" => %err),
+                }
+                debug!(log, "killed job process");
+                killed = true;
             }
 
             // Notice when the job dies, but do not exit the loop;
             // we must continue reading output until we hit EOF or
             // the drain timeout expires.
             _ = child.wait(), if !dead => {
-                info!(log, "job process died");
-                died!();
+                debug!(log, "reaped job process");
+                drain_timeout.as_mut().reset(Instant::now() + DRAIN_TIMEOUT);
+                dead = true;
             }
 
             // Give output a chance to drain from a dead process. It would
             // be great if there were a reliable, non-timeout way of doing
             // this, but it appears there is not. OpenSSH does this too, FWIW.
             _ = &mut drain_timeout, if dead => {
-                info!(log, "job output drained");
+                debug!(log, "drained job output");
                 break;
             }
         }

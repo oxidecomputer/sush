@@ -305,15 +305,16 @@ impl State {
                         ));
 
                         if let Some(JobStatus::Started {
-                            job_id,
+                            job_id: jid,
                             time_started,
                         }) = self
                             .get_job_status(job_id)
                             .and_then(|m| m.get(baseboard_id))
                             .cloned()
+                            && jid == *job_id
                         {
                             self.set_job_status(
-                                &job_id,
+                                job_id,
                                 baseboard_id,
                                 JobStatus::Stopped {
                                     job_id: job_id.clone(),
@@ -323,9 +324,9 @@ impl State {
                                     output: output.clone(),
                                 },
                             );
-                            if *baseboard_id == self.own_baseboard {
-                                executor.job_stopped(&job_id);
-                            }
+                        }
+                        if *baseboard_id == self.own_baseboard {
+                            executor.job_stopped(job_id);
                         }
                     }
                     JobEvent::Error(job_id, when, error) => {
@@ -336,13 +337,13 @@ impl State {
                             job_id,
                             baseboard_id,
                             JobStatus::Error {
-                                job_id: job_id.to_owned(),
+                                job_id: job_id.clone(),
                                 time_error: *when,
-                                error: error.to_owned(),
+                                error: error.clone(),
                             },
                         );
                         if *baseboard_id == self.own_baseboard {
-                            executor.job_stopped(&job_id);
+                            executor.job_stopped(job_id);
                         }
                     }
                 },
