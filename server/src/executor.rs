@@ -157,20 +157,6 @@ async fn job_spawn(
         format!("creating job stderr file `{}`", stderr_path.display())
     );
 
-    let get_output_state = {
-        let log = log.clone();
-        let job_id = job_id.clone();
-        let events = events.clone();
-        let output_dir = output_dir.clone();
-        async move || match output_dir.job_output_state(&job_id).await {
-            Ok(output) => Ok(output),
-            Err(err) => {
-                send_error(&log, &job_id, &events, err.error()).await;
-                Err(err)
-            }
-        }
-    };
-
     // Set up the job command.
     let mut cmd = Command::new("bash");
     cmd.arg("-c").arg(&command);
@@ -256,12 +242,19 @@ async fn job_spawn(
                     Ok(exit_status) => process_exit(exit_status),
                     Err(err) => Err(ProcessError::Interactive(err.to_string())),
                 };
+                let output_state = match output_dir.job_output_state(&job_id).await {
+                    Ok(output) => output,
+                    Err(err) => {
+                        send_error(&log, &job_id, &events, err.error()).await;
+                        return;
+                    }
+                };
                 let _ = events
                     .send(Event::Job(JobEvent::Stop(
                         job_id,
                         Utc::now(),
                         result,
-                        get_output_state().await.unwrap_or_default(),
+                        output_state,
                     )))
                     .await;
             }
@@ -290,7 +283,6 @@ async fn job_spawn(
             let mut killed = false;
             async move {
                 loop {
-                    let get_output_state = get_output_state.clone();
                     select! {
                         _ = stop.cancelled(), if !killed => {
                             match child.start_kill() {
@@ -300,7 +292,7 @@ async fn job_spawn(
                             killed = true;
                         }
                         exit_status = child.wait() => {
-                            match get_output_state().await {
+                            match output_dir.job_output_state(&job_id).await {
                                 Ok(output_state) => {
                                     debug!(log, "reaped job process");
                                     let _ = events
