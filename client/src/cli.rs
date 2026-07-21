@@ -142,6 +142,10 @@ impl CommandContext for Cli {
             return Err(CommandError::InvalidLeafCert(key_id));
         }
 
+        if matches!(self.get_output_format(), OutputFormat::Json) {
+            println!("{}", json!(certs));
+        }
+
         chain.pop().ok_or(CommandError::EmptyCertChain)
     }
 
