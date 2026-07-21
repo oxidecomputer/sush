@@ -921,21 +921,20 @@ async fn job_start(
                             client
                                 .job_stop()
                                 .job_id(&job_id)
+                                .wait(JobWait::Stop)
                                 .authorization(authz)
                                 .send()
                                 .await
                         }).await {
-                            Ok(_) => {
-                                stopped = true;
-                                break;
-                            }
                             Err(CommandError::NotFound) => {
                                 sleep(Duration::from_millis(100)).await;
                                 continue;
                             }
-                            Err(err) => {
+                            Ok(_) | Err(_) => {
                                 ctx.job_polling_finished(&job_id);
-                                return Err(err);
+                                ctx.job_stopped(&job_id);
+                                stopped = true;
+                                break;
                             }
                         }
                     }
