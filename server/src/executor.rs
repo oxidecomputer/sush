@@ -254,10 +254,9 @@ async fn job_spawn(
                         job_id,
                         Utc::now(),
                         result,
-                        get_output_state().await.map_err(|e| e.error())?,
+                        get_output_state().await.unwrap_or_default(),
                     )))
                     .await;
-                Ok::<_, ProcessError>(())
             }
         });
 

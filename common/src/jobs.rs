@@ -423,6 +423,7 @@ impl JobStatus {
     BorshSerialize,
     Clone,
     Debug,
+    Default,
     Deserialize,
     Eq,
     JsonSchema,
