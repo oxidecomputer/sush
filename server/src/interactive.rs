@@ -131,20 +131,28 @@ async fn interactive_job(
             // is known to be dead; it is essential to drain output that may be
             // sent before the process dies, but which arrives after detection
             // of its death.
-            Ok(n) = pty.read_buf(&mut buffer) => {
-                if n == 0 {
-                    info!(log, "EOF from job process");
-                    break;
-                }
-                output.write_all(&buffer[..n]).await?;
-                let data = buffer.copy_to_bytes(n);
-                if let Some(stream) = client.as_mut() {
-                    let message = InteractiveJobMessage::Data(data);
-                    if let Err(error) = stream.send(encoder.encode(message)?).await {
-                        close_client!(stream, "failed to relay job output"; "error" => %error);
+            read = pty.read_buf(&mut buffer) => {
+                match read {
+                    Ok(0) => {
+                        info!(log, "EOF from job process");
+                        break;
+                    }
+                    Ok(n) => {
+                        output.write_all(&buffer[..n]).await?;
+                        let data = buffer.copy_to_bytes(n);
+                        if let Some(stream) = client.as_mut() {
+                            let message = InteractiveJobMessage::Data(data);
+                            if let Err(error) = stream.send(encoder.encode(message)?).await {
+                                close_client!(stream, "failed to relay job output"; "error" => %error);
+                            }
+                        }
+                        buffer.truncate(0);
+                    }
+                    Err(error) => {
+                        info!(log, "error reading from PTY"; "error" => %error);
+                        break;
                     }
                 }
-                buffer.truncate(0);
             }
 
             // Accept a new client, rekey it, and play back the last buffer.
@@ -166,25 +174,38 @@ async fn interactive_job(
             }
 
             // Handle a message from the client.
-            Some(Ok(message)) = next_if_some(&mut client), if !dead => {
-                match decoder.decode(message) {
-                    Ok(message) => {
+            next = next_if_some(&mut client), if !dead => {
+                match next {
+                    None => {
+                        info!(log, "client disconnected");
+                        client = None;
+                    }
+                    Some(Err(error)) => {
                         if let Some(stream) = client.as_mut() {
-                            match handle_client_message(&log, &mut pty, &mut decoder, &mut ping, message).await {
-                                Ok(()) => (),
-                                Err(InteractiveJobError::Close) => {
-                                    info!(log, "client closed connection");
-                                    client = None;
-                                }
-                                Err(error) => {
-                                    close_client!(stream, "failed to handle client message"; "error" => %error);
-                                }
-                            }
+                            close_client!(stream, "client read error"; "error" => %error);
                         }
                     }
-                    Err(error) => {
-                        if let Some(stream) = client.as_mut() {
-                            close_client!(stream, "failed to decode client message"; "error" => %error);
+                    Some(Ok(message)) => {
+                        match decoder.decode(message) {
+                            Ok(message) => {
+                                if let Some(stream) = client.as_mut() {
+                                    match handle_client_message(&log, &mut pty, &mut decoder, &mut ping, message).await {
+                                        Ok(()) => (),
+                                        Err(InteractiveJobError::Close) => {
+                                            info!(log, "client closed connection");
+                                            client = None;
+                                        }
+                                        Err(error) => {
+                                            close_client!(stream, "failed to handle client message"; "error" => %error);
+                                        }
+                                    }
+                                }
+                            }
+                            Err(error) => {
+                                if let Some(stream) = client.as_mut() {
+                                    close_client!(stream, "failed to decode client message"; "error" => %error);
+                                }
+                            }
                         }
                     }
                 }
