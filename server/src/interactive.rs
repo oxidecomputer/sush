@@ -142,7 +142,11 @@ async fn interactive_job(
                         let data = buffer.copy_to_bytes(n);
                         if let Some(stream) = client.as_mut() {
                             let message = InteractiveJobMessage::Data(data);
-                            if let Err(error) = stream.send(encoder.encode(message)?).await {
+                            let encoded = match encoder.encode(message) {
+                                Ok(encoded) => encoded,
+                                Err(error) => close_client!(stream, "failed to encode message"; "error" => %error),
+                            };
+                            if let Err(error) = stream.send(encoded).await {
                                 close_client!(stream, "failed to relay job output"; "error" => %error);
                             }
                         }
