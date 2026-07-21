@@ -11,6 +11,7 @@ use tokio::fs::{File, metadata};
 use tokio::io;
 use tokio::io::{AsyncReadExt as _, AsyncSeekExt as _, SeekFrom};
 use tokio::task::spawn_blocking;
+use tokio::try_join;
 
 use sush_common::jobs::{ExecutionError, JobId, JobOutputHash, JobOutputState, JobOutputStream};
 
@@ -65,6 +66,7 @@ impl JobOutputDir {
             let path = path.clone();
             move || match hasher.update_mmap_rayon(&path) {
                 Ok(_) => Ok(hasher.finalize().into()),
+                Err(err) if err.kind() == io::ErrorKind::NotFound => Ok(hasher.finalize().into()),
                 Err(err) => Err(ExecutionError::io(
                     job_id.clone(),
                     format!("computing hash of {}", path.display()),
@@ -133,11 +135,17 @@ impl JobOutputDir {
 
     pub async fn job_output_state(&self, job_id: &JobId) -> Result<JobOutputState, ExecutionError> {
         use JobOutputStream::*;
+        let stdout_len = self.job_output_len(job_id, Stdout).await?;
+        let stderr_len = self.job_output_len(job_id, Stderr).await?;
+        let (stdout_hash, stderr_hash) = try_join!(
+            self.job_output_hash(job_id, Stdout),
+            self.job_output_hash(job_id, Stderr)
+        )?;
         Ok(JobOutputState {
-            stdout_len: self.job_output_len(job_id, Stdout).await?,
-            stderr_len: self.job_output_len(job_id, Stderr).await?,
-            stdout_hash: self.job_output_hash(job_id, Stdout).await?,
-            stderr_hash: self.job_output_hash(job_id, Stderr).await?,
+            stdout_len,
+            stderr_len,
+            stdout_hash,
+            stderr_hash,
         })
     }
 }
