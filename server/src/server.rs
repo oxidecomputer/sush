@@ -1,8 +1,9 @@
 //! API server for the Oxide Support Shell.
 
 use dropshot::{
-    Body, ClientErrorStatusCode, Header, HttpError, HttpResponseOk, Path as PathParams,
-    Query as QueryParams, RequestContext, TypedBody, WebsocketEndpointResult, WebsocketUpgrade,
+    Body, ClientErrorStatusCode, Header, HttpError, HttpResponseOk, HttpResponseUpdatedNoContent,
+    Path as PathParams, Query as QueryParams, RequestContext, TypedBody, WebsocketEndpointResult,
+    WebsocketUpgrade,
 };
 use hyper::Response;
 use tokio_tungstenite::WebSocketStream;
@@ -102,26 +103,26 @@ impl SushApi for ApiServer {
         ctx: RequestContext<Self::Context>,
         headers: Header<Authorization>,
         params: PathParams<SessionIdParam>,
-    ) -> Result<HttpResponseOk<()>, HttpError> {
+    ) -> Result<HttpResponseUpdatedNoContent, HttpError> {
         let mgr = ctx.context();
         let Authorization { authorization } = headers.into_inner();
         let authn = mgr.iam(authorization, None).await?;
         let SessionIdParam { session_id } = params.into_inner();
         mgr.session_start(&authn, session_id.clone()).await?;
-        Ok(HttpResponseOk(()))
+        Ok(HttpResponseUpdatedNoContent())
     }
 
     async fn session_stop(
         ctx: RequestContext<Self::Context>,
         headers: Header<Authorization>,
         params: PathParams<SessionIdParam>,
-    ) -> Result<HttpResponseOk<()>, HttpError> {
+    ) -> Result<HttpResponseUpdatedNoContent, HttpError> {
         let mgr = ctx.context();
         let Authorization { authorization } = headers.into_inner();
         let authn = mgr.iam(authorization, None).await?;
         let SessionIdParam { session_id } = params.into_inner();
         mgr.session_stop(&authn, session_id).await?;
-        Ok(HttpResponseOk(()))
+        Ok(HttpResponseUpdatedNoContent())
     }
 
     // Job management.
@@ -132,7 +133,7 @@ impl SushApi for ApiServer {
         params: PathParams<JobIdParam>,
         query: QueryParams<JobStartParams>,
         body: TypedBody<SignedJob>,
-    ) -> Result<HttpResponseOk<()>, HttpError> {
+    ) -> Result<HttpResponseUpdatedNoContent, HttpError> {
         let mgr = ctx.context();
         let Authorization { authorization } = headers.into_inner();
         let authn = mgr.iam(authorization, None).await?;
@@ -146,7 +147,7 @@ impl SushApi for ApiServer {
             ));
         }
         mgr.job_start(&authn, job, query.into_inner()).await?;
-        Ok(HttpResponseOk(()))
+        Ok(HttpResponseUpdatedNoContent())
     }
 
     async fn job_stop(
@@ -154,13 +155,13 @@ impl SushApi for ApiServer {
         headers: Header<Authorization>,
         params: PathParams<JobIdParam>,
         query: QueryParams<JobStopParams>,
-    ) -> Result<HttpResponseOk<()>, HttpError> {
+    ) -> Result<HttpResponseUpdatedNoContent, HttpError> {
         let mgr = ctx.context();
         let Authorization { authorization } = headers.into_inner();
         let authn = mgr.iam(authorization, None).await?;
         let JobIdParam { job_id } = params.into_inner();
         mgr.job_stop(&authn, &job_id, query.into_inner()).await?;
-        Ok(HttpResponseOk(()))
+        Ok(HttpResponseUpdatedNoContent())
     }
 
     async fn job_status(

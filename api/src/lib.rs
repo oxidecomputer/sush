@@ -5,9 +5,9 @@ use std::fmt;
 
 use borsh::{BorshDeserialize, BorshSerialize};
 use dropshot::{
-    Body, ClientErrorStatusCode, Header, HttpError, HttpResponseOk, Path as PathParams,
-    Query as QueryParams, RequestContext, TypedBody, WebsocketEndpointResult, WebsocketUpgrade,
-    api_description,
+    Body, ClientErrorStatusCode, Header, HttpError, HttpResponseOk, HttpResponseUpdatedNoContent,
+    Path as PathParams, Query as QueryParams, RequestContext, TypedBody, WebsocketEndpointResult,
+    WebsocketUpgrade, api_description,
 };
 use http_range_header::{SyntacticallyCorrectRange as Range, parse_range_header};
 use hyper::Response;
@@ -84,7 +84,7 @@ pub trait SushApi {
         ctx: RequestContext<Self::Context>,
         headers: Header<Authorization>,
         params: PathParams<SessionIdParam>,
-    ) -> Result<HttpResponseOk<()>, HttpError>;
+    ) -> Result<HttpResponseUpdatedNoContent, HttpError>;
 
     /// End a support session.
     #[endpoint { method = POST, path = "/sessions/{session_id}/stop" }]
@@ -92,7 +92,7 @@ pub trait SushApi {
         ctx: RequestContext<Self::Context>,
         headers: Header<Authorization>,
         params: PathParams<SessionIdParam>,
-    ) -> Result<HttpResponseOk<()>, HttpError>;
+    ) -> Result<HttpResponseUpdatedNoContent, HttpError>;
 
     // Job management.
 
@@ -104,7 +104,7 @@ pub trait SushApi {
         params: PathParams<JobIdParam>,
         query: QueryParams<JobStartParams>,
         body: TypedBody<SignedJob>,
-    ) -> Result<HttpResponseOk<()>, HttpError>;
+    ) -> Result<HttpResponseUpdatedNoContent, HttpError>;
 
     /// Stop a (running) job.
     #[endpoint { method = POST, path = "/jobs/{job_id}/stop" }]
@@ -113,7 +113,7 @@ pub trait SushApi {
         headers: Header<Authorization>,
         params: PathParams<JobIdParam>,
         query: QueryParams<JobStopParams>,
-    ) -> Result<HttpResponseOk<()>, HttpError>;
+    ) -> Result<HttpResponseUpdatedNoContent, HttpError>;
 
     /// Get the status of a job across the rack.
     #[endpoint { method = GET, path = "/jobs/{job_id}/status" }]
