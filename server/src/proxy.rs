@@ -66,7 +66,7 @@ async fn listen(
                     }
                     Err(err) => {
                         error!(log, "accept failed"; "error" => %err);
-                        return;
+                        continue;
                     }
                 }
             }
