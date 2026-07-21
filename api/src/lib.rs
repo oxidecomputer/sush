@@ -2,7 +2,6 @@
 
 use std::collections::BTreeMap;
 use std::fmt;
-use std::str::FromStr;
 
 use borsh::{BorshDeserialize, BorshSerialize};
 use dropshot::{
@@ -15,7 +14,6 @@ use hyper::Response;
 use schemars::JsonSchema;
 use serde::de::{Deserializer, Error as DeserializeError, IntoDeserializer, MapAccess, Visitor};
 use serde::{Deserialize, Serialize};
-use thiserror::Error;
 
 use sush_common::authn::Identity;
 use sush_common::jobs::{
@@ -221,37 +219,6 @@ impl JobWait {
         match self {
             Self::None | Self::Start => true,
             Self::Stop => status.is_stopped(),
-        }
-    }
-}
-
-impl fmt::Display for JobWait {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(
-            f,
-            "{}",
-            match self {
-                Self::None => "none",
-                Self::Start => "start",
-                Self::Stop => "stop",
-            }
-        )
-    }
-}
-
-#[derive(Clone, Debug, Error)]
-#[error("invalid job wait specification `{0}`")]
-pub struct JobWaitParseError(String);
-
-impl FromStr for JobWait {
-    type Err = JobWaitParseError;
-
-    fn from_str(s: &str) -> Result<Self, Self::Err> {
-        match s.to_ascii_lowercase().as_ref() {
-            "none" => Ok(Self::None),
-            "start" => Ok(Self::Start),
-            "stop" => Ok(Self::Stop),
-            _ => Err(JobWaitParseError(s.to_string())),
         }
     }
 }

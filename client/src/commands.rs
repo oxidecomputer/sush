@@ -23,7 +23,7 @@ use reqwest::Upgraded;
 use rustix::termios::tcgetwinsize;
 use thiserror::Error;
 use tokio::signal::ctrl_c;
-use tokio::time::{MissedTickBehavior, interval};
+use tokio::time::{MissedTickBehavior, interval, sleep};
 use tokio::{pin, select};
 use tokio_tungstenite::WebSocketStream;
 use tokio_tungstenite::tungstenite::error::Error as WebSocketError;
@@ -362,10 +362,10 @@ pub struct JobStartArgs {
     job_id: Option<JobId>,
 
     /// Job output is binary, not UTF-8 encoded text.
-    #[arg(short, long, default_value_t = false)]
+    #[arg(short, long, default_value_t = false, requires = "wait")]
     binary: bool,
 
-    /// Run the job with a pseudoterminal and allow interactive sessions.
+    /// Run the job with a pseudoterminal and allow attaching to it.
     #[arg(short, long, env = SUSH_KEY_ID, name = "KEY_ID")]
     interactive: bool,
 
@@ -381,9 +381,9 @@ pub struct JobStartArgs {
     #[arg(long, env = "TERM")]
     term: Option<String>,
 
-    /// Whether to wait for job start/stop.
-    #[arg(short, long, default_value_t = Default::default())]
-    wait: JobWait,
+    /// Wait for job start/stop and then attach/show output.
+    #[arg(short, long, default_value_if("interactive", "true", "true"))]
+    wait: bool,
 }
 
 impl ClientCommand {
@@ -579,8 +579,8 @@ async fn cert(
             let certs = with_authz(ctx, client, async |authz| {
                 client
                     .cert_chain()
-                    .authorization(authz)
                     .key_id(&key_id)
+                    .authorization(authz)
                     .send()
                     .await
             })
@@ -780,6 +780,7 @@ async fn job(
                 client
                     .job_stop()
                     .job_id(&job_id)
+                    .wait(JobWait::Stop)
                     .authorization(authz)
                     .send()
                     .await
@@ -789,23 +790,7 @@ async fn job(
             Ok(())
         }
 
-        (JobCommand::Status { job_id }, Some(client)) => {
-            let status = with_authz(ctx, client, async |authz| {
-                client
-                    .job_status()
-                    .job_id(&job_id)
-                    .authorization(authz)
-                    .send()
-                    .await
-            })
-            .await?
-            .into_inner();
-            ctx.job_status(
-                &job_id,
-                &job_status_map_de(status).map_err(CommandError::BaseboardIdParseError)?,
-            );
-            Ok(())
-        }
+        (JobCommand::Status { job_id }, Some(client)) => job_status(ctx, client, &job_id).await,
 
         (JobCommand::Stdout { target, output }, Some(client)) => {
             job_output(ctx, client, &target, Stdout, output).await
@@ -851,23 +836,37 @@ async fn job_start(
     job: SignedJob,
     start_args: JobStartArgs,
 ) -> Result<(), CommandError> {
+    let job_id = job.job_id().to_owned();
     let JobStartArgs {
-        limits, term, wait, ..
+        binary,
+        limits,
+        term,
+        wait,
+        ..
     } = start_args;
+    let interactive = job.payload().interactive;
+    let wait = if interactive {
+        JobWait::Start // so we can attach
+    } else if wait {
+        JobWait::Stop // so we can fetch output
+    } else {
+        JobWait::None // don't wait
+    };
     let JobLimits {
         max_cpu,
         max_mem,
         max_fsize,
     } = limits.as_limits();
-    with_authz(ctx, client, async |authz| {
+    let mut start_ctx = ctx.clone();
+    let start = with_authz(&mut start_ctx, client, async |authz| {
         let mut start = client
             .job_start()
-            .authorization(authz)
             .job_id(job.job_id())
             .max_cpu(max_cpu)
             .max_mem(max_mem)
             .max_fsize(max_fsize)
             .wait(wait)
+            .authorization(authz)
             .body(job.clone());
         if let Some(term) = term.as_ref() {
             start = start.term(term);
@@ -877,9 +876,120 @@ async fn job_start(
             }
         }
         start.send().await
+    });
+    pin!(start);
+
+    if interactive {
+        start.await?;
+        job_attach(ctx, client, &job_id).await?;
+    } else if wait.is_some() {
+        let mut interval = interval(Duration::from_millis(250));
+        let mut stopped = false;
+        interval.set_missed_tick_behavior(MissedTickBehavior::Skip);
+        ctx.job_polling_started(&job_id, interval.period());
+        loop {
+            select! {
+                _ = &mut start => {
+                    ctx.job_polling_finished(&job_id);
+                    ctx.job_started(&job);
+                    break;
+                }
+                _ = interval.tick() => {
+                    if let Ok(status) = with_authz(ctx, client, async |authz| {
+                        client
+                            .job_status()
+                            .job_id(&job_id)
+                            .authorization(authz)
+                            .send()
+                            .await
+                    }).await
+                    {
+                        ctx.job_polling_update(
+                            &job_id,
+                            &job_status_map_de(status.into_inner())
+                                .map_err(CommandError::BaseboardIdParseError)?
+                        );
+                    }
+                }
+                _ = ctrl_c(), if !stopped => {
+                    // Stop the job, but don't break out of the select loop;
+                    // we must wait for the start future to resolve. But there
+                    // is a race here with the start request, so retry the stop
+                    // a few times if needed.
+                    for _ in 0..3 {
+                        match with_authz(ctx, client, async |authz| {
+                            client
+                                .job_stop()
+                                .job_id(&job_id)
+                                .authorization(authz)
+                                .send()
+                                .await
+                        }).await {
+                            Ok(_) => {
+                                stopped = true;
+                                break;
+                            }
+                            Err(CommandError::NotFound) => {
+                                sleep(Duration::from_millis(100)).await;
+                                continue;
+                            }
+                            Err(err) => {
+                                ctx.job_polling_finished(&job_id);
+                                return Err(err);
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        job_status(ctx, client, &job_id).await?;
+
+        for stream in [Stdout, Stderr] {
+            match with_authz(ctx, client, async |authz| {
+                client
+                    .job_output()
+                    .job_id(&job_id)
+                    .stream(stream)
+                    .authorization(authz)
+                    .send()
+                    .await
+            })
+            .await
+            {
+                Ok(byte_stream) => {
+                    let output = byte_stream_to_vec(byte_stream.into_inner()).await?;
+                    ctx.job_output(&job_id, stream, &output, binary);
+                }
+                Err(error) => return Err(ctx.job_error(error)),
+            }
+        }
+    } else {
+        start.await?;
+        ctx.job_started(&job);
+    }
+    Ok(())
+}
+
+async fn job_status(
+    ctx: &mut impl CommandContext,
+    client: &Client,
+    job_id: &JobId,
+) -> Result<(), CommandError> {
+    let status = with_authz(ctx, client, async |authz| {
+        client
+            .job_status()
+            .job_id(job_id)
+            .authorization(authz)
+            .send()
+            .await
     })
-    .await?;
-    ctx.job_started(&job);
+    .await?
+    .into_inner();
+    ctx.job_status(
+        job_id,
+        &job_status_map_de(status).map_err(CommandError::BaseboardIdParseError)?,
+    );
     Ok(())
 }
 
@@ -935,8 +1045,8 @@ async fn job_output(
         with_authz(ctx, client, async |authz| {
             client
                 .job_status()
-                .authorization(authz)
                 .job_id(&job_id)
+                .authorization(authz)
                 .send()
                 .await
         })
@@ -1046,9 +1156,9 @@ async fn job_output(
             async |authz| {
                 client
                     .job_output()
-                    .authorization(authz)
                     .job_id(&job_id)
                     .stream(stream)
+                    .authorization(authz)
                     .send()
                     .await
             }
@@ -1087,10 +1197,10 @@ fn job_output_chunks<'a>(
                 let bytes = range.bytes();
                 let stream = client
                     .job_output()
-                    .authorization(&authz)
                     .job_id(job_id)
                     .stream(stream)
                     .range(&bytes)
+                    .authorization(&authz)
                     .send()
                     .await?
                     .into_inner();
@@ -1148,8 +1258,8 @@ async fn job_attach(
     match with_authz(ctx, client, async |authz| {
         client
             .job_attach()
-            .authorization(authz)
             .job_id(job_id)
+            .authorization(authz)
             .send()
             .await
     })
