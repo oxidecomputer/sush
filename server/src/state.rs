@@ -245,13 +245,17 @@ impl State {
                                 queued_jobs.remove(&session.next_job_id())
                             {
                                 let (tx_attachment, rx_attachment) = watch::channel(None);
-                                executor.job_start(
-                                    request.payload().clone(),
-                                    params,
-                                    tx_attachment,
-                                );
-                                self.attachments
-                                    .insert(request.payload().job_id.clone(), rx_attachment);
+                                let payload = request.payload();
+                                let job_id = payload.job_id();
+                                if self
+                                    .job_status
+                                    .get(job_id)
+                                    .map(|status| status.get(&self.own_baseboard).is_none())
+                                    .unwrap_or(true)
+                                {
+                                    executor.job_start(payload.clone(), params, tx_attachment);
+                                    self.attachments.insert(job_id.clone(), rx_attachment);
+                                }
                                 session.job_started(request);
                             }
                         }
