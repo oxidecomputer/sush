@@ -159,6 +159,7 @@ async fn job_spawn(
 
     // Set up the job command.
     let mut cmd = Command::new("bash");
+    cmd.kill_on_drop(true);
     cmd.arg("-c").arg(&command);
 
     // Set up basic environment.
