@@ -413,7 +413,6 @@ impl JobManager {
         job_id: &JobId,
         JobStopParams { wait }: JobStopParams,
     ) -> Result<(), JobError> {
-        let _status = self.job_status(authn, job_id).await?;
         self.job_request(authn, JobRequest::Stop(job_id.to_owned()))
             .await?;
         self.maybe_wait(job_id, wait).await
