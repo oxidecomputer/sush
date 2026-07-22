@@ -896,7 +896,11 @@ async fn job_start(
 
     if interactive {
         start.await?;
-        job_attach(ctx, client, &job_id, &target).await?;
+        ctx.job_started(&job);
+        match job_attach(ctx, client, &job_id, &target).await {
+            Ok(()) | Err(CommandError::NotFound) => job_status(ctx, client, &job_id).await?,
+            Err(error) => return Err(ctx.job_error(error)),
+        }
     } else if wait.is_some() {
         let mut interval = interval(Duration::from_millis(250));
         let mut stopped = false;
@@ -904,8 +908,9 @@ async fn job_start(
         ctx.job_polling_started(&job_id, interval.period());
         loop {
             select! {
-                _ = &mut start => {
+                start_result = &mut start => {
                     ctx.job_polling_finished(&job_id);
+                    start_result?;
                     ctx.job_started(&job);
                     break;
                 }
@@ -956,9 +961,7 @@ async fn job_start(
                 }
             }
         }
-
         job_status(ctx, client, &job_id).await?;
-
         for stream in [Stdout, Stderr] {
             match with_authz(ctx, client, async |authz| {
                 client
@@ -1251,21 +1254,13 @@ async fn byte_stream_to_file(
     }
 }
 
-enum InteractiveJobOk {
-    /// An interactive job session was established.
-    Established,
-
-    /// The job stopped before we could establish a connection.
-    NotFound,
-}
-
 /// Connect via WebSockets to a running interactive job.
 async fn job_attach(
     ctx: &mut impl CommandContext,
     client: &Client,
     job_id: &JobId,
     target: &BaseboardId,
-) -> Result<InteractiveJobOk, CommandError> {
+) -> Result<(), CommandError> {
     match with_authz(ctx, client, async |authz| {
         client
             .job_attach()
@@ -1277,7 +1272,6 @@ async fn job_attach(
     })
     .await
     {
-        Err(CommandError::NotFound) => Ok(InteractiveJobOk::NotFound),
         Err(error) => Err(ctx.job_error(error)),
         Ok(socket) => {
             ctx.job_attached(job_id);
@@ -1287,7 +1281,7 @@ async fn job_attach(
                 return Err(ctx.job_error(error.into()));
             }
             ctx.job_detached(job_id);
-            Ok(InteractiveJobOk::Established)
+            Ok(())
         }
     }
 }
