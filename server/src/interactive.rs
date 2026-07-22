@@ -134,7 +134,7 @@ async fn interactive_job(
             read = pty.read_buf(&mut buffer) => {
                 match read {
                     Ok(0) => {
-                        info!(log, "EOF from job process");
+                        debug!(log, "EOF from job process");
                         break;
                     }
                     Ok(n) => {
@@ -142,18 +142,20 @@ async fn interactive_job(
                         let data = buffer.copy_to_bytes(n);
                         if let Some(stream) = client.as_mut() {
                             let message = InteractiveJobMessage::Data(data);
-                            let encoded = match encoder.encode(message) {
-                                Ok(encoded) => encoded,
+                            match encoder.encode(message) {
+                                Ok(encoded) => if let Err(error) = stream.send(encoded).await {
+                                    close_client!(stream, "failed to relay job output"; "error" => %error);
+                                }
                                 Err(error) => close_client!(stream, "failed to encode message"; "error" => %error),
-                            };
-                            if let Err(error) = stream.send(encoded).await {
-                                close_client!(stream, "failed to relay job output"; "error" => %error);
                             }
                         }
                         buffer.truncate(0);
+                        if dead {
+                            drain_timeout.as_mut().reset(Instant::now() + DRAIN_TIMEOUT);
+                        }
                     }
                     Err(error) => {
-                        info!(log, "error reading from PTY"; "error" => %error);
+                        error!(log, "error reading from PTY"; "error" => %error);
                         break;
                     }
                 }
@@ -165,13 +167,12 @@ async fn interactive_job(
                 if let Some(playback) = playback_buffer(&mut output, INTERACTIVE_JOB_BUFFER_SIZE).await? {
                     let playback_len = playback.len();
                     let message = InteractiveJobMessage::Data(playback);
-                    match stream.send(encoder.encode(message)?).await {
-                        Ok(()) => {
-                            info!(log, "played back output"; "bytes" => playback_len);
+                    match encoder.encode(message) {
+                        Ok(encoded) => match stream.send(encoded).await {
+                            Ok(()) => debug!(log, "played back output"; "bytes" => playback_len),
+                            Err(error) => close_client!(stream, "failed to play back job output"; "error" => %error),
                         }
-                        Err(error) => {
-                            close_client!(stream, "failed to play back output"; "error" => %error);
-                        }
+                        Err(error) => close_client!(stream, "failed to encode message"; "error" => %error),
                     }
                 }
                 client = Some(stream);
