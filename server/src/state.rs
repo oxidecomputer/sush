@@ -307,7 +307,6 @@ impl State {
                             job_id.clone(),
                             baseboard_id.clone(),
                         ));
-
                         if let Some(JobStatus::Started {
                             job_id: jid,
                             time_started,
@@ -337,6 +336,11 @@ impl State {
                         error!(log, "job error"; "job_id" => %job_id, "when" => %when, "error" => %error);
                         self.attachments.remove(job_id);
                         self.running.remove(&(job_id.clone(), baseboard_id.clone()));
+                        self.causal_jobs.insert((
+                            incoming_version.rank(),
+                            job_id.clone(),
+                            baseboard_id.clone(),
+                        ));
                         self.set_job_status(
                             job_id,
                             baseboard_id,
