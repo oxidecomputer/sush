@@ -93,7 +93,7 @@ impl SushApi for ApiServer {
         let mgr = ctx.context();
         let Authorization { authorization } = headers.into_inner();
         let authn = mgr.iam(authorization, None).await?;
-        if let Some(session) = mgr.session(&authn).await {
+        if let Some(session) = mgr.session(&authn) {
             Ok(HttpResponseOk(session))
         } else {
             Err(JobError::NoSession.into())

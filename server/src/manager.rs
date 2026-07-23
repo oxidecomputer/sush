@@ -329,12 +329,12 @@ impl JobManager {
 
     // Session management.
 
-    pub async fn session(&self, _authn: &Identity) -> Option<Session> {
+    pub fn session(&self, _authn: &Identity) -> Option<Session> {
         self.state.borrow().session()
     }
 
     pub async fn session_id(&self, authn: &Identity) -> Result<SessionId, JobError> {
-        let Some(session) = self.session(authn).await else {
+        let Some(session) = self.session(authn) else {
             return Err(JobError::NoSession);
         };
         Ok(session.into_session_id())
@@ -369,6 +369,8 @@ impl JobManager {
         }
     }
 
+    /// It is possible for this to wait indefinitely; the client may set
+    /// a timeout and cancel the request if that is the desired semantics.
     async fn maybe_wait(&self, job_id: &JobId, wait: JobWait) -> Result<(), JobError> {
         if wait.is_some() {
             self.state
@@ -403,7 +405,6 @@ impl JobManager {
         // Submit the job for execution.
         self.job_request(authn, JobRequest::Start(job.into_signed(), params))
             .await?;
-
         self.maybe_wait(&job_id, wait).await
     }
 

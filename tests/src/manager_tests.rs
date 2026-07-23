@@ -37,7 +37,7 @@ fn check_status_started(status: JobStatus, expected_job_id: &JobId) {
         ..
     } = status
     else {
-        panic!("expected job to be started");
+        panic!("expected job to be started, instead it's {status:?}");
     };
     assert_eq!(job_id, *expected_job_id);
     assert!(time_started < Utc::now());
@@ -64,7 +64,7 @@ fn check_status_stopped(
             },
     } = status
     else {
-        panic!("expected job to be finished");
+        panic!("expected job to be stopped, instead it's {status:?}");
     };
     assert_eq!(job_id, *expected_job_id);
     assert!(time_started < time_stopped);
