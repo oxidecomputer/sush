@@ -284,9 +284,8 @@ impl CommandContext for Cli {
         }
     }
 
-    fn job_polling_update(&mut self, _job_id: &JobId, _status: &JobStatusMap) {
+    fn job_polling_update(&mut self, _job_id: &JobId) {
         if let Some(progress) = self.progress.lock().unwrap().as_mut() {
-            // TODO: use status map
             progress.tick();
         }
     }

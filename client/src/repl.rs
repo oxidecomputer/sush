@@ -277,8 +277,8 @@ impl CommandContext for Repl {
         self.cli.job_polling_started(job_id, duration);
     }
 
-    fn job_polling_update(&mut self, job_id: &JobId, status: &JobStatusMap) {
-        self.cli.job_polling_update(job_id, status);
+    fn job_polling_update(&mut self, job_id: &JobId) {
+        self.cli.job_polling_update(job_id);
     }
 
     fn job_polling_finished(&mut self, job_id: &JobId) {

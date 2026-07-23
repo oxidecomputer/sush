@@ -69,6 +69,15 @@ const DEFAULT_CHUNK_SIZE: ByteSize = ByteSize::mib(32);
 /// Default number of simultaneous downloads for large output.
 const PARALLEL_CHUNKS: NonZeroU8 = NonZeroU8::new(8).unwrap();
 
+// Timeouts for various kinds of job-wait conditions.
+const START_TIMEOUT: Duration = Duration::from_secs(60);
+const STOP_TIMEOUT: Duration = Duration::from_secs(600);
+const NO_TIMEOUT: Duration = Duration::from_secs(u64::MAX);
+
+// Spinner update intervals.
+const JOB_START_UPDATE_INTERVAL: Duration = Duration::from_millis(250);
+const SIGNING_UPDATE_INTERVAL: Duration = Duration::from_millis(100);
+
 /// Process limits for job execution.
 #[derive(Clone, Debug, Parser)]
 pub struct LimitArgs {
@@ -750,7 +759,7 @@ async fn job(
             };
 
             let mut signer = PermslipSigner::new(key_name, permslip_url).await?;
-            let mut interval = interval(Duration::from_millis(100));
+            let mut interval = interval(SIGNING_UPDATE_INTERVAL);
             interval.set_missed_tick_behavior(MissedTickBehavior::Skip);
             let sign = signer.sign(JobStartRequest::new(
                 job_id.to_owned(),
@@ -782,20 +791,7 @@ async fn job(
             }
         }
 
-        (JobCommand::Stop { job_id }, Some(client)) => {
-            with_authz(ctx, client, async |authz| {
-                client
-                    .job_stop()
-                    .job_id(&job_id)
-                    .wait(JobWait::Stop)
-                    .authorization(authz)
-                    .send()
-                    .await
-            })
-            .await?;
-            ctx.job_stopped(&job_id);
-            Ok(())
-        }
+        (JobCommand::Stop { job_id }, Some(client)) => job_stop(ctx, client, &job_id).await,
 
         (JobCommand::Status { job_id }, Some(client)) => job_status(ctx, client, &job_id).await,
 
@@ -861,13 +857,14 @@ async fn job_start(
         ..
     } = start_args;
     let interactive = job.payload().interactive;
-    let wait = if interactive {
-        JobWait::Start // so we can attach
+    let (wait, timeout) = if interactive {
+        (JobWait::Start, sleep(START_TIMEOUT))
     } else if wait {
-        JobWait::Stop // so we can fetch output
+        (JobWait::Stop, sleep(STOP_TIMEOUT))
     } else {
-        JobWait::None // don't wait
+        (JobWait::None, sleep(NO_TIMEOUT))
     };
+    pin!(timeout);
     let JobLimits {
         max_cpu,
         max_mem,
@@ -895,6 +892,7 @@ async fn job_start(
     });
     pin!(start);
 
+    // Start the job.
     if interactive {
         start.await?;
         ctx.job_started(&job);
@@ -903,69 +901,47 @@ async fn job_start(
             Err(error) => return Err(ctx.job_error(error)),
         }
     } else if wait.is_some() {
-        let mut interval = interval(Duration::from_millis(250));
+        let mut interval = interval(JOB_START_UPDATE_INTERVAL);
         let mut stopped = false;
         interval.set_missed_tick_behavior(MissedTickBehavior::Skip);
         ctx.job_polling_started(&job_id, interval.period());
         loop {
             select! {
+                // Wait for the start request to finish.
                 start_result = &mut start => {
-                    ctx.job_polling_finished(&job_id);
+                    if !stopped {
+                        ctx.job_polling_finished(&job_id);
+                    }
                     start_result?;
                     ctx.job_started(&job);
                     break;
                 }
+
+                // Periodically update the spinner.
                 _ = interval.tick() => {
-                    if let Ok(status) = with_authz(ctx, client, async |authz| {
-                        client
-                            .job_status()
-                            .job_id(&job_id)
-                            .authorization(authz)
-                            .send()
-                            .await
-                    }).await
-                    {
-                        ctx.job_polling_update(
-                            &job_id,
-                            &job_status_map_de(status.into_inner())
-                                .map_err(CommandError::BaseboardIdParseError)?
-                        );
-                    }
+                    ctx.job_polling_update(&job_id);
                 }
+
+                // Stop the job on interrupt, but don't break out of
+                // the select loop; we must wait for the start future
+                // to resolve.
                 _ = ctrl_c(), if !stopped => {
-                    // Stop the job, but don't break out of the select loop;
-                    // we must wait for the start future to resolve. But there
-                    // is a race here with the start request, so retry the stop
-                    // a few times if needed.
-                    for _ in 0..3 {
-                        match with_authz(ctx, client, async |authz| {
-                            client
-                                .job_stop()
-                                .job_id(&job_id)
-                                .wait(JobWait::Stop)
-                                .authorization(authz)
-                                .send()
-                                .await
-                        }).await {
-                            Ok(_) => {
-                                ctx.job_polling_finished(&job_id);
-                                ctx.job_stopped(&job_id);
-                                stopped = true;
-                                break;
-                            }
-                            Err(CommandError::NotFound) => {
-                                sleep(Duration::from_millis(100)).await;
-                                continue;
-                            }
-                            Err(error) => {
-                                ctx.job_polling_finished(&job_id);
-                                return Err(error);
-                            }
-                        }
-                    }
+                    ctx.job_polling_finished(&job_id);
+                    ctx.job_error(CommandError::Canceled);
+                    job_stop(ctx, client, &job_id).await?;
+                    stopped = true;
+                }
+
+                // Don't stop the job on timeout, but stop waiting.
+                _ = &mut timeout => {
+                    ctx.job_polling_finished(&job_id);
+                    ctx.job_error(CommandError::TimedOut);
+                    break;
                 }
             }
         }
+
+        // Show the job status and output.
         job_status(ctx, client, &job_id).await?;
         for stream in [Stdout, Stderr] {
             match with_authz(ctx, client, async |authz| {
@@ -991,6 +967,25 @@ async fn job_start(
         start.await?;
         ctx.job_started(&job);
     }
+    Ok(())
+}
+
+async fn job_stop(
+    ctx: &mut impl CommandContext,
+    client: &Client,
+    job_id: &JobId,
+) -> Result<(), CommandError> {
+    with_authz(ctx, client, async |authz| {
+        client
+            .job_stop()
+            .job_id(job_id)
+            .wait(JobWait::Stop)
+            .authorization(authz)
+            .send()
+            .await
+    })
+    .await?;
+    ctx.job_stopped(job_id);
     Ok(())
 }
 
@@ -1400,6 +1395,8 @@ pub enum CommandError {
     BaseboardIdParseError(sled_hardware_types::BaseboardIdParseError),
     #[error("❌ SSH key error: {0}")]
     SshKey(#[from] kms_agent_lib::ssh_key::Error),
+    #[error("❌ Timed out waiting for job")]
+    TimedOut,
     #[error("❌ Too much output to display on terminal, try `--file`")]
     TooMuchOutput,
     #[error("❌ Can't start interactive session: {0}")]
