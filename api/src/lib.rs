@@ -79,7 +79,8 @@ pub trait SushApi {
     ///
     /// There may only be one session active on the rack at a time.
     /// If a session is already running when this request is made,
-    /// the old session is stopped.
+    /// the new session supersedes the old one, but the old session's
+    /// jobs are not stopped.
     #[endpoint { method = POST, path = "/sessions/{session_id}/start" }]
     async fn session_start(
         ctx: RequestContext<Self::Context>,
