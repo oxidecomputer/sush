@@ -946,15 +946,19 @@ async fn job_start(
                                 .send()
                                 .await
                         }).await {
-                            Err(CommandError::NotFound) => {
-                                sleep(Duration::from_millis(100)).await;
-                                continue;
-                            }
-                            Ok(_) | Err(_) => {
+                            Ok(_) => {
                                 ctx.job_polling_finished(&job_id);
                                 ctx.job_stopped(&job_id);
                                 stopped = true;
                                 break;
+                            }
+                            Err(CommandError::NotFound) => {
+                                sleep(Duration::from_millis(100)).await;
+                                continue;
+                            }
+                            Err(error) => {
+                                ctx.job_polling_finished(&job_id);
+                                return Err(error);
                             }
                         }
                     }
