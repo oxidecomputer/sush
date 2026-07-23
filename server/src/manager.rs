@@ -466,7 +466,8 @@ impl JobManager {
         _limit: u32,
         _offset: u32,
     ) -> Result<Vec<JobStatusMap>, JobError> {
-        todo!("get job history from state")
+        // TODO: get job history from state
+        Ok(vec![])
     }
 }
 
