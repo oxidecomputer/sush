@@ -155,7 +155,9 @@ async fn interactive_job(
                         }
                     }
                     Err(error) => {
-                        error!(log, "error reading from PTY"; "error" => %error);
+                        if !dead {
+                            error!(log, "error reading from PTY"; "error" => %error);
+                        }
                         break;
                     }
                 }
