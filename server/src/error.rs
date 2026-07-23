@@ -2,7 +2,6 @@
 
 use std::path::{Path, PathBuf};
 
-use chrono::{DateTime, Utc};
 use dropshot::{ClientErrorStatusCode, HttpError};
 use thiserror::Error;
 
@@ -33,16 +32,12 @@ pub enum JobError {
     InteractiveJob(#[from] InteractiveJobError),
     #[error("Invalid command `{0}`, must not start with `-`")]
     InvalidCommand(String),
-    #[error("Invalid or duplicate job ID")]
-    InvalidJobId(JobId),
     #[error("Invalid range for output of length {0}")]
     InvalidRange(u64),
     #[error("I/O error during {what}: {error}")]
     Io { what: String, error: std::io::Error },
     #[error("Job `{0}` not found")]
     JobNotFound(JobId),
-    #[error("Job `{0}` is still running, so may produce more output")]
-    JobStillRunning(JobId),
     #[error(transparent)]
     Json(#[from] serde_json::Error),
     #[error("Key error: {0}")]
@@ -55,10 +50,6 @@ pub enum JobError {
     NoSession,
     #[error("Session `{0}` is no longer current")]
     SessionNotCurrent(SessionId),
-    #[error("Session `{0}` not found")]
-    SessionNotFound(SessionId),
-    #[error("Incorrect identity for session, try `iam`")]
-    SessionWrongIdentity,
     #[error("Job output hash mismatch, file may be corrupt")]
     OutputHashMismatch(JobId, JobOutputHash),
     #[error("Output too big, please use range requests")]
@@ -67,21 +58,12 @@ pub enum JobError {
     PublicKeyMismatch(KeyId),
     #[error("Public key `{0}` not found")]
     PublicKeyNotFound(KeyId),
-    #[error("Public key `{key_id}` was revoked at {time_revoked}")]
-    PublicKeyRevoked {
-        key_id: KeyId,
-        time_revoked: DateTime<Utc>,
-    },
     #[error(transparent)]
     Slice(#[from] std::array::TryFromSliceError),
     #[error(transparent)]
     Task(#[from] tokio::task::JoinError),
     #[error("Too many certificates ({0})")]
     TooManyCerts(usize),
-    #[error("Too many active jobs ({0}), try waiting for some to finish")]
-    TooManyJobs(usize),
-    #[error("Too many identities revoked ({0})")]
-    TooManyRevocations(usize),
     #[error("Unauthorized request")]
     Unauthorized(Nonce),
     #[error("Unable to wait for job end")]
@@ -166,23 +148,11 @@ impl From<JobError> for HttpError {
                     .expect("should be able to add WWW-Authenticate header");
                 err
             }
-            SessionWrongIdentity | PublicKeyRevoked { .. } => {
-                HttpError::for_client_error(None, ClientErrorStatusCode::FORBIDDEN, message)
-            }
-            IdentityNotFound(_) | JobNotFound(_) | NoSession | SessionNotFound(_)
-            | SessionNotCurrent(_) => {
+            IdentityNotFound(_) | JobNotFound(_) | NoSession | SessionNotCurrent(_) => {
                 HttpError::for_client_error(None, ClientErrorStatusCode::NOT_FOUND, message)
             }
-            CertChainTooLong
-            | InvalidCommand(_)
-            | InvalidJobId(_)
-            | Json(_)
-            | JobStillRunning(_)
-            | MissingCert(_)
-            | MultipleSessions
-            | TooManyCerts(_)
-            | TooManyJobs(_)
-            | TooManyRevocations(_) => {
+            CertChainTooLong | InvalidCommand(_) | Json(_) | MissingCert(_) | MultipleSessions
+            | TooManyCerts(_) => {
                 HttpError::for_client_error(None, ClientErrorStatusCode::BAD_REQUEST, message)
             }
         }

@@ -450,7 +450,7 @@ impl CommandContext for Cli {
                             error,
                         } => {
                             println!(
-                                "✅ Job ID:\t{job_id}\n   \
+                                "❌ Job ID:\t{job_id}\n   \
                                     Target:\t{baseboard_id}\n   \
                                     Job status:\tError\n   \
                                     Error at:\t{time_error}\n   \
