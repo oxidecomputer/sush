@@ -54,4 +54,3 @@ x509-cert.workspace = true
 
 [dev-dependencies]
 function_name.workspace = true
-sush-tests = { path = "../tests" }

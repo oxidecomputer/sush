@@ -3729,7 +3729,6 @@ dependencies = [
  "ssh-key",
  "sush-api",
  "sush-common",
- "sush-tests",
  "tempfile",
  "terminfo",
  "thiserror 1.0.69",
