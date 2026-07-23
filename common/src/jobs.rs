@@ -315,7 +315,8 @@ impl JobStatus {
 pub type JobStatusMap = BTreeMap<BaseboardId, JobStatus>;
 pub type JsonJobStatusMap = HashMap<String, JobStatus>;
 
-pub fn job_status_map_de(
+/// This helper fallibly decodes a job status map from a JSON (string-keyed) map.
+pub fn job_status_try_from_json_map(
     json_map: JsonJobStatusMap,
 ) -> Result<JobStatusMap, BaseboardIdParseError> {
     let mut new = JobStatusMap::new();
@@ -326,7 +327,7 @@ pub fn job_status_map_de(
 }
 
 /// And this one infallibly encodes a job status map into a JSON-compatible map.
-pub fn job_status_map_en(status_map: JobStatusMap) -> JsonJobStatusMap {
+pub fn job_status_to_json_map(status_map: JobStatusMap) -> JsonJobStatusMap {
     let mut new = HashMap::new();
     for (k, v) in status_map.into_iter() {
         new.insert(k.to_string(), v);

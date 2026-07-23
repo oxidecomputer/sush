@@ -36,7 +36,7 @@ use sush_common::interactive::InteractiveJobError;
 use sush_common::jobs::JobOutputStream::{self, Stderr, Stdout};
 use sush_common::jobs::{
     JobId, JobLimits, JobOutputHash, JobOutputState, JobStartRequest, JobStatus, Session,
-    SessionId, SignedJob, job_status_map_de,
+    SessionId, SignedJob, job_status_try_from_json_map,
 };
 use sush_common::keys::{KeyError, KeyId, Signer as _};
 
@@ -828,7 +828,8 @@ async fn job(
             .await?
             .into_inner();
             for job in history {
-                let status = job_status_map_de(job).map_err(CommandError::BaseboardIdParseError)?;
+                let status = job_status_try_from_json_map(job)
+                    .map_err(CommandError::BaseboardIdParseError)?;
                 if let Some(s) = status.values().next() {
                     ctx.job_status(s.job_id(), &status);
                 }
@@ -1010,7 +1011,7 @@ async fn job_status(
     .into_inner();
     ctx.job_status(
         job_id,
-        &job_status_map_de(status).map_err(CommandError::BaseboardIdParseError)?,
+        &job_status_try_from_json_map(status).map_err(CommandError::BaseboardIdParseError)?,
     );
     Ok(())
 }
@@ -1063,7 +1064,7 @@ async fn job_output(
     }: JobOutput,
 ) -> Result<(), CommandError> {
     // Fetch job status for output length and hash.
-    let status = job_status_map_de(
+    let status = job_status_try_from_json_map(
         with_authz(ctx, client, async |authz| {
             client
                 .job_status()

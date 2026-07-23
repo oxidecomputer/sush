@@ -17,7 +17,7 @@ use sush_api::{
     JobOutputParams, JobStartParams, JobStopParams, KeyIdParam, SessionIdParam, SushApi,
 };
 use sush_common::authn::Identity;
-use sush_common::jobs::{JsonJobStatusMap, Session, SignedJob, job_status_map_en};
+use sush_common::jobs::{JsonJobStatusMap, Session, SignedJob, job_status_to_json_map};
 use sush_common::keys::{KeyId, SshPublicKey, pem_cert_chain};
 
 use crate::error::JobError;
@@ -174,7 +174,7 @@ impl SushApi for ApiServer {
         let Authorization { authorization } = headers.into_inner();
         let authn = mgr.iam(authorization, None).await?;
         let JobIdParam { job_id } = params.into_inner();
-        Ok(HttpResponseOk(job_status_map_en(
+        Ok(HttpResponseOk(job_status_to_json_map(
             mgr.job_status(&authn, &job_id).await?,
         )))
     }
@@ -255,7 +255,7 @@ impl SushApi for ApiServer {
             mgr.job_history(&authn, limit, offset)
                 .await?
                 .into_iter()
-                .map(job_status_map_en)
+                .map(job_status_to_json_map)
                 .collect(),
         ))
     }

@@ -17,6 +17,7 @@ use x509_cert::der::Encode as _;
 use sush_common::authn::{Credentials, Identity};
 use sush_common::jobs::{
     JobId, JobOutputState, JobOutputStream, JobStatus, JobStatusMap, Session, SessionId, SignedJob,
+    job_status_to_json_map,
 };
 use sush_common::keys::{KeyId, Signature, SshPublicKey};
 
@@ -372,7 +373,7 @@ impl CommandContext for Cli {
 
         // TODO: parallel status display
         match self.get_output_format() {
-            OutputFormat::Json => println!("{}", json!(status)),
+            OutputFormat::Json => println!("{}", json!(job_status_to_json_map(status.clone()))),
             OutputFormat::Text => {
                 for (baseboard_id, status) in status {
                     match status {
