@@ -2,10 +2,11 @@
 
 use std::net::SocketAddr;
 
-use bytes::Bytes;
+use bytes::{Bytes, BytesMut};
 use dropshot::{ConfigDropshot, ServerBuilder};
 use function_name::named;
 use futures::{SinkExt as _, StreamExt as _};
+use tokio::io::{AsyncRead, AsyncWrite};
 use tokio::test;
 use tokio_tungstenite::WebSocketStream;
 use tokio_tungstenite::tungstenite::protocol::Role;
@@ -155,6 +156,61 @@ async fn client_proxy_server() {
     assert_eq!(iam, identity, "who am I?");
 }
 
+async fn init_interactive_stream<S>(
+    socket: S,
+) -> (
+    WebSocketStream<S>,
+    InteractiveJobEncoder,
+    InteractiveJobDecoder,
+)
+where
+    S: AsyncRead + AsyncWrite + Unpin,
+{
+    let mut stream = WebSocketStream::from_raw_socket(socket, Role::Client, None).await;
+    let mut encoder = InteractiveJobEncoder::default();
+    let mut decoder = InteractiveJobDecoder::default();
+    let InteractiveJobMessage::Ping(bytes) = decoder
+        .decode(
+            stream
+                .next()
+                .await
+                .expect("can't get first item")
+                .expect("can't get first message"),
+        )
+        .expect("can't decode first message")
+    else {
+        panic!("expected first message to be ping");
+    };
+    let pong = encoder.rekey(Some(&bytes)).expect("can't rekey encoder");
+    stream
+        .send(encoder.encode(pong).expect("can't encode pong"))
+        .await
+        .expect("can't send pong");
+    decoder.rekey(bytes, None);
+    (stream, encoder, decoder)
+}
+
+async fn ensure_next_interactive_message_data<S>(
+    stream: &mut WebSocketStream<S>,
+    decoder: &mut InteractiveJobDecoder,
+    expected: &Bytes,
+) where
+    S: AsyncRead + AsyncWrite + Unpin,
+{
+    let recvd = stream
+        .next()
+        .await
+        .expect("can't get next stream item")
+        .expect("can't get next message");
+    let InteractiveJobMessage::Data(bytes) = decoder
+        .decode(recvd)
+        .expect("can't decode received message")
+    else {
+        panic!("expected data message");
+    };
+    assert_eq!(bytes, expected);
+}
+
 #[named]
 #[test]
 async fn interactive_job() {
@@ -221,53 +277,52 @@ async fn interactive_job() {
         .expect("can't start job");
 
     // Attach to the job and rekey.
-    let socket = client
-        .job_attach()
-        .job_id(&job_id)
-        .target(test_baseboard_id().to_string())
-        .authorization(credentials.to_string())
-        .send()
-        .await
-        .expect("can't attach to job")
-        .into_inner();
-    let mut stream = WebSocketStream::from_raw_socket(socket, Role::Client, None).await;
-    let mut decoder = InteractiveJobDecoder::default();
-    let mut encoder = InteractiveJobEncoder::default();
-    let InteractiveJobMessage::Ping(bytes) = decoder
-        .decode(
-            stream
-                .next()
-                .await
-                .expect("can't get first item")
-                .expect("can't get first message"),
-        )
-        .expect("can't decode first message")
-    else {
-        panic!("expected first message to be ping");
-    };
-    let pong = encoder.rekey(Some(&bytes)).expect("can't rekey encoder");
-    stream
-        .send(encoder.encode(pong).expect("can't encode pong"))
-        .await
-        .expect("can't send pong");
-    decoder.rekey(bytes, None);
+    let (mut stream1, mut encoder1, mut decoder1) = init_interactive_stream(
+        client
+            .job_attach()
+            .job_id(&job_id)
+            .target(test_baseboard_id().to_string())
+            .authorization(credentials.to_string())
+            .send()
+            .await
+            .expect("can't attach to job")
+            .into_inner(),
+    )
+    .await;
 
     // Send a message and ensure that we can see it echoed.
     let hello = Bytes::from(format!("Hello, {job_id}!"));
-    stream
+    stream1
         .send(
-            encoder
+            encoder1
                 .encode(InteractiveJobMessage::Data(hello.clone()))
                 .expect("can't encode message"),
         )
         .await
         .expect("can't send message");
-    let recvd = stream
+    ensure_next_interactive_message_data(&mut stream1, &mut decoder1, &hello).await;
+
+    // Attach a second client.
+    let (mut stream2, mut encoder2, mut decoder2) = init_interactive_stream(
+        client
+            .job_attach()
+            .job_id(&job_id)
+            .target(test_baseboard_id().to_string())
+            .authorization(credentials.to_string())
+            .send()
+            .await
+            .expect("can't attach second client to job")
+            .into_inner(),
+    )
+    .await;
+
+    // Ensure the second client gets a playback message.
+    let recvd = stream2
         .next()
         .await
         .expect("can't get next stream item")
         .expect("can't get next message");
-    let InteractiveJobMessage::Data(bytes) = decoder
+    let InteractiveJobMessage::Data(bytes) = decoder2
         .decode(recvd)
         .expect("can't decode received message")
     else {
@@ -275,8 +330,24 @@ async fn interactive_job() {
     };
     assert_eq!(bytes, hello);
 
+    // Send another message from the second client.
+    let again = Bytes::from(format!("And hello again, {job_id}!"));
+    stream2
+        .send(
+            encoder2
+                .encode(InteractiveJobMessage::Data(again.clone()))
+                .expect("can't encode message"),
+        )
+        .await
+        .expect("can't send message");
+
+    // Ensure both clients get the new message.
+    ensure_next_interactive_message_data(&mut stream1, &mut decoder1, &again).await;
+    ensure_next_interactive_message_data(&mut stream2, &mut decoder2, &again).await;
+
     // Detach from the job.
-    stream.close(None).await.expect("can't close stream");
+    stream1.close(None).await.expect("can't close stream1");
+    stream2.close(None).await.expect("can't close stream2");
 
     // Stop the job.
     client
@@ -288,7 +359,7 @@ async fn interactive_job() {
         .await
         .expect("can't stop job");
 
-    // Check the output for our message.
+    // Check that the output contains both messages.
     let mut output = client
         .job_output()
         .authorization(credentials.to_string())
@@ -299,12 +370,15 @@ async fn interactive_job() {
         .await
         .expect("can't get job output")
         .into_inner();
+    let mut hello_again = BytesMut::new();
+    hello_again.extend(hello);
+    hello_again.extend(again);
     assert_eq!(
         output
             .next()
             .await
             .expect("can't get next output item")
             .expect("can't get output bytes"),
-        hello,
+        hello_again,
     );
 }
