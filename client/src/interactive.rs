@@ -14,8 +14,8 @@ use tokio_fd::AsyncFd;
 use tokio_tungstenite::WebSocketStream;
 
 use sush_common::interactive::{
-    INTERACTIVE_JOB_BUFFER_SIZE, InteractiveJobControl, InteractiveJobDecoder,
-    InteractiveJobEncoder, InteractiveJobError, InteractiveJobMessage, WindowSize,
+    INTERACTIVE_JOB_BUFFER_SIZE, InteractiveJobControl, InteractiveJobError, InteractiveJobMessage,
+    WindowSize,
 };
 
 /// Drive an interactive job, relaying stdin/stdout to/from a WebSocket.
@@ -45,8 +45,6 @@ where
     use InteractiveJobMessage as Message;
 
     let mut buffer = BytesMut::with_capacity(INTERACTIVE_JOB_BUFFER_SIZE);
-    let mut decoder = InteractiveJobDecoder::default();
-    let mut encoder = InteractiveJobEncoder::default();
     let mut sighup = signal(SignalKind::hangup())?;
     let mut sigint = signal(SignalKind::interrupt())?;
     let mut sigquit = signal(SignalKind::quit())?;
@@ -63,26 +61,20 @@ where
                 if n == 0 || buffer == "" {
                     break;
                 }
-                let message = Message::Data(buffer.copy_to_bytes(n));
-                stream.send(encoder.encode(message)?).await?;
+                stream.send(Message::Data(buffer.copy_to_bytes(n)).try_into()?).await?;
                 buffer.truncate(0);
             }
 
             // Handle a message from the server.
             Some(Ok(message)) = stream.next() => {
-                match decoder.decode(message)? {
+                match Message::try_from(message)? {
                     Message::Control(control) => match control {
-                        Control::WindowChange { .. } => (),
+                        Control::WindowChange { .. } => todo!("change client window size"),
                     }
                     Message::Data(bytes) => {
                         stdout_async.write_all(&bytes).await?;
                     }
-                    Message::Ping(bytes) => {
-                        let pong = encoder.rekey(Some(&bytes))?;
-                        stream.send(encoder.encode(pong)?).await?;
-                        decoder.rekey(bytes, None);
-                    }
-                    Message::Pong(_) => (),
+                    Message::Ignore => (),
                     Message::Close => break,
                 }
             }
@@ -90,11 +82,11 @@ where
             // Send window size on change.
             Some(()) = sigwinch.recv() => {
                 let winsize = tcgetwinsize(stdin)?;
-                let message = Control::WindowChange(WindowSize {
+                let message = Message::from(Control::WindowChange(WindowSize {
                     rows: winsize.ws_row,
                     cols: winsize.ws_col,
-                }).into();
-                stream.send(encoder.encode(message)?).await?;
+                }));
+                stream.send(message.try_into()?).await?;
             }
 
             // Break on other signals, errors, etc.

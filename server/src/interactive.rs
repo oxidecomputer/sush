@@ -4,11 +4,10 @@
 //! server is that we have a new (stream made from a) WebSocket connection
 //! with the (authenticated) client on the other end. So an _attachment
 //! point_ is an MPSC channel over which we send the WebSocket stream,
-//! i.e., a [`SocketSender`]. The interactive job `select!` loop will
-//! receive the new socket and begin processing/relaying messages from/to
-//! it.
+//! i.e., a [`SocketSender`]. The interactive job select loop receives
+//! the new socket and begins processing/relaying messages from/to it.
+//! Multiple clients may be simultaneously attached.
 
-use std::collections::BTreeMap;
 use std::io::{self, SeekFrom};
 use std::process::ExitStatus;
 
@@ -21,15 +20,14 @@ use tokio::io::{AsyncReadExt as _, AsyncSeekExt as _, AsyncWriteExt as _};
 use tokio::process::Child;
 use tokio::sync::mpsc;
 use tokio::task::JoinHandle;
-use tokio::time::{Duration, Instant, MissedTickBehavior, interval, sleep};
+use tokio::time::{Duration, Instant, sleep};
 use tokio::{pin, select, spawn};
 use tokio_stream::StreamMap;
 use tokio_tungstenite::WebSocketStream;
 
 use sush_common::interactive::{
-    INTERACTIVE_JOB_BUFFER_SIZE, INTERACTIVE_JOB_REKEY_PERIOD, InteractiveJobControl,
-    InteractiveJobDecoder as Decoder, InteractiveJobEncoder as Encoder, InteractiveJobError,
-    InteractiveJobMessage,
+    INTERACTIVE_JOB_BUFFER_SIZE, InteractiveJobControl as Control, InteractiveJobError as Error,
+    InteractiveJobMessage as Message,
 };
 use tokio_util::sync::CancellationToken;
 
@@ -40,7 +38,7 @@ pub type SocketSender = mpsc::Sender<SocketStream>;
 pub type SocketReceiver = mpsc::Receiver<SocketStream>;
 
 pub struct InteractiveJob {
-    task: JoinHandle<Result<ExitStatus, InteractiveJobError>>,
+    task: JoinHandle<Result<ExitStatus, Error>>,
     tx_client: SocketSender,
 }
 
@@ -63,7 +61,7 @@ impl InteractiveJob {
         self.tx_client.clone()
     }
 
-    pub async fn wait(self) -> Result<ExitStatus, InteractiveJobError> {
+    pub async fn wait(self) -> Result<ExitStatus, Error> {
         self.task.await?
     }
 }
@@ -80,44 +78,23 @@ async fn interactive_job(
     mut output: File,
     mut rx_client: mpsc::Receiver<SocketStream>,
     stop: CancellationToken,
-) -> Result<ExitStatus, InteractiveJobError> {
+) -> Result<ExitStatus, Error> {
     type ClientId = usize;
 
     let mut buffer = BytesMut::with_capacity(INTERACTIVE_JOB_BUFFER_SIZE);
+    let mut clients = StreamMap::<ClientId, SocketStream>::new();
     let mut client_id: ClientId = 0;
-    let mut streams = StreamMap::<ClientId, SocketStream>::new();
-    let mut encoders = BTreeMap::<ClientId, (Encoder, Decoder)>::new();
-    let mut pings = BTreeMap::<ClientId, Option<InteractiveJobMessage>>::new();
-    let mut interval = interval(INTERACTIVE_JOB_REKEY_PERIOD);
-    interval.set_missed_tick_behavior(MissedTickBehavior::Skip);
 
     // Client-induced errors must not break the loop;
     // close the client, log the error, and continue.
     macro_rules! close_client {
-        ($client_id:expr, $stream:ident) => {{
-            let _ = $stream.close(None).await;
-            encoders.remove(&$client_id);
-            pings.remove(&$client_id);
+        ($client:ident) => {{
+            let _ = $client.close(None).await;
         }};
-        ($client_id:expr, $stream:ident, $msg:literal; $($keys:tt)*) => {{
-            close_client!($client_id, $stream);
+        ($client:ident, $msg:literal; $($keys:tt)*) => {{
+            close_client!($client);
             error!(log, $msg; $($keys)*);
             continue;
-        }};
-    }
-
-    macro_rules! rekey_client {
-        ($client_id:expr, $stream:ident, $encoder:ident) => {{
-            let msg = $encoder.rekey(None)?;
-            pings.insert($client_id, Some(msg.clone()));
-            match $stream.send($encoder.encode(msg)?).await {
-                Ok(()) => {
-                    info!(log, "rekeyed interactive job encoder");
-                }
-                Err(error) => {
-                    close_client!($client_id, $stream, "failed to rekey client"; "error" => %error);
-                }
-            }
         }};
     }
 
@@ -146,21 +123,12 @@ async fn interactive_job(
                         output.write_all(&buffer[..n]).await?;
                         let data = buffer.copy_to_bytes(n);
                         // TODO: send in parallel
-                        for (client_id, stream) in streams.iter_mut() {
-                            if let Some((encoder, _decoder)) = encoders.get_mut(client_id) {
-                                let message = InteractiveJobMessage::Data(data.clone());
-                                match encoder.encode(message) {
-                                    Ok(encoded) => if let Err(error) = stream.send(encoded).await {
-                                        close_client!(client_id, stream, "failed to relay job output"; "error" => %error);
-                                    }
-                                    Err(error) => close_client!(client_id, stream, "failed to encode message"; "error" => %error),
-                                }
+                        for (_id, client) in clients.iter_mut() {
+                            if let Err(error) = client.send(Message::Data(data.clone()).try_into()?).await {
+                                close_client!(client, "failed to relay job output"; "error" => %error);
                             }
                         }
                         buffer.truncate(0);
-                        if dead {
-                            drain_timeout.as_mut().reset(Instant::now() + DRAIN_TIMEOUT);
-                        }
                     }
                     Err(error) => {
                         if !dead {
@@ -171,77 +139,49 @@ async fn interactive_job(
                 }
             }
 
-            // Accept a new client, rekey it, and play back the last buffer.
-            Some(mut stream) = rx_client.recv(), if !dead => {
-                client_id += 1;
-                let decoder = Decoder::default();
-                let mut encoder = Encoder::default();
-                rekey_client!(client_id, stream, encoder);
+            // Accept a new client and play back the last buffer.
+            Some(mut client) = rx_client.recv(), if !dead => {
                 if let Some(playback) = playback_buffer(&mut output, INTERACTIVE_JOB_BUFFER_SIZE).await? {
                     let playback_len = playback.len();
-                    let message = InteractiveJobMessage::Data(playback);
-                    match encoder.encode(message) {
-                        Ok(encoded) => match stream.send(encoded).await {
-                            Ok(()) => debug!(log, "played back output"; "bytes" => playback_len),
-                            Err(error) => close_client!(client_id, stream, "failed to play back job output"; "error" => %error),
-                        }
-                        Err(error) => close_client!(client_id, stream, "failed to encode message"; "error" => %error),
+                    match client.send(Message::Data(playback).try_into()?).await {
+                        Ok(()) => debug!(log, "played back output"; "bytes" => playback_len),
+                        Err(error) => close_client!(client, "failed to play back job output"; "error" => %error),
                     }
                 }
-                encoders.insert(client_id, (encoder, decoder));
-                streams.insert(client_id, stream);
+                client_id += 1;
+                clients.insert(client_id, client);
             }
 
             // Handle a message from a client.
-            next = streams.next(), if !streams.is_empty() => {
+            next = clients.next(), if !clients.is_empty() => {
                 match next {
                     None => {
                         debug!(log, "all clients disconnected");
                     }
                     Some((client_id, Err(error))) => {
-                        if let Some(mut stream) = streams.remove(&client_id) {
-                            close_client!(client_id, stream, "client read error"; "error" => %error);
+                        if let Some(mut client) = clients.remove(&client_id) {
+                            close_client!(client, "failed to read from client"; "error" => %error);
                         }
                     }
                     Some((client_id, Ok(message))) => {
-                        if let Some((_encoder, decoder)) = encoders.get_mut(&client_id) {
-                            match decoder.decode(message) {
-                                Ok(message) => {
-                                    match handle_client_message(
-                                        &log,
-                                        &mut pty,
-                                        decoder,
-                                        pings.entry(client_id).or_default(),
-                                        message
-                                    ).await {
-                                        Ok(()) => (),
-                                        Err(InteractiveJobError::Close) => {
-                                            info!(log, "client closed connection");
-                                        }
-                                        Err(error) => {
-                                            if let Some(mut stream) = streams.remove(&client_id) {
-                                                close_client!(client_id, stream, "failed to handle client message"; "error" => %error);
-                                            }
-                                        }
-                                    }
+                        match Message::try_from(message) {
+                            Ok(Message::Control(message)) => match message {
+                                Control::WindowChange(size) => pty.set_window_size(size)?,
+                            },
+                            Ok(Message::Data(bytes)) => pty.write_all(&bytes).await?,
+                            Ok(Message::Ignore) => (),
+                            Ok(Message::Close) => {
+                                if let Some(mut client) = clients.remove(&client_id) {
+                                    close_client!(client);
+                                    info!(log, "client closed connection");
                                 }
-                                Err(error) => {
-                                    if let Some(mut stream) = streams.remove(&client_id) {
-                                        close_client!(client_id, stream, "failed to decode client message"; "error" => %error);
-                                    }
+                            }
+                            Err(error) => {
+                                if let Some(mut client) = clients.remove(&client_id) {
+                                    close_client!(client, "failed to decode message from client"; "error" => %error);
                                 }
                             }
                         }
-                    }
-                }
-            }
-
-            // Periodically rekey all the clients.
-            // TODO: independent, random intervals
-            _ = interval.tick() => {
-                for (client_id, stream) in streams.iter_mut() {
-                    if let Some((encoder, _decoder)) = encoders.get_mut(&client_id) {
-                        rekey_client!(*client_id, stream, encoder);
                     }
                 }
             }
@@ -276,39 +216,14 @@ async fn interactive_job(
     }
 
     // Close clients.
-    for (client_id, stream) in streams.iter_mut() {
-        close_client!(client_id, stream);
+    for (_id, client) in clients.iter_mut() {
+        close_client!(client);
     }
 
     // Reap the process.
     let status = child.wait().await?;
     info!(log, "interactive job stopped");
     Ok(status)
-}
-
-async fn handle_client_message(
-    log: &Logger,
-    pty: &mut Pty,
-    decoder: &mut Decoder,
-    ping: &mut Option<InteractiveJobMessage>,
-    message: InteractiveJobMessage,
-) -> Result<(), InteractiveJobError> {
-    use InteractiveJobMessage as Message;
-    match message {
-        Message::Control(message) => match message {
-            InteractiveJobControl::WindowChange(size) => pty.set_window_size(size)?,
-        },
-        Message::Data(bytes) => pty.write_all(&bytes).await?,
-        Message::Ping(_) => return Err(InteractiveJobError::UnsolicitedPing),
-        Message::Pong(pong) => {
-            if let Some(Message::Ping(ping)) = ping.take() {
-                decoder.rekey(pong, Some(ping));
-                info!(log, "rekeyed interactive job decoder");
-            }
-        }
-        Message::Close => return Err(InteractiveJobError::Close),
-    }
-    Ok(())
 }
 
 /// Fetch the last few bytes of the output file for client play back.
