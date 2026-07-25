@@ -13,6 +13,7 @@
 //! as sprockets or TLS.
 
 use bytes::Bytes;
+use rustix::termios::Winsize;
 use serde::{Deserialize, Serialize};
 use serde_json::{from_str as from_json, to_string as to_json};
 use thiserror::Error;
@@ -69,10 +70,30 @@ pub enum InteractiveJobControl {
 
 /// The size of an interactive job pseudoterminal.
 /// Shells sometimes call these `$LINES` and `$COLUMNS`.
-#[derive(Clone, Debug, Deserialize, Serialize)]
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 pub struct WindowSize {
     pub rows: u16,
     pub cols: u16,
+}
+
+impl From<Winsize> for WindowSize {
+    fn from(Winsize { ws_row, ws_col, .. }: Winsize) -> Self {
+        Self {
+            rows: ws_row,
+            cols: ws_col,
+        }
+    }
+}
+
+impl From<WindowSize> for Winsize {
+    fn from(WindowSize { rows, cols }: WindowSize) -> Self {
+        Self {
+            ws_row: rows,
+            ws_col: cols,
+            ws_xpixel: 0,
+            ws_ypixel: 0,
+        }
+    }
 }
 
 /// What went wrong with an interactive job.

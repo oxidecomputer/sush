@@ -14,7 +14,7 @@ use std::task::{Context, Poll};
 use rustix::fs::{Mode, OFlags, fcntl_setfl, open};
 use rustix::io::{read, write};
 use rustix::pty::{OpenptFlags, grantpt, openpt, ptsname, unlockpt};
-use rustix::termios::{Winsize, tcsetwinsize};
+use rustix::termios::{tcgetwinsize, tcsetwinsize};
 
 use tokio::io::unix::AsyncFd;
 use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
@@ -51,17 +51,14 @@ impl Pty {
         Ok((Self(AsyncFd::new(pty)?), pts, pts_path))
     }
 
+    /// Get the current pseudoterminal window size.
+    pub fn get_window_size(&self) -> io::Result<WindowSize> {
+        Ok(tcgetwinsize(&self.0)?.into())
+    }
+
     /// Set the pseudoterminal window size.
-    pub fn set_window_size(&self, WindowSize { rows, cols }: WindowSize) -> io::Result<()> {
-        Ok(tcsetwinsize(
-            &self.0,
-            Winsize {
-                ws_row: rows,
-                ws_col: cols,
-                ws_xpixel: 0,
-                ws_ypixel: 0,
-            },
-        )?)
+    pub fn set_window_size(&self, size: WindowSize) -> io::Result<()> {
+        Ok(tcsetwinsize(&self.0, size.into())?)
     }
 }
 

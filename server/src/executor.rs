@@ -15,7 +15,6 @@ use pwd::Passwd;
 use rustix::io::close;
 use rustix::process::{ioctl_tiocsctty, setsid};
 use slog::{Logger, debug, error, o};
-use terminfo::Database as Terminfo;
 use tokio::fs::{DirBuilder, File};
 use tokio::process::Command;
 use tokio::sync::{mpsc, watch};
@@ -31,6 +30,9 @@ use crate::interactive::{InteractiveJob, SocketSender};
 use crate::messages::{Event, JobEvent};
 use crate::output::JobOutputDir;
 use crate::pty::Pty;
+
+pub const DEFAULT_PATH: &str = "/usr/sbin:/usr/bin:/sbin:/bin";
+pub const DEFAULT_TERM: &str = "vt100";
 
 pub struct Executor {
     log: Logger,
@@ -164,6 +166,7 @@ async fn job_spawn(
 
     // Set up basic environment.
     cmd.env_clear();
+    cmd.env("PATH", DEFAULT_PATH);
     if let Some(pwd) = Passwd::current_user() {
         cmd.current_dir(&pwd.dir)
             .env("HOME", &pwd.dir)
@@ -202,21 +205,14 @@ async fn job_spawn(
             });
         }
 
-        // If it has a valid terminfo database, set `TERM` and the
-        // initial pseudoterminal window size.
-        if let Some(term) = term
-            && Terminfo::from_name(&term).is_ok()
-        {
-            cmd.env("TERM", term);
-            if let Some(rows) = rows
-                && let Some(cols) = cols
-            {
-                with_io_err!(
-                    pty.set_window_size(WindowSize { rows, cols }),
-                    "resizing pseudoterminal window".to_string()
-                );
-            }
-        };
+        // Initialize the pseudoterminal.
+        cmd.env("TERM", term.unwrap_or_else(|| DEFAULT_TERM.to_string()));
+        if let (Some(rows), Some(cols)) = (rows, cols) {
+            with_io_err!(
+                pty.set_window_size(WindowSize { rows, cols }),
+                "resizing pseudoterminal window".to_string()
+            );
+        }
 
         // Start the interactive job and send the attachment point and notification.
         let child = with_io_err!(cmd.spawn(), "spawning job process".to_string());

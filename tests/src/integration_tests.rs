@@ -14,7 +14,7 @@ use tokio_tungstenite::tungstenite::protocol::Role;
 use sush_api::JobWait;
 use sush_api::sush_api_mod::api_description;
 use sush_client::{Client, Error as ClientError};
-use sush_common::interactive::InteractiveJobMessage;
+use sush_common::interactive::{InteractiveJobControl, InteractiveJobMessage};
 use sush_common::jobs::{JobLimits, JobOutputStream, Session, SessionId};
 use sush_server::{ApiServer, ProxyServer};
 
@@ -154,7 +154,7 @@ async fn client_proxy_server() {
     assert_eq!(iam, identity, "who am I?");
 }
 
-async fn ensure_next_interactive_message_data<S>(stream: &mut WebSocketStream<S>, expected: &Bytes)
+async fn next_data_message<S>(stream: &mut WebSocketStream<S>) -> Bytes
 where
     S: AsyncRead + AsyncWrite + Unpin,
 {
@@ -163,17 +163,35 @@ where
         .await
         .expect("can't get next stream item")
         .expect("can't get next message");
-    let InteractiveJobMessage::Data(bytes) =
-        recvd.try_into().expect("can't decode received message")
-    else {
+    let InteractiveJobMessage::Data(bytes) = recvd.try_into().expect("can't decode message") else {
         panic!("expected data message");
     };
-    assert_eq!(bytes, expected);
+    bytes
+}
+
+async fn next_control_message<S>(stream: &mut WebSocketStream<S>) -> InteractiveJobControl
+where
+    S: AsyncRead + AsyncWrite + Unpin,
+{
+    let recvd = stream
+        .next()
+        .await
+        .expect("can't get next stream item")
+        .expect("can't get next message");
+    let InteractiveJobMessage::Control(message) = recvd.try_into().expect("can't decode message")
+    else {
+        panic!("expected control message");
+    };
+    message
 }
 
 #[named]
 #[test]
 async fn interactive_job() {
+    // The one true terminal size.
+    const ROWS: u16 = 24;
+    const COLS: u16 = 80;
+
     // Spin up a server.
     let log = test_logger(function_name!());
     let (mgr, mut root, _dir) = manager_and_test_root(log.clone()).await;
@@ -230,6 +248,8 @@ async fn interactive_job() {
         .max_cpu(max_cpu)
         .max_mem(max_mem)
         .max_fsize(max_fsize)
+        .rows(ROWS)
+        .cols(COLS)
         .wait(JobWait::Start)
         .body(job.into_signed())
         .send()
@@ -248,6 +268,11 @@ async fn interactive_job() {
         .into_inner();
     let mut stream1 = WebSocketStream::from_raw_socket(socket1, Role::Client, None).await;
 
+    // Ensure that we get an initial window size message.
+    let InteractiveJobControl::WindowChange(size1) = next_control_message(&mut stream1).await;
+    assert_eq!(size1.rows, ROWS);
+    assert_eq!(size1.cols, COLS);
+
     // Send a message and ensure that we can see it echoed.
     let hello = Bytes::from(format!("Hello, {job_id}!"));
     stream1
@@ -258,9 +283,10 @@ async fn interactive_job() {
         )
         .await
         .expect("can't send message");
-    ensure_next_interactive_message_data(&mut stream1, &hello).await;
+    assert_eq!(next_data_message(&mut stream1).await, &hello);
 
-    // Attach a second client.
+    // Attach a second client and ensure that it gets a window size
+    // and playback.
     let socket2 = client
         .job_attach()
         .job_id(&job_id)
@@ -271,9 +297,9 @@ async fn interactive_job() {
         .expect("can't attach second client to job")
         .into_inner();
     let mut stream2 = WebSocketStream::from_raw_socket(socket2, Role::Client, None).await;
-
-    // Ensure the second client gets a playback message.
-    ensure_next_interactive_message_data(&mut stream2, &hello).await;
+    let InteractiveJobControl::WindowChange(size2) = next_control_message(&mut stream2).await;
+    assert_eq!(size2, size1);
+    assert_eq!(next_data_message(&mut stream2).await, &hello);
 
     // Send a message from the second client.
     let again = Bytes::from(format!("And hello again, {job_id}!"));
@@ -287,8 +313,8 @@ async fn interactive_job() {
         .expect("can't send message");
 
     // Ensure both clients get the new message.
-    ensure_next_interactive_message_data(&mut stream1, &again).await;
-    ensure_next_interactive_message_data(&mut stream2, &again).await;
+    assert_eq!(next_data_message(&mut stream1).await, &again);
+    assert_eq!(next_data_message(&mut stream2).await, &again);
 
     // Detach from the job.
     stream1.close(None).await.expect("can't close stream1");

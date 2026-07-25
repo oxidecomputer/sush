@@ -122,7 +122,8 @@ async fn interactive_job(
                     Ok(n) => {
                         output.write_all(&buffer[..n]).await?;
                         let data = buffer.copy_to_bytes(n);
-                        // TODO: send in parallel
+
+                        // TODO: better broadcast
                         for (_id, client) in clients.iter_mut() {
                             if let Err(error) = client.send(Message::Data(data.clone()).try_into()?).await {
                                 close_client!(client, "failed to relay job output"; "error" => %error);
@@ -139,13 +140,22 @@ async fn interactive_job(
                 }
             }
 
-            // Accept a new client and play back the last buffer.
+            // Attach a new client, send it the current window size, and play back the last buffer.
             Some(mut client) = rx_client.recv(), if !dead => {
+                match pty.get_window_size() {
+                    Err(error) => error!(log, "failed to get pseudoterminal window size"; "error" => %error),
+                    Ok(size) => {
+                        match client.send(Message::Control(Control::WindowChange(size.clone())).try_into()?).await {
+                            Err(error) => close_client!(client, "failed to send pty window size"; "error" => %error),
+                            Ok(()) => debug!(log, "sent pty window size"; "size" => ?size),
+                        }
+                    }
+                }
                 if let Some(playback) = playback_buffer(&mut output, INTERACTIVE_JOB_BUFFER_SIZE).await? {
                     let playback_len = playback.len();
                     match client.send(Message::Data(playback).try_into()?).await {
-                        Ok(()) => debug!(log, "played back output"; "bytes" => playback_len),
                         Err(error) => close_client!(client, "failed to play back job output"; "error" => %error),
+                        Ok(()) => debug!(log, "played back output"; "bytes" => playback_len),
                     }
                 }
                 client_id += 1;
@@ -166,7 +176,20 @@ async fn interactive_job(
                     Some((client_id, Ok(message))) => {
                         match Message::try_from(message) {
                             Ok(Message::Control(message)) => match message {
-                                Control::WindowChange(size) => pty.set_window_size(size)?,
+                                Control::WindowChange(size) => {
+                                    pty.set_window_size(size.clone())?;
+
+                                    // TODO: better broadcast
+                                    // TODO: hysteresis control
+                                    let winch = Control::WindowChange(size.clone());
+                                    for (id, client) in clients.iter_mut() {
+                                        if *id != client_id
+                                            && let Err(error) = client.send(Message::Control(winch.clone()).try_into()?).await
+                                        {
+                                            close_client!(client, "failed to relay window change"; "error" => %error);
+                                        }
+                                    }
+                                }
                             },
                             Ok(Message::Data(bytes)) => pty.write_all(&bytes).await?,
                             Ok(Message::Ignore) => (),
@@ -189,8 +212,8 @@ async fn interactive_job(
             // Stop job on cancellation signal, but only once.
             _ = stop.cancelled(), if !killed => {
                 match child.start_kill() {
-                    Ok(()) => debug!(log, "killed job processes"),
                     Err(err) => error!(log, "unable to kill job"; "error" => %err),
+                    Ok(()) => debug!(log, "killed job processes"),
                 }
                 debug!(log, "killed job process");
                 killed = true;

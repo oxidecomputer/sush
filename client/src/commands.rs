@@ -883,10 +883,10 @@ async fn job_start(
             .body(job.clone());
         if let Some(term) = term.as_ref() {
             start = start.term(term);
-            if let Ok(winsize) = tcgetwinsize(stdin()) {
-                start = start.rows(winsize.ws_row);
-                start = start.cols(winsize.ws_col);
-            }
+        }
+        if let Ok(winsize) = tcgetwinsize(stdin()) {
+            start = start.rows(winsize.ws_row);
+            start = start.cols(winsize.ws_col);
         }
         start.send().await
     });
