@@ -4,6 +4,7 @@
 use std::num::NonZeroUsize;
 use std::path::PathBuf;
 use std::sync::Arc;
+use std::time::Duration;
 
 use chrono::{DateTime, Utc};
 use http_range_header::SyntacticallyCorrectRange as Range;
@@ -12,6 +13,7 @@ use rumors::Rumors;
 use sled_hardware_types::BaseboardId;
 use slog::{Logger, debug, info, o, warn};
 use tokio::sync::{Mutex, mpsc, watch};
+use tokio::time::timeout;
 use tokio_stream::wrappers::ReceiverStream;
 use tokio_util::sync::CancellationToken;
 use x509_cert::Certificate;
@@ -52,6 +54,9 @@ const MAX_CACHED_IDENTITIES: NonZeroUsize = NonZeroUsize::new(1_000).unwrap();
 /// nor do we expect hostile (DoS) requests, so a small value
 /// here is adequate.
 const MAX_OUTSTANDING_NONCES: NonZeroUsize = NonZeroUsize::new(100).unwrap();
+
+/// Maximum amount of time we're willing to wait for job start or stop.
+const WAIT_TIMEOUT: Duration = Duration::from_secs(600);
 
 /// NB: All tables must have a fixed maximum size!
 #[derive(Debug)]
@@ -369,15 +374,15 @@ impl JobManager {
         }
     }
 
-    /// It is possible for this to wait indefinitely; the client may set
-    /// a timeout and cancel the request if that is the desired semantics.
     async fn maybe_wait(&self, job_id: &JobId, wait: JobWait) -> Result<(), JobError> {
         if wait.is_some() {
-            self.state
-                .clone()
-                .wait_for(self.wait_for(job_id, wait))
-                .await
-                .map_err(|_| JobError::ChannelClosed)?;
+            timeout(
+                WAIT_TIMEOUT,
+                self.state.clone().wait_for(self.wait_for(job_id, wait)),
+            )
+            .await
+            .map_err(|_| JobError::Timeout)?
+            .map_err(|_| JobError::ChannelClosed)?;
         }
         Ok(())
     }
@@ -414,9 +419,13 @@ impl JobManager {
         job_id: &JobId,
         JobStopParams { wait }: JobStopParams,
     ) -> Result<(), JobError> {
-        self.job_request(authn, JobRequest::Stop(job_id.to_owned()))
-            .await?;
-        self.maybe_wait(job_id, wait).await
+        if wait.is_none() || self.state.borrow().get_job_status(job_id).is_some() {
+            self.job_request(authn, JobRequest::Stop(job_id.to_owned()))
+                .await?;
+            self.maybe_wait(job_id, wait).await
+        } else {
+            Err(JobError::JobNotFound(job_id.to_owned()))
+        }
     }
 
     pub async fn job_status(

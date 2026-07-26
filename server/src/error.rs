@@ -2,7 +2,7 @@
 
 use std::path::{Path, PathBuf};
 
-use dropshot::{ClientErrorStatusCode, HttpError};
+use dropshot::{ClientErrorStatusCode, ErrorStatusCode, HttpError};
 use thiserror::Error;
 
 use sush_common::authn::{Challenge, Nonce};
@@ -62,6 +62,8 @@ pub enum JobError {
     Slice(#[from] std::array::TryFromSliceError),
     #[error(transparent)]
     Task(#[from] tokio::task::JoinError),
+    #[error("Wait timed out")]
+    Timeout,
     #[error("Too many certificates ({0})")]
     TooManyCerts(usize),
     #[error("Unauthorized request")]
@@ -137,6 +139,13 @@ impl From<JobError> for HttpError {
                 ClientErrorStatusCode::NOT_FOUND,
                 error.to_string(),
             ),
+            Timeout => HttpError {
+                status_code: ErrorStatusCode::GATEWAY_TIMEOUT,
+                error_code: None,
+                external_message: "Wait timed out".to_string(),
+                internal_message: "wait timed out".to_string(),
+                headers: None,
+            },
             Unauthorized(nonce) => {
                 let mut err = HttpError::for_client_error(
                     None,

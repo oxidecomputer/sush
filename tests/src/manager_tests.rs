@@ -196,8 +196,8 @@ async fn job_stop() {
     mgr.session_start(&authn, session_id.clone()).await.unwrap();
     let job_id = session.next_job_id();
 
-    // Stopping a not-yet-extant job should silently succeed;
-    // it just enqueues a request. But waiting would never return.
+    // Stopping a nonexistent job with no wait should silently succeed;
+    // it just enqueues a request.
     mgr.job_stop(
         &authn,
         &job_id,
@@ -206,7 +206,19 @@ async fn job_stop() {
         },
     )
     .await
-    .expect("should be able to stop a not-yet-extant job");
+    .expect("should be able to stop a nonexistent job without waiting");
+
+    // But trying to wait on stop of a nonexistant job should fail immediately,
+    // because there's nothing to wait on (yet).
+    mgr.job_stop(
+        &authn,
+        &job_id,
+        JobStopParams {
+            wait: JobWait::Stop,
+        },
+    )
+    .await
+    .expect_err("should not be able to stop a nonexistent job while waiting");
 
     // Start a (potentially) long-running job.
     let command = "sleep 10";

@@ -24,7 +24,7 @@ use rustix::termios::tcgetwinsize;
 use sled_hardware_types::BaseboardId;
 use thiserror::Error;
 use tokio::signal::ctrl_c;
-use tokio::time::{MissedTickBehavior, interval, sleep};
+use tokio::time::{MissedTickBehavior, interval};
 use tokio::{pin, select};
 use tokio_tungstenite::WebSocketStream;
 use tokio_tungstenite::tungstenite::error::Error as WebSocketError;
@@ -68,11 +68,6 @@ const DEFAULT_CHUNK_SIZE: ByteSize = ByteSize::mib(32);
 
 /// Default number of simultaneous downloads for large output.
 const PARALLEL_CHUNKS: NonZeroU8 = NonZeroU8::new(8).unwrap();
-
-// Timeouts for various kinds of job-wait conditions.
-const START_TIMEOUT: Duration = Duration::from_secs(60);
-const STOP_TIMEOUT: Duration = Duration::from_secs(600);
-const NO_TIMEOUT: Duration = Duration::from_secs(u64::MAX);
 
 // Spinner update intervals.
 const JOB_START_UPDATE_INTERVAL: Duration = Duration::from_millis(250);
@@ -865,14 +860,13 @@ async fn job_start(
         ..
     } = start_args;
     let interactive = job.payload().interactive;
-    let (wait, timeout) = if interactive {
-        (JobWait::Start, sleep(START_TIMEOUT))
+    let wait = if interactive {
+        JobWait::Start
     } else if wait {
-        (JobWait::Stop, sleep(STOP_TIMEOUT))
+        JobWait::Stop
     } else {
-        (JobWait::None, sleep(NO_TIMEOUT))
+        JobWait::None
     };
-    pin!(timeout);
     let JobLimits {
         max_cpu,
         max_mem,
@@ -938,13 +932,6 @@ async fn job_start(
                     ctx.job_error(CommandError::Canceled);
                     job_stop(ctx, client, &job_id).await?;
                     stopped = true;
-                }
-
-                // Don't stop the job on timeout, but stop waiting.
-                _ = &mut timeout => {
-                    ctx.job_polling_finished(&job_id);
-                    ctx.job_error(CommandError::TimedOut);
-                    break;
                 }
             }
         }
