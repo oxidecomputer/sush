@@ -401,7 +401,6 @@
             "in": "query",
             "name": "wait",
             "description": "Wait for the job to start or stop.",
-            "required": true,
             "schema": {
               "$ref": "#/components/schemas/JobWait"
             }
@@ -534,7 +533,6 @@
             "in": "query",
             "name": "wait",
             "description": "Wait for the job process to end.",
-            "required": true,
             "schema": {
               "$ref": "#/components/schemas/JobWait"
             }

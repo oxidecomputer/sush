@@ -187,6 +187,7 @@ pub struct JobAttachParams {
 
 /// Job parameters _not_ specified in the signed job request.
 #[derive(Clone, Debug, Default, Deserialize, JsonSchema, BorshSerialize, BorshDeserialize)]
+#[serde(default)]
 pub struct JobStartParams {
     #[serde(flatten, deserialize_with = "deserialize_job_limits")]
     pub limits: JobLimits,
@@ -242,6 +243,7 @@ impl JobWait {
 }
 
 #[derive(Clone, Debug, Default, Deserialize, JsonSchema, BorshSerialize, BorshDeserialize)]
+#[serde(default)]
 pub struct JobStopParams {
     /// Wait for the job process to end.
     pub wait: JobWait,
