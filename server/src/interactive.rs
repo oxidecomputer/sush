@@ -8,6 +8,7 @@
 //! the new socket and begins processing/relaying messages from/to it.
 //! Multiple clients may be simultaneously attached.
 
+use std::collections::BTreeMap;
 use std::io::{self, SeekFrom};
 use std::process::ExitStatus;
 
@@ -24,6 +25,7 @@ use tokio::time::{Duration, Instant, sleep};
 use tokio::{pin, select, spawn};
 use tokio_stream::StreamMap;
 use tokio_tungstenite::WebSocketStream;
+use tokio_tungstenite::tungstenite::protocol::Message as WebSocketMessage;
 
 use sush_common::interactive::{
     INTERACTIVE_JOB_BUFFER_SIZE, InteractiveJobControl as Control, InteractiveJobError as Error,
@@ -88,14 +90,37 @@ async fn interactive_job(
     // Client-induced errors must not break the loop;
     // close the client, log the error, and continue.
     macro_rules! close_client {
-        ($client:ident) => {{
-            let _ = $client.close(None).await;
+        ($client_id:ident) => {{
+            if let Some(mut client) = clients.remove(&$client_id) {
+                let _ = client.close(None).await;
+            }
         }};
-        ($client:ident, $msg:literal; $($keys:tt)*) => {{
-            close_client!($client);
+        ($client_id:ident, $msg:literal; $($keys:tt)*) => {{
+            close_client!($client_id);
             error!(log, $msg; $($keys)*);
-            continue;
         }};
+    }
+
+    // Distribute a message to every client.
+    // TODO: better, buffered broadcast
+    macro_rules! broadcast {
+        ($clients:ident, $message:expr) => {{
+            let mut to_close = BTreeMap::new();
+            for (client_id, client) in $clients.iter_mut() {
+                if let Err(error) = client.send($message.clone()).await {
+                    to_close.insert(*client_id, error);
+                }
+            }
+            for (client_id, error) in to_close {
+                close_client!(
+                    client_id,
+                    "failed to relay broadcast message";
+                    "client_id" => %client_id,
+                    "message" => %$message,
+                    "error" => %error,
+                );
+            }
+        }}
     }
 
     // Set up death watch and output drain timer.
@@ -124,11 +149,12 @@ async fn interactive_job(
                         let data = buffer.copy_to_bytes(n);
 
                         // TODO: better broadcast
-                        for (_id, client) in clients.iter_mut() {
-                            if let Err(error) = client.send(Message::Data(data.clone()).try_into()?).await {
-                                close_client!(client, "failed to relay job output"; "error" => %error);
-                            }
-                        }
+                        let Ok::<WebSocketMessage, _>(message) = Message::Data(data.clone()).try_into() else {
+                            error!(log, "failed to encode data message for relay");
+                            buffer.truncate(0);
+                            continue;
+                        };
+                        broadcast!(clients, message);
                         buffer.truncate(0);
                     }
                     Err(error) => {
@@ -146,63 +172,59 @@ async fn interactive_job(
                     Err(error) => error!(log, "failed to get pseudoterminal window size"; "error" => %error),
                     Ok(size) => {
                         match client.send(Message::Control(Control::WindowChange(size.clone())).try_into()?).await {
-                            Err(error) => close_client!(client, "failed to send pty window size"; "error" => %error),
+                            Err(error) => error!(log, "failed to send pty window size"; "error" => %error),
                             Ok(()) => debug!(log, "sent pty window size"; "size" => ?size),
                         }
                     }
                 }
+
                 if let Some(playback) = playback_buffer(&mut output, INTERACTIVE_JOB_BUFFER_SIZE).await? {
                     let playback_len = playback.len();
                     match client.send(Message::Data(playback).try_into()?).await {
-                        Err(error) => close_client!(client, "failed to play back job output"; "error" => %error),
+                        Err(error) => error!(log, "failed to play back job output"; "error" => %error),
                         Ok(()) => debug!(log, "played back output"; "bytes" => playback_len),
                     }
                 }
+
                 client_id += 1;
                 clients.insert(client_id, client);
             }
 
             // Handle a message from a client.
-            next = clients.next(), if !clients.is_empty() => {
+            next = clients.next(), if !clients.is_empty() && !dead => {
                 match next {
                     None => {
                         debug!(log, "all clients disconnected");
                     }
                     Some((client_id, Err(error))) => {
-                        if let Some(mut client) = clients.remove(&client_id) {
-                            close_client!(client, "failed to read from client"; "error" => %error);
-                        }
+                        close_client!(client_id, "failed to read from client"; "error" => %error);
                     }
                     Some((client_id, Ok(message))) => {
                         match Message::try_from(message) {
                             Ok(Message::Control(message)) => match message {
                                 Control::WindowChange(size) => {
-                                    pty.set_window_size(size.clone())?;
+                                    if let Err(error) = pty.set_window_size(size.clone()) {
+                                        error!(log, "failed to set window size"; "size" => ?size, "error" => %error);
+                                    }
 
                                     // TODO: better broadcast
                                     // TODO: hysteresis control
                                     let winch = Control::WindowChange(size.clone());
-                                    for (id, client) in clients.iter_mut() {
-                                        if *id != client_id
-                                            && let Err(error) = client.send(Message::Control(winch.clone()).try_into()?).await
-                                        {
-                                            close_client!(client, "failed to relay window change"; "error" => %error);
-                                        }
-                                    }
+                                    let Ok::<WebSocketMessage, _>(message) = Message::Control(winch).try_into() else {
+                                        error!(log, "failed to encode window change for relay");
+                                        continue;
+                                    };
+                                    broadcast!(clients, message);
                                 }
                             },
                             Ok(Message::Data(bytes)) => pty.write_all(&bytes).await?,
                             Ok(Message::Ignore) => (),
                             Ok(Message::Close) => {
-                                if let Some(mut client) = clients.remove(&client_id) {
-                                    close_client!(client);
-                                    info!(log, "client closed connection");
-                                }
+                                close_client!(client_id);
+                                info!(log, "client closed connection");
                             }
                             Err(error) => {
-                                if let Some(mut client) = clients.remove(&client_id) {
-                                    close_client!(client, "failed to decode message from client"; "error" => %error);
-                                }
+                                close_client!(client_id, "failed to decode message from client"; "error" => %error);
                             }
                         }
                     }
@@ -239,8 +261,8 @@ async fn interactive_job(
     }
 
     // Close clients.
-    for (_id, client) in clients.iter_mut() {
-        close_client!(client);
+    for client_id in clients.keys().cloned().collect::<Vec<ClientId>>() {
+        close_client!(client_id);
     }
 
     // Reap the process.
