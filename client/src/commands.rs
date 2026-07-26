@@ -900,7 +900,7 @@ async fn job_start(
         ctx.job_started(&job);
         match job_attach(ctx, client, &job_id, &target).await {
             Ok(()) | Err(CommandError::NotFound) => job_status(ctx, client, &job_id).await?,
-            Err(error) => return Err(ctx.job_error(error)),
+            Err(error) => return Err(error),
         }
     } else if wait.is_some() {
         let mut interval = interval(JOB_START_UPDATE_INTERVAL);

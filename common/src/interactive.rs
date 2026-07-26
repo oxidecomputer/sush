@@ -43,15 +43,15 @@ impl TryFrom<WebSocketMessage> for InteractiveJobMessage {
     }
 }
 
-impl TryInto<WebSocketMessage> for InteractiveJobMessage {
+impl TryFrom<InteractiveJobMessage> for WebSocketMessage {
     type Error = InteractiveJobError;
 
-    fn try_into(self) -> Result<WebSocketMessage, Self::Error> {
-        match self {
-            Self::Control(msg) => Ok(WebSocketMessage::Text(to_json(&msg)?.into())),
-            Self::Data(bytes) => Ok(WebSocketMessage::Binary(bytes)),
-            Self::Close => Ok(WebSocketMessage::Close(None)),
-            Self::Ignore => Err(Self::Error::IgnoredMessage),
+    fn try_from(message: InteractiveJobMessage) -> Result<Self, Self::Error> {
+        match message {
+            InteractiveJobMessage::Control(msg) => Ok(Self::Text(to_json(&msg)?.into())),
+            InteractiveJobMessage::Data(bytes) => Ok(Self::Binary(bytes)),
+            InteractiveJobMessage::Close => Ok(Self::Close(None)),
+            InteractiveJobMessage::Ignore => Err(Self::Error::IgnoredMessage),
         }
     }
 }
