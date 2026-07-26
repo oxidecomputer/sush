@@ -119,7 +119,7 @@ pub struct GlobalArgs {
           default_value = "text",
           default_value_if("json", "true", "json"),
           default_value_if("text", "true", "text"),
-          name = "FORMAT",
+          value_name = "FORMAT",
           value_enum)]
     #[clap(global = true)]
     pub output: Option<OutputFormat>,
@@ -172,6 +172,14 @@ impl ClientArgs {
         ctx.set_globals(self.globals.clone());
         self.command.clone().execute(ctx).await
     }
+}
+
+/// [`ClientArgs`] must satisfy Clap's internal consistency asserts
+/// (unique shorts per subcommand, valid references).
+#[test]
+fn client_args() {
+    use clap::CommandFactory as _;
+    ClientArgs::command().debug_assert();
 }
 
 /// Arguments for `job-stdout` and `job-stderr`.
@@ -323,7 +331,7 @@ pub enum JobCommand {
     #[clap(alias = "output")]
     Stdout {
         /// The baseboard ID of the sled from which output should be fetched.
-        #[arg(short, long, default_value = "*")]
+        #[arg(short = 'T', long, default_value = "*")]
         target: String,
 
         #[clap(flatten)]
@@ -334,7 +342,7 @@ pub enum JobCommand {
     #[clap(alias = "error")]
     Stderr {
         /// The baseboard ID of the sled from which output should be fetched.
-        #[arg(short, long, default_value = "*")]
+        #[arg(short = 'T', long, default_value = "*")]
         target: String,
 
         #[clap(flatten)]
@@ -348,7 +356,7 @@ pub enum JobCommand {
         job_id: JobId,
 
         /// The baseboard ID of the sled to attach to.
-        #[arg(short, long, default_value = "*")]
+        #[arg(short = 'T', long, default_value = "*")]
         target: String,
     },
 
@@ -382,11 +390,11 @@ pub struct JobStartArgs {
     binary: bool,
 
     /// Run the job with a pseudoterminal and allow attaching to it.
-    #[arg(short, long, env = SUSH_KEY_ID, name = "KEY_ID")]
+    #[arg(short, long)]
     interactive: bool,
 
     /// Use `permslip` to sign job requests with this key name.
-    #[arg(short, long, env = SUSH_PERMSLIP_KEY, name = "KEY_NAME")]
+    #[arg(short, long, env = SUSH_PERMSLIP_KEY, value_name = "KEY_NAME")]
     permslip: Option<String>,
 
     /// The `permslip` server to contact for signing.
