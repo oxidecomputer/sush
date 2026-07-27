@@ -448,7 +448,14 @@ impl JobManager {
         stream: JobOutputStream,
         range: Option<Range>,
     ) -> Result<Vec<u8>, JobError> {
-        if self.own_baseboard() == target && self.state.borrow().get_job_status(job_id).is_some() {
+        if self.own_baseboard() == target
+            && self
+                .state
+                .borrow()
+                .get_job_status(job_id)
+                .map(|m| m.contains_key(target))
+                .unwrap_or(false)
+        {
             self.output_dir.job_output(job_id, stream, range).await
         } else {
             Err(JobError::JobNotFound(job_id.to_owned()))
