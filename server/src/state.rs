@@ -70,7 +70,7 @@ impl State {
         self.job_status
             .entry(job_id.to_owned())
             .or_default()
-            .insert(baseboard_id.clone(), status.clone());
+            .insert(baseboard_id.clone(), status);
     }
 
     pub fn get_attachment(&self, job_id: &JobId) -> Option<SocketSender> {

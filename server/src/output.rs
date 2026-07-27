@@ -90,10 +90,9 @@ impl JobOutputDir {
         stream: JobOutputStream,
         range: Option<Range>,
     ) -> Result<Vec<u8>, JobError> {
-        let out = self.clone();
         let job_id = job_id.to_owned();
-        let len = out.job_output_len(&job_id, stream).await?;
-        let path = out.job_output_path(&job_id, stream);
+        let len = self.job_output_len(&job_id, stream).await?;
+        let path = self.job_output_path(&job_id, stream);
         let io_error = JobError::file_io_for(&path);
         let mut file = match File::open(&path).await {
             Ok(file) => file,
