@@ -2,7 +2,7 @@
 
 use std::path::{Path, PathBuf};
 
-use dropshot::{ClientErrorStatusCode, ErrorStatusCode, HttpError};
+use dropshot::{ClientErrorStatusCode, HttpError};
 use thiserror::Error;
 
 use sush_common::authn::{Challenge, Nonce};
@@ -139,13 +139,11 @@ impl From<JobError> for HttpError {
                 ClientErrorStatusCode::NOT_FOUND,
                 error.to_string(),
             ),
-            Timeout => HttpError {
-                status_code: ErrorStatusCode::GATEWAY_TIMEOUT,
-                error_code: None,
-                external_message: "Wait timed out".to_string(),
-                internal_message: "wait timed out".to_string(),
-                headers: None,
-            },
+            Timeout => HttpError::for_client_error(
+                None,
+                ClientErrorStatusCode::REQUEST_TIMEOUT,
+                String::from("Wait timed out"),
+            ),
             Unauthorized(nonce) => {
                 let mut err = HttpError::for_client_error(
                     None,

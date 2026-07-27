@@ -24,7 +24,7 @@ use rustix::termios::tcgetwinsize;
 use sled_hardware_types::BaseboardId;
 use thiserror::Error;
 use tokio::signal::ctrl_c;
-use tokio::time::{MissedTickBehavior, interval};
+use tokio::time::{MissedTickBehavior, interval, sleep};
 use tokio::{pin, select};
 use tokio_tungstenite::WebSocketStream;
 use tokio_tungstenite::tungstenite::error::Error as WebSocketError;
@@ -69,8 +69,9 @@ const DEFAULT_CHUNK_SIZE: ByteSize = ByteSize::mib(32);
 /// Default number of simultaneous downloads for large output.
 const PARALLEL_CHUNKS: NonZeroU8 = NonZeroU8::new(8).unwrap();
 
-// Spinner update intervals.
+// Job polling and spinner update intervals.
 const JOB_START_UPDATE_INTERVAL: Duration = Duration::from_millis(250);
+const JOB_STOP_RETRY_INTERVAL: Duration = Duration::from_millis(100);
 const SIGNING_UPDATE_INTERVAL: Duration = Duration::from_millis(100);
 
 /// Process limits for job execution.
@@ -794,7 +795,11 @@ async fn job(
             }
         }
 
-        (JobCommand::Stop { job_id }, Some(client)) => job_stop(ctx, client, &job_id).await,
+        (JobCommand::Stop { job_id }, Some(client)) => {
+            job_stop(ctx, client, &job_id).await?;
+            ctx.job_stopped(&job_id);
+            Ok(())
+        }
 
         (JobCommand::Status { job_id }, Some(client)) => job_status(ctx, client, &job_id).await,
 
@@ -926,12 +931,23 @@ async fn job_start(
 
                 // Stop the job on interrupt, but don't break out of
                 // the select loop; we must wait for the start future
-                // to resolve.
+                // to resolve. But there is a race here with the start,
+                // so retry the stop a few times if needed.
                 _ = ctrl_c(), if !stopped => {
-                    ctx.job_polling_finished(&job_id);
-                    ctx.job_error(CommandError::Canceled);
-                    job_stop(ctx, client, &job_id).await?;
-                    stopped = true;
+                    for _ in 0..3 {
+                        match job_stop(ctx, client, &job_id).await {
+                            Ok(_) => {
+                                ctx.job_polling_finished(&job_id);
+                                ctx.job_stopped(&job_id);
+                                stopped = true;
+                                break;
+                            }
+                            Err(CommandError::NotFound) => {
+                                sleep(JOB_STOP_RETRY_INTERVAL).await;
+                            }
+                            Err(error) => return Err(error),
+                        }
+                    }
                 }
             }
         }
@@ -955,7 +971,7 @@ async fn job_start(
                     let output = byte_stream_to_vec(byte_stream.into_inner()).await?;
                     ctx.job_output(&job_id, stream, &output, binary);
                 }
-                Err(error) => return Err(ctx.job_error(error)),
+                Err(error) => return Err(error),
             }
         }
     } else {
@@ -980,7 +996,6 @@ async fn job_stop(
             .await
     })
     .await?;
-    ctx.job_stopped(job_id);
     Ok(())
 }
 
@@ -1267,13 +1282,13 @@ async fn job_attach(
     })
     .await
     {
-        Err(error) => Err(ctx.job_error(error)),
+        Err(error) => Err(error),
         Ok(socket) => {
             ctx.job_attached(job_id);
             let socket = socket.into_inner();
             let stream = WebSocketStream::from_raw_socket(socket, Role::Client, None).await;
             if let Err(error) = interactive_job(stream).await {
-                return Err(ctx.job_error(error.into()));
+                return Err(error.into());
             }
             ctx.job_detached(job_id);
             Ok(())
@@ -1357,8 +1372,6 @@ pub enum CommandError {
     MissingSession,
     #[error("❌ Missing SSH agent socket, try `--ssh-auth-sock`")]
     MissingSshAuthSock,
-    #[error("❌ Missing job target, try `--target`")]
-    MissingTarget,
     #[error("❌ Resource not found")]
     NotFound,
     #[error("❌ Command not supported in offline mode, try `--url`")]
@@ -1420,6 +1433,7 @@ impl From<ClientError<ApiError>> for CommandError {
             CommunicationError(e) => CommandError::Client(format!("Communication error: {e}")),
             InvalidUpgrade(e) => CommandError::Client(e.to_string()),
             ErrorResponse(e) if e.status() == StatusCode::NOT_FOUND => CommandError::NotFound,
+            ErrorResponse(e) if e.status() == StatusCode::REQUEST_TIMEOUT => CommandError::TimedOut,
             ErrorResponse(e) => CommandError::Client(e.message.to_owned()),
             ResponseBodyError(e) => CommandError::Client(e.to_string()),
             InvalidResponsePayload(_b, e) => CommandError::Client(e.to_string()),
@@ -1444,6 +1458,7 @@ impl From<ClientError<ByteStream>> for CommandError {
     fn from(error: ClientError<ByteStream>) -> Self {
         match error.status() {
             Some(StatusCode::PAYLOAD_TOO_LARGE) => Self::TooMuchOutput,
+            Some(StatusCode::NOT_FOUND) => Self::NotFound,
             Some(status) => Self::Client(status.to_string()),
             None => Self::Client(error.to_string()),
         }
@@ -1453,6 +1468,7 @@ impl From<ClientError<ByteStream>> for CommandError {
 impl From<ClientError<Upgraded>> for CommandError {
     fn from(error: ClientError<Upgraded>) -> Self {
         match error.status() {
+            Some(StatusCode::NOT_FOUND) => Self::NotFound,
             Some(status) => Self::Client(status.to_string()),
             None => Self::Client(error.to_string()),
         }

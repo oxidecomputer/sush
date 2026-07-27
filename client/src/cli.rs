@@ -173,7 +173,7 @@ impl CommandContext for Cli {
     fn job_stopped(&mut self, job_id: &JobId) {
         match self.get_output_format() {
             OutputFormat::Json => println!("{}", json!(job_id)),
-            OutputFormat::Text => println!("✅ Stopped job `{job_id}`"),
+            OutputFormat::Text => println!("\r✅ Stopped job `{job_id}`"),
         }
     }
 
@@ -308,7 +308,7 @@ impl CommandContext for Cli {
     fn job_detached(&mut self, job_id: &JobId) {
         match self.get_output_format() {
             OutputFormat::Json => println!("{}", json!({"detached": job_id})),
-            OutputFormat::Text => println!("✅ Detached from interactive job `{job_id}`"),
+            OutputFormat::Text => println!("\r✅ Detached from interactive job `{job_id}`"),
         }
     }
 
