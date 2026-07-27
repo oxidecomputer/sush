@@ -8,7 +8,6 @@
 //! the new socket and begins processing/relaying messages from/to it.
 //! Multiple clients may be simultaneously attached.
 
-use std::collections::BTreeMap;
 use std::io::{self, SeekFrom};
 use std::process::ExitStatus;
 
@@ -23,7 +22,6 @@ use tokio::sync::mpsc;
 use tokio::task::JoinHandle;
 use tokio::time::{Duration, Instant, sleep};
 use tokio::{pin, select, spawn};
-use tokio_stream::StreamMap;
 use tokio_tungstenite::WebSocketStream;
 use tokio_tungstenite::tungstenite::protocol::Message as WebSocketMessage;
 
@@ -33,6 +31,7 @@ use sush_common::interactive::{
 };
 use tokio_util::sync::CancellationToken;
 
+use crate::mux::WebSocketMux;
 use crate::pty::Pty;
 
 pub type SocketStream = WebSocketStream<WebsocketConnectionRaw>;
@@ -81,49 +80,8 @@ async fn interactive_job(
     mut rx_client: mpsc::Receiver<SocketStream>,
     stop: CancellationToken,
 ) -> Result<ExitStatus, Error> {
-    type ClientId = usize;
-
     let mut buffer = BytesMut::with_capacity(INTERACTIVE_JOB_BUFFER_SIZE);
-    let mut clients = StreamMap::<ClientId, SocketStream>::new();
-    let mut client_id: ClientId = 0;
-
-    // Client-induced errors must not break the loop;
-    // close the client, log the error, and continue.
-    macro_rules! close_client {
-        ($client_id:ident) => {{
-            if let Some(mut client) = clients.remove(&$client_id) {
-                let _ = client.close(None).await;
-            }
-        }};
-        ($client_id:ident, $msg:literal; $($keys:tt)*) => {{
-            close_client!($client_id);
-            error!(log, $msg; $($keys)*);
-        }};
-    }
-
-    // Distribute a message to every client.
-    // TODO: better, buffered broadcast
-    macro_rules! broadcast {
-        ($clients:ident, $message:expr) => {{
-            let mut to_close = BTreeMap::new();
-            for (client_id, client) in $clients.iter_mut() {
-                if let Err(error) = client.send($message.clone()).await {
-                    to_close.insert(*client_id, error);
-                }
-            }
-            for (client_id, error) in to_close {
-                close_client!(
-                    client_id,
-                    "failed to relay broadcast message";
-                    "client_id" => %client_id,
-                    "message" => %$message,
-                    "error" => %error,
-                );
-            }
-        }}
-    }
-
-    // Set up death watch and output drain timer.
+    let mut clients = WebSocketMux::new();
     let mut killed = false;
     let mut dead = false;
     let drain_timeout = sleep(Duration::MAX);
@@ -146,20 +104,25 @@ async fn interactive_job(
                     }
                     Ok(n) => {
                         output.write_all(&buffer[..n]).await?;
-                        let data = buffer.copy_to_bytes(n);
-
-                        // TODO: better broadcast
-                        let Ok::<WebSocketMessage, _>(message) = Message::Data(data.clone()).try_into() else {
-                            error!(log, "failed to encode data message for relay");
-                            buffer.truncate(0);
-                            continue;
-                        };
-                        broadcast!(clients, message);
+                        if !clients.is_empty() {
+                            let data = buffer.copy_to_bytes(n);
+                            let Ok::<WebSocketMessage, _>(message) = Message::Data(data).try_into() else {
+                                error!(log, "failed to encode data message for relay");
+                                buffer.truncate(0);
+                                continue;
+                            };
+                            if let Err(error) = clients.send(message) {
+                                error!(log, "failed to relay data message to clients"; "error" => %error);
+                            }
+                        }
                         buffer.truncate(0);
                     }
                     Err(error) => {
                         if !dead {
                             error!(log, "error reading from PTY"; "error" => %error);
+                        }
+                        if let Err(error) = clients.send(Message::Close.try_into()?) {
+                            error!(log, "failed to send close message to clients"; "error" => %error);
                         }
                         break;
                     }
@@ -186,8 +149,7 @@ async fn interactive_job(
                     }
                 }
 
-                client_id += 1;
-                clients.insert(client_id, client);
+                clients.add(client, stop.child_token());
             }
 
             // Handle a message from a client.
@@ -197,7 +159,8 @@ async fn interactive_job(
                         debug!(log, "all clients disconnected");
                     }
                     Some((client_id, Err(error))) => {
-                        close_client!(client_id, "failed to read from client"; "error" => %error);
+                        error!(log, "failed to read from client"; "client_id" => %client_id, "error" => %error);
+                        clients.remove(&client_id);
                     }
                     Some((client_id, Ok(message))) => {
                         match Message::try_from(message) {
@@ -207,24 +170,26 @@ async fn interactive_job(
                                         error!(log, "failed to set window size"; "size" => ?size, "error" => %error);
                                     }
 
-                                    // TODO: better broadcast
                                     // TODO: hysteresis control
                                     let winch = Control::WindowChange(size.clone());
                                     let Ok::<WebSocketMessage, _>(message) = Message::Control(winch).try_into() else {
                                         error!(log, "failed to encode window change for relay");
                                         continue;
                                     };
-                                    broadcast!(clients, message);
+                                    if let Err(error) = clients.send(message) {
+                                        error!(log, "failed to relay window change to clients"; "client_id" => %client_id, "error" => %error);
+                                    }
                                 }
                             },
                             Ok(Message::Data(bytes)) => pty.write_all(&bytes).await?,
                             Ok(Message::Ignore) => (),
                             Ok(Message::Close) => {
-                                close_client!(client_id);
-                                info!(log, "client closed connection");
+                                info!(log, "client closed connection"; "client_id" => %client_id);
+                                clients.remove(&client_id);
                             }
                             Err(error) => {
-                                close_client!(client_id, "failed to decode message from client"; "error" => %error);
+                                error!(log, "failed to decode message from client"; "client_id" => %client_id, "error" => %error);
+                                clients.remove(&client_id);
                             }
                         }
                     }
@@ -234,10 +199,9 @@ async fn interactive_job(
             // Stop job on cancellation signal, but only once.
             _ = stop.cancelled(), if !killed => {
                 match child.start_kill() {
-                    Err(err) => error!(log, "unable to kill job"; "error" => %err),
-                    Ok(()) => debug!(log, "killed job processes"),
+                    Err(error) => error!(log, "failed to kill job process"; "error" => %error),
+                    Ok(()) => debug!(log, "killed job process"),
                 }
-                debug!(log, "killed job process");
                 killed = true;
             }
 
@@ -258,11 +222,6 @@ async fn interactive_job(
                 break;
             }
         }
-    }
-
-    // Close clients.
-    for client_id in clients.keys().cloned().collect::<Vec<ClientId>>() {
-        close_client!(client_id);
     }
 
     // Reap the process.

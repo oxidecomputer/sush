@@ -1,6 +1,7 @@
 //! Oxide Support Shell integration tests.
 
 use std::net::SocketAddr;
+use std::time::Duration;
 
 use bytes::{Bytes, BytesMut};
 use dropshot::{ConfigDropshot, ServerBuilder};
@@ -8,6 +9,7 @@ use function_name::named;
 use futures::{SinkExt as _, StreamExt as _};
 use tokio::io::{AsyncRead, AsyncWrite};
 use tokio::test;
+use tokio::time::timeout;
 use tokio_tungstenite::WebSocketStream;
 use tokio_tungstenite::tungstenite::protocol::Role;
 use tokio_util::sync::CancellationToken;
@@ -22,6 +24,8 @@ use sush_server::{ApiServer, ProxyServer};
 use crate::test_utils::{
     SignJobRequest as _, authz, manager_and_test_root, test_baseboard_id, test_logger,
 };
+
+const TIMEOUT: Duration = Duration::from_secs(10);
 
 fn local_addr() -> SocketAddr {
     "127.0.0.1:0".parse().unwrap()
@@ -168,11 +172,11 @@ async fn next_data_message<S>(stream: &mut WebSocketStream<S>) -> Bytes
 where
     S: AsyncRead + AsyncWrite + Unpin,
 {
-    let recvd = stream
-        .next()
+    let recvd = timeout(TIMEOUT, stream.next())
         .await
+        .expect("timed out waiting for data message")
         .expect("can't get next stream item")
-        .expect("can't get next message");
+        .expect("can't get next data message");
     let InteractiveJobMessage::Data(bytes) = recvd.try_into().expect("can't decode message") else {
         panic!("expected data message");
     };
@@ -183,11 +187,11 @@ async fn next_control_message<S>(stream: &mut WebSocketStream<S>) -> Interactive
 where
     S: AsyncRead + AsyncWrite + Unpin,
 {
-    let recvd = stream
-        .next()
+    let recvd = timeout(TIMEOUT, stream.next())
         .await
+        .expect("timed out waiting for control message")
         .expect("can't get next stream item")
-        .expect("can't get next message");
+        .expect("can't get next control message");
     let InteractiveJobMessage::Control(message) = recvd.try_into().expect("can't decode message")
     else {
         panic!("expected control message");

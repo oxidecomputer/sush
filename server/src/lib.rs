@@ -8,6 +8,7 @@ pub mod executor;
 pub mod interactive;
 pub mod manager;
 pub mod messages;
+pub mod mux;
 pub mod output;
 pub mod proxy;
 pub mod pty;
