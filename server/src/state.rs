@@ -12,7 +12,7 @@ use futures::{Stream, StreamExt};
 use rumors::before::Rank;
 use rumors::{Key, Rumors, Version};
 use sled_hardware_types::BaseboardId;
-use slog::{Logger, debug, error, info, o};
+use slog::{Logger, debug, error, info, o, warn};
 use sush_api::JobStartParams;
 use sush_common::jobs::{JobId, JobStatus, JobStatusMap, Session, SignedJob};
 use tokio::sync::watch;
@@ -66,11 +66,37 @@ impl State {
         baseboard_id: &BaseboardId,
         status: JobStatus,
     ) {
-        // TODO: evict old entries when crossing MAX_HISTORY
         self.job_status
             .entry(job_id.to_owned())
             .or_default()
             .insert(baseboard_id.clone(), status);
+        self.evict_old_history();
+    }
+
+    /// Evict causally-oldest job status entries once we exceed
+    /// `MAX_HISTORY`. A job may appear more than once in `causal_jobs`
+    /// (once per causal event: start, and stop or error), so the
+    /// causally-oldest entry isn't automatically safe to evict;
+    /// it may be the *start* event of a job that's still running,
+    /// whose terminal event (and thus later `causal_jobs` entry)
+    /// hasn't happened yet. We only ever evict full job entries,
+    /// and only for jobs that aren't currently running anywhere.
+    fn evict_old_history(&mut self) {
+        while self.job_status.len() > MAX_HISTORY {
+            let evictable = self
+                .causal_jobs
+                .iter()
+                .map(|(_, job_id, _)| job_id)
+                .find(|job_id| self.running.keys().all(|(id, _)| id != *job_id))
+                .cloned();
+            let Some(job_id) = evictable else {
+                // Everything we know about is still running somewhere;
+                // there's nothing safe to evict yet.
+                break;
+            };
+            self.job_status.remove(&job_id);
+            self.causal_jobs.retain(|(_, id, _)| id != &job_id);
+        }
     }
 
     pub fn get_attachment(&self, job_id: &JobId) -> Option<SocketSender> {
@@ -81,8 +107,12 @@ impl State {
 /// Maximum number of historical job statuses to retain before evicting them.
 /// This is specified as 32 (maximum sleds per rack) times 2,048 (maximum
 /// "scrollback" per sled).
-#[allow(dead_code)]
 const MAX_HISTORY: usize = 32 * 2048;
+
+/// Maximum number of jobs a session may have queued (submitted, but not
+/// yet next in the causal chain to run). Bounds memory in the presence
+/// of out-of-order, duplicate, or malformed submissions.
+const MAX_QUEUED_JOBS: usize = 1_000;
 
 #[derive(Clone, Debug, Default)]
 pub enum SessionState {
@@ -229,10 +259,33 @@ impl State {
                         } = self
                         {
                             let payload = signed.payload().clone();
+                            let job_id = payload.job_id.clone();
 
-                            // Insert the job into our queue, without starting anything
-                            queued_jobs
-                                .insert(payload.job_id.clone(), (signed.clone(), params.clone()));
+                            // A job ID that has a status has already run,
+                            // here or elsewhere; resubmitting it can never
+                            // advance the chain (it will never again match
+                            // `next_job_id`), so there's no point queuing it.
+                            // And if we're at capacity with a new ID, drop it
+                            // rather than grow without bound; a well-behaved
+                            // client can resubmit once earlier jobs are done.
+                            if self.job_status.contains_key(&job_id) {
+                                warn!(
+                                    log,
+                                    "ignoring resubmission of already started job";
+                                    "job_id" => %job_id
+                                );
+                            } else if queued_jobs.len() >= MAX_QUEUED_JOBS
+                                && !queued_jobs.contains_key(&job_id)
+                            {
+                                warn!(
+                                    log,
+                                    "dropping job request, too many jobs queued";
+                                    "job_id" => %job_id,
+                                    "limit" => MAX_QUEUED_JOBS
+                                );
+                            } else {
+                                queued_jobs.insert(job_id, (signed.clone(), params.clone()));
+                            }
 
                             // Then, pull out the next job to execute (if any),
                             // repeatedly. We loop because adding this new job
