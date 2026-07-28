@@ -19,6 +19,8 @@ pub enum JobError {
     ChannelClosed,
     #[error("DER encoding error: {0}")]
     Der(#[from] x509_cert::der::Error),
+    #[error("Duplicate job ID `{0}`")]
+    DuplicateJobId(JobId),
     #[error("Execution error: {0}")]
     Execution(#[from] ExecutionError),
     #[error("File I/O error accessing `{path}`: {error}")]
@@ -158,8 +160,8 @@ impl From<JobError> for HttpError {
             IdentityNotFound(_) | JobNotFound(_) | NoSession | SessionNotCurrent(_) => {
                 HttpError::for_client_error(None, ClientErrorStatusCode::NOT_FOUND, message)
             }
-            CertChainTooLong | InvalidCommand(_) | Json(_) | MissingCert(_) | MultipleSessions
-            | TooManyCerts(_) => {
+            CertChainTooLong | DuplicateJobId(_) | InvalidCommand(_) | Json(_) | MissingCert(_)
+            | MultipleSessions | TooManyCerts(_) => {
                 HttpError::for_client_error(None, ClientErrorStatusCode::BAD_REQUEST, message)
             }
         }

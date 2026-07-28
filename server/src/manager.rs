@@ -407,6 +407,15 @@ impl JobManager {
         let job_id = job.job_id().to_owned();
         let wait = params.wait.to_owned();
 
+        // Reject job IDs we already know about, rather than silently
+        // queuing a resubmission that can never advance the session's
+        // job chain. Without this, a caller that resubmits an
+        // already-completed job ID and waits would see the *original*
+        // job's status returned as if it belonged to this submission.
+        if self.state.borrow().get_job_status(&job_id).is_some() {
+            return Err(JobError::DuplicateJobId(job_id));
+        }
+
         // Submit the job for execution.
         self.job_request(authn, JobRequest::Start(job.into_signed(), params))
             .await?;
