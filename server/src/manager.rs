@@ -21,7 +21,7 @@ use x509_cert::der::{DecodePem as _, Encode as _};
 
 use sush_api::{JobStartParams, JobStopParams, JobWait};
 use sush_common::authn::{Credentials, Identity, Nonce};
-use sush_common::jobs::JobOutputStream::{self};
+use sush_common::jobs::JobOutputStream;
 use sush_common::jobs::{JobId, JobStatusMap, Session, SessionId, SignedJob};
 use sush_common::keys::{KeyError, KeyId, Signature, SshPublicKey};
 
