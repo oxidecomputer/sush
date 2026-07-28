@@ -8,12 +8,12 @@ use std::net::SocketAddr;
 use slog::{Logger, error, info, o};
 use tokio::io::copy_bidirectional;
 use tokio::net::{TcpListener, TcpStream};
-use tokio::sync::oneshot;
 use tokio::{select, spawn};
+use tokio_util::sync::CancellationToken;
 
 pub struct ProxyServer {
     local_addr: SocketAddr,
-    shutdown: Option<oneshot::Sender<()>>,
+    shutdown: CancellationToken,
 }
 
 impl ProxyServer {
@@ -23,20 +23,20 @@ impl ProxyServer {
         log: &Logger,
         local_addr: SocketAddr,
         remote_addr: SocketAddr,
+        shutdown: CancellationToken,
     ) -> io::Result<Self> {
         let listener = TcpListener::bind(local_addr).await?;
         let local_addr = listener.local_addr()?;
-        let (tx_shutdown, rx_shutdown) = oneshot::channel();
         spawn(listen(
             log.new(o!("component" => "proxy")),
             listener,
             remote_addr,
-            rx_shutdown,
+            shutdown.clone(),
         ));
         info!(log, "started proxy server");
         Ok(Self {
             local_addr,
-            shutdown: Some(tx_shutdown),
+            shutdown,
         })
     }
 
@@ -45,9 +45,7 @@ impl ProxyServer {
     }
 
     pub fn shutdown(&mut self) {
-        if let Some(shutdown) = self.shutdown.take() {
-            _ = shutdown.send(());
-        }
+        self.shutdown.cancel();
     }
 }
 
@@ -55,7 +53,7 @@ async fn listen(
     log: Logger,
     listener: TcpListener,
     remote_addr: SocketAddr,
-    mut shutdown: oneshot::Receiver<()>,
+    shutdown: CancellationToken,
 ) {
     loop {
         select! {
@@ -70,7 +68,7 @@ async fn listen(
                     }
                 }
             }
-            _ = &mut shutdown => {
+            _ = shutdown.cancelled() => {
                 info!(log, "shutting down");
                 return;
             }

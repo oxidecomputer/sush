@@ -10,6 +10,7 @@ use tokio::io::{AsyncRead, AsyncWrite};
 use tokio::test;
 use tokio_tungstenite::WebSocketStream;
 use tokio_tungstenite::tungstenite::protocol::Role;
+use tokio_util::sync::CancellationToken;
 
 use sush_api::JobWait;
 use sush_api::sush_api_mod::api_description;
@@ -129,9 +130,15 @@ async fn client_proxy_server() {
     let server_addr = server.local_addr();
 
     // Spin up a proxy server.
-    let proxy = ProxyServer::start(&log, local_addr(), server.local_addr())
-        .await
-        .expect("can't start proxy server");
+    let shutdown_proxy = CancellationToken::new();
+    let proxy = ProxyServer::start(
+        &log,
+        local_addr(),
+        server.local_addr(),
+        shutdown_proxy.clone(),
+    )
+    .await
+    .expect("can't start proxy server");
     let proxy_addr = proxy.local_addr();
     assert_ne!(server_addr, proxy_addr);
 
@@ -152,6 +159,9 @@ async fn client_proxy_server() {
         .expect("can't authenticate")
         .into_inner();
     assert_eq!(iam, identity, "who am I?");
+
+    shutdown_proxy.cancel();
+    server.close().await.expect("can't shutdown server");
 }
 
 async fn next_data_message<S>(stream: &mut WebSocketStream<S>) -> Bytes
