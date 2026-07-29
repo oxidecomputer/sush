@@ -222,6 +222,13 @@ impl State {
                             self.session = Inactive
                         }
                     }
+                    SessionRequest::Skip(session_id, job_id) => {
+                        if let Active { session, .. } = &mut self.session
+                            && session.session_id() == session_id
+                        {
+                            session.skip_job(job_id.clone());
+                        }
+                    }
                 },
                 Request::Job(job_request) => match job_request.as_ref() {
                     JobRequest::Start(signed, params) => {
@@ -255,6 +262,7 @@ impl State {
                                     queued_jobs,
                                     ..
                                 },
+                            job_status,
                             ..
                         } = self
                         {
@@ -268,7 +276,7 @@ impl State {
                             // And if we're at capacity with a new ID, drop it
                             // rather than grow without bound; a well-behaved
                             // client can resubmit once earlier jobs are done.
-                            if self.job_status.contains_key(&job_id) {
+                            if job_status.contains_key(&job_id) {
                                 warn!(
                                     log,
                                     "ignoring resubmission of already started job";
@@ -284,7 +292,16 @@ impl State {
                                     "limit" => MAX_QUEUED_JOBS
                                 );
                             } else {
-                                queued_jobs.insert(job_id, (signed.clone(), params.clone()));
+                                // Insert the job into our queue, without starting anything.
+                                queued_jobs
+                                    .insert(job_id.clone(), (signed.clone(), params.clone()));
+                                job_status.entry(job_id.clone()).or_default().insert(
+                                    self.own_baseboard.clone(),
+                                    JobStatus::Queued {
+                                        job_id,
+                                        time_queued: Utc::now(),
+                                    },
+                                );
                             }
 
                             // Then, pull out the next job to execute (if any),
@@ -303,7 +320,12 @@ impl State {
                                 if self
                                     .job_status
                                     .get(job_id)
-                                    .map(|status| status.get(&self.own_baseboard).is_none())
+                                    .map(|status| {
+                                        matches!(
+                                            status.get(&self.own_baseboard),
+                                            Some(JobStatus::Queued { .. })
+                                        )
+                                    })
                                     .unwrap_or(true)
                                 {
                                     executor.job_start(payload.clone(), params, tx_attachment);
@@ -323,8 +345,29 @@ impl State {
                         // job, even if it may not have ever existed. If we
                         // don't have a session, we still want to stop the
                         // job, because it could be from another session.
-                        if let Active { queued_jobs, .. } = &mut self.session {
+                        if let Self {
+                            session: Active { queued_jobs, .. },
+                            job_status,
+                            ..
+                        } = self
+                        {
                             queued_jobs.remove(job_id);
+                            job_status
+                                .entry(job_id.clone())
+                                .or_default()
+                                .entry(self.own_baseboard.clone())
+                                .and_modify(|status| {
+                                    if matches!(status, JobStatus::Queued { .. }) {
+                                        *status = JobStatus::Cancelled {
+                                            job_id: job_id.clone(),
+                                            time_cancelled: Utc::now(),
+                                        };
+                                    }
+                                })
+                                .or_insert(JobStatus::Cancelled {
+                                    job_id: job_id.clone(),
+                                    time_cancelled: Utc::now(),
+                                });
                         }
                         executor.job_stop(job_id);
                     }

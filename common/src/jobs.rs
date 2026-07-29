@@ -116,9 +116,14 @@ impl SessionId {
             .into()
     }
 
-    pub fn next_job_id(&self, prev_job: &SignedJob) -> JobId {
+    pub fn next_job_id(&self, last_job: &LastJob) -> JobId {
         id_phrase(U256::from_be_slice(
-            hash(&prev_job.to_be_signed()).as_bytes(),
+            match last_job {
+                LastJob::None => hash(self.0.as_bytes()),
+                LastJob::Some(job) => hash(&job.to_be_signed()),
+                LastJob::Burned(job_id) => hash(job_id.as_bytes()),
+            }
+            .as_bytes(),
         ))
         .join(WORD_SEPARATOR)
         .into()
@@ -151,17 +156,25 @@ impl<S: AsRef<str>> From<S> for SessionId {
     }
 }
 
+#[derive(Clone, Debug, Default, Deserialize, Eq, JsonSchema, PartialEq, Serialize)]
+pub enum LastJob {
+    #[default]
+    None,
+    Some(SignedJob),
+    Burned(JobId),
+}
+
 #[derive(Clone, Debug, Deserialize, Eq, JsonSchema, PartialEq, Serialize)]
 pub struct Session {
     session_id: SessionId,
-    last_job: Option<SignedJob>,
+    last_job: LastJob,
 }
 
 impl Session {
     pub fn new(session_id: SessionId) -> Self {
         Self {
             session_id,
-            last_job: None,
+            last_job: LastJob::None,
         }
     }
 
@@ -173,20 +186,22 @@ impl Session {
         self.session_id
     }
 
-    pub fn last_job(&self) -> Option<SignedJob> {
+    pub fn last_job(&self) -> LastJob {
         self.last_job.clone()
     }
 
     pub fn job_started(&mut self, job: SignedJob) {
-        self.last_job = Some(job)
+        self.last_job = LastJob::Some(job)
+    }
+
+    pub fn skip_job(&mut self, job_id: JobId) {
+        if job_id == self.next_job_id() {
+            self.last_job = LastJob::Burned(job_id)
+        }
     }
 
     pub fn next_job_id(&self) -> JobId {
-        if let Some(job) = self.last_job.as_ref() {
-            self.session_id.next_job_id(job)
-        } else {
-            self.session_id.first_job_id()
-        }
+        self.session_id.next_job_id(&self.last_job)
     }
 }
 
@@ -264,6 +279,31 @@ pub type VerifiedJob = Verified<JobStartRequest>;
 
 #[derive(BorshDeserialize, BorshSerialize, Clone, Debug, Deserialize, JsonSchema, Serialize)]
 pub enum JobStatus {
+    Cancelled {
+        job_id: JobId,
+        #[borsh(
+            serialize_with = "borsh_ser_datetime",
+            deserialize_with = "borsh_de_datetime"
+        )]
+        time_cancelled: DateTime<Utc>,
+    },
+    Queued {
+        job_id: JobId,
+        #[borsh(
+            serialize_with = "borsh_ser_datetime",
+            deserialize_with = "borsh_de_datetime"
+        )]
+        time_queued: DateTime<Utc>,
+    },
+    Error {
+        job_id: JobId,
+        #[borsh(
+            serialize_with = "borsh_ser_datetime",
+            deserialize_with = "borsh_de_datetime"
+        )]
+        time_error: DateTime<Utc>,
+        error: ProcessError,
+    },
     Started {
         job_id: JobId,
         #[borsh(
@@ -287,29 +327,6 @@ pub enum JobStatus {
         result: Result<i32, ProcessError>,
         output: JobOutputState,
     },
-    Error {
-        job_id: JobId,
-        #[borsh(
-            serialize_with = "borsh_ser_datetime",
-            deserialize_with = "borsh_de_datetime"
-        )]
-        time_error: DateTime<Utc>,
-        error: ProcessError,
-    },
-}
-
-impl JobStatus {
-    pub fn is_started(&self) -> bool {
-        matches!(self, Self::Started { .. })
-    }
-
-    pub fn is_stopped(&self) -> bool {
-        matches!(self, Self::Stopped { .. })
-    }
-
-    pub fn is_error(&self) -> bool {
-        matches!(self, Self::Error { .. })
-    }
 }
 
 pub type JobStatusMap = BTreeMap<BaseboardId, JobStatus>;
@@ -354,6 +371,8 @@ pub fn job_status_to_json_map(status_map: JobStatusMap) -> JsonJobStatusMap {
 pub enum ProcessError {
     #[error("the fate of the process is unknown")]
     Unknown,
+    #[error("the job was stopped before starting")]
+    Cancelled,
     #[error("process killed with signal {0}")]
     Killed(i32),
     #[error("interactive session error: {0}")]
@@ -410,21 +429,24 @@ impl ExecutionError {
 impl JobStatus {
     pub fn time_elapsed(&self) -> TimeDelta {
         match self {
+            Self::Cancelled { .. } | Self::Error { .. } => TimeDelta::zero(),
+            Self::Queued { time_queued, .. } => Utc::now() - time_queued,
             Self::Started { time_started, .. } => Utc::now() - time_started,
             Self::Stopped {
                 time_started,
                 time_stopped,
                 ..
             } => *time_stopped - time_started,
-            Self::Error { .. } => TimeDelta::zero(),
         }
     }
 
     pub fn job_id(&self) -> &JobId {
         match self {
-            Self::Started { job_id, .. }
-            | Self::Stopped { job_id, .. }
-            | Self::Error { job_id, .. } => job_id,
+            Self::Cancelled { job_id, .. }
+            | Self::Queued { job_id, .. }
+            | Self::Error { job_id, .. }
+            | Self::Started { job_id, .. }
+            | Self::Stopped { job_id, .. } => job_id,
         }
     }
 

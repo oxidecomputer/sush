@@ -19,7 +19,7 @@ use tokio_util::sync::CancellationToken;
 use x509_cert::Certificate;
 use x509_cert::der::{DecodePem as _, Encode as _};
 
-use sush_api::{JobStartParams, JobStopParams, JobWait};
+use sush_api::{JobStartParams, JobStopParams, JobWait, SessionStartParams};
 use sush_common::authn::{Credentials, Identity, Nonce};
 use sush_common::jobs::JobOutputStream;
 use sush_common::jobs::{JobId, JobStatusMap, Session, SessionId, SignedJob};
@@ -133,7 +133,7 @@ impl JobManager {
 
     /// Tests must import a root to use ephemeral signers,
     /// but this is not allowed in production.
-    #[cfg(feature = "import_root_for_test_only")] // disabled by default
+    #[cfg(feature = "test-support")] // disabled by default
     pub async fn import_root(&self, root: Certificate) -> Result<KeyId, JobError> {
         self.import_cert_inner(root, true).await
     }
@@ -332,6 +332,54 @@ impl JobManager {
             .collect())
     }
 
+    // Waiting.
+
+    fn wait_for_session(&self, session_id: SessionId) -> impl FnMut(&State) -> bool {
+        move |state| {
+            state
+                .session()
+                .is_some_and(|s| *s.session_id() == session_id)
+        }
+    }
+
+    fn wait_for_job(&self, job_id: &JobId, wait: JobWait) -> impl FnMut(&State) -> bool {
+        move |state| {
+            if wait.is_some() {
+                state
+                    .get_job_status(job_id)
+                    .and_then(|map| map.get(self.own_baseboard()))
+                    .map(|status| wait.matches_status(status))
+                    .unwrap_or(false)
+            } else {
+                true
+            }
+        }
+    }
+
+    async fn wait_for(&self, predicate: impl FnMut(&State) -> bool) -> Result<(), JobError> {
+        timeout(WAIT_TIMEOUT, self.state.clone().wait_for(predicate))
+            .await
+            .map_err(|_| JobError::Timeout)?
+            .map_err(|_| JobError::ChannelClosed)?;
+        Ok(())
+    }
+
+    /// Wait until the local state manager has recorded *any* status for
+    /// this job on this baseboard, including `Queued`. Used only to make
+    /// the `Queued` state observable in tests.
+    #[cfg(feature = "test-support")]
+    pub async fn wait_for_job_status(&self, job_id: &JobId) -> Result<(), JobError> {
+        let job_id = job_id.to_owned();
+        let baseboard = self.own_baseboard().to_owned();
+        self.wait_for(move |state: &State| {
+            state
+                .get_job_status(&job_id)
+                .and_then(|map| map.get(&baseboard))
+                .is_some()
+        })
+        .await
+    }
+
     // Session management.
 
     pub fn session(&self, _authn: &Identity) -> Option<Session> {
@@ -349,9 +397,15 @@ impl JobManager {
         &self,
         _authn: &Identity,
         session_id: SessionId,
+        SessionStartParams { wait }: SessionStartParams,
     ) -> Result<(), JobError> {
-        self.session_request(SessionRequest::Start(session_id))
-            .await
+        self.session_request(SessionRequest::Start(session_id.clone()))
+            .await?;
+        if wait {
+            self.wait_for(self.wait_for_session(session_id.clone()))
+                .await?;
+        }
+        Ok(())
     }
 
     pub async fn session_stop(
@@ -362,30 +416,17 @@ impl JobManager {
         self.session_request(SessionRequest::Stop(session_id)).await
     }
 
-    // Job management.
-
-    fn wait_for(&self, job_id: &JobId, wait: JobWait) -> impl FnMut(&State) -> bool {
-        move |state| {
-            state
-                .get_job_status(job_id)
-                .and_then(|map| map.get(self.own_baseboard()))
-                .map(|status| wait.matches_status(status))
-                .unwrap_or(false)
-        }
-    }
-
-    async fn maybe_wait(&self, job_id: &JobId, wait: JobWait) -> Result<(), JobError> {
-        if wait.is_some() {
-            timeout(
-                WAIT_TIMEOUT,
-                self.state.clone().wait_for(self.wait_for(job_id, wait)),
-            )
+    pub async fn session_skip_job(
+        &self,
+        _authn: &Identity,
+        session_id: SessionId,
+        job_id: JobId,
+    ) -> Result<(), JobError> {
+        self.session_request(SessionRequest::Skip(session_id, job_id))
             .await
-            .map_err(|_| JobError::Timeout)?
-            .map_err(|_| JobError::ChannelClosed)?;
-        }
-        Ok(())
     }
+
+    // Job management.
 
     pub async fn job_start(
         &self,
@@ -407,6 +448,13 @@ impl JobManager {
         let job_id = job.job_id().to_owned();
         let wait = params.wait.to_owned();
 
+        // A job can only ever run within an active session; fail fast
+        // rather than silently queuing (or discarding) a job that can
+        // never execute.
+        if self.session(authn).is_none() {
+            return Err(JobError::NoSession);
+        }
+
         // Reject job IDs we already know about, rather than silently
         // queuing a resubmission that can never advance the session's
         // job chain. Without this, a caller that resubmits an
@@ -419,7 +467,7 @@ impl JobManager {
         // Submit the job for execution.
         self.job_request(authn, JobRequest::Start(job.into_signed(), params))
             .await?;
-        self.maybe_wait(&job_id, wait).await
+        self.wait_for(self.wait_for_job(&job_id, wait)).await
     }
 
     pub async fn job_stop(
@@ -428,13 +476,9 @@ impl JobManager {
         job_id: &JobId,
         JobStopParams { wait }: JobStopParams,
     ) -> Result<(), JobError> {
-        if wait.is_none() || self.state.borrow().get_job_status(job_id).is_some() {
-            self.job_request(authn, JobRequest::Stop(job_id.to_owned()))
-                .await?;
-            self.maybe_wait(job_id, wait).await
-        } else {
-            Err(JobError::JobNotFound(job_id.to_owned()))
-        }
+        self.job_request(authn, JobRequest::Stop(job_id.to_owned()))
+            .await?;
+        self.wait_for(self.wait_for_job(job_id, wait)).await
     }
 
     pub async fn job_status(

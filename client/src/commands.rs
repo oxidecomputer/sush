@@ -285,6 +285,10 @@ pub enum SessionCommand {
     Start {
         /// The session to start.
         session_id: Option<SessionId>,
+
+        /// Wait for the session to become active.
+        #[arg(short, long)]
+        wait: bool,
     },
 
     /// Stop a support session.
@@ -643,7 +647,7 @@ async fn session(
             Ok(())
         }
 
-        (SessionCommand::Start { session_id }, Some(client)) => {
+        (SessionCommand::Start { session_id, wait }, Some(client)) => {
             let session = if let Some(session_id) = session_id {
                 Session::new(session_id)
             } else {
@@ -653,6 +657,7 @@ async fn session(
                 client
                     .session_start()
                     .session_id(session.session_id())
+                    .wait(wait)
                     .authorization(authz)
                     .send()
                     .await
@@ -1053,7 +1058,7 @@ struct Chunk(Range, ByteStream);
 /// A promise of some bytes for a range of output.
 type FutureChunk<'a> = dyn Future<Output = Result<Chunk, CommandError>> + Send + 'a;
 
-/// Download or truncate job output.
+/// Download job output.
 async fn job_output(
     ctx: &mut impl CommandContext,
     client: &Client,
@@ -1090,13 +1095,19 @@ async fn job_output(
         stderr_hash,
     } = match status.get(target) {
         None => return Err(CommandError::NotFound),
+        Some(JobStatus::Cancelled { .. }) => {
+            return Err(CommandError::JobCancelled(job_id.to_owned()));
+        }
+        Some(JobStatus::Queued { job_id, .. }) => {
+            return Err(CommandError::JobNotYetRunning(job_id.to_owned()));
+        }
+        Some(JobStatus::Error { error, .. }) => {
+            return Err(CommandError::Process(error.to_owned()));
+        }
         Some(JobStatus::Started { job_id, .. }) => {
             return Err(CommandError::JobStillRunning(job_id.to_owned()));
         }
         Some(JobStatus::Stopped { output, .. }) => output,
-        Some(JobStatus::Error { error, .. }) => {
-            return Err(CommandError::Process(error.to_owned()));
-        }
     };
     let len = match stream {
         Stdout => stdout_len,
@@ -1356,6 +1367,10 @@ pub enum CommandError {
     InvalidLeafCert(KeyId),
     #[error("❌ Root certificate is not self-signed")]
     InvalidRootCert,
+    #[error("❌ Job `{0}` was cancelled before it started")]
+    JobCancelled(JobId),
+    #[error("❌ Job `{0}` is not yet running")]
+    JobNotYetRunning(JobId),
     #[error("❌ Job `{0}` is still running")]
     JobStillRunning(JobId),
     #[error("❌ JSON error: {0}")]

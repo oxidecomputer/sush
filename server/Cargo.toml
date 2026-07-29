@@ -10,7 +10,7 @@ name = "sush-server"
 path = "src/main.rs"
 
 [features]
-import_root_for_test_only = []
+test-support = []
 
 [dependencies]
 blake3.workspace = true

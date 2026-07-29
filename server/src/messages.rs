@@ -52,6 +52,7 @@ impl Request {
 pub enum SessionRequest {
     Start(SessionId),
     Stop(SessionId),
+    Skip(SessionId, JobId),
 }
 
 #[derive(Clone, Debug, BorshDeserialize, BorshSerialize)]

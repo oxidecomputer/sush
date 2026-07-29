@@ -376,6 +376,28 @@ impl CommandContext for Cli {
             OutputFormat::Text => {
                 for (baseboard_id, status) in status {
                     match status {
+                        JobStatus::Cancelled {
+                            job_id,
+                            time_cancelled,
+                        } => {
+                            println!(
+                                "❌ Job ID:\t{job_id}\n   \
+                                    Target:\t{baseboard_id}\n   \
+                                    Job status:\tCancelled\n   \
+                                    Cancelled at:\t{time_cancelled}"
+                            )
+                        }
+                        JobStatus::Queued {
+                            job_id,
+                            time_queued,
+                        } => {
+                            println!(
+                                "⏳ Job ID:\t{job_id}\n   \
+                                    Target:\t{baseboard_id}\n   \
+                                    Job status:\tQueued\n   \
+                                    Queued at:\t{time_queued}"
+                            )
+                        }
                         JobStatus::Started {
                             job_id,
                             time_started,

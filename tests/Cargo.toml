@@ -21,7 +21,7 @@ slog-term.workspace = true
 sush-api = { path = "../api" }
 sush-client = { path = "../client" }
 sush-common = { path = "../common" }
-sush-server = { path = "../server", features = ["import_root_for_test_only"] }
+sush-server = { path = "../server", features = ["test-support"] }
 tempfile.workspace = true
 tokio.workspace = true
 tokio-tungstenite.workspace = true

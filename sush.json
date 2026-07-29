@@ -585,6 +585,49 @@
         }
       }
     },
+    "/sessions/{session_id}/skip/{job_id}": {
+      "post": {
+        "summary": "Burn a job ID in the current session.",
+        "operationId": "session_skip_job",
+        "parameters": [
+          {
+            "in": "header",
+            "name": "authorization",
+            "description": "Authorization to access some resource, such as a signature.\n\nSee: <https://developer.mozilla.org/en-US/docs/Web/HTTP/Reference/Headers/Authorization>",
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "in": "path",
+            "name": "session_id",
+            "required": true,
+            "schema": {
+              "$ref": "#/components/schemas/SessionId"
+            }
+          },
+          {
+            "in": "path",
+            "name": "job_id",
+            "required": true,
+            "schema": {
+              "$ref": "#/components/schemas/JobId"
+            }
+          }
+        ],
+        "responses": {
+          "204": {
+            "description": "resource updated"
+          },
+          "4XX": {
+            "$ref": "#/components/responses/Error"
+          },
+          "5XX": {
+            "$ref": "#/components/responses/Error"
+          }
+        }
+      }
+    },
     "/sessions/{session_id}/start": {
       "post": {
         "summary": "Start a new support session.",
@@ -605,6 +648,14 @@
             "required": true,
             "schema": {
               "$ref": "#/components/schemas/SessionId"
+            }
+          },
+          {
+            "in": "query",
+            "name": "wait",
+            "description": "Wait for the session to become active.",
+            "schema": {
+              "type": "boolean"
             }
           }
         ],
@@ -755,6 +806,85 @@
           {
             "type": "object",
             "properties": {
+              "Cancelled": {
+                "type": "object",
+                "properties": {
+                  "job_id": {
+                    "$ref": "#/components/schemas/JobId"
+                  },
+                  "time_cancelled": {
+                    "type": "string",
+                    "format": "date-time"
+                  }
+                },
+                "required": [
+                  "job_id",
+                  "time_cancelled"
+                ]
+              }
+            },
+            "required": [
+              "Cancelled"
+            ],
+            "additionalProperties": false
+          },
+          {
+            "type": "object",
+            "properties": {
+              "Queued": {
+                "type": "object",
+                "properties": {
+                  "job_id": {
+                    "$ref": "#/components/schemas/JobId"
+                  },
+                  "time_queued": {
+                    "type": "string",
+                    "format": "date-time"
+                  }
+                },
+                "required": [
+                  "job_id",
+                  "time_queued"
+                ]
+              }
+            },
+            "required": [
+              "Queued"
+            ],
+            "additionalProperties": false
+          },
+          {
+            "type": "object",
+            "properties": {
+              "Error": {
+                "type": "object",
+                "properties": {
+                  "job_id": {
+                    "$ref": "#/components/schemas/JobId"
+                  },
+                  "time_error": {
+                    "type": "string",
+                    "format": "date-time"
+                  },
+                  "error": {
+                    "$ref": "#/components/schemas/ProcessError"
+                  }
+                },
+                "required": [
+                  "error",
+                  "job_id",
+                  "time_error"
+                ]
+              }
+            },
+            "required": [
+              "Error"
+            ],
+            "additionalProperties": false
+          },
+          {
+            "type": "object",
+            "properties": {
               "Started": {
                 "type": "object",
                 "properties": {
@@ -814,35 +944,6 @@
               "Stopped"
             ],
             "additionalProperties": false
-          },
-          {
-            "type": "object",
-            "properties": {
-              "Error": {
-                "type": "object",
-                "properties": {
-                  "job_id": {
-                    "$ref": "#/components/schemas/JobId"
-                  },
-                  "time_error": {
-                    "type": "string",
-                    "format": "date-time"
-                  },
-                  "error": {
-                    "$ref": "#/components/schemas/ProcessError"
-                  }
-                },
-                "required": [
-                  "error",
-                  "job_id",
-                  "time_error"
-                ]
-              }
-            },
-            "required": [
-              "Error"
-            ],
-            "additionalProperties": false
           }
         ]
       },
@@ -850,40 +951,14 @@
         "description": "A globally unique identifier for a job within a session.",
         "type": "string"
       },
-      "Result_of_int32_or_ProcessError": {
-        "oneOf": [
-          {
-            "type": "object",
-            "properties": {
-              "Ok": {
-                "type": "integer",
-                "format": "int32"
-              }
-            },
-            "required": [
-              "Ok"
-            ]
-          },
-          {
-            "type": "object",
-            "properties": {
-              "Err": {
-                "$ref": "#/components/schemas/ProcessError"
-              }
-            },
-            "required": [
-              "Err"
-            ]
-          }
-        ]
-      },
       "ProcessError": {
         "description": "What went wrong running a job's process or interactive session.\n\nWe currently squash inner errors into strings to avoid excessive derivation requirements, but may come to regret that decision.",
         "oneOf": [
           {
             "type": "string",
             "enum": [
-              "Unknown"
+              "Unknown",
+              "Cancelled"
             ]
           },
           {
@@ -934,6 +1009,33 @@
               "Io"
             ],
             "additionalProperties": false
+          }
+        ]
+      },
+      "Result_of_int32_or_ProcessError": {
+        "oneOf": [
+          {
+            "type": "object",
+            "properties": {
+              "Ok": {
+                "type": "integer",
+                "format": "int32"
+              }
+            },
+            "required": [
+              "Ok"
+            ]
+          },
+          {
+            "type": "object",
+            "properties": {
+              "Err": {
+                "$ref": "#/components/schemas/ProcessError"
+              }
+            },
+            "required": [
+              "Err"
+            ]
           }
         ]
       },
@@ -1041,21 +1143,51 @@
             "$ref": "#/components/schemas/SessionId"
           },
           "last_job": {
-            "nullable": true,
-            "allOf": [
-              {
-                "$ref": "#/components/schemas/Signed_for_JobStartRequest"
-              }
-            ]
+            "$ref": "#/components/schemas/LastJob"
           }
         },
         "required": [
+          "last_job",
           "session_id"
         ]
       },
       "SessionId": {
         "description": "A globally unique identifier for a session.",
         "type": "string"
+      },
+      "LastJob": {
+        "oneOf": [
+          {
+            "type": "string",
+            "enum": [
+              "None"
+            ]
+          },
+          {
+            "type": "object",
+            "properties": {
+              "Some": {
+                "$ref": "#/components/schemas/Signed_for_JobStartRequest"
+              }
+            },
+            "required": [
+              "Some"
+            ],
+            "additionalProperties": false
+          },
+          {
+            "type": "object",
+            "properties": {
+              "Burned": {
+                "$ref": "#/components/schemas/JobId"
+              }
+            },
+            "required": [
+              "Burned"
+            ],
+            "additionalProperties": false
+          }
+        ]
       },
       "BaseboardId": {
         "description": "A representation of a Baseboard ID as used in the inventory subsystem.\n\nThis type is essentially the same as a `Baseboard` except it doesn't have a revision or HW type (Gimlet, PC, Unknown).",

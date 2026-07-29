@@ -14,7 +14,8 @@ use x509_cert::der::{Decode as _, DecodePem as _};
 
 use sush_api::{
     Authorization, AuthorizedRangeRequest, JobAttachParams, JobHistoryParams, JobIdParam,
-    JobOutputParams, JobStartParams, JobStopParams, KeyIdParam, SessionIdParam, SushApi,
+    JobOutputParams, JobStartParams, JobStopParams, KeyIdParam, SessionAndJobIds, SessionIdParam,
+    SessionStartParams, SushApi,
 };
 use sush_common::authn::Identity;
 use sush_common::jobs::{JsonJobStatusMap, Session, SignedJob, job_status_to_json_map};
@@ -104,12 +105,14 @@ impl SushApi for ApiServer {
         ctx: RequestContext<Self::Context>,
         headers: Header<Authorization>,
         params: PathParams<SessionIdParam>,
+        query: QueryParams<SessionStartParams>,
     ) -> Result<HttpResponseUpdatedNoContent, HttpError> {
         let mgr = ctx.context();
         let Authorization { authorization } = headers.into_inner();
         let authn = mgr.iam(authorization, None).await?;
         let SessionIdParam { session_id } = params.into_inner();
-        mgr.session_start(&authn, session_id.clone()).await?;
+        mgr.session_start(&authn, session_id.clone(), query.into_inner())
+            .await?;
         Ok(HttpResponseUpdatedNoContent())
     }
 
@@ -123,6 +126,19 @@ impl SushApi for ApiServer {
         let authn = mgr.iam(authorization, None).await?;
         let SessionIdParam { session_id } = params.into_inner();
         mgr.session_stop(&authn, session_id).await?;
+        Ok(HttpResponseUpdatedNoContent())
+    }
+
+    async fn session_skip_job(
+        ctx: RequestContext<Self::Context>,
+        headers: Header<Authorization>,
+        params: PathParams<SessionAndJobIds>,
+    ) -> Result<HttpResponseUpdatedNoContent, HttpError> {
+        let mgr = ctx.context();
+        let Authorization { authorization } = headers.into_inner();
+        let authn = mgr.iam(authorization, None).await?;
+        let SessionAndJobIds { session_id, job_id } = params.into_inner();
+        mgr.session_skip_job(&authn, session_id, job_id).await?;
         Ok(HttpResponseUpdatedNoContent())
     }
 

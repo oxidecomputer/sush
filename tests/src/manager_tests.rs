@@ -13,7 +13,7 @@ use tempfile::TempDir;
 use tokio_util::sync::CancellationToken;
 use x509_cert::time::Validity;
 
-use sush_api::{JobStartParams, JobStopParams, JobWait};
+use sush_api::{JobStartParams, JobStopParams, JobWait, SessionStartParams};
 use sush_common::authn::{Challenge, ChallengeResponse, Credentials, Identity};
 use sush_common::jobs::{
     JobId, JobLimits, JobOutputState, JobOutputStream, JobStatus, ProcessError, Session, SessionId,
@@ -83,7 +83,13 @@ async fn jobs() {
     let authn = fake_identity(&mut root).await;
     let session_id = SessionId::new();
     let mut session = Session::new(session_id.clone());
-    mgr.session_start(&authn, session_id.clone()).await.unwrap();
+    mgr.session_start(
+        &authn,
+        session_id.clone(),
+        SessionStartParams { wait: true },
+    )
+    .await
+    .unwrap();
 
     let job_id = session.next_job_id();
     let job = root.sign_job_request(&job_id, "true", false).await;
@@ -193,23 +199,17 @@ async fn job_stop() {
     let authn = fake_identity(&mut root).await;
     let session_id = SessionId::new();
     let mut session = Session::new(session_id.clone());
-    mgr.session_start(&authn, session_id.clone()).await.unwrap();
-    let job_id = session.next_job_id();
-
-    // Stopping a nonexistent job with no wait should silently succeed;
-    // it just enqueues a request.
-    mgr.job_stop(
+    mgr.session_start(
         &authn,
-        &job_id,
-        JobStopParams {
-            wait: JobWait::None,
-        },
+        session_id.clone(),
+        SessionStartParams { wait: true },
     )
     .await
-    .expect("should be able to stop a nonexistent job without waiting");
+    .unwrap();
 
-    // But trying to wait on stop of a nonexistant job should fail immediately,
-    // because there's nothing to wait on (yet).
+    // Stopping a nonexistent job should mark it cancelled, and so succeed
+    // immediately.
+    let job_id = session.next_job_id();
     mgr.job_stop(
         &authn,
         &job_id,
@@ -218,10 +218,22 @@ async fn job_stop() {
         },
     )
     .await
-    .expect_err("should not be able to stop a nonexistent job while waiting");
+    .expect("should be able to stop a nonexistent job");
 
-    // Start a (potentially) long-running job.
+    assert!(matches!(
+        &mgr.job_status(&authn, &job_id).await.unwrap()[baseboard_id],
+        JobStatus::Cancelled { job_id: jid, time_cancelled } if *jid == job_id && *time_cancelled < Utc::now()
+    ));
+
+    // Skip the cancelled job.
+    session.skip_job(job_id.clone());
+    mgr.session_skip_job(&authn, session_id.clone(), job_id.clone())
+        .await
+        .expect("should be able to skip cancelled job");
+
+    // Start a new (potentially) long-running job.
     let command = "sleep 10";
+    let job_id = session.next_job_id();
     let job = root.sign_job_request(&job_id, command, false).await;
     mgr.job_start(
         &authn,
@@ -259,6 +271,83 @@ async fn job_stop() {
         .expect("should have job status");
     assert!(status.time_elapsed().to_std().unwrap() < Duration::from_secs(1));
     check_status_stopped(status, &job_id, Err(ProcessError::Killed(SIGKILL)), 0, 0);
+}
+
+#[named]
+#[tokio::test]
+async fn cancel_queued_job() {
+    let log = test_logger(function_name!());
+    let (mgr, mut root, _dir) = manager_and_test_root(log).await;
+    let authn = fake_identity(&mut root).await;
+    let session_id = SessionId::new();
+    let mut session = Session::new(session_id.clone());
+    mgr.session_start(
+        &authn,
+        session_id.clone(),
+        SessionStartParams { wait: true },
+    )
+    .await
+    .unwrap();
+
+    // Queue job A, which won't finish soon.
+    let command_a = "sleep 10";
+    let job_id_a = session.next_job_id();
+    let job_a = root.sign_job_request(&job_id_a, command_a, false).await;
+    mgr.job_start(
+        &authn,
+        job_a.clone().into_signed(),
+        JobStartParams {
+            wait: JobWait::Start,
+            ..Default::default()
+        },
+    )
+    .await
+    .expect("should be able to start job A");
+    session.job_started(job_a.into_signed());
+
+    // Queue job B ...
+    let command_b = "false";
+    let job_id_b = session.next_job_id();
+    let job_b = root.sign_job_request(&job_id_b, command_b, false).await;
+    mgr.job_start(
+        &authn,
+        job_b.clone().into_signed(),
+        JobStartParams::default(),
+    )
+    .await
+    .expect("should be able to queue job B");
+    session.job_started(job_b.into_signed());
+    mgr.wait_for_job_status(&job_id_b).await.unwrap();
+    assert!(matches!(
+        &mgr.job_status(&authn, &job_id_b).await.unwrap()[mgr.own_baseboard()],
+        JobStatus::Queued { job_id: jid, time_queued, } if *jid == job_id_b && *time_queued < Utc::now()
+    ));
+
+    // ... but immediately cancel it.
+    mgr.job_stop(
+        &authn,
+        &job_id_b,
+        JobStopParams {
+            wait: JobWait::Stop,
+        },
+    )
+    .await
+    .expect("should be able to stop queued job");
+    assert!(matches!(
+        &mgr.job_status(&authn, &job_id_b).await.unwrap()[mgr.own_baseboard()],
+        JobStatus::Cancelled { job_id: jid, time_cancelled } if *jid == job_id_b && *time_cancelled < Utc::now()
+    ));
+
+    // Clean up.
+    mgr.job_stop(
+        &authn,
+        &job_id_a,
+        JobStopParams {
+            wait: JobWait::Stop,
+        },
+    )
+    .await
+    .expect("should be able to stop job A");
 }
 
 #[named]
@@ -332,7 +421,9 @@ async fn cert_chain() {
 
     let session_id = SessionId::new();
     let mut session = Session::new(session_id.clone());
-    mgr.session_start(&authn, session_id).await.unwrap();
+    mgr.session_start(&authn, session_id, SessionStartParams { wait: true })
+        .await
+        .unwrap();
     let job_id = session.next_job_id();
     let job = child.sign_job_request(&job_id, "true", false).await;
     mgr.job_start(
@@ -359,7 +450,13 @@ async fn too_much_cpu() {
     let authn = fake_identity(&mut root).await;
     let session_id = SessionId::new();
     let session = Session::new(session_id.clone());
-    mgr.session_start(&authn, session_id.clone()).await.unwrap();
+    mgr.session_start(
+        &authn,
+        session_id.clone(),
+        SessionStartParams { wait: true },
+    )
+    .await
+    .unwrap();
     let job_id = session.next_job_id();
     let command = "openssl speed sha1";
     let job = root.sign_job_request(&job_id, command, false).await;
@@ -425,7 +522,13 @@ async fn output_ranges() {
     let authn = fake_identity(&mut root).await;
     let session_id = SessionId::new();
     let session = Session::new(session_id.clone());
-    mgr.session_start(&authn, session_id.clone()).await.unwrap();
+    mgr.session_start(
+        &authn,
+        session_id.clone(),
+        SessionStartParams { wait: true },
+    )
+    .await
+    .unwrap();
     let job_id = session.next_job_id();
 
     // Read some random bytes.

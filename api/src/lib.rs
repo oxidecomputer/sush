@@ -86,6 +86,7 @@ pub trait SushApi {
         ctx: RequestContext<Self::Context>,
         headers: Header<Authorization>,
         params: PathParams<SessionIdParam>,
+        query: QueryParams<SessionStartParams>,
     ) -> Result<HttpResponseUpdatedNoContent, HttpError>;
 
     /// End a support session.
@@ -94,6 +95,14 @@ pub trait SushApi {
         ctx: RequestContext<Self::Context>,
         headers: Header<Authorization>,
         params: PathParams<SessionIdParam>,
+    ) -> Result<HttpResponseUpdatedNoContent, HttpError>;
+
+    /// Burn a job ID in the current session.
+    #[endpoint { method = POST, path = "/sessions/{session_id}/skip/{job_id}" }]
+    async fn session_skip_job(
+        ctx: RequestContext<Self::Context>,
+        headers: Header<Authorization>,
+        params: PathParams<SessionAndJobIds>,
     ) -> Result<HttpResponseUpdatedNoContent, HttpError>;
 
     // Job management.
@@ -172,6 +181,19 @@ pub struct SessionIdParam {
 }
 
 #[derive(Deserialize, JsonSchema)]
+pub struct SessionAndJobIds {
+    pub session_id: SessionId,
+    pub job_id: JobId,
+}
+
+#[derive(Clone, Debug, Default, Deserialize, JsonSchema, BorshSerialize, BorshDeserialize)]
+#[serde(default)]
+pub struct SessionStartParams {
+    /// Wait for the session to become active.
+    pub wait: bool,
+}
+
+#[derive(Deserialize, JsonSchema)]
 pub struct JobIdParam {
     pub job_id: JobId,
 }
@@ -235,9 +257,11 @@ impl JobWait {
     }
 
     pub fn matches_status(&self, status: &JobStatus) -> bool {
+        use JobStatus::*;
         match self {
-            Self::None | Self::Start => true,
-            Self::Stop => status.is_stopped() || status.is_error(),
+            Self::None => true,
+            Self::Start => !matches!(status, Queued { .. }),
+            Self::Stop => matches!(status, Cancelled { .. } | Error { .. } | Stopped { .. }),
         }
     }
 }
