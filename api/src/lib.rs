@@ -154,7 +154,10 @@ pub trait SushApi {
         upgrade: WebsocketUpgrade,
     ) -> WebsocketEndpointResult;
 
-    /// List previous jobs sorted by start time, most recent first.
+    /// List known jobs sorted by start time, most recent first.
+    ///
+    /// Offsets may shift under concurrent eviction, so pagination
+    /// is currently best-effort.
     #[endpoint { method = GET, path = "/jobs" }]
     async fn job_history(
         ctx: RequestContext<Self::Context>,

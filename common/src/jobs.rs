@@ -119,9 +119,9 @@ impl SessionId {
     pub fn next_job_id(&self, last_job: &LastJob) -> JobId {
         id_phrase(U256::from_be_slice(
             match last_job {
-                LastJob::None => hash(self.0.as_bytes()),
-                LastJob::Some(job) => hash(&job.to_be_signed()),
-                LastJob::Burned(job_id) => hash(job_id.as_bytes()),
+                LastJob::None => hash(&[b"None", self.0.as_bytes()].concat()),
+                LastJob::Some(job) => hash(&[b"Some", job.to_be_signed().as_slice()].concat()),
+                LastJob::Burned(job_id) => hash(&[b"Burned", job_id.as_bytes()].concat()),
             }
             .as_bytes(),
         ))
@@ -371,8 +371,6 @@ pub fn job_status_to_json_map(status_map: JobStatusMap) -> JsonJobStatusMap {
 pub enum ProcessError {
     #[error("the fate of the process is unknown")]
     Unknown,
-    #[error("the job was stopped before starting")]
-    Cancelled,
     #[error("process killed with signal {0}")]
     Killed(i32),
     #[error("interactive session error: {0}")]
@@ -427,6 +425,17 @@ impl ExecutionError {
 }
 
 impl JobStatus {
+    /// The most recent timestamp recorded for this status.
+    pub fn time(&self) -> DateTime<Utc> {
+        match self {
+            Self::Cancelled { time_cancelled, .. } => *time_cancelled,
+            Self::Queued { time_queued, .. } => *time_queued,
+            Self::Error { time_error, .. } => *time_error,
+            Self::Started { time_started, .. } => *time_started,
+            Self::Stopped { time_stopped, .. } => *time_stopped,
+        }
+    }
+
     pub fn time_elapsed(&self) -> TimeDelta {
         match self {
             Self::Cancelled { .. } | Self::Error { .. } => TimeDelta::zero(),

@@ -4,110 +4,30 @@
 //! messages via the gossip protocol.
 
 use std::cmp::Ordering;
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::BTreeMap;
 use std::sync::Arc;
 
 use chrono::{DateTime, Utc};
 use futures::{Stream, StreamExt};
-use rumors::before::Rank;
 use rumors::{Key, Rumors, Version};
 use sled_hardware_types::BaseboardId;
 use slog::{Logger, debug, error, info, o, warn};
-use sush_api::JobStartParams;
-use sush_common::jobs::{JobId, JobStatus, JobStatusMap, Session, SignedJob};
 use tokio::sync::watch;
 use tokio::{select, spawn};
 use tokio_util::sync::CancellationToken;
 
+use sush_api::JobStartParams;
+use sush_common::jobs::{JobId, JobStatus, JobStatusMap, Session, SessionId, SignedJob};
+
 use crate::executor::Executor;
+use crate::history::JobHistory;
 use crate::interactive::SocketSender;
 use crate::messages::{Error, Event, JobEvent, JobRequest, Message, Request, SessionRequest};
 use crate::output::JobOutputDir;
 
-#[derive(Clone, Debug)]
-pub struct State {
-    /// The ID of the baseboard (sled) the server is running on.
-    own_baseboard: BaseboardId,
-    /// The set of running jobs *everywhere*, tagged by start wall-clock time.
-    running: BTreeMap<(JobId, BaseboardId), DateTime<Utc>>,
-    /// The set of *all* jobs (running or stopped) *everywhere*, causally
-    /// ordered; we use causal ordering to garbage-collect jobs which are the
-    /// causally oldest, once the memory representation of our state gets big.
-    causal_jobs: BTreeSet<(Rank, JobId, BaseboardId)>,
-    /// Lookup table for job status of *all* jobs *everywhere*, pruned by the
-    /// causal ordering in `causal_jobs`, and indexed first by job ID so that
-    /// it's possible to ask "what's the status of this job across the rack?"
-    job_status: BTreeMap<JobId, JobStatusMap>,
-    /// The current state of the active session, if any.
-    session: SessionState,
-    /// Attachment points (socket senders) for interactive jobs.
-    attachments: BTreeMap<JobId, watch::Receiver<Option<SocketSender>>>,
-}
-
-impl State {
-    pub fn new(own_baseboard: BaseboardId) -> Self {
-        Self {
-            own_baseboard,
-            running: Default::default(),
-            causal_jobs: Default::default(),
-            job_status: Default::default(),
-            session: Default::default(),
-            attachments: Default::default(),
-        }
-    }
-
-    pub fn get_job_status(&self, job_id: &JobId) -> Option<&JobStatusMap> {
-        self.job_status.get(job_id)
-    }
-
-    pub fn set_job_status(
-        &mut self,
-        job_id: &JobId,
-        baseboard_id: &BaseboardId,
-        status: JobStatus,
-    ) {
-        self.job_status
-            .entry(job_id.to_owned())
-            .or_default()
-            .insert(baseboard_id.clone(), status);
-        self.evict_old_history();
-    }
-
-    /// Evict causally-oldest job status entries once we exceed
-    /// `MAX_HISTORY`. A job may appear more than once in `causal_jobs`
-    /// (once per causal event: start, and stop or error), so the
-    /// causally-oldest entry isn't automatically safe to evict;
-    /// it may be the *start* event of a job that's still running,
-    /// whose terminal event (and thus later `causal_jobs` entry)
-    /// hasn't happened yet. We only ever evict full job entries,
-    /// and only for jobs that aren't currently running anywhere.
-    fn evict_old_history(&mut self) {
-        while self.job_status.len() > MAX_HISTORY {
-            let evictable = self
-                .causal_jobs
-                .iter()
-                .map(|(_, job_id, _)| job_id)
-                .find(|job_id| self.running.keys().all(|(id, _)| id != *job_id))
-                .cloned();
-            let Some(job_id) = evictable else {
-                // Everything we know about is still running somewhere;
-                // there's nothing safe to evict yet.
-                break;
-            };
-            self.job_status.remove(&job_id);
-            self.causal_jobs.retain(|(_, id, _)| id != &job_id);
-        }
-    }
-
-    pub fn get_attachment(&self, job_id: &JobId) -> Option<SocketSender> {
-        self.attachments.get(job_id)?.borrow().to_owned()
-    }
-}
-
-/// Maximum number of historical job statuses to retain before evicting them.
-/// This is specified as 32 (maximum sleds per rack) times 2,048 (maximum
-/// "scrollback" per sled).
-const MAX_HISTORY: usize = 32 * 2048;
+pub type QueuedJobs = BTreeMap<JobId, (SignedJob, JobStartParams)>;
+pub type RunningJobs = BTreeMap<(JobId, BaseboardId), DateTime<Utc>>;
+pub type AttachmentPoints = BTreeMap<JobId, watch::Receiver<Option<SocketSender>>>;
 
 /// Maximum number of jobs a session may have queued (submitted, but not
 /// yet next in the causal chain to run). Bounds memory in the presence
@@ -121,23 +41,193 @@ pub enum SessionState {
     Active {
         session: Box<Session>,
         session_start: Version,
-        queued_jobs: BTreeMap<JobId, (SignedJob, JobStartParams)>,
+        queued_jobs: QueuedJobs,
     },
 }
 
 impl SessionState {
-    pub fn session(&self) -> Option<Session> {
+    fn active_session(&mut self) -> Option<SessionGuard<'_>> {
         use SessionState::*;
         match self {
             Inactive => None,
-            Active { session, .. } => Some(*session.clone()),
+            Active {
+                session,
+                queued_jobs,
+                ..
+            } => Some(SessionGuard {
+                inner: session,
+                queued_jobs,
+            }),
+        }
+    }
+
+    pub fn session(&self) -> Option<&Session> {
+        use SessionState::*;
+        match self {
+            Inactive => None,
+            Active { session, .. } => Some(session),
+        }
+    }
+
+    fn queued_jobs(&self) -> Option<&QueuedJobs> {
+        use SessionState::*;
+        match self {
+            Inactive => None,
+            Active { queued_jobs, .. } => Some(queued_jobs),
         }
     }
 }
 
+/// A dynamic guard around an active session and its job queue.
+struct SessionGuard<'a> {
+    inner: &'a mut Session,
+    queued_jobs: &'a mut QueuedJobs,
+}
+
+impl<'a> SessionGuard<'a> {
+    pub fn session_id(&self) -> &SessionId {
+        self.inner.session_id()
+    }
+
+    pub fn job_started(&mut self, job: SignedJob) {
+        self.inner.job_started(job)
+    }
+
+    pub fn skip_job(&mut self, job_id: &JobId) {
+        self.inner.skip_job(job_id.clone())
+    }
+
+    pub fn next_queued_job(&mut self) -> Option<(SignedJob, JobStartParams)> {
+        self.queued_jobs.remove(&self.inner.next_job_id())
+    }
+
+    pub fn enqueue_job(
+        &mut self,
+        log: &Logger,
+        history: &mut JobHistory,
+        running: &RunningJobs,
+        own_baseboard: &BaseboardId,
+        job: SignedJob,
+        params: JobStartParams,
+    ) {
+        let job_id = job.job_id().clone();
+        if history.contains(&job_id) {
+            // Note but otherwise ignore the duplicate job.
+            warn!(log, "already started job"; "job_id" => %job_id);
+        } else if self.queued_jobs.len() >= MAX_QUEUED_JOBS
+            && !self.queued_jobs.contains_key(&job_id)
+        {
+            // We have no choice; drop the job on the floor.
+            warn!(log, "too many jobs queued"; "job_id" => %job_id, "max" => MAX_QUEUED_JOBS);
+        } else {
+            // Insert the job into our queue and record its new status.
+            self.queued_jobs.insert(job_id.clone(), (job, params));
+            history.set_job_status(
+                &job_id,
+                own_baseboard,
+                JobStatus::Queued {
+                    job_id: job_id.clone(),
+                    time_queued: Utc::now(),
+                },
+                None,
+                Some(self.queued_jobs),
+                running,
+            );
+        }
+    }
+
+    pub fn cancel_job(
+        &mut self,
+        job_id: &JobId,
+        own_baseboard: &BaseboardId,
+        history: &mut JobHistory,
+        running: &RunningJobs,
+    ) {
+        self.queued_jobs.remove(job_id);
+        history.transition_job_status(
+            job_id,
+            own_baseboard,
+            None,
+            |old_status| match old_status {
+                None | Some(JobStatus::Queued { .. }) => Some(JobStatus::Cancelled {
+                    job_id: job_id.clone(),
+                    time_cancelled: Utc::now(),
+                }),
+                _ => None,
+            },
+            Some(self.queued_jobs),
+            running,
+        );
+    }
+
+    /// Pull out the next job to execute (if any), repeatedly.
+    /// We loop because adding or skipping a job may have "filled a hole"
+    /// in the hash chain, and there may be an unbounded number of
+    /// newly-ready-to-run jobs after it in the queue. Once we reach
+    /// a fixed point, we have nothing further to do.
+    pub fn execute_ready_jobs(
+        &mut self,
+        own_baseboard: &BaseboardId,
+        history: &mut JobHistory,
+        executor: &mut Executor,
+        attachments: &mut AttachmentPoints,
+    ) {
+        while let Some((request, params)) = self.next_queued_job() {
+            let (tx_attachment, rx_attachment) = watch::channel(None);
+            let payload = request.payload();
+            let job_id = payload.job_id();
+            if history
+                .get_job_status(job_id)
+                .map(|status| matches!(status.get(own_baseboard), Some(JobStatus::Queued { .. })))
+                .unwrap_or(true)
+            {
+                executor.job_start(payload.clone(), params, tx_attachment);
+                attachments.insert(job_id.clone(), rx_attachment);
+            }
+            self.job_started(request);
+        }
+    }
+}
+
+#[derive(Debug)]
+pub struct State {
+    /// The ID of the baseboard (sled) the server is running on.
+    own_baseboard: BaseboardId,
+    /// Status of all jobs everywhere (lossy).
+    history: JobHistory,
+    /// The set of running jobs everywhere, tagged by start wall-clock time.
+    running: RunningJobs,
+    /// The current state of the active session, if any.
+    session: SessionState,
+    /// Attachment points (socket senders) for interactive jobs.
+    attachments: AttachmentPoints,
+}
+
 impl State {
-    pub fn session(&self) -> Option<Session> {
+    pub fn new(own_baseboard: BaseboardId) -> Self {
+        Self {
+            own_baseboard,
+            running: Default::default(),
+            history: Default::default(),
+            session: Default::default(),
+            attachments: Default::default(),
+        }
+    }
+
+    pub fn get_attachment(&self, job_id: &JobId) -> Option<SocketSender> {
+        self.attachments.get(job_id)?.borrow().to_owned()
+    }
+
+    pub fn session(&self) -> Option<&Session> {
         self.session.session()
+    }
+
+    pub fn history(&self) -> &JobHistory {
+        &self.history
+    }
+
+    pub fn get_job_status(&self, job_id: &JobId) -> Option<&JobStatusMap> {
+        self.history.get_job_status(job_id)
     }
 
     fn update(
@@ -160,7 +250,7 @@ impl State {
                             self.session = Active {
                                 session: Box::new(Session::new(session_id.clone())),
                                 session_start: incoming_version.clone(),
-                                queued_jobs: BTreeMap::new(),
+                                queued_jobs: QueuedJobs::new(),
                             }
                         }
                         Active {
@@ -177,7 +267,7 @@ impl State {
                                 self.session = Active {
                                     session: Box::new(Session::new(session_id.clone())),
                                     session_start: incoming_version.clone(),
-                                    queued_jobs: BTreeMap::new(),
+                                    queued_jobs: QueuedJobs::new(),
                                 }
                             }
                             // If we already have the newest session, then we
@@ -202,7 +292,15 @@ impl State {
                             // because rumors guarantees that no messages have
                             // equal versions. However, we can't panic here, so
                             // invalidate both sessions.
-                            Some(Ordering::Equal) => self.session = Inactive,
+                            Some(Ordering::Equal) => {
+                                error!(
+                                    log,
+                                    "causality violation: sessions with equal versions";
+                                    "session_id" => %session.session_id(),
+                                    "version" => %created,
+                                );
+                                self.session = Inactive;
+                            }
                         },
                     },
                     SessionRequest::Stop(session_id) => {
@@ -223,10 +321,28 @@ impl State {
                         }
                     }
                     SessionRequest::Skip(session_id, job_id) => {
-                        if let Active { session, .. } = &mut self.session
+                        if let Some(mut session) = self.session.active_session()
                             && session.session_id() == session_id
                         {
-                            session.skip_job(job_id.clone());
+                            session.skip_job(job_id);
+                            session.cancel_job(
+                                job_id,
+                                &self.own_baseboard,
+                                &mut self.history,
+                                &self.running,
+                            );
+                            session.execute_ready_jobs(
+                                &self.own_baseboard,
+                                &mut self.history,
+                                executor,
+                                &mut self.attachments,
+                            );
+                        } else {
+                            warn!(
+                                log,
+                                "skipping job in inactive or invalid session";
+                                "session_id" => %session_id
+                            );
                         }
                     }
                 },
@@ -255,121 +371,33 @@ impl State {
                         // receive a job from a session before that
                         // session's own start (since each session is
                         // linearized by its accepting server).
-                        if let Self {
-                            session:
-                                Active {
-                                    session,
-                                    queued_jobs,
-                                    ..
-                                },
-                            job_status,
-                            ..
-                        } = self
-                        {
-                            let payload = signed.payload().clone();
-                            let job_id = payload.job_id.clone();
-
-                            // A job ID that has a status has already run,
-                            // here or elsewhere; resubmitting it can never
-                            // advance the chain (it will never again match
-                            // `next_job_id`), so there's no point queuing it.
-                            // And if we're at capacity with a new ID, drop it
-                            // rather than grow without bound; a well-behaved
-                            // client can resubmit once earlier jobs are done.
-                            if job_status.contains_key(&job_id) {
-                                warn!(
-                                    log,
-                                    "ignoring resubmission of already started job";
-                                    "job_id" => %job_id
-                                );
-                            } else if queued_jobs.len() >= MAX_QUEUED_JOBS
-                                && !queued_jobs.contains_key(&job_id)
-                            {
-                                warn!(
-                                    log,
-                                    "dropping job request, too many jobs queued";
-                                    "job_id" => %job_id,
-                                    "limit" => MAX_QUEUED_JOBS
-                                );
-                            } else {
-                                // Insert the job into our queue, without starting anything.
-                                queued_jobs
-                                    .insert(job_id.clone(), (signed.clone(), params.clone()));
-                                job_status.entry(job_id.clone()).or_default().insert(
-                                    self.own_baseboard.clone(),
-                                    JobStatus::Queued {
-                                        job_id,
-                                        time_queued: Utc::now(),
-                                    },
-                                );
-                            }
-
-                            // Then, pull out the next job to execute (if any),
-                            // repeatedly. We loop because adding this new job
-                            // may have "filled a hole" in the hash chain, and
-                            // there may be an unbounded number of
-                            // newly-ready-to-run jobs after it in the queue.
-                            // Once we reach a fixed point, we have nothing
-                            // further to do.
-                            while let Some((request, params)) =
-                                queued_jobs.remove(&session.next_job_id())
-                            {
-                                let (tx_attachment, rx_attachment) = watch::channel(None);
-                                let payload = request.payload();
-                                let job_id = payload.job_id();
-                                if self
-                                    .job_status
-                                    .get(job_id)
-                                    .map(|status| {
-                                        matches!(
-                                            status.get(&self.own_baseboard),
-                                            Some(JobStatus::Queued { .. })
-                                        )
-                                    })
-                                    .unwrap_or(true)
-                                {
-                                    executor.job_start(payload.clone(), params, tx_attachment);
-                                    self.attachments.insert(job_id.clone(), rx_attachment);
-                                }
-                                session.job_started(request);
-                            }
+                        if let Some(mut session) = self.session.active_session() {
+                            session.enqueue_job(
+                                log,
+                                &mut self.history,
+                                &self.running,
+                                &self.own_baseboard,
+                                signed.clone(),
+                                params.clone(),
+                            );
+                            session.execute_ready_jobs(
+                                &self.own_baseboard,
+                                &mut self.history,
+                                executor,
+                                &mut self.attachments,
+                            );
                         }
                     }
                     JobRequest::Stop(job_id) => {
-                        // If we can't remove the job from the queued jobs,
-                        // then it's possible it has been already executed
-                        // (or is starting to be). We cannot rely on it
-                        // already being present in the started jobs state,
-                        // because this is updated asynchronously, so we
-                        // unconditionally tell the executor to stop the
-                        // job, even if it may not have ever existed. If we
-                        // don't have a session, we still want to stop the
-                        // job, because it could be from another session.
-                        if let Self {
-                            session: Active { queued_jobs, .. },
-                            job_status,
-                            ..
-                        } = self
-                        {
-                            queued_jobs.remove(job_id);
-                            job_status
-                                .entry(job_id.clone())
-                                .or_default()
-                                .entry(self.own_baseboard.clone())
-                                .and_modify(|status| {
-                                    if matches!(status, JobStatus::Queued { .. }) {
-                                        *status = JobStatus::Cancelled {
-                                            job_id: job_id.clone(),
-                                            time_cancelled: Utc::now(),
-                                        };
-                                    }
-                                })
-                                .or_insert(JobStatus::Cancelled {
-                                    job_id: job_id.clone(),
-                                    time_cancelled: Utc::now(),
-                                });
-                        }
                         executor.job_stop(job_id);
+                        if let Some(mut session) = self.session.active_session() {
+                            session.cancel_job(
+                                job_id,
+                                &self.own_baseboard,
+                                &mut self.history,
+                                &self.running,
+                            );
+                        }
                     }
                 },
             },
@@ -380,50 +408,41 @@ impl State {
                         info!(log, "job started"; "job_id" => %job_id, "when" => %when);
                         self.running
                             .insert((job_id.clone(), baseboard_id.clone()), *when);
-                        self.causal_jobs.insert((
-                            incoming_version.rank(),
-                            job_id.clone(),
-                            baseboard_id.clone(),
-                        ));
-                        self.set_job_status(
+                        self.history.set_job_status(
                             job_id,
                             baseboard_id,
                             JobStatus::Started {
                                 job_id: job_id.clone(),
                                 time_started: *when,
                             },
+                            Some(incoming_version.rank()),
+                            self.session.queued_jobs(),
+                            &self.running,
                         );
                     }
                     JobEvent::Stop(job_id, when, result, output) => {
                         info!(log, "job stopped"; "job_id" => %job_id, "when" => %when, "result" => ?result);
                         self.attachments.remove(job_id);
                         self.running.remove(&(job_id.clone(), baseboard_id.clone()));
-                        self.causal_jobs.insert((
-                            incoming_version.rank(),
-                            job_id.clone(),
-                            baseboard_id.clone(),
-                        ));
-                        if let Some(JobStatus::Started {
-                            job_id: jid,
-                            time_started,
-                        }) = self
-                            .get_job_status(job_id)
-                            .and_then(|m| m.get(baseboard_id))
-                            .cloned()
-                            && jid == *job_id
-                        {
-                            self.set_job_status(
-                                job_id,
-                                baseboard_id,
-                                JobStatus::Stopped {
-                                    job_id: job_id.clone(),
-                                    time_started,
-                                    time_stopped: *when,
-                                    result: result.clone(),
-                                    output: output.clone(),
-                                },
-                            );
-                        }
+                        self.history.transition_job_status(
+                            job_id,
+                            baseboard_id,
+                            Some(incoming_version.rank()),
+                            |old_status| match old_status {
+                                Some(JobStatus::Started { time_started, .. }) => {
+                                    Some(JobStatus::Stopped {
+                                        job_id: job_id.clone(),
+                                        time_started: *time_started,
+                                        time_stopped: *when,
+                                        result: result.clone(),
+                                        output: output.clone(),
+                                    })
+                                }
+                                _ => None,
+                            },
+                            self.session.queued_jobs(),
+                            &self.running,
+                        );
                         if *baseboard_id == self.own_baseboard {
                             executor.job_stopped(job_id);
                         }
@@ -432,12 +451,7 @@ impl State {
                         error!(log, "job error"; "job_id" => %job_id, "when" => %when, "error" => %error);
                         self.attachments.remove(job_id);
                         self.running.remove(&(job_id.clone(), baseboard_id.clone()));
-                        self.causal_jobs.insert((
-                            incoming_version.rank(),
-                            job_id.clone(),
-                            baseboard_id.clone(),
-                        ));
-                        self.set_job_status(
+                        self.history.set_job_status(
                             job_id,
                             baseboard_id,
                             JobStatus::Error {
@@ -445,6 +459,9 @@ impl State {
                                 time_error: *when,
                                 error: error.clone(),
                             },
+                            Some(incoming_version.rank()),
+                            self.session.queued_jobs(),
+                            &self.running,
                         );
                         if *baseboard_id == self.own_baseboard {
                             executor.job_stopped(job_id);

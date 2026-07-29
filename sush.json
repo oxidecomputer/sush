@@ -184,7 +184,8 @@
     },
     "/jobs": {
       "get": {
-        "summary": "List previous jobs sorted by start time, most recent first.",
+        "summary": "List known jobs sorted by start time, most recent first.",
+        "description": "Offsets may shift under concurrent eviction, so pagination is currently best-effort.",
         "operationId": "job_history",
         "parameters": [
           {
@@ -957,8 +958,7 @@
           {
             "type": "string",
             "enum": [
-              "Unknown",
-              "Cancelled"
+              "Unknown"
             ]
           },
           {

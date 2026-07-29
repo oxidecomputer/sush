@@ -5,6 +5,7 @@ extern crate function_name;
 
 pub mod error;
 pub mod executor;
+pub mod history;
 pub mod interactive;
 pub mod manager;
 pub mod messages;

@@ -383,7 +383,7 @@ impl JobManager {
     // Session management.
 
     pub fn session(&self, _authn: &Identity) -> Option<Session> {
-        self.state.borrow().session()
+        self.state.borrow().session().cloned()
     }
 
     pub async fn session_id(&self, authn: &Identity) -> Result<SessionId, JobError> {
@@ -533,11 +533,18 @@ impl JobManager {
     pub async fn job_history(
         &self,
         _authn: &Identity,
-        _limit: u32,
-        _offset: u32,
+        limit: u32,
+        offset: u32,
     ) -> Result<Vec<JobStatusMap>, JobError> {
-        // TODO: get job history from state
-        Ok(vec![])
+        Ok(self
+            .state
+            .borrow()
+            .history()
+            .iter()
+            .skip(offset as usize)
+            .take(limit as usize)
+            .cloned()
+            .collect())
     }
 }
 
