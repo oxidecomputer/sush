@@ -18,7 +18,7 @@ use tokio_tungstenite::tungstenite::error::Error as WebSocketError;
 use tokio_tungstenite::tungstenite::protocol::Message as WebSocketMessage;
 use tokio_util::sync::CancellationToken;
 
-use crate::interactive::SocketStream;
+use crate::job::SocketStream;
 
 /// Maximum number of messages a client is allowed to lag by
 /// before it is disconnected.

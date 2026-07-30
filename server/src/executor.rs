@@ -6,8 +6,7 @@
 use std::collections::BTreeMap;
 use std::io;
 use std::os::fd::AsRawFd as _;
-use std::os::unix::process::ExitStatusExt as _;
-use std::process::{ExitStatus, Stdio};
+use std::process::Stdio;
 
 use chrono::Utc;
 use futures::Stream;
@@ -17,8 +16,8 @@ use rustix::process::{Pid, Signal, ioctl_tiocsctty, kill_process_group, setsid};
 use slog::{Logger, debug, error, o};
 use tokio::fs::{DirBuilder, File};
 use tokio::process::{Child, Command};
+use tokio::spawn;
 use tokio::sync::{mpsc, watch};
-use tokio::{select, spawn};
 use tokio_stream::wrappers::ReceiverStream;
 use tokio_util::sync::CancellationToken;
 
@@ -26,7 +25,8 @@ use sush_api::JobStartParams;
 use sush_common::interactive::WindowSize;
 use sush_common::jobs::{JobId, JobOutputStream, JobStartRequest, ProcessError};
 
-use crate::interactive::{InteractiveJob, SocketSender};
+use crate::io::JobIo;
+use crate::job::{Job, SocketSender};
 use crate::messages::{Event, JobEvent};
 use crate::output::JobOutputDir;
 use crate::pty::Pty;
@@ -191,7 +191,7 @@ async fn job_spawn(
         });
     }
 
-    if interactive {
+    let job = if interactive {
         // Create a pseudoterminal and wire the child up to it.
         let (pty, pts, pts_path) = with_io_err!(Pty::open(), "opening pseudoterminal".to_string());
         macro_rules! pts_clone {
@@ -222,126 +222,76 @@ async fn job_spawn(
             );
         }
 
-        // Start the interactive job and send the attachment point and notification.
-        let child = with_io_err!(cmd.spawn(), "spawning job process".to_string());
-        let job = InteractiveJob::start(
-            log.new(o!("interactive" => true)),
-            child,
-            pty,
-            stdout_file,
-            stop,
+        // Start the interactive job.
+        let child = with_io_err!(cmd.spawn(), "spawning interactive job".to_string());
+        let io = with_io_err!(
+            JobIo::interactive(pty, stop.child_token()),
+            "creating pty I/O wrapper".to_string()
         );
-        if tx_attachment.send(Some(job.attachment())).is_err() {
-            error!(log, "can't send attachment point");
-        }
-        let _ = events
-            .send(Event::Job(JobEvent::Start(job_id.clone(), Utc::now())))
-            .await;
+        Job::start(
+            log.new(o!("interactive" => interactive)),
+            child,
+            io,
+            stdout_file,
+            stderr_file,
+            stop,
+        )
+    } else {
+        // For batch jobs, close stdin and send output to pipes.
+        cmd.stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped());
 
-        spawn({
-            // Wait for the interactive job to end, and send an event when it does.
-            let events = events.clone();
-            let job_id = job_id.clone();
-            async move {
-                let result = match job.wait().await {
-                    Ok(exit_status) => process_exit(exit_status),
-                    Err(err) => Err(ProcessError::Interactive(err.to_string())),
-                };
-                let output_state = match output_dir.job_output_state(&job_id).await {
-                    Ok(output) => output,
-                    Err(err) => {
-                        send_error(&log, &job_id, &events, err.error()).await;
-                        return;
-                    }
-                };
+        // Start the batch job.
+        let mut child = with_io_err!(cmd.spawn(), "spawning batch job".to_string());
+        let io = JobIo::batch(
+            child.stdout.take().expect("batch job should have stdout"),
+            child.stderr.take().expect("batch job should have stderr"),
+        );
+        Job::start(
+            log.new(o!("interactive" => interactive)),
+            child,
+            io,
+            stdout_file,
+            stderr_file,
+            stop,
+        )
+    };
+
+    // Send the attachment point.
+    if tx_attachment.send(Some(job.attachment())).is_err() {
+        error!(log, "can't send attachment point");
+    }
+
+    // Announce the birth of our new job!
+    let _ = events
+        .send(Event::Job(JobEvent::Start(job_id.clone(), Utc::now())))
+        .await;
+
+    // Wait for the job to die and send an event when it does.
+    spawn(async move {
+        match job.wait().await {
+            Ok((result, state)) => {
                 let _ = events
                     .send(Event::Job(JobEvent::Stop(
                         job_id,
                         Utc::now(),
                         result,
-                        output_state,
+                        state,
                     )))
                     .await;
             }
-        });
-    } else {
-        // For batch jobs, close stdin and send output directly to files.
-        cmd.stdin(Stdio::null())
-            .stdout(stdout_file.into_std().await)
-            .stderr(stderr_file.into_std().await);
-
-        // Batch jobs are not attachable.
-        if tx_attachment.send(None).is_err() {
-            error!(log, "can't clear attachment point");
-        }
-
-        // Start and report.
-        let mut child = with_io_err!(cmd.spawn(), "spawning job process".to_string());
-        let _ = events
-            .send(Event::Job(JobEvent::Start(job_id.clone(), Utc::now())))
-            .await;
-
-        // Wait for or induce death, and send an event when that happens.
-        spawn({
-            let events = events.clone();
-            let job_id = job_id.clone();
-            let mut killed = false;
-            async move {
-                loop {
-                    select! {
-                        _ = stop.cancelled(), if !killed => {
-                            kill_job(&log, &child);
-                            killed = true;
-                        }
-                        exit_status = child.wait() => {
-                            match output_dir.job_output_state(&job_id).await {
-                                Ok(output_state) => {
-                                    debug!(log, "reaped job process");
-                                    let _ = events
-                                        .send(Event::Job(JobEvent::Stop(
-                                            job_id,
-                                            Utc::now(),
-                                            match exit_status {
-                                                Ok(exit_status) => process_exit(exit_status),
-                                                Err(err) => Err(ProcessError::io("waiting for job process", err)),
-                                            },
-                                            output_state,
-                                        )))
-                                        .await;
-                                }
-                                Err(err) => {
-                                    error!(log, "unable to get output state"; "error" => %err);
-                                    let _ = events
-                                        .send(Event::Job(JobEvent::Error(
-                                            job_id,
-                                            Utc::now(),
-                                            err.error(),
-                                        )))
-                                        .await;
-                                }
-                            }
-                            break;
-                        }
-                    }
-                }
+            Err(error) => {
+                let _ = events
+                    .send(Event::Job(JobEvent::Error(
+                        job_id,
+                        Utc::now(),
+                        ProcessError::Join(error.to_string()),
+                    )))
+                    .await;
             }
-        });
-    }
-}
-
-fn process_exit(exit_status: ExitStatus) -> Result<i32, ProcessError> {
-    if let Some(code) = exit_status.code() {
-        Ok(code)
-    } else if let Some(signal) = exit_status.signal() {
-        Err(ProcessError::Killed(signal))
-    } else {
-        // Processes should either exit with a code or
-        // be killed by a signal; there is no third option
-        // on Unix. But since the type system does not
-        // guarantee that, this branch is technically
-        // reachable, but impossible in practice.
-        Err(ProcessError::Unknown)
-    }
+        }
+    });
 }
 
 async fn send_error(

@@ -26,7 +26,7 @@ use sush_common::jobs::{JobId, JobStatusMap, Session, SessionId, SignedJob};
 use sush_common::keys::{KeyError, KeyId, Signature, SshPublicKey};
 
 use crate::error::JobError;
-use crate::interactive::SocketSender;
+use crate::job::SocketSender;
 use crate::messages::{JobRequest, Message, Request, SessionRequest};
 use crate::output::JobOutputDir;
 use crate::state::{State, StateManager};

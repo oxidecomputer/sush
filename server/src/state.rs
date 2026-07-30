@@ -20,7 +20,7 @@ use sush_common::jobs::{JobId, JobStatus, JobStatusMap, Session, SessionId, Sign
 
 use crate::executor::Executor;
 use crate::history::JobHistory;
-use crate::interactive::SocketSender;
+use crate::job::SocketSender;
 use crate::messages::{Error, Event, JobEvent, JobRequest, Message, Request, SessionRequest};
 use crate::output::JobOutputDir;
 

@@ -9,7 +9,7 @@ use std::os::unix::ffi::OsStrExt as _;
 use std::os::unix::io::{AsFd, AsRawFd, BorrowedFd, OwnedFd, RawFd};
 use std::path::PathBuf;
 use std::pin::Pin;
-use std::task::{Context, Poll};
+use std::task::{Context, Poll, ready};
 
 use rustix::fs::{Mode, OFlags, fcntl_setfl, open};
 use rustix::io::{read, write};
@@ -51,6 +51,13 @@ impl Pty {
         Ok((Self(AsyncFd::new(pty)?), pts, pts_path))
     }
 
+    /// Get a writer to the pseudoterminal's input.
+    pub fn writer(&self) -> io::Result<PtyWriter> {
+        Ok(PtyWriter(AsyncFd::new(
+            self.0.as_fd().try_clone_to_owned()?,
+        )?))
+    }
+
     /// Get the current pseudoterminal window size.
     pub fn get_window_size(&self) -> io::Result<WindowSize> {
         Ok(tcgetwinsize(&self.0)?.into())
@@ -81,12 +88,7 @@ impl AsyncRead for Pty {
         buf: &mut ReadBuf<'_>,
     ) -> Poll<io::Result<()>> {
         loop {
-            let mut guard = match self.0.poll_read_ready(cx) {
-                Poll::Ready(Ok(guard)) => guard,
-                Poll::Ready(Err(e)) => return Poll::Ready(Err(e)),
-                Poll::Pending => return Poll::Pending,
-            };
-
+            let mut guard = ready!(self.0.poll_read_ready(cx))?;
             let unfilled = buf.initialize_unfilled();
             match guard.try_io(|inner| Ok(read(inner.get_ref(), unfilled)?)) {
                 Ok(Ok(len)) => {
@@ -100,19 +102,17 @@ impl AsyncRead for Pty {
     }
 }
 
-impl AsyncWrite for Pty {
+#[derive(Debug)]
+pub struct PtyWriter(AsyncFd<OwnedFd>);
+
+impl AsyncWrite for PtyWriter {
     fn poll_write(
         self: Pin<&mut Self>,
         cx: &mut Context<'_>,
         buf: &[u8],
     ) -> Poll<io::Result<usize>> {
         loop {
-            let mut guard = match self.0.poll_write_ready(cx) {
-                Poll::Ready(Ok(guard)) => guard,
-                Poll::Ready(Err(e)) => return Poll::Ready(Err(e)),
-                Poll::Pending => return Poll::Pending,
-            };
-
+            let mut guard = ready!(self.0.poll_write_ready(cx))?;
             match guard.try_io(|inner| Ok(write(inner.get_ref(), buf)?)) {
                 Ok(result) => return Poll::Ready(result),
                 Err(_would_block) => continue,

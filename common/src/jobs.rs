@@ -377,6 +377,8 @@ pub enum ProcessError {
     Interactive(String),
     #[error("I/O error {what}: {error}")]
     Io { what: String, error: String },
+    #[error("unable to join job process: {0}")]
+    Join(String),
 }
 
 impl ProcessError {

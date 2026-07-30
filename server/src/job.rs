@@ -1,60 +1,73 @@
-//! Interactive jobs, server side.
+//! Batch and interactive jobs, server side.
 //!
-//! When a client attaches to an interactive job, what that means on the
-//! server is that we have a new (stream made from a) WebSocket connection
-//! with the (authenticated) client on the other end. So an _attachment
-//! point_ is an MPSC channel over which we send the WebSocket stream,
-//! i.e., a [`SocketSender`]. The interactive job select loop receives
-//! the new socket and begins processing/relaying messages from/to it.
-//! Multiple clients may be simultaneously attached.
+//! Standard output and standard error streams for all jobs are hashed
+//! online and recorded in files. If we cannot write to an output file,
+//! the job is terminated.
+//!
+//! Batch jobs are treated as interactive jobs without a pseudoterminal
+//! but with potentially non-trivial error output streams. Batch jobs
+//! also don't need to drain their output; when we get EOF from both
+//! output streams, we're done. Input to batch jobs is ignored.
+//!
+//! When a client attaches to a job, what that means is that we have a
+//! new (stream made from a) WebSocket connection with the (authenticated)
+//! client on the other end. So an _attachment point_ is an MPSC channel
+//! over which we send the WebSocket stream, i.e., a [`SocketSender`].
+//! The select loop receives the new socket and begins processing/relaying
+//! messages from/to it. Multiple clients may be simultaneously attached
+//! using a [`WebSocketMux`].
 
 use std::io::{self, SeekFrom};
+use std::os::unix::process::ExitStatusExt as _;
 use std::process::ExitStatus;
 
-use bytes::{Buf as _, Bytes, BytesMut};
+use blake3::Hasher;
+use bytes::{Bytes, BytesMut};
 use dropshot::WebsocketConnectionRaw;
 use futures::{SinkExt as _, StreamExt as _};
-use slog::{Logger, debug, error, info};
+use slog::{Logger, debug, error, info, warn};
 use tokio::fs::File;
 use tokio::io::{AsyncReadExt as _, AsyncSeekExt as _, AsyncWriteExt as _};
 use tokio::process::Child;
 use tokio::sync::mpsc;
-use tokio::task::JoinHandle;
+use tokio::task::{JoinError, JoinHandle};
 use tokio::time::{Duration, Instant, sleep};
 use tokio::{pin, select, spawn};
 use tokio_tungstenite::WebSocketStream;
 use tokio_tungstenite::tungstenite::protocol::Message as WebSocketMessage;
 
 use sush_common::interactive::{
-    INTERACTIVE_JOB_BUFFER_SIZE, InteractiveJobControl as Control, InteractiveJobError as Error,
-    InteractiveJobMessage as Message,
+    INTERACTIVE_JOB_BUFFER_SIZE, InteractiveJobControl as Control, InteractiveJobMessage as Message,
 };
+use sush_common::jobs::JobOutputStream::*;
+use sush_common::jobs::{JobOutputState, ProcessError};
 use tokio_util::sync::CancellationToken;
 
 use crate::executor::kill_job;
+use crate::io::JobIo;
 use crate::mux::WebSocketMux;
-use crate::pty::Pty;
 
 pub type SocketStream = WebSocketStream<WebsocketConnectionRaw>;
 pub type SocketSender = mpsc::Sender<SocketStream>;
 pub type SocketReceiver = mpsc::Receiver<SocketStream>;
 
-pub struct InteractiveJob {
-    task: JoinHandle<Result<ExitStatus, Error>>,
+pub struct Job {
+    task: JoinHandle<(Result<i32, ProcessError>, JobOutputState)>,
     tx_client: SocketSender,
 }
 
-impl InteractiveJob {
+impl Job {
     pub fn start(
         log: Logger,
         child: Child,
-        pty: Pty,
-        output: File,
+        io: JobIo,
+        stdout: File,
+        stderr: File,
         stop: CancellationToken,
     ) -> Self {
         let (tx_client, rx_client) = mpsc::channel::<SocketStream>(1);
         Self {
-            task: spawn(interactive_job(log, child, pty, output, rx_client, stop)),
+            task: spawn(job(log, child, io, stdout, stderr, rx_client, stop)),
             tx_client,
         }
     }
@@ -63,66 +76,73 @@ impl InteractiveJob {
         self.tx_client.clone()
     }
 
-    pub async fn wait(self) -> Result<ExitStatus, Error> {
-        self.task.await?
+    pub async fn wait(self) -> Result<(Result<i32, ProcessError>, JobOutputState), JoinError> {
+        self.task.await
     }
 }
 
-/// How long to continue trying to read from a dead job.
-const DRAIN_TIMEOUT: Duration = Duration::from_millis(10);
-
-/// Run an interactive job that allows, but does not require,
-/// a client connection via WebSocket.
-async fn interactive_job(
+/// Run a job that allows for client connections.
+/// It need not have a controlling (pseudo)terminal.
+async fn job(
     log: Logger,
     mut child: Child,
-    mut pty: Pty,
-    mut output: File,
+    mut io: JobIo,
+    mut stdout_file: File,
+    mut stderr_file: File,
     mut rx_client: mpsc::Receiver<SocketStream>,
     stop: CancellationToken,
-) -> Result<ExitStatus, Error> {
-    let mut buffer = BytesMut::with_capacity(INTERACTIVE_JOB_BUFFER_SIZE);
+) -> (Result<i32, ProcessError>, JobOutputState) {
+    let mut stdout_hasher = Hasher::new();
+    let mut stderr_hasher = Hasher::new();
     let mut clients = WebSocketMux::new();
     let mut killed = false;
     let mut dead = false;
-    let drain_timeout = sleep(Duration::MAX);
+    let drain_timeout = sleep(Duration::default());
     pin!(drain_timeout);
-
-    // Handle interactive job events.
     loop {
-        buffer.reserve(INTERACTIVE_JOB_BUFFER_SIZE);
         select! {
             // Read available job output, record it, and relay it to the clients
             // if there are any. We try to read regardless of whether the process
             // is known to be dead; it is essential to drain output that may be
-            // sent before the process dies, but which arrives after detection
-            // of its death.
-            read = pty.read_buf(&mut buffer) => {
+            // sent before it dies, but which arrives after detection of its death.
+            read = io.read_output() => {
                 match read {
-                    Ok(0) => {
-                        debug!(log, "EOF from job process");
+                    Ok((buf, _)) if buf.is_empty() => {
+                        debug!(log, "EOF on all job output streams");
                         break;
                     }
-                    Ok(n) => {
-                        output.write_all(&buffer[..n]).await?;
+                    Ok((buf, stream)) => {
+                        match stream {
+                            Stdout => {
+                                stdout_hasher.update(&buf);
+                                if let Err(error) = stdout_file.write_all(&buf).await {
+                                    error!(log, "failed to record standard output"; "error" => %error);
+                                    stop.cancel();
+                                }
+                            }
+                            Stderr => {
+                                stderr_hasher.update(&buf);
+                                if let Err(error) = stderr_file.write_all(&buf).await {
+                                    error!(log, "failed to record error output"; "error" => %error);
+                                    stop.cancel();
+                                }
+                            }
+                        }
                         if !clients.is_empty() {
-                            let data = buffer.copy_to_bytes(n);
-                            let Ok::<WebSocketMessage, _>(message) = Message::Data(data).try_into() else {
+                            let Ok::<WebSocketMessage, _>(message) = Message::Data(buf).try_into() else {
                                 error!(log, "failed to encode data message for relay");
-                                buffer.truncate(0);
                                 continue;
                             };
                             if let Err(error) = clients.send(message) {
                                 error!(log, "failed to relay data message to clients"; "error" => %error);
                             }
                         }
-                        buffer.truncate(0);
                     }
                     Err(error) => {
                         if !dead {
-                            error!(log, "error reading from PTY"; "error" => %error);
+                            error!(log, "error reading from job process"; "error" => %error);
                         }
-                        if let Err(error) = clients.send(Message::Close.try_into()?) {
+                        if let Err(error) = clients.send(Message::Close.try_into().unwrap()) {
                             error!(log, "failed to send close message to clients"; "error" => %error);
                         }
                         break;
@@ -132,19 +152,19 @@ async fn interactive_job(
 
             // Attach a new client, send it the current window size, and play back the last buffer.
             Some(mut client) = rx_client.recv(), if !dead => {
-                match pty.get_window_size() {
+                match io.get_window_size() {
                     Err(error) => error!(log, "failed to get pseudoterminal window size"; "error" => %error),
                     Ok(size) => {
-                        match client.send(Message::Control(Control::WindowChange(size.clone())).try_into()?).await {
+                        match client.send(Message::Control(Control::WindowChange(size.clone())).try_into().unwrap()).await {
                             Err(error) => error!(log, "failed to send pty window size"; "error" => %error),
                             Ok(()) => debug!(log, "sent pty window size"; "size" => ?size),
                         }
                     }
                 }
 
-                if let Some(playback) = playback_buffer(&mut output, INTERACTIVE_JOB_BUFFER_SIZE).await? {
+                if let Ok(Some(playback)) = playback_buffer(&mut stdout_file, INTERACTIVE_JOB_BUFFER_SIZE).await {
                     let playback_len = playback.len();
-                    match client.send(Message::Data(playback).try_into()?).await {
+                    match client.send(Message::Data(playback).try_into().unwrap()).await {
                         Err(error) => error!(log, "failed to play back job output"; "error" => %error),
                         Ok(()) => debug!(log, "played back output"; "bytes" => playback_len),
                     }
@@ -167,7 +187,7 @@ async fn interactive_job(
                         match Message::try_from(message) {
                             Ok(Message::Control(message)) => match message {
                                 Control::WindowChange(size) => {
-                                    if let Err(error) = pty.set_window_size(size.clone()) {
+                                    if let Err(error) = io.set_window_size(size.clone()) {
                                         error!(log, "failed to set window size"; "size" => ?size, "error" => %error);
                                     }
 
@@ -182,7 +202,7 @@ async fn interactive_job(
                                     }
                                 }
                             },
-                            Ok(Message::Data(bytes)) => pty.write_all(&bytes).await?,
+                            Ok(Message::Data(bytes)) => io.write_input(bytes),
                             Ok(Message::Ignore) => (),
                             Ok(Message::Close) => {
                                 info!(log, "client closed connection"; "client_id" => %client_id);
@@ -208,24 +228,64 @@ async fn interactive_job(
             // the drain timeout expires.
             _ = child.wait(), if !dead => {
                 debug!(log, "reaped job process");
-                drain_timeout.as_mut().reset(Instant::now() + DRAIN_TIMEOUT);
+                drain_timeout.as_mut().reset(Instant::now() + io.drain_timeout());
                 dead = true;
             }
 
-            // Give output a chance to drain from a dead process. It would
-            // be great if there were a reliable, non-timeout way of doing
-            // this, but it appears there is not. OpenSSH does this too, FWIW.
+            // Give output a chance to drain from a dead process.
             _ = &mut drain_timeout, if dead => {
-                debug!(log, "drained job output");
+                match io {
+                    JobIo::Interactive { .. } => debug!(log, "drained job output"),
+                    JobIo::Batch { .. } => warn!(
+                        log,
+                        "batch job output pipes never closed, possible escaped descendant";
+                        "timeout_ms" => %io.drain_timeout().as_millis()
+                    ),
+                }
                 break;
             }
         }
     }
 
     // Reap the process.
-    let status = child.wait().await?;
-    info!(log, "interactive job stopped");
-    Ok(status)
+    let exit_status = select! {
+        status = child.wait() => status,
+        _ = stop.cancelled(), if !killed => {
+            kill_job(&log, &child);
+            child.wait().await
+        }
+    };
+    let result = match exit_status {
+        Ok(status) => process_exit(status),
+        Err(error) => Err(ProcessError::Interactive(error.to_string())),
+    };
+    info!(log, "job stopped");
+
+    // Construct the output state directly from the hashers;
+    // no need to hit the file system.
+    let output_state = JobOutputState {
+        stdout_len: stdout_hasher.count(),
+        stderr_len: stderr_hasher.count(),
+        stdout_hash: stdout_hasher.finalize().into(),
+        stderr_hash: stderr_hasher.finalize().into(),
+    };
+
+    (result, output_state)
+}
+
+fn process_exit(exit_status: ExitStatus) -> Result<i32, ProcessError> {
+    if let Some(code) = exit_status.code() {
+        Ok(code)
+    } else if let Some(signal) = exit_status.signal() {
+        Err(ProcessError::Killed(signal))
+    } else {
+        // Processes should either exit with a code or
+        // be killed by a signal; there is no third option
+        // on Unix. But since the type system does not
+        // guarantee that, this branch is technically
+        // reachable, but impossible in practice.
+        Err(ProcessError::Unknown)
+    }
 }
 
 /// Fetch the last few bytes of the output file for client play back.
@@ -256,6 +316,9 @@ mod test {
     use tempfile::NamedTempFile;
     use tokio::process::Command;
 
+    use crate::io::JobIo;
+    use crate::pty::Pty;
+
     use super::*;
 
     /// Exercise the race between process exit and slurping all of its
@@ -276,14 +339,21 @@ mod test {
                 .stdout(pts.try_clone().unwrap())
                 .spawn()
                 .unwrap();
-            let job = InteractiveJob::start(
+            let stop = CancellationToken::new();
+            let io = JobIo::interactive(pty, stop.child_token()).unwrap();
+            let job = Job::start(
                 log,
                 child,
-                pty,
+                io,
                 output_file.reopen().unwrap().into(),
-                CancellationToken::new(),
+                File::options()
+                    .append(true)
+                    .open("/dev/null")
+                    .await
+                    .unwrap(),
+                stop,
             );
-            assert!(job.wait().await.unwrap().success());
+            assert_eq!(job.wait().await.unwrap().0.unwrap(), 0);
 
             // The output of `tty` on GNU/Linux is written using puts(3),
             // which uses two write(2) calls: one for the string, and one
