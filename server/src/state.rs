@@ -257,6 +257,16 @@ impl State {
                             session,
                             session_start: created,
                             ..
+                        } if session.session_id() == session_id => {
+                            // Duplicate session starts; join with the incoming
+                            // version and ignore.
+                            *created |= incoming_version.clone();
+                            info!(log, "duplicate session start"; "session_id" => %session_id);
+                        }
+                        Active {
+                            session,
+                            session_start: created,
+                            ..
                         } => match (*created).partial_cmp(incoming_version) {
                             // If the incoming new session is in the *strict
                             // causal future* of our current session, then we
@@ -295,7 +305,7 @@ impl State {
                             Some(Ordering::Equal) => {
                                 error!(
                                     log,
-                                    "causality violation: sessions with equal versions";
+                                    "causality violation: distinct sessions with equal versions";
                                     "session_id" => %session.session_id(),
                                     "version" => %created,
                                 );
