@@ -3,7 +3,6 @@
 //! Manage sessions and their associated jobs by sending and receiving
 //! messages via the gossip protocol.
 
-use std::cmp::Ordering;
 use std::collections::BTreeMap;
 use std::sync::Arc;
 
@@ -34,22 +33,37 @@ pub type AttachmentPoints = BTreeMap<JobId, watch::Receiver<Option<SocketSender>
 /// of out-of-order, duplicate, or malformed submissions.
 const MAX_QUEUED_JOBS: usize = 1_000;
 
-#[derive(Clone, Debug, Default)]
+#[derive(Clone, Debug)]
 pub enum SessionState {
-    #[default]
-    Inactive,
+    Inactive {
+        /// Last observed session request.
+        frontier: Version,
+    },
     Active {
+        /// Last observed session request.
+        frontier: Version,
+        /// Start of this session; identity anchor.
+        started: Version,
+        /// The active session.
         session: Box<Session>,
-        session_start: Version,
+        /// Jobs waiting to run in this session.
         queued_jobs: QueuedJobs,
     },
 }
 
 impl SessionState {
+    fn frontier(&self) -> Version {
+        use SessionState::*;
+        match self {
+            Inactive { frontier } => frontier.clone(),
+            Active { frontier, .. } => frontier.clone(),
+        }
+    }
+
     fn active_session(&mut self) -> Option<SessionGuard<'_>> {
         use SessionState::*;
         match self {
-            Inactive => None,
+            Inactive { .. } => None,
             Active {
                 session,
                 queued_jobs,
@@ -64,7 +78,7 @@ impl SessionState {
     pub fn session(&self) -> Option<&Session> {
         use SessionState::*;
         match self {
-            Inactive => None,
+            Inactive { .. } => None,
             Active { session, .. } => Some(session),
         }
     }
@@ -72,8 +86,16 @@ impl SessionState {
     fn queued_jobs(&self) -> Option<&QueuedJobs> {
         use SessionState::*;
         match self {
-            Inactive => None,
+            Inactive { .. } => None,
             Active { queued_jobs, .. } => Some(queued_jobs),
+        }
+    }
+}
+
+impl Default for SessionState {
+    fn default() -> Self {
+        Self::Inactive {
+            frontier: Version::new(),
         }
     }
 }
@@ -113,7 +135,7 @@ impl<'a> SessionGuard<'a> {
         let job_id = job.job_id().clone();
         if history.contains(&job_id) {
             // Note but otherwise ignore the duplicate job.
-            warn!(log, "already started job"; "job_id" => %job_id);
+            info!(log, "already started job"; "job_id" => %job_id);
         } else if self.queued_jobs.len() >= MAX_QUEUED_JOBS
             && !self.queued_jobs.contains_key(&job_id)
         {
@@ -241,77 +263,69 @@ impl State {
         message: &Arc<Message>,
     ) -> Result<(), Error> {
         use SessionState::*;
-
         match message.as_ref() {
             Message::Request(request) => match request {
                 Request::Session(session_request) => match session_request.as_ref() {
                     SessionRequest::Start(session_id) => match &mut self.session {
-                        Inactive => {
+                        // Re-announcement of active session; absorb and ignore.
+                        Active {
+                            frontier, session, ..
+                        } if session.session_id() == session_id => {
+                            *frontier |= incoming_version.clone();
+                            info!(log, "duplicate session start"; "session_id" => %session_id);
+                        }
+
+                        // If the incoming new session is in the *strict
+                        // causal future* of everything we have observed,
+                        // adopt it regardless of our current state. Every
+                        // other peer will make the same decision, so it
+                        // will come to dominate the network entirely.
+                        Inactive { frontier } | Active { frontier, .. }
+                            if *incoming_version > *frontier =>
+                        {
                             self.session = Active {
+                                frontier: self.session.frontier() | incoming_version.clone(),
+                                started: incoming_version.clone(),
                                 session: Box::new(Session::new(session_id.clone())),
-                                session_start: incoming_version.clone(),
                                 queued_jobs: QueuedJobs::new(),
                             }
                         }
+
+                        // When the incoming session is concurrent, we can't
+                        // establish which is older, so we have to kill both
+                        // sessions. Every peer will make this same decision,
+                        // so as a partition resolves, both sessions will be
+                        // killed everywhere.
                         Active {
+                            frontier,
+                            started,
                             session,
-                            session_start: created,
                             ..
-                        } if session.session_id() == session_id => {
-                            // Duplicate session starts; join with the incoming
-                            // version and ignore.
-                            *created |= incoming_version.clone();
-                            info!(log, "duplicate session start"; "session_id" => %session_id);
+                        } if incoming_version.partial_cmp(frontier).is_none() => {
+                            let error = Error::ConcurrentSessions {
+                                own_session: session.session_id().clone(),
+                                own_version: started.clone(),
+                                incoming_session: session_id.clone(),
+                                incoming_version: incoming_version.clone(),
+                            };
+                            self.session = Inactive {
+                                frontier: &*frontier | incoming_version.clone(),
+                            };
+                            return Err(error);
                         }
-                        Active {
-                            session,
-                            session_start: created,
-                            ..
-                        } => match (*created).partial_cmp(incoming_version) {
-                            // If the incoming new session is in the *strict
-                            // causal future* of our current session, then we
-                            // adopt that session; every other peer will make
-                            // the same decision, so it will come to dominate
-                            // the network entirely.
-                            Some(Ordering::Less) => {
-                                self.session = Active {
-                                    session: Box::new(Session::new(session_id.clone())),
-                                    session_start: incoming_version.clone(),
-                                    queued_jobs: QueuedJobs::new(),
-                                }
-                            }
-                            // If we already have the newest session, then we
-                            // just drop the other one on the floor.
-                            Some(Ordering::Greater) => {}
-                            // When the incoming session is concurrent, we can't
-                            // establish which is older, so we have to kill both
-                            // sessions. Every peer will make this same
-                            // decision, so as a partition resolves, both
-                            // sessions will be killed everywhere.
-                            None => {
-                                let error = Error::ConcurrentSessions {
-                                    own_session: session.session_id().clone(),
-                                    own_version: created.clone(),
-                                    incoming_session: session_id.clone(),
-                                    incoming_version: incoming_version.clone(),
-                                };
-                                self.session = Inactive;
-                                return Err(error);
-                            }
-                            // No sessions can have equal creation times,
-                            // because rumors guarantees that no messages have
-                            // equal versions. However, we can't panic here, so
-                            // invalidate both sessions.
-                            Some(Ordering::Equal) => {
-                                error!(
-                                    log,
-                                    "causality violation: distinct sessions with equal versions";
-                                    "session_id" => %session.session_id(),
-                                    "version" => %created,
-                                );
-                                self.session = Inactive;
-                            }
-                        },
+
+                        // Stale (≤ frontier) or concurrent while inactive; OBE.
+                        // Absorb and ignore.
+                        Inactive { frontier, .. } | Active { frontier, .. } => {
+                            info!(
+                                log,
+                                "stale session start";
+                                "session_id" => %session_id,
+                                "frontier" => %frontier,
+                                "incoming_version" => %incoming_version,
+                            );
+                            *frontier |= incoming_version.clone();
+                        }
                     },
                     SessionRequest::Stop(session_id) => {
                         // Any session stop request for a session that isn't
@@ -324,10 +338,14 @@ impl State {
                         // ordering above when handling session-start. Together,
                         // this means that we can't fail to react to a stop for
                         // the active session.
-                        if let Active { session, .. } = &self.session
+                        if let Active {
+                            frontier, session, ..
+                        } = &self.session
                             && session.session_id() == session_id
                         {
-                            self.session = Inactive
+                            self.session = Inactive {
+                                frontier: frontier.clone(),
+                            }
                         }
                     }
                     SessionRequest::Skip(session_id, job_id) => {
@@ -348,7 +366,7 @@ impl State {
                                 &mut self.attachments,
                             );
                         } else {
-                            warn!(
+                            info!(
                                 log,
                                 "skipping job in inactive or invalid session";
                                 "session_id" => %session_id
