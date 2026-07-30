@@ -13,10 +13,10 @@ use chrono::Utc;
 use futures::Stream;
 use pwd::Passwd;
 use rustix::io::close;
-use rustix::process::{ioctl_tiocsctty, setsid};
+use rustix::process::{Pid, Signal, ioctl_tiocsctty, kill_process_group, setsid};
 use slog::{Logger, debug, error, o};
 use tokio::fs::{DirBuilder, File};
-use tokio::process::Command;
+use tokio::process::{Child, Command};
 use tokio::sync::{mpsc, watch};
 use tokio::{select, spawn};
 use tokio_stream::wrappers::ReceiverStream;
@@ -182,6 +182,15 @@ async fn job_spawn(
         cmd.pre_exec(move || limits.apply());
     }
 
+    // Always create a new process session and group.
+    // Job stop kills the whole group.
+    unsafe {
+        cmd.pre_exec(move || {
+            setsid()?;
+            Ok(())
+        });
+    }
+
     if interactive {
         // Create a pseudoterminal and wire the child up to it.
         let (pty, pts, pts_path) = with_io_err!(Pty::open(), "opening pseudoterminal".to_string());
@@ -199,7 +208,6 @@ async fn job_spawn(
             let pty = pty.as_raw_fd();
             cmd.pre_exec(move || {
                 close(pty); // not needed in the child
-                setsid()?; // create new process session
                 ioctl_tiocsctty(&pts)?; // set controlling terminal
                 Ok(())
             });
@@ -282,10 +290,7 @@ async fn job_spawn(
                 loop {
                     select! {
                         _ = stop.cancelled(), if !killed => {
-                            match child.start_kill() {
-                                Ok(()) => debug!(log, "killed job processes"),
-                                Err(err) => error!(log, "unable to kill job"; "error" => %err),
-                            }
+                            kill_job(&log, &child);
                             killed = true;
                         }
                         exit_status = child.wait() => {
@@ -354,5 +359,22 @@ async fn send_error(
         .await
     {
         error!(log, "can't send error event"; "error" => %send_error);
+    }
+}
+
+/// Kill a job's whole process group, of which `child` should be the leader.
+///
+/// TODO: 2-stage stop with `SIGTERM` and a grace period.
+pub fn kill_job(log: &Logger, child: &Child) {
+    if let Some(pid) = child.id()
+        && let Ok(pid) = pid.try_into()
+        && let Some(pid) = Pid::from_raw(pid)
+    {
+        match kill_process_group(pid, Signal::KILL) {
+            Ok(()) => debug!(log, "killed job processes"),
+            Err(err) => error!(log, "unable to kill job"; "error" => %err),
+        }
+    } else {
+        debug!(log, "process is already dead or has an invalid PID");
     }
 }

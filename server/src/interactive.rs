@@ -31,6 +31,7 @@ use sush_common::interactive::{
 };
 use tokio_util::sync::CancellationToken;
 
+use crate::executor::kill_job;
 use crate::mux::WebSocketMux;
 use crate::pty::Pty;
 
@@ -198,10 +199,7 @@ async fn interactive_job(
 
             // Stop job on cancellation signal, but only once.
             _ = stop.cancelled(), if !killed => {
-                match child.start_kill() {
-                    Err(error) => error!(log, "failed to kill job process"; "error" => %error),
-                    Ok(()) => debug!(log, "killed job process"),
-                }
+                kill_job(&log, &child);
                 killed = true;
             }
 
