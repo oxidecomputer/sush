@@ -29,7 +29,7 @@ use crate::io::JobIo;
 use crate::job::{Job, SocketSender};
 use crate::messages::{Event, JobEvent};
 use crate::output::JobOutputDir;
-use crate::pty::Pty;
+use crate::pty::open_pty;
 
 pub const DEFAULT_PATH: &str = "/usr/sbin:/usr/bin:/sbin:/bin";
 pub const DEFAULT_TERM: &str = "vt100";
@@ -193,7 +193,8 @@ async fn job_spawn(
 
     let job = if interactive {
         // Create a pseudoterminal and wire the child up to it.
-        let (pty, pts, pts_path) = with_io_err!(Pty::open(), "opening pseudoterminal".to_string());
+        let (pty, writer, pts, pts_path) =
+            with_io_err!(open_pty(), "opening pseudoterminal".to_string());
         macro_rules! pts_clone {
             () => {
                 with_io_err!(pts.try_clone(), "cloning pseudoterminal".to_string())
@@ -224,10 +225,7 @@ async fn job_spawn(
 
         // Start the interactive job.
         let child = with_io_err!(cmd.spawn(), "spawning interactive job".to_string());
-        let io = with_io_err!(
-            JobIo::interactive(pty, stop.child_token()),
-            "creating pty I/O wrapper".to_string()
-        );
+        let io = JobIo::interactive(pty, writer, stop.child_token());
         Job::start(
             log.new(o!("interactive" => interactive)),
             child,

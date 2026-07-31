@@ -317,7 +317,7 @@ mod test {
     use tokio::process::Command;
 
     use crate::io::JobIo;
-    use crate::pty::Pty;
+    use crate::pty::open_pty;
 
     use super::*;
 
@@ -330,7 +330,7 @@ mod test {
             let decorator = PlainSyncDecorator::new(TestStdoutWriter);
             let drain = FullFormat::new(decorator).build().fuse();
             let log = Logger::root(drain, o!("test" => function_name!()));
-            let (pty, pts, pts_path) = Pty::open().unwrap();
+            let (pty, writer, pts, pts_path) = open_pty().unwrap();
             assert!(pts_path.starts_with("/dev/pts/"));
 
             let output_file = NamedTempFile::new().unwrap();
@@ -340,7 +340,7 @@ mod test {
                 .spawn()
                 .unwrap();
             let stop = CancellationToken::new();
-            let io = JobIo::interactive(pty, stop.child_token()).unwrap();
+            let io = JobIo::interactive(pty, writer, stop.child_token());
             let job = Job::start(
                 log,
                 child,

@@ -21,43 +21,38 @@ use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
 
 use sush_common::interactive::WindowSize;
 
-/// Unix pseudoterminal.
-#[derive(Debug)]
-pub struct Pty(AsyncFd<OwnedFd>);
+/// Open and configure a Unix pseudoterminal. We return a reader/control
+/// handle, a write handle, the slave fd, and its path.
+pub fn open_pty() -> io::Result<(PtyReader, PtyWriter, OwnedFd, PathBuf)> {
+    let pty = openpt(OpenptFlags::RDWR | OpenptFlags::NOCTTY)?;
+    grantpt(&pty)?;
+    unlockpt(&pty)?;
+    fcntl_setfl(&pty, OFlags::NONBLOCK)?;
 
-impl Pty {
-    /// Open and configure the pseudoterminal.
-    pub fn open() -> io::Result<(Self, OwnedFd, PathBuf)> {
-        let pty = openpt(OpenptFlags::RDWR | OpenptFlags::NOCTTY)?;
-        grantpt(&pty)?;
-        unlockpt(&pty)?;
-        fcntl_setfl(&pty, OFlags::NONBLOCK)?;
+    let pts_name = ptsname(&pty, Vec::new())?;
+    let pts_path = PathBuf::from(OsStr::from_bytes(pts_name.to_bytes()));
+    let pts = open(&pts_path, OFlags::RDWR | OFlags::NOCTTY, Mode::empty())?;
 
-        let pts_name = ptsname(&pty, Vec::new())?;
-        let pts_path = PathBuf::from(OsStr::from_bytes(pts_name.to_bytes()));
-        let pts = open(&pts_path, OFlags::RDWR | OFlags::NOCTTY, Mode::empty())?;
-
-        // Push the terminal interface STREAMS modules; see pts(4D).
-        #[cfg(target_os = "illumos")]
-        unsafe {
-            let fd = pts.as_raw_fd();
-            if libc::ioctl(fd, libc::I_PUSH, c"ptem") != 0
-                || libc::ioctl(fd, libc::I_PUSH, c"ldterm") != 0
-            {
-                return Err(io::Error::last_os_error());
-            }
+    // Push the terminal interface STREAMS modules; see pts(4D).
+    #[cfg(target_os = "illumos")]
+    unsafe {
+        let fd = pts.as_raw_fd();
+        if libc::ioctl(fd, libc::I_PUSH, c"ptem") != 0
+            || libc::ioctl(fd, libc::I_PUSH, c"ldterm") != 0
+        {
+            return Err(io::Error::last_os_error());
         }
-
-        Ok((Self(AsyncFd::new(pty)?), pts, pts_path))
     }
 
-    /// Get a writer to the pseudoterminal's input.
-    pub fn writer(&self) -> io::Result<PtyWriter> {
-        Ok(PtyWriter(AsyncFd::new(
-            self.0.as_fd().try_clone_to_owned()?,
-        )?))
-    }
+    let dup = AsyncFd::new(pty.try_clone()?)?;
+    let fd = AsyncFd::new(pty)?;
+    Ok((PtyReader(fd), PtyWriter(dup), pts, pts_path))
+}
 
+#[derive(Debug)]
+pub struct PtyReader(AsyncFd<OwnedFd>);
+
+impl PtyReader {
     /// Get the current pseudoterminal window size.
     pub fn get_window_size(&self) -> io::Result<WindowSize> {
         Ok(tcgetwinsize(&self.0)?.into())
@@ -69,19 +64,7 @@ impl Pty {
     }
 }
 
-impl AsFd for Pty {
-    fn as_fd(&self) -> BorrowedFd<'_> {
-        self.0.as_fd()
-    }
-}
-
-impl AsRawFd for Pty {
-    fn as_raw_fd(&self) -> RawFd {
-        self.0.as_raw_fd()
-    }
-}
-
-impl AsyncRead for Pty {
+impl AsyncRead for PtyReader {
     fn poll_read(
         self: Pin<&mut Self>,
         cx: &mut Context<'_>,
@@ -102,10 +85,23 @@ impl AsyncRead for Pty {
     }
 }
 
+impl AsFd for PtyReader {
+    fn as_fd(&self) -> BorrowedFd<'_> {
+        self.0.as_fd()
+    }
+}
+
+impl AsRawFd for PtyReader {
+    fn as_raw_fd(&self) -> RawFd {
+        self.0.as_raw_fd()
+    }
+}
+
 #[derive(Debug)]
 pub struct PtyWriter(AsyncFd<OwnedFd>);
 
 impl AsyncWrite for PtyWriter {
+    /// Write some input to a pseudoterminal.
     fn poll_write(
         self: Pin<&mut Self>,
         cx: &mut Context<'_>,
@@ -120,10 +116,12 @@ impl AsyncWrite for PtyWriter {
         }
     }
 
+    /// Writes go straight to the fd, so there's nothing to flush.
     fn poll_flush(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<io::Result<()>> {
         Poll::Ready(Ok(()))
     }
 
+    /// Can't half-close a pty, the fd closes on drop.
     fn poll_shutdown(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<io::Result<()>> {
         Poll::Ready(Ok(()))
     }
@@ -137,8 +135,8 @@ mod test {
     use rustix::termios::tcgetwinsize;
 
     #[tokio::test]
-    async fn open_pty() {
-        let (pty, pts, pts_path) = Pty::open().unwrap();
+    async fn pty() {
+        let (pty, _writer, pts, pts_path) = open_pty().unwrap();
         let pty_flags = fcntl_getfl(&pty).unwrap();
         let pts_flags = fcntl_getfl(&pts).unwrap();
         assert!(!(pty_flags & OFlags::RDWR).is_empty());
@@ -149,7 +147,7 @@ mod test {
 
     #[tokio::test]
     async fn set_window_size() {
-        let (pty, pts, _pts_path) = Pty::open().unwrap();
+        let (pty, _writer, pts, _pts_path) = open_pty().unwrap();
         let winsz = tcgetwinsize(&pts).unwrap();
         let rows = winsz.ws_row + 80;
         let cols = winsz.ws_col + 24;

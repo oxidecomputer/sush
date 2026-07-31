@@ -19,7 +19,7 @@ use tokio_util::sync::CancellationToken;
 use sush_common::interactive::WindowSize;
 use sush_common::jobs::JobOutputStream::{self, *};
 
-use crate::pty::Pty;
+use crate::pty::{PtyReader, PtyWriter};
 
 const INPUT_CHANNEL_CAPACITY: usize = 100;
 const BATCH_OUTPUT_BUFFER_SIZE: usize = 0x10000;
@@ -27,7 +27,7 @@ const INTERACTIVE_OUTPUT_BUFFER_SIZE: usize = 0x2000;
 
 pub enum JobIo {
     Interactive {
-        pty: Pty,
+        pty: PtyReader,
         tx_input: mpsc::Sender<Bytes>,
     },
     Batch {
@@ -39,27 +39,10 @@ pub enum JobIo {
 }
 
 impl JobIo {
-    pub fn interactive(pty: Pty, stop: CancellationToken) -> io::Result<Self> {
-        let (tx_input, mut rx_input) = mpsc::channel::<Bytes>(INPUT_CHANNEL_CAPACITY);
-        let mut pty_writer = pty.writer()?;
-        spawn(async move {
-            loop {
-                select! {
-                    recvd = rx_input.recv() => {
-                        if let Some(input) = recvd {
-                            pty_writer.write_all(&input).await?;
-                        } else {
-                            break;
-                        }
-                    }
-                    _ = stop.cancelled() => {
-                        break;
-                    }
-                }
-            }
-            Ok::<_, io::Error>(())
-        });
-        Ok(Self::Interactive { pty, tx_input })
+    pub fn interactive(pty: PtyReader, writer: PtyWriter, stop: CancellationToken) -> Self {
+        let (tx_input, rx_input) = mpsc::channel::<Bytes>(INPUT_CHANNEL_CAPACITY);
+        spawn(Self::relay_input(rx_input, writer, stop));
+        Self::Interactive { pty, tx_input }
     }
 
     pub fn batch(stdout: ChildStdout, stderr: ChildStderr) -> Self {
@@ -69,6 +52,28 @@ impl JobIo {
             stdout_eof: false,
             stderr_eof: false,
         }
+    }
+
+    async fn relay_input(
+        mut rx_input: mpsc::Receiver<Bytes>,
+        mut pty_writer: PtyWriter,
+        stop: CancellationToken,
+    ) -> io::Result<()> {
+        loop {
+            select! {
+                recvd = rx_input.recv() => {
+                    if let Some(input) = recvd {
+                        pty_writer.write_all(&input).await?;
+                    } else {
+                        break;
+                    }
+                }
+                _ = stop.cancelled() => {
+                    break;
+                }
+            }
+        }
+        Ok::<_, io::Error>(())
     }
 
     pub async fn read_output(&mut self) -> io::Result<(Bytes, JobOutputStream)> {
