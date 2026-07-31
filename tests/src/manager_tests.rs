@@ -10,6 +10,7 @@ use rumors::Peer;
 use sled_hardware_types::BaseboardId;
 use slog::{Discard, Logger, o};
 use tempfile::TempDir;
+use tokio::time::timeout;
 use tokio_util::sync::CancellationToken;
 use x509_cert::time::Validity;
 
@@ -78,7 +79,7 @@ fn check_status_stopped(
 #[tokio::test]
 async fn jobs() {
     let log = test_logger(function_name!());
-    let (mgr, mut root, _dir) = manager_and_test_root(log).await;
+    let (mgr, mut root, _dir, _shutdown) = manager_and_test_root(log).await;
     let baseboard_id = mgr.own_baseboard();
     let authn = fake_identity(&mut root).await;
     let session_id = SessionId::new();
@@ -194,7 +195,7 @@ async fn jobs() {
 #[tokio::test]
 async fn job_stop() {
     let log = test_logger(function_name!());
-    let (mgr, mut root, _dir) = manager_and_test_root(log).await;
+    let (mgr, mut root, _dir, _shutdown) = manager_and_test_root(log).await;
     let baseboard_id = mgr.own_baseboard();
     let authn = fake_identity(&mut root).await;
     let session_id = SessionId::new();
@@ -277,7 +278,7 @@ async fn job_stop() {
 #[tokio::test]
 async fn cancel_queued_job() {
     let log = test_logger(function_name!());
-    let (mgr, mut root, _dir) = manager_and_test_root(log).await;
+    let (mgr, mut root, _dir, _shutdown) = manager_and_test_root(log).await;
     let authn = fake_identity(&mut root).await;
     let session_id = SessionId::new();
     let mut session = Session::new(session_id.clone());
@@ -348,6 +349,47 @@ async fn cancel_queued_job() {
     )
     .await
     .expect("should be able to stop job A");
+}
+
+#[named]
+#[tokio::test]
+async fn shutdown() {
+    let log = test_logger(function_name!());
+    let (mut mgr, mut root, _dir, shutdown) = manager_and_test_root(log).await;
+    let authn = fake_identity(&mut root).await;
+    let session_id = SessionId::new();
+    let session = Session::new(session_id.clone());
+    mgr.session_start(
+        &authn,
+        session_id.clone(),
+        SessionStartParams { wait: true },
+    )
+    .await
+    .unwrap();
+
+    let command = "sleep 30";
+    let job_id = session.next_job_id();
+    let job = root.sign_job_request(&job_id, command, false).await;
+    mgr.job_start(
+        &authn,
+        job.clone().into_signed(),
+        JobStartParams {
+            limits: JobLimits::default(),
+            wait: JobWait::Start,
+            ..Default::default()
+        },
+    )
+    .await
+    .expect("should be able to start job");
+
+    shutdown.cancel();
+    timeout(Duration::from_secs(5), mgr.take_join_handle().unwrap())
+        .await
+        .expect("state manager failed to drain")
+        .unwrap();
+
+    let status = mgr.job_status(&authn, &job_id).await.unwrap()[mgr.own_baseboard()].clone();
+    check_status_stopped(status, &job_id, Err(ProcessError::Killed(SIGKILL)), 0, 0);
 }
 
 #[named]
@@ -445,7 +487,7 @@ async fn cert_chain() {
 #[tokio::test]
 async fn too_much_cpu() {
     let log = test_logger(function_name!());
-    let (mgr, mut root, _dir) = manager_and_test_root(log).await;
+    let (mgr, mut root, _dir, _shutdown) = manager_and_test_root(log).await;
     let baseboard_id = mgr.own_baseboard();
     let authn = fake_identity(&mut root).await;
     let session_id = SessionId::new();
@@ -517,7 +559,7 @@ async fn too_much_cpu() {
 #[tokio::test]
 async fn output_ranges() {
     let log = test_logger(function_name!());
-    let (mgr, mut root, _dir) = manager_and_test_root(log).await;
+    let (mgr, mut root, _dir, _shutdown) = manager_and_test_root(log).await;
     let baseboard_id = mgr.own_baseboard();
     let authn = fake_identity(&mut root).await;
     let session_id = SessionId::new();
@@ -711,7 +753,7 @@ async fn output_ranges() {
 #[tokio::test]
 async fn iam() {
     let log = test_logger(function_name!());
-    let (mgr, mut root, _dir) = manager_and_test_root(log).await;
+    let (mgr, mut root, _dir, _shutdown) = manager_and_test_root(log).await;
     let JobError::Unauthorized(nonce) = mgr.iam(None, None).await.unwrap_err() else {
         panic!("should not be authorized yet");
     };

@@ -7,6 +7,7 @@ use std::collections::BTreeMap;
 use std::io;
 use std::os::fd::AsRawFd as _;
 use std::process::Stdio;
+use std::sync::{Arc, RwLock};
 
 use chrono::Utc;
 use futures::Stream;
@@ -34,9 +35,14 @@ use crate::pty::open_pty;
 pub const DEFAULT_PATH: &str = "/usr/sbin:/usr/bin:/sbin:/bin";
 pub const DEFAULT_TERM: &str = "vt100";
 
+/// This queue size is an arbitrary choice. We expect to consume
+/// messages from the channel very rapidly, so should not
+/// experience backpressure; if we do, something is wrong.
+const EVENTS_CHANNEL_CAPACITY: usize = 16;
+
 pub struct Executor {
     log: Logger,
-    events: mpsc::Sender<Event>,
+    events: Arc<RwLock<Option<mpsc::Sender<Event>>>>,
     output_dir: JobOutputDir,
     shutdown: CancellationToken,
     stop: BTreeMap<JobId, CancellationToken>,
@@ -49,19 +55,29 @@ impl Executor {
         output_dir: JobOutputDir,
         shutdown: CancellationToken,
     ) -> (Self, impl Stream<Item = Event> + Send + 'static) {
-        // This queue size is an arbitrary choice. We expect to consume
-        // messages from the channel very rapidly, so should not
-        // experience backpressure; if we do, something is wrong.
-        let (tx, rx) = mpsc::channel(16);
+        let (tx_events, rx_events) = mpsc::channel(EVENTS_CHANNEL_CAPACITY);
+        let events = Arc::new(RwLock::new(Some(tx_events)));
+
+        // Stop sending new events to the state manager on shutdown.
+        spawn({
+            let events = events.clone();
+            let shutdown = shutdown.clone();
+            async move {
+                shutdown.cancelled().await;
+                events.write().unwrap().take();
+            }
+        });
+
+        // Return the executor and event stream.
         (
             Self {
                 log,
-                events: tx,
+                events,
                 output_dir,
                 shutdown,
                 stop: BTreeMap::new(),
             },
-            ReceiverStream::new(rx),
+            ReceiverStream::new(rx_events),
         )
     }
 
@@ -71,11 +87,16 @@ impl Executor {
         params: JobStartParams,
         tx_attachment: watch::Sender<Option<SocketSender>>,
     ) {
+        let Some(events) = self.events.read().unwrap().as_ref().cloned() else {
+            // No more events ⇒ shutting down ⇒ no new jobs allowed.
+            return;
+        };
+
         let stop = self.shutdown.child_token();
         self.stop.insert(request.job_id().clone(), stop.clone());
         spawn(job_spawn(
             self.log.new(o!("job_id" => request.job_id().clone())),
-            self.events.clone(),
+            events,
             self.output_dir.clone(),
             request,
             params,

@@ -95,7 +95,9 @@ pub async fn fake_identity(key: &mut EphemeralKey) -> Identity {
     Identity::new(key.ssh_public_key(), verified, Utc::now()).unwrap()
 }
 
-pub async fn manager_and_test_root(log: Logger) -> (JobManager, EphemeralKey, TempDir) {
+pub async fn manager_and_test_root(
+    log: Logger,
+) -> (JobManager, EphemeralKey, TempDir, CancellationToken) {
     let dir = TempDir::with_prefix("sush-").unwrap();
     let gossip = Peer::seed().into_rumors();
     let shutdown = CancellationToken::new();
@@ -104,14 +106,14 @@ pub async fn manager_and_test_root(log: Logger) -> (JobManager, EphemeralKey, Te
         dir.path().to_owned(),
         test_baseboard_id(),
         gossip,
-        shutdown,
+        shutdown.clone(),
     )
     .await
     .unwrap();
     let root = ephemeral_test_root();
     let key_id = mgr.import_root(root.cert().to_owned()).await.unwrap();
     assert_eq!(&key_id, root.key_id());
-    (mgr, root, dir)
+    (mgr, root, dir, shutdown)
 }
 
 pub async fn authz<E>(

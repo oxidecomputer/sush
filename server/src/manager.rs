@@ -13,6 +13,7 @@ use rumors::Rumors;
 use sled_hardware_types::BaseboardId;
 use slog::{Logger, debug, info, o, warn};
 use tokio::sync::{Mutex, mpsc, watch};
+use tokio::task::JoinHandle;
 use tokio::time::timeout;
 use tokio_stream::wrappers::ReceiverStream;
 use tokio_util::sync::CancellationToken;
@@ -70,6 +71,7 @@ pub struct JobManager {
     own_baseboard: BaseboardId,
     state: watch::Receiver<State>, // from the state manager
     tx_req: mpsc::Sender<Request>, // to the state manager
+    join_state: Option<JoinHandle<()>>,
 }
 
 impl JobManager {
@@ -84,22 +86,24 @@ impl JobManager {
         let output_dir = JobOutputDir::new(output_dir);
         let (tx_req, rx_req) = mpsc::channel(16);
         let requests = ReceiverStream::new(rx_req);
+        let (rx_state, join_state) = StateManager::run(
+            log.new(o!("component" => "state manager")),
+            output_dir.clone(),
+            own_baseboard.clone(),
+            requests,
+            rumors,
+            shutdown,
+        );
         let new = Self {
             log: log.new(o!("component" => "job manager")),
             nonces: Arc::new(Mutex::new(LruCache::new(MAX_OUTSTANDING_NONCES))),
             identities: Arc::new(Mutex::new(LruCache::new(MAX_CACHED_IDENTITIES))),
             certs: Arc::new(Mutex::new(LruCache::new(MAX_CERTS))),
-            own_baseboard: own_baseboard.clone(),
-            output_dir: output_dir.clone(),
-            state: StateManager::run(
-                log.new(o!("component" => "state manager")),
-                output_dir,
-                own_baseboard,
-                requests,
-                rumors,
-                shutdown,
-            ),
+            own_baseboard,
+            output_dir,
+            state: rx_state,
             tx_req,
+            join_state: Some(join_state),
         };
 
         // Import the root certificates.
@@ -333,6 +337,10 @@ impl JobManager {
     }
 
     // Waiting.
+
+    pub fn take_join_handle(&mut self) -> Option<JoinHandle<()>> {
+        self.join_state.take()
+    }
 
     fn wait_for_session(&self, session_id: SessionId) -> impl FnMut(&State) -> bool {
         move |state| {

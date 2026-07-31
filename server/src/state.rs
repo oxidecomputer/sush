@@ -12,6 +12,7 @@ use rumors::{Key, Rumors, Version};
 use sled_hardware_types::BaseboardId;
 use slog::{Logger, debug, error, info, o, warn};
 use tokio::sync::watch;
+use tokio::task::JoinHandle;
 use tokio::{select, spawn};
 use tokio_util::sync::CancellationToken;
 
@@ -522,7 +523,7 @@ impl StateManager {
         mut requests: R,
         rumors: Rumors<Message>,
         shutdown: CancellationToken,
-    ) -> watch::Receiver<State>
+    ) -> (watch::Receiver<State>, JoinHandle<()>)
     where
         R: Stream<Item = Request> + Send + Unpin + 'static,
     {
@@ -538,22 +539,26 @@ impl StateManager {
         let mut causal_messages = rumors.causal_messages();
 
         // The executor needs to have access to send messages back.
-        let (mut executor, mut events) =
-            Executor::new(log.new(o!("component" => "executor")), output_dir, shutdown);
+        let (mut executor, mut events) = Executor::new(
+            log.new(o!("component" => "executor")),
+            output_dir,
+            shutdown.child_token(),
+        );
 
         // We will drop this once we want to drain the remaining messages.
         let mut rumors = Some(rumors);
 
-        spawn({
-            async move {
+        (
+            rx_state,
+            spawn(async move {
                 info!(log, "managing state");
 
                 // These flip both to `true` once our two input streams (local
-                // requests and local events from the executor) terminate. At
-                // this point, we must drop `rumors` and thereby permit its own
-                // `unordered_messages` stream to eventually be drained; we do
-                // this so that we fully update the local state until nothing
-                // more is left to do.
+                // requests and local events from the executor) terminate or
+                // we're shutting down. At this point, we must drop `rumors`
+                // and thereby permit its own `unordered_messages` stream to
+                // eventually be drained; we do this so that we fully update
+                // the local state until nothing more is left to do.
                 let mut requests_empty = false;
                 let mut events_empty = false;
 
@@ -584,6 +589,7 @@ impl StateManager {
                                 rumors.send(Message::Request(request));
                             },
                         },
+
                         // Handle events produced by the executor.
                         next = events.next(), if !events_empty => match next {
                             None => events_empty = true,
@@ -592,6 +598,7 @@ impl StateManager {
                                 rumors.send(Message::Event(own_baseboard.clone(), event));
                             },
                         },
+
                         // Handle messages from the gossip network.
                         next = message => match next {
                             None => {
@@ -618,11 +625,14 @@ impl StateManager {
                                 });
                             },
                         },
+
+                        // Stop processing requests on shutdown.
+                        _ = shutdown.cancelled(), if !requests_empty => {
+                            requests_empty = true;
+                        }
                     }
                 }
-            }
-        });
-
-        rx_state
+            }),
+        )
     }
 }

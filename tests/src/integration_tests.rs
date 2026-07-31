@@ -36,7 +36,7 @@ fn local_addr() -> SocketAddr {
 async fn client_server() {
     // Spin up a server.
     let log = test_logger(function_name!());
-    let (mgr, mut root, _dir) = manager_and_test_root(log.clone()).await;
+    let (mgr, mut root, _dir, _shutdown) = manager_and_test_root(log.clone()).await;
     let api = api_description::<ApiServer>().unwrap();
     let server = ServerBuilder::new(api, mgr, log)
         .config(ConfigDropshot {
@@ -122,7 +122,7 @@ async fn client_server() {
 async fn client_proxy_server() {
     // Spin up a full server.
     let log = test_logger(function_name!());
-    let (mgr, mut root, _dir) = manager_and_test_root(log.clone()).await;
+    let (mgr, mut root, _dir, _shutdown) = manager_and_test_root(log.clone()).await;
     let api = api_description::<ApiServer>().unwrap();
     let server = ServerBuilder::new(api, mgr, log.clone())
         .config(ConfigDropshot {
@@ -208,7 +208,7 @@ async fn interactive_job() {
 
     // Spin up a server.
     let log = test_logger(function_name!());
-    let (mgr, mut root, _dir) = manager_and_test_root(log.clone()).await;
+    let (mgr, mut root, _dir, _shutdown) = manager_and_test_root(log.clone()).await;
     let api = api_description::<ApiServer>().unwrap();
     let server = ServerBuilder::new(api, mgr, log)
         .config(ConfigDropshot {

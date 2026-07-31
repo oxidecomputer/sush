@@ -64,9 +64,10 @@ async fn main() -> Result<(), String> {
     let gossip = Peer::seed().into_rumors();
 
     let shutdown = listen_for_shutdown()?;
-    let mgr = JobManager::new(log.clone(), directory, baseboard, gossip, shutdown.clone())
+    let mut mgr = JobManager::new(log.clone(), directory, baseboard, gossip, shutdown.clone())
         .await
         .map_err(|e| e.to_string())?;
+    let join = mgr.take_join_handle().expect("should have join handle");
 
     let api = api_description::<ApiServer>()
         .map_err(|error| format!("failed to get API description: {error}"))?;
@@ -81,7 +82,13 @@ async fn main() -> Result<(), String> {
         .map_err(|error| format!("failed to start server: {error}"))?;
 
     shutdown.cancelled().await;
-    server.close().await
+    server
+        .close()
+        .await
+        .map_err(|error| format!("failed to shutdown server: {error}"))?;
+    join.await
+        .map_err(|error| format!("failed to wait for manager: {error}"))?;
+    Ok(())
 }
 
 /// Trigger a cancellation token on receipt of a terminal Unix signal(7).
