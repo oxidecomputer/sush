@@ -54,6 +54,8 @@ pub enum JobError {
     SessionNotCurrent(SessionId),
     #[error("Job output hash mismatch, file may be corrupt")]
     OutputHashMismatch(JobId, JobOutputHash),
+    #[error("Job output file missing or unavailable")]
+    OutputFileMissing(JobId),
     #[error("Output too big, please use range requests")]
     OutputTooBig,
     #[error("Public key for `{0}` does not match stored key")]
@@ -68,6 +70,8 @@ pub enum JobError {
     Timeout,
     #[error("Too many certificates ({0})")]
     TooManyCerts(usize),
+    #[error("Too many simultaneous output requests ({0})")]
+    TooManyOutputRequests(usize),
     #[error("Unauthorized request")]
     Unauthorized(Nonce),
     #[error("Unable to wait for job end")]
@@ -146,6 +150,11 @@ impl From<JobError> for HttpError {
                 ClientErrorStatusCode::REQUEST_TIMEOUT,
                 String::from("Wait timed out"),
             ),
+            TooManyOutputRequests(_) => HttpError::for_client_error(
+                None,
+                ClientErrorStatusCode::TOO_MANY_REQUESTS,
+                error.to_string(),
+            ),
             Unauthorized(nonce) => {
                 let mut err = HttpError::for_client_error(
                     None,
@@ -157,7 +166,8 @@ impl From<JobError> for HttpError {
                     .expect("should be able to add WWW-Authenticate header");
                 err
             }
-            IdentityNotFound(_) | JobNotFound(_) | NoSession | SessionNotCurrent(_) => {
+            IdentityNotFound(_) | JobNotFound(_) | NoSession | OutputFileMissing(_)
+            | SessionNotCurrent(_) => {
                 HttpError::for_client_error(None, ClientErrorStatusCode::NOT_FOUND, message)
             }
             CertChainTooLong | DuplicateJobId(_) | InvalidCommand(_) | Json(_) | MissingCert(_)

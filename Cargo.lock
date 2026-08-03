@@ -3649,6 +3649,8 @@ dependencies = [
  "ed25519-dalek",
  "function_name",
  "futures",
+ "http 1.4.0",
+ "http-body-util",
  "http-range-header",
  "hyper 1.8.1",
  "libc",

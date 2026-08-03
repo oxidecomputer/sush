@@ -150,13 +150,17 @@ async fn jobs() {
     assert_eq!(
         mgr.job_output(&authn, &job_id, baseboard_id, JobOutputStream::Stdout, None)
             .await
-            .unwrap(),
+            .unwrap()
+            .into_bytes()
+            .await,
         job_id_bytes
     );
     assert!(
         mgr.job_output(&authn, &job_id, baseboard_id, JobOutputStream::Stderr, None)
             .await
             .unwrap()
+            .into_bytes()
+            .await
             .is_empty()
     );
 
@@ -180,13 +184,17 @@ async fn jobs() {
     assert_eq!(
         mgr.job_output(&authn, &job_id, baseboard_id, JobOutputStream::Stdout, None)
             .await
-            .unwrap(),
+            .unwrap()
+            .into_bytes()
+            .await,
         output.as_bytes(),
     );
     assert!(
         mgr.job_output(&authn, &job_id, baseboard_id, JobOutputStream::Stderr, None)
             .await
             .unwrap()
+            .into_bytes()
+            .await
             .is_empty()
     );
 }
@@ -534,7 +542,9 @@ async fn too_much_cpu() {
     let stderr = mgr
         .job_output(&authn, &job_id, baseboard_id, JobOutputStream::Stderr, None)
         .await
-        .unwrap();
+        .unwrap()
+        .into_bytes()
+        .await;
     let stderr = String::from_utf8_lossy(&stderr);
     match status {
         JobStatus::Stopped {
@@ -594,7 +604,9 @@ async fn output_ranges() {
     let r = mgr
         .job_output(&authn, &job_id, baseboard_id, JobOutputStream::Stdout, None)
         .await
-        .unwrap();
+        .unwrap()
+        .into_bytes()
+        .await;
 
     // One byte too big.
     assert!(matches!(
@@ -626,7 +638,9 @@ async fn output_ranges() {
             }),
         )
         .await
-        .unwrap(),
+        .unwrap()
+        .into_bytes()
+        .await,
         r
     );
 
@@ -643,7 +657,9 @@ async fn output_ranges() {
             }),
         )
         .await
-        .unwrap();
+        .unwrap()
+        .into_bytes()
+        .await;
     o.extend(
         mgr.job_output(
             &authn,
@@ -656,7 +672,9 @@ async fn output_ranges() {
             }),
         )
         .await
-        .unwrap(),
+        .unwrap()
+        .into_bytes()
+        .await,
     );
     assert_eq!(o, r);
 
@@ -674,7 +692,9 @@ async fn output_ranges() {
             }),
         )
         .await
-        .unwrap(),
+        .unwrap()
+        .into_bytes()
+        .await,
     );
     o.extend(
         mgr.job_output(
@@ -688,7 +708,9 @@ async fn output_ranges() {
             }),
         )
         .await
-        .unwrap(),
+        .unwrap()
+        .into_bytes()
+        .await,
     );
     assert_eq!(o, r);
 
@@ -706,7 +728,9 @@ async fn output_ranges() {
             }),
         )
         .await
-        .unwrap(),
+        .unwrap()
+        .into_bytes()
+        .await,
     );
     assert_eq!(o, r[(n - 1) as usize..]);
 
@@ -727,7 +751,9 @@ async fn output_ranges() {
                     }),
                 )
                 .await
-                .unwrap(),
+                .unwrap()
+                .into_bytes()
+                .await,
             );
             i += l;
         }
@@ -743,7 +769,9 @@ async fn output_ranges() {
                 }),
             )
             .await
-            .unwrap(),
+            .unwrap()
+            .into_bytes()
+            .await,
         );
         assert_eq!(o, r);
     }

@@ -17,6 +17,7 @@ ed25519-dalek = { version = "2", features = ["rand_core"] }
 function_name = "0.3"
 futures = "0.3"
 http = "1"
+http-body-util = "0.1"
 http-range-header = "0.4"
 humantime = "2"
 hyper = "1"

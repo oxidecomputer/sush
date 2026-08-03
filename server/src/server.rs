@@ -1,11 +1,16 @@
 //! API server for the Oxide Support Shell.
 
 use dropshot::{
-    Body, ClientErrorStatusCode, Header, HttpError, HttpResponseOk, HttpResponseUpdatedNoContent,
-    Path as PathParams, Query as QueryParams, RequestContext, TypedBody, WebsocketEndpointResult,
-    WebsocketUpgrade,
+    Body, CONTENT_TYPE_OCTET_STREAM, ClientErrorStatusCode, Header, HttpError, HttpResponseOk,
+    HttpResponseUpdatedNoContent, Path as PathParams, Query as QueryParams, RequestContext,
+    TypedBody, WebsocketEndpointResult, WebsocketUpgrade,
 };
+use futures::TryStreamExt as _;
+use http::StatusCode;
+use http::header::{CONTENT_LENGTH, CONTENT_TYPE};
+use http_body_util::StreamBody;
 use hyper::Response;
+use hyper::body::Frame;
 use sled_hardware_types::BaseboardId;
 use tokio_tungstenite::WebSocketStream;
 use tokio_tungstenite::tungstenite::protocol::Role;
@@ -220,10 +225,17 @@ impl SushApi for ApiServer {
                 )
             })?
         };
-        let stdout = mgr
+
+        let stream = mgr
             .job_output(&authn, &job_id, &target, stream, range)
             .await?;
-        Ok(Response::new(stdout.into()))
+        let length = stream.length();
+        let body = Body::wrap(StreamBody::new(stream.map_ok(Frame::data)));
+        Ok(Response::builder()
+            .status(StatusCode::OK)
+            .header(CONTENT_TYPE, CONTENT_TYPE_OCTET_STREAM)
+            .header(CONTENT_LENGTH, length)
+            .body(body)?)
     }
 
     async fn job_attach(

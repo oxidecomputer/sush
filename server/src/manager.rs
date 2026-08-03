@@ -29,7 +29,7 @@ use sush_common::keys::{KeyError, KeyId, Signature, SshPublicKey};
 use crate::error::JobError;
 use crate::job::SocketSender;
 use crate::messages::{JobRequest, Message, Request, SessionRequest};
-use crate::output::JobOutputDir;
+use crate::output::{JobOutputDir, JobOutputFileStream};
 use crate::state::{State, StateManager};
 
 /// Self-signed (root) X.509 certificates. Self-signed certificates may
@@ -508,7 +508,7 @@ impl JobManager {
         target: &BaseboardId,
         stream: JobOutputStream,
         range: Option<Range>,
-    ) -> Result<Vec<u8>, JobError> {
+    ) -> Result<JobOutputFileStream, JobError> {
         if self.own_baseboard() == target
             && self
                 .state
