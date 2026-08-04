@@ -34,6 +34,7 @@ pub trait SushApi {
     async fn import_cert(
         ctx: RequestContext<Self::Context>,
         headers: Header<Authorization>,
+        query: QueryParams<WaitParam>,
         params: TypedBody<Vec<u8>>,
     ) -> Result<HttpResponseOk<KeyId>, HttpError>;
 
@@ -86,7 +87,7 @@ pub trait SushApi {
         ctx: RequestContext<Self::Context>,
         headers: Header<Authorization>,
         params: PathParams<SessionIdParam>,
-        query: QueryParams<SessionStartParams>,
+        query: QueryParams<WaitParam>,
     ) -> Result<HttpResponseUpdatedNoContent, HttpError>;
 
     /// End a support session.
@@ -178,6 +179,13 @@ pub struct KeyIdParam {
     pub key_id: KeyId,
 }
 
+#[derive(Clone, Debug, Default, Deserialize, JsonSchema, BorshSerialize, BorshDeserialize)]
+#[serde(default)]
+pub struct WaitParam {
+    /// Wait for the subject to appear in the state.
+    pub wait: bool,
+}
+
 #[derive(Deserialize, JsonSchema)]
 pub struct SessionIdParam {
     pub session_id: SessionId,
@@ -187,13 +195,6 @@ pub struct SessionIdParam {
 pub struct SessionAndJobIds {
     pub session_id: SessionId,
     pub job_id: JobId,
-}
-
-#[derive(Clone, Debug, Default, Deserialize, JsonSchema, BorshSerialize, BorshDeserialize)]
-#[serde(default)]
-pub struct SessionStartParams {
-    /// Wait for the session to become active.
-    pub wait: bool,
 }
 
 #[derive(Deserialize, JsonSchema)]

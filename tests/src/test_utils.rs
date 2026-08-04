@@ -101,18 +101,17 @@ pub async fn manager_and_test_root(
     let dir = TempDir::with_prefix("sush-").unwrap();
     let gossip = Peer::seed().into_rumors();
     let shutdown = CancellationToken::new();
+    let root = ephemeral_test_root();
     let mgr = JobManager::new(
         log,
         dir.path().to_owned(),
         test_baseboard_id(),
         gossip,
+        &[root.cert().to_owned()],
         shutdown.clone(),
     )
     .await
     .unwrap();
-    let root = ephemeral_test_root();
-    let key_id = mgr.import_root(root.cert().to_owned()).await.unwrap();
-    assert_eq!(&key_id, root.key_id());
     (mgr, root, dir, shutdown)
 }
 

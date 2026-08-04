@@ -24,13 +24,16 @@ use tokio_util::sync::CancellationToken;
 
 use sush_api::JobStartParams;
 use sush_common::interactive::WindowSize;
-use sush_common::jobs::{JobId, JobOutputStream, JobStartRequest, ProcessError};
+use sush_common::jobs::{
+    JobId, JobOutputStream, JobStartRequest, ProcessError, SignedJob, VerifiedJob,
+};
 
 use crate::io::JobIo;
 use crate::job::{Job, SocketSender};
 use crate::messages::{Event, JobEvent};
 use crate::output::JobOutputDir;
 use crate::pty::open_pty;
+use crate::state::{Certificates, cert_chain};
 
 pub const DEFAULT_PATH: &str = "/usr/sbin:/usr/bin:/sbin:/bin";
 pub const DEFAULT_TERM: &str = "vt100";
@@ -83,7 +86,8 @@ impl Executor {
 
     pub fn job_start(
         &mut self,
-        request: JobStartRequest,
+        certs: &mut Certificates,
+        request: SignedJob,
         params: JobStartParams,
         tx_attachment: watch::Sender<Option<SocketSender>>,
     ) {
@@ -92,13 +96,39 @@ impl Executor {
             return;
         };
 
+        // Validate the job request.
+        let job_id = request.payload().job_id().to_owned();
+        macro_rules! fail {
+            ($err:expr) => {{
+                let log = self.log.clone();
+                let job_id = job_id.clone();
+                let events = events.clone();
+                spawn(async move {
+                    send_error(&log, &job_id, &events, $err).await;
+                });
+                return;
+            }};
+        }
+        if request.payload().command.starts_with('-') {
+            fail!(ProcessError::InvalidCommand);
+        }
+        let chain = match cert_chain(certs, request.key_id()) {
+            Ok(chain) => chain,
+            Err(error) => fail!(ProcessError::InvalidJob(error.to_string())),
+        };
+        let leaf = chain.last().expect("cert chain should be non-empty");
+        let verified_request = match request.verify_with_cert(leaf) {
+            Ok(request) => request,
+            Err(error) => fail!(ProcessError::InvalidJob(error.to_string())),
+        };
+
         let stop = self.shutdown.child_token();
-        self.stop.insert(request.job_id().clone(), stop.clone());
+        self.stop.insert(job_id.clone(), stop.clone());
         spawn(job_spawn(
-            self.log.new(o!("job_id" => request.job_id().clone())),
+            self.log.new(o!("job_id" => job_id.clone())),
             events,
             self.output_dir.clone(),
-            request,
+            verified_request,
             params,
             tx_attachment,
             stop,
@@ -127,7 +157,7 @@ async fn job_spawn(
     log: Logger,
     events: mpsc::Sender<Event>,
     output_dir: JobOutputDir,
-    request: JobStartRequest,
+    request: VerifiedJob,
     params: JobStartParams,
     tx_attachment: watch::Sender<Option<SocketSender>>,
     stop: CancellationToken,
@@ -137,7 +167,7 @@ async fn job_spawn(
         job_id,
         command,
         interactive,
-    } = request;
+    } = request.payload().clone();
     let JobStartParams {
         limits,
         term,
@@ -146,17 +176,14 @@ async fn job_spawn(
         wait: _,
     } = params;
 
-    // Report I/O errors as job events.
+    // Report all I/O errors as job events.
     let io_err = |what| move |err: io::Error| ProcessError::io(what, err);
     macro_rules! with_io_err {
         ($expr:expr, $err:expr) => {
             match $expr.map_err(io_err($err)) {
                 Ok(value) => value,
-                Err(err) => {
-                    if tx_attachment.send(None).is_err() {
-                        error!(log, "can't clear attachment point");
-                    }
-                    send_error(&log, &job_id, &events, err).await;
+                Err(error) => {
+                    send_error(&log, &job_id, &events, error).await;
                     return;
                 }
             }
@@ -293,7 +320,7 @@ async fn job_spawn(
             Ok((result, state)) => {
                 let _ = events
                     .send(Event::Job(JobEvent::Stop(
-                        job_id,
+                        job_id.clone(),
                         Utc::now(),
                         result,
                         state,
@@ -303,7 +330,7 @@ async fn job_spawn(
             Err(error) => {
                 let _ = events
                     .send(Event::Job(JobEvent::Error(
-                        job_id,
+                        job_id.clone(),
                         Utc::now(),
                         ProcessError::Join(error.to_string()),
                     )))
@@ -341,7 +368,7 @@ pub fn kill_job(log: &Logger, child: &Child) {
     {
         match kill_process_group(pid, Signal::KILL) {
             Ok(()) => debug!(log, "killed job processes"),
-            Err(err) => error!(log, "unable to kill job"; "error" => %err),
+            Err(error) => error!(log, "unable to kill job"; "error" => %error),
         }
     } else {
         debug!(log, "process is already dead or has an invalid PID");

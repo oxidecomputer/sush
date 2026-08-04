@@ -10,12 +10,19 @@ use sled_hardware_types::BaseboardId;
 use tokio::signal::unix::{SignalKind, signal};
 use tokio::{select, spawn};
 use tokio_util::sync::CancellationToken;
+use x509_cert::Certificate;
+use x509_cert::der::DecodePem as _;
 
 use sush_api::sush_api_mod::api_description;
 use sush_server::manager::JobManager;
 use sush_server::server::ApiServer;
 
 const DEFAULT_ADDRESS: &str = "0.0.0.0:44444";
+const ROOT_CERTS: &[&[u8]] = &[
+    // export PERMSLIP_URL="https://permslip.inickles.0xeng.dev"
+    // export SUSH_PERMSLIP_KEY="UNTRUSTED Support Shell Prototype"
+    include_bytes!("../certs/sandbox.pem"),
+];
 const ROOT_LOG_NAME: &str = "sush";
 const REQUEST_MAX_BODY_BYTES: usize = 0xFFFF;
 
@@ -63,10 +70,23 @@ async fn main() -> Result<(), String> {
     // TODO: get/seed Rumors network
     let gossip = Peer::seed().into_rumors();
 
-    let shutdown = listen_for_shutdown()?;
-    let mut mgr = JobManager::new(log.clone(), directory, baseboard, gossip, shutdown.clone())
-        .await
+    let roots = ROOT_CERTS
+        .iter()
+        .map(Certificate::from_pem)
+        .collect::<Result<Vec<_>, _>>()
         .map_err(|e| e.to_string())?;
+
+    let shutdown = listen_for_shutdown()?;
+    let mut mgr = JobManager::new(
+        log.clone(),
+        directory,
+        baseboard,
+        gossip,
+        &roots,
+        shutdown.clone(),
+    )
+    .await
+    .map_err(|e| e.to_string())?;
     let join = mgr.take_join_handle().expect("should have join handle");
 
     let api = api_description::<ApiServer>()

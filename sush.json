@@ -17,6 +17,14 @@
             "schema": {
               "type": "string"
             }
+          },
+          {
+            "in": "query",
+            "name": "wait",
+            "description": "Wait for the subject to appear in the state.",
+            "schema": {
+              "type": "boolean"
+            }
           }
         ],
         "requestBody": {
@@ -654,7 +662,7 @@
           {
             "in": "query",
             "name": "wait",
-            "description": "Wait for the session to become active.",
+            "description": "Wait for the subject to appear in the state.",
             "schema": {
               "type": "boolean"
             }
@@ -958,7 +966,8 @@
           {
             "type": "string",
             "enum": [
-              "Unknown"
+              "Unknown",
+              "InvalidCommand"
             ]
           },
           {
@@ -989,6 +998,18 @@
           {
             "type": "object",
             "properties": {
+              "InvalidJob": {
+                "type": "string"
+              }
+            },
+            "required": [
+              "InvalidJob"
+            ],
+            "additionalProperties": false
+          },
+          {
+            "type": "object",
+            "properties": {
               "Io": {
                 "type": "object",
                 "properties": {
@@ -1007,6 +1028,18 @@
             },
             "required": [
               "Io"
+            ],
+            "additionalProperties": false
+          },
+          {
+            "type": "object",
+            "properties": {
+              "Join": {
+                "type": "string"
+              }
+            },
+            "required": [
+              "Join"
             ],
             "additionalProperties": false
           }

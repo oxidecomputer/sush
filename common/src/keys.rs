@@ -8,6 +8,7 @@ use std::ops::Deref;
 
 use borsh::{BorshDeserialize, BorshSerialize};
 use bytes::{Buf as _, BufMut as _, BytesMut};
+use chrono::{DateTime, Utc};
 use crypto_bigint::{ArrayEncoding as _, Random as _, U128, U256};
 use ed25519_dalek::{
     Signature as Ed25519Signature, Signer as _, SigningKey as Ed25519SigningKey,
@@ -879,8 +880,12 @@ pub fn pem_cert_chain(certs: Vec<Certificate>) -> Result<String, KeyError> {
 /// What went wrong handling a key, signature, or certificate.
 #[derive(Debug, Error)]
 pub enum KeyError {
+    #[error("Certificate chain is too long")]
+    CertChainTooLong,
     #[error("DER encoding error: {0}")]
     Der(#[from] x509_cert::der::Error),
+    #[error("Invalid certificate: {0}")]
+    InvalidCert(String),
     #[error(transparent)]
     InvalidCodephrase(#[from] InvalidCodephrase),
     #[error("Invalid key ID")]
@@ -893,10 +898,14 @@ pub enum KeyError {
     InvalidSignatureAlgorithm,
     #[error("Invalid signature encoding")]
     InvalidSignatureEncoding,
+    #[error("Can't find certificate for key `{0}`")]
+    MissingCert(KeyId),
     #[error(transparent)]
     Pem(#[from] pem_rfc7468::Error),
     #[error("SSH agent protocol error: {0}")]
     Protocol(#[from] ProtocolError),
+    #[error("Certificate for key `{0}` was revoked at {1}")]
+    Revoked(KeyId, DateTime<Utc>),
     #[error("Will not import a self-signed (root) certificate")]
     SelfSigned,
     #[error("Signature error: {0}")]
@@ -907,6 +916,8 @@ pub enum KeyError {
     Signer(String),
     #[error("SSH key error: {0}")]
     SshKey(#[from] SshKeyError),
+    #[error("Too many certificates ({0})")]
+    TooManyCerts(usize),
 }
 
 impl KeyError {

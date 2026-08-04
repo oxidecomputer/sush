@@ -15,24 +15,37 @@ use tokio::sync::watch;
 use tokio::task::JoinHandle;
 use tokio::{select, spawn};
 use tokio_util::sync::CancellationToken;
+use x509_cert::Certificate;
+use x509_cert::der::Encode as _;
 
 use sush_api::JobStartParams;
 use sush_common::jobs::{JobId, JobStatus, JobStatusMap, Session, SessionId, SignedJob};
+use sush_common::keys::{KeyError, KeyId, Signature};
 
 use crate::executor::Executor;
 use crate::history::JobHistory;
 use crate::job::SocketSender;
-use crate::messages::{Error, Event, JobEvent, JobRequest, Message, Request, SessionRequest};
+use crate::messages::{
+    CertRequest, Error, Event, JobEvent, JobRequest, Message, Request, SessionRequest,
+};
 use crate::output::JobOutputDir;
 
+pub type AttachmentPoints = BTreeMap<JobId, watch::Receiver<Option<SocketSender>>>;
+pub type Certificates = BTreeMap<KeyId, CertState>;
 pub type QueuedJobs = BTreeMap<JobId, (SignedJob, JobStartParams)>;
 pub type RunningJobs = BTreeMap<(JobId, BaseboardId), DateTime<Utc>>;
-pub type AttachmentPoints = BTreeMap<JobId, watch::Receiver<Option<SocketSender>>>;
+
+/// Maximum certificate chain length.
+pub const MAX_CERT_CHAIN_LEN: usize = 10;
+
+/// Maximum number of job request signing certificates.
+/// The ideal number of certs is 1, so this need not be large.
+pub const MAX_CERTS: usize = 100;
 
 /// Maximum number of jobs a session may have queued (submitted, but not
 /// yet next in the causal chain to run). Bounds memory in the presence
 /// of out-of-order, duplicate, or malformed submissions.
-const MAX_QUEUED_JOBS: usize = 1_000;
+pub const MAX_QUEUED_JOBS: usize = 1_000;
 
 #[derive(Clone, Debug)]
 pub enum SessionState {
@@ -191,20 +204,20 @@ impl<'a> SessionGuard<'a> {
     pub fn execute_ready_jobs(
         &mut self,
         own_baseboard: &BaseboardId,
+        certs: &mut Certificates,
         history: &mut JobHistory,
         executor: &mut Executor,
         attachments: &mut AttachmentPoints,
     ) {
         while let Some((request, params)) = self.next_queued_job() {
             let (tx_attachment, rx_attachment) = watch::channel(None);
-            let payload = request.payload();
-            let job_id = payload.job_id();
+            let job_id = request.payload().job_id().to_owned();
             if history
-                .get_job_status(job_id)
+                .get_job_status(&job_id)
                 .map(|status| matches!(status.get(own_baseboard), Some(JobStatus::Queued { .. })))
                 .unwrap_or(true)
             {
-                executor.job_start(payload.clone(), params, tx_attachment);
+                executor.job_start(certs, request.clone(), params, tx_attachment);
                 attachments.insert(job_id.clone(), rx_attachment);
             }
             self.job_started(request);
@@ -224,17 +237,39 @@ pub struct State {
     session: SessionState,
     /// Attachment points (socket senders) for interactive jobs.
     attachments: AttachmentPoints,
+    /// Job request signing certificates.
+    certs: Certificates,
+    /// Hard-coded root certificate key IDs. Self-signed certificates
+    /// not in this set will be revoked with prejudice.
+    roots: Box<[KeyId]>,
 }
 
 impl State {
-    pub fn new(own_baseboard: BaseboardId) -> Self {
-        Self {
+    pub fn new(own_baseboard: BaseboardId, root_certs: &[Certificate]) -> Self {
+        let certs = root_certs
+            .iter()
+            .map(|cert| {
+                (
+                    KeyId::try_from(cert).expect("root certificate must be well-formed"),
+                    CertState::Unknown(Box::new(cert.clone())),
+                )
+            })
+            .collect::<BTreeMap<KeyId, CertState>>();
+        let roots: Box<[KeyId]> = certs.keys().cloned().collect();
+        let mut new = Self {
             own_baseboard,
             running: Default::default(),
             history: Default::default(),
             session: Default::default(),
             attachments: Default::default(),
+            certs,
+            roots: roots.clone(),
+        };
+        new.validate_certs(&roots);
+        for root in &roots {
+            assert!(new.certs[root].is_valid());
         }
+        new
     }
 
     pub fn get_attachment(&self, job_id: &JobId) -> Option<SocketSender> {
@@ -253,6 +288,29 @@ impl State {
         self.history.get_job_status(job_id)
     }
 
+    fn import_cert(&mut self, cert: &Certificate) -> Result<KeyId, KeyError> {
+        if self.certs.len() >= MAX_CERTS {
+            return Err(KeyError::TooManyCerts(MAX_CERTS));
+        }
+
+        let key_id = KeyId::try_from(cert)?;
+        if let Some(CertState::Revoked(_, when)) = self.certs.get(&key_id) {
+            return Err(KeyError::Revoked(key_id, *when));
+        }
+
+        self.certs
+            .insert(key_id.clone(), CertState::Unknown(Box::new(cert.clone())));
+        Ok(key_id)
+    }
+
+    pub fn cert_chain(&self, key_id: &KeyId) -> Result<Vec<Certificate>, KeyError> {
+        cert_chain(&self.certs, key_id)
+    }
+
+    pub fn num_certs(&self) -> usize {
+        self.certs.len()
+    }
+
     fn update(
         &mut self,
         log: &Logger,
@@ -266,6 +324,29 @@ impl State {
         use SessionState::*;
         match message.as_ref() {
             Message::Request(request) => match request {
+                Request::Cert(cert_request) => match cert_request.as_ref() {
+                    CertRequest::Import(cert) => match self.import_cert(cert) {
+                        Ok(key_id) => {
+                            info!(log, "imported certificate"; "key_id" => %key_id);
+                            self.validate_certs(&self.roots.clone());
+                        }
+                        Err(error) => {
+                            error!(log, "ignoring invalid certificate"; "cert" => ?cert, "error" => %error);
+                        }
+                    },
+                    CertRequest::Revoke(key_id, when) => {
+                        if self.roots.contains(key_id) {
+                            error!(log, "refusing to revoke root certificate"; "key_id" => %key_id);
+                        } else if let Some(cert) = self.certs.get_mut(key_id) {
+                            *cert = CertState::Revoked(key_id.clone(), *when);
+                            info!(log, "revoked known certificate"; "key_id" => %key_id);
+                        } else {
+                            self.certs
+                                .insert(key_id.clone(), CertState::Revoked(key_id.clone(), *when));
+                            info!(log, "revoked unknown certificate"; "key_id" => %key_id);
+                        }
+                    }
+                },
                 Request::Session(session_request) => match session_request.as_ref() {
                     SessionRequest::Start(session_id) => match &mut self.session {
                         // Re-announcement of active session; absorb and ignore.
@@ -362,6 +443,7 @@ impl State {
                             );
                             session.execute_ready_jobs(
                                 &self.own_baseboard,
+                                &mut self.certs,
                                 &mut self.history,
                                 executor,
                                 &mut self.attachments,
@@ -411,6 +493,7 @@ impl State {
                             );
                             session.execute_ready_jobs(
                                 &self.own_baseboard,
+                                &mut self.certs,
                                 &mut self.history,
                                 executor,
                                 &mut self.attachments,
@@ -522,13 +605,14 @@ impl StateManager {
         own_baseboard: BaseboardId,
         mut requests: R,
         rumors: Rumors<Message>,
+        roots: &[Certificate],
         shutdown: CancellationToken,
     ) -> (watch::Receiver<State>, JoinHandle<()>)
     where
         R: Stream<Item = Request> + Send + Unpin + 'static,
     {
         // We report our current state through a watch channel.
-        let (tx_state, rx_state) = watch::channel(State::new(own_baseboard.clone()));
+        let (tx_state, rx_state) = watch::channel(State::new(own_baseboard.clone(), roots));
 
         // We process messages in causal order, so that we can rely on
         // things like "the session stop happens after its corresponding
@@ -635,4 +719,153 @@ impl StateManager {
             }),
         )
     }
+}
+
+/// Certificate validation state.
+///
+/// Transitions are monotone: state only moves upward in this
+/// lattice, so the resulting map is a function of the set of
+/// messages received, independent of their delivery order.
+///
+/// ```text
+///              Revoked
+///             ▲   ▲   ▲
+///            /    |    \
+///        Valid    |    Invalid
+///            ▲    |    ▲
+///             \   |   /
+///              Unknown ──┐
+///                  ▲     │ (issuer not yet seen)
+///                  └─────┘
+/// ```
+///
+/// Allowed transitions are `Unknown → Valid` on successful chain validation;
+/// `Unknown → Unknown` when an unknown issuer is encountered during validation;
+/// `Unknown → Invalid` on a permanent failure (bad signature or encoding);
+/// and any state `→ Revoked`, from which no state ever returns.
+#[derive(Debug)]
+pub enum CertState {
+    Unknown(Box<Certificate>),
+    Valid(Box<Certificate>),
+    Invalid(KeyError),
+    Revoked(KeyId, DateTime<Utc>),
+}
+
+impl CertState {
+    fn is_unknown(&self) -> bool {
+        matches!(self, Self::Unknown(_))
+    }
+
+    fn is_valid(&self) -> bool {
+        matches!(self, Self::Valid(_))
+    }
+
+    fn map_valid<R>(&self, f: impl FnOnce(&Certificate) -> &R) -> Option<&R> {
+        if let Self::Valid(cert) = self {
+            Some(f(cert))
+        } else {
+            None
+        }
+    }
+
+    fn validate(self, certs: &Certificates, roots: &[KeyId]) -> Self {
+        if let Self::Unknown(cert) = self {
+            macro_rules! with_err {
+                ($expr:expr) => {
+                    match $expr {
+                        Ok(res) => res,
+                        Err(err) => return Self::Invalid(err.into()),
+                    }
+                };
+            }
+
+            // Verify the certificate signature.
+            // TODO: Mythos report #82-86: check expiry, basicConstraints, keyUsage
+            let signature = with_err!(Signature::try_from(cert.as_ref()));
+            let tbs = with_err!(cert.tbs_certificate.to_der());
+            let subject = &cert.tbs_certificate.subject;
+            let issuer = &cert.tbs_certificate.issuer;
+            let root = subject == issuer;
+            if root {
+                let key_id = with_err!(KeyId::try_from(issuer));
+                if !roots.contains(&key_id) {
+                    return Self::Invalid(KeyError::SelfSigned);
+                }
+                with_err!(
+                    signature.verify_with_spki(&tbs, &cert.tbs_certificate.subject_public_key_info)
+                );
+            } else {
+                let issuer_key_id = with_err!(KeyId::try_from(issuer));
+                if let Some(issuer) = certs.get(&issuer_key_id)
+                    && let Some(spki) =
+                        issuer.map_valid(|cert| &cert.tbs_certificate.subject_public_key_info)
+                {
+                    with_err!(signature.verify_with_spki(&tbs, spki));
+                } else {
+                    // Don't complain about the missing cert, because certs could
+                    // arrive out of order.
+                    return Self::Unknown(cert);
+                }
+            }
+            Self::Valid(cert)
+        } else {
+            self
+        }
+    }
+}
+
+impl State {
+    /// Move as many certificates as possible from `Unknown → `Valid`.
+    /// This allows us to eventually validate chains whose elements
+    /// may arrive out of order.
+    fn validate_certs(&mut self, roots: &[KeyId]) {
+        loop {
+            let pending = self
+                .certs
+                .iter()
+                .filter(|(_, c)| c.is_unknown())
+                .map(|(k, _)| k.clone())
+                .collect::<Vec<KeyId>>();
+            let mut progressed = false;
+            for key_id in pending {
+                let state = self.certs.remove(&key_id).unwrap();
+                let validated = state.validate(&self.certs, roots);
+                progressed |= !validated.is_unknown();
+                self.certs.insert(key_id, validated);
+            }
+            if !progressed {
+                break;
+            }
+        }
+    }
+}
+
+/// Return the cert chain for the given key in root-to-leaf order.
+/// Will never return an empty chain.
+pub fn cert_chain(certs: &Certificates, key_id: &KeyId) -> Result<Vec<Certificate>, KeyError> {
+    let mut chain = Vec::new();
+    let mut key_id = key_id.to_owned();
+    loop {
+        if chain.len() >= MAX_CERT_CHAIN_LEN {
+            return Err(KeyError::CertChainTooLong);
+        }
+        let cert = match certs.get(&key_id) {
+            None | Some(CertState::Unknown(_)) => return Err(KeyError::MissingCert(key_id)),
+            Some(CertState::Valid(cert)) => *cert.clone(),
+            Some(CertState::Invalid(error)) => {
+                return Err(KeyError::InvalidCert(error.to_string()));
+            }
+            Some(CertState::Revoked(key_id, when)) => {
+                return Err(KeyError::Revoked(key_id.clone(), *when));
+            }
+        };
+        chain.push(cert.clone());
+        if cert.tbs_certificate.subject == cert.tbs_certificate.issuer {
+            break;
+        }
+        key_id = KeyId::try_from(&cert.tbs_certificate.issuer)?;
+    }
+    assert!(!chain.is_empty());
+    chain.reverse();
+    Ok(chain)
 }

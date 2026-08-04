@@ -13,8 +13,6 @@ use sush_common::keys::{KeyError, KeyId};
 /// What went wrong processing a client job request.
 #[derive(Debug, Error)]
 pub enum JobError {
-    #[error("Certificate chain is too long")]
-    CertChainTooLong,
     #[error("Internal communications channel was unexpectedly closed")]
     ChannelClosed,
     #[error("DER encoding error: {0}")]
@@ -32,8 +30,8 @@ pub enum JobError {
     IdentityNotFound(KeyId),
     #[error("Interactive session error: {0}")]
     InteractiveJob(#[from] InteractiveJobError),
-    #[error("Invalid command `{0}`, must not start with `-`")]
-    InvalidCommand(String),
+    #[error("Command must not start with `-`")]
+    InvalidCommand,
     #[error("Invalid range for output of length {0}")]
     InvalidRange(u64),
     #[error("I/O error during {what}: {error}")]
@@ -44,8 +42,6 @@ pub enum JobError {
     Json(#[from] serde_json::Error),
     #[error("Key error: {0}")]
     Key(#[from] KeyError),
-    #[error("Can't find certificate for key `{0}`")]
-    MissingCert(KeyId),
     #[error("Only one session may be running at a time")]
     MultipleSessions,
     #[error("No current session")]
@@ -68,8 +64,6 @@ pub enum JobError {
     Task(#[from] tokio::task::JoinError),
     #[error("Wait timed out")]
     Timeout,
-    #[error("Too many certificates ({0})")]
-    TooManyCerts(usize),
     #[error("Too many simultaneous output requests ({0})")]
     TooManyOutputRequests(usize),
     #[error("Unauthorized request")]
@@ -170,8 +164,7 @@ impl From<JobError> for HttpError {
             | SessionNotCurrent(_) => {
                 HttpError::for_client_error(None, ClientErrorStatusCode::NOT_FOUND, message)
             }
-            CertChainTooLong | DuplicateJobId(_) | InvalidCommand(_) | Json(_) | MissingCert(_)
-            | MultipleSessions | TooManyCerts(_) => {
+            DuplicateJobId(_) | InvalidCommand | Json(_) | MultipleSessions => {
                 HttpError::for_client_error(None, ClientErrorStatusCode::BAD_REQUEST, message)
             }
         }

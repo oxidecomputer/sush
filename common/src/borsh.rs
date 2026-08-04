@@ -5,6 +5,8 @@ use borsh::io::{Error, ErrorKind, Read, Result, Write};
 use borsh::{BorshDeserialize as _, BorshSerialize as _};
 use chrono::{DateTime, Utc};
 use sled_hardware_types::BaseboardId;
+use x509_cert::Certificate;
+use x509_cert::der::{Decode as _, Encode as _};
 
 /// Borsh-encode a [`Hash`] as its 32 raw bytes.
 ///
@@ -50,5 +52,21 @@ pub fn borsh_de_baseboard_id<R: Read>(reader: &mut R) -> Result<BaseboardId> {
     Ok(BaseboardId {
         part_number: String::deserialize_reader(reader)?,
         serial_number: String::deserialize_reader(reader)?,
+    })
+}
+
+pub fn borsh_ser_cert<W: Write>(value: &Certificate, writer: &mut W) -> Result<()> {
+    let der = value
+        .to_der()
+        .map_err(|_| Error::new(ErrorKind::InvalidData, "failed to produce certificate DER"))?;
+    der.serialize(writer)
+}
+
+pub fn borsh_de_cert<R: Read>(reader: &mut R) -> Result<Certificate> {
+    Certificate::from_der(&Vec::<u8>::deserialize_reader(reader)?).map_err(|_| {
+        Error::new(
+            ErrorKind::InvalidData,
+            "failed to deserialize cert from DER",
+        )
     })
 }

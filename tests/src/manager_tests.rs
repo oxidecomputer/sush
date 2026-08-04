@@ -14,7 +14,7 @@ use tokio::time::timeout;
 use tokio_util::sync::CancellationToken;
 use x509_cert::time::Validity;
 
-use sush_api::{JobStartParams, JobStopParams, JobWait, SessionStartParams};
+use sush_api::{JobStartParams, JobStopParams, JobWait};
 use sush_common::authn::{Challenge, ChallengeResponse, Credentials, Identity};
 use sush_common::jobs::{
     JobId, JobLimits, JobOutputState, JobOutputStream, JobStatus, ProcessError, Session, SessionId,
@@ -84,13 +84,9 @@ async fn jobs() {
     let authn = fake_identity(&mut root).await;
     let session_id = SessionId::new();
     let mut session = Session::new(session_id.clone());
-    mgr.session_start(
-        &authn,
-        session_id.clone(),
-        SessionStartParams { wait: true },
-    )
-    .await
-    .unwrap();
+    mgr.session_start(&authn, session_id.clone(), true)
+        .await
+        .unwrap();
 
     let job_id = session.next_job_id();
     let job = root.sign_job_request(&job_id, "true", false).await;
@@ -208,13 +204,9 @@ async fn job_stop() {
     let authn = fake_identity(&mut root).await;
     let session_id = SessionId::new();
     let mut session = Session::new(session_id.clone());
-    mgr.session_start(
-        &authn,
-        session_id.clone(),
-        SessionStartParams { wait: true },
-    )
-    .await
-    .unwrap();
+    mgr.session_start(&authn, session_id.clone(), true)
+        .await
+        .unwrap();
 
     // Stopping a nonexistent job should mark it cancelled, and so succeed
     // immediately.
@@ -290,13 +282,9 @@ async fn cancel_queued_job() {
     let authn = fake_identity(&mut root).await;
     let session_id = SessionId::new();
     let mut session = Session::new(session_id.clone());
-    mgr.session_start(
-        &authn,
-        session_id.clone(),
-        SessionStartParams { wait: true },
-    )
-    .await
-    .unwrap();
+    mgr.session_start(&authn, session_id.clone(), true)
+        .await
+        .unwrap();
 
     // Queue job A, which won't finish soon.
     let command_a = "sleep 10";
@@ -367,13 +355,9 @@ async fn shutdown() {
     let authn = fake_identity(&mut root).await;
     let session_id = SessionId::new();
     let session = Session::new(session_id.clone());
-    mgr.session_start(
-        &authn,
-        session_id.clone(),
-        SessionStartParams { wait: true },
-    )
-    .await
-    .unwrap();
+    mgr.session_start(&authn, session_id.clone(), true)
+        .await
+        .unwrap();
 
     let command = "sleep 30";
     let job_id = session.next_job_id();
@@ -403,11 +387,13 @@ async fn shutdown() {
 #[named]
 #[tokio::test]
 async fn cert_chain() {
+    // Build a two-level chain.
     let validity = Validity::from_now(Duration::from_secs(60)).unwrap();
     let mut root =
         EphemeralKey::new_root(KeyType::P256, ephemeral_test_subject(), validity).unwrap();
     let root_key_id = root.key_id().to_owned();
     let root_cert = root.cert().to_owned();
+    let roots = vec![root_cert.clone()];
     let issuer = root.subject();
     let signature_algorithm = root.signature_algorithm();
     let subject = ephemeral_test_subject();
@@ -424,6 +410,7 @@ async fn cert_chain() {
     assert_ne!(child.key_id(), &root_key_id);
     let child_key_id = child.key_id().to_owned();
 
+    // Set up the manager.
     let authn = fake_identity(&mut root).await;
     let dir = TempDir::with_prefix("sush-").unwrap();
     let log = Logger::root(Discard, o!("test" => function_name!()));
@@ -433,47 +420,47 @@ async fn cert_chain() {
     };
     let gossip = Peer::seed().into_rumors();
     let shutdown = CancellationToken::new();
-    let mgr = JobManager::new(log, dir.path().to_owned(), baseboard, gossip, shutdown)
-        .await
-        .unwrap();
+    let mgr = JobManager::new(
+        log,
+        dir.path().to_owned(),
+        baseboard,
+        gossip,
+        &roots,
+        shutdown,
+    )
+    .await
+    .unwrap();
+
+    // Test failure modes.
     assert!(
         matches!(
-            mgr.import_cert(&authn, root_cert.clone())
+            mgr.import_cert(&authn, root_cert.clone(), false)
                 .await
                 .unwrap_err(),
             JobError::Key(KeyError::SelfSigned),
         ),
-        "should not accept root cert without override"
-    );
-    assert!(
-        matches!(
-            mgr.import_cert(&authn, child.cert().clone()).await.unwrap_err(),
-            JobError::MissingCert(key_id) if key_id == root_key_id,
-        ),
-        "should not accept child cert without root"
+        "should not import root cert"
     );
     assert_eq!(
-        mgr.import_root(root_cert.clone()).await.unwrap(),
-        root_key_id
-    );
-    assert_eq!(
-        mgr.cert_chain(&authn, &root_key_id).await.unwrap(),
+        mgr.cert_chain(&authn, &root_key_id).unwrap(),
         vec![root_cert.clone()]
     );
+    timeout(
+        Duration::from_secs(1),
+        mgr.import_cert(&authn, child.cert().clone(), true),
+    )
+    .await
+    .expect("timed out importing child")
+    .expect("could not import child");
     assert_eq!(
-        mgr.import_cert(&authn, child.cert().clone()).await.unwrap(),
-        child_key_id
-    );
-    assert_eq!(
-        mgr.cert_chain(&authn, &child_key_id).await.unwrap(),
+        mgr.cert_chain(&authn, &child_key_id).unwrap(),
         vec![root_cert.clone(), child.cert().clone()]
     );
 
+    // Start a job signed with the child.
     let session_id = SessionId::new();
     let mut session = Session::new(session_id.clone());
-    mgr.session_start(&authn, session_id, SessionStartParams { wait: true })
-        .await
-        .unwrap();
+    mgr.session_start(&authn, session_id, true).await.unwrap();
     let job_id = session.next_job_id();
     let job = child.sign_job_request(&job_id, "true", false).await;
     mgr.job_start(
@@ -500,13 +487,9 @@ async fn too_much_cpu() {
     let authn = fake_identity(&mut root).await;
     let session_id = SessionId::new();
     let session = Session::new(session_id.clone());
-    mgr.session_start(
-        &authn,
-        session_id.clone(),
-        SessionStartParams { wait: true },
-    )
-    .await
-    .unwrap();
+    mgr.session_start(&authn, session_id.clone(), true)
+        .await
+        .unwrap();
     let job_id = session.next_job_id();
     let command = "openssl speed sha1";
     let job = root.sign_job_request(&job_id, command, false).await;
@@ -574,13 +557,9 @@ async fn output_ranges() {
     let authn = fake_identity(&mut root).await;
     let session_id = SessionId::new();
     let session = Session::new(session_id.clone());
-    mgr.session_start(
-        &authn,
-        session_id.clone(),
-        SessionStartParams { wait: true },
-    )
-    .await
-    .unwrap();
+    mgr.session_start(&authn, session_id.clone(), true)
+        .await
+        .unwrap();
     let job_id = session.next_job_id();
 
     // Read some random bytes.

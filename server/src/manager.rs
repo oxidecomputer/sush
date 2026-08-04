@@ -11,41 +11,25 @@ use http_range_header::SyntacticallyCorrectRange as Range;
 use lru::LruCache;
 use rumors::Rumors;
 use sled_hardware_types::BaseboardId;
-use slog::{Logger, debug, info, o, warn};
+use slog::{Logger, debug, o, warn};
 use tokio::sync::{Mutex, mpsc, watch};
 use tokio::task::JoinHandle;
 use tokio::time::timeout;
 use tokio_stream::wrappers::ReceiverStream;
 use tokio_util::sync::CancellationToken;
 use x509_cert::Certificate;
-use x509_cert::der::{DecodePem as _, Encode as _};
 
-use sush_api::{JobStartParams, JobStopParams, JobWait, SessionStartParams};
+use sush_api::{JobStartParams, JobStopParams, JobWait};
 use sush_common::authn::{Credentials, Identity, Nonce};
 use sush_common::jobs::JobOutputStream;
 use sush_common::jobs::{JobId, JobStatusMap, Session, SessionId, SignedJob};
-use sush_common::keys::{KeyError, KeyId, Signature, SshPublicKey};
+use sush_common::keys::{KeyError, KeyId, SshPublicKey};
 
 use crate::error::JobError;
 use crate::job::SocketSender;
-use crate::messages::{JobRequest, Message, Request, SessionRequest};
+use crate::messages::{CertRequest, JobRequest, Message, Request, SessionRequest};
 use crate::output::{JobOutputDir, JobOutputFileStream};
-use crate::state::{State, StateManager};
-
-/// Self-signed (root) X.509 certificates. Self-signed certificates may
-/// not be imported (except in test code), and so must be included here.
-pub const ROOT_CERTS: &[&[u8]] = &[
-    // export PERMSLIP_URL="https://permslip.inickles.0xeng.dev"
-    // export SUSH_PERMSLIP_KEY="UNTRUSTED Support Shell Prototype"
-    include_bytes!("../certs/sandbox.pem"),
-];
-
-/// Maximum certificate chain length.
-const MAX_CERT_CHAIN_LEN: usize = 10;
-
-/// Maximum number of job signing certificates.
-/// The ideal number of certs is 1, so this need not be large.
-const MAX_CERTS: NonZeroUsize = NonZeroUsize::new(100).unwrap();
+use crate::state::{MAX_CERTS, State, StateManager};
 
 /// Maximum number of cached identities.
 const MAX_CACHED_IDENTITIES: NonZeroUsize = NonZeroUsize::new(1_000).unwrap();
@@ -66,7 +50,6 @@ pub struct JobManager {
     log: Logger,
     nonces: Arc<Mutex<LruCache<Nonce, DateTime<Utc>>>>,
     identities: Arc<Mutex<LruCache<(KeyId, Nonce), (Identity, Credentials)>>>,
-    certs: Arc<Mutex<LruCache<KeyId, Certificate>>>,
     output_dir: JobOutputDir,
     own_baseboard: BaseboardId,
     state: watch::Receiver<State>, // from the state manager
@@ -80,9 +63,9 @@ impl JobManager {
         output_dir: PathBuf,
         own_baseboard: BaseboardId,
         rumors: Rumors<Message>,
+        roots: &[Certificate],
         shutdown: CancellationToken,
     ) -> Result<Self, JobError> {
-        // Make the new manager instance.
         let output_dir = JobOutputDir::new(output_dir);
         let (tx_req, rx_req) = mpsc::channel(16);
         let requests = ReceiverStream::new(rx_req);
@@ -92,31 +75,30 @@ impl JobManager {
             own_baseboard.clone(),
             requests,
             rumors,
+            roots,
             shutdown,
         );
-        let new = Self {
+        Ok(Self {
             log: log.new(o!("component" => "job manager")),
             nonces: Arc::new(Mutex::new(LruCache::new(MAX_OUTSTANDING_NONCES))),
             identities: Arc::new(Mutex::new(LruCache::new(MAX_CACHED_IDENTITIES))),
-            certs: Arc::new(Mutex::new(LruCache::new(MAX_CERTS))),
             own_baseboard,
             output_dir,
             state: rx_state,
             tx_req,
             join_state: Some(join_state),
-        };
-
-        // Import the root certificates.
-        for root in ROOT_CERTS {
-            new.import_cert_inner(Certificate::from_pem(root)?, true)
-                .await?;
-        }
-
-        Ok(new)
+        })
     }
 
     pub fn own_baseboard(&self) -> &BaseboardId {
         &self.own_baseboard
+    }
+
+    async fn cert_request(&self, request: CertRequest) -> Result<(), JobError> {
+        self.tx_req
+            .send(Request::cert(request))
+            .await
+            .map_err(|_| JobError::ChannelClosed)
     }
 
     async fn session_request(&self, request: SessionRequest) -> Result<(), JobError> {
@@ -135,99 +117,32 @@ impl JobManager {
 
     // Certificate management.
 
-    /// Tests must import a root to use ephemeral signers,
-    /// but this is not allowed in production.
-    #[cfg(feature = "test-support")] // disabled by default
-    pub async fn import_root(&self, root: Certificate) -> Result<KeyId, JobError> {
-        self.import_cert_inner(root, true).await
-    }
-
     pub async fn import_cert(
         &self,
         _authn: &Identity,
         cert: Certificate,
-    ) -> Result<KeyId, JobError> {
-        self.import_cert_inner(cert, false).await
+        wait: bool,
+    ) -> Result<(), JobError> {
+        if self.state.borrow().num_certs() >= MAX_CERTS {
+            return Err(KeyError::TooManyCerts(MAX_CERTS).into());
+        }
+        if cert.tbs_certificate.subject == cert.tbs_certificate.issuer {
+            return Err(KeyError::SelfSigned.into());
+        }
+        let key_id = KeyId::try_from(&cert)?;
+        self.cert_request(CertRequest::Import(cert)).await?;
+        if wait {
+            self.wait_for(self.wait_for_cert(key_id)).await?;
+        }
+        Ok(())
     }
 
-    async fn import_cert_inner(
-        &self,
-        cert: Certificate,
-        root_allowed: bool,
-    ) -> Result<KeyId, JobError> {
-        // Verify the certificate signature.
-        let signature = Signature::try_from(&cert)?;
-        let tbs = cert.tbs_certificate.to_der()?;
-        let subject = &cert.tbs_certificate.subject;
-        let issuer = &cert.tbs_certificate.issuer;
-        let root = subject == issuer;
-        if root {
-            if root_allowed {
-                signature.verify_with_spki(&tbs, &cert.tbs_certificate.subject_public_key_info)?;
-            } else {
-                return Err(KeyError::SelfSigned.into());
-            }
-        } else {
-            let issuer_key_id = KeyId::try_from(issuer)?;
-            if let Some(issuer) = self.certs.lock().await.get(&issuer_key_id) {
-                signature
-                    .verify_with_spki(&tbs, &issuer.tbs_certificate.subject_public_key_info)?;
-            } else {
-                return Err(JobError::MissingCert(issuer_key_id));
-            }
-        }
-
-        // Try to make room for the new cert, but do not evict roots.
-        let key_id = KeyId::try_from(subject)?;
-        let mut certs = self.certs.lock().await;
-        if certs.len() >= MAX_CERTS.get() && !certs.contains(&key_id) {
-            let mut i = 0;
-            while let Some((lru_key_id, lru_cert)) =
-                certs.peek_lru().map(|(k, v)| (k.to_owned(), v.to_owned()))
-            {
-                if lru_cert.tbs_certificate.subject == lru_cert.tbs_certificate.issuer {
-                    certs.promote(&lru_key_id);
-                    i += 1;
-                } else {
-                    certs.pop_lru();
-                    break;
-                }
-                if i == MAX_CERTS.get() {
-                    return Err(JobError::TooManyCerts(MAX_CERTS.get()));
-                }
-            }
-        }
-
-        // Import the certificate.
-        certs.put(key_id.clone(), cert);
-        info!(self.log, "imported certificate"; "key_id" => %key_id, "root" => root);
-        Ok(key_id)
-    }
-
-    /// Return the cert chain for the given key in root-to-leaf order.
-    pub async fn cert_chain(
+    pub fn cert_chain(
         &self,
         _authn: &Identity,
         key_id: &KeyId,
     ) -> Result<Vec<Certificate>, JobError> {
-        let mut certs = self.certs.lock().await;
-        let mut chain = Vec::new();
-        let mut key_id = key_id.to_owned();
-        loop {
-            if chain.len() >= MAX_CERT_CHAIN_LEN {
-                return Err(JobError::CertChainTooLong);
-            }
-            let Some(cert) = certs.get(&key_id) else {
-                return Err(JobError::MissingCert(key_id));
-            };
-            chain.push(cert.to_owned());
-            if cert.tbs_certificate.subject == cert.tbs_certificate.issuer {
-                break;
-            }
-            key_id = KeyId::try_from(&cert.tbs_certificate.issuer)?;
-        }
-        chain.reverse();
-        Ok(chain)
+        Ok(self.state.borrow().cert_chain(key_id)?)
     }
 
     // Identity management.
@@ -342,6 +257,10 @@ impl JobManager {
         self.join_state.take()
     }
 
+    fn wait_for_cert(&self, key_id: KeyId) -> impl FnMut(&State) -> bool {
+        move |state| state.cert_chain(&key_id).is_ok()
+    }
+
     fn wait_for_session(&self, session_id: SessionId) -> impl FnMut(&State) -> bool {
         move |state| {
             state
@@ -405,7 +324,7 @@ impl JobManager {
         &self,
         _authn: &Identity,
         session_id: SessionId,
-        SessionStartParams { wait }: SessionStartParams,
+        wait: bool,
     ) -> Result<(), JobError> {
         self.session_request(SessionRequest::Start(session_id.clone()))
             .await?;
@@ -442,17 +361,6 @@ impl JobManager {
         job: SignedJob,
         params: JobStartParams,
     ) -> Result<(), JobError> {
-        // Validate the job request.
-        if job.command.starts_with('-') {
-            return Err(JobError::InvalidCommand(job.into_payload().command));
-        }
-        let cert_key_id = job.key_id().to_owned();
-        let chain = self.cert_chain(authn, &cert_key_id).await?;
-        let job = if let Some(leaf) = chain.last() {
-            job.verify_with_cert(leaf)?
-        } else {
-            return Err(JobError::MissingCert(cert_key_id));
-        };
         let job_id = job.job_id().to_owned();
         let wait = params.wait.to_owned();
 
@@ -473,7 +381,7 @@ impl JobManager {
         }
 
         // Submit the job for execution.
-        self.job_request(authn, JobRequest::Start(job.into_signed(), params))
+        self.job_request(authn, JobRequest::Start(job, params))
             .await?;
         self.wait_for(self.wait_for_job(&job_id, wait)).await
     }

@@ -20,7 +20,7 @@ use x509_cert::der::{Decode as _, DecodePem as _};
 use sush_api::{
     Authorization, AuthorizedRangeRequest, JobAttachParams, JobHistoryParams, JobIdParam,
     JobOutputParams, JobStartParams, JobStopParams, KeyIdParam, SessionAndJobIds, SessionIdParam,
-    SessionStartParams, SushApi,
+    SushApi, WaitParam,
 };
 use sush_common::authn::Identity;
 use sush_common::jobs::{JsonJobStatusMap, Session, SignedJob, job_status_to_json_map};
@@ -39,16 +39,19 @@ impl SushApi for ApiServer {
     async fn import_cert(
         ctx: RequestContext<Self::Context>,
         headers: Header<Authorization>,
+        query: QueryParams<WaitParam>,
         params: TypedBody<Vec<u8>>,
     ) -> Result<HttpResponseOk<KeyId>, HttpError> {
         let mgr = ctx.context();
         let Authorization { authorization } = headers.into_inner();
         let authn = mgr.iam(authorization, None).await?;
+        let WaitParam { wait } = query.into_inner();
         let bytes = params.into_inner();
         let cert = Certificate::from_pem(&bytes)
             .or_else(|_| Certificate::from_der(&bytes))
             .map_err(JobError::Der)?;
-        let key_id = mgr.import_cert(&authn, cert).await?;
+        let key_id = KeyId::try_from(&cert).map_err(JobError::Key)?;
+        mgr.import_cert(&authn, cert, wait).await?;
         Ok(HttpResponseOk(key_id))
     }
 
@@ -61,7 +64,7 @@ impl SushApi for ApiServer {
         let Authorization { authorization } = headers.into_inner();
         let authn = mgr.iam(authorization, None).await?;
         let KeyIdParam { key_id } = params.into_inner();
-        let certs = mgr.cert_chain(&authn, &key_id).await?;
+        let certs = mgr.cert_chain(&authn, &key_id)?;
         let chain = pem_cert_chain(certs).map_err(JobError::Key)?;
         Ok(HttpResponseOk(chain))
     }
@@ -110,14 +113,14 @@ impl SushApi for ApiServer {
         ctx: RequestContext<Self::Context>,
         headers: Header<Authorization>,
         params: PathParams<SessionIdParam>,
-        query: QueryParams<SessionStartParams>,
+        query: QueryParams<WaitParam>,
     ) -> Result<HttpResponseUpdatedNoContent, HttpError> {
         let mgr = ctx.context();
         let Authorization { authorization } = headers.into_inner();
         let authn = mgr.iam(authorization, None).await?;
+        let WaitParam { wait } = query.into_inner();
         let SessionIdParam { session_id } = params.into_inner();
-        mgr.session_start(&authn, session_id.clone(), query.into_inner())
-            .await?;
+        mgr.session_start(&authn, session_id.clone(), wait).await?;
         Ok(HttpResponseUpdatedNoContent())
     }
 

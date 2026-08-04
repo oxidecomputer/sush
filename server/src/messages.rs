@@ -6,15 +6,18 @@ use rumors::{
     borsh::{BorshDeserialize, BorshSerialize},
 };
 use sled_hardware_types::BaseboardId;
-use sush_api::JobStartParams;
 use thiserror::Error;
 use uuid::Uuid;
+use x509_cert::Certificate;
 
-use sush_common::jobs::{JobId, ProcessError, SessionId, SignedJob};
-use sush_common::{
-    borsh::{borsh_de_baseboard_id, borsh_de_datetime, borsh_ser_baseboard_id, borsh_ser_datetime},
-    jobs::JobOutputState,
+use sush_api::JobStartParams;
+use sush_common::borsh::{
+    borsh_de_baseboard_id, borsh_de_cert, borsh_de_datetime, borsh_ser_baseboard_id,
+    borsh_ser_cert, borsh_ser_datetime,
 };
+use sush_common::jobs::JobOutputState;
+use sush_common::jobs::{JobId, ProcessError, SessionId, SignedJob};
+use sush_common::keys::KeyId;
 
 #[derive(BorshDeserialize, BorshSerialize, Copy, Clone, Debug, Eq, PartialEq)]
 pub struct RequestId(pub Uuid);
@@ -34,11 +37,16 @@ pub enum Message {
 
 #[derive(Clone, Debug, BorshDeserialize, BorshSerialize)]
 pub enum Request {
+    Cert(Box<CertRequest>),
     Session(Box<SessionRequest>),
     Job(Box<JobRequest>),
 }
 
 impl Request {
+    pub fn cert(request: CertRequest) -> Self {
+        Self::Cert(Box::new(request))
+    }
+
     pub fn session(request: SessionRequest) -> Self {
         Self::Session(Box::new(request))
     }
@@ -46,6 +54,23 @@ impl Request {
     pub fn job(request: JobRequest) -> Self {
         Self::Job(Box::new(request))
     }
+}
+
+/// Certificates are PEM-encoded X.509
+#[derive(Clone, Debug, BorshDeserialize, BorshSerialize)]
+#[allow(clippy::large_enum_variant)]
+pub enum CertRequest {
+    Import(
+        #[borsh(serialize_with = "borsh_ser_cert", deserialize_with = "borsh_de_cert")] Certificate,
+    ),
+    Revoke(
+        KeyId,
+        #[borsh(
+            serialize_with = "borsh_ser_datetime",
+            deserialize_with = "borsh_de_datetime"
+        )]
+        DateTime<Utc>,
+    ),
 }
 
 #[derive(Clone, Debug, BorshDeserialize, BorshSerialize)]

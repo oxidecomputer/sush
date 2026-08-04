@@ -369,15 +369,19 @@ pub fn job_status_to_json_map(status_map: JobStatusMap) -> JsonJobStatusMap {
     Serialize,
 )]
 pub enum ProcessError {
-    #[error("the fate of the process is unknown")]
+    #[error("The fate of the process is unknown")]
     Unknown,
-    #[error("process killed with signal {0}")]
+    #[error("Process killed with signal {0}")]
     Killed(i32),
-    #[error("interactive session error: {0}")]
+    #[error("Interactive session error: {0}")]
     Interactive(String),
+    #[error("Command must not start with `-`")]
+    InvalidCommand,
+    #[error("Job validation error: {0}")]
+    InvalidJob(String),
     #[error("I/O error {what}: {error}")]
     Io { what: String, error: String },
-    #[error("unable to join job process: {0}")]
+    #[error("Unable to join job process: {0}")]
     Join(String),
 }
 
