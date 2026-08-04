@@ -41,7 +41,7 @@ fn check_status_started(status: JobStatus, expected_job_id: &JobId) {
         panic!("expected job to be started, instead it's {status:?}");
     };
     assert_eq!(job_id, *expected_job_id);
-    assert!(time_started < Utc::now());
+    assert!(time_started <= Utc::now());
 }
 
 #[track_caller]
@@ -69,7 +69,7 @@ fn check_status_stopped(
     };
     assert_eq!(job_id, *expected_job_id);
     assert!(time_started < time_stopped);
-    assert!(time_stopped < Utc::now());
+    assert!(time_stopped <= Utc::now());
     assert_eq!(result, expected_result);
     assert_eq!(stdout_len, expected_stdout_len);
     assert_eq!(stderr_len, expected_stderr_len);
@@ -231,7 +231,7 @@ async fn job_stop() {
 
     assert!(matches!(
         &mgr.job_status(&authn, &job_id).await.unwrap()[baseboard_id],
-        JobStatus::Cancelled { job_id: jid, time_cancelled } if *jid == job_id && *time_cancelled < Utc::now()
+        JobStatus::Cancelled { job_id: jid, time_cancelled } if *jid == job_id && *time_cancelled <= Utc::now()
     ));
 
     // Skip the cancelled job.
@@ -329,7 +329,7 @@ async fn cancel_queued_job() {
     mgr.wait_for_job_status(&job_id_b).await.unwrap();
     assert!(matches!(
         &mgr.job_status(&authn, &job_id_b).await.unwrap()[mgr.own_baseboard()],
-        JobStatus::Queued { job_id: jid, time_queued, } if *jid == job_id_b && *time_queued < Utc::now()
+        JobStatus::Queued { job_id: jid, time_queued, } if *jid == job_id_b && *time_queued <= Utc::now()
     ));
 
     // ... but immediately cancel it.
@@ -344,7 +344,7 @@ async fn cancel_queued_job() {
     .expect("should be able to stop queued job");
     assert!(matches!(
         &mgr.job_status(&authn, &job_id_b).await.unwrap()[mgr.own_baseboard()],
-        JobStatus::Cancelled { job_id: jid, time_cancelled } if *jid == job_id_b && *time_cancelled < Utc::now()
+        JobStatus::Cancelled { job_id: jid, time_cancelled } if *jid == job_id_b && *time_cancelled <= Utc::now()
     ));
 
     // Clean up.
