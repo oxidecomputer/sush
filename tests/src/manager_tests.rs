@@ -31,6 +31,7 @@ use sush_server::{JobError, JobManager};
 use crate::test_utils::{
     SignJobRequest as _, ephemeral_test_subject, fake_identity, manager_and_test_root, test_logger,
 };
+use sush_server::executor::PathIsolation;
 
 // Signal numbers for killed jobs.
 const SIGKILL: i32 = 9;
@@ -499,6 +500,7 @@ async fn cert_chain() {
     let shutdown = CancellationToken::new();
     let mgr = JobManager::new(
         log,
+        PathIsolation::InsecureDisable,
         dir.path().to_owned(),
         baseboard,
         gossip,

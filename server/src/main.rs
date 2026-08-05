@@ -14,6 +14,7 @@ use x509_cert::Certificate;
 use x509_cert::der::DecodePem as _;
 
 use sush_api::sush_api_mod::api_description;
+use sush_server::executor::PathIsolation;
 use sush_server::manager::JobManager;
 use sush_server::server::ApiServer;
 
@@ -41,6 +42,12 @@ struct ServerArgs {
     /// Path to the job output directory
     #[arg(short = 'o', long, default_value = ".")]
     directory: PathBuf,
+
+    /// Whether to disable $PATH isolation
+    ///
+    /// Disabling $PATH isolation could be insecure, and must never be done on production.
+    #[arg(long, default_value_t = false)]
+    insecure_disable_path_isolation: bool,
 }
 
 #[tokio::main]
@@ -49,7 +56,14 @@ async fn main() -> Result<(), String> {
         address,
         debug,
         directory,
+        insecure_disable_path_isolation,
     } = ServerArgs::parse();
+
+    let path_isolation = if insecure_disable_path_isolation {
+        PathIsolation::InsecureDisable
+    } else {
+        PathIsolation::Enable
+    };
 
     let log = ConfigLogging::StderrTerminal {
         level: if debug {
@@ -79,6 +93,7 @@ async fn main() -> Result<(), String> {
     let shutdown = listen_for_shutdown()?;
     let mut mgr = JobManager::new(
         log.clone(),
+        path_isolation,
         directory,
         baseboard,
         gossip,

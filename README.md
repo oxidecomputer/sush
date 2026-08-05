@@ -20,6 +20,10 @@ Jan 29 14:08:17.672 INFO imported root certificate, key_id: much-hedgehog-cup-bl
 Jan 29 14:08:17.672 INFO listening, local_addr: 0.0.0.0:44444
 ```
 
+> [!NOTE]
+> On NixOS you will have to pass the `--insecure-disable-path-isolation` flag to
+> the server, otherwise spawning commands will fail.
+
 In another terminal, point the client at the server and start it up
 in REPL mode:
 

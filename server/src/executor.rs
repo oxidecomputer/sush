@@ -46,6 +46,7 @@ const EVENTS_CHANNEL_CAPACITY: usize = 16;
 pub struct Executor {
     log: Logger,
     events: Arc<RwLock<Option<mpsc::Sender<Event>>>>,
+    path_isolation: PathIsolation,
     output_dir: JobOutputDir,
     shutdown: CancellationToken,
     stop: BTreeMap<JobId, CancellationToken>,
@@ -55,6 +56,7 @@ pub struct Executor {
 impl Executor {
     pub fn new(
         log: Logger,
+        path_isolation: PathIsolation,
         output_dir: JobOutputDir,
         shutdown: CancellationToken,
     ) -> (Self, impl Stream<Item = Event> + Send + 'static) {
@@ -76,6 +78,7 @@ impl Executor {
             Self {
                 log,
                 events,
+                path_isolation,
                 output_dir,
                 shutdown,
                 stop: BTreeMap::new(),
@@ -130,6 +133,7 @@ impl Executor {
             self.output_dir.clone(),
             verified_request,
             params,
+            self.path_isolation,
             tx_attachment,
             stop,
         ));
@@ -153,12 +157,14 @@ impl Executor {
 /// Spawn a process for a job and return an attachment point if it is
 /// interactive. Assumes the job request has already been validated,
 /// e.g., as by [`crate::JobManager::job_start`].
+#[allow(clippy::too_many_arguments)]
 async fn job_spawn(
     log: Logger,
     events: mpsc::Sender<Event>,
     output_dir: JobOutputDir,
     request: VerifiedJob,
     params: JobStartParams,
+    path_isolation: PathIsolation,
     tx_attachment: watch::Sender<Option<SocketSender>>,
     stop: CancellationToken,
 ) {
@@ -232,7 +238,16 @@ async fn job_spawn(
 
     // Set up basic environment.
     cmd.env_clear();
-    cmd.env("PATH", DEFAULT_PATH);
+    match path_isolation {
+        PathIsolation::Enable => {
+            cmd.env("PATH", DEFAULT_PATH);
+        }
+        PathIsolation::InsecureDisable => {
+            if let Some(path) = std::env::var_os("PATH") {
+                cmd.env("PATH", path);
+            }
+        }
+    }
     if let Some(pwd) = Passwd::current_user() {
         cmd.current_dir(&pwd.dir)
             .env("HOME", &pwd.dir)
@@ -394,4 +409,10 @@ pub fn kill_job(log: &Logger, child: &Child) {
     } else {
         debug!(log, "process is already dead or has an invalid PID");
     }
+}
+
+#[derive(Debug, Clone, Copy)]
+pub enum PathIsolation {
+    Enable,
+    InsecureDisable,
 }
