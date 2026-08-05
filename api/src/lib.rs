@@ -30,12 +30,14 @@ pub trait SushApi {
     // Certificate management.
 
     /// Import a certificate, verify its signature, and return a key ID for it.
+    ///
+    /// The body should be a PEM encoded X.509 certificate.
     #[endpoint { method = PUT, path = "/certs" }]
     async fn import_cert(
         ctx: RequestContext<Self::Context>,
         headers: Header<Authorization>,
         query: QueryParams<WaitParam>,
-        params: TypedBody<Vec<u8>>,
+        params: TypedBody<String>,
     ) -> Result<HttpResponseOk<KeyId>, HttpError>;
 
     /// Get the certificate chain that validates a key.

@@ -255,7 +255,7 @@ pub enum ClientCommand {
 
 #[derive(Clone, Debug, Subcommand)]
 pub enum CertCommand {
-    /// Import a certificate, verify its signature, and return a key ID for it.
+    /// Import a PEM encoded X.509 certificate and return its key ID.
     Import { path: PathBuf },
 
     /// Get the certificate chain that validates a key, in root-to-leaf order.

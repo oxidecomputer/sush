@@ -15,8 +15,8 @@ use sush_common::keys::{KeyError, KeyId};
 pub enum JobError {
     #[error("Internal communications channel was unexpectedly closed")]
     ChannelClosed,
-    #[error("DER encoding error: {0}")]
-    Der(#[from] x509_cert::der::Error),
+    #[error("Certificate decoding error: {0}")]
+    DecodeCert(#[from] x509_cert::der::Error),
     #[error("Duplicate job ID `{0}`")]
     DuplicateJobId(JobId),
     #[error("Execution error: {0}")]
@@ -110,7 +110,6 @@ impl From<JobError> for HttpError {
         match error {
             Key(_)
             | ChannelClosed
-            | Der(_)
             | Execution(_)
             | FileIo { .. }
             | Io { .. }
@@ -164,7 +163,7 @@ impl From<JobError> for HttpError {
             | SessionNotCurrent(_) => {
                 HttpError::for_client_error(None, ClientErrorStatusCode::NOT_FOUND, message)
             }
-            DuplicateJobId(_) | InvalidCommand | Json(_) | MultipleSessions => {
+            DecodeCert(_) | DuplicateJobId(_) | InvalidCommand | Json(_) | MultipleSessions => {
                 HttpError::for_client_error(None, ClientErrorStatusCode::BAD_REQUEST, message)
             }
         }

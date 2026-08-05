@@ -15,7 +15,7 @@ use sled_hardware_types::BaseboardId;
 use tokio_tungstenite::WebSocketStream;
 use tokio_tungstenite::tungstenite::protocol::Role;
 use x509_cert::Certificate;
-use x509_cert::der::{Decode as _, DecodePem as _};
+use x509_cert::der::DecodePem as _;
 
 use sush_api::{
     Authorization, AuthorizedRangeRequest, JobAttachParams, JobHistoryParams, JobIdParam,
@@ -40,16 +40,14 @@ impl SushApi for ApiServer {
         ctx: RequestContext<Self::Context>,
         headers: Header<Authorization>,
         query: QueryParams<WaitParam>,
-        params: TypedBody<Vec<u8>>,
+        params: TypedBody<String>,
     ) -> Result<HttpResponseOk<KeyId>, HttpError> {
         let mgr = ctx.context();
         let Authorization { authorization } = headers.into_inner();
         let authn = mgr.iam(authorization, None).await?;
         let WaitParam { wait } = query.into_inner();
         let bytes = params.into_inner();
-        let cert = Certificate::from_pem(&bytes)
-            .or_else(|_| Certificate::from_der(&bytes))
-            .map_err(JobError::Der)?;
+        let cert = Certificate::from_pem(&bytes).map_err(JobError::DecodeCert)?;
         let key_id = KeyId::try_from(&cert).map_err(JobError::Key)?;
         mgr.import_cert(&authn, cert, wait).await?;
         Ok(HttpResponseOk(key_id))
