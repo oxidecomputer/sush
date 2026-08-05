@@ -1,5 +1,7 @@
 //! Job manager tests.
 
+use std::os::unix::fs::PermissionsExt as _;
+use std::path::Path;
 use std::time::Duration;
 
 use chrono::Utc;
@@ -10,6 +12,7 @@ use rumors::Peer;
 use sled_hardware_types::BaseboardId;
 use slog::{Discard, Logger, o};
 use tempfile::TempDir;
+use tokio::fs::metadata;
 use tokio::time::timeout;
 use tokio_util::sync::CancellationToken;
 use x509_cert::time::Validity;
@@ -17,10 +20,12 @@ use x509_cert::time::Validity;
 use sush_api::{JobStartParams, JobStopParams, JobWait};
 use sush_common::authn::{Challenge, ChallengeResponse, Credentials, Identity};
 use sush_common::jobs::{
-    JobId, JobLimits, JobOutputState, JobOutputStream, JobStatus, ProcessError, Session, SessionId,
+    JobId, JobLimits, JobOutputState, JobOutputStream::*, JobStatus, ProcessError, Session,
+    SessionId,
 };
 use sush_common::keys::{EphemeralKey, KeyError, KeyType, Signer as _};
 use sush_server::io::BATCH_OUTPUT_BUFFER_SIZE;
+use sush_server::output::JobOutputDir;
 use sush_server::{JobError, JobManager};
 
 use crate::test_utils::{
@@ -155,7 +160,7 @@ async fn jobs() {
         Some(0),
     );
     assert_eq!(
-        mgr.job_output(&authn, &job_id, baseboard_id, JobOutputStream::Stdout, None)
+        mgr.job_output(&authn, &job_id, baseboard_id, Stdout, None)
             .await
             .unwrap()
             .into_bytes()
@@ -163,7 +168,7 @@ async fn jobs() {
         job_id_bytes
     );
     assert!(
-        mgr.job_output(&authn, &job_id, baseboard_id, JobOutputStream::Stderr, None)
+        mgr.job_output(&authn, &job_id, baseboard_id, Stderr, None)
             .await
             .unwrap()
             .into_bytes()
@@ -189,7 +194,7 @@ async fn jobs() {
     let status = mgr.job_status(&authn, &job_id).await.unwrap()[baseboard_id].clone();
     check_status_stopped(status, &job_id, Ok(0), Some(output.len() as u64), Some(0));
     assert_eq!(
-        mgr.job_output(&authn, &job_id, baseboard_id, JobOutputStream::Stdout, None)
+        mgr.job_output(&authn, &job_id, baseboard_id, Stdout, None)
             .await
             .unwrap()
             .into_bytes()
@@ -197,7 +202,7 @@ async fn jobs() {
         output.as_bytes(),
     );
     assert!(
-        mgr.job_output(&authn, &job_id, baseboard_id, JobOutputStream::Stderr, None)
+        mgr.job_output(&authn, &job_id, baseboard_id, Stderr, None)
             .await
             .unwrap()
             .into_bytes()
@@ -362,6 +367,55 @@ async fn cancel_queued_job() {
     )
     .await
     .expect("should be able to stop job A");
+}
+
+#[named]
+#[tokio::test]
+async fn job_output_perms() {
+    let log = test_logger(function_name!());
+    let (mgr, mut root, dir, _shutdown) = manager_and_test_root(log).await;
+    let dir_perms = metadata(&dir).await.unwrap().permissions();
+    let baseboard_id = mgr.own_baseboard();
+    let authn = fake_identity(&mut root).await;
+    let session_id = SessionId::new();
+    let session = Session::new(session_id.clone());
+    mgr.session_start(&authn, session_id.clone(), true)
+        .await
+        .unwrap();
+
+    // Run a job with some output on both streams.
+    let command = "echo -n foo && echo -n bar >&2";
+    let job_id = session.next_job_id();
+    let job = root.sign_job_request(&job_id, command, false).await;
+    mgr.job_start(
+        &authn,
+        job.clone().into_signed(),
+        JobStartParams {
+            wait: JobWait::Stop,
+            ..Default::default()
+        },
+    )
+    .await
+    .expect("should be able to start job");
+    let status = mgr
+        .job_status(&authn, &job_id)
+        .await
+        .expect("should be able to get status")
+        .remove(baseboard_id)
+        .expect("should have job status");
+    check_status_stopped(status, &job_id, Ok(0), Some(3), Some(3));
+
+    // Job output root should not be changed.
+    let out = JobOutputDir::new(dir.as_ref().to_owned());
+    assert_eq!(metadata(out.root()).await.unwrap().permissions(), dir_perms);
+
+    // Check output directory and file permissions.
+    async fn mode(path: &Path) -> u32 {
+        metadata(path).await.unwrap().permissions().mode() & 0o777
+    }
+    assert_eq!(mode(&out.job_output_dir(&job_id)).await, 0o700);
+    assert_eq!(mode(&out.job_output_path(&job_id, Stdout)).await, 0o600);
+    assert_eq!(mode(&out.job_output_path(&job_id, Stderr)).await, 0o600);
 }
 
 #[named]
@@ -546,7 +600,7 @@ async fn too_much_cpu() {
 
     // The output of `openssl speed` changed between v3.0 and v3.5.
     let stderr = mgr
-        .job_output(&authn, &job_id, baseboard_id, JobOutputStream::Stderr, None)
+        .job_output(&authn, &job_id, baseboard_id, Stderr, None)
         .await
         .unwrap()
         .into_bytes()
@@ -620,7 +674,7 @@ async fn too_much_output() {
         status.clone(),
         &job_id,
         Err(ProcessError::OutputLimitExceeded {
-            stream: JobOutputStream::Stdout,
+            stream: Stdout,
             limit: max_fsize,
         }),
         None,
@@ -659,7 +713,7 @@ async fn too_much_output() {
         status.clone(),
         &job_id,
         Err(ProcessError::OutputLimitExceeded {
-            stream: JobOutputStream::Stderr,
+            stream: Stderr,
             limit: max_fsize,
         }),
         Some(0),
@@ -707,7 +761,7 @@ async fn output_ranges() {
 
     // No range, i.e., full output.
     let r = mgr
-        .job_output(&authn, &job_id, baseboard_id, JobOutputStream::Stdout, None)
+        .job_output(&authn, &job_id, baseboard_id, Stdout, None)
         .await
         .unwrap()
         .into_bytes()
@@ -719,7 +773,7 @@ async fn output_ranges() {
             &authn,
             &job_id,
                     baseboard_id,
-            JobOutputStream::Stdout,
+            Stdout,
             Some(Range {
                 start: StartPosition::Index(0),
                 end: EndPosition::Index(n),
@@ -736,7 +790,7 @@ async fn output_ranges() {
             &authn,
             &job_id,
             baseboard_id,
-            JobOutputStream::Stdout,
+            Stdout,
             Some(Range {
                 start: StartPosition::Index(0),
                 end: EndPosition::Index(n - 1),
@@ -755,7 +809,7 @@ async fn output_ranges() {
             &authn,
             &job_id,
             baseboard_id,
-            JobOutputStream::Stdout,
+            Stdout,
             Some(Range {
                 start: StartPosition::Index(0),
                 end: EndPosition::Index(n / 2 - 1),
@@ -770,7 +824,7 @@ async fn output_ranges() {
             &authn,
             &job_id,
             baseboard_id,
-            JobOutputStream::Stdout,
+            Stdout,
             Some(Range {
                 start: StartPosition::Index(n / 2),
                 end: EndPosition::Index(n - 1),
@@ -790,7 +844,7 @@ async fn output_ranges() {
             &authn,
             &job_id,
             baseboard_id,
-            JobOutputStream::Stdout,
+            Stdout,
             Some(Range {
                 start: StartPosition::Index(0),
                 end: EndPosition::Index(9),
@@ -806,7 +860,7 @@ async fn output_ranges() {
             &authn,
             &job_id,
             baseboard_id,
-            JobOutputStream::Stdout,
+            Stdout,
             Some(Range {
                 start: StartPosition::Index(10),
                 end: EndPosition::LastByte,
@@ -826,7 +880,7 @@ async fn output_ranges() {
             &authn,
             &job_id,
             baseboard_id,
-            JobOutputStream::Stdout,
+            Stdout,
             Some(Range {
                 start: StartPosition::Index(n - 1),
                 end: EndPosition::LastByte,
@@ -849,7 +903,7 @@ async fn output_ranges() {
                     &authn,
                     &job_id,
                     baseboard_id,
-                    JobOutputStream::Stdout,
+                    Stdout,
                     Some(Range {
                         start: StartPosition::Index(i),
                         end: EndPosition::Index(i + l - 1),
@@ -867,7 +921,7 @@ async fn output_ranges() {
                 &authn,
                 &job_id,
                 baseboard_id,
-                JobOutputStream::Stdout,
+                Stdout,
                 Some(Range {
                     start: StartPosition::Index(i),
                     end: EndPosition::Index(n - 1),

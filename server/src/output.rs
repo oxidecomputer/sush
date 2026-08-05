@@ -2,7 +2,7 @@
 //!
 //! We use a trivial hierarchy: `{base}/jobs/{job_id}`.
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::pin::Pin;
 use std::task::{Context, Poll};
 
@@ -76,6 +76,10 @@ pub struct JobOutputDir(PathBuf);
 impl JobOutputDir {
     pub fn new(output_dir: PathBuf) -> Self {
         Self(output_dir)
+    }
+
+    pub fn root(&self) -> &Path {
+        &self.0
     }
 
     pub fn job_output_dir(&self, job_id: &JobId) -> PathBuf {

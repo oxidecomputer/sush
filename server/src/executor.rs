@@ -15,7 +15,7 @@ use pwd::Passwd;
 use rustix::io::close;
 use rustix::process::{Pid, Signal, ioctl_tiocsctty, kill_process_group, setsid};
 use slog::{Logger, debug, error, o};
-use tokio::fs::{DirBuilder, File};
+use tokio::fs::{DirBuilder, OpenOptions};
 use tokio::process::{Child, Command};
 use tokio::spawn;
 use tokio::sync::{mpsc, watch};
@@ -190,20 +190,38 @@ async fn job_spawn(
         };
     }
 
-    // Set up output files.
+    // Set up output directories and files.
+    let dir_mode = 0o700;
+    let file_mode = 0o600;
     let job_dir = output_dir.job_output_dir(&job_id);
     with_io_err!(
-        DirBuilder::new().recursive(true).create(&job_dir).await,
+        DirBuilder::new()
+            .recursive(true)
+            .mode(dir_mode)
+            .create(&job_dir)
+            .await,
         format!("creating job output directory `{}`", job_dir.display())
     );
     let stdout_path = output_dir.job_output_path(&job_id, Stdout);
     let stderr_path = output_dir.job_output_path(&job_id, Stderr);
     let stdout_file = with_io_err!(
-        File::create_new(&stdout_path).await,
+        OpenOptions::new()
+            .create_new(true)
+            .read(true) // needed for interactive job output playback
+            .write(true)
+            .mode(file_mode)
+            .open(&stdout_path)
+            .await,
         format!("creating job stdout file `{}`", stdout_path.display())
     );
     let stderr_file = with_io_err!(
-        File::create_new(&stderr_path).await,
+        OpenOptions::new()
+            .create_new(true)
+            .read(false) // not needed since interactive jobs have no stderr
+            .write(true)
+            .mode(file_mode)
+            .open(&stderr_path)
+            .await,
         format!("creating job stderr file `{}`", stderr_path.display())
     );
 
