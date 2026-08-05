@@ -534,7 +534,9 @@ impl State {
                     }
                     JobEvent::Stop(job_id, when, result, output) => {
                         info!(log, "job stopped"; "job_id" => %job_id, "when" => %when, "result" => ?result);
-                        self.attachments.remove(job_id);
+                        if baseboard_id == &self.own_baseboard {
+                            self.attachments.remove(job_id);
+                        }
                         self.running.remove(&(job_id.clone(), baseboard_id.clone()));
                         self.history.transition_job_status(
                             job_id,
@@ -561,7 +563,9 @@ impl State {
                     }
                     JobEvent::Error(job_id, when, error) => {
                         error!(log, "job error"; "job_id" => %job_id, "when" => %when, "error" => %error);
-                        self.attachments.remove(job_id);
+                        if baseboard_id == &self.own_baseboard {
+                            self.attachments.remove(job_id);
+                        }
                         self.running.remove(&(job_id.clone(), baseboard_id.clone()));
                         self.history.set_job_status(
                             job_id,
