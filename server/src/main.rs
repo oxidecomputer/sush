@@ -125,12 +125,15 @@ fn listen_for_shutdown() -> Result<CancellationToken, String> {
     let shutdown = CancellationToken::new();
     let trigger_shutdown = shutdown.clone();
     spawn(async move {
-        select! {
-            _ = sighup.recv() => (),
-            _ = sigint.recv() => (),
-            _ = sigterm.recv() => (),
+        loop {
+            select! {
+                Some(_) = sighup.recv() => (),
+                Some(_) = sigint.recv() => (),
+                Some(_) = sigterm.recv() => (),
+                else => break
+            }
+            trigger_shutdown.cancel();
         }
-        trigger_shutdown.cancel();
     });
     Ok(shutdown)
 }
