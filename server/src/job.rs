@@ -39,8 +39,7 @@ use tokio_tungstenite::tungstenite::protocol::Message as WebSocketMessage;
 use sush_common::interactive::{
     INTERACTIVE_JOB_BUFFER_SIZE, InteractiveJobControl as Control, InteractiveJobMessage as Message,
 };
-use sush_common::jobs::JobOutputStream::*;
-use sush_common::jobs::{JobOutputState, ProcessError};
+use sush_common::jobs::{JobLimits, JobOutputState, JobOutputStream::*, ProcessError};
 use tokio_util::sync::CancellationToken;
 
 use crate::executor::kill_job;
@@ -59,6 +58,7 @@ pub struct Job {
 impl Job {
     pub fn start(
         log: Logger,
+        limits: JobLimits,
         child: Child,
         io: JobIo,
         stdout: File,
@@ -67,7 +67,7 @@ impl Job {
     ) -> Self {
         let (tx_client, rx_client) = mpsc::channel::<SocketStream>(1);
         Self {
-            task: spawn(job(log, child, io, stdout, stderr, rx_client, stop)),
+            task: spawn(job(log, limits, child, io, stdout, stderr, rx_client, stop)),
             tx_client,
         }
     }
@@ -83,8 +83,10 @@ impl Job {
 
 /// Run a job that allows for client connections.
 /// It need not have a controlling (pseudo)terminal.
+#[allow(clippy::too_many_arguments)]
 async fn job(
     log: Logger,
+    JobLimits { max_fsize, .. }: JobLimits,
     mut child: Child,
     mut io: JobIo,
     mut stdout_file: File,
@@ -95,6 +97,7 @@ async fn job(
     let mut stdout_hasher = Hasher::new();
     let mut stderr_hasher = Hasher::new();
     let mut clients = WebSocketMux::new();
+    let mut fatal = Option::<ProcessError>::None;
     let mut killed = false;
     let mut dead = false;
     let drain_timeout = sleep(Duration::default());
@@ -119,12 +122,30 @@ async fn job(
                                     error!(log, "failed to record standard output"; "error" => %error);
                                     stop.cancel();
                                 }
+                                if stdout_hasher.count() > max_fsize {
+                                    error!(log, "standard output over limit"; "max_fsize" => %max_fsize);
+                                    io.stop_recording(stream);
+                                    stop.cancel();
+                                    fatal.get_or_insert(ProcessError::OutputLimitExceeded {
+                                        stream,
+                                        limit: max_fsize,
+                                    });
+                                }
                             }
                             Stderr => {
                                 stderr_hasher.update(&buf);
                                 if let Err(error) = stderr_file.write_all(&buf).await {
                                     error!(log, "failed to record error output"; "error" => %error);
                                     stop.cancel();
+                                }
+                                if stderr_hasher.count() > max_fsize {
+                                    error!(log, "error output over limit"; "max_fsize" => %max_fsize);
+                                    io.stop_recording(stream);
+                                    stop.cancel();
+                                    fatal.get_or_insert(ProcessError::OutputLimitExceeded {
+                                        stream,
+                                        limit: max_fsize,
+                                    });
                                 }
                             }
                         }
@@ -255,9 +276,12 @@ async fn job(
             child.wait().await
         }
     };
-    let result = match exit_status {
-        Ok(status) => process_exit(status),
-        Err(error) => Err(ProcessError::Interactive(error.to_string())),
+    let result = match fatal {
+        Some(error) => Err(error),
+        None => match exit_status {
+            Ok(status) => process_exit(status),
+            Err(error) => Err(ProcessError::Interactive(error.to_string())),
+        },
     };
     info!(log, "job stopped");
 
@@ -343,6 +367,7 @@ mod test {
             let io = JobIo::interactive(pty, writer, stop.child_token());
             let job = Job::start(
                 log,
+                JobLimits::default(),
                 child,
                 io,
                 output_file.reopen().unwrap().into(),

@@ -20,6 +20,7 @@ use sush_common::jobs::{
     JobId, JobLimits, JobOutputState, JobOutputStream, JobStatus, ProcessError, Session, SessionId,
 };
 use sush_common::keys::{EphemeralKey, KeyError, KeyType, Signer as _};
+use sush_server::io::BATCH_OUTPUT_BUFFER_SIZE;
 use sush_server::{JobError, JobManager};
 
 use crate::test_utils::{
@@ -49,8 +50,8 @@ fn check_status_stopped(
     status: JobStatus,
     expected_job_id: &JobId,
     expected_result: Result<i32, ProcessError>,
-    expected_stdout_len: u64,
-    expected_stderr_len: u64,
+    expected_stdout_len: Option<u64>,
+    expected_stderr_len: Option<u64>,
 ) {
     let JobStatus::Stopped {
         job_id,
@@ -71,8 +72,12 @@ fn check_status_stopped(
     assert!(time_started < time_stopped);
     assert!(time_stopped <= Utc::now());
     assert_eq!(result, expected_result);
-    assert_eq!(stdout_len, expected_stdout_len);
-    assert_eq!(stderr_len, expected_stderr_len);
+    if let Some(expected_len) = expected_stdout_len {
+        assert_eq!(stdout_len, expected_len);
+    }
+    if let Some(expected_len) = expected_stderr_len {
+        assert_eq!(stderr_len, expected_len);
+    }
 }
 
 #[named]
@@ -106,7 +111,7 @@ async fn jobs() {
     .unwrap();
     session.job_started(job.clone().into_signed());
     let status = mgr.job_status(&authn, &job_id).await.unwrap()[mgr.own_baseboard()].clone();
-    check_status_stopped(status, &job_id, Ok(0), 0, 0);
+    check_status_stopped(status, &job_id, Ok(0), Some(0), Some(0));
 
     let job_id = session.next_job_id();
     let job = root.sign_job_request(&job_id, "false", false).await;
@@ -122,7 +127,7 @@ async fn jobs() {
     .unwrap();
     session.job_started(job.clone().into_signed());
     let status = mgr.job_status(&authn, &job_id).await.unwrap()[mgr.own_baseboard()].clone();
-    check_status_stopped(status, &job_id, Ok(1), 0, 0);
+    check_status_stopped(status, &job_id, Ok(1), Some(0), Some(0));
 
     let job_id = session.next_job_id();
     let job_id_string = job_id.to_string();
@@ -142,7 +147,13 @@ async fn jobs() {
     .unwrap();
     session.job_started(job.clone().into_signed());
     let status = mgr.job_status(&authn, &job_id).await.unwrap()[baseboard_id].clone();
-    check_status_stopped(status, &job_id, Ok(0), job_id_bytes.len() as u64, 0);
+    check_status_stopped(
+        status,
+        &job_id,
+        Ok(0),
+        Some(job_id_bytes.len() as u64),
+        Some(0),
+    );
     assert_eq!(
         mgr.job_output(&authn, &job_id, baseboard_id, JobOutputStream::Stdout, None)
             .await
@@ -176,7 +187,7 @@ async fn jobs() {
     .unwrap();
     session.job_started(job.clone().into_signed());
     let status = mgr.job_status(&authn, &job_id).await.unwrap()[baseboard_id].clone();
-    check_status_stopped(status, &job_id, Ok(0), output.len() as u64, 0);
+    check_status_stopped(status, &job_id, Ok(0), Some(output.len() as u64), Some(0));
     assert_eq!(
         mgr.job_output(&authn, &job_id, baseboard_id, JobOutputStream::Stdout, None)
             .await
@@ -271,7 +282,13 @@ async fn job_stop() {
         .remove(baseboard_id)
         .expect("should have job status");
     assert!(status.time_elapsed().to_std().unwrap() < Duration::from_secs(1));
-    check_status_stopped(status, &job_id, Err(ProcessError::Killed(SIGKILL)), 0, 0);
+    check_status_stopped(
+        status,
+        &job_id,
+        Err(ProcessError::Killed(SIGKILL)),
+        Some(0),
+        Some(0),
+    );
 }
 
 #[named]
@@ -381,7 +398,13 @@ async fn shutdown() {
         .unwrap();
 
     let status = mgr.job_status(&authn, &job_id).await.unwrap()[mgr.own_baseboard()].clone();
-    check_status_stopped(status, &job_id, Err(ProcessError::Killed(SIGKILL)), 0, 0);
+    check_status_stopped(
+        status,
+        &job_id,
+        Err(ProcessError::Killed(SIGKILL)),
+        Some(0),
+        Some(0),
+    );
 }
 
 #[named]
@@ -475,7 +498,7 @@ async fn cert_chain() {
     .unwrap();
     session.job_started(job.clone().into_signed());
     let status = mgr.job_status(&authn, &job_id).await.unwrap()[mgr.own_baseboard()].clone();
-    check_status_stopped(status, &job_id, Ok(0), 0, 0);
+    check_status_stopped(status, &job_id, Ok(0), Some(0), Some(0));
 }
 
 #[named]
@@ -534,18 +557,121 @@ async fn too_much_cpu() {
             output: JobOutputState { stderr_len: 37, .. },
             ..
         } => {
-            check_status_stopped(status, &job_id, Err(ProcessError::Killed(SIGXCPU)), 0, 37);
+            check_status_stopped(
+                status,
+                &job_id,
+                Err(ProcessError::Killed(SIGXCPU)),
+                Some(0),
+                Some(37),
+            );
             assert_eq!(stderr, "Doing sha1 for 3s on 16 size blocks: ");
         }
         JobStatus::Stopped {
             output: JobOutputState { stderr_len: 41, .. },
             ..
         } => {
-            check_status_stopped(status, &job_id, Err(ProcessError::Killed(SIGXCPU)), 0, 41);
+            check_status_stopped(
+                status,
+                &job_id,
+                Err(ProcessError::Killed(SIGXCPU)),
+                Some(0),
+                Some(41),
+            );
             assert_eq!(stderr, "Doing sha1 ops for 3s on 16 size blocks: ");
         }
         _ => todo!("what does `{command}` produce on your system?"),
     }
+}
+
+#[named]
+#[tokio::test]
+async fn too_much_output() {
+    let log = test_logger(function_name!());
+    let (mgr, mut root, _dir, _shutdown) = manager_and_test_root(log).await;
+    let authn = fake_identity(&mut root).await;
+    let session_id = SessionId::new();
+    let mut session = Session::new(session_id.clone());
+    mgr.session_start(&authn, session_id.clone(), true)
+        .await
+        .unwrap();
+
+    let job_id = session.next_job_id();
+    let command = "yes";
+    let job = root.sign_job_request(&job_id, command, false).await;
+    let job_id = job.job_id().to_owned();
+    let max_fsize = 0x10000;
+    mgr.job_start(
+        &authn,
+        job.clone().into_signed(),
+        JobStartParams {
+            limits: JobLimits {
+                max_fsize,
+                ..Default::default()
+            },
+            wait: JobWait::Stop,
+            ..Default::default()
+        },
+    )
+    .await
+    .expect("should be able to start job");
+    session.job_started(job.clone().into_signed());
+    let status = mgr.job_status(&authn, &job_id).await.unwrap()[mgr.own_baseboard()].clone();
+    check_status_stopped(
+        status.clone(),
+        &job_id,
+        Err(ProcessError::OutputLimitExceeded {
+            stream: JobOutputStream::Stdout,
+            limit: max_fsize,
+        }),
+        None,
+        Some(0),
+    );
+    assert!(matches!(
+        status,
+        JobStatus::Stopped {
+            output: JobOutputState { stdout_len, .. },
+            ..
+        } if stdout_len >= max_fsize && stdout_len <= max_fsize + BATCH_OUTPUT_BUFFER_SIZE as u64
+    ));
+
+    let job_id = session.next_job_id();
+    let command = "yes >&2";
+    let job = root.sign_job_request(&job_id, command, false).await;
+    let job_id = job.job_id().to_owned();
+    let max_fsize = 0x10000;
+    mgr.job_start(
+        &authn,
+        job.clone().into_signed(),
+        JobStartParams {
+            limits: JobLimits {
+                max_fsize,
+                ..Default::default()
+            },
+            wait: JobWait::Stop,
+            ..Default::default()
+        },
+    )
+    .await
+    .expect("should be able to start job");
+    session.job_started(job.clone().into_signed());
+    let status = mgr.job_status(&authn, &job_id).await.unwrap()[mgr.own_baseboard()].clone();
+    check_status_stopped(
+        status.clone(),
+        &job_id,
+        Err(ProcessError::OutputLimitExceeded {
+            stream: JobOutputStream::Stderr,
+            limit: max_fsize,
+        }),
+        Some(0),
+        None,
+    );
+    assert!(matches!(
+        status,
+        JobStatus::Stopped {
+            output: JobOutputState { stderr_len, .. },
+            ..
+        } if stderr_len >= max_fsize && stderr_len <= max_fsize + BATCH_OUTPUT_BUFFER_SIZE as u64
+    ));
 }
 
 #[named]
@@ -577,7 +703,7 @@ async fn output_ranges() {
     .await
     .unwrap();
     let status = mgr.job_status(&authn, &job_id).await.unwrap()[mgr.own_baseboard()].clone();
-    check_status_stopped(status, &job_id, Ok(0), n, 0);
+    check_status_stopped(status, &job_id, Ok(0), Some(n), Some(0));
 
     // No range, i.e., full output.
     let r = mgr

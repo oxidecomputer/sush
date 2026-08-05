@@ -10,7 +10,7 @@ use std::io;
 use std::time::Duration;
 
 use bytes::{Bytes, BytesMut};
-use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
+use tokio::io::{AsyncRead, AsyncReadExt as _, AsyncWriteExt as _};
 use tokio::process::{ChildStderr, ChildStdout};
 use tokio::sync::mpsc;
 use tokio::{select, spawn};
@@ -22,19 +22,47 @@ use sush_common::jobs::JobOutputStream::{self, *};
 use crate::pty::{PtyReader, PtyWriter};
 
 const INPUT_CHANNEL_CAPACITY: usize = 100;
-const BATCH_OUTPUT_BUFFER_SIZE: usize = 0x10000;
+pub const BATCH_OUTPUT_BUFFER_SIZE: usize = 0x10000;
 const INTERACTIVE_OUTPUT_BUFFER_SIZE: usize = 0x2000;
+
+pub struct StreamState<R> {
+    reader: R,
+    buf: BytesMut,
+    eof: bool,
+    rec: bool,
+}
+
+impl<R: AsyncRead + Unpin> StreamState<R> {
+    fn new(reader: R, buf_size: usize) -> Self {
+        Self {
+            reader,
+            buf: BytesMut::with_capacity(buf_size),
+            eof: false,
+            rec: true,
+        }
+    }
+
+    async fn read(&mut self) -> io::Result<Option<Bytes>> {
+        self.buf.clear();
+        match self.reader.read_buf(&mut self.buf).await? {
+            0 => {
+                self.eof = true;
+                Ok(None)
+            }
+            _ if !self.rec => Ok(None),
+            n => Ok(Some(Bytes::copy_from_slice(&self.buf[..n]))),
+        }
+    }
+}
 
 pub enum JobIo {
     Interactive {
-        pty: PtyReader,
+        pty: StreamState<PtyReader>,
         tx_input: mpsc::Sender<Bytes>,
     },
     Batch {
-        stdout: ChildStdout,
-        stderr: ChildStderr,
-        stdout_eof: bool,
-        stderr_eof: bool,
+        stdout: StreamState<ChildStdout>,
+        stderr: StreamState<ChildStderr>,
     },
 }
 
@@ -42,15 +70,16 @@ impl JobIo {
     pub fn interactive(pty: PtyReader, writer: PtyWriter, stop: CancellationToken) -> Self {
         let (tx_input, rx_input) = mpsc::channel::<Bytes>(INPUT_CHANNEL_CAPACITY);
         spawn(Self::relay_input(rx_input, writer, stop));
-        Self::Interactive { pty, tx_input }
+        Self::Interactive {
+            pty: StreamState::new(pty, INTERACTIVE_OUTPUT_BUFFER_SIZE),
+            tx_input,
+        }
     }
 
     pub fn batch(stdout: ChildStdout, stderr: ChildStderr) -> Self {
         Self::Batch {
-            stdout,
-            stderr,
-            stdout_eof: false,
-            stderr_eof: false,
+            stdout: StreamState::new(stdout, BATCH_OUTPUT_BUFFER_SIZE),
+            stderr: StreamState::new(stderr, BATCH_OUTPUT_BUFFER_SIZE),
         }
     }
 
@@ -78,37 +107,28 @@ impl JobIo {
 
     pub async fn read_output(&mut self) -> io::Result<(Bytes, JobOutputStream)> {
         match self {
-            Self::Interactive { pty, .. } => {
-                let mut buf = BytesMut::with_capacity(INTERACTIVE_OUTPUT_BUFFER_SIZE);
-                let n = pty.read_buf(&mut buf).await?;
-                Ok((Bytes::copy_from_slice(&buf[..n]), Stdout))
-            }
-            Self::Batch {
-                stdout,
-                stderr,
-                stdout_eof,
-                stderr_eof,
-            } => {
-                let mut stdout_buf = BytesMut::with_capacity(BATCH_OUTPUT_BUFFER_SIZE);
-                let mut stderr_buf = BytesMut::with_capacity(BATCH_OUTPUT_BUFFER_SIZE);
-                loop {
-                    select! {
-                        n = stdout.read_buf(&mut stdout_buf), if !*stdout_eof => {
-                            match n? {
-                                0 => *stdout_eof = true,
-                                n => return Ok((Bytes::copy_from_slice(&stdout_buf[..n]), Stdout)),
-                            }
-                        }
-                        n = stderr.read_buf(&mut stderr_buf), if !*stderr_eof => {
-                            match n? {
-                                0 => *stderr_eof = true,
-                                n => return Ok((Bytes::copy_from_slice(&stderr_buf[..n]), Stderr)),
-                            }
-                        }
-                        else => return Ok((Bytes::new(), Stdout)), // both streams at EOF
-                    }
+            Self::Interactive { pty, .. } => loop {
+                match pty.read().await? {
+                    Some(b) => return Ok((b, Stdout)),
+                    None if pty.eof => return Ok((Bytes::new(), Stdout)),
+                    None => (), // drained, keep reading
                 }
-            }
+            },
+            Self::Batch { stdout, stderr } => loop {
+                select! {
+                    r = stdout.read(), if !stdout.eof => {
+                        if let Some(b) = r? {
+                            return Ok((b, Stdout));
+                        }
+                    }
+                    r = stderr.read(), if !stderr.eof => {
+                        if let Some(b) = r? {
+                            return Ok((b, Stderr));
+                        }
+                    }
+                    else => return Ok((Bytes::new(), Stdout)), // both streams at EOF
+                }
+            },
         }
     }
 
@@ -124,14 +144,14 @@ impl JobIo {
 
     pub fn get_window_size(&self) -> io::Result<WindowSize> {
         match self {
-            Self::Interactive { pty, .. } => pty.get_window_size(),
+            Self::Interactive { pty, .. } => pty.reader.get_window_size(),
             Self::Batch { .. } => Err(unsupported("batch jobs have no window size")),
         }
     }
 
     pub fn set_window_size(&mut self, size: WindowSize) -> io::Result<()> {
         match self {
-            Self::Interactive { pty, .. } => pty.set_window_size(size),
+            Self::Interactive { pty, .. } => pty.reader.set_window_size(size),
             Self::Batch { .. } => Err(unsupported("batch jobs have no windows")),
         }
     }
@@ -147,6 +167,16 @@ impl JobIo {
         match self {
             Self::Interactive { .. } => Duration::from_millis(10),
             Self::Batch { .. } => Duration::from_secs(5),
+        }
+    }
+
+    pub fn stop_recording(&mut self, stream: JobOutputStream) {
+        match self {
+            Self::Interactive { pty, .. } => pty.rec = false,
+            Self::Batch { stdout, stderr, .. } => match stream {
+                Stdout => stdout.rec = false,
+                Stderr => stderr.rec = false,
+            },
         }
     }
 }

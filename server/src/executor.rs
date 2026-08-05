@@ -227,6 +227,7 @@ async fn job_spawn(
 
     // Set process limits.
     unsafe {
+        let limits = limits.clone();
         cmd.pre_exec(move || limits.apply());
     }
 
@@ -276,6 +277,7 @@ async fn job_spawn(
         let io = JobIo::interactive(pty, writer, stop.child_token());
         Job::start(
             log.new(o!("interactive" => interactive)),
+            limits,
             child,
             io,
             stdout_file,
@@ -296,6 +298,7 @@ async fn job_spawn(
         );
         Job::start(
             log.new(o!("interactive" => interactive)),
+            limits,
             child,
             io,
             stdout_file,

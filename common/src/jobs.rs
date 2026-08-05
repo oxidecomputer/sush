@@ -395,6 +395,8 @@ pub enum ProcessError {
     InvalidJob(String),
     #[error("I/O error {what}: {error}")]
     Io { what: String, error: String },
+    #[error("{stream} exceeded the output limit of {limit} bytes")]
+    OutputLimitExceeded { stream: JobOutputStream, limit: u64 },
     #[error("Unable to join job process: {0}")]
     Join(String),
 }
@@ -630,7 +632,16 @@ impl Default for JobLimits {
 
 /// Either the standard output or standard error of a job.
 #[derive(
-    Clone, Copy, Debug, Deserialize, JsonSchema, Serialize, BorshDeserialize, BorshSerialize,
+    BorshDeserialize,
+    BorshSerialize,
+    Clone,
+    Copy,
+    Debug,
+    Deserialize,
+    Eq,
+    JsonSchema,
+    PartialEq,
+    Serialize,
 )]
 #[serde(rename_all = "lowercase")]
 pub enum JobOutputStream {
