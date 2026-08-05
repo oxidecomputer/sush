@@ -48,6 +48,11 @@ struct ServerArgs {
     /// Disabling $PATH isolation could be insecure, and must never be done on production.
     #[arg(long, default_value_t = false)]
     insecure_disable_path_isolation: bool,
+
+    /// Root certificates to use to verify signatures
+    #[cfg(feature = "test-support")]
+    #[arg(long = "root-cert")]
+    override_root_certs: Vec<PathBuf>,
 }
 
 #[tokio::main]
@@ -56,6 +61,8 @@ async fn main() -> Result<(), String> {
         address,
         debug,
         directory,
+        #[cfg(feature = "test-support")]
+        override_root_certs,
         insecure_disable_path_isolation,
     } = ServerArgs::parse();
 
@@ -84,11 +91,10 @@ async fn main() -> Result<(), String> {
     // TODO: get/seed Rumors network
     let gossip = Peer::seed().into_rumors();
 
-    let roots = ROOT_CERTS
-        .iter()
-        .map(Certificate::from_pem)
-        .collect::<Result<Vec<_>, _>>()
-        .map_err(|e| e.to_string())?;
+    #[cfg(feature = "test-support")]
+    let roots = overridable_root_certs(&override_root_certs)?;
+    #[cfg(not(feature = "test-support"))]
+    let roots = builtin_root_certs()?;
 
     let shutdown = listen_for_shutdown()?;
     let mut mgr = JobManager::new(
@@ -124,6 +130,29 @@ async fn main() -> Result<(), String> {
     join.await
         .map_err(|error| format!("failed to wait for manager: {error}"))?;
     Ok(())
+}
+
+fn builtin_root_certs() -> Result<Vec<Certificate>, String> {
+    ROOT_CERTS
+        .iter()
+        .map(Certificate::from_pem)
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(|e| e.to_string())
+}
+
+#[cfg_attr(not(feature = "test-support"), expect(dead_code))]
+fn overridable_root_certs(override_root_certs: &[PathBuf]) -> Result<Vec<Certificate>, String> {
+    if override_root_certs.is_empty() {
+        builtin_root_certs()
+    } else {
+        override_root_certs
+            .iter()
+            .map(|path| {
+                Certificate::from_pem(&std::fs::read(path).map_err(|e| e.to_string())?)
+                    .map_err(|e| e.to_string())
+            })
+            .collect()
+    }
 }
 
 /// Trigger a cancellation token on receipt of a terminal Unix signal(7).
