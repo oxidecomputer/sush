@@ -1,7 +1,6 @@
 //! Signed job requests.
 
 use std::collections::{BTreeMap, HashMap};
-use std::convert::Infallible;
 use std::fmt;
 use std::io::Error as IoError;
 use std::ops::Deref;
@@ -20,8 +19,12 @@ use serde::{Deserialize, Serialize, Serializer};
 use sled_hardware_types::{BaseboardId, BaseboardIdParseError};
 use thiserror::Error;
 
-use crate::borsh::{borsh_de_datetime, borsh_de_hash, borsh_ser_datetime, borsh_ser_hash};
-use crate::codephrases::{WORD_SEPARATOR, generate_id, id_phrase};
+use crate::borsh::{
+    borsh_de_datetime, borsh_de_hash, borsh_de_job_id, borsh_ser_datetime, borsh_ser_hash,
+};
+use crate::codephrases::{
+    InvalidCodephrase, WORD_SEPARATOR, decode_phrase, generate_id, id_phrase,
+};
 use crate::interactive::InteractiveJobError;
 use crate::keys::{Signed, ToBeSigned, Verified};
 
@@ -40,7 +43,8 @@ use crate::keys::{Signed, ToBeSigned, Verified};
     PartialOrd,
     Serialize,
 )]
-pub struct JobId(String);
+#[serde(try_from = "String")]
+pub struct JobId(#[borsh(deserialize_with = "borsh_de_job_id")] String);
 
 impl Deref for JobId {
     type Target = str;
@@ -56,23 +60,36 @@ impl fmt::Display for JobId {
     }
 }
 
-impl FromStr for JobId {
-    type Err = Infallible;
-
-    fn from_str(s: &str) -> Result<Self, Self::Err> {
-        Ok(Self(s.to_string()))
-    }
-}
-
 impl From<&Self> for JobId {
     fn from(other: &Self) -> Self {
         other.to_owned()
     }
 }
 
-impl<S: AsRef<str>> From<S> for JobId {
-    fn from(s: S) -> Self {
-        Self(s.as_ref().to_string())
+impl From<U256> for JobId {
+    fn from(value: U256) -> Self {
+        Self(id_phrase(value).join(WORD_SEPARATOR))
+    }
+}
+
+impl FromStr for JobId {
+    type Err = InvalidCodephrase;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        let p = id_phrase(decode_phrase(s)?).join(WORD_SEPARATOR);
+        if p == *s {
+            Ok(Self(p))
+        } else {
+            Err(InvalidCodephrase)
+        }
+    }
+}
+
+impl TryFrom<String> for JobId {
+    type Error = InvalidCodephrase;
+
+    fn try_from(s: String) -> Result<Self, Self::Error> {
+        JobId::from_str(&s)
     }
 }
 
@@ -111,21 +128,18 @@ impl SessionId {
     }
 
     pub fn first_job_id(&self) -> JobId {
-        id_phrase(U256::from_be_slice(hash(self.0.as_bytes()).as_bytes()))
-            .join(WORD_SEPARATOR)
-            .into()
+        U256::from_be_slice(hash(self.0.as_bytes()).as_bytes()).into()
     }
 
     pub fn next_job_id(&self, last_job: &LastJob) -> JobId {
-        id_phrase(U256::from_be_slice(
+        U256::from_be_slice(
             match last_job {
                 LastJob::None => hash(&[b"None", self.0.as_bytes()].concat()),
                 LastJob::Some(job) => hash(&[b"Some", job.to_be_signed().as_slice()].concat()),
                 LastJob::Burned(job_id) => hash(&[b"Burned", job_id.as_bytes()].concat()),
             }
             .as_bytes(),
-        ))
-        .join(WORD_SEPARATOR)
+        )
         .into()
     }
 }
