@@ -24,14 +24,18 @@ use sush_common::interactive::WindowSize;
 /// Open and configure a Unix pseudoterminal. We return a reader/control
 /// handle, a write handle, the slave fd, and its path.
 pub fn open_pty() -> io::Result<(PtyReader, PtyWriter, OwnedFd, PathBuf)> {
-    let pty = openpt(OpenptFlags::RDWR | OpenptFlags::NOCTTY)?;
+    let pty = openpt(OpenptFlags::RDWR | OpenptFlags::NOCTTY | OpenptFlags::CLOEXEC)?;
     grantpt(&pty)?;
     unlockpt(&pty)?;
     fcntl_setfl(&pty, OFlags::NONBLOCK)?;
 
     let pts_name = ptsname(&pty, Vec::new())?;
     let pts_path = PathBuf::from(OsStr::from_bytes(pts_name.to_bytes()));
-    let pts = open(&pts_path, OFlags::RDWR | OFlags::NOCTTY, Mode::empty())?;
+    let pts = open(
+        &pts_path,
+        OFlags::RDWR | OFlags::NOCTTY | OFlags::CLOEXEC,
+        Mode::empty(),
+    )?;
 
     // Push the terminal interface STREAMS modules; see pts(4D).
     #[cfg(target_os = "illumos")]
@@ -100,6 +104,18 @@ impl AsRawFd for PtyReader {
 #[derive(Debug)]
 pub struct PtyWriter(AsyncFd<OwnedFd>);
 
+impl AsFd for PtyWriter {
+    fn as_fd(&self) -> BorrowedFd<'_> {
+        self.0.as_fd()
+    }
+}
+
+impl AsRawFd for PtyWriter {
+    fn as_raw_fd(&self) -> RawFd {
+        self.0.as_raw_fd()
+    }
+}
+
 impl AsyncWrite for PtyWriter {
     /// Write some input to a pseudoterminal.
     fn poll_write(
@@ -132,11 +148,15 @@ mod test {
     use super::*;
 
     use rustix::fs::fcntl_getfl;
+    use rustix::io::{FdFlags, fcntl_getfd};
     use rustix::termios::tcgetwinsize;
 
     #[tokio::test]
     async fn pty() {
-        let (pty, _writer, pts, pts_path) = open_pty().unwrap();
+        let (pty, writer, pts, pts_path) = open_pty().unwrap();
+        for fd in [pty.as_fd(), writer.as_fd(), pts.as_fd()] {
+            assert!(fcntl_getfd(fd).unwrap().contains(FdFlags::CLOEXEC));
+        }
         let pty_flags = fcntl_getfl(&pty).unwrap();
         let pts_flags = fcntl_getfl(&pts).unwrap();
         assert!(!(pty_flags & OFlags::RDWR).is_empty());
