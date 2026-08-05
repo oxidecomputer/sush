@@ -216,7 +216,7 @@ checksum = "55248b47b0caf0546f7988906588779981c43bb1bc9d0c44087278f80cdb44ba"
 [[package]]
 name = "before"
 version = "0.1.0"
-source = "git+https://github.com/oxidecomputer/rumors#61ddf3a5781d76ef03534f60d518e39b9bf1292c"
+source = "git+https://github.com/oxidecomputer/rumors?rev=748325407feb4c61f558713bad431281f8326ac4#748325407feb4c61f558713bad431281f8326ac4"
 dependencies = [
  "bitvec",
  "borsh",
@@ -331,9 +331,9 @@ checksum = "46c5e41b57b8bba42a04676d81cb89e9ee8e859a1a66f80a5a72e1cb76b34d43"
 
 [[package]]
 name = "bytemuck"
-version = "1.25.0"
+version = "1.25.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "c8efb64bd706a16a1bdde310ae86b351e4d21550d98d056f22f8a7f7a2183fec"
+checksum = "95832e849adfb21180ccb6826a99da14e5d266ae5c2e668e1602cf234f153797"
 
 [[package]]
 name = "byteorder"
@@ -1651,12 +1651,13 @@ dependencies = [
 
 [[package]]
 name = "imbl"
-version = "7.0.0"
+version = "7.0.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "e525189e5f603908d0c6e0d402cb5de9c4b2c8866151fabc4ebd771ed2630a2e"
+checksum = "43ea8d4c37ee560727e824d62804183624d371e632019b0e9e3532bce64a33e5"
 dependencies = [
  "archery",
  "bitmaps",
+ "equivalent",
  "imbl-sized-chunks",
  "rand_core 0.9.5",
  "rand_xoshiro",
@@ -2845,7 +2846,7 @@ dependencies = [
 [[package]]
 name = "rumors"
 version = "0.1.0"
-source = "git+https://github.com/oxidecomputer/rumors#61ddf3a5781d76ef03534f60d518e39b9bf1292c"
+source = "git+https://github.com/oxidecomputer/rumors?rev=748325407feb4c61f558713bad431281f8326ac4#748325407feb4c61f558713bad431281f8326ac4"
 dependencies = [
  "async-stream",
  "before",
@@ -3314,7 +3315,7 @@ checksum = "7a2ae44ef20feb57a68b23d846850f861394c2e02dc425a50098ae8c90267589"
 [[package]]
 name = "sled-hardware-types"
 version = "0.1.0"
-source = "git+https://github.com/oxidecomputer/omicron#8b0886dbd0222992175f34f9ab7bab48b304b0ad"
+source = "git+https://github.com/oxidecomputer/omicron?tag=rel%2Fv21%2Frc1#3e5bafe8ad9d19de5db48fb50bbe2e9437f82e86"
 dependencies = [
  "daft",
  "omicron-workspace-hack",
