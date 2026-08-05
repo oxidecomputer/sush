@@ -30,7 +30,7 @@ use sush_common::jobs::{
 
 use crate::io::JobIo;
 use crate::job::{Job, SocketSender};
-use crate::messages::{Event, JobEvent};
+use crate::messages::v0::{Event, JobEvent};
 use crate::output::JobOutputDir;
 use crate::pty::open_pty;
 use crate::state::{Certificates, cert_chain};

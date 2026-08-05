@@ -214,7 +214,9 @@ pub struct JobAttachParams {
 }
 
 /// Job parameters _not_ specified in the signed job request.
-#[derive(Clone, Debug, Default, Deserialize, JsonSchema, BorshSerialize, BorshDeserialize)]
+#[derive(
+    BorshSerialize, BorshDeserialize, Clone, Debug, Default, Deserialize, Eq, JsonSchema, PartialEq,
+)]
 #[serde(default)]
 pub struct JobStartParams {
     #[serde(flatten, deserialize_with = "deserialize_job_limits")]
@@ -235,14 +237,16 @@ pub struct JobStartParams {
 
 /// Whether and until what state is reached to wait for a job start/stop request.
 #[derive(
+    BorshSerialize,
+    BorshDeserialize,
     Clone,
     Copy,
     Debug,
     Default,
     Deserialize,
+    Eq,
     JsonSchema,
-    BorshSerialize,
-    BorshDeserialize,
+    PartialEq,
     Serialize,
 )]
 #[serde(rename_all = "lowercase")]

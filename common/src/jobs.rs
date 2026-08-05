@@ -588,7 +588,17 @@ fn hash_schema(g: &mut SchemaGenerator) -> Schema {
 }
 
 /// Limits on job processes.
-#[derive(BorshDeserialize, BorshSerialize, Clone, Debug, Deserialize, JsonSchema, Serialize)]
+#[derive(
+    BorshDeserialize,
+    BorshSerialize,
+    Clone,
+    Debug,
+    Deserialize,
+    Eq,
+    JsonSchema,
+    Serialize,
+    PartialEq,
+)]
 pub struct JobLimits {
     /// Maximum CPU use in seconds.
     pub max_cpu: u64,

@@ -25,13 +25,15 @@ use sush_common::keys::{KeyError, KeyId, Signature};
 use crate::executor::Executor;
 use crate::history::JobHistory;
 use crate::job::SocketSender;
-use crate::messages::{
+use crate::messages::v0::{
     CertRequest, Error, Event, JobEvent, JobRequest, Message, Request, SessionRequest,
 };
+use crate::messages::{VersionedMessage, VersionedMessage::*};
 use crate::output::JobOutputDir;
 
 pub type AttachmentPoints = BTreeMap<JobId, watch::Receiver<Option<SocketSender>>>;
 pub type Certificates = BTreeMap<KeyId, CertState>;
+pub type GossipNetwork = Rumors<VersionedMessage>;
 pub type QueuedJobs = BTreeMap<JobId, (SignedJob, JobStartParams)>;
 pub type RunningJobs = BTreeMap<(JobId, BaseboardId), DateTime<Utc>>;
 
@@ -319,11 +321,11 @@ impl State {
         // they're committed to persistent storage:
         _key: Key,
         incoming_version: &Version,
-        message: &Arc<Message>,
+        message: &Arc<VersionedMessage>,
     ) -> Result<(), Error> {
         use SessionState::*;
         match message.as_ref() {
-            Message::Request(request) => match request {
+            V0(Message::Request(request)) => match request {
                 Request::Cert(cert_request) => match cert_request.as_ref() {
                     CertRequest::Import(cert) => match self.import_cert(cert) {
                         Ok(key_id) => {
@@ -513,7 +515,7 @@ impl State {
                     }
                 },
             },
-            Message::Event(baseboard_id, event) => match event {
+            V0(Message::Event(baseboard_id, event)) => match event {
                 // Track the active set of known-running jobs anywhere in the rack.
                 Event::Job(job_event) => match job_event {
                     JobEvent::Start(job_id, when) => {
@@ -608,7 +610,7 @@ impl StateManager {
         output_dir: JobOutputDir,
         own_baseboard: BaseboardId,
         mut requests: R,
-        rumors: Rumors<Message>,
+        rumors: GossipNetwork,
         roots: &[Certificate],
         shutdown: CancellationToken,
     ) -> (watch::Receiver<State>, JoinHandle<()>)
@@ -674,7 +676,7 @@ impl StateManager {
                             None => requests_empty = true,
                             Some(request) => if let Some(rumors) = &rumors {
                                 debug!(log, "forwarding request to gossip network"; "request" => ?request);
-                                rumors.send(Message::Request(request));
+                                rumors.send(Message::Request(request).into());
                             },
                         },
 
@@ -683,7 +685,7 @@ impl StateManager {
                             None => events_empty = true,
                             Some(event) => if let Some(rumors) = &rumors {
                                 debug!(log, "forwarding event to gossip network"; "event" => ?event);
-                                rumors.send(Message::Event(own_baseboard.clone(), event));
+                                rumors.send(Message::Event(own_baseboard.clone(), event).into());
                             },
                         },
 
@@ -707,7 +709,7 @@ impl StateManager {
                                         error!(log, "state update failed"; "error" => ?error);
                                         if let Some(rumors) = &rumors {
                                             debug!(log, "sending error to gossip network"; "error" => ?error);
-                                            rumors.send(Message::Event(own_baseboard.clone(), Event::Error(error)));
+                                            rumors.send(Message::Event(own_baseboard.clone(), Event::Error(error)).into());
                                         }
                                     }
                                 });

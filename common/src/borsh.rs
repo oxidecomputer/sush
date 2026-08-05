@@ -10,7 +10,7 @@ use x509_cert::der::{Decode as _, Encode as _};
 
 use crate::jobs::JobId;
 
-/// Borsh-encode a [`Hash`] as its 32 raw bytes.
+/// Borsh-encode a [`blake3::Hash`] as its 32 raw bytes.
 ///
 /// `blake3::Hash` has no native Borsh impl; the wire form is the fixed-width
 /// digest with no length prefix.

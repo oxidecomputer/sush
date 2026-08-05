@@ -9,7 +9,6 @@ use std::time::Duration;
 use chrono::{DateTime, Utc};
 use http_range_header::SyntacticallyCorrectRange as Range;
 use lru::LruCache;
-use rumors::Rumors;
 use sled_hardware_types::BaseboardId;
 use slog::{Logger, debug, o, warn};
 use tokio::sync::{Mutex, mpsc, watch};
@@ -27,9 +26,9 @@ use sush_common::keys::{KeyError, KeyId, SshPublicKey};
 
 use crate::error::JobError;
 use crate::job::SocketSender;
-use crate::messages::{CertRequest, JobRequest, Message, Request, SessionRequest};
+use crate::messages::v0::{CertRequest, JobRequest, Request, SessionRequest};
 use crate::output::{JobOutputDir, JobOutputFileStream};
-use crate::state::{MAX_CERTS, State, StateManager};
+use crate::state::{GossipNetwork, MAX_CERTS, State, StateManager};
 
 /// Maximum number of cached identities.
 const MAX_CACHED_IDENTITIES: NonZeroUsize = NonZeroUsize::new(1_000).unwrap();
@@ -62,7 +61,7 @@ impl JobManager {
         log: Logger,
         output_dir: PathBuf,
         own_baseboard: BaseboardId,
-        rumors: Rumors<Message>,
+        rumors: GossipNetwork,
         roots: &[Certificate],
         shutdown: CancellationToken,
     ) -> Result<Self, JobError> {
