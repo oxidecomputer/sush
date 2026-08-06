@@ -25,3 +25,4 @@ pub use error::JobError;
 pub use manager::JobManager;
 pub use proxy::ProxyServer;
 pub use server::ApiServer;
+pub use state::seed_gossip;

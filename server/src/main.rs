@@ -9,7 +9,6 @@ use std::path::PathBuf;
 
 use clap::Parser;
 use dropshot::{ConfigDropshot, ConfigLogging, ConfigLoggingLevel, HandlerTaskMode, ServerBuilder};
-use rumors::Peer;
 use sled_hardware_types::BaseboardId;
 use tokio::signal::unix::{SignalKind, signal};
 use tokio::{select, spawn};
@@ -20,6 +19,7 @@ use x509_cert::der::DecodePem as _;
 use sush_api::sush_api_mod::api_description;
 use sush_server::executor::PathIsolation;
 use sush_server::manager::JobManager;
+use sush_server::seed_gossip;
 use sush_server::server::ApiServer;
 
 const DEFAULT_ADDRESS: &str = "0.0.0.0:44444";
@@ -89,7 +89,7 @@ async fn main() -> Result<(), String> {
     };
 
     // TODO: get/seed Rumors network
-    let gossip = Peer::seed().into_rumors();
+    let gossip = seed_gossip();
 
     #[cfg(feature = "test-support")]
     let roots = overridable_root_certs(&override_root_certs)?;

@@ -14,7 +14,7 @@ use std::sync::Arc;
 use chrono::{DateTime, Utc};
 use futures::{Stream, StreamExt};
 use lru::LruCache;
-use rumors::{Key, Rumors, Version};
+use rumors::{Key, Peer, Rumors, Version};
 use sled_hardware_types::BaseboardId;
 use slog::{Logger, debug, error, info, o, warn};
 use tokio::sync::watch;
@@ -722,6 +722,16 @@ impl State {
 
         Ok(())
     }
+}
+
+/// Create a fresh gossip network with this server as its only peer.
+///
+/// A peer that seeds its own network has no one to gossip with, so jobs run
+/// only on the server that accepted them, and no server learns about any other
+/// server's sessions. This stands in for joining the rack's network over
+/// sprockets on the bootstrap network.
+pub fn seed_gossip() -> GossipNetwork {
+    Peer::seed().into_rumors()
 }
 
 #[derive(Debug)]
