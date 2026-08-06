@@ -6,6 +6,7 @@
 
 use std::net::SocketAddr;
 use std::path::PathBuf;
+use std::sync::Arc;
 
 use clap::Parser;
 use dropshot::{ConfigDropshot, ConfigLogging, ConfigLoggingLevel, HandlerTaskMode, ServerBuilder};
@@ -112,7 +113,7 @@ async fn main() -> Result<(), String> {
 
     let api = api_description::<ApiServer>()
         .map_err(|error| format!("failed to get API description: {error}"))?;
-    let server = ServerBuilder::new(api, mgr, log)
+    let server = ServerBuilder::new(api, Arc::new(mgr), log)
         .config(ConfigDropshot {
             bind_address: address,
             default_request_body_max_bytes: REQUEST_MAX_BODY_BYTES,

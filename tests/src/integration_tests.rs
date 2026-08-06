@@ -5,6 +5,7 @@
 //! Oxide Support Shell integration tests.
 
 use std::net::SocketAddr;
+use std::sync::Arc;
 use std::time::Duration;
 
 use bytes::{Bytes, BytesMut};
@@ -43,7 +44,7 @@ async fn client_server() {
     let log = test_logger(function_name!());
     let (mgr, mut root, _dir, _shutdown) = manager_and_test_root(log.clone()).await;
     let api = api_description::<ApiServer>().unwrap();
-    let server = ServerBuilder::new(api, mgr, log)
+    let server = ServerBuilder::new(api, Arc::new(mgr), log)
         .config(ConfigDropshot {
             bind_address: local_addr(),
             ..Default::default()
@@ -127,7 +128,7 @@ async fn client_proxy_server() {
     let log = test_logger(function_name!());
     let (mgr, mut root, _dir, _shutdown) = manager_and_test_root(log.clone()).await;
     let api = api_description::<ApiServer>().unwrap();
-    let server = ServerBuilder::new(api, mgr, log.clone())
+    let server = ServerBuilder::new(api, Arc::new(mgr), log.clone())
         .config(ConfigDropshot {
             bind_address: local_addr(),
             ..Default::default()
@@ -214,7 +215,7 @@ async fn interactive_job() {
     let log = test_logger(function_name!());
     let (mgr, mut root, _dir, _shutdown) = manager_and_test_root(log.clone()).await;
     let api = api_description::<ApiServer>().unwrap();
-    let server = ServerBuilder::new(api, mgr, log)
+    let server = ServerBuilder::new(api, Arc::new(mgr), log)
         .config(ConfigDropshot {
             bind_address: local_addr(),
             ..Default::default()

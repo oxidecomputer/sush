@@ -4,6 +4,8 @@
 
 //! API server for the Oxide Support Shell.
 
+use std::sync::Arc;
+
 use dropshot::{
     Body, CONTENT_TYPE_OCTET_STREAM, ClientErrorStatusCode, Header, HttpError, HttpResponseOk,
     HttpResponseUpdatedNoContent, Path as PathParams, Query as QueryParams, RequestContext,
@@ -48,7 +50,7 @@ fn request_line(request: &dropshot::RequestInfo) -> (&str, &str) {
 }
 
 impl SushApi for ApiServer {
-    type Context = JobManager;
+    type Context = Arc<JobManager>;
 
     // Certificate management.
 
