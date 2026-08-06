@@ -7,7 +7,9 @@
 use std::sync::OnceLock;
 use std::time::Duration;
 
+use bytes::Bytes;
 use chrono::Utc;
+use futures::TryStreamExt as _;
 use rand_core::{OsRng, RngCore as _};
 use rumors::Peer;
 use sled_hardware_types::BaseboardId;
@@ -25,7 +27,7 @@ use sush_common::codephrases::generate_id;
 use sush_common::jobs::{JobId, JobStartRequest, VerifiedJob};
 use sush_common::keys::{EphemeralKey, KeyType, Signer};
 use sush_server::executor::PathIsolation;
-use sush_server::output::JobOutputDir;
+use sush_server::output::{JobOutputDir, JobOutputFileStream};
 use sush_server::state::GossipNetwork;
 use sush_server::{JobError, JobManager};
 
@@ -38,6 +40,24 @@ pub fn test_baseboard_id() -> BaseboardId {
             serial_number: "0000".to_string(),
         })
         .clone()
+}
+
+/// Collect a job output stream into memory. Convenient for tests, which know
+/// their output is small; the server deliberately streams instead.
+#[allow(async_fn_in_trait)]
+pub trait IntoBytes {
+    async fn into_bytes(self) -> Vec<u8>;
+}
+
+impl IntoBytes for JobOutputFileStream {
+    async fn into_bytes(self) -> Vec<u8> {
+        self.try_collect::<Vec<Bytes>>()
+            .await
+            .unwrap()
+            .into_iter()
+            .flatten()
+            .collect()
+    }
 }
 
 #[allow(async_fn_in_trait)]

@@ -411,9 +411,8 @@ impl JobManager {
     }
 
     /// Wait until the local state manager has recorded *any* status for
-    /// this job on this baseboard, including `Queued`. Used only to make
-    /// the `Queued` state observable in tests.
-    #[cfg(feature = "test-support")]
+    /// this job on this baseboard, including `Queued`. This is what makes the
+    /// `Queued` state observable.
     pub async fn wait_for_job_status(&self, job_id: &JobId) -> Result<(), JobError> {
         let job_id = job_id.to_owned();
         let baseboard = self.own_baseboard().to_owned();

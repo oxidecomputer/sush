@@ -11,9 +11,8 @@ use std::path::{Path, PathBuf};
 use std::pin::Pin;
 use std::task::{Context, Poll};
 
-use bytes::Bytes;
 use bytesize::ByteSize;
-use futures::{Stream, TryStreamExt as _};
+use futures::Stream;
 use http_range_header::{EndPosition, StartPosition, SyntacticallyCorrectRange as Range};
 use tokio::fs::{File, metadata};
 use tokio::io;
@@ -58,16 +57,6 @@ impl JobOutputFileStream {
         self.length
     }
 
-    #[cfg(feature = "test-support")]
-    pub async fn into_bytes(self) -> Vec<u8> {
-        self.stream
-            .try_collect::<Vec<Bytes>>()
-            .await
-            .unwrap()
-            .into_iter()
-            .flatten()
-            .collect()
-    }
 }
 
 impl Stream for JobOutputFileStream {

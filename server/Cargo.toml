@@ -12,6 +12,7 @@ name = "sush-server"
 path = "src/main.rs"
 
 [features]
+embedded = []
 test-support = []
 
 [dependencies]

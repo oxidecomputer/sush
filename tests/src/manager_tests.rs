@@ -37,9 +37,9 @@ use sush_server::output::{JobOutputDir, OutputDirs};
 use sush_server::{JobError, JobManager, seed_gossip};
 
 use crate::test_utils::{
-    SignJobRequest as _, ephemeral_test_root, ephemeral_test_subject, fake_identity,
-    manager_and_test_root, manager_login, manager_test_root_and_peer, test_baseboard_id,
-    test_logger,
+    IntoBytes as _, SignJobRequest as _, ephemeral_test_root, ephemeral_test_subject,
+    fake_identity, manager_and_test_root, manager_login, manager_test_root_and_peer,
+    test_baseboard_id, test_logger,
 };
 use sush_server::executor::PathIsolation;
 
