@@ -17,7 +17,7 @@ use rumors::Peer;
 use sled_hardware_types::BaseboardId;
 use slog::{Discard, Logger, o};
 use tempfile::TempDir;
-use tokio::fs::metadata;
+use tokio::fs::{metadata, write};
 use tokio::sync::watch;
 use tokio::time::{sleep, timeout};
 use tokio_util::sync::CancellationToken;
@@ -30,7 +30,7 @@ use sush_common::jobs::{
     Access, JobId, JobLimits, JobOutputState, JobOutputStream::*, JobStatus, ProcessError, Session,
     SessionId,
 };
-use sush_common::keys::{EphemeralKey, KeyError, KeyId, KeyType, Signer as _};
+use sush_common::keys::{EphemeralKey, KeyError, KeyId, KeyType, Signer as _, pem_cert_chain};
 use sush_server::io::BATCH_OUTPUT_BUFFER_SIZE;
 use sush_server::messages::v0::{CertRequest, Message, Request, SessionRequest};
 use sush_server::output::{JobOutputDir, OutputDirs};
@@ -431,6 +431,78 @@ async fn job_output_perms() {
 
 #[named]
 #[tokio::test]
+async fn root_certs_from_files() {
+    // The sled-agent embedding configures roots as paths, so the manager reads
+    // them itself.
+    let log = test_logger(function_name!());
+    let dir = TempDir::with_prefix("sush-").unwrap();
+    let mut root = ephemeral_test_root();
+    let path = dir.path().join("root.pem");
+    write(&path, pem_cert_chain(vec![root.cert().to_owned()]).unwrap())
+        .await
+        .unwrap();
+    let mgr = JobManager::new(
+        log,
+        PathIsolation::InsecureDisable,
+        JobOutputDir::fixed(dir.path()),
+        test_baseboard_id(),
+        seed_gossip(),
+        &[path],
+        CancellationToken::new(),
+    )
+    .await
+    .unwrap();
+
+    // A job signed by the configured root runs.
+    let authn = fake_identity(&mut root).await;
+    let session_id = SessionId::new();
+    let session = Session::new(session_id.clone());
+    mgr.session_start(&authn, session_id.clone(), true)
+        .await
+        .unwrap();
+    let job_id = session.next_job_id();
+    let job = root.sign_job_request(&job_id, "true", false).await;
+    mgr.job_start(
+        &authn,
+        job.into_signed(),
+        JobStartParams {
+            wait: JobWait::Stop,
+            ..Default::default()
+        },
+    )
+    .await
+    .unwrap();
+    let status = mgr.job_status(&authn, &job_id).await.unwrap()[mgr.own_baseboard()].clone();
+    check_status_stopped(status, &job_id, Ok(0), Some(0), Some(0));
+}
+
+#[named]
+#[tokio::test]
+async fn bad_root_cert_files() {
+    // A trust store we can't read is an error, not an empty trust store.
+    let log = test_logger(function_name!());
+    let dir = TempDir::with_prefix("sush-").unwrap();
+    let undecodable = dir.path().join("undecodable.pem");
+    write(&undecodable, "not a certificate").await.unwrap();
+    for path in [undecodable, dir.path().join("missing.pem")] {
+        assert!(
+            JobManager::new(
+                log.clone(),
+                PathIsolation::InsecureDisable,
+                JobOutputDir::fixed(dir.path()),
+                test_baseboard_id(),
+                seed_gossip(),
+                &[path],
+                CancellationToken::new(),
+            )
+            .await
+            .is_err()
+        );
+    }
+}
+
+#[named]
+#[tokio::test]
 async fn job_output_dir_moves() {
     // A server may move its output base part way through its life: sled-agent
     // records job output on a ramdisk until an encrypted dataset is mounted,
@@ -443,7 +515,7 @@ async fn job_output_dir_moves() {
         JobLimits::default().max_fsize,
     ));
     let mut root = ephemeral_test_root();
-    let mgr = JobManager::new(
+    let mgr = JobManager::with_root_certs(
         log,
         PathIsolation::InsecureDisable,
         JobOutputDir::new(rx_dirs),
@@ -605,7 +677,7 @@ async fn cert_chain() {
     };
     let gossip = Peer::seed().into_rumors();
     let shutdown = CancellationToken::new();
-    let mgr = JobManager::new(
+    let mgr = JobManager::with_root_certs(
         log,
         PathIsolation::InsecureDisable,
         JobOutputDir::fixed(dir.path()),

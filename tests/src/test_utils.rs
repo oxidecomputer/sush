@@ -151,7 +151,7 @@ pub async fn manager_test_root_and_peer(
     let peer = gossip.clone();
     let shutdown = CancellationToken::new();
     let root = ephemeral_test_root();
-    let mgr = JobManager::new(
+    let mgr = JobManager::with_root_certs(
         log,
         PathIsolation::InsecureDisable,
         JobOutputDir::fixed(dir.path()),

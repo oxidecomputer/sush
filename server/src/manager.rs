@@ -6,6 +6,7 @@
 //! state machine. Does not manage jobs directly.
 
 use std::num::NonZeroUsize;
+use std::path::Path;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -14,12 +15,14 @@ use http_range_header::SyntacticallyCorrectRange as Range;
 use lru::LruCache;
 use sled_hardware_types::BaseboardId;
 use slog::{Logger, debug, info, o, warn};
+use tokio::fs::read;
 use tokio::sync::{Mutex, mpsc, watch};
 use tokio::task::JoinHandle;
 use tokio::time::timeout;
 use tokio_stream::wrappers::ReceiverStream;
 use tokio_util::sync::CancellationToken;
 use x509_cert::Certificate;
+use x509_cert::der::DecodePem as _;
 
 use sush_api::{JobStartParams, JobStopParams, JobWait};
 use sush_common::authn::{
@@ -93,7 +96,31 @@ pub struct JobManager {
 }
 
 impl JobManager {
+    /// Trust the root certificates in `roots`, one PEM-encoded certificate
+    /// per file.
     pub async fn new(
+        log: Logger,
+        path_isolation: PathIsolation,
+        output_dir: JobOutputDir,
+        own_baseboard: BaseboardId,
+        rumors: GossipNetwork,
+        roots: &[impl AsRef<Path>],
+        shutdown: CancellationToken,
+    ) -> Result<Self, JobError> {
+        let roots = read_root_certs(roots).await?;
+        Self::with_root_certs(
+            log,
+            path_isolation,
+            output_dir,
+            own_baseboard,
+            rumors,
+            &roots,
+            shutdown,
+        )
+        .await
+    }
+
+    pub async fn with_root_certs(
         log: Logger,
         path_isolation: PathIsolation,
         output_dir: JobOutputDir,
@@ -602,6 +629,17 @@ impl JobManager {
             .cloned()
             .collect())
     }
+}
+
+/// Read one PEM-encoded certificate from each of `paths`.
+pub async fn read_root_certs(paths: &[impl AsRef<Path>]) -> Result<Vec<Certificate>, JobError> {
+    let mut roots = Vec::with_capacity(paths.len());
+    for path in paths {
+        let path = path.as_ref();
+        let pem = read(path).await.map_err(JobError::file_io_for(path))?;
+        roots.push(Certificate::from_pem(&pem)?);
+    }
+    Ok(roots)
 }
 
 // See tests in `tests/src/manager_tests.rs`

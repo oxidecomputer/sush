@@ -22,7 +22,7 @@ pub mod server;
 pub mod state;
 
 pub use error::JobError;
-pub use manager::JobManager;
+pub use manager::{JobManager, read_root_certs};
 pub use proxy::ProxyServer;
 pub use server::ApiServer;
 pub use state::seed_gossip;

@@ -21,7 +21,7 @@ use sush_api::sush_api_mod::api_description;
 use sush_server::executor::PathIsolation;
 use sush_server::manager::JobManager;
 use sush_server::output::JobOutputDir;
-use sush_server::seed_gossip;
+use sush_server::{read_root_certs, seed_gossip};
 use sush_server::server::ApiServer;
 
 const DEFAULT_ADDRESS: &str = "0.0.0.0:44444";
@@ -94,12 +94,12 @@ async fn main() -> Result<(), String> {
     let gossip = seed_gossip();
 
     #[cfg(feature = "test-support")]
-    let roots = overridable_root_certs(&override_root_certs)?;
+    let roots = overridable_root_certs(&override_root_certs).await?;
     #[cfg(not(feature = "test-support"))]
     let roots = builtin_root_certs()?;
 
     let shutdown = listen_for_shutdown()?;
-    let mut mgr = JobManager::new(
+    let mut mgr = JobManager::with_root_certs(
         log.clone(),
         path_isolation,
         JobOutputDir::fixed(directory),
@@ -144,17 +144,15 @@ fn builtin_root_certs() -> Result<Vec<Certificate>, String> {
 }
 
 #[cfg_attr(not(feature = "test-support"), expect(dead_code))]
-fn overridable_root_certs(override_root_certs: &[PathBuf]) -> Result<Vec<Certificate>, String> {
+async fn overridable_root_certs(
+    override_root_certs: &[PathBuf],
+) -> Result<Vec<Certificate>, String> {
     if override_root_certs.is_empty() {
         builtin_root_certs()
     } else {
-        override_root_certs
-            .iter()
-            .map(|path| {
-                Certificate::from_pem(&std::fs::read(path).map_err(|e| e.to_string())?)
-                    .map_err(|e| e.to_string())
-            })
-            .collect()
+        read_root_certs(override_root_certs)
+            .await
+            .map_err(|e| e.to_string())
     }
 }
 
