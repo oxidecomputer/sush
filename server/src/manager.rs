@@ -113,7 +113,7 @@ impl JobManager {
             rumors,
             roots,
             shutdown,
-        );
+        )?;
         Ok(Self {
             log: log.new(o!("component" => "job manager")),
             nonces: Arc::new(Mutex::new(LruCache::new(MAX_OUTSTANDING_NONCES))),

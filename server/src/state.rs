@@ -284,16 +284,22 @@ pub struct State {
 }
 
 impl State {
-    pub fn new(own_baseboard: BaseboardId, root_certs: &[Certificate]) -> Self {
+    /// Fails if any root certificate is malformed or does not validate. Roots
+    /// are supplied by whoever configures the server, so they are not
+    /// necessarily trustworthy just because they were handed to us.
+    pub fn new(
+        own_baseboard: BaseboardId,
+        root_certs: &[Certificate],
+    ) -> Result<Self, KeyError> {
         let certs = root_certs
             .iter()
             .map(|cert| {
-                (
-                    KeyId::try_from(cert).expect("root certificate must be well-formed"),
+                Ok((
+                    KeyId::try_from(cert)?,
                     CertState::Unknown(Box::new(cert.clone())),
-                )
+                ))
             })
-            .collect::<BTreeMap<KeyId, CertState>>();
+            .collect::<Result<BTreeMap<KeyId, CertState>, KeyError>>()?;
         let roots: Box<[KeyId]> = certs.keys().cloned().collect();
         let mut new = Self {
             own_baseboard,
@@ -307,9 +313,13 @@ impl State {
         };
         new.validate_certs(&roots);
         for root in &roots {
-            assert!(new.certs[root].is_valid());
+            if !new.certs[root].is_valid() {
+                return Err(KeyError::InvalidCert(format!(
+                    "root certificate `{root}` does not validate"
+                )));
+            }
         }
-        new
+        Ok(new)
     }
 
     pub fn get_attachment(&self, job_id: &JobId) -> Option<SocketSender> {
@@ -753,12 +763,12 @@ impl StateManager {
         rumors: GossipNetwork,
         roots: &[Certificate],
         shutdown: CancellationToken,
-    ) -> (watch::Receiver<State>, JoinHandle<()>)
+    ) -> Result<(watch::Receiver<State>, JoinHandle<()>), KeyError>
     where
         R: Stream<Item = Request> + Send + Unpin + 'static,
     {
         // We report our current state through a watch channel.
-        let (tx_state, rx_state) = watch::channel(State::new(own_baseboard.clone(), roots));
+        let (tx_state, rx_state) = watch::channel(State::new(own_baseboard.clone(), roots)?);
 
         // We process messages in causal order, so that we can rely on
         // things like "the session stop happens after its corresponding
@@ -779,7 +789,7 @@ impl StateManager {
         // We will drop this once we want to drain the remaining messages.
         let mut rumors = Some(rumors);
 
-        (
+        Ok((
             rx_state,
             spawn(async move {
                 info!(log, "managing state");
@@ -864,7 +874,7 @@ impl StateManager {
                     }
                 }
             }),
-        )
+        ))
     }
 }
 
