@@ -185,12 +185,25 @@ async fn job_spawn(
         cols,
         wait: _,
     } = params;
-    let limits = requested.clone().clamp();
+    let mut limits = requested.clone().clamp();
     if limits != requested {
         warn!(
             log, "clamped requested job limits";
             "requested" => ?requested, "limits" => ?limits,
         );
+    }
+
+    // Ensure consistent output dirs.
+    let dirs = output_dir.current();
+
+    // Clamp max file size to output requirements.
+    if limits.max_fsize > dirs.max_fsize() {
+        warn!(
+            log, "clamping requested job output size limit";
+            "requested" => limits.max_fsize,
+            "max_fsize" => dirs.max_fsize(),
+        );
+        limits.max_fsize = dirs.max_fsize();
     }
 
     // Report all I/O errors as job events.
@@ -210,7 +223,7 @@ async fn job_spawn(
     // Set up output directories and files.
     let dir_mode = 0o700;
     let file_mode = 0o600;
-    let job_dir = output_dir.job_output_dir(&job_id);
+    let job_dir = dirs.job_output_dir(&job_id);
     with_io_err!(
         DirBuilder::new()
             .recursive(true)
@@ -219,8 +232,8 @@ async fn job_spawn(
             .await,
         format!("creating job output directory `{}`", job_dir.display())
     );
-    let stdout_path = output_dir.job_output_path(&job_id, Stdout);
-    let stderr_path = output_dir.job_output_path(&job_id, Stderr);
+    let stdout_path = dirs.job_output_path(&job_id, Stdout);
+    let stderr_path = dirs.job_output_path(&job_id, Stderr);
     let stdout_file = with_io_err!(
         OpenOptions::new()
             .create_new(true)

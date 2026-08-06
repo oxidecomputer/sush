@@ -25,6 +25,7 @@ use sush_common::codephrases::generate_id;
 use sush_common::jobs::{JobId, JobStartRequest, VerifiedJob};
 use sush_common::keys::{EphemeralKey, KeyType, Signer};
 use sush_server::executor::PathIsolation;
+use sush_server::output::JobOutputDir;
 use sush_server::state::GossipNetwork;
 use sush_server::{JobError, JobManager};
 
@@ -153,7 +154,7 @@ pub async fn manager_test_root_and_peer(
     let mgr = JobManager::new(
         log,
         PathIsolation::InsecureDisable,
-        dir.path().to_owned(),
+        JobOutputDir::fixed(dir.path()),
         test_baseboard_id(),
         gossip,
         &[root.cert().to_owned()],

@@ -6,7 +6,6 @@
 //! state machine. Does not manage jobs directly.
 
 use std::num::NonZeroUsize;
-use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -97,13 +96,12 @@ impl JobManager {
     pub async fn new(
         log: Logger,
         path_isolation: PathIsolation,
-        output_dir: PathBuf,
+        output_dir: JobOutputDir,
         own_baseboard: BaseboardId,
         rumors: GossipNetwork,
         roots: &[Certificate],
         shutdown: CancellationToken,
     ) -> Result<Self, JobError> {
-        let output_dir = JobOutputDir::new(output_dir);
         let (tx_req, rx_req) = mpsc::channel(16);
         let requests = ReceiverStream::new(rx_req);
         let (rx_state, join_state) = StateManager::run(

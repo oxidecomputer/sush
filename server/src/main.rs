@@ -20,6 +20,7 @@ use x509_cert::der::DecodePem as _;
 use sush_api::sush_api_mod::api_description;
 use sush_server::executor::PathIsolation;
 use sush_server::manager::JobManager;
+use sush_server::output::JobOutputDir;
 use sush_server::seed_gossip;
 use sush_server::server::ApiServer;
 
@@ -101,7 +102,7 @@ async fn main() -> Result<(), String> {
     let mut mgr = JobManager::new(
         log.clone(),
         path_isolation,
-        directory,
+        JobOutputDir::fixed(directory),
         baseboard,
         gossip,
         &roots,

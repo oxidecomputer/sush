@@ -18,6 +18,7 @@ use sled_hardware_types::BaseboardId;
 use slog::{Discard, Logger, o};
 use tempfile::TempDir;
 use tokio::fs::metadata;
+use tokio::sync::watch;
 use tokio::time::{sleep, timeout};
 use tokio_util::sync::CancellationToken;
 use x509_cert::time::Validity;
@@ -32,12 +33,13 @@ use sush_common::jobs::{
 use sush_common::keys::{EphemeralKey, KeyError, KeyId, KeyType, Signer as _};
 use sush_server::io::BATCH_OUTPUT_BUFFER_SIZE;
 use sush_server::messages::v0::{CertRequest, Message, Request, SessionRequest};
-use sush_server::output::JobOutputDir;
-use sush_server::{JobError, JobManager};
+use sush_server::output::{JobOutputDir, OutputDirs};
+use sush_server::{JobError, JobManager, seed_gossip};
 
 use crate::test_utils::{
-    SignJobRequest as _, ephemeral_test_subject, fake_identity, manager_and_test_root,
-    manager_login, manager_test_root_and_peer, test_logger,
+    SignJobRequest as _, ephemeral_test_root, ephemeral_test_subject, fake_identity,
+    manager_and_test_root, manager_login, manager_test_root_and_peer, test_baseboard_id,
+    test_logger,
 };
 use sush_server::executor::PathIsolation;
 
@@ -415,7 +417,7 @@ async fn job_output_perms() {
     check_status_stopped(status, &job_id, Ok(0), Some(3), Some(3));
 
     // Job output root should not be changed.
-    let out = JobOutputDir::new(dir.as_ref().to_owned());
+    let out = JobOutputDir::fixed(dir.as_ref());
     assert_eq!(metadata(out.root()).await.unwrap().permissions(), dir_perms);
 
     // Check output directory and file permissions.
@@ -425,6 +427,103 @@ async fn job_output_perms() {
     assert_eq!(mode(&out.job_output_dir(&job_id)).await, 0o700);
     assert_eq!(mode(&out.job_output_path(&job_id, Stdout)).await, 0o600);
     assert_eq!(mode(&out.job_output_path(&job_id, Stderr)).await, 0o600);
+}
+
+#[named]
+#[tokio::test]
+async fn job_output_dir_moves() {
+    // A server may move its output base part way through its life: sled-agent
+    // records job output on a ramdisk until an encrypted dataset is mounted,
+    // then moves to it. Output recorded before a move must stay readable.
+    let log = test_logger(function_name!());
+    let ramdisk = TempDir::with_prefix("sush-ramdisk-").unwrap();
+    let encrypted = TempDir::with_prefix("sush-encrypted-").unwrap();
+    let (tx_dirs, rx_dirs) = watch::channel(OutputDirs::new(
+        ramdisk.path(),
+        JobLimits::default().max_fsize,
+    ));
+    let mut root = ephemeral_test_root();
+    let mgr = JobManager::new(
+        log,
+        PathIsolation::InsecureDisable,
+        JobOutputDir::new(rx_dirs),
+        test_baseboard_id(),
+        seed_gossip(),
+        &[root.cert().to_owned()],
+        CancellationToken::new(),
+    )
+    .await
+    .unwrap();
+    let baseboard_id = mgr.own_baseboard();
+    let authn = fake_identity(&mut root).await;
+    let session_id = SessionId::new();
+    let mut session = Session::new(session_id.clone());
+    mgr.session_start(&authn, session_id.clone(), true)
+        .await
+        .unwrap();
+
+    // Record a job's output under the first base.
+    let first = session.next_job_id();
+    let job = root.sign_job_request(&first, "echo -n foo", false).await;
+    mgr.job_start(
+        &authn,
+        job.clone().into_signed(),
+        JobStartParams {
+            wait: JobWait::Stop,
+            ..Default::default()
+        },
+    )
+    .await
+    .unwrap();
+    session.job_started(job.clone().into_signed());
+    assert!(
+        metadata(ramdisk.path().join("jobs").join(first.to_string()))
+            .await
+            .is_ok()
+    );
+
+    // Move to the second base.
+    tx_dirs.send_modify(|dirs| {
+        *dirs = dirs.moved_to(encrypted.path(), JobLimits::default().max_fsize)
+    });
+
+    // The first job's output is still readable, from the base it was written to.
+    assert_eq!(
+        mgr.job_output(&authn, &first, baseboard_id, Stdout, None)
+            .await
+            .unwrap()
+            .into_bytes()
+            .await,
+        b"foo".as_slice()
+    );
+
+    // New jobs are recorded under the new base.
+    let second = session.next_job_id();
+    let job = root.sign_job_request(&second, "echo -n bar", false).await;
+    mgr.job_start(
+        &authn,
+        job.clone().into_signed(),
+        JobStartParams {
+            wait: JobWait::Stop,
+            ..Default::default()
+        },
+    )
+    .await
+    .unwrap();
+    session.job_started(job.clone().into_signed());
+    assert!(
+        metadata(encrypted.path().join("jobs").join(second.to_string()))
+            .await
+            .is_ok()
+    );
+    assert_eq!(
+        mgr.job_output(&authn, &second, baseboard_id, Stdout, None)
+            .await
+            .unwrap()
+            .into_bytes()
+            .await,
+        b"bar".as_slice()
+    );
 }
 
 #[named]
@@ -509,7 +608,7 @@ async fn cert_chain() {
     let mgr = JobManager::new(
         log,
         PathIsolation::InsecureDisable,
-        dir.path().to_owned(),
+        JobOutputDir::fixed(dir.path()),
         baseboard,
         gossip,
         &roots,
