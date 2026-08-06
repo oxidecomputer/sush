@@ -118,6 +118,7 @@ async fn main() -> Result<(), String> {
             default_request_body_max_bytes: REQUEST_MAX_BODY_BYTES,
             default_handler_task_mode: HandlerTaskMode::Detached,
             log_headers: vec![],
+            compression: Default::default(),
         })
         .start()
         .map_err(|error| format!("failed to start server: {error}"))?;
