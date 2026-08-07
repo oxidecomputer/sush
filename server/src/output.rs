@@ -56,7 +56,6 @@ impl JobOutputFileStream {
     pub fn length(&self) -> u64 {
         self.length
     }
-
 }
 
 impl Stream for JobOutputFileStream {
@@ -123,8 +122,7 @@ impl OutputDirs {
 
     /// Every base we may have written output to, most recent first.
     pub fn bases(&self) -> impl Iterator<Item = &Path> {
-        std::iter::once(self.current.as_path())
-            .chain(self.previous.iter().map(PathBuf::as_path))
+        std::iter::once(self.current.as_path()).chain(self.previous.iter().map(PathBuf::as_path))
     }
 
     pub fn job_output_dir(&self, job_id: &JobId) -> PathBuf {

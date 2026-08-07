@@ -103,7 +103,7 @@ impl JobManager {
         path_isolation: PathIsolation,
         output_dir: JobOutputDir,
         own_baseboard: BaseboardId,
-        rumors: GossipNetwork,
+        universe: watch::Receiver<GossipNetwork>,
         roots: &[impl AsRef<Path>],
         shutdown: CancellationToken,
     ) -> Result<Self, JobError> {
@@ -113,7 +113,7 @@ impl JobManager {
             path_isolation,
             output_dir,
             own_baseboard,
-            rumors,
+            universe,
             &roots,
             shutdown,
         )
@@ -125,7 +125,7 @@ impl JobManager {
         path_isolation: PathIsolation,
         output_dir: JobOutputDir,
         own_baseboard: BaseboardId,
-        rumors: GossipNetwork,
+        universe: watch::Receiver<GossipNetwork>,
         roots: &[Certificate],
         shutdown: CancellationToken,
     ) -> Result<Self, JobError> {
@@ -137,7 +137,7 @@ impl JobManager {
             output_dir.clone(),
             own_baseboard.clone(),
             requests,
-            rumors,
+            universe,
             roots,
             shutdown,
         )?;

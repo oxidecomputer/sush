@@ -13,7 +13,6 @@ use chrono::Utc;
 use function_name::named;
 use http_range_header::{EndPosition, StartPosition, SyntacticallyCorrectRange as Range};
 use pwd::Passwd;
-use rumors::Peer;
 use sled_hardware_types::BaseboardId;
 use slog::{Discard, Logger, o};
 use tempfile::TempDir;
@@ -31,6 +30,7 @@ use sush_common::jobs::{
     SessionId,
 };
 use sush_common::keys::{EphemeralKey, KeyError, KeyId, KeyType, Signer as _, pem_cert_chain};
+use sush_server::gossip::isolated;
 use sush_server::io::BATCH_OUTPUT_BUFFER_SIZE;
 use sush_server::messages::v0::{CertRequest, Message, Request, SessionRequest};
 use sush_server::output::{JobOutputDir, OutputDirs};
@@ -446,7 +446,7 @@ async fn root_certs_from_files() {
         PathIsolation::InsecureDisable,
         JobOutputDir::fixed(dir.path()),
         test_baseboard_id(),
-        seed_gossip(),
+        isolated(seed_gossip()),
         &[path],
         CancellationToken::new(),
     )
@@ -491,7 +491,7 @@ async fn bad_root_cert_files() {
                 PathIsolation::InsecureDisable,
                 JobOutputDir::fixed(dir.path()),
                 test_baseboard_id(),
-                seed_gossip(),
+                isolated(seed_gossip()),
                 &[path],
                 CancellationToken::new(),
             )
@@ -520,7 +520,7 @@ async fn job_output_dir_moves() {
         PathIsolation::InsecureDisable,
         JobOutputDir::new(rx_dirs),
         test_baseboard_id(),
-        seed_gossip(),
+        isolated(seed_gossip()),
         &[root.cert().to_owned()],
         CancellationToken::new(),
     )
@@ -600,6 +600,69 @@ async fn job_output_dir_moves() {
 
 #[named]
 #[tokio::test]
+async fn universe_swap() {
+    // A universe migration resets the state machine. Sessions and history
+    // die with the old universe, and the manager keeps serving.
+    let log = test_logger(function_name!());
+    let dir = TempDir::with_prefix("sush-").unwrap();
+    let mut root = ephemeral_test_root();
+    let (universe, universe_rx) = watch::channel(seed_gossip());
+    let mgr = JobManager::with_root_certs(
+        log,
+        PathIsolation::InsecureDisable,
+        JobOutputDir::fixed(dir.path()),
+        test_baseboard_id(),
+        universe_rx,
+        &[root.cert().to_owned()],
+        CancellationToken::new(),
+    )
+    .await
+    .unwrap();
+    let authn = fake_identity(&mut root).await;
+
+    async fn run_job(mgr: &JobManager, root: &mut EphemeralKey, authn: &Identity) -> JobId {
+        let session_id = SessionId::new();
+        let session = Session::new(session_id.clone());
+        mgr.session_start(authn, session_id, true).await.unwrap();
+        let job_id = session.next_job_id();
+        let job = root.sign_job_request(&job_id, "true", false).await;
+        mgr.job_start(
+            authn,
+            job.into_signed(),
+            JobStartParams {
+                wait: JobWait::Stop,
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+        job_id
+    }
+
+    // Run a job in the first universe.
+    let job_id = run_job(&mgr, &mut root, &authn).await;
+    assert!(mgr.job_status(&authn, &job_id).await.is_ok());
+
+    // Migrate. The session and the job's history are gone.
+    universe.send(seed_gossip()).unwrap();
+    timeout(Duration::from_secs(30), async {
+        while mgr.session(&authn).is_some() {
+            sleep(Duration::from_millis(50)).await;
+        }
+    })
+    .await
+    .expect("state reset");
+    assert!(matches!(
+        mgr.job_status(&authn, &job_id).await,
+        Err(JobError::JobNotFound(_))
+    ));
+
+    // The manager still works in the new universe.
+    run_job(&mgr, &mut root, &authn).await;
+}
+
+#[named]
+#[tokio::test]
 async fn shutdown() {
     let log = test_logger(function_name!());
     let (mut mgr, mut root, _dir, shutdown) = manager_and_test_root(log).await;
@@ -675,7 +738,7 @@ async fn cert_chain() {
         part_number: "test part".to_string(),
         serial_number: "0000".to_string(),
     };
-    let gossip = Peer::seed().into_rumors();
+    let gossip = isolated(seed_gossip());
     let shutdown = CancellationToken::new();
     let mgr = JobManager::with_root_certs(
         log,
@@ -1149,15 +1212,15 @@ async fn hostile_imports_cannot_displace() {
         part_number: "test part".to_string(),
         serial_number: "0000".to_string(),
     };
-    let gossip = Peer::seed().into_rumors();
-    let peer = gossip.clone();
+    let seed = seed_gossip();
+    let peer = seed.clone();
     let shutdown = CancellationToken::new();
-    let mgr = JobManager::new(
+    let mgr = JobManager::with_root_certs(
         log,
         PathIsolation::InsecureDisable,
-        dir.path().to_owned(),
+        JobOutputDir::fixed(dir.path()),
         baseboard,
-        gossip,
+        isolated(seed),
         from_ref(&root_cert),
         shutdown,
     )
@@ -1293,15 +1356,15 @@ async fn homonym_issuer_resolves_to_true_parent() {
         part_number: "test part".to_string(),
         serial_number: "0000".to_string(),
     };
-    let gossip = Peer::seed().into_rumors();
-    let peer = gossip.clone();
+    let seed = seed_gossip();
+    let peer = seed.clone();
     let shutdown = CancellationToken::new();
-    let mgr = JobManager::new(
+    let mgr = JobManager::with_root_certs(
         log,
         PathIsolation::InsecureDisable,
-        dir.path().to_owned(),
+        JobOutputDir::fixed(dir.path()),
         baseboard,
-        gossip,
+        isolated(seed),
         from_ref(&root_cert),
         shutdown,
     )

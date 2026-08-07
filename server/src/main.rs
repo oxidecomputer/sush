@@ -19,10 +19,11 @@ use x509_cert::der::DecodePem as _;
 
 use sush_api::sush_api_mod::api_description;
 use sush_server::executor::PathIsolation;
+use sush_server::gossip::isolated;
 use sush_server::manager::JobManager;
 use sush_server::output::JobOutputDir;
-use sush_server::{read_root_certs, seed_gossip};
 use sush_server::server::ApiServer;
+use sush_server::{read_root_certs, seed_gossip};
 
 const DEFAULT_ADDRESS: &str = "0.0.0.0:44444";
 const ROOT_CERTS: &[&[u8]] = &[include_bytes!("../certs/sandbox.pem")];
@@ -91,7 +92,7 @@ async fn main() -> Result<(), String> {
     };
 
     // TODO: get/seed Rumors network
-    let gossip = seed_gossip();
+    let gossip = isolated(seed_gossip());
 
     #[cfg(feature = "test-support")]
     let roots = overridable_root_certs(&override_root_certs).await?;

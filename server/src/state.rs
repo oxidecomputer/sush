@@ -287,10 +287,7 @@ impl State {
     /// Fails if any root certificate is malformed or does not validate. Roots
     /// are supplied by whoever configures the server, so they are not
     /// necessarily trustworthy just because they were handed to us.
-    pub fn new(
-        own_baseboard: BaseboardId,
-        root_certs: &[Certificate],
-    ) -> Result<Self, KeyError> {
+    pub fn new(own_baseboard: BaseboardId, root_certs: &[Certificate]) -> Result<Self, KeyError> {
         let certs = root_certs
             .iter()
             .map(|cert| {
@@ -753,6 +750,11 @@ impl StateManager {
     /// requests, events, or messages can be received. Returns a shared
     /// `State` that will be asynchronously updated in response to
     /// messages and events.
+    ///
+    /// `universe` follows the gossip network we belong to. When it changes,
+    /// everything resets. Versions do not compare across universes, so no
+    /// session or history bookkeeping can survive a migration; running jobs
+    /// continue, and their events land in the new universe.
     #[allow(clippy::too_many_arguments)]
     pub fn run<R>(
         log: Logger,
@@ -760,7 +762,7 @@ impl StateManager {
         output_dir: JobOutputDir,
         own_baseboard: BaseboardId,
         mut requests: R,
-        rumors: GossipNetwork,
+        universe: watch::Receiver<GossipNetwork>,
         roots: &[Certificate],
         shutdown: CancellationToken,
     ) -> Result<(watch::Receiver<State>, JoinHandle<()>), KeyError>
@@ -769,6 +771,7 @@ impl StateManager {
     {
         // We report our current state through a watch channel.
         let (tx_state, rx_state) = watch::channel(State::new(own_baseboard.clone(), roots)?);
+        let roots = roots.to_vec();
 
         // We process messages in causal order, so that we can rely on
         // things like "the session stop happens after its corresponding
@@ -776,7 +779,8 @@ impl StateManager {
         // and computation, but makes it much easier to ensure that our
         // state machine is correct, because it now only has to be correct
         // in the face of arbitrary *causal* reorderings.
-        let mut causal_messages = rumors.causal_messages();
+        let initial = universe.borrow().clone();
+        let mut causal_messages = initial.causal_messages();
 
         // The executor needs to have access to send messages back.
         let (mut executor, mut events) = Executor::new(
@@ -787,7 +791,10 @@ impl StateManager {
         );
 
         // We will drop this once we want to drain the remaining messages.
-        let mut rumors = Some(rumors);
+        // The watch channel behind `universe` stores its own copy of the
+        // network, so holding the receiver would keep the network from
+        // draining while we wait for exactly that.
+        let mut gossip = Some((initial, universe));
 
         Ok((
             rx_state,
@@ -796,7 +803,7 @@ impl StateManager {
 
                 // These flip both to `true` once our two input streams (local
                 // requests and local events from the executor) terminate or
-                // we're shutting down. At this point, we must drop `rumors`
+                // we're shutting down. At this point, we must drop `gossip`
                 // and thereby permit its own `unordered_messages` stream to
                 // eventually be drained; we do this so that we fully update
                 // the local state until nothing more is left to do.
@@ -806,15 +813,19 @@ impl StateManager {
                 loop {
                     let message = causal_messages.borrow_next();
 
-                    // Once we drain the requests and events, we drop `rumors` so
+                    // Once we drain the requests and events, we drop `gossip` so
                     // that if there are no outstanding copies elsewhere, we will
                     // drain it and then break.
                     //
                     // If there are still gossip sessions happening, those will
                     // complete and we will process their messages into the state.
                     if requests_empty && events_empty {
-                        rumors = None;
+                        gossip = None;
                     }
+
+                    // Applied after the select, once `message` and the
+                    // universe future have released their borrows.
+                    let mut swap = false;
 
                     select! {
                         // Forward local requests into the rumors state,
@@ -825,7 +836,7 @@ impl StateManager {
                             // we need to let all spawned tasks by the executor
                             // quiesce, updating the state all the way.
                             None => requests_empty = true,
-                            Some(request) => if let Some(rumors) = &rumors {
+                            Some(request) => if let Some((rumors, _)) = &gossip {
                                 debug!(log, "forwarding request to gossip network"; "kind" => request.kind());
                                 rumors.send(Message::Request(request).into());
                             },
@@ -834,7 +845,7 @@ impl StateManager {
                         // Handle events produced by the executor.
                         next = events.next(), if !events_empty => match next {
                             None => events_empty = true,
-                            Some(event) => if let Some(rumors) = &rumors {
+                            Some(event) => if let Some((rumors, _)) = &gossip {
                                 debug!(log, "forwarding event to gossip network"; "event" => ?event);
                                 rumors.send(Message::Event(own_baseboard.clone(), event).into());
                             },
@@ -858,7 +869,7 @@ impl StateManager {
                                 tx_state.send_modify(|state| {
                                     if let Err(error) = state.update(&log, &mut executor, key, version, message) {
                                         error!(log, "state update failed"; "error" => ?error);
-                                        if let Some(rumors) = &rumors {
+                                        if let Some((rumors, _)) = &gossip {
                                             debug!(log, "sending error to gossip network"; "error" => ?error);
                                             rumors.send(Message::Event(own_baseboard.clone(), Event::Error(error)).into());
                                         }
@@ -867,10 +878,33 @@ impl StateManager {
                             },
                         },
 
+                        // Follow the gossip manager to a new universe,
+                        // unless we're already draining.
+                        Ok(()) = async {
+                            match gossip.as_mut() {
+                                Some((_, universe)) => universe.changed().await,
+                                None => std::future::pending().await,
+                            }
+                        } => swap = true,
+
                         // Stop processing requests on shutdown.
                         _ = shutdown.cancelled(), if !requests_empty => {
                             requests_empty = true;
                         }
+                    }
+
+                    if swap {
+                        let (rumors, universe) =
+                            gossip.as_mut().expect("gossip present when it changes");
+                        let fresh = universe.borrow_and_update().clone();
+                        info!(log, "gossip universe changed, resetting state"; "network" => %fresh.network());
+                        causal_messages = fresh.causal_messages();
+                        // TODO: re-inject local job state (policy pending).
+                        tx_state.send_modify(|state| {
+                            *state = State::new(own_baseboard.clone(), &roots)
+                                .expect("roots validated at startup")
+                        });
+                        *rumors = fresh;
                     }
                 }
             }),

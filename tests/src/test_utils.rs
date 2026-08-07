@@ -11,7 +11,6 @@ use bytes::Bytes;
 use chrono::Utc;
 use futures::TryStreamExt as _;
 use rand_core::{OsRng, RngCore as _};
-use rumors::Peer;
 use sled_hardware_types::BaseboardId;
 use slog::{Drain as _, Logger, o};
 use slog_term::{FullFormat, PlainSyncDecorator, TestStdoutWriter};
@@ -27,9 +26,10 @@ use sush_common::codephrases::generate_id;
 use sush_common::jobs::{JobId, JobStartRequest, VerifiedJob};
 use sush_common::keys::{EphemeralKey, KeyType, Signer};
 use sush_server::executor::PathIsolation;
+use sush_server::gossip::isolated;
 use sush_server::output::{JobOutputDir, JobOutputFileStream};
 use sush_server::state::GossipNetwork;
-use sush_server::{JobError, JobManager};
+use sush_server::{JobError, JobManager, seed_gossip};
 
 static TEST_BASEBOARD_ID: OnceLock<BaseboardId> = OnceLock::new();
 
@@ -167,8 +167,9 @@ pub async fn manager_test_root_and_peer(
     CancellationToken,
 ) {
     let dir = TempDir::with_prefix("sush-").unwrap();
-    let gossip = Peer::seed().into_rumors();
-    let peer = gossip.clone();
+    let seed = seed_gossip();
+    let peer = seed.clone();
+    let gossip = isolated(seed);
     let shutdown = CancellationToken::new();
     let root = ephemeral_test_root();
     let mgr = JobManager::with_root_certs(
