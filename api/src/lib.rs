@@ -3,20 +3,22 @@
 use std::collections::BTreeMap;
 use std::fmt;
 
+use borsh::{BorshDeserialize, BorshSerialize};
 use dropshot::{
-    Body, ClientErrorStatusCode, Header, HttpError, HttpResponseDeleted, HttpResponseOk,
+    Body, ClientErrorStatusCode, Header, HttpError, HttpResponseOk, HttpResponseUpdatedNoContent,
     Path as PathParams, Query as QueryParams, RequestContext, TypedBody, WebsocketEndpointResult,
     WebsocketUpgrade, api_description,
 };
 use http_range_header::{SyntacticallyCorrectRange as Range, parse_range_header};
 use hyper::Response;
 use schemars::JsonSchema;
-use serde::Deserialize;
 use serde::de::{Deserializer, Error as DeserializeError, IntoDeserializer, MapAccess, Visitor};
+use serde::{Deserialize, Serialize};
+use sled_hardware_types::BaseboardId;
 
 use sush_common::authn::Identity;
 use sush_common::jobs::{
-    JobId, JobLimits, JobOutputStream, JobStatus, Session, SessionId, SignedJob,
+    JobId, JobLimits, JobOutputStream, JobStatus, JsonJobStatusMap, Session, SessionId, SignedJob,
 };
 use sush_common::keys::{KeyId, SshPublicKey};
 
@@ -28,11 +30,14 @@ pub trait SushApi {
     // Certificate management.
 
     /// Import a certificate, verify its signature, and return a key ID for it.
+    ///
+    /// The body should be a PEM encoded X.509 certificate.
     #[endpoint { method = PUT, path = "/certs" }]
     async fn import_cert(
         ctx: RequestContext<Self::Context>,
         headers: Header<Authorization>,
-        params: TypedBody<Vec<u8>>,
+        query: QueryParams<WaitParam>,
+        params: TypedBody<String>,
     ) -> Result<HttpResponseOk<KeyId>, HttpError>;
 
     /// Get the certificate chain that validates a key.
@@ -64,17 +69,6 @@ pub trait SushApi {
         headers: Header<Authorization>,
     ) -> Result<HttpResponseOk<Vec<Identity>>, HttpError>;
 
-    /// Revoke an authenticated identity.
-    ///
-    /// Any authenticated identity may revoke any other identity;
-    /// this is the only way to handle lost or stolen private keys.
-    #[endpoint { method = DELETE, path = "/iam/{key_id}" }]
-    async fn revoke_identity(
-        ctx: RequestContext<Self::Context>,
-        headers: Header<Authorization>,
-        params: PathParams<KeyIdParam>,
-    ) -> Result<HttpResponseDeleted, HttpError>;
-
     // Session management.
 
     /// Get the current session from this server's point of view.
@@ -88,24 +82,31 @@ pub trait SushApi {
     ///
     /// There may only be one session active on the rack at a time.
     /// If a session is already running when this request is made,
-    /// the old session is stopped, regardless of ownership.
-    #[endpoint { method = POST, path = "/sessions" }]
+    /// the new session supersedes the old one, but the old session's
+    /// jobs are not stopped.
+    #[endpoint { method = POST, path = "/sessions/{session_id}/start" }]
     async fn session_start(
         ctx: RequestContext<Self::Context>,
         headers: Header<Authorization>,
-    ) -> Result<HttpResponseOk<Session>, HttpError>;
+        params: PathParams<SessionIdParam>,
+        query: QueryParams<WaitParam>,
+    ) -> Result<HttpResponseUpdatedNoContent, HttpError>;
 
     /// End a support session.
-    ///
-    /// Since there may be only one session active on the rack at a time
-    /// and we do not want to prevent starting new sessions, anyone is
-    /// allowed to stop anyone else's session and start their own.
     #[endpoint { method = POST, path = "/sessions/{session_id}/stop" }]
     async fn session_stop(
         ctx: RequestContext<Self::Context>,
         headers: Header<Authorization>,
         params: PathParams<SessionIdParam>,
-    ) -> Result<HttpResponseOk<()>, HttpError>;
+    ) -> Result<HttpResponseUpdatedNoContent, HttpError>;
+
+    /// Burn a job ID in the current session.
+    #[endpoint { method = POST, path = "/sessions/{session_id}/skip/{job_id}" }]
+    async fn session_skip_job(
+        ctx: RequestContext<Self::Context>,
+        headers: Header<Authorization>,
+        params: PathParams<SessionAndJobIds>,
+    ) -> Result<HttpResponseUpdatedNoContent, HttpError>;
 
     // Job management.
 
@@ -117,78 +118,74 @@ pub trait SushApi {
         params: PathParams<JobIdParam>,
         query: QueryParams<JobStartParams>,
         body: TypedBody<SignedJob>,
-    ) -> Result<HttpResponseOk<JobStatus>, HttpError>;
+    ) -> Result<HttpResponseUpdatedNoContent, HttpError>;
 
     /// Stop a (running) job.
-    ///
-    /// Any authenticated identity may stop a job, regardless of ownership.
     #[endpoint { method = POST, path = "/jobs/{job_id}/stop" }]
     async fn job_stop(
         ctx: RequestContext<Self::Context>,
         headers: Header<Authorization>,
         params: PathParams<JobIdParam>,
-    ) -> Result<HttpResponseOk<()>, HttpError>;
+        query: QueryParams<JobStopParams>,
+    ) -> Result<HttpResponseUpdatedNoContent, HttpError>;
 
-    /// Get the status of a job.
-    ///
-    /// Any authenticated identity may see the status of any job,
-    /// regardless of ownership.
+    /// Get the status of a job across the rack.
     #[endpoint { method = GET, path = "/jobs/{job_id}/status" }]
     async fn job_status(
         ctx: RequestContext<Self::Context>,
         headers: Header<Authorization>,
         params: PathParams<JobIdParam>,
-    ) -> Result<HttpResponseOk<JobStatus>, HttpError>;
+    ) -> Result<HttpResponseOk<JsonJobStatusMap>, HttpError>;
 
     /// Get (a subset of) the standard output or standard error of a job.
-    ///
-    /// Only the job owner may request job output.
-    #[endpoint { method = GET, path = "/jobs/{job_id}/output/{stream}" }]
+    #[endpoint { method = GET, path = "/jobs/{job_id}/output/{target}/{stream}" }]
     async fn job_output(
         ctx: RequestContext<Self::Context>,
         headers: Header<AuthorizedRangeRequest>,
         params: PathParams<JobOutputParams>,
     ) -> Result<Response<Body>, HttpError>;
 
-    /// Truncate the standard output or standard error of a job.
-    ///
-    /// Only the job owner may truncate job output.
-    /// Returns the new length.
-    #[endpoint { method = DELETE, path = "/jobs/{job_id}/output/{stream}" }]
-    async fn job_output_delete(
-        ctx: RequestContext<Self::Context>,
-        headers: Header<AuthorizedRangeRequest>,
-        params: PathParams<JobOutputParams>,
-    ) -> Result<HttpResponseOk<u64>, HttpError>;
-
-    /// Start a new interactive job session.
-    ///
-    /// Only the job owner may start an interactive session.
+    /// Attach to an interactive job.
     // This should use `channel { protocol = WEBSOCKETS, .. }`, but that
-    // does not currently let us return errors before the connection upgrade.
-    #[endpoint { method = GET, path = "/jobs/{job_id}/session" }]
-    async fn job_start_interactive_session(
+    // does not currently let us return (unauthorized) errors before the
+    // connection upgrade.
+    #[endpoint { method = GET, path = "/jobs/{job_id}/attach/{target}" }]
+    async fn job_attach(
         ctx: RequestContext<Self::Context>,
         headers: Header<Authorization>,
-        params: PathParams<JobIdParam>,
+        params: PathParams<JobAttachParams>,
         upgrade: WebsocketUpgrade,
     ) -> WebsocketEndpointResult;
 
-    /// List previous jobs sorted by start time, most recent first.
+    /// List known jobs sorted by start time, most recent first.
     ///
-    /// Any authenticated identity may see the job history,
-    /// regardless of ownership.
+    /// Offsets may shift under concurrent eviction, so pagination
+    /// is currently best-effort.
     #[endpoint { method = GET, path = "/jobs" }]
     async fn job_history(
         ctx: RequestContext<Self::Context>,
         headers: Header<Authorization>,
         query: QueryParams<JobHistoryParams>,
-    ) -> Result<HttpResponseOk<Vec<JobStatus>>, HttpError>;
+    ) -> Result<HttpResponseOk<Vec<JsonJobStatusMap>>, HttpError>;
+
+    /// Get the baseboard ID of the sled handling this request.
+    #[endpoint { method = GET, path = "/target" }]
+    async fn target(
+        ctx: RequestContext<Self::Context>,
+        headers: Header<Authorization>,
+    ) -> Result<HttpResponseOk<BaseboardId>, HttpError>;
 }
 
 #[derive(Deserialize, JsonSchema)]
 pub struct KeyIdParam {
     pub key_id: KeyId,
+}
+
+#[derive(Clone, Debug, Default, Deserialize, JsonSchema, BorshSerialize, BorshDeserialize)]
+#[serde(default)]
+pub struct WaitParam {
+    /// Wait for the subject to appear in the state.
+    pub wait: bool,
 }
 
 #[derive(Deserialize, JsonSchema)]
@@ -197,12 +194,30 @@ pub struct SessionIdParam {
 }
 
 #[derive(Deserialize, JsonSchema)]
+pub struct SessionAndJobIds {
+    pub session_id: SessionId,
+    pub job_id: JobId,
+}
+
+#[derive(Deserialize, JsonSchema)]
 pub struct JobIdParam {
     pub job_id: JobId,
 }
 
+#[derive(Deserialize, JsonSchema)]
+pub struct JobAttachParams {
+    /// Which job to attach to.
+    pub job_id: JobId,
+
+    /// To be used by Nexus for routing.
+    pub target: String,
+}
+
 /// Job parameters _not_ specified in the signed job request.
-#[derive(Debug, Default, Deserialize, JsonSchema)]
+#[derive(
+    BorshSerialize, BorshDeserialize, Clone, Debug, Default, Deserialize, Eq, JsonSchema, PartialEq,
+)]
+#[serde(default)]
 pub struct JobStartParams {
     #[serde(flatten, deserialize_with = "deserialize_job_limits")]
     pub limits: JobLimits,
@@ -216,17 +231,56 @@ pub struct JobStartParams {
     /// Terminal window width for interactive jobs.
     pub cols: Option<u16>,
 
-    /// Keep the request open until the batch job ends.
-    pub wait: bool,
+    /// Wait for the job to start or stop.
+    pub wait: JobWait,
 }
 
-impl JobStartParams {
-    pub fn wait() -> Self {
-        JobStartParams {
-            wait: true,
-            ..Default::default()
+/// Whether and until what state is reached to wait for a job start/stop request.
+#[derive(
+    BorshSerialize,
+    BorshDeserialize,
+    Clone,
+    Copy,
+    Debug,
+    Default,
+    Deserialize,
+    Eq,
+    JsonSchema,
+    PartialEq,
+    Serialize,
+)]
+#[serde(rename_all = "lowercase")]
+pub enum JobWait {
+    #[default]
+    None,
+    Start,
+    Stop,
+}
+
+impl JobWait {
+    pub fn is_none(&self) -> bool {
+        matches!(self, Self::None)
+    }
+
+    pub fn is_some(&self) -> bool {
+        !self.is_none()
+    }
+
+    pub fn matches_status(&self, status: &JobStatus) -> bool {
+        use JobStatus::*;
+        match self {
+            Self::None => true,
+            Self::Start => !matches!(status, Queued { .. }),
+            Self::Stop => matches!(status, Cancelled { .. } | Error { .. } | Stopped { .. }),
         }
     }
+}
+
+#[derive(Clone, Debug, Default, Deserialize, JsonSchema, BorshSerialize, BorshDeserialize)]
+#[serde(default)]
+pub struct JobStopParams {
+    /// Wait for the job process to end.
+    pub wait: JobWait,
 }
 
 /// Simple pagination for history list.
@@ -263,7 +317,7 @@ where
             while let Some((key, value)) = map.next_entry::<String, String>()? {
                 limits.insert(key, value.parse().map_err(DeserializeError::custom)?);
             }
-            JobLimits::deserialize(limits.into_deserializer())
+            <JobLimits as Deserialize>::deserialize(limits.into_deserializer())
         }
     }
 
@@ -273,6 +327,7 @@ where
 #[derive(Deserialize, JsonSchema)]
 pub struct JobOutputParams {
     pub job_id: JobId,
+    pub target: String,
     pub stream: JobOutputStream,
 }
 

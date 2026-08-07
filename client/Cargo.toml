@@ -39,7 +39,9 @@ serde.workspace = true
 serde_json.workspace = true
 shlex.workspace = true
 signature.workspace = true
+sled-hardware-types.workspace = true
 ssh-key.workspace = true
+sush-api = { path = "../api" }
 sush-common = { path = "../common" }
 thiserror.workspace = true
 tokio.workspace = true
@@ -47,3 +49,6 @@ tokio-fd.workspace = true
 tokio-tungstenite.workspace = true
 x509-cert.workspace = true
 xdg.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true

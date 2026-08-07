@@ -1,22 +1,29 @@
 //! API server for the Oxide Support Shell.
 
 use dropshot::{
-    Body, ClientErrorStatusCode, Header, HttpError, HttpResponseDeleted, HttpResponseOk,
-    Path as PathParams, Query as QueryParams, RequestContext, TypedBody, WebsocketEndpointResult,
-    WebsocketUpgrade,
+    Body, CONTENT_TYPE_OCTET_STREAM, ClientErrorStatusCode, Header, HttpError, HttpResponseOk,
+    HttpResponseUpdatedNoContent, Path as PathParams, Query as QueryParams, RequestContext,
+    TypedBody, WebsocketEndpointResult, WebsocketUpgrade,
 };
+use futures::TryStreamExt as _;
+use http::StatusCode;
+use http::header::{CONTENT_LENGTH, CONTENT_TYPE};
+use http_body_util::StreamBody;
 use hyper::Response;
+use hyper::body::Frame;
+use sled_hardware_types::BaseboardId;
 use tokio_tungstenite::WebSocketStream;
 use tokio_tungstenite::tungstenite::protocol::Role;
 use x509_cert::Certificate;
-use x509_cert::der::{Decode as _, DecodePem as _};
+use x509_cert::der::DecodePem as _;
 
 use sush_api::{
-    Authorization, AuthorizedRangeRequest, JobHistoryParams, JobIdParam, JobOutputParams,
-    JobStartParams, KeyIdParam, SessionIdParam, SushApi,
+    Authorization, AuthorizedRangeRequest, JobAttachParams, JobHistoryParams, JobIdParam,
+    JobOutputParams, JobStartParams, JobStopParams, KeyIdParam, SessionAndJobIds, SessionIdParam,
+    SushApi, WaitParam,
 };
 use sush_common::authn::Identity;
-use sush_common::jobs::{JobStatus, Session, SignedJob};
+use sush_common::jobs::{JsonJobStatusMap, Session, SignedJob, job_status_to_json_map};
 use sush_common::keys::{KeyId, SshPublicKey, pem_cert_chain};
 
 use crate::error::JobError;
@@ -32,16 +39,17 @@ impl SushApi for ApiServer {
     async fn import_cert(
         ctx: RequestContext<Self::Context>,
         headers: Header<Authorization>,
-        params: TypedBody<Vec<u8>>,
+        query: QueryParams<WaitParam>,
+        params: TypedBody<String>,
     ) -> Result<HttpResponseOk<KeyId>, HttpError> {
         let mgr = ctx.context();
         let Authorization { authorization } = headers.into_inner();
         let authn = mgr.iam(authorization, None).await?;
+        let WaitParam { wait } = query.into_inner();
         let bytes = params.into_inner();
-        let cert = Certificate::from_pem(&bytes)
-            .or_else(|_| Certificate::from_der(&bytes))
-            .map_err(JobError::Der)?;
-        let key_id = mgr.import_cert(&authn, cert).await?;
+        let cert = Certificate::from_pem(&bytes).map_err(JobError::DecodeCert)?;
+        let key_id = KeyId::try_from(&cert).map_err(JobError::Key)?;
+        mgr.import_cert(&authn, cert, wait).await?;
         Ok(HttpResponseOk(key_id))
     }
 
@@ -54,7 +62,7 @@ impl SushApi for ApiServer {
         let Authorization { authorization } = headers.into_inner();
         let authn = mgr.iam(authorization, None).await?;
         let KeyIdParam { key_id } = params.into_inner();
-        let certs = mgr.cert_chain(&authn, &key_id).await?;
+        let certs = mgr.cert_chain(&authn, &key_id)?;
         let chain = pem_cert_chain(certs).map_err(JobError::Key)?;
         Ok(HttpResponseOk(chain))
     }
@@ -83,19 +91,6 @@ impl SushApi for ApiServer {
         Ok(HttpResponseOk(mgr.identities(&authn).await?))
     }
 
-    async fn revoke_identity(
-        ctx: RequestContext<Self::Context>,
-        headers: Header<Authorization>,
-        params: PathParams<KeyIdParam>,
-    ) -> Result<HttpResponseDeleted, HttpError> {
-        let mgr = ctx.context();
-        let Authorization { authorization } = headers.into_inner();
-        let authn = mgr.iam(authorization, None).await?;
-        let KeyIdParam { key_id } = params.into_inner();
-        mgr.revoke_identity(&authn, key_id).await?;
-        Ok(HttpResponseDeleted())
-    }
-
     // Session management.
 
     async fn session(
@@ -105,7 +100,7 @@ impl SushApi for ApiServer {
         let mgr = ctx.context();
         let Authorization { authorization } = headers.into_inner();
         let authn = mgr.iam(authorization, None).await?;
-        if let Some(session) = mgr.session(&authn).await? {
+        if let Some(session) = mgr.session(&authn) {
             Ok(HttpResponseOk(session))
         } else {
             Err(JobError::NoSession.into())
@@ -115,25 +110,42 @@ impl SushApi for ApiServer {
     async fn session_start(
         ctx: RequestContext<Self::Context>,
         headers: Header<Authorization>,
-    ) -> Result<HttpResponseOk<Session>, HttpError> {
+        params: PathParams<SessionIdParam>,
+        query: QueryParams<WaitParam>,
+    ) -> Result<HttpResponseUpdatedNoContent, HttpError> {
         let mgr = ctx.context();
         let Authorization { authorization } = headers.into_inner();
         let authn = mgr.iam(authorization, None).await?;
-        let session = mgr.session_start(&authn).await?;
-        Ok(HttpResponseOk(session))
+        let WaitParam { wait } = query.into_inner();
+        let SessionIdParam { session_id } = params.into_inner();
+        mgr.session_start(&authn, session_id.clone(), wait).await?;
+        Ok(HttpResponseUpdatedNoContent())
     }
 
     async fn session_stop(
         ctx: RequestContext<Self::Context>,
         headers: Header<Authorization>,
         params: PathParams<SessionIdParam>,
-    ) -> Result<HttpResponseOk<()>, HttpError> {
+    ) -> Result<HttpResponseUpdatedNoContent, HttpError> {
         let mgr = ctx.context();
         let Authorization { authorization } = headers.into_inner();
         let authn = mgr.iam(authorization, None).await?;
         let SessionIdParam { session_id } = params.into_inner();
-        mgr.session_stop(&authn, &session_id).await?;
-        Ok(HttpResponseOk(()))
+        mgr.session_stop(&authn, session_id).await?;
+        Ok(HttpResponseUpdatedNoContent())
+    }
+
+    async fn session_skip_job(
+        ctx: RequestContext<Self::Context>,
+        headers: Header<Authorization>,
+        params: PathParams<SessionAndJobIds>,
+    ) -> Result<HttpResponseUpdatedNoContent, HttpError> {
+        let mgr = ctx.context();
+        let Authorization { authorization } = headers.into_inner();
+        let authn = mgr.iam(authorization, None).await?;
+        let SessionAndJobIds { session_id, job_id } = params.into_inner();
+        mgr.session_skip_job(&authn, session_id, job_id).await?;
+        Ok(HttpResponseUpdatedNoContent())
     }
 
     // Job management.
@@ -144,12 +156,11 @@ impl SushApi for ApiServer {
         params: PathParams<JobIdParam>,
         query: QueryParams<JobStartParams>,
         body: TypedBody<SignedJob>,
-    ) -> Result<HttpResponseOk<JobStatus>, HttpError> {
+    ) -> Result<HttpResponseUpdatedNoContent, HttpError> {
         let mgr = ctx.context();
         let Authorization { authorization } = headers.into_inner();
         let authn = mgr.iam(authorization, None).await?;
         let JobIdParam { job_id } = params.into_inner();
-        let params = query.into_inner();
         let job = body.into_inner();
         if *job.job_id() != job_id {
             return Err(HttpError::for_client_error(
@@ -158,36 +169,36 @@ impl SushApi for ApiServer {
                 String::from("Query parameter job ID does not match body"),
             ));
         }
-        match mgr.job_start(&authn, job, params).await? {
-            None => Ok(HttpResponseOk(mgr.job_status(&authn, &job_id).await?)),
-            Some(Ok(end)) => Ok(HttpResponseOk(mgr.job_end_status(&authn, end).await?)),
-            Some(Err(err)) => Err(JobError::from(err).into()),
-        }
+        mgr.job_start(&authn, job, query.into_inner()).await?;
+        Ok(HttpResponseUpdatedNoContent())
     }
 
     async fn job_stop(
         ctx: RequestContext<Self::Context>,
         headers: Header<Authorization>,
         params: PathParams<JobIdParam>,
-    ) -> Result<HttpResponseOk<()>, HttpError> {
+        query: QueryParams<JobStopParams>,
+    ) -> Result<HttpResponseUpdatedNoContent, HttpError> {
         let mgr = ctx.context();
         let Authorization { authorization } = headers.into_inner();
         let authn = mgr.iam(authorization, None).await?;
         let JobIdParam { job_id } = params.into_inner();
-        mgr.job_stop(&authn, &job_id).await?;
-        Ok(HttpResponseOk(()))
+        mgr.job_stop(&authn, &job_id, query.into_inner()).await?;
+        Ok(HttpResponseUpdatedNoContent())
     }
 
     async fn job_status(
         ctx: RequestContext<Self::Context>,
         headers: Header<Authorization>,
         params: PathParams<JobIdParam>,
-    ) -> Result<HttpResponseOk<JobStatus>, HttpError> {
+    ) -> Result<HttpResponseOk<JsonJobStatusMap>, HttpError> {
         let mgr = ctx.context();
         let Authorization { authorization } = headers.into_inner();
         let authn = mgr.iam(authorization, None).await?;
         let JobIdParam { job_id } = params.into_inner();
-        Ok(HttpResponseOk(mgr.job_status(&authn, &job_id).await?))
+        Ok(HttpResponseOk(job_status_to_json_map(
+            mgr.job_status(&authn, &job_id).await?,
+        )))
     }
 
     async fn job_output(
@@ -199,47 +210,62 @@ impl SushApi for ApiServer {
         let headers = headers.into_inner();
         let range = headers.range()?;
         let authn = mgr.iam(headers.authorization, None).await?;
-        let JobOutputParams { job_id, stream } = params.into_inner();
-        let stdout = mgr.job_output(&authn, &job_id, stream, range).await?;
-        Ok(Response::new(stdout.into()))
-    }
+        let JobOutputParams {
+            job_id,
+            stream,
+            target,
+        } = params.into_inner();
+        let target = if target == "*" {
+            mgr.own_baseboard().clone()
+        } else {
+            target.parse().map_err(|_| {
+                HttpError::for_client_error(
+                    None,
+                    ClientErrorStatusCode::BAD_REQUEST,
+                    String::from("Unable to parse target as baseboard ID"),
+                )
+            })?
+        };
 
-    async fn job_output_delete(
-        ctx: RequestContext<Self::Context>,
-        headers: Header<AuthorizedRangeRequest>,
-        params: PathParams<JobOutputParams>,
-    ) -> Result<HttpResponseOk<u64>, HttpError> {
-        let mgr = ctx.context();
-        let headers = headers.into_inner();
-        let range = headers.range()?;
-        let authn = mgr.iam(headers.authorization, None).await?;
-        let JobOutputParams { job_id, stream } = params.into_inner();
-        let n = mgr
-            .job_output_delete(&authn, &job_id, stream, range)
+        let stream = mgr
+            .job_output(&authn, &job_id, &target, stream, range)
             .await?;
-        Ok(HttpResponseOk(n))
+        let length = stream.length();
+        let body = Body::wrap(StreamBody::new(stream.map_ok(Frame::data)));
+        Ok(Response::builder()
+            .status(StatusCode::OK)
+            .header(CONTENT_TYPE, CONTENT_TYPE_OCTET_STREAM)
+            .header(CONTENT_LENGTH, length)
+            .body(body)?)
     }
 
-    async fn job_start_interactive_session(
+    async fn job_attach(
         ctx: RequestContext<Self::Context>,
         headers: Header<Authorization>,
-        params: PathParams<JobIdParam>,
+        params: PathParams<JobAttachParams>,
         upgrade: WebsocketUpgrade,
     ) -> WebsocketEndpointResult {
         let mgr = ctx.context();
         let Authorization { authorization } = headers.into_inner();
         let authn = mgr.iam(authorization, None).await?;
-        let JobIdParam { job_id } = params.into_inner();
-        let session = mgr.job_start_interactive_session(&authn, &job_id).await?;
+        let JobAttachParams { job_id, target } = params.into_inner();
+        let target = if target == "*" {
+            mgr.own_baseboard().clone()
+        } else {
+            target.parse().map_err(|_| {
+                HttpError::for_client_error(
+                    None,
+                    ClientErrorStatusCode::BAD_REQUEST,
+                    String::from("Unable to parse target as baseboard ID"),
+                )
+            })?
+        };
+        let attachment = mgr.job_attachment(&authn, &job_id, &target).await?;
         upgrade.handle(async move |conn| {
             let socket = conn.into_inner();
             let stream = WebSocketStream::from_raw_socket(socket, Role::Server, None).await;
-            session.try_send(stream).map_err(|_| {
-                HttpError::for_client_error(
-                    None,
-                    ClientErrorStatusCode::NOT_FOUND,
-                    String::from("Interactive session unavailable"),
-                )
+            attachment.try_send(stream).map_err(|_| {
+                HttpError::for_internal_error(String::from("Unable to attach to interactive job"))
             })?;
             Ok(())
         })
@@ -249,13 +275,27 @@ impl SushApi for ApiServer {
         ctx: RequestContext<Self::Context>,
         headers: Header<Authorization>,
         query: QueryParams<JobHistoryParams>,
-    ) -> Result<HttpResponseOk<Vec<JobStatus>>, HttpError> {
+    ) -> Result<HttpResponseOk<Vec<JsonJobStatusMap>>, HttpError> {
         let mgr = ctx.context();
         let Authorization { authorization } = headers.into_inner();
         let authn = mgr.iam(authorization, None).await?;
         let JobHistoryParams { limit, offset } = query.into_inner();
         Ok(HttpResponseOk(
-            mgr.job_history(&authn, limit, offset).await?,
+            mgr.job_history(&authn, limit, offset)
+                .await?
+                .into_iter()
+                .map(job_status_to_json_map)
+                .collect(),
         ))
+    }
+
+    async fn target(
+        ctx: RequestContext<Self::Context>,
+        headers: Header<Authorization>,
+    ) -> Result<HttpResponseOk<BaseboardId>, HttpError> {
+        let mgr = ctx.context();
+        let Authorization { authorization } = headers.into_inner();
+        let _authn = mgr.iam(authorization, None).await?;
+        Ok(HttpResponseOk(mgr.own_baseboard().to_owned()))
     }
 }

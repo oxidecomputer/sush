@@ -10,6 +10,7 @@ progenitor::generate_api!(
     spec = "../sush.json", // must match `sush_common::OPENAPI_DOCUMENT`
     interface = Builder,
     replace = {
+        BaseboardId = sled_hardware_types::BaseboardId,
         Identity = sush_common::authn::Identity,
         Session = sush_common::jobs::Session,
         SessionId = sush_common::jobs::SessionId,
@@ -18,6 +19,7 @@ progenitor::generate_api!(
         JobOutputHash = sush_common::jobs::JobOutputHash,
         JobOutputStream = sush_common::jobs::JobOutputStream,
         JobStatus = sush_common::jobs::JobStatus,
+        JobWait = sush_api::JobWait,
         KeyId = sush_common::keys::KeyId,
         Signature = sush_common::keys::Signature,
         SignedForJobStartRequest = sush_common::jobs::SignedJob,

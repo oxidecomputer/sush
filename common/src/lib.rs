@@ -1,6 +1,7 @@
 //! Common data structures and algorithms for the Oxide Support Shell.
 
 pub mod authn;
+pub mod borsh;
 pub mod codephrases;
 pub mod interactive;
 pub mod jobs;

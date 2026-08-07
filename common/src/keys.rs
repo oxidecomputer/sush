@@ -6,7 +6,9 @@
 use std::fmt;
 use std::ops::Deref;
 
+use borsh::{BorshDeserialize, BorshSerialize};
 use bytes::{Buf as _, BufMut as _, BytesMut};
+use chrono::{DateTime, Utc};
 use crypto_bigint::{ArrayEncoding as _, Random as _, U128, U256};
 use ed25519_dalek::{
     Signature as Ed25519Signature, Signer as _, SigningKey as Ed25519SigningKey,
@@ -40,7 +42,18 @@ use crate::codephrases::{InvalidCodephrase, WORD_SEPARATOR, codephrase, decode_p
 /// SHA-256 of a certificate subject or an identity public key,
 /// encoded as a pseudorandom code phrase for storage & transport.
 #[derive(
-    Clone, Debug, Deserialize, Eq, Hash, JsonSchema, Ord, PartialEq, PartialOrd, Serialize,
+    BorshDeserialize,
+    BorshSerialize,
+    Clone,
+    Debug,
+    Deserialize,
+    Eq,
+    Hash,
+    JsonSchema,
+    Ord,
+    PartialEq,
+    PartialOrd,
+    Serialize,
 )]
 pub struct KeyId(String);
 
@@ -168,7 +181,18 @@ impl JsonSchema for SshPublicKey {
 /// public keys](https://cvsweb.openbsd.org/src/usr.bin/ssh/PROTOCOL.u2f?annotate=HEAD).
 /// They should be set to 0 for other key types.
 #[derive(
-    Clone, Debug, Deserialize, Eq, Hash, JsonSchema, Ord, PartialEq, PartialOrd, Serialize,
+    BorshDeserialize,
+    BorshSerialize,
+    Clone,
+    Debug,
+    Deserialize,
+    Eq,
+    Hash,
+    JsonSchema,
+    Ord,
+    PartialEq,
+    PartialOrd,
+    Serialize,
 )]
 pub struct EncodedSignature {
     pub r: String,
@@ -435,7 +459,7 @@ impl TryFrom<SshSignature> for Signature {
 /// Produce a verifiable signature.
 #[allow(async_fn_in_trait)]
 pub trait Signer {
-    type Error: std::fmt::Display;
+    type Error: std::fmt::Debug + std::fmt::Display;
 
     async fn sign<T: ToBeSigned>(&mut self, thing: T) -> Result<Signed<T>, Self::Error>;
 }
@@ -453,7 +477,17 @@ impl<T: AsRef<[u8]>> ToBeSigned for T {
 }
 
 /// A signed envelope around some data.
-#[derive(Clone, Debug, Deserialize, JsonSchema, Serialize)]
+#[derive(
+    BorshDeserialize,
+    BorshSerialize,
+    Clone,
+    Debug,
+    Deserialize,
+    Eq,
+    JsonSchema,
+    PartialEq,
+    Serialize,
+)]
 pub struct Signed<T> {
     payload: T,
     key_id: KeyId,
@@ -566,7 +600,7 @@ impl<T: ToBeSigned> Signed<T> {
 }
 
 /// An envelope whose signature has been verified.
-#[derive(Clone, Debug, Deserialize, JsonSchema, Serialize)]
+#[derive(BorshDeserialize, BorshSerialize, Clone, Debug, Deserialize, JsonSchema, Serialize)]
 pub struct Verified<T> {
     signed: Signed<T>,
     verified_by: KeyId,
@@ -846,8 +880,12 @@ pub fn pem_cert_chain(certs: Vec<Certificate>) -> Result<String, KeyError> {
 /// What went wrong handling a key, signature, or certificate.
 #[derive(Debug, Error)]
 pub enum KeyError {
+    #[error("Certificate chain is too long")]
+    CertChainTooLong,
     #[error("DER encoding error: {0}")]
     Der(#[from] x509_cert::der::Error),
+    #[error("Invalid certificate: {0}")]
+    InvalidCert(String),
     #[error(transparent)]
     InvalidCodephrase(#[from] InvalidCodephrase),
     #[error("Invalid key ID")]
@@ -860,10 +898,14 @@ pub enum KeyError {
     InvalidSignatureAlgorithm,
     #[error("Invalid signature encoding")]
     InvalidSignatureEncoding,
+    #[error("Can't find certificate for key `{0}`")]
+    MissingCert(KeyId),
     #[error(transparent)]
     Pem(#[from] pem_rfc7468::Error),
     #[error("SSH agent protocol error: {0}")]
     Protocol(#[from] ProtocolError),
+    #[error("Certificate for key `{0}` was revoked at {1}")]
+    Revoked(KeyId, DateTime<Utc>),
     #[error("Will not import a self-signed (root) certificate")]
     SelfSigned,
     #[error("Signature error: {0}")]
@@ -874,6 +916,8 @@ pub enum KeyError {
     Signer(String),
     #[error("SSH key error: {0}")]
     SshKey(#[from] SshKeyError),
+    #[error("Too many certificates ({0})")]
+    TooManyCerts(usize),
 }
 
 impl KeyError {

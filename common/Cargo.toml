@@ -7,6 +7,7 @@ publish = false
 
 [dependencies]
 blake3.workspace = true
+borsh.workspace = true
 bytes.workspace = true
 bytesize.workspace = true
 chrono.workspace = true
@@ -25,6 +26,8 @@ schemars.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 signature.workspace = true
+sled-hardware-types.workspace = true
+slog.workspace = true
 ssh-key.workspace = true
 sha2.workspace = true
 tempfile.workspace = true

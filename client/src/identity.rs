@@ -186,16 +186,47 @@ impl IdentityError {
 
 #[cfg(test)]
 mod test {
-    use std::env;
-
     use sush_common::codephrases::{PHRASE_WORDS_ID, WORD_SEPARATOR, generate_id};
+    use tempfile::TempDir;
+    use tokio::process::Command;
 
     use super::*;
 
-    /// May require a presence check if using SK-* keys.
     #[tokio::test]
     async fn ssh_identities() {
-        let sock = PathBuf::from(env::var("SSH_AUTH_SOCK").unwrap());
+        let ssh_home = TempDir::new().unwrap();
+        let sock = ssh_home.path().join("sock");
+        let key = ssh_home.path().join("id_ed25519");
+
+        let status = Command::new("ssh-keygen")
+            .args(["-t", "ed25519"])
+            .args(["-P", ""]) // Don't set a password.
+            .arg("-f")
+            .arg(&key)
+            .status()
+            .await
+            .expect("failed to run ssh-keygen");
+        if !status.success() {
+            panic!("ssh-keygen failed with {status:?}");
+        }
+
+        let mut agent_process = Command::new("ssh-agent")
+            .arg("-D") // Start the agent in foreground mode.
+            .arg("-a")
+            .arg(&sock)
+            .spawn()
+            .expect("failed to spawn ssh-agent");
+
+        let status = Command::new("ssh-add")
+            .arg(&key)
+            .env("SSH_AUTH_SOCK", &sock)
+            .status()
+            .await
+            .expect("failed to run ssh-add");
+        if !status.success() {
+            panic!("ssh-add failed with {status:?}");
+        }
+
         let mut agent = SshAgentConnection::connect(&sock).await.unwrap();
         for key in agent.list_identities().await.unwrap() {
             let key_id = key.key_id().unwrap();
@@ -205,5 +236,10 @@ mod test {
             let signature = agent.sign_with(&key, nonce.as_bytes()).await.unwrap();
             key.verify(nonce.as_bytes(), &signature).unwrap();
         }
+
+        agent_process
+            .kill()
+            .await
+            .expect("failed to kill ssh-agent");
     }
 }

@@ -4,8 +4,20 @@
 extern crate function_name;
 
 pub mod error;
-pub mod interactive;
+pub mod executor;
+pub mod history;
+pub mod io;
+pub mod job;
 pub mod manager;
-pub mod monitor;
+pub mod messages;
+pub mod mux;
+pub mod output;
+pub mod proxy;
 pub mod pty;
 pub mod server;
+pub mod state;
+
+pub use error::JobError;
+pub use manager::JobManager;
+pub use proxy::ProxyServer;
+pub use server::ApiServer;

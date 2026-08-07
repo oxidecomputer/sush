@@ -33,7 +33,7 @@ pub const WORD_SEPARATOR: &str = "-";
 
 /// Decoding a phrase failed.
 #[derive(Debug, Error)]
-#[error("invalid code phrase, must be ≤ {PHRASE_WORDS_256} words from the BIP-39 list")]
+#[error("invalid or non-canonical code phrase")]
 pub struct InvalidCodephrase;
 
 /// Look up a word in the word list.
@@ -63,11 +63,17 @@ pub fn codephrase(value: U256) -> Vec<&'static str> {
 }
 
 /// Turn 256 bits of entropy into a reasonably unique code phrase.
-/// We use the low-order words of the full codephrase.
+/// We use the low-order words of the full codephrase, and pad to
+/// the canonical length; these phrases are intended for machine
+/// consumption, and are short enough for easy transmission.
 pub fn id_phrase(value: U256) -> Vec<&'static str> {
     let mut phrase = codephrase(value);
     let n = phrase.len().saturating_sub(PHRASE_WORDS_ID);
-    phrase.split_off(n)
+    let mut phrase = phrase.split_off(n);
+    while phrase.len() < PHRASE_WORDS_ID {
+        phrase.insert(0, word(0)); // pad w/leading zeros
+    }
+    phrase
 }
 
 /// Generate a code phrase for use as an identifier.
@@ -76,10 +82,16 @@ pub fn generate_id() -> String {
 }
 
 /// Decode a big endian code phrase into 256 bits of entropy.
+///
+/// Decoding is non-injective, or "liberal" in the sense that it will
+/// accept non-canonical codephrases, e.g., ones with spaces instead of
+/// separators, words in mixed case, or without leading zeros. This is
+/// for the comfort of humans that may have to transmit such phrases.
 pub fn decode_phrase(phrase: &str) -> Result<U256, InvalidCodephrase> {
     let b = Wrapping(U256::from_u64(WORDLIST_LEN as u64));
     let mut n = Wrapping(U256::ZERO);
     for word in phrase
+        .to_ascii_lowercase()
         .replace(WORD_SEPARATOR, " ")
         .split_ascii_whitespace()
         .take(PHRASE_WORDS_256)
@@ -197,7 +209,18 @@ mod test {
             let n = id.split(WORD_SEPARATOR).count();
             assert_eq!(n, PHRASE_WORDS_ID);
             assert!(seen.insert(id.clone()), "duplicate ID {id}");
-            round_trip(decode_phrase(&id).unwrap());
+
+            let entropy = decode_phrase(&id).unwrap();
+            round_trip(entropy);
+            assert_eq!(id, id_phrase(entropy).join(WORD_SEPARATOR));
         }
+    }
+
+    #[test]
+    fn id_leading_zero() {
+        let v = U256::ONE.shl_vartime(66); // 7 digits, since 2048⁶ = 2⁶⁶
+        let id = id_phrase(v);
+        assert_eq!(id.len(), PHRASE_WORDS_ID);
+        assert_eq!(decode_phrase(&id.join(WORD_SEPARATOR)).unwrap(), v);
     }
 }

@@ -6,10 +6,13 @@ edition = "2024"
 publish = false
 
 [dependencies]
+borsh.workspace = true
 chrono.workspace = true
 dropshot.workspace = true
 http-range-header.workspace = true
 hyper.workspace = true
 schemars.workspace = true
 serde.workspace = true
+sled-hardware-types.workspace = true
 sush-common = { path = "../common" }
+thiserror.workspace = true

@@ -8,6 +8,7 @@
     "/certs": {
       "put": {
         "summary": "Import a certificate, verify its signature, and return a key ID for it.",
+        "description": "The body should be a PEM encoded X.509 certificate.",
         "operationId": "import_cert",
         "parameters": [
           {
@@ -17,19 +18,22 @@
             "schema": {
               "type": "string"
             }
+          },
+          {
+            "in": "query",
+            "name": "wait",
+            "description": "Wait for the subject to appear in the state.",
+            "schema": {
+              "type": "boolean"
+            }
           }
         ],
         "requestBody": {
           "content": {
             "application/json": {
               "schema": {
-                "title": "Array_of_uint8",
-                "type": "array",
-                "items": {
-                  "type": "integer",
-                  "format": "uint8",
-                  "minimum": 0
-                }
+                "title": "String",
+                "type": "string"
               }
             }
           },
@@ -182,46 +186,10 @@
         }
       }
     },
-    "/iam/{key_id}": {
-      "delete": {
-        "summary": "Revoke an authenticated identity.",
-        "description": "Any authenticated identity may revoke any other identity; this is the only way to handle lost or stolen private keys.",
-        "operationId": "revoke_identity",
-        "parameters": [
-          {
-            "in": "header",
-            "name": "authorization",
-            "description": "Authorization to access some resource, such as a signature.\n\nSee: <https://developer.mozilla.org/en-US/docs/Web/HTTP/Reference/Headers/Authorization>",
-            "schema": {
-              "type": "string"
-            }
-          },
-          {
-            "in": "path",
-            "name": "key_id",
-            "required": true,
-            "schema": {
-              "$ref": "#/components/schemas/KeyId"
-            }
-          }
-        ],
-        "responses": {
-          "204": {
-            "description": "successful deletion"
-          },
-          "4XX": {
-            "$ref": "#/components/responses/Error"
-          },
-          "5XX": {
-            "$ref": "#/components/responses/Error"
-          }
-        }
-      }
-    },
     "/jobs": {
       "get": {
-        "summary": "List previous jobs sorted by start time, most recent first.",
-        "description": "Any authenticated identity may see the job history, regardless of ownership.",
+        "summary": "List known jobs sorted by start time, most recent first.",
+        "description": "Offsets may shift under concurrent eviction, so pagination is currently best-effort.",
         "operationId": "job_history",
         "parameters": [
           {
@@ -258,10 +226,13 @@
             "content": {
               "application/json": {
                 "schema": {
-                  "title": "Array_of_JobStatus",
+                  "title": "Array_of_Map_of_JobStatus",
                   "type": "array",
                   "items": {
-                    "$ref": "#/components/schemas/JobStatus"
+                    "type": "object",
+                    "additionalProperties": {
+                      "$ref": "#/components/schemas/JobStatus"
+                    }
                   }
                 }
               }
@@ -276,10 +247,54 @@
         }
       }
     },
-    "/jobs/{job_id}/output/{stream}": {
+    "/jobs/{job_id}/attach/{target}": {
+      "get": {
+        "summary": "Attach to an interactive job.",
+        "operationId": "job_attach",
+        "parameters": [
+          {
+            "in": "header",
+            "name": "authorization",
+            "description": "Authorization to access some resource, such as a signature.\n\nSee: <https://developer.mozilla.org/en-US/docs/Web/HTTP/Reference/Headers/Authorization>",
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "in": "path",
+            "name": "job_id",
+            "description": "Which job to attach to.",
+            "required": true,
+            "schema": {
+              "$ref": "#/components/schemas/JobId"
+            }
+          },
+          {
+            "in": "path",
+            "name": "target",
+            "description": "To be used by Nexus for routing.",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "default": {
+            "description": "",
+            "content": {
+              "*/*": {
+                "schema": {}
+              }
+            }
+          }
+        },
+        "x-dropshot-websocket": {}
+      }
+    },
+    "/jobs/{job_id}/output/{target}/{stream}": {
       "get": {
         "summary": "Get (a subset of) the standard output or standard error of a job.",
-        "description": "Only the job owner may request job output.",
         "operationId": "job_output",
         "parameters": [
           {
@@ -308,6 +323,14 @@
           },
           {
             "in": "path",
+            "name": "target",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "in": "path",
             "name": "stream",
             "required": true,
             "schema": {
@@ -325,102 +348,6 @@
             }
           }
         }
-      },
-      "delete": {
-        "summary": "Truncate the standard output or standard error of a job.",
-        "description": "Only the job owner may truncate job output. Returns the new length.",
-        "operationId": "job_output_delete",
-        "parameters": [
-          {
-            "in": "header",
-            "name": "authorization",
-            "description": "Authorization to access the range.\n\nSee: <https://developer.mozilla.org/en-US/docs/Web/HTTP/Reference/Headers/Authorization>",
-            "schema": {
-              "type": "string"
-            }
-          },
-          {
-            "in": "header",
-            "name": "range",
-            "description": "A request to access a portion of the resource, such as `bytes=0-499`\n\nSee: <https://developer.mozilla.org/en-US/docs/Web/HTTP/Reference/Headers/Range>",
-            "schema": {
-              "type": "string"
-            }
-          },
-          {
-            "in": "path",
-            "name": "job_id",
-            "required": true,
-            "schema": {
-              "$ref": "#/components/schemas/JobId"
-            }
-          },
-          {
-            "in": "path",
-            "name": "stream",
-            "required": true,
-            "schema": {
-              "$ref": "#/components/schemas/JobOutputStream"
-            }
-          }
-        ],
-        "responses": {
-          "200": {
-            "description": "successful operation",
-            "content": {
-              "application/json": {
-                "schema": {
-                  "title": "uint64",
-                  "type": "integer",
-                  "format": "uint64",
-                  "minimum": 0
-                }
-              }
-            }
-          },
-          "4XX": {
-            "$ref": "#/components/responses/Error"
-          },
-          "5XX": {
-            "$ref": "#/components/responses/Error"
-          }
-        }
-      }
-    },
-    "/jobs/{job_id}/session": {
-      "get": {
-        "summary": "Start a new interactive job session.",
-        "description": "Only the job owner may start an interactive session.",
-        "operationId": "job_start_interactive_session",
-        "parameters": [
-          {
-            "in": "header",
-            "name": "authorization",
-            "description": "Authorization to access some resource, such as a signature.\n\nSee: <https://developer.mozilla.org/en-US/docs/Web/HTTP/Reference/Headers/Authorization>",
-            "schema": {
-              "type": "string"
-            }
-          },
-          {
-            "in": "path",
-            "name": "job_id",
-            "required": true,
-            "schema": {
-              "$ref": "#/components/schemas/JobId"
-            }
-          }
-        ],
-        "responses": {
-          "default": {
-            "description": "",
-            "content": {
-              "*/*": {
-                "schema": {}
-              }
-            }
-          }
-        },
-        "x-dropshot-websocket": {}
       }
     },
     "/jobs/{job_id}/start": {
@@ -478,10 +405,9 @@
           {
             "in": "query",
             "name": "wait",
-            "description": "Keep the request open until the batch job ends.",
-            "required": true,
+            "description": "Wait for the job to start or stop.",
             "schema": {
-              "type": "boolean"
+              "$ref": "#/components/schemas/JobWait"
             }
           },
           {
@@ -529,15 +455,8 @@
           "required": true
         },
         "responses": {
-          "200": {
-            "description": "successful operation",
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/JobStatus"
-                }
-              }
-            }
+          "204": {
+            "description": "resource updated"
           },
           "4XX": {
             "$ref": "#/components/responses/Error"
@@ -550,8 +469,7 @@
     },
     "/jobs/{job_id}/status": {
       "get": {
-        "summary": "Get the status of a job.",
-        "description": "Any authenticated identity may see the status of any job, regardless of ownership.",
+        "summary": "Get the status of a job across the rack.",
         "operationId": "job_status",
         "parameters": [
           {
@@ -577,7 +495,11 @@
             "content": {
               "application/json": {
                 "schema": {
-                  "$ref": "#/components/schemas/JobStatus"
+                  "title": "Map_of_JobStatus",
+                  "type": "object",
+                  "additionalProperties": {
+                    "$ref": "#/components/schemas/JobStatus"
+                  }
                 }
               }
             }
@@ -594,7 +516,6 @@
     "/jobs/{job_id}/stop": {
       "post": {
         "summary": "Stop a (running) job.",
-        "description": "Any authenticated identity may stop a job, regardless of ownership.",
         "operationId": "job_stop",
         "parameters": [
           {
@@ -612,22 +533,19 @@
             "schema": {
               "$ref": "#/components/schemas/JobId"
             }
+          },
+          {
+            "in": "query",
+            "name": "wait",
+            "description": "Wait for the job process to end.",
+            "schema": {
+              "$ref": "#/components/schemas/JobWait"
+            }
           }
         ],
         "responses": {
-          "200": {
-            "description": "successful operation",
-            "content": {
-              "application/json": {
-                "schema": {
-                  "title": "Null",
-                  "type": "string",
-                  "enum": [
-                    null
-                  ]
-                }
-              }
-            }
+          "204": {
+            "description": "resource updated"
           },
           "4XX": {
             "$ref": "#/components/responses/Error"
@@ -670,10 +588,55 @@
             "$ref": "#/components/responses/Error"
           }
         }
-      },
+      }
+    },
+    "/sessions/{session_id}/skip/{job_id}": {
+      "post": {
+        "summary": "Burn a job ID in the current session.",
+        "operationId": "session_skip_job",
+        "parameters": [
+          {
+            "in": "header",
+            "name": "authorization",
+            "description": "Authorization to access some resource, such as a signature.\n\nSee: <https://developer.mozilla.org/en-US/docs/Web/HTTP/Reference/Headers/Authorization>",
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "in": "path",
+            "name": "session_id",
+            "required": true,
+            "schema": {
+              "$ref": "#/components/schemas/SessionId"
+            }
+          },
+          {
+            "in": "path",
+            "name": "job_id",
+            "required": true,
+            "schema": {
+              "$ref": "#/components/schemas/JobId"
+            }
+          }
+        ],
+        "responses": {
+          "204": {
+            "description": "resource updated"
+          },
+          "4XX": {
+            "$ref": "#/components/responses/Error"
+          },
+          "5XX": {
+            "$ref": "#/components/responses/Error"
+          }
+        }
+      }
+    },
+    "/sessions/{session_id}/start": {
       "post": {
         "summary": "Start a new support session.",
-        "description": "There may only be one session active on the rack at a time. If a session is already running when this request is made, the old session is stopped, regardless of ownership.",
+        "description": "There may only be one session active on the rack at a time. If a session is already running when this request is made, the new session supersedes the old one, but the old session's jobs are not stopped.",
         "operationId": "session_start",
         "parameters": [
           {
@@ -683,18 +646,27 @@
             "schema": {
               "type": "string"
             }
+          },
+          {
+            "in": "path",
+            "name": "session_id",
+            "required": true,
+            "schema": {
+              "$ref": "#/components/schemas/SessionId"
+            }
+          },
+          {
+            "in": "query",
+            "name": "wait",
+            "description": "Wait for the subject to appear in the state.",
+            "schema": {
+              "type": "boolean"
+            }
           }
         ],
         "responses": {
-          "200": {
-            "description": "successful operation",
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/Session"
-                }
-              }
-            }
+          "204": {
+            "description": "resource updated"
           },
           "4XX": {
             "$ref": "#/components/responses/Error"
@@ -708,7 +680,6 @@
     "/sessions/{session_id}/stop": {
       "post": {
         "summary": "End a support session.",
-        "description": "Since there may be only one session active on the rack at a time and we do not want to prevent starting new sessions, anyone is allowed to stop anyone else's session and start their own.",
         "operationId": "session_stop",
         "parameters": [
           {
@@ -729,16 +700,39 @@
           }
         ],
         "responses": {
+          "204": {
+            "description": "resource updated"
+          },
+          "4XX": {
+            "$ref": "#/components/responses/Error"
+          },
+          "5XX": {
+            "$ref": "#/components/responses/Error"
+          }
+        }
+      }
+    },
+    "/target": {
+      "get": {
+        "summary": "Get the baseboard ID of the sled handling this request.",
+        "operationId": "target",
+        "parameters": [
+          {
+            "in": "header",
+            "name": "authorization",
+            "description": "Authorization to access some resource, such as a signature.\n\nSee: <https://developer.mozilla.org/en-US/docs/Web/HTTP/Reference/Headers/Authorization>",
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
           "200": {
             "description": "successful operation",
             "content": {
               "application/json": {
                 "schema": {
-                  "title": "Null",
-                  "type": "string",
-                  "enum": [
-                    null
-                  ]
+                  "$ref": "#/components/schemas/BaseboardId"
                 }
               }
             }
@@ -817,39 +811,98 @@
           {
             "type": "object",
             "properties": {
+              "Cancelled": {
+                "type": "object",
+                "properties": {
+                  "job_id": {
+                    "$ref": "#/components/schemas/JobId"
+                  },
+                  "time_cancelled": {
+                    "type": "string",
+                    "format": "date-time"
+                  }
+                },
+                "required": [
+                  "job_id",
+                  "time_cancelled"
+                ]
+              }
+            },
+            "required": [
+              "Cancelled"
+            ],
+            "additionalProperties": false
+          },
+          {
+            "type": "object",
+            "properties": {
+              "Queued": {
+                "type": "object",
+                "properties": {
+                  "job_id": {
+                    "$ref": "#/components/schemas/JobId"
+                  },
+                  "time_queued": {
+                    "type": "string",
+                    "format": "date-time"
+                  }
+                },
+                "required": [
+                  "job_id",
+                  "time_queued"
+                ]
+              }
+            },
+            "required": [
+              "Queued"
+            ],
+            "additionalProperties": false
+          },
+          {
+            "type": "object",
+            "properties": {
+              "Error": {
+                "type": "object",
+                "properties": {
+                  "job_id": {
+                    "$ref": "#/components/schemas/JobId"
+                  },
+                  "time_error": {
+                    "type": "string",
+                    "format": "date-time"
+                  },
+                  "error": {
+                    "$ref": "#/components/schemas/ProcessError"
+                  }
+                },
+                "required": [
+                  "error",
+                  "job_id",
+                  "time_error"
+                ]
+              }
+            },
+            "required": [
+              "Error"
+            ],
+            "additionalProperties": false
+          },
+          {
+            "type": "object",
+            "properties": {
               "Started": {
                 "type": "object",
                 "properties": {
-                  "job": {
-                    "$ref": "#/components/schemas/Verified_for_JobStartRequest"
-                  },
-                  "session_id": {
-                    "$ref": "#/components/schemas/SessionId"
-                  },
-                  "key_id": {
-                    "$ref": "#/components/schemas/KeyId"
+                  "job_id": {
+                    "$ref": "#/components/schemas/JobId"
                   },
                   "time_started": {
                     "type": "string",
                     "format": "date-time"
-                  },
-                  "stdout_len": {
-                    "type": "integer",
-                    "format": "uint64",
-                    "minimum": 0
-                  },
-                  "stderr_len": {
-                    "type": "integer",
-                    "format": "uint64",
-                    "minimum": 0
                   }
                 },
                 "required": [
-                  "job",
-                  "key_id",
-                  "session_id",
-                  "stderr_len",
-                  "stdout_len",
+                  "job_id",
                   "time_started"
                 ]
               }
@@ -862,83 +915,224 @@
           {
             "type": "object",
             "properties": {
-              "Ended": {
+              "Stopped": {
                 "type": "object",
                 "properties": {
-                  "job": {
-                    "$ref": "#/components/schemas/Verified_for_JobStartRequest"
-                  },
-                  "session_id": {
-                    "$ref": "#/components/schemas/SessionId"
-                  },
-                  "key_id": {
-                    "$ref": "#/components/schemas/KeyId"
+                  "job_id": {
+                    "$ref": "#/components/schemas/JobId"
                   },
                   "time_started": {
                     "type": "string",
                     "format": "date-time"
                   },
-                  "time_ended": {
+                  "time_stopped": {
                     "type": "string",
                     "format": "date-time"
                   },
-                  "status": {
-                    "nullable": true,
-                    "type": "integer",
-                    "format": "int32"
+                  "result": {
+                    "$ref": "#/components/schemas/Result_of_int32_or_ProcessError"
                   },
-                  "stdout_len": {
-                    "type": "integer",
-                    "format": "uint64",
-                    "minimum": 0
-                  },
-                  "stderr_len": {
-                    "type": "integer",
-                    "format": "uint64",
-                    "minimum": 0
-                  },
-                  "stdout_hash": {
-                    "$ref": "#/components/schemas/JobOutputHash"
-                  },
-                  "stderr_hash": {
-                    "$ref": "#/components/schemas/JobOutputHash"
+                  "output": {
+                    "$ref": "#/components/schemas/JobOutputState"
                   }
                 },
                 "required": [
-                  "job",
-                  "key_id",
-                  "session_id",
-                  "stderr_hash",
-                  "stderr_len",
-                  "stdout_hash",
-                  "stdout_len",
-                  "time_ended",
-                  "time_started"
+                  "job_id",
+                  "output",
+                  "result",
+                  "time_started",
+                  "time_stopped"
                 ]
               }
             },
             "required": [
-              "Ended"
+              "Stopped"
             ],
             "additionalProperties": false
           }
         ]
       },
-      "Verified_for_JobStartRequest": {
-        "description": "An envelope whose signature has been verified.",
+      "JobId": {
+        "description": "A globally unique identifier for a job within a session.",
+        "type": "string"
+      },
+      "ProcessError": {
+        "description": "What went wrong running a job's process or interactive session.\n\nWe currently squash inner errors into strings to avoid excessive derivation requirements, but may come to regret that decision.",
+        "oneOf": [
+          {
+            "type": "string",
+            "enum": [
+              "Unknown",
+              "InvalidCommand"
+            ]
+          },
+          {
+            "type": "object",
+            "properties": {
+              "Killed": {
+                "type": "integer",
+                "format": "int32"
+              }
+            },
+            "required": [
+              "Killed"
+            ],
+            "additionalProperties": false
+          },
+          {
+            "type": "object",
+            "properties": {
+              "Interactive": {
+                "type": "string"
+              }
+            },
+            "required": [
+              "Interactive"
+            ],
+            "additionalProperties": false
+          },
+          {
+            "type": "object",
+            "properties": {
+              "InvalidJob": {
+                "type": "string"
+              }
+            },
+            "required": [
+              "InvalidJob"
+            ],
+            "additionalProperties": false
+          },
+          {
+            "type": "object",
+            "properties": {
+              "Io": {
+                "type": "object",
+                "properties": {
+                  "what": {
+                    "type": "string"
+                  },
+                  "error": {
+                    "type": "string"
+                  }
+                },
+                "required": [
+                  "error",
+                  "what"
+                ]
+              }
+            },
+            "required": [
+              "Io"
+            ],
+            "additionalProperties": false
+          },
+          {
+            "type": "object",
+            "properties": {
+              "OutputLimitExceeded": {
+                "type": "object",
+                "properties": {
+                  "stream": {
+                    "$ref": "#/components/schemas/JobOutputStream"
+                  },
+                  "limit": {
+                    "type": "integer",
+                    "format": "uint64",
+                    "minimum": 0
+                  }
+                },
+                "required": [
+                  "limit",
+                  "stream"
+                ]
+              }
+            },
+            "required": [
+              "OutputLimitExceeded"
+            ],
+            "additionalProperties": false
+          },
+          {
+            "type": "object",
+            "properties": {
+              "Join": {
+                "type": "string"
+              }
+            },
+            "required": [
+              "Join"
+            ],
+            "additionalProperties": false
+          }
+        ]
+      },
+      "JobOutputStream": {
+        "description": "Either the standard output or standard error of a job.",
+        "type": "string",
+        "enum": [
+          "stdout",
+          "stderr"
+        ]
+      },
+      "Result_of_int32_or_ProcessError": {
+        "oneOf": [
+          {
+            "type": "object",
+            "properties": {
+              "Ok": {
+                "type": "integer",
+                "format": "int32"
+              }
+            },
+            "required": [
+              "Ok"
+            ]
+          },
+          {
+            "type": "object",
+            "properties": {
+              "Err": {
+                "$ref": "#/components/schemas/ProcessError"
+              }
+            },
+            "required": [
+              "Err"
+            ]
+          }
+        ]
+      },
+      "JobOutputState": {
         "type": "object",
         "properties": {
-          "signed": {
-            "$ref": "#/components/schemas/Signed_for_JobStartRequest"
+          "stdout_len": {
+            "type": "integer",
+            "format": "uint64",
+            "minimum": 0
           },
-          "verified_by": {
-            "$ref": "#/components/schemas/KeyId"
+          "stderr_len": {
+            "type": "integer",
+            "format": "uint64",
+            "minimum": 0
+          },
+          "stdout_hash": {
+            "$ref": "#/components/schemas/JobOutputHash"
+          },
+          "stderr_hash": {
+            "$ref": "#/components/schemas/JobOutputHash"
           }
         },
         "required": [
-          "signed",
-          "verified_by"
+          "stderr_hash",
+          "stderr_len",
+          "stdout_hash",
+          "stdout_len"
         ]
+      },
+      "JobOutputHash": {
+        "description": "BLAKE3 hash of job output, used as a checksum.",
+        "type": "string",
+        "format": "hex encoded hash (32 bytes)"
       },
       "Signed_for_JobStartRequest": {
         "description": "A signed envelope around some data.",
@@ -979,10 +1173,6 @@
           "job_id"
         ]
       },
-      "JobId": {
-        "description": "A globally unique identifier for a job within a session.",
-        "type": "string"
-      },
       "EncodedSignature": {
         "description": "Code phrase encoded signature.\n\nThe decoded phrases `r` and `s` together comprise a signature _(r, s)_ over a 256 bit elliptic curve.\n\nThe `flags` and `counter` parameters are for the [`SK-*` family of SSH public keys](https://cvsweb.openbsd.org/src/usr.bin/ssh/PROTOCOL.u2f?annotate=HEAD). They should be set to 0 for other key types.",
         "type": "object",
@@ -1009,48 +1199,84 @@
           "s"
         ]
       },
-      "SessionId": {
-        "description": "A globally unique identifier for a session.",
-        "type": "string"
-      },
-      "JobOutputHash": {
-        "description": "BLAKE3 hash of job output, used as a checksum.",
-        "type": "string",
-        "format": "hex encoded hash (32 bytes)"
-      },
       "Session": {
         "type": "object",
         "properties": {
           "session_id": {
             "$ref": "#/components/schemas/SessionId"
           },
-          "key_id": {
-            "nullable": true,
-            "allOf": [
-              {
-                "$ref": "#/components/schemas/KeyId"
-              }
-            ]
-          },
           "last_job": {
-            "nullable": true,
-            "allOf": [
-              {
-                "$ref": "#/components/schemas/Signed_for_JobStartRequest"
-              }
-            ]
+            "$ref": "#/components/schemas/LastJob"
           }
         },
         "required": [
+          "last_job",
           "session_id"
         ]
       },
-      "JobOutputStream": {
-        "description": "Either the standard output or standard error of a job.",
+      "SessionId": {
+        "description": "A globally unique identifier for a session.",
+        "type": "string"
+      },
+      "LastJob": {
+        "oneOf": [
+          {
+            "type": "string",
+            "enum": [
+              "None"
+            ]
+          },
+          {
+            "type": "object",
+            "properties": {
+              "Some": {
+                "$ref": "#/components/schemas/Signed_for_JobStartRequest"
+              }
+            },
+            "required": [
+              "Some"
+            ],
+            "additionalProperties": false
+          },
+          {
+            "type": "object",
+            "properties": {
+              "Burned": {
+                "$ref": "#/components/schemas/JobId"
+              }
+            },
+            "required": [
+              "Burned"
+            ],
+            "additionalProperties": false
+          }
+        ]
+      },
+      "BaseboardId": {
+        "description": "A representation of a Baseboard ID as used in the inventory subsystem.\n\nThis type is essentially the same as a `Baseboard` except it doesn't have a revision or HW type (Gimlet, PC, Unknown).",
+        "type": "object",
+        "properties": {
+          "part_number": {
+            "description": "Oxide Part Number",
+            "type": "string"
+          },
+          "serial_number": {
+            "description": "Serial number (unique for a given part number)",
+            "type": "string"
+          }
+        },
+        "required": [
+          "part_number",
+          "serial_number"
+        ]
+      },
+      "JobWait": {
+        "description": "Whether and until what state is reached to wait for a job start/stop request.",
         "type": "string",
         "enum": [
-          "stdout",
-          "stderr"
+          "none",
+          "start",
+          "stop"
         ]
       }
     },

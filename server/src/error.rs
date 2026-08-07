@@ -1,27 +1,25 @@
 //! Job server errors.
 
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
 
-use chrono::{DateTime, Utc};
 use dropshot::{ClientErrorStatusCode, HttpError};
 use thiserror::Error;
 
 use sush_common::authn::{Challenge, Nonce};
-use sush_common::interactive::InteractiveSessionError;
-use sush_common::jobs::{JobId, JobOutputHash, SessionId};
+use sush_common::interactive::InteractiveJobError;
+use sush_common::jobs::{ExecutionError, JobId, JobOutputHash, SessionId};
 use sush_common::keys::{KeyError, KeyId};
 
 /// What went wrong processing a client job request.
 #[derive(Debug, Error)]
 pub enum JobError {
-    #[error("Certificate chain is too long")]
-    CertChainTooLong,
     #[error("Internal communications channel was unexpectedly closed")]
     ChannelClosed,
-    #[error("DER encoding error: {0}")]
-    Der(#[from] x509_cert::der::Error),
-    #[error(transparent)]
+    #[error("Certificate decoding error: {0}")]
+    DecodeCert(#[from] x509_cert::der::Error),
+    #[error("Duplicate job ID `{0}`")]
+    DuplicateJobId(JobId),
+    #[error("Execution error: {0}")]
     Execution(#[from] ExecutionError),
     #[error("File I/O error accessing `{path}`: {error}")]
     FileIo {
@@ -31,62 +29,43 @@ pub enum JobError {
     #[error("Identity not found")]
     IdentityNotFound(KeyId),
     #[error("Interactive session error: {0}")]
-    InteractiveSession(#[from] InteractiveSessionError),
-    #[error("Invalid command `{0}`, must not start with `-`")]
-    InvalidCommand(String),
-    #[error("Invalid or duplicate job ID")]
-    InvalidJobId(JobId),
+    InteractiveJob(#[from] InteractiveJobError),
+    #[error("Command must not start with `-`")]
+    InvalidCommand,
     #[error("Invalid range for output of length {0}")]
     InvalidRange(u64),
     #[error("I/O error during {what}: {error}")]
     Io { what: String, error: std::io::Error },
     #[error("Job `{0}` not found")]
     JobNotFound(JobId),
-    #[error("Job `{0}` is still running, so may produce more output")]
-    JobStillRunning(JobId),
     #[error(transparent)]
     Json(#[from] serde_json::Error),
     #[error("Key error: {0}")]
     Key(#[from] KeyError),
-    #[error("Can't kill job `{0}`")]
-    Shutdown(JobId),
-    #[error("Can't find certificate for key `{0}`")]
-    MissingCert(KeyId),
     #[error("Only one session may be running at a time")]
     MultipleSessions,
     #[error("No current session")]
     NoSession,
     #[error("Session `{0}` is no longer current")]
     SessionNotCurrent(SessionId),
-    #[error("Session `{0}` not found")]
-    SessionNotFound(SessionId),
-    #[error("Incorrect identity for session, try `iam`")]
-    SessionWrongIdentity,
     #[error("Job output hash mismatch, file may be corrupt")]
     OutputHashMismatch(JobId, JobOutputHash),
+    #[error("Job output file missing or unavailable")]
+    OutputFileMissing(JobId),
     #[error("Output too big, please use range requests")]
     OutputTooBig,
     #[error("Public key for `{0}` does not match stored key")]
     PublicKeyMismatch(KeyId),
     #[error("Public key `{0}` not found")]
     PublicKeyNotFound(KeyId),
-    #[error("Public key `{key_id}` was revoked at {time_revoked}")]
-    PublicKeyRevoked {
-        key_id: KeyId,
-        time_revoked: DateTime<Utc>,
-    },
-    #[error("Can't receive response: sender dropped")]
-    Recv(#[from] tokio::sync::oneshot::error::RecvError),
     #[error(transparent)]
     Slice(#[from] std::array::TryFromSliceError),
     #[error(transparent)]
     Task(#[from] tokio::task::JoinError),
-    #[error("Too many certificates ({0})")]
-    TooManyCerts(usize),
-    #[error("Too many active jobs ({0}), try waiting for some to finish")]
-    TooManyJobs(usize),
-    #[error("Too many identities revoked ({0})")]
-    TooManyRevocations(usize),
+    #[error("Wait timed out")]
+    Timeout,
+    #[error("Too many simultaneous output requests ({0})")]
+    TooManyOutputRequests(usize),
     #[error("Unauthorized request")]
     Unauthorized(Nonce),
     #[error("Unable to wait for job end")]
@@ -131,15 +110,12 @@ impl From<JobError> for HttpError {
         match error {
             Key(_)
             | ChannelClosed
-            | Der(_)
             | Execution(_)
             | FileIo { .. }
             | Io { .. }
             | OutputHashMismatch(_, _)
             | PublicKeyNotFound(_)
             | PublicKeyMismatch(_)
-            | Recv(_)
-            | Shutdown(_)
             | Task(_)
             | Slice(_)
             | Wait => HttpError::for_internal_error(message),
@@ -157,9 +133,19 @@ impl From<JobError> for HttpError {
             OutputTooBig => {
                 HttpError::for_client_error(None, ClientErrorStatusCode::PAYLOAD_TOO_LARGE, message)
             }
-            InteractiveSession(error) => HttpError::for_client_error(
+            InteractiveJob(error) => HttpError::for_client_error(
                 None,
                 ClientErrorStatusCode::NOT_FOUND,
+                error.to_string(),
+            ),
+            Timeout => HttpError::for_client_error(
+                None,
+                ClientErrorStatusCode::REQUEST_TIMEOUT,
+                String::from("Wait timed out"),
+            ),
+            TooManyOutputRequests(_) => HttpError::for_client_error(
+                None,
+                ClientErrorStatusCode::TOO_MANY_REQUESTS,
                 error.to_string(),
             ),
             Unauthorized(nonce) => {
@@ -173,45 +159,13 @@ impl From<JobError> for HttpError {
                     .expect("should be able to add WWW-Authenticate header");
                 err
             }
-            SessionWrongIdentity | PublicKeyRevoked { .. } => {
-                HttpError::for_client_error(None, ClientErrorStatusCode::FORBIDDEN, message)
-            }
-            IdentityNotFound(_) | JobNotFound(_) | NoSession | SessionNotFound(_)
+            IdentityNotFound(_) | JobNotFound(_) | NoSession | OutputFileMissing(_)
             | SessionNotCurrent(_) => {
                 HttpError::for_client_error(None, ClientErrorStatusCode::NOT_FOUND, message)
             }
-            CertChainTooLong
-            | InvalidCommand(_)
-            | InvalidJobId(_)
-            | Json(_)
-            | JobStillRunning(_)
-            | MissingCert(_)
-            | MultipleSessions
-            | TooManyCerts(_)
-            | TooManyJobs(_)
-            | TooManyRevocations(_) => {
+            DecodeCert(_) | DuplicateJobId(_) | InvalidCommand | Json(_) | MultipleSessions => {
                 HttpError::for_client_error(None, ClientErrorStatusCode::BAD_REQUEST, message)
             }
-        }
-    }
-}
-
-/// What went wrong acutally running a job.
-#[derive(Clone, Debug, Error)]
-#[error("{error}")]
-pub struct ExecutionError {
-    pub job_id: JobId,
-    pub time: DateTime<Utc>,
-    pub error: Arc<JobError>,
-}
-
-impl ExecutionError {
-    pub fn new(job_id: JobId, error: JobError) -> Self {
-        let time = Utc::now();
-        Self {
-            job_id,
-            time,
-            error: Arc::new(error),
         }
     }
 }

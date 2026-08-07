@@ -11,10 +11,11 @@ use clap::Parser;
 use rustyline::DefaultEditor;
 use rustyline::error::ReadlineError;
 use shlex::split as split_command;
+use x509_cert::Certificate;
 use xdg::BaseDirectories;
 
 use sush_common::authn::{Credentials, Identity};
-use sush_common::jobs::{JobId, JobOutputStream, JobStatus, Session, SessionId, SignedJob};
+use sush_common::jobs::{JobId, JobOutputStream, JobStatusMap, Session, SessionId, SignedJob};
 use sush_common::keys::{KeyId, SshPublicKey};
 
 use crate::Client;
@@ -219,7 +220,7 @@ impl CommandContext for Repl {
 
     // Job signing certificates
 
-    fn cert_chain(&mut self, key_id: KeyId, certs: &str) -> Result<(), CommandError> {
+    fn cert_chain(&mut self, key_id: KeyId, certs: &str) -> Result<Certificate, CommandError> {
         self.cli.cert_chain(key_id, certs)
     }
 
@@ -230,6 +231,7 @@ impl CommandContext for Repl {
     // Job management
 
     fn job_started(&mut self, job: &SignedJob) {
+        self.set_job_id(Some(job.job_id().to_owned()));
         self.cli.job_started(job);
     }
 
@@ -275,20 +277,20 @@ impl CommandContext for Repl {
         self.cli.job_polling_started(job_id, duration);
     }
 
-    fn job_polling_update(&mut self, job_id: &JobId, status: &JobStatus) {
-        self.cli.job_polling_update(job_id, status);
+    fn job_polling_update(&mut self, job_id: &JobId) {
+        self.cli.job_polling_update(job_id);
     }
 
     fn job_polling_finished(&mut self, job_id: &JobId) {
         self.cli.job_polling_finished(job_id);
     }
 
-    fn job_session_connected(&mut self, job_id: &JobId) {
-        self.cli.job_session_connected(job_id);
+    fn job_attached(&mut self, job_id: &JobId) {
+        self.cli.job_attached(job_id);
     }
 
-    fn job_session_disconnected(&mut self, job_id: &JobId) {
-        self.cli.job_session_disconnected(job_id);
+    fn job_detached(&mut self, job_id: &JobId) {
+        self.cli.job_detached(job_id);
     }
 
     fn job_signing_started(&mut self, job_id: &JobId) {
@@ -307,7 +309,7 @@ impl CommandContext for Repl {
         self.cli.job_signed(job, show);
     }
 
-    fn job_status(&mut self, job_id: &JobId, status: &JobStatus) {
+    fn job_status(&mut self, job_id: &JobId, status: &JobStatusMap) {
         self.set_job_id(Some(job_id.to_owned()));
         self.cli.job_status(job_id, status);
     }
