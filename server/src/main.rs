@@ -14,6 +14,7 @@ use x509_cert::Certificate;
 use x509_cert::der::DecodePem as _;
 
 use sush_api::sush_api_mod::api_description;
+use sush_server::executor::PathIsolation;
 use sush_server::manager::JobManager;
 use sush_server::server::ApiServer;
 
@@ -41,6 +42,17 @@ struct ServerArgs {
     /// Path to the job output directory
     #[arg(short = 'o', long, default_value = ".")]
     directory: PathBuf,
+
+    /// Whether to disable $PATH isolation
+    ///
+    /// Disabling $PATH isolation could be insecure, and must never be done on production.
+    #[arg(long, default_value_t = false)]
+    insecure_disable_path_isolation: bool,
+
+    /// Root certificates to use to verify signatures
+    #[cfg(feature = "test-support")]
+    #[arg(long = "root-cert")]
+    override_root_certs: Vec<PathBuf>,
 }
 
 #[tokio::main]
@@ -49,7 +61,16 @@ async fn main() -> Result<(), String> {
         address,
         debug,
         directory,
+        #[cfg(feature = "test-support")]
+        override_root_certs,
+        insecure_disable_path_isolation,
     } = ServerArgs::parse();
+
+    let path_isolation = if insecure_disable_path_isolation {
+        PathIsolation::InsecureDisable
+    } else {
+        PathIsolation::Enable
+    };
 
     let log = ConfigLogging::StderrTerminal {
         level: if debug {
@@ -70,15 +91,15 @@ async fn main() -> Result<(), String> {
     // TODO: get/seed Rumors network
     let gossip = Peer::seed().into_rumors();
 
-    let roots = ROOT_CERTS
-        .iter()
-        .map(Certificate::from_pem)
-        .collect::<Result<Vec<_>, _>>()
-        .map_err(|e| e.to_string())?;
+    #[cfg(feature = "test-support")]
+    let roots = overridable_root_certs(&override_root_certs)?;
+    #[cfg(not(feature = "test-support"))]
+    let roots = builtin_root_certs()?;
 
     let shutdown = listen_for_shutdown()?;
     let mut mgr = JobManager::new(
         log.clone(),
+        path_isolation,
         directory,
         baseboard,
         gossip,
@@ -109,6 +130,29 @@ async fn main() -> Result<(), String> {
     join.await
         .map_err(|error| format!("failed to wait for manager: {error}"))?;
     Ok(())
+}
+
+fn builtin_root_certs() -> Result<Vec<Certificate>, String> {
+    ROOT_CERTS
+        .iter()
+        .map(Certificate::from_pem)
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(|e| e.to_string())
+}
+
+#[cfg_attr(not(feature = "test-support"), expect(dead_code))]
+fn overridable_root_certs(override_root_certs: &[PathBuf]) -> Result<Vec<Certificate>, String> {
+    if override_root_certs.is_empty() {
+        builtin_root_certs()
+    } else {
+        override_root_certs
+            .iter()
+            .map(|path| {
+                Certificate::from_pem(&std::fs::read(path).map_err(|e| e.to_string())?)
+                    .map_err(|e| e.to_string())
+            })
+            .collect()
+    }
 }
 
 /// Trigger a cancellation token on receipt of a terminal Unix signal(7).

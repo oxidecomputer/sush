@@ -22,7 +22,7 @@ use sush_api::JobStartParams;
 use sush_common::jobs::{JobId, JobStatus, JobStatusMap, Session, SessionId, SignedJob};
 use sush_common::keys::{KeyError, KeyId, Signature};
 
-use crate::executor::Executor;
+use crate::executor::{Executor, PathIsolation};
 use crate::history::JobHistory;
 use crate::job::SocketSender;
 use crate::messages::v0::{
@@ -605,8 +605,10 @@ impl StateManager {
     /// requests, events, or messages can be received. Returns a shared
     /// `State` that will be asynchronously updated in response to
     /// messages and events.
+    #[allow(clippy::too_many_arguments)]
     pub fn run<R>(
         log: Logger,
+        path_isolation: PathIsolation,
         output_dir: JobOutputDir,
         own_baseboard: BaseboardId,
         mut requests: R,
@@ -631,6 +633,7 @@ impl StateManager {
         // The executor needs to have access to send messages back.
         let (mut executor, mut events) = Executor::new(
             log.new(o!("component" => "executor")),
+            path_isolation,
             output_dir,
             shutdown.child_token(),
         );

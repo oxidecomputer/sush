@@ -20,6 +20,7 @@ use sush_common::codephrases::generate_id;
 use sush_common::jobs::{JobId, JobStartRequest, VerifiedJob};
 use sush_common::keys::{EphemeralKey, KeyType, Signer};
 use sush_server::JobManager;
+use sush_server::executor::PathIsolation;
 
 static TEST_BASEBOARD_ID: OnceLock<BaseboardId> = OnceLock::new();
 
@@ -104,6 +105,7 @@ pub async fn manager_and_test_root(
     let root = ephemeral_test_root();
     let mgr = JobManager::new(
         log,
+        PathIsolation::InsecureDisable,
         dir.path().to_owned(),
         test_baseboard_id(),
         gossip,

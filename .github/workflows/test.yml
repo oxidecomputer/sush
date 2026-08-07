@@ -3,6 +3,9 @@ on: [push]
 jobs:
   Test:
     runs-on: ubuntu-22.04-8core
+    permissions:
+      contents: read
+      id-token: write
     steps:
     - name: Install Rust toolchain
       uses: dtolnay/rust-toolchain@master
@@ -10,13 +13,16 @@ jobs:
         toolchain: 1.91
         components: clippy,rustfmt
 
-    - name: Configure Git
-      run: |
-        git config --global init.defaultBranch main &&
-        git config --global url."https://${{ secrets.GIT_CREDENTIALS }}@github.com".insteadOf https://github.com
-
     - name: Checkout
       uses: actions/checkout@v6
+
+    - name: Get token to fetch private repositories
+      uses: oxidecomputer/oidcx-action@main
+      with:
+        service: github
+        repositories: oxidecomputer/permission-slip,oxidecomputer/kms-agent
+        permissions: contents:read
+        configure-git: true
 
     - name: Lint
       run: |
@@ -28,8 +34,4 @@ jobs:
       run: cargo build --locked
 
     - name: Test
-      run: |
-        eval `ssh-agent -s` &&
-        ssh-keygen -t ed25519 -f /tmp/id_ephemeral -C "ephemeral test key" -P "" &&
-        ssh-add /tmp/id_ephemeral &&
-        cargo test
+      run: cargo test

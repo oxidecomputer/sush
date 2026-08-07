@@ -25,6 +25,7 @@ use sush_common::jobs::{JobId, JobStatusMap, Session, SessionId, SignedJob};
 use sush_common::keys::{KeyError, KeyId, SshPublicKey};
 
 use crate::error::JobError;
+use crate::executor::PathIsolation;
 use crate::job::SocketSender;
 use crate::messages::v0::{CertRequest, JobRequest, Request, SessionRequest};
 use crate::output::{JobOutputDir, JobOutputFileStream};
@@ -59,6 +60,7 @@ pub struct JobManager {
 impl JobManager {
     pub async fn new(
         log: Logger,
+        path_isolation: PathIsolation,
         output_dir: PathBuf,
         own_baseboard: BaseboardId,
         rumors: GossipNetwork,
@@ -70,6 +72,7 @@ impl JobManager {
         let requests = ReceiverStream::new(rx_req);
         let (rx_state, join_state) = StateManager::run(
             log.new(o!("component" => "state manager")),
+            path_isolation,
             output_dir.clone(),
             own_baseboard.clone(),
             requests,

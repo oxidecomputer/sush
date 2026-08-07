@@ -3593,6 +3593,7 @@ dependencies = [
  "ssh-key",
  "sush-api",
  "sush-common",
+ "tempfile",
  "thiserror 1.0.69",
  "tokio",
  "tokio-fd",
