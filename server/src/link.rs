@@ -22,7 +22,7 @@ use std::task::{Context, Poll};
 use std::time::Duration;
 
 use camino::Utf8PathBuf;
-use rumors::link::routed::{Config, Dial, Endpoint, Incoming, LinkError, Listen, RoutedLink};
+use rumors::link::routed::{Config, Dial, Endpoint, Incoming, Listen, RoutedLink};
 use slog::{Logger, o, warn};
 use sprockets_tls::keys::SprocketsConfig;
 use sprockets_tls::{Client, Server};
@@ -219,11 +219,8 @@ impl Transport {
     }
 
     /// A cheap handle for establishing links, free to move into tasks.
-    pub fn linker(&self) -> Linker {
-        Linker {
-            endpoint: self.endpoint.clone(),
-            advertised: SocketAddr::V6(self.bound),
-        }
+    pub fn endpoint(&self) -> Endpoint<SprocketsDial> {
+        self.endpoint.clone()
     }
 
     /// Receive the next link a peer established toward us, with the name it
@@ -231,25 +228,6 @@ impl Transport {
     pub async fn accept(&mut self) -> Option<(SocketAddr, SprocketsLink)> {
         let (info, link) = self.incoming.accept().await?;
         Some((info.peer, link))
-    }
-}
-
-/// Establishes outbound links; clones are handles onto one endpoint.
-#[derive(Clone)]
-pub struct Linker {
-    endpoint: Endpoint<SprocketsDial>,
-    advertised: SocketAddr,
-}
-
-impl Linker {
-    /// The name peers dial us at, and the one the dial tiebreak compares.
-    pub fn advertised(&self) -> SocketAddr {
-        self.advertised
-    }
-
-    /// Establish a link to the peer listening at `peer`.
-    pub async fn link(&self, peer: SocketAddr) -> Result<SprocketsLink, LinkError> {
-        self.endpoint.link(peer).await
     }
 }
 

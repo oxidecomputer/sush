@@ -38,7 +38,9 @@ use tokio::time::{MissedTickBehavior, interval, timeout};
 use tokio::{select, spawn};
 use tokio_util::sync::CancellationToken;
 
-use crate::link::{CorpusSource, Linker, SprocketsLink, Transport};
+use rumors::link::routed::Endpoint;
+
+use crate::link::{CorpusSource, SprocketsDial, SprocketsLink, Transport};
 
 /// Manager timing. The defaults suit a rack; tests shrink them.
 #[derive(Clone, Debug)]
@@ -136,7 +138,7 @@ where
     let manager = Manager {
         log: log.new(o!("component" => "gossip manager")),
         config,
-        linker: transport.linker(),
+        endpoint: transport.endpoint(),
         transport,
         peers,
         rumors: seed,
@@ -166,7 +168,7 @@ enum Stopped {
 struct Manager<T> {
     log: Logger,
     config: GossipConfig,
-    linker: Linker,
+    endpoint: Endpoint<SprocketsDial>,
     transport: Transport,
     peers: watch::Receiver<BTreeSet<SocketAddrV6>>,
     rumors: Rumors<T>,
@@ -224,7 +226,7 @@ where
     /// The addresses the dial tiebreak makes ours to establish, so that a
     /// pair of peers ends up with one link rather than two.
     fn wanted(&self) -> BTreeSet<SocketAddr> {
-        let ours = self.linker.advertised();
+        let ours = *self.endpoint.local_addr();
         self.peers
             .borrow()
             .iter()
@@ -240,9 +242,9 @@ where
                 continue;
             }
             let deadline = self.config.connect_timeout;
-            let linker = self.linker.clone();
+            let endpoint = self.endpoint.clone();
             let handle = self.dials.spawn(async move {
-                let result = match timeout(deadline, linker.link(peer)).await {
+                let result = match timeout(deadline, endpoint.link(peer)).await {
                     Ok(Ok(link)) => Ok(link),
                     Ok(Err(err)) => Err(err.to_string()),
                     Err(_) => Err("link establishment timed out".to_string()),

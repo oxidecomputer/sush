@@ -66,12 +66,12 @@ impl TestNet {
 
     /// One fresh connected link pair: node 1 establishes, node 2 accepts.
     async fn link_pair(&mut self) -> (SprocketsLink, SprocketsLink) {
-        let linker = self.a.linker();
-        let peer = self.b.linker().advertised();
-        let (linked, accepted) = join!(linker.link(peer), self.b.accept());
+        let endpoint = self.a.endpoint();
+        let peer = *self.b.endpoint().local_addr();
+        let (linked, accepted) = join!(endpoint.link(peer), self.b.accept());
         let link_a = linked.expect("peer router accepts the link");
         let (from, link_b) = accepted.expect("router is live");
-        assert_eq!(from, linker.advertised());
+        assert_eq!(from, *endpoint.local_addr());
         (link_a, link_b)
     }
 }
