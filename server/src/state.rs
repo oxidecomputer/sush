@@ -793,7 +793,7 @@ impl CertState {
             }
 
             // Verify the certificate signature.
-            // TODO: Mythos report #82-86: check expiry, basicConstraints, keyUsage
+            // TODO: check expiry, basicConstraints, keyUsage.
             let signature = with_err!(Signature::try_from(cert.as_ref()));
             let tbs = with_err!(cert.tbs_certificate.to_der());
             let subject = &cert.tbs_certificate.subject;

@@ -23,11 +23,7 @@ use sush_server::manager::JobManager;
 use sush_server::server::ApiServer;
 
 const DEFAULT_ADDRESS: &str = "0.0.0.0:44444";
-const ROOT_CERTS: &[&[u8]] = &[
-    // export PERMSLIP_URL="https://permslip.inickles.0xeng.dev"
-    // export SUSH_PERMSLIP_KEY="UNTRUSTED Support Shell Prototype"
-    include_bytes!("../certs/sandbox.pem"),
-];
+const ROOT_CERTS: &[&[u8]] = &[include_bytes!("../certs/sandbox.pem")];
 const ROOT_LOG_NAME: &str = "sush";
 const REQUEST_MAX_BODY_BYTES: usize = 0xFFFF;
 
