@@ -28,10 +28,13 @@ jobs:
       run: |
         cargo fmt -- --check &&
         cargo clippy -- --no-deps --deny warnings &&
-        cargo clippy --tests -- --no-deps --deny warnings
+        cargo clippy --tests -- --no-deps --deny warnings &&
+        cargo clippy --package sush-client --features permslip -- --no-deps --deny warnings
 
     - name: Build
-      run: cargo build --locked
+      run: |
+        cargo build --locked &&
+        cargo build --locked --package sush-client --features permslip
 
     - name: Test
       run: cargo test

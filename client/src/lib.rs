@@ -7,6 +7,7 @@ pub mod commands;
 pub mod context;
 pub mod identity;
 pub mod interactive;
+#[cfg(feature = "permslip")]
 pub mod permslip;
 pub mod repl;
 

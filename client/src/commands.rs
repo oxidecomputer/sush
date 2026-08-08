@@ -38,9 +38,11 @@ use sush_api::JobWait;
 use sush_common::authn::{AuthnError, Challenge, ChallengeResponse, Credentials, Identity};
 use sush_common::interactive::InteractiveJobError;
 use sush_common::jobs::JobOutputStream::{self, Stderr, Stdout};
+#[cfg(feature = "permslip")]
+use sush_common::jobs::JobStartRequest;
 use sush_common::jobs::{
-    JobId, JobLimits, JobOutputHash, JobOutputState, JobStartRequest, JobStatus, Session,
-    SessionId, SignedJob, job_status_try_from_json_map,
+    JobId, JobLimits, JobOutputHash, JobOutputState, JobStatus, Session, SessionId, SignedJob,
+    job_status_try_from_json_map,
 };
 use sush_common::keys::{KeyError, KeyId, Signer as _};
 
@@ -48,14 +50,15 @@ use crate::ByteStream;
 use crate::context::{CommandContext, OutputFormat};
 use crate::identity::{IdentityError, SshAgentConnection};
 use crate::interactive::interactive_job;
-use crate::permslip::PermslipError;
-use crate::permslip::{DEFAULT_PERMSLIP_URL, PermslipSigner};
+#[cfg(feature = "permslip")]
+use crate::permslip::{PermslipError, PermslipSigner};
 use crate::repl::Repl;
 use crate::types::Error as ApiError;
 use crate::{Client, Error as ClientError};
 
 // Names of environment variables for argument defaults
 // (to prevent mispellings).
+#[cfg(feature = "permslip")]
 pub const PERMSLIP_URL: &str = "PERMSLIP_URL";
 pub const SSH_AUTH_SOCK: &str = "SSH_AUTH_SOCK";
 pub const SUSH_JOB_ID: &str = "SUSH_JOB_ID";
@@ -63,6 +66,7 @@ pub const SUSH_KEY_ID: &str = "SUSH_KEY_ID";
 pub const SUSH_MAX_CPU: &str = "SUSH_MAX_CPU";
 pub const SUSH_MAX_MEM: &str = "SUSH_MAX_MEM";
 pub const SUSH_MAX_FSIZE: &str = "SUSH_MAX_FSIZE";
+#[cfg(feature = "permslip")]
 pub const SUSH_PERMSLIP_KEY: &str = "SUSH_PERMSLIP_KEY";
 pub const SUSH_OUTPUT_FORMAT: &str = "SUSH_OUTPUT_FORMAT";
 pub const SUSH_URL: &str = "SUSH_URL";
@@ -76,6 +80,7 @@ const PARALLEL_CHUNKS: NonZeroU8 = NonZeroU8::new(8).unwrap();
 // Job polling and spinner update intervals.
 const JOB_START_UPDATE_INTERVAL: Duration = Duration::from_millis(250);
 const JOB_STOP_RETRY_INTERVAL: Duration = Duration::from_millis(100);
+#[cfg(feature = "permslip")]
 const SIGNING_UPDATE_INTERVAL: Duration = Duration::from_millis(100);
 
 /// Process limits for job execution.
@@ -398,12 +403,14 @@ pub struct JobStartArgs {
     interactive: bool,
 
     /// Use `permslip` to sign job requests with this key name.
+    #[cfg(feature = "permslip")]
     #[arg(short, long, env = SUSH_PERMSLIP_KEY, value_name = "KEY_NAME")]
     permslip: Option<String>,
 
     /// The `permslip` server to contact for signing.
-    #[arg(long, env = PERMSLIP_URL, default_value = DEFAULT_PERMSLIP_URL)]
-    permslip_url: String,
+    #[cfg(feature = "permslip")]
+    #[arg(long, env = PERMSLIP_URL, requires = "permslip", value_name = "URL")]
+    permslip_url: Option<String>,
 
     /// Terminal type for interactive jobs.
     #[arg(long, env = "TERM")]
@@ -412,6 +419,16 @@ pub struct JobStartArgs {
     /// Wait for job start/stop and then attach/show output.
     #[arg(short, long, default_value_if("interactive", "true", "true"))]
     wait: bool,
+}
+
+impl JobStartArgs {
+    /// The signing key name in a build that can sign.
+    fn key_name(&self) -> Option<&str> {
+        #[cfg(feature = "permslip")]
+        return self.permslip.as_deref();
+        #[cfg(not(feature = "permslip"))]
+        None
+    }
 }
 
 impl ClientCommand {
@@ -701,7 +718,7 @@ async fn job(
 ) -> Result<(), CommandError> {
     match (command, client) {
         (JobCommand::Start { start_args }, Some(client))
-            if start_args.command.is_none() && start_args.permslip.is_none() =>
+            if start_args.command.is_none() && start_args.key_name().is_none() =>
         {
             let job = ctx.read_signed_job()?;
             job_start(ctx, client, job, start_args).await?;
@@ -716,6 +733,7 @@ async fn job(
             Some(_),
         ) => Err(CommandError::MissingCommand),
 
+        #[cfg(feature = "permslip")]
         (
             JobCommand::Start {
                 start_args: JobStartArgs { permslip: None, .. },
@@ -724,6 +742,10 @@ async fn job(
             Some(_),
         ) => Err(CommandError::MissingKeyName),
 
+        #[cfg(not(feature = "permslip"))]
+        (JobCommand::Start { .. }, Some(_)) => Err(CommandError::SigningUnavailable),
+
+        #[cfg(feature = "permslip")]
         (
             JobCommand::Start {
                 start_args:
@@ -771,6 +793,9 @@ async fn job(
                 ctx.next_job_id()?
             };
 
+            let Some(permslip_url) = permslip_url else {
+                return Err(CommandError::MissingPermslipUrl);
+            };
             let mut signer = PermslipSigner::new(key_name, permslip_url).await?;
             let mut interval = interval(SIGNING_UPDATE_INTERVAL);
             interval.set_missed_tick_behavior(MissedTickBehavior::Skip);
@@ -1385,8 +1410,12 @@ pub enum CommandError {
     LengthMismatch { expected: u64, received: u64 },
     #[error("❌ Missing job command, try `--help`")]
     MissingCommand,
+    #[cfg(feature = "permslip")]
     #[error("❌ Missing signing key name, try `--permslip`")]
     MissingKeyName,
+    #[cfg(feature = "permslip")]
+    #[error("❌ Missing permslip URL, try `--permslip-url` or setting `PERMSLIP_URL`")]
+    MissingPermslipUrl,
     #[error("❌ Missing session, try `session start`")]
     MissingSession,
     #[error("❌ Missing SSH agent socket, try `--ssh-auth-sock`")]
@@ -1404,6 +1433,7 @@ pub enum CommandError {
         expected: JobOutputHash,
         received: JobOutputHash,
     },
+    #[cfg(feature = "permslip")]
     #[error("❌ permslip error: {0}")]
     Permslip(#[from] PermslipError),
     #[error("❌ Job process error: {0}")]
@@ -1418,6 +1448,9 @@ pub enum CommandError {
     Reqwest(#[from] reqwest::Error),
     #[error("❌ SSH signature error on key ID `{0}`")]
     Signature(KeyId),
+    #[cfg(not(feature = "permslip"))]
+    #[error("❌ Signing unavailable: built without the `permslip` feature")]
+    SigningUnavailable,
     #[error("❌ Can't parse target baseboard ID: {0}")]
     BaseboardIdParseError(sled_hardware_types::BaseboardIdParseError),
     #[error("❌ SSH key error: {0}")]

@@ -22,9 +22,6 @@ use x509_cert::spki::AlgorithmIdentifierOwned;
 
 use sush_common::keys::{KeyError, KeyId, Signature, Signed, Signer, ToBeSigned};
 
-/// The default Permission Slip (aka Online Signing Service) server.
-pub const DEFAULT_PERMSLIP_URL: &str = "https://signer-us-west.corp.oxide.computer";
-
 pub struct PermslipSigner {
     client: Client,
     key_name: String,
