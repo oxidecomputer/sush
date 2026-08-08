@@ -14,7 +14,7 @@ use chrono::{DateTime, Utc};
 use http_range_header::SyntacticallyCorrectRange as Range;
 use lru::LruCache;
 use sled_hardware_types::BaseboardId;
-use slog::{Logger, debug, o, warn};
+use slog::{Logger, debug, info, o, warn};
 use tokio::sync::{Mutex, mpsc, watch};
 use tokio::task::JoinHandle;
 use tokio::time::timeout;
@@ -100,23 +100,27 @@ impl JobManager {
         &self.own_baseboard
     }
 
-    async fn cert_request(&self, request: CertRequest) -> Result<(), JobError> {
+    async fn cert_request(&self, authn: &Identity, request: CertRequest) -> Result<(), JobError> {
         self.tx_req
-            .send(Request::cert(request))
+            .send(Request::cert(authn.key_id.clone(), request))
             .await
             .map_err(|_| JobError::ChannelClosed)
     }
 
-    async fn session_request(&self, request: SessionRequest) -> Result<(), JobError> {
+    async fn session_request(
+        &self,
+        authn: &Identity,
+        request: SessionRequest,
+    ) -> Result<(), JobError> {
         self.tx_req
-            .send(Request::session(request))
+            .send(Request::session(authn.key_id.clone(), request))
             .await
             .map_err(|_| JobError::ChannelClosed)
     }
 
-    async fn job_request(&self, _authn: &Identity, request: JobRequest) -> Result<(), JobError> {
+    async fn job_request(&self, authn: &Identity, request: JobRequest) -> Result<(), JobError> {
         self.tx_req
-            .send(Request::job(request))
+            .send(Request::job(authn.key_id.clone(), request))
             .await
             .map_err(|_| JobError::ChannelClosed)
     }
@@ -125,7 +129,7 @@ impl JobManager {
 
     pub async fn import_cert(
         &self,
-        _authn: &Identity,
+        authn: &Identity,
         cert: Certificate,
         wait: bool,
     ) -> Result<(), JobError> {
@@ -136,7 +140,7 @@ impl JobManager {
             return Err(KeyError::SelfSigned.into());
         }
         let key_id = KeyId::try_from(&cert)?;
-        self.cert_request(CertRequest::Import(cert)).await?;
+        self.cert_request(authn, CertRequest::Import(cert)).await?;
         if wait {
             self.wait_for(self.wait_for_cert(key_id)).await?;
         }
@@ -328,11 +332,11 @@ impl JobManager {
 
     pub async fn session_start(
         &self,
-        _authn: &Identity,
+        authn: &Identity,
         session_id: SessionId,
         wait: bool,
     ) -> Result<(), JobError> {
-        self.session_request(SessionRequest::Start(session_id.clone()))
+        self.session_request(authn, SessionRequest::Start(session_id.clone()))
             .await?;
         if wait {
             self.wait_for(self.wait_for_session(session_id.clone()))
@@ -343,19 +347,20 @@ impl JobManager {
 
     pub async fn session_stop(
         &self,
-        _authn: &Identity,
+        authn: &Identity,
         session_id: SessionId,
     ) -> Result<(), JobError> {
-        self.session_request(SessionRequest::Stop(session_id)).await
+        self.session_request(authn, SessionRequest::Stop(session_id))
+            .await
     }
 
     pub async fn session_skip_job(
         &self,
-        _authn: &Identity,
+        authn: &Identity,
         session_id: SessionId,
         job_id: JobId,
     ) -> Result<(), JobError> {
-        self.session_request(SessionRequest::Skip(session_id, job_id))
+        self.session_request(authn, SessionRequest::Skip(session_id, job_id))
             .await
     }
 
@@ -417,7 +422,7 @@ impl JobManager {
 
     pub async fn job_output(
         &self,
-        _authn: &Identity,
+        authn: &Identity,
         job_id: &JobId,
         target: &BaseboardId,
         stream: JobOutputStream,
@@ -431,6 +436,10 @@ impl JobManager {
                 .map(|m| m.contains_key(target))
                 .unwrap_or(false)
         {
+            info!(
+                self.log, "job output read";
+                "job_id" => %job_id, "stream" => %stream, "actor" => %authn.key_id,
+            );
             self.output_dir.job_output(job_id, stream, range).await
         } else {
             Err(JobError::JobNotFound(job_id.to_owned()))

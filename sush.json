@@ -820,9 +820,18 @@
                   "time_cancelled": {
                     "type": "string",
                     "format": "date-time"
+                  },
+                  "actor": {
+                    "description": "The key that requested the cancellation.",
+                    "allOf": [
+                      {
+                        "$ref": "#/components/schemas/KeyId"
+                      }
+                    ]
                   }
                 },
                 "required": [
+                  "actor",
                   "job_id",
                   "time_cancelled"
                 ]
@@ -845,9 +854,18 @@
                   "time_queued": {
                     "type": "string",
                     "format": "date-time"
+                  },
+                  "actor": {
+                    "description": "The key that submitted the job.",
+                    "allOf": [
+                      {
+                        "$ref": "#/components/schemas/KeyId"
+                      }
+                    ]
                   }
                 },
                 "required": [
+                  "actor",
                   "job_id",
                   "time_queued"
                 ]
@@ -1207,6 +1225,15 @@
           },
           "last_job": {
             "$ref": "#/components/schemas/LastJob"
+          },
+          "started_by": {
+            "nullable": true,
+            "description": "The key that started the session, where known. `None` in client-side trackers; servers record the verified starter.",
+            "allOf": [
+              {
+                "$ref": "#/components/schemas/KeyId"
+              }
+            ]
           }
         },
         "required": [

@@ -3,6 +3,10 @@
 // file, You can obtain one at https://mozilla.org/MPL/2.0/.
 
 //! Key, signature, and certificate management.
+//!
+//! Authority to run a job comes from its signature alone. Client
+//! authentication proves possession of an SSH key for attribution;
+//! the key carries no meaning beyond what the deployment assigns it.
 
 // Handle raw SSH public keys, algorithms, and signatures.
 #![allow(clippy::disallowed_types)]

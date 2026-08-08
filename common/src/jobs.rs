@@ -30,7 +30,7 @@ use crate::codephrases::{
     InvalidCodephrase, WORD_SEPARATOR, decode_phrase, generate_id, id_phrase,
 };
 use crate::interactive::InteractiveJobError;
-use crate::keys::{Signed, ToBeSigned, Verified};
+use crate::keys::{KeyId, Signed, ToBeSigned, Verified};
 
 /// A globally unique identifier for a job within a session.
 #[derive(
@@ -186,6 +186,9 @@ pub enum LastJob {
 pub struct Session {
     session_id: SessionId,
     last_job: LastJob,
+    /// The key that started the session, where known. `None` in
+    /// client-side trackers; servers record the verified starter.
+    started_by: Option<KeyId>,
 }
 
 impl Session {
@@ -193,11 +196,24 @@ impl Session {
         Self {
             session_id,
             last_job: LastJob::None,
+            started_by: None,
+        }
+    }
+
+    pub fn started(session_id: SessionId, actor: KeyId) -> Self {
+        Self {
+            session_id,
+            last_job: LastJob::None,
+            started_by: Some(actor),
         }
     }
 
     pub fn session_id(&self) -> &SessionId {
         &self.session_id
+    }
+
+    pub fn started_by(&self) -> Option<&KeyId> {
+        self.started_by.as_ref()
     }
 
     pub fn into_session_id(self) -> SessionId {
@@ -304,6 +320,8 @@ pub enum JobStatus {
             deserialize_with = "borsh_de_datetime"
         )]
         time_cancelled: DateTime<Utc>,
+        /// The key that requested the cancellation.
+        actor: KeyId,
     },
     Queued {
         job_id: JobId,
@@ -312,6 +330,8 @@ pub enum JobStatus {
             deserialize_with = "borsh_de_datetime"
         )]
         time_queued: DateTime<Utc>,
+        /// The key that submitted the job.
+        actor: KeyId,
     },
     Error {
         job_id: JobId,

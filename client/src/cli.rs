@@ -383,23 +383,27 @@ impl CommandContext for Cli {
                         JobStatus::Cancelled {
                             job_id,
                             time_cancelled,
+                            actor,
                         } => {
                             println!(
                                 "❌ Job ID:\t{job_id}\n   \
                                     Target:\t{baseboard_id}\n   \
                                     Job status:\tCancelled\n   \
-                                    Cancelled at:\t{time_cancelled}"
+                                    Cancelled at:\t{time_cancelled}\n   \
+                                    Cancelled by:\t{actor}"
                             )
                         }
                         JobStatus::Queued {
                             job_id,
                             time_queued,
+                            actor,
                         } => {
                             println!(
                                 "⏳ Job ID:\t{job_id}\n   \
                                     Target:\t{baseboard_id}\n   \
                                     Job status:\tQueued\n   \
-                                    Queued at:\t{time_queued}"
+                                    Queued at:\t{time_queued}\n   \
+                                    Queued by:\t{actor}"
                             )
                         }
                         JobStatus::Started {

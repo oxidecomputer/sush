@@ -143,6 +143,7 @@ impl<'a> SessionGuard<'a> {
         self.queued_jobs.remove(&self.inner.next_job_id())
     }
 
+    #[allow(clippy::too_many_arguments)]
     pub fn enqueue_job(
         &mut self,
         log: &Logger,
@@ -151,6 +152,7 @@ impl<'a> SessionGuard<'a> {
         own_baseboard: &BaseboardId,
         job: SignedJob,
         params: JobStartParams,
+        actor: &KeyId,
     ) {
         let job_id = job.job_id().clone();
         if history.contains(&job_id) {
@@ -170,6 +172,7 @@ impl<'a> SessionGuard<'a> {
                 JobStatus::Queued {
                     job_id: job_id.clone(),
                     time_queued: Utc::now(),
+                    actor: actor.clone(),
                 },
                 None,
                 Some(self.queued_jobs),
@@ -181,6 +184,7 @@ impl<'a> SessionGuard<'a> {
     pub fn cancel_job(
         &mut self,
         job_id: &JobId,
+        actor: &KeyId,
         own_baseboard: &BaseboardId,
         history: &mut JobHistory,
         running: &RunningJobs,
@@ -194,6 +198,7 @@ impl<'a> SessionGuard<'a> {
                 None | Some(JobStatus::Queued { .. }) => Some(JobStatus::Cancelled {
                     job_id: job_id.clone(),
                     time_cancelled: Utc::now(),
+                    actor: actor.clone(),
                 }),
                 _ => None,
             },
@@ -337,31 +342,31 @@ impl State {
         use SessionState::*;
         match message.as_ref() {
             V0(Message::Request(request)) => match request {
-                Request::Cert(cert_request) => match cert_request.as_ref() {
-                    CertRequest::Import(cert) => match self.import_cert(cert) {
+                Request::Cert(attributed) => match attributed.as_parts() {
+                    (actor, CertRequest::Import(cert)) => match self.import_cert(cert) {
                         Ok(key_id) => {
-                            info!(log, "imported certificate"; "key_id" => %key_id);
+                            info!(log, "imported certificate"; "key_id" => %key_id, "actor" => %actor);
                             self.validate_certs(&self.roots.clone());
                         }
                         Err(error) => {
                             error!(log, "ignoring invalid certificate"; "cert" => ?cert, "error" => %error);
                         }
                     },
-                    CertRequest::Revoke(key_id, when) => {
+                    (actor, CertRequest::Revoke(key_id, when)) => {
                         if self.roots.contains(key_id) {
                             error!(log, "refusing to revoke root certificate"; "key_id" => %key_id);
                         } else if let Some(cert) = self.certs.get_mut(key_id) {
                             *cert = CertState::Revoked(key_id.clone(), *when);
-                            info!(log, "revoked known certificate"; "key_id" => %key_id);
+                            info!(log, "revoked known certificate"; "key_id" => %key_id, "actor" => %actor);
                         } else {
                             self.certs
                                 .insert(key_id.clone(), CertState::Revoked(key_id.clone(), *when));
-                            info!(log, "revoked unknown certificate"; "key_id" => %key_id);
+                            info!(log, "revoked unknown certificate"; "key_id" => %key_id, "actor" => %actor);
                         }
                     }
                 },
-                Request::Session(session_request) => match session_request.as_ref() {
-                    SessionRequest::Start(session_id) => match &mut self.session {
+                Request::Session(attributed) => match attributed.as_parts() {
+                    (actor, SessionRequest::Start(session_id)) => match &mut self.session {
                         // Re-announcement of active session; absorb and ignore.
                         Active {
                             frontier, session, ..
@@ -378,10 +383,17 @@ impl State {
                         Inactive { frontier } | Active { frontier, .. }
                             if *incoming_version > *frontier =>
                         {
+                            info!(
+                                log, "session started";
+                                "session_id" => %session_id, "actor" => %actor,
+                            );
                             self.session = Active {
                                 frontier: self.session.frontier() | incoming_version.clone(),
                                 started: incoming_version.clone(),
-                                session: Box::new(Session::new(session_id.clone())),
+                                session: Box::new(Session::started(
+                                    session_id.clone(),
+                                    actor.clone(),
+                                )),
                                 queued_jobs: QueuedJobs::new(),
                             }
                         }
@@ -422,7 +434,7 @@ impl State {
                             *frontier |= incoming_version.clone();
                         }
                     },
-                    SessionRequest::Stop(session_id) => {
+                    (actor, SessionRequest::Stop(session_id)) => {
                         // Any session stop request for a session that isn't
                         // ours is silently ignored. Even in the case of
                         // arbitrary causal reordering (which we must handle),
@@ -438,18 +450,27 @@ impl State {
                         } = &self.session
                             && session.session_id() == session_id
                         {
+                            info!(
+                                log, "session stopped";
+                                "session_id" => %session_id, "actor" => %actor,
+                            );
                             self.session = Inactive {
                                 frontier: frontier.clone(),
                             }
                         }
                     }
-                    SessionRequest::Skip(session_id, job_id) => {
+                    (actor, SessionRequest::Skip(session_id, job_id)) => {
                         if let Some(mut session) = self.session.active_session()
                             && session.session_id() == session_id
                         {
+                            info!(
+                                log, "job skipped";
+                                "job_id" => %job_id, "actor" => %actor,
+                            );
                             session.skip_job(job_id);
                             session.cancel_job(
                                 job_id,
+                                actor,
                                 &self.own_baseboard,
                                 &mut self.history,
                                 &self.running,
@@ -470,8 +491,8 @@ impl State {
                         }
                     }
                 },
-                Request::Job(job_request) => match job_request.as_ref() {
-                    JobRequest::Start(signed, params) => {
+                Request::Job(attributed) => match attributed.as_parts() {
+                    (actor, JobRequest::Start(signed, params)) => {
                         // TODO: When we implement
                         // https://github.com/oxidecomputer/sush/issues/23, we
                         // should check for revocation here before executing the
@@ -503,6 +524,7 @@ impl State {
                                 &self.own_baseboard,
                                 signed.clone(),
                                 params.clone(),
+                                actor,
                             );
                             session.execute_ready_jobs(
                                 &self.own_baseboard,
@@ -513,11 +535,12 @@ impl State {
                             );
                         }
                     }
-                    JobRequest::Stop(job_id) => {
+                    (actor, JobRequest::Stop(job_id)) => {
                         executor.job_stop(job_id);
                         if let Some(mut session) = self.session.active_session() {
                             session.cancel_job(
                                 job_id,
+                                actor,
                                 &self.own_baseboard,
                                 &mut self.history,
                                 &self.running,

@@ -246,7 +246,7 @@ async fn job_stop() {
 
     assert!(matches!(
         &mgr.job_status(&authn, &job_id).await.unwrap()[baseboard_id],
-        JobStatus::Cancelled { job_id: jid, time_cancelled } if *jid == job_id && *time_cancelled <= Utc::now()
+        JobStatus::Cancelled { job_id: jid, time_cancelled, .. } if *jid == job_id && *time_cancelled <= Utc::now()
     ));
 
     // Skip the cancelled job.
@@ -346,7 +346,7 @@ async fn cancel_queued_job() {
     mgr.wait_for_job_status(&job_id_b).await.unwrap();
     assert!(matches!(
         &mgr.job_status(&authn, &job_id_b).await.unwrap()[mgr.own_baseboard()],
-        JobStatus::Queued { job_id: jid, time_queued, } if *jid == job_id_b && *time_queued <= Utc::now()
+        JobStatus::Queued { job_id: jid, time_queued, .. } if *jid == job_id_b && *time_queued <= Utc::now()
     ));
 
     // ... but immediately cancel it.
@@ -361,7 +361,7 @@ async fn cancel_queued_job() {
     .expect("should be able to stop queued job");
     assert!(matches!(
         &mgr.job_status(&authn, &job_id_b).await.unwrap()[mgr.own_baseboard()],
-        JobStatus::Cancelled { job_id: jid, time_cancelled } if *jid == job_id_b && *time_cancelled <= Utc::now()
+        JobStatus::Cancelled { job_id: jid, time_cancelled, .. } if *jid == job_id_b && *time_cancelled <= Utc::now()
     ));
 
     // Clean up.
@@ -563,6 +563,81 @@ async fn cert_chain() {
     check_status_stopped(status, &job_id, Ok(0), Some(0), Some(0));
 }
 
+/// Requests record the verified key that made them: the session names
+/// its starter, and queued and cancelled jobs name their actors.
+#[named]
+#[tokio::test]
+async fn attribution() {
+    let log = test_logger(function_name!());
+    let (mgr, mut root, _dir, _shutdown) = manager_and_test_root(log).await;
+    let authn = fake_identity(&mut root).await;
+    let session_id = SessionId::new();
+    let mut session = Session::new(session_id.clone());
+    mgr.session_start(&authn, session_id.clone(), true)
+        .await
+        .unwrap();
+    assert_eq!(
+        mgr.session(&authn).unwrap().started_by(),
+        Some(&authn.key_id)
+    );
+
+    // Job B queues behind long-running job A, attributed.
+    let job_id_a = session.next_job_id();
+    let job_a = root.sign_job_request(&job_id_a, "sleep 60", false).await;
+    mgr.job_start(
+        &authn,
+        job_a.clone().into_signed(),
+        JobStartParams {
+            wait: JobWait::Start,
+            ..Default::default()
+        },
+    )
+    .await
+    .unwrap();
+    session.job_started(job_a.into_signed());
+    let job_id_b = session.next_job_id();
+    let job_b = root.sign_job_request(&job_id_b, "true", false).await;
+    mgr.job_start(
+        &authn,
+        job_b.clone().into_signed(),
+        JobStartParams::default(),
+    )
+    .await
+    .unwrap();
+    session.job_started(job_b.into_signed());
+    mgr.wait_for_job_status(&job_id_b).await.unwrap();
+    let status = mgr.job_status(&authn, &job_id_b).await.unwrap()[mgr.own_baseboard()].clone();
+    assert!(
+        matches!(&status, JobStatus::Queued { actor, .. } if *actor == authn.key_id),
+        "expected job B queued by us, got {status:?}"
+    );
+
+    // Cancelling B records the canceller.
+    mgr.job_stop(
+        &authn,
+        &job_id_b,
+        JobStopParams {
+            wait: JobWait::Stop,
+        },
+    )
+    .await
+    .unwrap();
+    let status = mgr.job_status(&authn, &job_id_b).await.unwrap()[mgr.own_baseboard()].clone();
+    assert!(
+        matches!(&status, JobStatus::Cancelled { actor, .. } if *actor == authn.key_id),
+        "expected job B cancelled by us, got {status:?}"
+    );
+    mgr.job_stop(
+        &authn,
+        &job_id_a,
+        JobStopParams {
+            wait: JobWait::Stop,
+        },
+    )
+    .await
+    .unwrap();
+}
+
 /// Hostile certificate imports over gossip cannot displace the trust
 /// anchor or any established certificate.
 #[named]
@@ -620,7 +695,11 @@ async fn hostile_imports_cannot_displace() {
     let fake_root = EphemeralKey::new_root(KeyType::P256, root.subject(), validity).unwrap();
     assert_ne!(fake_root.key_id(), &root_key_id);
     let import = |key: &EphemeralKey| {
-        Message::Request(Request::cert(CertRequest::Import(key.cert().clone()))).into()
+        Message::Request(Request::cert(
+            key.key_id().clone(),
+            CertRequest::Import(key.cert().clone()),
+        ))
+        .into()
     };
     peer.send(import(&fake_root));
 
@@ -644,7 +723,13 @@ async fn hostile_imports_cannot_displace() {
     // A different certificate bearing the child's key.
     let mut conflict = child.cert().clone();
     conflict.tbs_certificate.validity = Validity::from_now(Duration::from_secs(120)).unwrap();
-    peer.send(Message::Request(Request::cert(CertRequest::Import(conflict))).into());
+    peer.send(
+        Message::Request(Request::cert(
+            child.key_id().clone(),
+            CertRequest::Import(conflict),
+        ))
+        .into(),
+    );
 
     // A grandchild sent on the same handle marks the batch processed
     // once it validates.
@@ -745,7 +830,13 @@ async fn homonym_issuer_resolves_to_true_parent() {
     // The homonym arrives before the certificate it mimics, then the
     // real intermediate and a grandchild that names their shared
     // subject as its issuer.
-    peer.send(Message::Request(Request::cert(CertRequest::Import(homonym.cert().clone()))).into());
+    peer.send(
+        Message::Request(Request::cert(
+            homonym.key_id().clone(),
+            CertRequest::Import(homonym.cert().clone()),
+        ))
+        .into(),
+    );
     timeout(
         Duration::from_secs(1),
         mgr.import_cert(&authn, child.cert().clone(), true),

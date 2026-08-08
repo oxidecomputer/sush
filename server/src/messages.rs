@@ -61,24 +61,42 @@ pub mod v0 {
         }
     }
 
+    /// A request and the key that made it.
+    ///
+    /// The actor is attribution, not authority: it names the key whose
+    /// possession the accepting server verified, and the record is only
+    /// as truthful as that server. Execution authority comes from the
+    /// job signature alone.
+    #[derive(BorshDeserialize, BorshSerialize, Clone, Debug, Eq, PartialEq)]
+    pub struct Attributed<T> {
+        pub actor: KeyId,
+        pub request: T,
+    }
+
+    impl<T> Attributed<T> {
+        pub fn as_parts(&self) -> (&KeyId, &T) {
+            (&self.actor, &self.request)
+        }
+    }
+
     #[derive(BorshDeserialize, BorshSerialize, Clone, Debug, Eq, PartialEq)]
     pub enum Request {
-        Cert(Box<CertRequest>),
-        Session(Box<SessionRequest>),
-        Job(Box<JobRequest>),
+        Cert(Box<Attributed<CertRequest>>),
+        Session(Box<Attributed<SessionRequest>>),
+        Job(Box<Attributed<JobRequest>>),
     }
 
     impl Request {
-        pub fn cert(request: CertRequest) -> Self {
-            Self::Cert(Box::new(request))
+        pub fn cert(actor: KeyId, request: CertRequest) -> Self {
+            Self::Cert(Box::new(Attributed { actor, request }))
         }
 
-        pub fn session(request: SessionRequest) -> Self {
-            Self::Session(Box::new(request))
+        pub fn session(actor: KeyId, request: SessionRequest) -> Self {
+            Self::Session(Box::new(Attributed { actor, request }))
         }
 
-        pub fn job(request: JobRequest) -> Self {
-            Self::Job(Box::new(request))
+        pub fn job(actor: KeyId, request: JobRequest) -> Self {
+            Self::Job(Box::new(Attributed { actor, request }))
         }
     }
 
@@ -189,20 +207,28 @@ mod wire_format {
 
     #[test]
     fn session_start_request() {
-        let msg: VersionedMessage = Message::Request(Request::session(SessionRequest::Start(
-            SessionId::from("abandon-ability"),
-        )))
+        let msg: VersionedMessage = Message::Request(Request::session(
+            KeyId::from("zoo-zero".to_string()),
+            SessionRequest::Start(SessionId::from("abandon-ability")),
+        ))
         .into();
-        assert_wire_format(msg, b"\x00\x00\x01\x00\x0f\x00\x00\x00abandon-ability");
+        assert_wire_format(
+            msg,
+            b"\x00\x00\x01\x08\x00\x00\x00zoo-zero\x00\x0f\x00\x00\x00abandon-ability",
+        );
     }
 
     #[test]
     fn session_stop_request() {
-        let msg: VersionedMessage = Message::Request(Request::session(SessionRequest::Stop(
-            SessionId::from("abandon-ability"),
-        )))
+        let msg: VersionedMessage = Message::Request(Request::session(
+            KeyId::from("zoo-zero".to_string()),
+            SessionRequest::Stop(SessionId::from("abandon-ability")),
+        ))
         .into();
-        assert_wire_format(msg, b"\x00\x00\x01\x01\x0f\x00\x00\x00abandon-ability");
+        assert_wire_format(
+            msg,
+            b"\x00\x00\x01\x08\x00\x00\x00zoo-zero\x01\x0f\x00\x00\x00abandon-ability",
+        );
     }
 
     // TODO: snapshot more messages
