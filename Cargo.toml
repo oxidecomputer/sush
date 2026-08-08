@@ -37,7 +37,7 @@ rand_core = "0.6"
 reqwest = "0.12"
 rlimit = "0.10"
 rumors = { git = "https://github.com/oxidecomputer/rumors", rev = "748325407feb4c61f558713bad431281f8326ac4" }
-rustix = { version = "1", features = ["process", "pty"] }
+rustix = { version = "1", features = ["fs", "process", "pty", "termios"] }
 rustyline = "17"
 schemars = { version = "0.8", features = ["chrono", "preserve_order"] }
 serde = "1"
