@@ -25,6 +25,7 @@ use sush_common::jobs::{JobId, JobStartRequest, VerifiedJob};
 use sush_common::keys::{EphemeralKey, KeyType, Signer};
 use sush_server::JobManager;
 use sush_server::executor::PathIsolation;
+use sush_server::state::GossipNetwork;
 
 static TEST_BASEBOARD_ID: OnceLock<BaseboardId> = OnceLock::new();
 
@@ -103,8 +104,24 @@ pub async fn fake_identity(key: &mut EphemeralKey) -> Identity {
 pub async fn manager_and_test_root(
     log: Logger,
 ) -> (JobManager, EphemeralKey, TempDir, CancellationToken) {
+    let (mgr, root, _peer, dir, shutdown) = manager_test_root_and_peer(log).await;
+    (mgr, root, dir, shutdown)
+}
+
+/// Like [`manager_and_test_root`], but also hands back a clone of the
+/// manager's gossip network, for tests that play a peer.
+pub async fn manager_test_root_and_peer(
+    log: Logger,
+) -> (
+    JobManager,
+    EphemeralKey,
+    GossipNetwork,
+    TempDir,
+    CancellationToken,
+) {
     let dir = TempDir::with_prefix("sush-").unwrap();
     let gossip = Peer::seed().into_rumors();
+    let peer = gossip.clone();
     let shutdown = CancellationToken::new();
     let root = ephemeral_test_root();
     let mgr = JobManager::new(
@@ -118,7 +135,7 @@ pub async fn manager_and_test_root(
     )
     .await
     .unwrap();
-    (mgr, root, dir, shutdown)
+    (mgr, root, peer, dir, shutdown)
 }
 
 pub async fn authz<E>(

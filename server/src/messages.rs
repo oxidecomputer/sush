@@ -20,7 +20,7 @@ use sush_common::borsh::{
     borsh_ser_cert, borsh_ser_datetime,
 };
 use sush_common::jobs::JobOutputState;
-use sush_common::jobs::{JobId, ProcessError, SessionId, SignedJob};
+use sush_common::jobs::{Access, JobId, ProcessError, SessionId, SignedJob};
 use sush_common::keys::KeyId;
 
 #[derive(BorshDeserialize, BorshSerialize, Copy, Clone, Debug, Eq, PartialEq)]
@@ -123,6 +123,8 @@ pub mod v0 {
         Start(SessionId),
         Stop(SessionId),
         Skip(SessionId, JobId),
+        AllowAttach(SessionId, KeyId, Access),
+        DenyAttach(SessionId, KeyId),
     }
 
     #[derive(BorshDeserialize, BorshSerialize, Clone, Debug, Eq, PartialEq)]
@@ -228,6 +230,41 @@ mod wire_format {
         assert_wire_format(
             msg,
             b"\x00\x00\x01\x08\x00\x00\x00zoo-zero\x01\x0f\x00\x00\x00abandon-ability",
+        );
+    }
+
+    #[test]
+    fn session_allow_attach_request() {
+        let msg: VersionedMessage = Message::Request(Request::session(
+            KeyId::from("zoo-zero".to_string()),
+            SessionRequest::AllowAttach(
+                SessionId::from("abandon-ability"),
+                KeyId::from("able-about".to_string()),
+                Access::ReadWrite,
+            ),
+        ))
+        .into();
+        assert_wire_format(
+            msg,
+            b"\x00\x00\x01\x08\x00\x00\x00zoo-zero\x03\x0f\x00\x00\x00abandon-ability\
+              \x0a\x00\x00\x00able-about\x01",
+        );
+    }
+
+    #[test]
+    fn session_deny_attach_request() {
+        let msg: VersionedMessage = Message::Request(Request::session(
+            KeyId::from("zoo-zero".to_string()),
+            SessionRequest::DenyAttach(
+                SessionId::from("abandon-ability"),
+                KeyId::from("able-about".to_string()),
+            ),
+        ))
+        .into();
+        assert_wire_format(
+            msg,
+            b"\x00\x00\x01\x08\x00\x00\x00zoo-zero\x04\x0f\x00\x00\x00abandon-ability\
+              \x0a\x00\x00\x00able-about",
         );
     }
 

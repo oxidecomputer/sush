@@ -23,7 +23,7 @@ use x509_cert::Certificate;
 use x509_cert::der::Encode as _;
 
 use sush_api::JobStartParams;
-use sush_common::jobs::{JobId, JobStatus, JobStatusMap, Session, SessionId, SignedJob};
+use sush_common::jobs::{Access, JobId, JobStatus, JobStatusMap, Session, SessionId, SignedJob};
 use sush_common::keys::{KeyError, KeyId, Signature};
 
 use crate::executor::{Executor, PathIsolation};
@@ -68,6 +68,8 @@ pub enum SessionState {
         session: Box<Session>,
         /// Jobs waiting to run in this session.
         queued_jobs: QueuedJobs,
+        /// Keys the starter has granted attach access, and how much.
+        attach_grants: BTreeMap<KeyId, Access>,
     },
 }
 
@@ -101,6 +103,24 @@ impl SessionState {
             Inactive { .. } => None,
             Active { session, .. } => Some(session),
         }
+    }
+
+    /// The attach access `key_id` has to this session's interactive
+    /// jobs, if any.
+    pub fn attach_access(&self, key_id: &KeyId) -> Option<Access> {
+        use SessionState::*;
+        let Active {
+            session,
+            attach_grants,
+            ..
+        } = self
+        else {
+            return None;
+        };
+        if session.started_by() == Some(key_id) {
+            return Some(Access::ReadWrite);
+        }
+        attach_grants.get(key_id).copied()
     }
 
     fn queued_jobs(&self) -> Option<&QueuedJobs> {
@@ -291,6 +311,10 @@ impl State {
         self.session.session()
     }
 
+    pub fn attach_access(&self, key_id: &KeyId) -> Option<Access> {
+        self.session.attach_access(key_id)
+    }
+
     pub fn history(&self) -> &JobHistory {
         &self.history
     }
@@ -395,6 +419,7 @@ impl State {
                                     actor.clone(),
                                 )),
                                 queued_jobs: QueuedJobs::new(),
+                                attach_grants: BTreeMap::new(),
                             }
                         }
 
@@ -456,6 +481,50 @@ impl State {
                             );
                             self.session = Inactive {
                                 frontier: frontier.clone(),
+                            }
+                        }
+                    }
+                    (actor, SessionRequest::AllowAttach(session_id, key_id, access)) => {
+                        if let Active {
+                            session,
+                            attach_grants,
+                            ..
+                        } = &mut self.session
+                            && session.session_id() == session_id
+                        {
+                            if session.started_by() == Some(actor) {
+                                attach_grants.insert(key_id.clone(), *access);
+                                info!(
+                                    log, "attach allowed";
+                                    "key_id" => %key_id, "access" => ?access, "actor" => %actor,
+                                );
+                            } else {
+                                warn!(
+                                    log, "ignoring attach grant from non-starter";
+                                    "key_id" => %key_id, "actor" => %actor,
+                                );
+                            }
+                        }
+                    }
+                    (actor, SessionRequest::DenyAttach(session_id, key_id)) => {
+                        if let Active {
+                            session,
+                            attach_grants,
+                            ..
+                        } = &mut self.session
+                            && session.session_id() == session_id
+                        {
+                            if session.started_by() == Some(actor) {
+                                attach_grants.remove(key_id);
+                                info!(
+                                    log, "attach denied";
+                                    "key_id" => %key_id, "actor" => %actor,
+                                );
+                            } else {
+                                warn!(
+                                    log, "ignoring attach denial from non-starter";
+                                    "key_id" => %key_id, "actor" => %actor,
+                                );
                             }
                         }
                     }

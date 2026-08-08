@@ -25,7 +25,7 @@ use x509_cert::Certificate;
 use sush_api::{JobStartParams, JobStopParams, JobWait};
 use sush_common::authn::{Credentials, Identity, Nonce};
 use sush_common::jobs::JobOutputStream;
-use sush_common::jobs::{JobId, JobStatusMap, Session, SessionId, SignedJob};
+use sush_common::jobs::{Access, JobId, JobStatusMap, Session, SessionId, SignedJob};
 use sush_common::keys::{KeyError, KeyId, SshPublicKey};
 
 use crate::error::JobError;
@@ -364,6 +364,42 @@ impl JobManager {
             .await
     }
 
+    /// Only the session starter may grant or deny attach access. The
+    /// authoritative check is in the state machine; this one fails fast.
+    fn starter_check(&self, authn: &Identity) -> Result<(), JobError> {
+        match self.state.borrow().session() {
+            None => Err(JobError::NoSession),
+            Some(session) if session.started_by() == Some(&authn.key_id) => Ok(()),
+            Some(_) => Err(JobError::NotSessionStarter),
+        }
+    }
+
+    pub async fn session_allow_attach(
+        &self,
+        authn: &Identity,
+        session_id: SessionId,
+        key_id: KeyId,
+        access: Access,
+    ) -> Result<(), JobError> {
+        self.starter_check(authn)?;
+        self.session_request(
+            authn,
+            SessionRequest::AllowAttach(session_id, key_id, access),
+        )
+        .await
+    }
+
+    pub async fn session_deny_attach(
+        &self,
+        authn: &Identity,
+        session_id: SessionId,
+        key_id: KeyId,
+    ) -> Result<(), JobError> {
+        self.starter_check(authn)?;
+        self.session_request(authn, SessionRequest::DenyAttach(session_id, key_id))
+            .await
+    }
+
     // Job management.
 
     pub async fn job_start(
@@ -448,14 +484,21 @@ impl JobManager {
 
     pub async fn job_attachment(
         &self,
-        _authn: &Identity,
+        authn: &Identity,
         job_id: &JobId,
         target: &BaseboardId,
-    ) -> Result<SocketSender, JobError> {
+    ) -> Result<(SocketSender, Access), JobError> {
+        let Some(access) = self.state.borrow().attach_access(&authn.key_id) else {
+            return Err(JobError::AttachDenied);
+        };
         if self.own_baseboard() == target
             && let Some(attachment) = self.state.borrow().get_attachment(job_id)
         {
-            Ok(attachment.to_owned())
+            info!(
+                self.log, "job attach";
+                "job_id" => %job_id, "access" => ?access, "actor" => %authn.key_id,
+            );
+            Ok((attachment.to_owned(), access))
         } else {
             Err(JobError::JobNotFound(job_id.to_owned()))
         }

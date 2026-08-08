@@ -20,8 +20,8 @@ use x509_cert::der::Encode as _;
 
 use sush_common::authn::{Credentials, Identity};
 use sush_common::jobs::{
-    JobId, JobOutputState, JobOutputStream, JobStatus, JobStatusMap, Session, SessionId, SignedJob,
-    job_status_to_json_map,
+    Access, JobId, JobOutputState, JobOutputStream, JobStatus, JobStatusMap, Session, SessionId,
+    SignedJob, job_status_to_json_map,
 };
 use sush_common::keys::{KeyId, Signature, SshPublicKey};
 
@@ -108,6 +108,28 @@ impl CommandContext for Cli {
             OutputFormat::Text => println!("✅ Stopped session `{session_id}`"),
         }
         Ok(())
+    }
+
+    fn attach_allowed(&mut self, key_id: &KeyId, access: Access) {
+        match self.get_output_format() {
+            OutputFormat::Json => {
+                println!("{}", json!({"attach_allowed": key_id, "access": access}))
+            }
+            OutputFormat::Text => {
+                let how = match access {
+                    Access::ReadOnly => "read-only",
+                    Access::ReadWrite => "read-write",
+                };
+                println!("✅ Allowed {how} attach for `{key_id}`")
+            }
+        }
+    }
+
+    fn attach_denied(&mut self, key_id: &KeyId) {
+        match self.get_output_format() {
+            OutputFormat::Json => println!("{}", json!({"attach_denied": key_id})),
+            OutputFormat::Text => println!("✅ Denied attach for `{key_id}`"),
+        }
     }
 
     // Job signing certificates

@@ -664,6 +664,31 @@ impl Default for JobLimits {
     }
 }
 
+/// Attach access to a session's interactive jobs. The session starter
+/// always has read-write access; guests have what they were granted.
+/// Read-write means co-driving a shell the job signature authorized,
+/// so who deserves it is deployment policy. Recorded output is not
+/// gated: it is the customer's data, readable by any authenticated key.
+#[derive(
+    BorshDeserialize,
+    BorshSerialize,
+    Clone,
+    Copy,
+    Debug,
+    Default,
+    Deserialize,
+    Eq,
+    JsonSchema,
+    PartialEq,
+    Serialize,
+)]
+#[serde(rename_all = "kebab-case")]
+pub enum Access {
+    #[default]
+    ReadOnly,
+    ReadWrite,
+}
+
 /// Either the standard output or standard error of a job.
 #[derive(
     BorshDeserialize,

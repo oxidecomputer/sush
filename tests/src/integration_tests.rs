@@ -22,11 +22,12 @@ use sush_api::JobWait;
 use sush_api::sush_api_mod::api_description;
 use sush_client::{Client, Error as ClientError};
 use sush_common::interactive::{InteractiveJobControl, InteractiveJobMessage};
-use sush_common::jobs::{JobLimits, JobOutputStream, Session, SessionId};
+use sush_common::jobs::{Access, JobLimits, JobOutputStream, Session, SessionId};
 use sush_server::{ApiServer, ProxyServer};
 
 use crate::test_utils::{
-    SignJobRequest as _, authz, manager_and_test_root, test_baseboard_id, test_logger,
+    SignJobRequest as _, authz, ephemeral_test_root, manager_and_test_root, test_baseboard_id,
+    test_logger,
 };
 
 const TIMEOUT: Duration = Duration::from_secs(10);
@@ -334,9 +335,136 @@ async fn interactive_job() {
     assert_eq!(next_data_message(&mut stream1).await, &again);
     assert_eq!(next_data_message(&mut stream2).await, &again);
 
+    // A guest key authenticates but cannot attach until granted.
+    let mut guest_key = ephemeral_test_root();
+    let ClientError::ErrorResponse(unauthz) = client.iam().body(None).send().await.unwrap_err()
+    else {
+        panic!("expected error response")
+    };
+    let (guest, guest_credentials) = authz(&client, unauthz, &mut guest_key).await;
+    let guest_attach = async || {
+        client
+            .job_attach()
+            .job_id(&job_id)
+            .target(test_baseboard_id().to_string())
+            .authorization(guest_credentials.to_string())
+            .send()
+            .await
+    };
+    let denied = guest_attach().await.unwrap_err();
+    assert!(
+        matches!(denied.status(), Some(status) if status.as_u16() == 403),
+        "expected 403 Forbidden, got {denied:?}"
+    );
+
+    // Grant the guest read-only access and attach.
+    client
+        .session_allow_attach()
+        .session_id(session.session_id())
+        .key_id(guest.key_id.clone())
+        .access(Access::ReadOnly)
+        .authorization(credentials.to_string())
+        .send()
+        .await
+        .expect("can't allow attach");
+    let socket3 = timeout(TIMEOUT, async {
+        loop {
+            match guest_attach().await {
+                Ok(socket) => break socket.into_inner(),
+                Err(_) => tokio::time::sleep(Duration::from_millis(50)).await,
+            }
+        }
+    })
+    .await
+    .expect("grant never took effect");
+    let mut stream3 = WebSocketStream::from_raw_socket(socket3, Role::Client, None).await;
+    let InteractiveJobControl::WindowChange(size3) = next_control_message(&mut stream3).await;
+    assert_eq!(size3, size1);
+    let _playback = next_data_message(&mut stream3).await;
+
+    // The read-only guest's input is dropped: the starter's marker,
+    // sent after it, echoes without it.
+    let intrusion = Bytes::from("intruder input");
+    stream3
+        .send(
+            InteractiveJobMessage::Data(intrusion.clone())
+                .try_into()
+                .expect("can't encode message"),
+        )
+        .await
+        .expect("can't send message");
+    let marker = Bytes::from(format!("Marker, {job_id}!"));
+    stream1
+        .send(
+            InteractiveJobMessage::Data(marker.clone())
+                .try_into()
+                .expect("can't encode message"),
+        )
+        .await
+        .expect("can't send message");
+    assert_eq!(next_data_message(&mut stream1).await, &marker);
+    assert_eq!(next_data_message(&mut stream3).await, &marker);
+
+    // Withdraw the grant, so that the next successful attach can only
+    // mean the read-write grant that follows.
+    client
+        .session_deny_attach()
+        .session_id(session.session_id())
+        .key_id(guest.key_id.clone())
+        .authorization(credentials.to_string())
+        .send()
+        .await
+        .expect("can't deny attach");
+    timeout(TIMEOUT, async {
+        while guest_attach().await.is_ok() {
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+    })
+    .await
+    .expect("denial never took effect");
+
+    // Granted read-write, the guest's input echoes everywhere, and the
+    // old read-only socket keeps the access it attached with.
+    client
+        .session_allow_attach()
+        .session_id(session.session_id())
+        .key_id(guest.key_id.clone())
+        .access(Access::ReadWrite)
+        .authorization(credentials.to_string())
+        .send()
+        .await
+        .expect("can't allow attach");
+    let socket4 = timeout(TIMEOUT, async {
+        loop {
+            match guest_attach().await {
+                Ok(socket) => break socket.into_inner(),
+                Err(_) => tokio::time::sleep(Duration::from_millis(50)).await,
+            }
+        }
+    })
+    .await
+    .expect("upgrade never took effect");
+    let mut stream4 = WebSocketStream::from_raw_socket(socket4, Role::Client, None).await;
+    let InteractiveJobControl::WindowChange(_) = next_control_message(&mut stream4).await;
+    let _playback = next_data_message(&mut stream4).await;
+    let welcome = Bytes::from(format!("Welcome, {job_id}!"));
+    stream4
+        .send(
+            InteractiveJobMessage::Data(welcome.clone())
+                .try_into()
+                .expect("can't encode message"),
+        )
+        .await
+        .expect("can't send message");
+    assert_eq!(next_data_message(&mut stream1).await, &welcome);
+    assert_eq!(next_data_message(&mut stream3).await, &welcome);
+    assert_eq!(next_data_message(&mut stream4).await, &welcome);
+
     // Detach from the job.
     stream1.close(None).await.expect("can't close stream1");
     stream2.close(None).await.expect("can't close stream2");
+    stream3.close(None).await.expect("can't close stream3");
+    stream4.close(None).await.expect("can't close stream4");
 
     // Stop the job.
     client
@@ -348,7 +476,8 @@ async fn interactive_job() {
         .await
         .expect("can't stop job");
 
-    // Check that the output contains both messages.
+    // Check that the output contains every echoed message, and nothing
+    // from the read-only guest.
     let mut output = client
         .job_output()
         .authorization(credentials.to_string())
@@ -362,6 +491,8 @@ async fn interactive_job() {
     let mut hello_again = BytesMut::new();
     hello_again.extend(hello);
     hello_again.extend(again);
+    hello_again.extend(marker);
+    hello_again.extend(welcome);
     assert_eq!(
         output
             .next()

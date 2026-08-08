@@ -22,9 +22,9 @@ use x509_cert::Certificate;
 use x509_cert::der::DecodePem as _;
 
 use sush_api::{
-    Authorization, AuthorizedRangeRequest, JobAttachParams, JobHistoryParams, JobIdParam,
-    JobOutputParams, JobStartParams, JobStopParams, KeyIdParam, SessionAndJobIds, SessionIdParam,
-    SushApi, WaitParam,
+    AccessParam, Authorization, AuthorizedRangeRequest, JobAttachParams, JobHistoryParams,
+    JobIdParam, JobOutputParams, JobStartParams, JobStopParams, KeyIdParam, SessionAndJobIds,
+    SessionAndKeyIds, SessionIdParam, SushApi, WaitParam,
 };
 use sush_common::authn::Identity;
 use sush_common::jobs::{JsonJobStatusMap, Session, SignedJob, job_status_to_json_map};
@@ -152,6 +152,35 @@ impl SushApi for ApiServer {
         Ok(HttpResponseUpdatedNoContent())
     }
 
+    async fn session_allow_attach(
+        ctx: RequestContext<Self::Context>,
+        headers: Header<Authorization>,
+        params: PathParams<SessionAndKeyIds>,
+        query: QueryParams<AccessParam>,
+    ) -> Result<HttpResponseUpdatedNoContent, HttpError> {
+        let mgr = ctx.context();
+        let Authorization { authorization } = headers.into_inner();
+        let authn = mgr.iam(authorization, None).await?;
+        let SessionAndKeyIds { session_id, key_id } = params.into_inner();
+        let AccessParam { access } = query.into_inner();
+        mgr.session_allow_attach(&authn, session_id, key_id, access)
+            .await?;
+        Ok(HttpResponseUpdatedNoContent())
+    }
+
+    async fn session_deny_attach(
+        ctx: RequestContext<Self::Context>,
+        headers: Header<Authorization>,
+        params: PathParams<SessionAndKeyIds>,
+    ) -> Result<HttpResponseUpdatedNoContent, HttpError> {
+        let mgr = ctx.context();
+        let Authorization { authorization } = headers.into_inner();
+        let authn = mgr.iam(authorization, None).await?;
+        let SessionAndKeyIds { session_id, key_id } = params.into_inner();
+        mgr.session_deny_attach(&authn, session_id, key_id).await?;
+        Ok(HttpResponseUpdatedNoContent())
+    }
+
     // Job management.
 
     async fn job_start(
@@ -264,11 +293,11 @@ impl SushApi for ApiServer {
                 )
             })?
         };
-        let attachment = mgr.job_attachment(&authn, &job_id, &target).await?;
+        let (attachment, access) = mgr.job_attachment(&authn, &job_id, &target).await?;
         upgrade.handle(async move |conn| {
             let socket = conn.into_inner();
             let stream = WebSocketStream::from_raw_socket(socket, Role::Server, None).await;
-            attachment.try_send(stream).map_err(|_| {
+            attachment.try_send((stream, access)).map_err(|_| {
                 HttpError::for_internal_error(String::from("Unable to attach to interactive job"))
             })?;
             Ok(())

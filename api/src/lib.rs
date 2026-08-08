@@ -22,7 +22,8 @@ use sled_hardware_types::BaseboardId;
 
 use sush_common::authn::Identity;
 use sush_common::jobs::{
-    JobId, JobLimits, JobOutputStream, JobStatus, JsonJobStatusMap, Session, SessionId, SignedJob,
+    Access, JobId, JobLimits, JobOutputStream, JobStatus, JsonJobStatusMap, Session, SessionId,
+    SignedJob,
 };
 use sush_common::keys::{KeyId, SshPublicKey};
 
@@ -110,6 +111,28 @@ pub trait SushApi {
         ctx: RequestContext<Self::Context>,
         headers: Header<Authorization>,
         params: PathParams<SessionAndJobIds>,
+    ) -> Result<HttpResponseUpdatedNoContent, HttpError>;
+
+    /// Grant a key attach access to this session's interactive jobs.
+    ///
+    /// Only the key that started the session may grant access.
+    #[endpoint { method = POST, path = "/sessions/{session_id}/allow/{key_id}" }]
+    async fn session_allow_attach(
+        ctx: RequestContext<Self::Context>,
+        headers: Header<Authorization>,
+        params: PathParams<SessionAndKeyIds>,
+        query: QueryParams<AccessParam>,
+    ) -> Result<HttpResponseUpdatedNoContent, HttpError>;
+
+    /// Withdraw a key's attach access.
+    ///
+    /// Only the key that started the session may withdraw access.
+    /// Already-attached connections keep the access they attached with.
+    #[endpoint { method = POST, path = "/sessions/{session_id}/deny/{key_id}" }]
+    async fn session_deny_attach(
+        ctx: RequestContext<Self::Context>,
+        headers: Header<Authorization>,
+        params: PathParams<SessionAndKeyIds>,
     ) -> Result<HttpResponseUpdatedNoContent, HttpError>;
 
     // Job management.
@@ -201,6 +224,19 @@ pub struct SessionIdParam {
 pub struct SessionAndJobIds {
     pub session_id: SessionId,
     pub job_id: JobId,
+}
+
+#[derive(Deserialize, JsonSchema)]
+pub struct SessionAndKeyIds {
+    pub session_id: SessionId,
+    pub key_id: KeyId,
+}
+
+#[derive(Deserialize, JsonSchema)]
+pub struct AccessParam {
+    /// How much access to grant; read-only if omitted.
+    #[serde(default)]
+    pub access: Access,
 }
 
 #[derive(Deserialize, JsonSchema)]

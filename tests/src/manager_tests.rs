@@ -25,17 +25,18 @@ use x509_cert::time::Validity;
 use sush_api::{JobStartParams, JobStopParams, JobWait};
 use sush_common::authn::{Challenge, ChallengeResponse, Credentials, Identity};
 use sush_common::jobs::{
-    JobId, JobLimits, JobOutputState, JobOutputStream::*, JobStatus, ProcessError, Session,
+    Access, JobId, JobLimits, JobOutputState, JobOutputStream::*, JobStatus, ProcessError, Session,
     SessionId,
 };
 use sush_common::keys::{EphemeralKey, KeyError, KeyType, Signer as _};
 use sush_server::io::BATCH_OUTPUT_BUFFER_SIZE;
-use sush_server::messages::v0::{CertRequest, Message, Request};
+use sush_server::messages::v0::{CertRequest, Message, Request, SessionRequest};
 use sush_server::output::JobOutputDir;
 use sush_server::{JobError, JobManager};
 
 use crate::test_utils::{
-    SignJobRequest as _, ephemeral_test_subject, fake_identity, manager_and_test_root, test_logger,
+    SignJobRequest as _, ephemeral_test_subject, fake_identity, manager_and_test_root,
+    manager_test_root_and_peer, test_logger,
 };
 use sush_server::executor::PathIsolation;
 
@@ -630,6 +631,144 @@ async fn attribution() {
     mgr.job_stop(
         &authn,
         &job_id_a,
+        JobStopParams {
+            wait: JobWait::Stop,
+        },
+    )
+    .await
+    .unwrap();
+}
+
+/// Attach access: strangers are refused, the starter grants and
+/// withdraws guest access mid-session, only the starter may grant, and
+/// grants from non-starters over gossip are ignored.
+#[named]
+#[tokio::test]
+async fn attach_grants() {
+    let log = test_logger(function_name!());
+    let (mgr, mut root, peer, _dir, _shutdown) = manager_test_root_and_peer(log).await;
+    let owner = fake_identity(&mut root).await;
+    let validity = Validity::from_now(Duration::from_secs(60)).unwrap();
+    let mut guest_key =
+        EphemeralKey::new_root(KeyType::P256, ephemeral_test_subject(), validity).unwrap();
+    let guest = fake_identity(&mut guest_key).await;
+
+    let session_id = SessionId::new();
+    let session = Session::new(session_id.clone());
+    mgr.session_start(&owner, session_id.clone(), true)
+        .await
+        .unwrap();
+    let job_id = session.next_job_id();
+    let job = root.sign_job_request(&job_id, "sleep 10", false).await;
+    mgr.job_start(
+        &owner,
+        job.into_signed(),
+        JobStartParams {
+            wait: JobWait::Start,
+            ..Default::default()
+        },
+    )
+    .await
+    .unwrap();
+
+    // The starter attaches read-write; a stranger not at all; a guest
+    // may not grant.
+    let target = mgr.own_baseboard().clone();
+    let attach = async |authn: Identity| mgr.job_attachment(&authn, &job_id, &target).await;
+    assert!(matches!(
+        attach(owner.clone()).await,
+        Ok((_, Access::ReadWrite))
+    ));
+    assert!(matches!(
+        attach(guest.clone()).await,
+        Err(JobError::AttachDenied)
+    ));
+    assert!(matches!(
+        mgr.session_allow_attach(
+            &guest,
+            session_id.clone(),
+            owner.key_id.clone(),
+            Access::ReadOnly
+        )
+        .await,
+        Err(JobError::NotSessionStarter)
+    ));
+
+    // The starter grants read-only, upgrades to read-write, then
+    // withdraws, all mid-session.
+    let granted = async |authn: Identity, want: Option<Access>| {
+        timeout(Duration::from_secs(30), async {
+            loop {
+                let access = match attach(authn.clone()).await {
+                    Ok((_, access)) => Some(access),
+                    Err(JobError::AttachDenied) => None,
+                    Err(err) => panic!("unexpected attach error: {err}"),
+                };
+                if access == want {
+                    break;
+                }
+                sleep(Duration::from_millis(50)).await;
+            }
+        })
+        .await
+        .expect("grant never took effect")
+    };
+    mgr.session_allow_attach(
+        &owner,
+        session_id.clone(),
+        guest.key_id.clone(),
+        Access::ReadOnly,
+    )
+    .await
+    .unwrap();
+    granted(guest.clone(), Some(Access::ReadOnly)).await;
+    mgr.session_allow_attach(
+        &owner,
+        session_id.clone(),
+        guest.key_id.clone(),
+        Access::ReadWrite,
+    )
+    .await
+    .unwrap();
+    granted(guest.clone(), Some(Access::ReadWrite)).await;
+    mgr.session_deny_attach(&owner, session_id.clone(), guest.key_id.clone())
+        .await
+        .unwrap();
+    granted(guest.clone(), None).await;
+
+    // A grant whose actor is not the starter is ignored. The starter's
+    // grant of a third key, sent after it on the same handle, marks it
+    // processed.
+    let mut third_key =
+        EphemeralKey::new_root(KeyType::P256, ephemeral_test_subject(), validity).unwrap();
+    let third = fake_identity(&mut third_key).await;
+    peer.send(
+        Message::Request(Request::session(
+            guest.key_id.clone(),
+            SessionRequest::AllowAttach(
+                session_id.clone(),
+                guest.key_id.clone(),
+                Access::ReadWrite,
+            ),
+        ))
+        .into(),
+    );
+    peer.send(
+        Message::Request(Request::session(
+            owner.key_id.clone(),
+            SessionRequest::AllowAttach(session_id, third.key_id.clone(), Access::ReadOnly),
+        ))
+        .into(),
+    );
+    granted(third.clone(), Some(Access::ReadOnly)).await;
+    assert!(matches!(
+        attach(guest.clone()).await,
+        Err(JobError::AttachDenied)
+    ));
+
+    mgr.job_stop(
+        &owner,
+        &job_id,
         JobStopParams {
             wait: JobWait::Stop,
         },

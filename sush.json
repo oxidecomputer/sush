@@ -590,6 +590,102 @@
         }
       }
     },
+    "/sessions/{session_id}/allow/{key_id}": {
+      "post": {
+        "summary": "Grant a key attach access to this session's interactive jobs.",
+        "description": "Only the key that started the session may grant access.",
+        "operationId": "session_allow_attach",
+        "parameters": [
+          {
+            "in": "header",
+            "name": "authorization",
+            "description": "Authorization to access some resource, such as a signature.\n\nSee: <https://developer.mozilla.org/en-US/docs/Web/HTTP/Reference/Headers/Authorization>",
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "in": "path",
+            "name": "session_id",
+            "required": true,
+            "schema": {
+              "$ref": "#/components/schemas/SessionId"
+            }
+          },
+          {
+            "in": "path",
+            "name": "key_id",
+            "required": true,
+            "schema": {
+              "$ref": "#/components/schemas/KeyId"
+            }
+          },
+          {
+            "in": "query",
+            "name": "access",
+            "description": "How much access to grant; read-only if omitted.",
+            "schema": {
+              "$ref": "#/components/schemas/Access"
+            }
+          }
+        ],
+        "responses": {
+          "204": {
+            "description": "resource updated"
+          },
+          "4XX": {
+            "$ref": "#/components/responses/Error"
+          },
+          "5XX": {
+            "$ref": "#/components/responses/Error"
+          }
+        }
+      }
+    },
+    "/sessions/{session_id}/deny/{key_id}": {
+      "post": {
+        "summary": "Withdraw a key's attach access.",
+        "description": "Only the key that started the session may withdraw access. Already-attached connections keep the access they attached with.",
+        "operationId": "session_deny_attach",
+        "parameters": [
+          {
+            "in": "header",
+            "name": "authorization",
+            "description": "Authorization to access some resource, such as a signature.\n\nSee: <https://developer.mozilla.org/en-US/docs/Web/HTTP/Reference/Headers/Authorization>",
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "in": "path",
+            "name": "session_id",
+            "required": true,
+            "schema": {
+              "$ref": "#/components/schemas/SessionId"
+            }
+          },
+          {
+            "in": "path",
+            "name": "key_id",
+            "required": true,
+            "schema": {
+              "$ref": "#/components/schemas/KeyId"
+            }
+          }
+        ],
+        "responses": {
+          "204": {
+            "description": "resource updated"
+          },
+          "4XX": {
+            "$ref": "#/components/responses/Error"
+          },
+          "5XX": {
+            "$ref": "#/components/responses/Error"
+          }
+        }
+      }
+    },
     "/sessions/{session_id}/skip/{job_id}": {
       "post": {
         "summary": "Burn a job ID in the current session.",
@@ -1304,6 +1400,14 @@
           "none",
           "start",
           "stop"
+        ]
+      },
+      "Access": {
+        "description": "Attach access to a session's interactive jobs. The session starter always has read-write access; guests have what they were granted.",
+        "type": "string",
+        "enum": [
+          "read-only",
+          "read-write"
         ]
       }
     },

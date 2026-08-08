@@ -12,7 +12,9 @@ use clap::ValueEnum;
 use x509_cert::Certificate;
 
 use sush_common::authn::{Credentials, Identity};
-use sush_common::jobs::{JobId, JobOutputStream, JobStatusMap, Session, SessionId, SignedJob};
+use sush_common::jobs::{
+    Access, JobId, JobOutputStream, JobStatusMap, Session, SessionId, SignedJob,
+};
 use sush_common::keys::{KeyId, SshPublicKey};
 
 use crate::commands::{CommandError, GlobalArgs};
@@ -57,6 +59,8 @@ pub trait CommandContext: Clone + Send + Sync {
     fn next_job_id(&self) -> Result<JobId, CommandError>;
     fn session_started(&mut self, session: Session) -> Result<(), CommandError>;
     fn session_stopped(&mut self, session_id: &SessionId) -> Result<(), CommandError>;
+    fn attach_allowed(&mut self, key_id: &KeyId, access: Access);
+    fn attach_denied(&mut self, key_id: &KeyId);
 
     // Job signing certificates
     fn cert_chain(&mut self, key_id: KeyId, certs: &str) -> Result<Certificate, CommandError>;

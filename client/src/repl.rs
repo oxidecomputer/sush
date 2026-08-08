@@ -19,7 +19,9 @@ use x509_cert::Certificate;
 use xdg::BaseDirectories;
 
 use sush_common::authn::{Credentials, Identity};
-use sush_common::jobs::{JobId, JobOutputStream, JobStatusMap, Session, SessionId, SignedJob};
+use sush_common::jobs::{
+    Access, JobId, JobOutputStream, JobStatusMap, Session, SessionId, SignedJob,
+};
 use sush_common::keys::{KeyId, SshPublicKey};
 
 use crate::Client;
@@ -220,6 +222,14 @@ impl CommandContext for Repl {
 
     fn session_stopped(&mut self, session_id: &SessionId) -> Result<(), CommandError> {
         self.cli.session_stopped(session_id)
+    }
+
+    fn attach_allowed(&mut self, key_id: &KeyId, access: Access) {
+        self.cli.attach_allowed(key_id, access)
+    }
+
+    fn attach_denied(&mut self, key_id: &KeyId) {
+        self.cli.attach_denied(key_id)
     }
 
     // Job signing certificates

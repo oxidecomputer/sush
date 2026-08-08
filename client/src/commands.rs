@@ -41,8 +41,8 @@ use sush_common::jobs::JobOutputStream::{self, Stderr, Stdout};
 #[cfg(feature = "permslip")]
 use sush_common::jobs::JobStartRequest;
 use sush_common::jobs::{
-    JobId, JobLimits, JobOutputHash, JobOutputState, JobStatus, Session, SessionId, SignedJob,
-    job_status_try_from_json_map,
+    Access, JobId, JobLimits, JobOutputHash, JobOutputState, JobStatus, Session, SessionId,
+    SignedJob, job_status_try_from_json_map,
 };
 use sush_common::keys::{KeyError, KeyId, Signer as _};
 
@@ -287,8 +287,24 @@ pub enum IdentityCommand {
 
 #[derive(Clone, Debug, Subcommand)]
 pub enum SessionCommand {
+    /// Grant a key attach access to this session's interactive jobs.
+    Allow {
+        /// The key to grant access to (try `iam` for your own).
+        key_id: KeyId,
+
+        /// Grant read-write access instead of read-only.
+        #[arg(short, long)]
+        write: bool,
+    },
+
     /// Attach to a current support session.
     Attach { session_id: Option<SessionId> },
+
+    /// Withdraw a key's attach access.
+    Deny {
+        /// The key to withdraw access from.
+        key_id: KeyId,
+    },
 
     /// Start a new support session.
     Start {
@@ -686,6 +702,48 @@ async fn session(
             .await?
             .into_inner();
             ctx.session_started(session)?;
+            Ok(())
+        }
+
+        (SessionCommand::Allow { key_id, write }, Some(client)) => {
+            let Some(session_id) = ctx.session_id() else {
+                return Err(CommandError::MissingSession);
+            };
+            let access = if write {
+                Access::ReadWrite
+            } else {
+                Access::ReadOnly
+            };
+            with_authz(ctx, client, async |authz| {
+                client
+                    .session_allow_attach()
+                    .session_id(session_id.clone())
+                    .key_id(key_id.clone())
+                    .access(access)
+                    .authorization(authz)
+                    .send()
+                    .await
+            })
+            .await?;
+            ctx.attach_allowed(&key_id, access);
+            Ok(())
+        }
+
+        (SessionCommand::Deny { key_id }, Some(client)) => {
+            let Some(session_id) = ctx.session_id() else {
+                return Err(CommandError::MissingSession);
+            };
+            with_authz(ctx, client, async |authz| {
+                client
+                    .session_deny_attach()
+                    .session_id(session_id.clone())
+                    .key_id(key_id.clone())
+                    .authorization(authz)
+                    .send()
+                    .await
+            })
+            .await?;
+            ctx.attach_denied(&key_id);
             Ok(())
         }
 
