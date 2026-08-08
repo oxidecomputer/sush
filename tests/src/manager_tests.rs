@@ -6,6 +6,7 @@
 
 use std::os::unix::fs::PermissionsExt as _;
 use std::path::Path;
+use std::slice::from_ref;
 use std::time::Duration;
 
 use chrono::Utc;
@@ -17,7 +18,7 @@ use sled_hardware_types::BaseboardId;
 use slog::{Discard, Logger, o};
 use tempfile::TempDir;
 use tokio::fs::metadata;
-use tokio::time::timeout;
+use tokio::time::{sleep, timeout};
 use tokio_util::sync::CancellationToken;
 use x509_cert::time::Validity;
 
@@ -29,6 +30,7 @@ use sush_common::jobs::{
 };
 use sush_common::keys::{EphemeralKey, KeyError, KeyType, Signer as _};
 use sush_server::io::BATCH_OUTPUT_BUFFER_SIZE;
+use sush_server::messages::v0::{CertRequest, Message, Request};
 use sush_server::output::JobOutputDir;
 use sush_server::{JobError, JobManager};
 
@@ -559,6 +561,224 @@ async fn cert_chain() {
     session.job_started(job.clone().into_signed());
     let status = mgr.job_status(&authn, &job_id).await.unwrap()[mgr.own_baseboard()].clone();
     check_status_stopped(status, &job_id, Ok(0), Some(0), Some(0));
+}
+
+/// Hostile certificate imports over gossip cannot displace the trust
+/// anchor or any established certificate.
+#[named]
+#[tokio::test]
+async fn hostile_imports_cannot_displace() {
+    let validity = Validity::from_now(Duration::from_secs(60)).unwrap();
+    let mut root =
+        EphemeralKey::new_root(KeyType::P256, ephemeral_test_subject(), validity).unwrap();
+    let root_cert = root.cert().to_owned();
+    let root_key_id = root.key_id().to_owned();
+    let issuer = root.subject();
+    let algorithm = root.signature_algorithm();
+    let mut child = EphemeralKey::new_child(
+        KeyType::P256,
+        ephemeral_test_subject(),
+        issuer,
+        validity,
+        &mut root,
+        algorithm.clone(),
+    )
+    .await
+    .unwrap();
+
+    let dir = TempDir::with_prefix("sush-").unwrap();
+    let log = Logger::root(Discard, o!("test" => function_name!()));
+    let baseboard = BaseboardId {
+        part_number: "test part".to_string(),
+        serial_number: "0000".to_string(),
+    };
+    let gossip = Peer::seed().into_rumors();
+    let peer = gossip.clone();
+    let shutdown = CancellationToken::new();
+    let mgr = JobManager::new(
+        log,
+        PathIsolation::InsecureDisable,
+        dir.path().to_owned(),
+        baseboard,
+        gossip,
+        from_ref(&root_cert),
+        shutdown,
+    )
+    .await
+    .unwrap();
+    let authn = fake_identity(&mut root).await;
+    timeout(
+        Duration::from_secs(1),
+        mgr.import_cert(&authn, child.cert().clone(), true),
+    )
+    .await
+    .expect("timed out importing child")
+    .expect("could not import child");
+
+    // A self-signed homonym of the root: same subject, different key,
+    // and therefore a different key ID.
+    let fake_root = EphemeralKey::new_root(KeyType::P256, root.subject(), validity).unwrap();
+    assert_ne!(fake_root.key_id(), &root_key_id);
+    let import = |key: &EphemeralKey| {
+        Message::Request(Request::cert(CertRequest::Import(key.cert().clone()))).into()
+    };
+    peer.send(import(&fake_root));
+
+    // A homonym of the root issued by an outsider.
+    let mut outsider =
+        EphemeralKey::new_root(KeyType::P256, ephemeral_test_subject(), validity).unwrap();
+    let outsider_issuer = outsider.subject();
+    let outsider_algorithm = outsider.signature_algorithm();
+    let fake_delegate = EphemeralKey::new_child(
+        KeyType::P256,
+        root.subject(),
+        outsider_issuer,
+        validity,
+        &mut outsider,
+        outsider_algorithm,
+    )
+    .await
+    .unwrap();
+    peer.send(import(&fake_delegate));
+
+    // A different certificate bearing the child's key.
+    let mut conflict = child.cert().clone();
+    conflict.tbs_certificate.validity = Validity::from_now(Duration::from_secs(120)).unwrap();
+    peer.send(Message::Request(Request::cert(CertRequest::Import(conflict))).into());
+
+    // A grandchild sent on the same handle marks the batch processed
+    // once it validates.
+    let child_issuer = child.subject();
+    let grandchild = EphemeralKey::new_child(
+        KeyType::P256,
+        ephemeral_test_subject(),
+        child_issuer,
+        validity,
+        &mut child,
+        algorithm,
+    )
+    .await
+    .unwrap();
+    peer.send(import(&grandchild));
+    timeout(Duration::from_secs(30), async {
+        while mgr.cert_chain(&authn, grandchild.key_id()).is_err() {
+            sleep(Duration::from_millis(50)).await;
+        }
+    })
+    .await
+    .expect("grandchild never validated");
+
+    // The anchor and the established chain are intact, and neither
+    // homonym ever became usable.
+    assert_eq!(
+        mgr.cert_chain(&authn, &root_key_id).unwrap(),
+        vec![root_cert.clone()]
+    );
+    assert_eq!(
+        mgr.cert_chain(&authn, child.key_id()).unwrap(),
+        vec![root_cert, child.cert().clone()]
+    );
+    assert!(mgr.cert_chain(&authn, fake_root.key_id()).is_err());
+    assert!(mgr.cert_chain(&authn, fake_delegate.key_id()).is_err());
+}
+
+/// A certificate whose subject name matches another's cannot take its
+/// place as an issuer: chains resolve through the key that verifies.
+#[named]
+#[tokio::test]
+async fn homonym_issuer_resolves_to_true_parent() {
+    let validity = Validity::from_now(Duration::from_secs(60)).unwrap();
+    let mut root =
+        EphemeralKey::new_root(KeyType::P256, ephemeral_test_subject(), validity).unwrap();
+    let root_cert = root.cert().to_owned();
+    let issuer = root.subject();
+    let algorithm = root.signature_algorithm();
+    let shared_subject = ephemeral_test_subject();
+    let mut child = EphemeralKey::new_child(
+        KeyType::P256,
+        shared_subject.clone(),
+        issuer,
+        validity,
+        &mut root,
+        algorithm.clone(),
+    )
+    .await
+    .unwrap();
+    let mut outsider =
+        EphemeralKey::new_root(KeyType::P256, ephemeral_test_subject(), validity).unwrap();
+    let outsider_issuer = outsider.subject();
+    let outsider_algorithm = outsider.signature_algorithm();
+    let homonym = EphemeralKey::new_child(
+        KeyType::P256,
+        shared_subject,
+        outsider_issuer,
+        validity,
+        &mut outsider,
+        outsider_algorithm,
+    )
+    .await
+    .unwrap();
+    assert_ne!(homonym.key_id(), child.key_id());
+
+    let dir = TempDir::with_prefix("sush-").unwrap();
+    let log = Logger::root(Discard, o!("test" => function_name!()));
+    let baseboard = BaseboardId {
+        part_number: "test part".to_string(),
+        serial_number: "0000".to_string(),
+    };
+    let gossip = Peer::seed().into_rumors();
+    let peer = gossip.clone();
+    let shutdown = CancellationToken::new();
+    let mgr = JobManager::new(
+        log,
+        PathIsolation::InsecureDisable,
+        dir.path().to_owned(),
+        baseboard,
+        gossip,
+        from_ref(&root_cert),
+        shutdown,
+    )
+    .await
+    .unwrap();
+    let authn = fake_identity(&mut root).await;
+
+    // The homonym arrives before the certificate it mimics, then the
+    // real intermediate and a grandchild that names their shared
+    // subject as its issuer.
+    peer.send(Message::Request(Request::cert(CertRequest::Import(homonym.cert().clone()))).into());
+    timeout(
+        Duration::from_secs(1),
+        mgr.import_cert(&authn, child.cert().clone(), true),
+    )
+    .await
+    .expect("timed out importing child")
+    .expect("could not import child");
+    let child_issuer = child.subject();
+    let grandchild = EphemeralKey::new_child(
+        KeyType::P256,
+        ephemeral_test_subject(),
+        child_issuer,
+        validity,
+        &mut child,
+        algorithm,
+    )
+    .await
+    .unwrap();
+    timeout(
+        Duration::from_secs(1),
+        mgr.import_cert(&authn, grandchild.cert().clone(), true),
+    )
+    .await
+    .expect("timed out importing grandchild")
+    .expect("could not import grandchild");
+
+    // The chain runs through the key that verifies, and the homonym
+    // never becomes usable, its issuer being a stranger.
+    assert_eq!(
+        mgr.cert_chain(&authn, grandchild.key_id()).unwrap(),
+        vec![root_cert, child.cert().clone(), grandchild.cert().clone()]
+    );
+    assert!(mgr.cert_chain(&authn, homonym.key_id()).is_err());
 }
 
 #[named]

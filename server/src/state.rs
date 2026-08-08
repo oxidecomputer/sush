@@ -294,19 +294,26 @@ impl State {
         self.history.get_job_status(job_id)
     }
 
+    /// Import the first certificate seen for a key. Re-importing the
+    /// identical certificate is a no-op; anything else at an occupied
+    /// key ID is refused, so no import can displace an established
+    /// certificate.
     fn import_cert(&mut self, cert: &Certificate) -> Result<KeyId, KeyError> {
-        if self.certs.len() >= MAX_CERTS {
-            return Err(KeyError::TooManyCerts(MAX_CERTS));
+        if cert.tbs_certificate.subject == cert.tbs_certificate.issuer {
+            return Err(KeyError::SelfSigned);
         }
-
         let key_id = KeyId::try_from(cert)?;
-        if let Some(CertState::Revoked(_, when)) = self.certs.get(&key_id) {
-            return Err(KeyError::Revoked(key_id, *when));
+        match self.certs.get(&key_id) {
+            Some(CertState::Revoked(_, when)) => Err(KeyError::Revoked(key_id, *when)),
+            Some(existing) if existing.cert() == Some(cert) => Ok(key_id),
+            Some(_) => Err(KeyError::CertConflict(key_id)),
+            None if self.certs.len() >= MAX_CERTS => Err(KeyError::TooManyCerts(MAX_CERTS)),
+            None => {
+                self.certs
+                    .insert(key_id.clone(), CertState::Unknown(Box::new(cert.clone())));
+                Ok(key_id)
+            }
         }
-
-        self.certs
-            .insert(key_id.clone(), CertState::Unknown(Box::new(cert.clone())));
-        Ok(key_id)
     }
 
     pub fn cert_chain(&self, key_id: &KeyId) -> Result<Vec<Certificate>, KeyError> {
@@ -753,13 +760,16 @@ impl StateManager {
 /// ```
 ///
 /// Allowed transitions are `Unknown → Valid` on successful chain validation;
-/// `Unknown → Unknown` when an unknown issuer is encountered during validation;
-/// `Unknown → Invalid` on a permanent failure (bad signature or encoding);
-/// and any state `→ Revoked`, from which no state ever returns.
+/// `Unknown → Unknown` while no valid issuer verifies the certificate;
+/// `Unknown → Invalid` on an intrinsic failure (bad encoding, or self-signed
+/// without being a root); and any state `→ Revoked`, from which no state
+/// ever returns.
 #[derive(Debug)]
 pub enum CertState {
     Unknown(Box<Certificate>),
-    Valid(Box<Certificate>),
+    /// A validated certificate and the key ID of the issuer that
+    /// verified it, or `None` for a root.
+    Valid(Box<Certificate>, Option<KeyId>),
     Invalid(KeyError),
     Revoked(KeyId, DateTime<Utc>),
 }
@@ -770,11 +780,18 @@ impl CertState {
     }
 
     fn is_valid(&self) -> bool {
-        matches!(self, Self::Valid(_))
+        matches!(self, Self::Valid(..))
+    }
+
+    fn cert(&self) -> Option<&Certificate> {
+        match self {
+            Self::Unknown(cert) | Self::Valid(cert, _) => Some(cert),
+            Self::Invalid(_) | Self::Revoked(..) => None,
+        }
     }
 
     fn map_valid<R>(&self, f: impl FnOnce(&Certificate) -> &R) -> Option<&R> {
-        if let Self::Valid(cert) = self {
+        if let Self::Valid(cert, _) = self {
             Some(f(cert))
         } else {
             None
@@ -798,29 +815,32 @@ impl CertState {
             let tbs = with_err!(cert.tbs_certificate.to_der());
             let subject = &cert.tbs_certificate.subject;
             let issuer = &cert.tbs_certificate.issuer;
-            let root = subject == issuer;
-            if root {
-                let key_id = with_err!(KeyId::try_from(issuer));
+            if subject == issuer {
+                let key_id = with_err!(KeyId::try_from(cert.as_ref()));
                 if !roots.contains(&key_id) {
                     return Self::Invalid(KeyError::SelfSigned);
                 }
                 with_err!(
                     signature.verify_with_spki(&tbs, &cert.tbs_certificate.subject_public_key_info)
                 );
-            } else {
-                let issuer_key_id = with_err!(KeyId::try_from(issuer));
-                if let Some(issuer) = certs.get(&issuer_key_id)
-                    && let Some(spki) =
-                        issuer.map_valid(|cert| &cert.tbs_certificate.subject_public_key_info)
+                return Self::Valid(cert, None);
+            }
+            // The issuer name only routes: the parent is whichever valid
+            // certificate of that name verifies the signature, so a
+            // homonym cannot take the true parent's place. Until such a
+            // parent arrives the certificate stays `Unknown`, keeping
+            // the outcome independent of delivery order.
+            for (key_id, candidate) in certs {
+                if let Some(parent) = candidate.map_valid(|cert| cert)
+                    && parent.tbs_certificate.subject == *issuer
+                    && signature
+                        .verify_with_spki(&tbs, &parent.tbs_certificate.subject_public_key_info)
+                        .is_ok()
                 {
-                    with_err!(signature.verify_with_spki(&tbs, spki));
-                } else {
-                    // Don't complain about the missing cert, because certs could
-                    // arrive out of order.
-                    return Self::Unknown(cert);
+                    return Self::Valid(cert, Some(key_id.clone()));
                 }
             }
-            Self::Valid(cert)
+            Self::Unknown(cert)
         } else {
             self
         }
@@ -862,9 +882,9 @@ pub fn cert_chain(certs: &Certificates, key_id: &KeyId) -> Result<Vec<Certificat
         if chain.len() >= MAX_CERT_CHAIN_LEN {
             return Err(KeyError::CertChainTooLong);
         }
-        let cert = match certs.get(&key_id) {
+        let (cert, parent) = match certs.get(&key_id) {
             None | Some(CertState::Unknown(_)) => return Err(KeyError::MissingCert(key_id)),
-            Some(CertState::Valid(cert)) => *cert.clone(),
+            Some(CertState::Valid(cert, parent)) => (*cert.clone(), parent.clone()),
             Some(CertState::Invalid(error)) => {
                 return Err(KeyError::InvalidCert(error.to_string()));
             }
@@ -872,11 +892,11 @@ pub fn cert_chain(certs: &Certificates, key_id: &KeyId) -> Result<Vec<Certificat
                 return Err(KeyError::Revoked(key_id.clone(), *when));
             }
         };
-        chain.push(cert.clone());
-        if cert.tbs_certificate.subject == cert.tbs_certificate.issuer {
-            break;
+        chain.push(cert);
+        match parent {
+            None => break,
+            Some(parent) => key_id = parent,
         }
-        key_id = KeyId::try_from(&cert.tbs_certificate.issuer)?;
     }
     assert!(!chain.is_empty());
     chain.reverse();

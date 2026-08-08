@@ -86,21 +86,14 @@ impl From<&Self> for KeyId {
     }
 }
 
-impl TryFrom<&Name> for KeyId {
-    type Error = KeyError;
-
-    fn try_from(name: &Name) -> Result<KeyId, Self::Error> {
-        let hash = Sha256::digest(&name.to_der()?);
-        let phrase = id_phrase(U256::from_be_slice(hash.as_slice()));
-        Ok(KeyId(phrase.join(WORD_SEPARATOR)))
-    }
-}
-
+/// Key IDs are derived from a certificate's public key.
 impl TryFrom<&Certificate> for KeyId {
     type Error = KeyError;
 
     fn try_from(cert: &Certificate) -> Result<Self, Self::Error> {
-        Self::try_from(&cert.tbs_certificate.subject)
+        let hash = Sha256::digest(cert.tbs_certificate.subject_public_key_info.to_der()?);
+        let phrase = id_phrase(U256::from_be_slice(hash.as_slice()));
+        Ok(KeyId(phrase.join(WORD_SEPARATOR)))
     }
 }
 
@@ -745,8 +738,7 @@ impl EphemeralKey {
     ) -> Result<Self, KeyError> {
         let key = SigningKey::new(key_type);
         let cert = Self::self_signed_cert(&key, subject, validity)?;
-        let subject = cert.tbs_certificate.subject.to_owned();
-        let key_id = KeyId::try_from(&subject)?;
+        let key_id = KeyId::try_from(&cert)?;
         Signature::try_from(&cert)?.verify_with_spki(
             &cert.tbs_certificate.to_der()?,
             &cert.tbs_certificate.subject_public_key_info,
@@ -764,7 +756,6 @@ impl EphemeralKey {
         signature_algorithm: AlgorithmIdentifierOwned,
     ) -> Result<Self, KeyError> {
         let key = SigningKey::new(key_type);
-        let key_id = KeyId::try_from(&subject)?;
         let tbs_certificate = Self::tbs_certificate(
             &key,
             Self::generate_serial_number()?,
@@ -776,6 +767,7 @@ impl EphemeralKey {
         let cert = Self::sign_cert(tbs_certificate, signer)
             .await
             .map_err(|e| KeyError::Signer(e.to_string()))?;
+        let key_id = KeyId::try_from(&cert)?;
         Ok(Self { key, key_id, cert })
     }
 
@@ -904,6 +896,8 @@ pub fn pem_cert_chain(certs: Vec<Certificate>) -> Result<String, KeyError> {
 pub enum KeyError {
     #[error("Certificate chain is too long")]
     CertChainTooLong,
+    #[error("A different certificate for key `{0}` is already imported")]
+    CertConflict(KeyId),
     #[error("DER encoding error: {0}")]
     Der(#[from] x509_cert::der::Error),
     #[error("Invalid certificate: {0}")]
