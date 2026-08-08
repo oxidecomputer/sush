@@ -9,7 +9,7 @@
 //! that must be readily transmissible over low bandwidth channels (e.g.,
 //! email, voice, printed or handwritten notes, etc.).
 
-use crypto_bigint::{Limb, Random as _, Reciprocal, U256, Wrapping};
+use crypto_bigint::{CheckedAdd as _, CheckedMul as _, Limb, Random as _, Reciprocal, U256};
 use rand_core::OsRng;
 use thiserror::Error;
 
@@ -91,21 +91,28 @@ pub fn generate_id() -> String {
 /// accept non-canonical codephrases, e.g., ones with spaces instead of
 /// separators, words in mixed case, or without leading zeros. This is
 /// for the comfort of humans that may have to transmit such phrases.
+/// It rejects phrases that no entropy encodes to: unknown words, more
+/// than [`PHRASE_WORDS_256`] words, or a value of 256 bits or more.
+/// The empty phrase decodes to zero; callers that must distinguish
+/// absent input from a zero value should check before decoding.
 pub fn decode_phrase(phrase: &str) -> Result<U256, InvalidCodephrase> {
-    let b = Wrapping(U256::from_u64(WORDLIST_LEN as u64));
-    let mut n = Wrapping(U256::ZERO);
+    let b = U256::from_u64(WORDLIST_LEN as u64);
+    let mut n = U256::ZERO;
+    let mut words = 0;
     for word in phrase
         .to_ascii_lowercase()
         .replace(WORD_SEPARATOR, " ")
         .split_ascii_whitespace()
-        .take(PHRASE_WORDS_256)
     {
-        let i = index(word)?;
-        let r = Wrapping(U256::from_u64(i as u64));
-        n *= b;
-        n += r;
+        words += 1;
+        if words > PHRASE_WORDS_256 {
+            return Err(InvalidCodephrase);
+        }
+        let r = U256::from_u64(index(word)? as u64);
+        n = Option::from(n.checked_mul(&b)).ok_or(InvalidCodephrase)?;
+        n = Option::from(n.checked_add(&r)).ok_or(InvalidCodephrase)?;
     }
-    Ok(n.0)
+    Ok(n)
 }
 
 #[cfg(test)]
@@ -145,6 +152,26 @@ mod test {
             round_trip(U256::from_u64(b.pow(3) + b - 1)),
             "ability-abandon-abandon-zoo"
         );
+        round_trip(U256::MAX);
+    }
+
+    #[test]
+    fn non_phrases() {
+        // Unknown words, wherever they appear.
+        assert!(decode_phrase("plugh").is_err());
+        assert!(decode_phrase("abandon-plugh").is_err());
+
+        // More words than any entropy encodes to.
+        let long = [word(0); PHRASE_WORDS_256 + 1].join(WORD_SEPARATOR);
+        assert!(decode_phrase(&long).is_err());
+
+        // 24-word values of 256 bits or more: the smallest, exactly
+        // 2^256, and the largest.
+        let mut smallest = vec![word(8)];
+        smallest.extend([word(0); PHRASE_WORDS_256 - 1]);
+        assert!(decode_phrase(&smallest.join(WORD_SEPARATOR)).is_err());
+        let largest = [word(WORDLIST_LEN - 1); PHRASE_WORDS_256].join(WORD_SEPARATOR);
+        assert!(decode_phrase(&largest).is_err());
     }
 
     #[test]

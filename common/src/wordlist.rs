@@ -236,6 +236,8 @@ mod test {
             WORDLIST.len(),
             "duplicate words in word list"
         );
+        // `codephrases::index` binary searches the list.
+        assert!(WORDLIST.is_sorted(), "unsorted word list");
         assert!(
             WORDLIST
                 .iter()
