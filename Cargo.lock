@@ -1784,20 +1784,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "kms-agent"
-version = "0.0.1"
-source = "git+https://github.com/oxidecomputer/kms-agent?branch=lib#9c5b99d703e7ed005be4c93361e7e22ecccfd255"
-dependencies = [
- "bytes",
- "der",
- "p256",
- "spki",
- "ssh-encoding",
- "ssh-key",
- "thiserror 2.0.18",
-]
-
-[[package]]
 name = "lazy_static"
 version = "1.5.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -3573,7 +3559,6 @@ dependencies = [
  "http-range-header",
  "humantime",
  "indicatif",
- "kms-agent",
  "memmap2",
  "p256",
  "pem-rfc7468",
@@ -3615,7 +3600,6 @@ dependencies = [
  "ed25519-dalek",
  "http 1.4.0",
  "http-range-header",
- "kms-agent",
  "p256",
  "pem-rfc7468",
  "rand 0.8.5",

@@ -18,7 +18,6 @@ use ed25519_dalek::{
     Signature as Ed25519Signature, Signer as _, SigningKey as Ed25519SigningKey,
     VerifyingKey as Ed25519VerifyingKey,
 };
-use kms_agent_lib::protocol::{ProtocolError, SshBufReader as _, SshBufWriter as _};
 use p256::{SecretKey as P256SecretKey, ecdsa};
 use rand_core::OsRng;
 use schemars::schema::Schema;
@@ -27,7 +26,7 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest as _, Sha256};
 use signature::Verifier;
 use ssh_key::{
-    Algorithm as SshAlgorithm, EcdsaCurve, Error as SshKeyError, Signature as SshSignature,
+    Algorithm as SshAlgorithm, EcdsaCurve, Error as SshKeyError, Mpint, Signature as SshSignature,
 };
 use thiserror::Error;
 use x509_cert::der::Encode as _;
@@ -105,7 +104,6 @@ impl TryFrom<&Certificate> for KeyId {
     }
 }
 
-#[allow(clippy::disallowed_types)]
 impl TryFrom<&ssh_key::PublicKey> for KeyId {
     type Error = KeyError;
 
@@ -271,8 +269,8 @@ impl EncodedSignature {
             ))),
             SkEcdsaSha2NistP256 => {
                 let mut bytes = BytesMut::new();
-                bytes.put_mpint(r)?;
-                bytes.put_mpint(s)?;
+                put_mpint(&mut bytes, r)?;
+                put_mpint(&mut bytes, s)?;
                 bytes.put_u8(*flags);
                 bytes.put_u32(*counter);
                 Ok(Signature::SkEcdsaSha256(SshSignature::new(
@@ -334,8 +332,8 @@ impl Signature {
             Self::SkEcdsaSha256(signature) => {
                 let (signature, flags, counter) = sk_split(signature.as_bytes())?;
                 let mut signature = BytesMut::from(signature);
-                let r = signature.try_get_mpint()?;
-                let s = signature.try_get_mpint()?;
+                let r = get_mpint(&mut signature)?;
+                let s = get_mpint(&mut signature)?;
                 let e = || KeyError::InvalidSignatureEncoding;
                 Ok(EncodedSignature {
                     r: codephrase(U256::from_be_slice(r.as_positive_bytes().ok_or_else(e)?)),
@@ -402,6 +400,26 @@ impl Signature {
         }
         Ok(())
     }
+}
+
+/// Append one SSH mpint, encoded from positive big-endian bytes.
+fn put_mpint(buf: &mut BytesMut, bytes: impl AsRef<[u8]>) -> Result<(), KeyError> {
+    let mpint = Mpint::from_positive_bytes(bytes.as_ref())?;
+    let bytes = mpint.as_bytes();
+    buf.put_u32(bytes.len() as u32);
+    buf.put_slice(bytes);
+    Ok(())
+}
+
+/// Take one SSH mpint off the front of `buf`.
+fn get_mpint(buf: &mut BytesMut) -> Result<Mpint, KeyError> {
+    let malformed = |_| KeyError::InvalidSignatureEncoding;
+    let length = buf.try_get_u32().map_err(malformed)? as usize;
+    if buf.remaining() < length {
+        return Err(KeyError::InvalidSignatureEncoding);
+    }
+    let blob = buf.copy_to_bytes(length);
+    Ok(Mpint::from_positive_bytes(&blob)?)
 }
 
 /// Decode an `SK-*` signature into `(signature, flags, counter)`.
@@ -906,8 +924,6 @@ pub enum KeyError {
     MissingCert(KeyId),
     #[error(transparent)]
     Pem(#[from] pem_rfc7468::Error),
-    #[error("SSH agent protocol error: {0}")]
-    Protocol(#[from] ProtocolError),
     #[error("Certificate for key `{0}` was revoked at {1}")]
     Revoked(KeyId, DateTime<Utc>),
     #[error("Will not import a self-signed (root) certificate")]

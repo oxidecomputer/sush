@@ -15,7 +15,6 @@ crypto-bigint.workspace = true
 ed25519-dalek.workspace = true
 http-range-header.workspace = true
 http.workspace = true
-kms-agent.workspace = true
 p256.workspace = true
 pem-rfc7468.workspace = true
 rand.workspace = true

@@ -1454,7 +1454,7 @@ pub enum CommandError {
     #[error("❌ Can't parse target baseboard ID: {0}")]
     BaseboardIdParseError(sled_hardware_types::BaseboardIdParseError),
     #[error("❌ SSH key error: {0}")]
-    SshKey(#[from] kms_agent_lib::ssh_key::Error),
+    SshKey(#[from] ssh_key::Error),
     #[error("❌ Timed out waiting for job")]
     TimedOut,
     #[error("❌ Too much output to display on terminal, try `--file`")]

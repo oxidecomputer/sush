@@ -20,7 +20,7 @@ jobs:
       uses: oxidecomputer/oidcx-action@main
       with:
         service: github
-        repositories: oxidecomputer/permission-slip,oxidecomputer/kms-agent
+        repositories: oxidecomputer/permission-slip
         permissions: contents:read
         configure-git: true
 
