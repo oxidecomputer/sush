@@ -230,8 +230,13 @@ impl CommandContext for Repl {
 
     // Job signing certificates
 
-    fn cert_chain(&mut self, key_id: KeyId, certs: &str) -> Result<Certificate, CommandError> {
-        self.cli.cert_chain(key_id, certs)
+    fn cert_chain(
+        &mut self,
+        key_id: KeyId,
+        certs: &str,
+        roots: &[Certificate],
+    ) -> Result<Certificate, CommandError> {
+        self.cli.cert_chain(key_id, certs, roots)
     }
 
     fn cert_imported(&mut self, path: &Path, key_id: KeyId) -> Result<(), CommandError> {

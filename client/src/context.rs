@@ -103,7 +103,12 @@ pub trait CommandContext: Clone + Send + Sync {
     fn attach_denied(&mut self, key_id: &KeyId);
 
     // Job signing certificates
-    fn cert_chain(&mut self, key_id: KeyId, certs: &str) -> Result<Certificate, CommandError>;
+    fn cert_chain(
+        &mut self,
+        key_id: KeyId,
+        certs: &str,
+        roots: &[Certificate],
+    ) -> Result<Certificate, CommandError>;
     fn cert_imported(&mut self, path: &Path, key_id: KeyId) -> Result<(), CommandError>;
 
     // Job management

@@ -6,7 +6,7 @@
 //!
 //! May be executed via either the main CLI or the interactive REPL.
 
-use std::fs::{File, OpenOptions};
+use std::fs::{File, OpenOptions, read};
 use std::io::{Read as _, Seek as _, SeekFrom, Write as _, stdin};
 use std::num::{NonZeroU8, NonZeroU64};
 use std::path::{Path, PathBuf};
@@ -33,6 +33,8 @@ use tokio::{pin, select};
 use tokio_tungstenite::WebSocketStream;
 use tokio_tungstenite::tungstenite::error::Error as WebSocketError;
 use tokio_tungstenite::tungstenite::protocol::Role;
+use x509_cert::Certificate;
+use x509_cert::der::DecodePem as _;
 
 use sush_api::JobWait;
 use sush_common::authn::{
@@ -291,7 +293,14 @@ pub enum CertCommand {
     Import { path: PathBuf },
 
     /// Get the certificate chain that validates a key, in root-to-leaf order.
-    Chain { key_id: KeyId },
+    Chain {
+        key_id: KeyId,
+
+        /// Trusted root certificates (PEM) to verify the chain against.
+        /// Without any, only the chain's internal consistency is checked.
+        #[arg(long = "root-cert")]
+        root_certs: Vec<PathBuf>,
+    },
 }
 
 #[derive(Clone, Debug, Default, Subcommand)]
@@ -650,13 +659,18 @@ async fn cert(
             ctx.cert_imported(&path, key_id)
         }
 
-        CertCommand::Chain { key_id } => {
+        CertCommand::Chain { key_id, root_certs } => {
+            let mut roots = Vec::new();
+            for path in &root_certs {
+                let pem = read(path).map_err(|err| CommandError::io(path, err))?;
+                roots.push(Certificate::from_pem(&pem)?);
+            }
             let certs = with_login(ctx, client, async || {
                 client.cert_chain().key_id(&key_id).send().await
             })
             .await?
             .into_inner();
-            ctx.cert_chain(key_id, &certs)?;
+            ctx.cert_chain(key_id, &certs, &roots)?;
             Ok(())
         }
     }
@@ -1395,6 +1409,8 @@ pub enum CommandError {
     Authn(#[from] AuthnError),
     #[error("❌ Canceled")]
     Canceled,
+    #[error("❌ Certificate for `{0}` is outside its validity window")]
+    CertExpired(String),
     #[error("❌ Chunk size must be positive")]
     ChunkSizeZero,
     #[error("❓ {0}")]
@@ -1491,6 +1507,8 @@ pub enum CommandError {
     TimedOut,
     #[error("❌ Too much output to display on terminal, try `--file`")]
     TooMuchOutput,
+    #[error("❌ Chain root does not match any supplied root certificate")]
+    UntrustedRoot,
     #[error("❌ Can't start interactive session: {0}")]
     Upgrade(String),
     #[error("❌ UTF-8 error: {0}")]

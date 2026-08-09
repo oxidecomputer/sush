@@ -7,7 +7,7 @@
 use std::io::{self, BufRead as _, Read as _, Write as _, stderr, stdin, stdout};
 use std::path::Path;
 use std::sync::{Arc, Mutex};
-use std::time::Duration;
+use std::time::{Duration, SystemTime};
 
 use bytesize::ByteSize;
 use chrono::TimeDelta;
@@ -127,7 +127,12 @@ impl CommandContext for Cli {
 
     // Job signing certificates
 
-    fn cert_chain(&mut self, key_id: KeyId, certs: &str) -> Result<Certificate, CommandError> {
+    fn cert_chain(
+        &mut self,
+        key_id: KeyId,
+        certs: &str,
+        roots: &[Certificate],
+    ) -> Result<Certificate, CommandError> {
         let mut chain = Certificate::load_pem_chain(certs.as_bytes())?;
         let Some((root, rest)) = chain.split_first() else {
             return Err(CommandError::EmptyCertChain);
@@ -135,35 +140,47 @@ impl CommandContext for Cli {
         if root.tbs_certificate.subject != root.tbs_certificate.issuer {
             return Err(CommandError::InvalidRootCert);
         }
+        if !roots.is_empty() && !roots.contains(root) {
+            return Err(CommandError::UntrustedRoot);
+        }
         let tbs = root.tbs_certificate.to_der()?;
         Signature::try_from(root)?
             .verify_with_spki(&tbs, &root.tbs_certificate.subject_public_key_info)?;
-        if matches!(self.get_output_format(), OutputFormat::Text) {
-            println!(
-                "✅ Verified root certificate for subject `{}`",
-                root.tbs_certificate.subject
-            );
-        }
 
+        let now = SystemTime::now();
         let mut prev = root;
+        for cert in &chain {
+            let validity = &cert.tbs_certificate.validity;
+            if now < validity.not_before.to_system_time()
+                || now > validity.not_after.to_system_time()
+            {
+                return Err(CommandError::CertExpired(
+                    cert.tbs_certificate.subject.to_string(),
+                ));
+            }
+        }
         for cert in rest {
             let tbs = cert.tbs_certificate.to_der()?;
             Signature::try_from(cert)?
                 .verify_with_spki(&tbs, &prev.tbs_certificate.subject_public_key_info)?;
             prev = cert;
-            if matches!(self.get_output_format(), OutputFormat::Text) {
-                println!(
-                    "✅ Verified certificate for subject `{}`",
-                    cert.tbs_certificate.subject
-                );
-            }
         }
         if KeyId::try_from(prev)? != key_id {
             return Err(CommandError::InvalidLeafCert(key_id));
         }
 
-        if matches!(self.get_output_format(), OutputFormat::Json) {
-            println!("{}", json!(certs));
+        match self.get_output_format() {
+            OutputFormat::Json => println!("{}", json!(certs)),
+            OutputFormat::Text => {
+                if roots.is_empty() {
+                    println!("✅ Verified chain consistency");
+                } else {
+                    println!("✅ Verified chain against supplied root");
+                }
+                for cert in &chain {
+                    println!("   {}", cert.tbs_certificate.subject);
+                }
+            }
         }
 
         chain.pop().ok_or(CommandError::EmptyCertChain)
@@ -653,4 +670,62 @@ fn stderr_err<E: Into<io::Error>>(err: E) -> CommandError {
 
 fn stdin_err<E: Into<io::Error>>(err: E) -> CommandError {
     CommandError::io("stdin", err.into())
+}
+
+#[cfg(test)]
+mod test {
+    use std::slice::from_ref;
+    use std::time::Duration;
+
+    use x509_cert::time::Validity;
+
+    use sush_common::keys::{EphemeralKey, KeyType, pem_cert_chain};
+
+    use super::*;
+
+    async fn chain(validity: Validity) -> (KeyId, String, Certificate) {
+        let subject = |name: &str| format!("CN={name},O=Test,C=US").parse().unwrap();
+        let mut root = EphemeralKey::new_root(KeyType::P256, subject("root"), validity).unwrap();
+        let issuer = root.subject();
+        let algorithm = root.signature_algorithm();
+        let child = EphemeralKey::new_child(
+            KeyType::P256,
+            subject("child"),
+            issuer,
+            validity,
+            &mut root,
+            algorithm,
+        )
+        .await
+        .unwrap();
+        let pem = pem_cert_chain(vec![root.cert().clone(), child.cert().clone()]).unwrap();
+        (child.key_id().clone(), pem, root.cert().clone())
+    }
+
+    /// A chain verifies against a supplied root, or unanchored for
+    /// consistency only; a different root or an expired certificate
+    /// is refused.
+    #[tokio::test]
+    async fn cert_chains() {
+        let validity = Validity::from_now(Duration::from_secs(600)).unwrap();
+        let (key_id, pem, root) = chain(validity).await;
+        let mut cli = Cli::default();
+        cli.cert_chain(key_id.clone(), &pem, from_ref(&root))
+            .unwrap();
+        cli.cert_chain(key_id.clone(), &pem, &[]).unwrap();
+
+        let (_, _, other_root) = chain(validity).await;
+        assert!(matches!(
+            cli.cert_chain(key_id, &pem, &[other_root]).unwrap_err(),
+            CommandError::UntrustedRoot
+        ));
+
+        let brief = Validity::from_now(Duration::from_secs(1)).unwrap();
+        let (key_id, pem, root) = chain(brief).await;
+        tokio::time::sleep(Duration::from_secs(2)).await;
+        assert!(matches!(
+            cli.cert_chain(key_id, &pem, &[root]).unwrap_err(),
+            CommandError::CertExpired(_)
+        ));
+    }
 }
