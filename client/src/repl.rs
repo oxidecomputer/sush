@@ -347,11 +347,11 @@ impl CommandContext for Repl {
         self.cli.please_touch(identity)
     }
 
-    fn really_revoke(&mut self, key_id: KeyId) -> Result<KeyId, CommandError> {
-        self.cli.really_revoke(key_id)
+    fn really_revoke(&mut self, what: &str, key_id: KeyId) -> Result<KeyId, CommandError> {
+        self.cli.really_revoke(what, key_id)
     }
 
-    fn identity_revoked(&mut self, key_id: KeyId) -> Result<(), CommandError> {
-        self.cli.identity_revoked(key_id)
+    fn revoked(&mut self, what: &str, key_id: KeyId) -> Result<(), CommandError> {
+        self.cli.revoked(what, key_id)
     }
 }

@@ -602,11 +602,11 @@ impl CommandContext for Cli {
         Ok(())
     }
 
-    fn really_revoke(&mut self, key_id: KeyId) -> Result<KeyId, CommandError> {
+    fn really_revoke(&mut self, what: &str, key_id: KeyId) -> Result<KeyId, CommandError> {
         match self.get_output_format() {
             OutputFormat::Json => Ok(key_id),
             OutputFormat::Text => {
-                let prompt = format!("❓ Really revoke identity `{key_id}` (yes/no)? ");
+                let prompt = format!("❓ Really revoke {what} `{key_id}` (yes/no)? ");
                 if read_bool(&prompt)? {
                     Ok(key_id)
                 } else {
@@ -616,10 +616,10 @@ impl CommandContext for Cli {
         }
     }
 
-    fn identity_revoked(&mut self, key_id: KeyId) -> Result<(), CommandError> {
+    fn revoked(&mut self, what: &str, key_id: KeyId) -> Result<(), CommandError> {
         match self.get_output_format() {
             OutputFormat::Json => println!("{}", json!({"revoked": key_id})),
-            OutputFormat::Text => println!("✅ Revoked SSH identity `{key_id}`"),
+            OutputFormat::Text => println!("✅ Revoked {what} `{key_id}`"),
         }
         Ok(())
     }

@@ -10,7 +10,7 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use chrono::Utc;
+use chrono::{DateTime, Utc};
 use http_range_header::SyntacticallyCorrectRange as Range;
 use lru::LruCache;
 use sled_hardware_types::BaseboardId;
@@ -47,6 +47,13 @@ const MAX_CACHED_IDENTITIES: NonZeroUsize = NonZeroUsize::new(1_000).unwrap();
 /// for the whole nonce TTL to lock a user out.
 const MAX_OUTSTANDING_NONCES: NonZeroUsize = NonZeroUsize::new(10_000).unwrap();
 
+/// Maximum number of revoked SSH keys remembered for login refusal.
+/// Any authenticated key may revoke, so a flood of junk revocations
+/// can evict a real one; entries never expire, so unlike nonces the
+/// eviction is permanent. This is sized so the flood takes thousands
+/// of authenticated, attributed, logged requests.
+const MAX_REVOKED_KEYS: NonZeroUsize = NonZeroUsize::new(10_000).unwrap();
+
 /// Maximum amount of time we're willing to wait for job start or stop.
 const WAIT_TIMEOUT: Duration = Duration::from_secs(600);
 
@@ -78,6 +85,7 @@ pub struct JobManager {
     log: Logger,
     nonces: Arc<Mutex<LruCache<Nonce, Instant>>>,
     identities: Arc<Mutex<LruCache<(KeyId, Nonce), CachedIdentity>>>,
+    revoked_keys: Arc<Mutex<LruCache<KeyId, DateTime<Utc>>>>,
     output_dir: JobOutputDir,
     own_baseboard: BaseboardId,
     state: watch::Receiver<State>, // from the state manager
@@ -112,6 +120,7 @@ impl JobManager {
             log: log.new(o!("component" => "job manager")),
             nonces: Arc::new(Mutex::new(LruCache::new(MAX_OUTSTANDING_NONCES))),
             identities: Arc::new(Mutex::new(LruCache::new(MAX_CACHED_IDENTITIES))),
+            revoked_keys: Arc::new(Mutex::new(LruCache::new(MAX_REVOKED_KEYS))),
             own_baseboard,
             output_dir,
             state: rx_state,
@@ -151,7 +160,7 @@ impl JobManager {
 
     // Certificate management.
 
-    pub async fn import_cert(
+    pub async fn cert_import(
         &self,
         authn: &Identity,
         cert: Certificate,
@@ -177,6 +186,23 @@ impl JobManager {
         key_id: &KeyId,
     ) -> Result<Vec<Certificate>, JobError> {
         Ok(self.state.borrow().cert_chain(key_id)?)
+    }
+
+    pub async fn cert_revoke(
+        &self,
+        authn: &Identity,
+        key_id: KeyId,
+        wait: bool,
+    ) -> Result<(), JobError> {
+        if self.state.borrow().is_root(&key_id) {
+            return Err(JobError::RootRevocation(key_id));
+        }
+        self.cert_request(authn, CertRequest::Revoke(key_id.clone(), Utc::now()))
+            .await?;
+        if wait {
+            self.wait_for(self.wait_for_revocation(key_id)).await?;
+        }
+        Ok(())
     }
 
     // Identity management.
@@ -253,6 +279,11 @@ impl JobManager {
             unauthorized!("initial credentials presented outside iam");
         }
 
+        // Refuse revoked keys.
+        if self.revoked_keys.lock().await.get(&key_id).is_some() {
+            unauthorized!("key is revoked");
+        }
+
         // Claim the nonce.
         let Some(minted) = self.nonces.lock().await.pop(&nonce) else {
             unauthorized!("nonce not found");
@@ -298,6 +329,18 @@ impl JobManager {
             .collect())
     }
 
+    pub async fn iam_revoke(&self, _authn: &Identity, key_id: KeyId) -> Result<(), JobError> {
+        let now = Utc::now();
+        let mut identities = self.identities.lock().await;
+        for (_, cached) in identities.iter_mut().filter(|((id, _), _)| *id == key_id) {
+            cached.identity.time_revoked = Some(now);
+        }
+        drop(identities);
+        self.revoked_keys.lock().await.put(key_id.clone(), now);
+        info!(self.log, "revoked identity"; "key_id" => %key_id);
+        Ok(())
+    }
+
     // Waiting.
 
     pub fn take_join_handle(&mut self) -> Option<JoinHandle<()>> {
@@ -306,6 +349,10 @@ impl JobManager {
 
     fn wait_for_cert(&self, key_id: KeyId) -> impl FnMut(&State) -> bool {
         move |state| state.cert_chain(&key_id).is_ok()
+    }
+
+    fn wait_for_revocation(&self, key_id: KeyId) -> impl FnMut(&State) -> bool {
+        move |state| state.is_cert_revoked(&key_id)
     }
 
     fn wait_for_session(&self, session_id: SessionId) -> impl FnMut(&State) -> bool {

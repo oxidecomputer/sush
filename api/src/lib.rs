@@ -38,7 +38,7 @@ pub trait SushApi {
     ///
     /// The body should be a PEM encoded X.509 certificate.
     #[endpoint { method = PUT, path = "/certs" }]
-    async fn import_cert(
+    async fn cert_import(
         ctx: RequestContext<Self::Context>,
         headers: Header<Authorization>,
         query: QueryParams<WaitParam>,
@@ -54,6 +54,18 @@ pub trait SushApi {
         headers: Header<Authorization>,
         params: PathParams<KeyIdParam>,
     ) -> Result<HttpResponseOk<String>, HttpError>;
+
+    /// Revoke a certificate.
+    ///
+    /// Revocation is permanent and propagates across the rack.
+    /// Root certificates cannot be revoked.
+    #[endpoint { method = POST, path = "/certs/{key_id}/revoke" }]
+    async fn cert_revoke(
+        ctx: RequestContext<Self::Context>,
+        headers: Header<Authorization>,
+        params: PathParams<KeyIdParam>,
+        query: QueryParams<WaitParam>,
+    ) -> Result<HttpResponseUpdatedNoContent, HttpError>;
 
     // Identity management.
 
@@ -73,6 +85,18 @@ pub trait SushApi {
         ctx: RequestContext<Self::Context>,
         headers: Header<Authorization>,
     ) -> Result<HttpResponseOk<Vec<Identity>>, HttpError>;
+
+    /// Revoke an SSH identity.
+    ///
+    /// Expires the key's cached identities and refuses its future
+    /// logins. Identities are not shared across the rack, so this
+    /// applies only to the server handling the request.
+    #[endpoint { method = POST, path = "/iam/{key_id}/revoke" }]
+    async fn iam_revoke(
+        ctx: RequestContext<Self::Context>,
+        headers: Header<Authorization>,
+        params: PathParams<KeyIdParam>,
+    ) -> Result<HttpResponseUpdatedNoContent, HttpError>;
 
     // Session management.
 

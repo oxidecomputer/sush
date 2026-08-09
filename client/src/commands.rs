@@ -301,6 +301,9 @@ pub enum CertCommand {
         #[arg(long = "root-cert")]
         root_certs: Vec<PathBuf>,
     },
+
+    /// Permanently revoke a certificate across the rack.
+    Revoke { key_id: KeyId },
 }
 
 #[derive(Clone, Debug, Default, Subcommand)]
@@ -315,6 +318,10 @@ pub enum IdentityCommand {
     /// Log in to the server as an SSH identity.
     #[default]
     Login,
+
+    /// Revoke an SSH identity and refuse its future logins.
+    /// Applies only to the server handling the request.
+    Revoke { key_id: KeyId },
 }
 
 #[derive(Clone, Debug, Subcommand)]
@@ -637,6 +644,15 @@ async fn iam(
                 .into_inner();
             ctx.iam(&identity)
         }
+
+        IdentityCommand::Revoke { key_id } => {
+            let key_id = ctx.really_revoke("SSH identity", key_id)?;
+            with_login(ctx, client, async || {
+                client.iam_revoke().key_id(&key_id).send().await
+            })
+            .await?;
+            ctx.revoked("SSH identity", key_id)
+        }
     }
 }
 
@@ -652,7 +668,7 @@ async fn cert(
             let mut cert = Vec::new();
             file.read_to_end(&mut cert).map_err(io_error)?;
             let key_id = with_login(ctx, client, async || {
-                client.import_cert().body(cert.clone()).send().await
+                client.cert_import().body(cert.clone()).send().await
             })
             .await?
             .into_inner();
@@ -672,6 +688,15 @@ async fn cert(
             .into_inner();
             ctx.cert_chain(key_id, &certs, &roots)?;
             Ok(())
+        }
+
+        CertCommand::Revoke { key_id } => {
+            let key_id = ctx.really_revoke("certificate", key_id)?;
+            with_login(ctx, client, async || {
+                client.cert_revoke().key_id(&key_id).wait(true).send().await
+            })
+            .await?;
+            ctx.revoked("certificate", key_id)
         }
     }
 }

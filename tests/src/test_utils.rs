@@ -24,9 +24,9 @@ use sush_common::authn::{Challenge, ChallengeResponse, Credentials, Identity, No
 use sush_common::codephrases::generate_id;
 use sush_common::jobs::{JobId, JobStartRequest, VerifiedJob};
 use sush_common::keys::{EphemeralKey, KeyType, Signer};
-use sush_server::JobManager;
 use sush_server::executor::PathIsolation;
 use sush_server::state::GossipNetwork;
+use sush_server::{JobError, JobManager};
 
 static TEST_BASEBOARD_ID: OnceLock<BaseboardId> = OnceLock::new();
 
@@ -102,6 +102,29 @@ pub async fn fake_identity(key: &mut EphemeralKey) -> Identity {
         .verify_with_ssh_public_key(&key.ssh_public_key())
         .unwrap();
     Identity::new(key.ssh_public_key(), verified, Utc::now()).unwrap()
+}
+
+/// Log in at the manager layer, without a client or server.
+pub async fn manager_login(mgr: &JobManager, key: &mut EphemeralKey) -> Result<Authz, JobError> {
+    let JobError::Unauthorized(nonce) = mgr.iam(None, None, ("POST", "/iam")).await.unwrap_err()
+    else {
+        panic!("expected a challenge");
+    };
+    let challenge = Challenge::new(nonce);
+    let request_key = RequestKey::new();
+    let response = ChallengeResponse::new(challenge, request_key.verifier());
+    let signed = key.sign(response).await.unwrap();
+    let public_key = key.ssh_public_key();
+    let verified = signed.verify_with_ssh_public_key(&public_key).unwrap();
+    let mut credentials = Credentials::new(verified);
+    credentials.key_id = public_key.key_id().unwrap();
+    mgr.iam(
+        Some(credentials.to_string()),
+        Some(public_key),
+        ("POST", "/iam"),
+    )
+    .await?;
+    Ok(Authz::new(credentials, request_key))
 }
 
 pub async fn manager_and_test_root(

@@ -336,7 +336,7 @@ impl State {
     /// identical certificate is a no-op; anything else at an occupied
     /// key ID is refused, so no import can displace an established
     /// certificate.
-    fn import_cert(&mut self, cert: &Certificate) -> Result<KeyId, KeyError> {
+    fn cert_import(&mut self, cert: &Certificate) -> Result<KeyId, KeyError> {
         if cert.tbs_certificate.subject == cert.tbs_certificate.issuer {
             return Err(KeyError::SelfSigned);
         }
@@ -370,6 +370,15 @@ impl State {
         self.certs.len()
     }
 
+    pub fn is_root(&self, key_id: &KeyId) -> bool {
+        self.roots.contains(key_id)
+    }
+
+    pub fn is_cert_revoked(&self, key_id: &KeyId) -> bool {
+        matches!(self.certs.get(key_id), Some(CertState::Revoked(..)))
+            || self.tombstones.peek(key_id).is_some()
+    }
+
     fn update(
         &mut self,
         log: &Logger,
@@ -384,7 +393,7 @@ impl State {
         match message.as_ref() {
             V0(Message::Request(request)) => match request {
                 Request::Cert(attributed) => match attributed.as_parts() {
-                    (actor, CertRequest::Import(cert)) => match self.import_cert(cert) {
+                    (actor, CertRequest::Import(cert)) => match self.cert_import(cert) {
                         Ok(key_id) => {
                             info!(log, "imported certificate"; "key_id" => %key_id, "actor" => %actor);
                             self.validate_certs(&self.roots.clone());

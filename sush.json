@@ -9,7 +9,7 @@
       "put": {
         "summary": "Import a certificate, verify its signature, and return a key ID for it.",
         "description": "The body should be a PEM encoded X.509 certificate.",
-        "operationId": "import_cert",
+        "operationId": "cert_import",
         "parameters": [
           {
             "in": "header",
@@ -103,6 +103,50 @@
         }
       }
     },
+    "/certs/{key_id}/revoke": {
+      "post": {
+        "summary": "Revoke a certificate.",
+        "description": "Revocation is permanent and propagates across the rack. Root certificates cannot be revoked.",
+        "operationId": "cert_revoke",
+        "parameters": [
+          {
+            "in": "header",
+            "name": "authorization",
+            "description": "Authorization to access some resource, such as a signature.\n\nSee: <https://developer.mozilla.org/en-US/docs/Web/HTTP/Reference/Headers/Authorization>",
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "in": "path",
+            "name": "key_id",
+            "required": true,
+            "schema": {
+              "$ref": "#/components/schemas/KeyId"
+            }
+          },
+          {
+            "in": "query",
+            "name": "wait",
+            "description": "Wait for the subject to appear in the state.",
+            "schema": {
+              "type": "boolean"
+            }
+          }
+        ],
+        "responses": {
+          "204": {
+            "description": "resource updated"
+          },
+          "4XX": {
+            "$ref": "#/components/responses/Error"
+          },
+          "5XX": {
+            "$ref": "#/components/responses/Error"
+          }
+        }
+      }
+    },
     "/iam": {
       "get": {
         "summary": "List cached identities.",
@@ -176,6 +220,42 @@
                 }
               }
             }
+          },
+          "4XX": {
+            "$ref": "#/components/responses/Error"
+          },
+          "5XX": {
+            "$ref": "#/components/responses/Error"
+          }
+        }
+      }
+    },
+    "/iam/{key_id}/revoke": {
+      "post": {
+        "summary": "Revoke an SSH identity.",
+        "description": "Expires the key's cached identities and refuses its future logins. Identities are not shared across the rack, so this applies only to the server handling the request.",
+        "operationId": "iam_revoke",
+        "parameters": [
+          {
+            "in": "header",
+            "name": "authorization",
+            "description": "Authorization to access some resource, such as a signature.\n\nSee: <https://developer.mozilla.org/en-US/docs/Web/HTTP/Reference/Headers/Authorization>",
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "in": "path",
+            "name": "key_id",
+            "required": true,
+            "schema": {
+              "$ref": "#/components/schemas/KeyId"
+            }
+          }
+        ],
+        "responses": {
+          "204": {
+            "description": "resource updated"
           },
           "4XX": {
             "$ref": "#/components/responses/Error"
@@ -1403,7 +1483,7 @@
         ]
       },
       "Access": {
-        "description": "Attach access to a session's interactive jobs. The session starter always has read-write access; guests have what they were granted.",
+        "description": "Attach access to a session's interactive jobs. The session starter always has read-write access; guests have what they were granted. Read-write means co-driving a shell the job signature authorized, so who deserves it is deployment policy. Recorded output is not gated: it is the customer's data, readable by any authenticated key.",
         "type": "string",
         "enum": [
           "read-only",

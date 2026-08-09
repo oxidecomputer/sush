@@ -37,7 +37,7 @@ use sush_server::{JobError, JobManager};
 
 use crate::test_utils::{
     SignJobRequest as _, ephemeral_test_subject, fake_identity, manager_and_test_root,
-    manager_test_root_and_peer, test_logger,
+    manager_login, manager_test_root_and_peer, test_logger,
 };
 use sush_server::executor::PathIsolation;
 
@@ -521,7 +521,7 @@ async fn cert_chain() {
     // Test failure modes.
     assert!(
         matches!(
-            mgr.import_cert(&authn, root_cert.clone(), false)
+            mgr.cert_import(&authn, root_cert.clone(), false)
                 .await
                 .unwrap_err(),
             JobError::Key(KeyError::SelfSigned),
@@ -534,7 +534,7 @@ async fn cert_chain() {
     );
     timeout(
         Duration::from_secs(1),
-        mgr.import_cert(&authn, child.cert().clone(), true),
+        mgr.cert_import(&authn, child.cert().clone(), true),
     )
     .await
     .expect("timed out importing child")
@@ -707,11 +707,103 @@ async fn revocation_tombstones() {
     .expect("revocation never landed");
     timeout(
         Duration::from_secs(30),
-        mgr.import_cert(&authn, spared.cert().clone(), true),
+        mgr.cert_import(&authn, spared.cert().clone(), true),
     )
     .await
     .expect("timed out importing spared child")
     .expect("could not import spared child");
+}
+
+/// Certificate revocation through the API: roots are refused, known
+/// certificates stop validating, and unseen certificates are
+/// tombstoned so their eventual import is refused.
+#[named]
+#[tokio::test]
+async fn cert_revoke() {
+    let log = test_logger(function_name!());
+    let (mgr, mut root, _dir, _shutdown) = manager_and_test_root(log).await;
+    let authn = fake_identity(&mut root).await;
+    let validity = Validity::from_now(Duration::from_secs(60)).unwrap();
+    let issuer = root.subject();
+    let algorithm = root.signature_algorithm();
+    let child = EphemeralKey::new_child(
+        KeyType::P256,
+        ephemeral_test_subject(),
+        issuer.clone(),
+        validity,
+        &mut root,
+        algorithm.clone(),
+    )
+    .await
+    .unwrap();
+    let unseen = EphemeralKey::new_child(
+        KeyType::P256,
+        ephemeral_test_subject(),
+        issuer,
+        validity,
+        &mut root,
+        algorithm,
+    )
+    .await
+    .unwrap();
+
+    assert!(matches!(
+        mgr.cert_revoke(&authn, root.key_id().clone(), false).await,
+        Err(JobError::RootRevocation(_)),
+    ));
+
+    mgr.cert_import(&authn, child.cert().clone(), true)
+        .await
+        .unwrap();
+    mgr.cert_revoke(&authn, child.key_id().clone(), true)
+        .await
+        .unwrap();
+    assert!(matches!(
+        mgr.cert_chain(&authn, child.key_id()),
+        Err(JobError::Key(KeyError::Revoked(..))),
+    ));
+
+    mgr.cert_revoke(&authn, unseen.key_id().clone(), true)
+        .await
+        .unwrap();
+    mgr.cert_import(&authn, unseen.cert().clone(), false)
+        .await
+        .unwrap();
+    timeout(Duration::from_secs(30), async {
+        loop {
+            match mgr.cert_chain(&authn, unseen.key_id()) {
+                Err(JobError::Key(KeyError::Revoked(..))) => break,
+                _ => sleep(Duration::from_millis(50)).await,
+            }
+        }
+    })
+    .await
+    .expect("tombstone never consumed the import");
+}
+
+/// Identity revocation: live bound credentials die and the key may
+/// not log back in.
+#[named]
+#[tokio::test]
+async fn iam_revoke() {
+    let log = test_logger(function_name!());
+    let (mgr, mut root, _dir, _shutdown) = manager_and_test_root(log).await;
+    let authz = manager_login(&mgr, &mut root).await.unwrap();
+    let key_id = root.ssh_public_key().key_id().unwrap();
+    let header = authz.header("GET", "/sessions");
+    let authn = mgr
+        .iam(Some(header), None, ("GET", "/sessions"))
+        .await
+        .unwrap();
+
+    mgr.iam_revoke(&authn, key_id).await.unwrap();
+    let header = authz.header("GET", "/sessions");
+    assert!(
+        mgr.iam(Some(header), None, ("GET", "/sessions"))
+            .await
+            .is_err()
+    );
+    assert!(manager_login(&mgr, &mut root).await.is_err());
 }
 
 /// Attach access: strangers are refused, the starter grants and
@@ -898,7 +990,7 @@ async fn hostile_imports_cannot_displace() {
     let authn = fake_identity(&mut root).await;
     timeout(
         Duration::from_secs(1),
-        mgr.import_cert(&authn, child.cert().clone(), true),
+        mgr.cert_import(&authn, child.cert().clone(), true),
     )
     .await
     .expect("timed out importing child")
@@ -1053,7 +1145,7 @@ async fn homonym_issuer_resolves_to_true_parent() {
     );
     timeout(
         Duration::from_secs(1),
-        mgr.import_cert(&authn, child.cert().clone(), true),
+        mgr.cert_import(&authn, child.cert().clone(), true),
     )
     .await
     .expect("timed out importing child")
@@ -1071,7 +1163,7 @@ async fn homonym_issuer_resolves_to_true_parent() {
     .unwrap();
     timeout(
         Duration::from_secs(1),
-        mgr.import_cert(&authn, grandchild.cert().clone(), true),
+        mgr.cert_import(&authn, grandchild.cert().clone(), true),
     )
     .await
     .expect("timed out importing grandchild")

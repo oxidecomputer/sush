@@ -52,7 +52,7 @@ impl SushApi for ApiServer {
 
     // Certificate management.
 
-    async fn import_cert(
+    async fn cert_import(
         ctx: RequestContext<Self::Context>,
         headers: Header<Authorization>,
         query: QueryParams<WaitParam>,
@@ -67,7 +67,7 @@ impl SushApi for ApiServer {
         let bytes = params.into_inner();
         let cert = Certificate::from_pem(&bytes).map_err(JobError::DecodeCert)?;
         let key_id = KeyId::try_from(&cert).map_err(JobError::Key)?;
-        mgr.import_cert(&authn, cert, wait).await?;
+        mgr.cert_import(&authn, cert, wait).await?;
         Ok(HttpResponseOk(key_id))
     }
 
@@ -85,6 +85,23 @@ impl SushApi for ApiServer {
         let certs = mgr.cert_chain(&authn, &key_id)?;
         let chain = pem_cert_chain(certs).map_err(JobError::Key)?;
         Ok(HttpResponseOk(chain))
+    }
+
+    async fn cert_revoke(
+        ctx: RequestContext<Self::Context>,
+        headers: Header<Authorization>,
+        params: PathParams<KeyIdParam>,
+        query: QueryParams<WaitParam>,
+    ) -> Result<HttpResponseUpdatedNoContent, HttpError> {
+        let mgr = ctx.context();
+        let Authorization { authorization } = headers.into_inner();
+        let authn = mgr
+            .iam(authorization, None, request_line(&ctx.request))
+            .await?;
+        let KeyIdParam { key_id } = params.into_inner();
+        let WaitParam { wait } = query.into_inner();
+        mgr.cert_revoke(&authn, key_id, wait).await?;
+        Ok(HttpResponseUpdatedNoContent())
     }
 
     // Identity management.
@@ -113,6 +130,21 @@ impl SushApi for ApiServer {
             .iam(authorization, None, request_line(&ctx.request))
             .await?;
         Ok(HttpResponseOk(mgr.identities(&authn).await?))
+    }
+
+    async fn iam_revoke(
+        ctx: RequestContext<Self::Context>,
+        headers: Header<Authorization>,
+        params: PathParams<KeyIdParam>,
+    ) -> Result<HttpResponseUpdatedNoContent, HttpError> {
+        let mgr = ctx.context();
+        let Authorization { authorization } = headers.into_inner();
+        let authn = mgr
+            .iam(authorization, None, request_line(&ctx.request))
+            .await?;
+        let KeyIdParam { key_id } = params.into_inner();
+        mgr.iam_revoke(&authn, key_id).await?;
+        Ok(HttpResponseUpdatedNoContent())
     }
 
     // Session management.

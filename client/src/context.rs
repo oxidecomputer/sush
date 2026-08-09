@@ -141,6 +141,6 @@ pub trait CommandContext: Clone + Send + Sync {
     fn iam(&mut self, identity: &Identity) -> Result<(), CommandError>;
     fn identities(&mut self, identities: &[SshPublicKey]) -> Result<(), CommandError>;
     fn please_touch(&mut self, identity: &SshPublicKey) -> Result<(), CommandError>;
-    fn really_revoke(&mut self, key_id: KeyId) -> Result<KeyId, CommandError>;
-    fn identity_revoked(&mut self, key_id: KeyId) -> Result<(), CommandError>;
+    fn really_revoke(&mut self, what: &str, key_id: KeyId) -> Result<KeyId, CommandError>;
+    fn revoked(&mut self, what: &str, key_id: KeyId) -> Result<(), CommandError>;
 }
