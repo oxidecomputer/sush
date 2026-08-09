@@ -186,8 +186,8 @@ pub enum LastJob {
 pub struct Session {
     session_id: SessionId,
     last_job: LastJob,
-    /// The key that started the session, where known. `None` in
-    /// client-side trackers; servers record the verified starter.
+    /// The key that started the session, where known. Client-side
+    /// trackers leave it `None`. Servers record the verified starter.
     started_by: Option<KeyId>,
 }
 
@@ -677,7 +677,7 @@ impl Default for JobLimits {
 }
 
 /// Attach access to a session's interactive jobs. The session starter
-/// always has read-write access; guests have what they were granted.
+/// always has read-write access. Guests have what they were granted.
 /// Read-write means co-driving a shell the job signature authorized,
 /// so who deserves it is deployment policy. Recorded output is not
 /// gated: it is the customer's data, readable by any authenticated key.

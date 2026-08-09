@@ -344,11 +344,11 @@ impl FromStr for Authn {
 /// falls out of the window and fails.
 pub const SEQ_WINDOW: u64 = 256;
 
-/// Which sequence numbers an identity has already spent, tracked over
-/// the [`SEQ_WINDOW`] most recent values (the highest seen and the
-/// rest below it), so that concurrent requests may arrive out of order
-/// without opening a replay. Anything older than the window is refused
-/// outright. Bit `age` of `seen` marks `highest - age` as spent.
+/// The sequence numbers an identity has spent, tracked over the
+/// [`SEQ_WINDOW`] values up to the highest seen. The window lets
+/// concurrent requests arrive out of order without opening a replay.
+/// Anything older is refused. Bit `age` of `seen` marks
+/// `highest - age` as spent.
 #[derive(Clone, Copy, Debug, Default)]
 pub struct SeqWindow {
     highest: u64,
@@ -622,7 +622,7 @@ impl FromStr for AuthnParams {
 pub enum AuthnError {
     #[error(transparent)]
     Codephrase(#[from] InvalidCodephrase),
-    #[error("Duplicate authentication parameter `{0}")]
+    #[error("Duplicate authentication parameter `{0}`")]
     DuplicateParam(String),
     #[error("Invalid ephemeral key")]
     InvalidKey,
@@ -724,7 +724,7 @@ mod test {
             Authn::Bound(parsed) if parsed == creds
         ));
 
-        // The method is signed case-insensitively; everything else
+        // The method is signed case-insensitively. Everything else
         // must match exactly.
         verifier.verify(&request, &creds).unwrap();
         let verify =

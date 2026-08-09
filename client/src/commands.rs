@@ -81,7 +81,7 @@ const DEFAULT_CHUNK_SIZE: ByteSize = ByteSize::mib(32);
 /// Default number of simultaneous downloads for large output.
 const PARALLEL_CHUNKS: NonZeroU8 = NonZeroU8::new(8).unwrap();
 
-/// Most simultaneous downloads allowed; see [`parallel_chunks`].
+/// Most simultaneous downloads allowed (see [`parallel_chunks`]).
 const MAX_PARALLEL_CHUNKS: NonZeroU8 = NonZeroU8::new(64).unwrap();
 
 // Job polling and spinner update intervals.

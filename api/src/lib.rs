@@ -258,7 +258,7 @@ pub struct SessionAndKeyIds {
 
 #[derive(Deserialize, JsonSchema)]
 pub struct AccessParam {
-    /// How much access to grant; read-only if omitted.
+    /// How much access to grant. Read-only if omitted.
     #[serde(default)]
     pub access: Access,
 }

@@ -686,7 +686,7 @@ async fn revocation_tombstones() {
     }
     peer.send(revoke(doomed.key_id().clone()));
 
-    // The revocation outlives the spam and refuses the import; the
+    // The revocation outlives the spam and refuses the import. The
     // spam blocks nothing else.
     peer.send(
         Message::Request(Request::cert(

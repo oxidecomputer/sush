@@ -12,10 +12,10 @@ and the Support Shell prompt is `sush# `.
 In one terminal, start the server:
 
 ```
-$ cargo run --bin=sush-server -- --debug
+$ cargo run --bin=sush-server
      Running `target/debug/sush-server`
-Jan 29 14:08:17.672 INFO imported root certificate, key_id: much-hedgehog-cup-bleak-energy-village-lawn-pumpkin, component: job-manager
-Jan 29 14:08:17.672 INFO listening, local_addr: 0.0.0.0:44444
+Aug 09 03:41:44.592 INFO managing state, component: state manager
+Aug 09 03:41:44.594 INFO listening, local_addr: 0.0.0.0:44444
 ```
 
 > [!NOTE]
@@ -35,7 +35,7 @@ $ cargo run --bin=sush --features permslip -- repl
      Running `target/debug/sush repl`
 ✅ Output format set to `text`
 ✅ Server URL set to `http://localhost:44444`
-✅ SSH agent socket set to `/run/user/1000/keyring/ssh`
+✅ SSH agent socket set to `/run/user/1000/ssh-agent.sock`
 ✅ SSH key ID unset
 sush# 
 ```

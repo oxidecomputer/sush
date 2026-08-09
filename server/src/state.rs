@@ -333,7 +333,7 @@ impl State {
     }
 
     /// Import the first certificate seen for a key. Re-importing the
-    /// identical certificate is a no-op; anything else at an occupied
+    /// identical certificate is a no-op. Anything else at an occupied
     /// key ID is refused, so no import can displace an established
     /// certificate.
     fn cert_import(&mut self, cert: &Certificate) -> Result<KeyId, KeyError> {
@@ -342,7 +342,7 @@ impl State {
         }
         let key_id = KeyId::try_from(cert)?;
         // A tombstone becomes a durable revocation once its
-        // certificate shows up; `certs` may briefly exceed `MAX_CERTS`
+        // certificate shows up. `certs` may briefly exceed `MAX_CERTS`
         // by the tombstone count.
         if let Some(when) = self.tombstones.pop(&key_id) {
             self.certs

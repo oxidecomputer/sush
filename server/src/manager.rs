@@ -42,14 +42,14 @@ use crate::state::{GossipNetwork, MAX_CERTS, State, StateManager};
 const MAX_CACHED_IDENTITIES: NonZeroUsize = NonZeroUsize::new(1_000).unwrap();
 
 /// Maximum number of outstanding authentication nonces. Every failed
-/// request mints one, so garbage traffic evicts real challenges; this
+/// request mints one, so garbage traffic evicts real challenges. This
 /// is sized so a flood must sustain hundreds of requests per second
 /// for the whole nonce TTL to lock a user out.
 const MAX_OUTSTANDING_NONCES: NonZeroUsize = NonZeroUsize::new(10_000).unwrap();
 
 /// Maximum number of revoked SSH keys remembered for login refusal.
 /// Any authenticated key may revoke, so a flood of junk revocations
-/// can evict a real one; entries never expire, so unlike nonces the
+/// can evict a real one. Entries never expire, so unlike nonces the
 /// eviction is permanent. This is sized so the flood takes thousands
 /// of authenticated, attributed, logged requests.
 const MAX_REVOKED_KEYS: NonZeroUsize = NonZeroUsize::new(10_000).unwrap();
@@ -449,7 +449,7 @@ impl JobManager {
     }
 
     /// Only the session starter may grant or deny attach access. The
-    /// authoritative check is in the state machine; this one fails fast.
+    /// authoritative check is in the state machine. This one fails fast.
     fn starter_check(&self, authn: &Identity) -> Result<(), JobError> {
         match self.state.borrow().session() {
             None => Err(JobError::NoSession),

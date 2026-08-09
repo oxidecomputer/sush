@@ -1,7 +1,36 @@
 name: Test
-on: [push]
+on: [push, pull_request]
 jobs:
   Test:
+    runs-on: ubuntu-22.04-8core
+    permissions:
+      contents: read
+    steps:
+    - name: Install Rust toolchain
+      uses: dtolnay/rust-toolchain@master
+      with:
+        toolchain: 1.91
+        components: clippy,rustfmt
+
+    - name: Checkout
+      uses: actions/checkout@v6
+
+    - name: Lint
+      run: |
+        cargo fmt -- --check &&
+        cargo clippy -- --no-deps --deny warnings &&
+        cargo clippy --tests -- --no-deps --deny warnings
+
+    - name: Build
+      run: cargo build --locked
+
+    - name: Test
+      run: cargo test
+
+  # The permslip feature pulls in permission-slip, which is private, so
+  # this job only runs where the OIDC exchange can succeed.
+  Permslip:
+    if: github.event_name == 'push' && github.repository == 'oxidecomputer/sush'
     runs-on: ubuntu-22.04-8core
     permissions:
       contents: read
@@ -11,7 +40,7 @@ jobs:
       uses: dtolnay/rust-toolchain@master
       with:
         toolchain: 1.91
-        components: clippy,rustfmt
+        components: clippy
 
     - name: Checkout
       uses: actions/checkout@v6
@@ -25,16 +54,7 @@ jobs:
         configure-git: true
 
     - name: Lint
-      run: |
-        cargo fmt -- --check &&
-        cargo clippy -- --no-deps --deny warnings &&
-        cargo clippy --tests -- --no-deps --deny warnings &&
-        cargo clippy --package sush-client --features permslip -- --no-deps --deny warnings
+      run: cargo clippy --package sush-client --features permslip -- --no-deps --deny warnings
 
     - name: Build
-      run: |
-        cargo build --locked &&
-        cargo build --locked --package sush-client --features permslip
-
-    - name: Test
-      run: cargo test
+      run: cargo build --locked --package sush-client --features permslip

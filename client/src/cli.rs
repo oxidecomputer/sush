@@ -703,7 +703,7 @@ mod test {
     }
 
     /// A chain verifies against a supplied root, or unanchored for
-    /// consistency only; a different root or an expired certificate
+    /// consistency only. A different root or an expired certificate
     /// is refused.
     #[tokio::test]
     async fn cert_chains() {

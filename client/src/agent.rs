@@ -6,7 +6,7 @@
 //! need, request-identities and sign-request.
 //!
 //! A message is a `u32` length, a type byte, and a type-specific
-//! payload; strings within are length-prefixed bytes.
+//! payload. Strings within are length-prefixed bytes.
 //!
 //! [SSH agent protocol]: https://datatracker.ietf.org/doc/html/draft-miller-ssh-agent
 
@@ -86,7 +86,7 @@ pub fn sign_request(key: &PublicKey, data: &[u8]) -> Result<Bytes, AgentError> {
 }
 
 /// Parse an identities-answer payload into its keys. Comments are
-/// consumed and dropped; our key IDs derive from the key material.
+/// consumed and dropped. Key IDs derive from the key material alone.
 pub fn identities_answer(mut payload: Bytes) -> Result<Vec<PublicKey>, AgentError> {
     let count = payload.try_get_u32()?;
     let mut keys = Vec::new();

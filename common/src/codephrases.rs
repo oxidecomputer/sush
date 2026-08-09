@@ -93,8 +93,8 @@ pub fn generate_id() -> String {
 /// for the comfort of humans that may have to transmit such phrases.
 /// It rejects phrases that no entropy encodes to: unknown words, more
 /// than [`PHRASE_WORDS_256`] words, or a value of 256 bits or more.
-/// The empty phrase decodes to zero; callers that must distinguish
-/// absent input from a zero value should check before decoding.
+/// The empty phrase decodes to zero. Callers that must distinguish
+/// absent input from zero should check before decoding.
 pub fn decode_phrase(phrase: &str) -> Result<U256, InvalidCodephrase> {
     let b = U256::from_u64(WORDLIST_LEN as u64);
     let mut n = U256::ZERO;
