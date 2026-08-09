@@ -82,7 +82,13 @@ impl Drop for TestNet {
     }
 }
 
+// Slow (~35s each): CI always runs these, and local runs should
+// whenever `link.rs` or the gossip configuration changes:
+//
+//     cargo test --package sush-server --test link -- --include-ignored
+
 #[tokio::test]
+#[ignore]
 async fn conformance() {
     let mut net = TestNet::new("conformance").await;
     timeout(
@@ -94,6 +100,7 @@ async fn conformance() {
 }
 
 #[tokio::test]
+#[ignore]
 async fn gossip_convergence() {
     let mut net = TestNet::new("gossip_convergence").await;
     let (link_a, mut link_b) = net.link_pair().await;

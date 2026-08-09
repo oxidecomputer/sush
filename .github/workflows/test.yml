@@ -40,11 +40,16 @@ jobs:
     - name: Build
       run: cargo build --locked
 
-    - name: Test
-      run: cargo test
+    - name: Install nextest
+      uses: taiki-e/install-action@nextest
 
-  # The permslip feature pulls in permission-slip, which is private, so
-  # this job only runs where the OIDC exchange can succeed.
+    - name: Test
+      run: |
+        cargo nextest run --run-ignored all &&
+        cargo test --doc
+
+  # The permslip feature pulls in permission-slip, which is private,
+  # so this job only runs where the OIDC exchange can succeed.
   Permslip:
     if: github.repository == 'oxidecomputer/sush'
     runs-on: ubuntu-22.04
