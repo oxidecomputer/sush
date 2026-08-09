@@ -8,10 +8,12 @@
 //! messages via the gossip protocol.
 
 use std::collections::BTreeMap;
+use std::num::NonZeroUsize;
 use std::sync::Arc;
 
 use chrono::{DateTime, Utc};
 use futures::{Stream, StreamExt};
+use lru::LruCache;
 use rumors::{Key, Rumors, Version};
 use sled_hardware_types::BaseboardId;
 use slog::{Logger, debug, error, info, o, warn};
@@ -52,6 +54,9 @@ pub const MAX_CERTS: usize = 100;
 /// yet next in the causal chain to run). Bounds memory in the presence
 /// of out-of-order, duplicate, or malformed submissions.
 pub const MAX_QUEUED_JOBS: usize = 1_000;
+
+/// Maximum number of revocations held for certificates not yet seen.
+pub const MAX_TOMBSTONES: NonZeroUsize = NonZeroUsize::new(100).unwrap();
 
 #[derive(Clone, Debug)]
 pub enum SessionState {
@@ -270,6 +275,9 @@ pub struct State {
     attachments: AttachmentPoints,
     /// Job request signing certificates.
     certs: Certificates,
+    /// Revocations of certificates we have never seen. Bounded and
+    /// apart from `certs`, so revocation spam evicts only itself.
+    tombstones: LruCache<KeyId, DateTime<Utc>>,
     /// Hard-coded root certificate key IDs. Self-signed certificates
     /// not in this set will be revoked with prejudice.
     roots: Box<[KeyId]>,
@@ -293,6 +301,7 @@ impl State {
             history: Default::default(),
             session: Default::default(),
             attachments: Default::default(),
+            tombstones: LruCache::new(MAX_TOMBSTONES),
             certs,
             roots: roots.clone(),
         };
@@ -332,6 +341,14 @@ impl State {
             return Err(KeyError::SelfSigned);
         }
         let key_id = KeyId::try_from(cert)?;
+        // A tombstone becomes a durable revocation once its
+        // certificate shows up; `certs` may briefly exceed `MAX_CERTS`
+        // by the tombstone count.
+        if let Some(when) = self.tombstones.pop(&key_id) {
+            self.certs
+                .insert(key_id.clone(), CertState::Revoked(key_id.clone(), when));
+            return Err(KeyError::Revoked(key_id, when));
+        }
         match self.certs.get(&key_id) {
             Some(CertState::Revoked(_, when)) => Err(KeyError::Revoked(key_id, *when)),
             Some(existing) if existing.cert() == Some(cert) => Ok(key_id),
@@ -383,8 +400,7 @@ impl State {
                             *cert = CertState::Revoked(key_id.clone(), *when);
                             info!(log, "revoked known certificate"; "key_id" => %key_id, "actor" => %actor);
                         } else {
-                            self.certs
-                                .insert(key_id.clone(), CertState::Revoked(key_id.clone(), *when));
+                            self.tombstones.put(key_id.clone(), *when);
                             info!(log, "revoked unknown certificate"; "key_id" => %key_id, "actor" => %actor);
                         }
                     }

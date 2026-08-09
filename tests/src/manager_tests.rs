@@ -29,7 +29,7 @@ use sush_common::jobs::{
     Access, JobId, JobLimits, JobOutputState, JobOutputStream::*, JobStatus, ProcessError, Session,
     SessionId,
 };
-use sush_common::keys::{EphemeralKey, KeyError, KeyType, Signer as _};
+use sush_common::keys::{EphemeralKey, KeyError, KeyId, KeyType, Signer as _};
 use sush_server::io::BATCH_OUTPUT_BUFFER_SIZE;
 use sush_server::messages::v0::{CertRequest, Message, Request, SessionRequest};
 use sush_server::output::JobOutputDir;
@@ -638,6 +638,80 @@ async fn attribution() {
     )
     .await
     .unwrap();
+}
+
+/// A revocation that precedes its certificate still lands, and
+/// revocation spam for made-up key IDs cannot block imports.
+#[named]
+#[tokio::test]
+async fn revocation_tombstones() {
+    let log = test_logger(function_name!());
+    let (mgr, mut root, peer, _dir, _shutdown) = manager_test_root_and_peer(log).await;
+    let authn = fake_identity(&mut root).await;
+    let validity = Validity::from_now(Duration::from_secs(60)).unwrap();
+    let issuer = root.subject();
+    let algorithm = root.signature_algorithm();
+    let doomed = EphemeralKey::new_child(
+        KeyType::P256,
+        ephemeral_test_subject(),
+        issuer.clone(),
+        validity,
+        &mut root,
+        algorithm.clone(),
+    )
+    .await
+    .unwrap();
+    let spared = EphemeralKey::new_child(
+        KeyType::P256,
+        ephemeral_test_subject(),
+        issuer,
+        validity,
+        &mut root,
+        algorithm,
+    )
+    .await
+    .unwrap();
+
+    // Spam revocations for keys that will never exist, then revoke the
+    // doomed child before anyone has seen its certificate.
+    let revoke = |key_id: KeyId| {
+        Message::Request(Request::cert(
+            authn.key_id.clone(),
+            CertRequest::Revoke(key_id, Utc::now()),
+        ))
+        .into()
+    };
+    for i in 0..200 {
+        peer.send(revoke(KeyId::from(format!("bogus-{i}"))));
+    }
+    peer.send(revoke(doomed.key_id().clone()));
+
+    // The revocation outlives the spam and refuses the import; the
+    // spam blocks nothing else.
+    peer.send(
+        Message::Request(Request::cert(
+            authn.key_id.clone(),
+            CertRequest::Import(doomed.cert().clone()),
+        ))
+        .into(),
+    );
+    timeout(Duration::from_secs(30), async {
+        loop {
+            match mgr.cert_chain(&authn, doomed.key_id()) {
+                Err(JobError::Key(KeyError::Revoked(..))) => break,
+                _ => sleep(Duration::from_millis(50)).await,
+            }
+        }
+    })
+    .await
+    .expect("revocation never landed");
+    timeout(
+        Duration::from_secs(30),
+        mgr.import_cert(&authn, spared.cert().clone(), true),
+    )
+    .await
+    .expect("timed out importing spared child")
+    .expect("could not import spared child");
 }
 
 /// Attach access: strangers are refused, the starter grants and
