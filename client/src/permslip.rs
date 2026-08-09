@@ -81,24 +81,26 @@ impl Signer for PermslipSigner {
             .client
             .sign()
             .params(json_to_string(&json!(params))?)
-            .body(message)
+            .body(message.clone())
             .send()
             .await?
             .into_inner();
+        let signature = match Signed::<T>::signature_algorithm_from_spki(&spki.algorithm)? {
+            AlgorithmIdentifierOwned {
+                oid: ID_ED_25519,
+                parameters: None,
+            } => Signature::Ed25519(Ed25519Signature::from_slice(&signature)?),
+            AlgorithmIdentifierOwned {
+                oid: ECDSA_WITH_SHA_256,
+                parameters: None,
+            } => Signature::EcdsaSha256(ecdsa::Signature::from_der(&signature)?),
+            _ => return Err(Self::Error::InvalidSignature),
+        };
+        signature.verify_with_spki(&message, spki)?;
         Ok(Signed::new(
             thing,
             KeyId::try_from(&cert)?,
-            match Signed::<T>::signature_algorithm_from_spki(&spki.algorithm)? {
-                AlgorithmIdentifierOwned {
-                    oid: ID_ED_25519,
-                    parameters: None,
-                } => Signature::Ed25519(Ed25519Signature::from_slice(&signature)?).encode()?,
-                AlgorithmIdentifierOwned {
-                    oid: ECDSA_WITH_SHA_256,
-                    parameters: None,
-                } => Signature::EcdsaSha256(ecdsa::Signature::from_der(&signature)?).encode()?,
-                _ => return Err(Self::Error::InvalidSignature),
-            },
+            signature.encode()?,
         ))
     }
 }

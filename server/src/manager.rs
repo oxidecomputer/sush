@@ -41,11 +41,11 @@ use crate::state::{GossipNetwork, MAX_CERTS, State, StateManager};
 /// Maximum number of cached identities.
 const MAX_CACHED_IDENTITIES: NonZeroUsize = NonZeroUsize::new(1_000).unwrap();
 
-/// Maximum number of outstanding authentication nonces.
-/// We do not really expect more than one simultaneous user,
-/// nor do we expect hostile (DoS) requests, so a small value
-/// here is adequate.
-const MAX_OUTSTANDING_NONCES: NonZeroUsize = NonZeroUsize::new(100).unwrap();
+/// Maximum number of outstanding authentication nonces. Every failed
+/// request mints one, so garbage traffic evicts real challenges; this
+/// is sized so a flood must sustain hundreds of requests per second
+/// for the whole nonce TTL to lock a user out.
+const MAX_OUTSTANDING_NONCES: NonZeroUsize = NonZeroUsize::new(10_000).unwrap();
 
 /// Maximum amount of time we're willing to wait for job start or stop.
 const WAIT_TIMEOUT: Duration = Duration::from_secs(600);

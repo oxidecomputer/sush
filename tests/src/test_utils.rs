@@ -98,7 +98,9 @@ pub async fn fake_identity(key: &mut EphemeralKey) -> Identity {
     let challenge = Challenge::new(nonce.clone());
     let response = ChallengeResponse::new(challenge, RequestKey::new().verifier());
     let signed = key.sign(response).await.unwrap();
-    let verified = signed.verify_with_cert(key.cert()).unwrap();
+    let verified = signed
+        .verify_with_ssh_public_key(&key.ssh_public_key())
+        .unwrap();
     Identity::new(key.ssh_public_key(), verified, Utc::now()).unwrap()
 }
 

@@ -98,6 +98,26 @@ pub mod v0 {
         pub fn job(actor: KeyId, request: JobRequest) -> Self {
             Self::Job(Box::new(Attributed { actor, request }))
         }
+
+        pub fn kind(&self) -> &'static str {
+            match self {
+                Self::Cert(r) => match r.request {
+                    CertRequest::Import(_) => "cert import",
+                    CertRequest::Revoke(..) => "cert revoke",
+                },
+                Self::Session(r) => match r.request {
+                    SessionRequest::Start(_) => "session start",
+                    SessionRequest::Stop(_) => "session stop",
+                    SessionRequest::Skip(..) => "session skip",
+                    SessionRequest::AllowAttach(..) => "session allow",
+                    SessionRequest::DenyAttach(..) => "session deny",
+                },
+                Self::Job(r) => match r.request {
+                    JobRequest::Start(..) => "job start",
+                    JobRequest::Stop(_) => "job stop",
+                },
+            }
+        }
     }
 
     /// Certificates are PEM-encoded X.509

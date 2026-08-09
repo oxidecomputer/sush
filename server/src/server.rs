@@ -17,7 +17,7 @@ use hyper::Response;
 use hyper::body::Frame;
 use sled_hardware_types::BaseboardId;
 use tokio_tungstenite::WebSocketStream;
-use tokio_tungstenite::tungstenite::protocol::Role;
+use tokio_tungstenite::tungstenite::protocol::{Role, WebSocketConfig};
 use x509_cert::Certificate;
 use x509_cert::der::DecodePem as _;
 
@@ -32,6 +32,9 @@ use sush_common::keys::{KeyId, SshPublicKey, pem_cert_chain};
 
 use crate::error::JobError;
 use crate::manager::JobManager;
+
+/// Cap on WebSocket messages.
+const MAX_WS_MESSAGE_SIZE: usize = 0x10_0000;
 
 pub struct ApiServer;
 
@@ -335,7 +338,10 @@ impl SushApi for ApiServer {
         let (attachment, access) = mgr.job_attachment(&authn, &job_id, &target).await?;
         upgrade.handle(async move |conn| {
             let socket = conn.into_inner();
-            let stream = WebSocketStream::from_raw_socket(socket, Role::Server, None).await;
+            let config = WebSocketConfig::default()
+                .max_message_size(Some(MAX_WS_MESSAGE_SIZE))
+                .max_frame_size(Some(MAX_WS_MESSAGE_SIZE));
+            let stream = WebSocketStream::from_raw_socket(socket, Role::Server, Some(config)).await;
             attachment.try_send((stream, access)).map_err(|_| {
                 HttpError::for_internal_error(String::from("Unable to attach to interactive job"))
             })?;

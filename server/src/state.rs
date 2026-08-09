@@ -390,7 +390,7 @@ impl State {
                             self.validate_certs(&self.roots.clone());
                         }
                         Err(error) => {
-                            error!(log, "ignoring invalid certificate"; "cert" => ?cert, "error" => %error);
+                            error!(log, "ignoring invalid certificate"; "error" => %error);
                         }
                     },
                     (actor, CertRequest::Revoke(key_id, when)) => {
@@ -797,7 +797,7 @@ impl StateManager {
                             // quiesce, updating the state all the way.
                             None => requests_empty = true,
                             Some(request) => if let Some(rumors) = &rumors {
-                                debug!(log, "forwarding request to gossip network"; "request" => ?request);
+                                debug!(log, "forwarding request to gossip network"; "kind" => request.kind());
                                 rumors.send(Message::Request(request).into());
                             },
                         },

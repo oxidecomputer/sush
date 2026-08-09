@@ -537,9 +537,13 @@ impl Identity {
         response: Verified<ChallengeResponse>,
         time_authenticated: DateTime<Utc>,
     ) -> Result<Self, KeyError> {
+        let key_id = public_key.key_id()?;
+        if response.verified_by() != &key_id {
+            return Err(KeyError::InvalidKeyId);
+        }
         let ChallengeResponse { nonce, .. } = response.into_payload();
         Ok(Self {
-            key_id: public_key.key_id()?,
+            key_id,
             public_key,
             nonce,
             time_authenticated,
@@ -630,10 +634,6 @@ pub enum AuthnError {
     InvalidScheme(String),
     #[error("Missing credential parameter `{0}`")]
     MissingParam(&'static str),
-    #[error("Invalid signature counter")]
-    InvalidSignatureCounter,
-    #[error("Invalid signature flags")]
-    InvalidSignatureFlags,
     #[error("Missing authentication scheme")]
     MissingScheme,
     #[error("Too many credential parameters")]

@@ -333,8 +333,8 @@ impl Signature {
                 let s = get_mpint(&mut signature)?;
                 let e = || KeyError::InvalidSignatureEncoding;
                 Ok(EncodedSignature {
-                    r: codephrase(U256::from_be_slice(r.as_positive_bytes().ok_or_else(e)?)),
-                    s: codephrase(U256::from_be_slice(s.as_positive_bytes().ok_or_else(e)?)),
+                    r: codephrase(u256_be(r.as_positive_bytes().ok_or_else(e)?)?),
+                    s: codephrase(u256_be(s.as_positive_bytes().ok_or_else(e)?)?),
                     flags,
                     counter,
                 })
@@ -392,11 +392,26 @@ impl Signature {
                 Verifier::verify(&public_key.0, message, &signature)?;
             }
             Self::SkEcdsaSha256(signature) | Self::SkEd25519(signature) => {
+                let (_, flags, _) = sk_split(signature.as_bytes())?;
+                if flags & SK_USER_PRESENCE == 0 {
+                    return Err(KeyError::UserPresenceRequired);
+                }
                 Verifier::verify(&public_key.0, message, signature)?;
             }
         }
         Ok(())
     }
+}
+
+/// A `U256` from up to 32 big-endian bytes. An mpint's minimal
+/// encoding may carry fewer, which `U256::from_be_slice` refuses.
+fn u256_be(bytes: &[u8]) -> Result<U256, KeyError> {
+    let Some(pad) = 32usize.checked_sub(bytes.len()) else {
+        return Err(KeyError::InvalidSignatureEncoding);
+    };
+    let mut buf = [0; 32];
+    buf[pad..].copy_from_slice(bytes);
+    Ok(U256::from_be_slice(&buf))
 }
 
 /// Append one SSH mpint, encoded from positive big-endian bytes.
@@ -418,6 +433,9 @@ fn get_mpint(buf: &mut BytesMut) -> Result<Mpint, KeyError> {
     let blob = buf.copy_to_bytes(length);
     Ok(Mpint::from_positive_bytes(&blob)?)
 }
+
+/// The `SK-*` signature flag bit attesting user presence (a touch).
+const SK_USER_PRESENCE: u8 = 0x01;
 
 /// Decode an `SK-*` signature into `(signature, flags, counter)`.
 /// See <https://cvsweb.openbsd.org/src/usr.bin/ssh/PROTOCOL.u2f?annotate=HEAD>
@@ -618,8 +636,9 @@ impl<T: ToBeSigned> Signed<T> {
     }
 }
 
-/// An envelope whose signature has been verified.
-#[derive(BorshDeserialize, BorshSerialize, Clone, Debug, Deserialize, JsonSchema, Serialize)]
+/// An envelope whose signature has been verified. Deliberately not
+/// deserializable, must be produced via verification.
+#[derive(BorshSerialize, Clone, Debug, JsonSchema, Serialize)]
 pub struct Verified<T> {
     signed: Signed<T>,
     verified_by: KeyId,
@@ -936,6 +955,8 @@ pub enum KeyError {
     SshKey(#[from] SshKeyError),
     #[error("Too many certificates ({0})")]
     TooManyCerts(usize),
+    #[error("Signature does not attest user presence")]
+    UserPresenceRequired,
 }
 
 impl KeyError {
