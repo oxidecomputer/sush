@@ -164,6 +164,7 @@ impl CommandContext for Repl {
             offline,
             ssh_auth_sock,
             ssh_key_id,
+            proxy_roots: _,
         } = args;
         if json {
             output = Some(OutputFormat::Json);

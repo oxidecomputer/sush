@@ -58,6 +58,7 @@ use crate::interactive::interactive_job;
 #[cfg(feature = "permslip")]
 use crate::permslip::{PermslipError, PermslipSigner};
 use crate::repl::Repl;
+use crate::tls;
 use crate::types::Error as ApiError;
 use crate::{Client, Error as ClientError};
 
@@ -74,6 +75,7 @@ pub const SUSH_MAX_FSIZE: &str = "SUSH_MAX_FSIZE";
 #[cfg(feature = "permslip")]
 pub const SUSH_PERMSLIP_KEY: &str = "SUSH_PERMSLIP_KEY";
 pub const SUSH_OUTPUT_FORMAT: &str = "SUSH_OUTPUT_FORMAT";
+pub const SUSH_PROXY_ROOT: &str = "SUSH_PROXY_ROOT";
 pub const SUSH_URL: &str = "SUSH_URL";
 
 /// Default chunk size for parallel downloads of large output.
@@ -151,6 +153,11 @@ pub struct GlobalArgs {
     #[arg(short, long, env = SUSH_URL)]
     #[clap(global = true)]
     pub url: Option<String>,
+
+    /// PEM roots that a proxy's TLS certificate must chain to.
+    #[arg(long = "proxy-root", env = SUSH_PROXY_ROOT, value_name = "PEM")]
+    #[clap(global = true)]
+    pub proxy_roots: Vec<PathBuf>,
 
     /// Offline mode, i.e., job signing only
     #[arg(long, default_value_t = false, conflicts_with = "url")]
@@ -499,10 +506,22 @@ impl ClientCommand {
             ctx.set_output_format(output);
         }
 
-        let client = args
-            .url
-            .as_ref()
-            .map(|url| Client::new(url, ctx.authz_signer()));
+        let client = match args.url.as_ref() {
+            Some(url) if !args.proxy_roots.is_empty() => {
+                let mut roots = Vec::new();
+                for path in &args.proxy_roots {
+                    let pem = read(path).map_err(|err| CommandError::io(path, err))?;
+                    roots.push(Certificate::from_pem(&pem)?);
+                }
+                Some(Client::new_with_client(
+                    url,
+                    tls::client(roots)?,
+                    ctx.authz_signer(),
+                ))
+            }
+            Some(url) => Some(Client::new(url, ctx.authz_signer())),
+            None => None,
+        };
         match (self, client) {
             (ClientCommand::Cert { command }, Some(client)) => cert(ctx, &client, command).await,
 
@@ -1535,6 +1554,8 @@ pub enum CommandError {
     Permslip(#[from] PermslipError),
     #[error("❌ Job process error: {0}")]
     Process(#[from] sush_common::jobs::ProcessError),
+    #[error("❌ Proxy TLS error: {0}")]
+    ProxyTls(#[from] tls::ProxyTlsError),
     #[error("👋 Goodbye!")]
     Quit,
     #[error("❌ {0}")]

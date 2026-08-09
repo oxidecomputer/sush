@@ -27,12 +27,16 @@ use hyper::upgrade::OnUpgrade;
 use hyper::{Request, Response};
 use hyper_util::rt::TokioIo;
 use percent_encoding::percent_decode_str;
+use rustls::ServerConfig;
+use rustls::version::TLS13;
 use sled_hardware_types::BaseboardId;
 use slog::{Logger, debug, error, info, o, warn};
-use tokio::io::copy_bidirectional;
+use sprockets_tls::keys::{CertResolver, ResolveSetting};
+use tokio::io::{AsyncRead, AsyncWrite, copy_bidirectional};
 use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::watch;
 use tokio::{select, spawn, try_join};
+use tokio_rustls::TlsAcceptor;
 use tokio_util::sync::CancellationToken;
 
 use sush_common::targets::{Cubbies, SledId, Target};
@@ -67,6 +71,18 @@ impl Targets {
 /// Backend responses pass through. Proxy errors carry their own body.
 type ProxyBody = Either<Incoming, Full<Bytes>>;
 
+/// The proxy's TLS identity is the sled's platform identity.
+pub fn platform_tls(log: &Logger, resolve: ResolveSetting) -> Result<ServerConfig, rustls::Error> {
+    let log = log.new(o!("component" => "proxy-cert-resolver"));
+    let resolver = Arc::new(CertResolver::new(log, resolve));
+    Ok(
+        ServerConfig::builder_with_provider(Arc::new(sprockets_tls::crypto_provider()))
+            .with_protocol_versions(&[&TLS13])?
+            .with_no_client_auth()
+            .with_cert_resolver(resolver),
+    )
+}
+
 pub struct ProxyServer {
     local_addr: SocketAddr,
     shutdown: CancellationToken,
@@ -77,11 +93,13 @@ impl ProxyServer {
     pub async fn start(
         log: &Logger,
         local_addr: SocketAddr,
+        tls: Option<ServerConfig>,
         targets: watch::Receiver<Targets>,
         shutdown: CancellationToken,
     ) -> io::Result<Self> {
         let listener = TcpListener::bind(local_addr).await?;
         let local_addr = listener.local_addr()?;
+        let acceptor = tls.map(|config| TlsAcceptor::from(Arc::new(config)));
         let router = Arc::new(Router {
             targets,
             default: Mutex::new(None),
@@ -89,6 +107,7 @@ impl ProxyServer {
         spawn(listen(
             log.new(o!("component" => "proxy")),
             listener,
+            acceptor,
             router,
             shutdown.clone(),
         ));
@@ -180,6 +199,7 @@ fn named_target<B>(request: &Request<B>) -> Option<Result<Target, String>> {
 async fn listen(
     log: Logger,
     listener: TcpListener,
+    acceptor: Option<TlsAcceptor>,
     router: Arc<Router>,
     shutdown: CancellationToken,
 ) {
@@ -189,7 +209,18 @@ async fn listen(
                 match result {
                     Ok((client, client_addr)) => {
                         let log = log.new(o!("client_addr" => client_addr));
-                        spawn(serve(log, client, router.clone()));
+                        let router = router.clone();
+                        match acceptor.clone() {
+                            Some(acceptor) => spawn(async move {
+                                match acceptor.accept(client).await {
+                                    Ok(client) => serve(log, client, router).await,
+                                    Err(err) => {
+                                        debug!(log, "TLS handshake failed"; "error" => %err);
+                                    }
+                                }
+                            }),
+                            None => spawn(serve(log, client, router)),
+                        };
                     }
                     Err(err) => {
                         error!(log, "accept failed"; "error" => %err);
@@ -207,7 +238,10 @@ async fn listen(
 
 /// Serve one client connection, forwarding each request to the sled
 /// the router picks for it.
-async fn serve(log: Logger, client: TcpStream, router: Arc<Router>) {
+async fn serve<S>(log: Logger, client: S, router: Arc<Router>)
+where
+    S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
+{
     let service = service_fn(|request| {
         let log = log.clone();
         let router = router.clone();

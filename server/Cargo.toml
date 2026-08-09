@@ -40,6 +40,7 @@ pwd.workspace = true
 rumors.workspace = true
 rand_core.workspace = true
 rustix.workspace = true
+rustls.workspace = true
 schemars.workspace = true
 serde.workspace = true
 serde_json.workspace = true
@@ -54,6 +55,7 @@ sush-common = { path = "../common" }
 tempfile.workspace = true
 thiserror.workspace = true
 tokio.workspace = true
+tokio-rustls.workspace = true
 tokio-stream.workspace = true
 tokio-util.workspace = true
 tokio-tungstenite.workspace = true

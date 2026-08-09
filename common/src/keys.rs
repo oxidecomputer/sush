@@ -23,6 +23,7 @@ use ed25519_dalek::{
     Signature as Ed25519Signature, Signer as _, SigningKey as Ed25519SigningKey,
     VerifyingKey as Ed25519VerifyingKey,
 };
+use p256::pkcs8::{self, EncodePrivateKey as _};
 use p256::{SecretKey as P256SecretKey, ecdsa};
 use rand_core::OsRng;
 use schemars::schema::Schema;
@@ -784,6 +785,41 @@ impl EphemeralKey {
         Ok(Self { key, key_id, cert })
     }
 
+    /// Ephemeral key with cert signed by an external authority,
+    /// e.g., a platform RoT. `sign` takes the TBS certificate DER
+    /// and returns raw signature bytes in whatever convention the
+    /// authority and its verifiers share. `signature_algorithm` is
+    /// the authority's claimed scheme. A nonstandard convention has
+    /// no identifier of its own, so the cert may not verify under
+    /// the algorithm it declares.
+    pub fn new_delegated<E: fmt::Display>(
+        key_type: KeyType,
+        subject: Name,
+        issuer: Name,
+        validity: Validity,
+        signature_algorithm: AlgorithmIdentifierOwned,
+        sign: impl FnOnce(&[u8]) -> Result<Vec<u8>, E>,
+    ) -> Result<Self, KeyError> {
+        let key = SigningKey::new(key_type);
+        let tbs_certificate = Self::tbs_certificate(
+            &key,
+            Self::generate_serial_number()?,
+            signature_algorithm,
+            subject,
+            issuer,
+            validity,
+        );
+        let tbs = tbs_certificate.to_der()?;
+        let signature = sign(&tbs).map_err(KeyError::signer)?;
+        let cert = Certificate {
+            signature_algorithm: tbs_certificate.signature.to_owned(),
+            signature: BitString::from_bytes(&signature)?,
+            tbs_certificate,
+        };
+        let key_id = KeyId::try_from(&cert)?;
+        Ok(Self { key, key_id, cert })
+    }
+
     /// Ephemeral key with cert signed by a parent.
     pub async fn new_child(
         key_type: KeyType,
@@ -819,6 +855,15 @@ impl EphemeralKey {
 
     pub fn cert(&self) -> &Certificate {
         &self.cert
+    }
+
+    /// Export the private key as PKCS#8 PEM, e.g., for TLS.
+    pub fn private_key_pem(&self) -> Result<String, KeyError> {
+        let pem = match &self.key {
+            SigningKey::Ed25519(key) => key.to_pkcs8_pem(LineEnding::LF)?,
+            SigningKey::P256(key) => key.to_pkcs8_pem(LineEnding::LF)?,
+        };
+        Ok(pem.to_string())
     }
 
     pub fn subject(&self) -> Name {
@@ -956,6 +1001,8 @@ pub enum KeyError {
     MissingCert(KeyId),
     #[error(transparent)]
     Pem(#[from] pem_rfc7468::Error),
+    #[error("PKCS#8 encoding error: {0}")]
+    Pkcs8(#[from] pkcs8::Error),
     #[error("Certificate for key `{0}` was revoked at {1}")]
     Revoked(KeyId, DateTime<Utc>),
     #[error("Will not import a self-signed (root) certificate")]

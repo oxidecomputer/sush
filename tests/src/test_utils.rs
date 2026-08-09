@@ -8,12 +8,14 @@ use std::sync::OnceLock;
 use std::time::Duration;
 
 use bytes::Bytes;
+use camino::Utf8PathBuf;
 use chrono::Utc;
 use futures::TryStreamExt as _;
 use rand_core::{OsRng, RngCore as _};
 use sled_hardware_types::BaseboardId;
 use slog::{Drain as _, Logger, o};
 use slog_term::{FullFormat, PlainSyncDecorator, TestStdoutWriter};
+use sprockets_tls_test_utils::{OutputFileExistsBehavior, generate_config};
 use tempfile::TempDir;
 use tokio_util::sync::CancellationToken;
 use x509_cert::name::Name;
@@ -114,6 +116,19 @@ pub fn test_logger(test_name: &'static str) -> Logger {
     let decorator = PlainSyncDecorator::new(TestStdoutWriter);
     let drain = FullFormat::new(decorator).build().fuse();
     Logger::root(drain, o!("test" => test_name))
+}
+
+/// A one-node local PKI in a fresh temp dir, standing in for the
+/// platform identity a real sled resolves from its RoT.
+pub fn test_pki(prefix: &'static str) -> (TempDir, Utf8PathBuf) {
+    let tmp = TempDir::with_prefix(prefix).unwrap();
+    let dir = Utf8PathBuf::from_path_buf(tmp.path().to_owned()).unwrap();
+    let behavior = OutputFileExistsBehavior::Overwrite;
+    let doc = generate_config(1);
+    doc.write_key_pairs(dir.clone(), behavior).unwrap();
+    doc.write_certificates(dir.clone(), behavior).unwrap();
+    doc.write_certificate_lists(dir.clone(), behavior).unwrap();
+    (tmp, dir)
 }
 
 pub async fn fake_identity(key: &mut EphemeralKey) -> Identity {
