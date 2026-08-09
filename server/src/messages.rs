@@ -15,13 +15,14 @@ use uuid::Uuid;
 use x509_cert::Certificate;
 
 use sush_api::JobStartParams;
+use sush_common::authn::SignedLogin;
 use sush_common::borsh::{
     borsh_de_baseboard_id, borsh_de_cert, borsh_de_datetime, borsh_ser_baseboard_id,
     borsh_ser_cert, borsh_ser_datetime,
 };
 use sush_common::jobs::JobOutputState;
 use sush_common::jobs::{Access, JobId, ProcessError, SessionId, SignedJob};
-use sush_common::keys::KeyId;
+use sush_common::keys::{KeyId, SshPublicKey};
 
 #[derive(BorshDeserialize, BorshSerialize, Copy, Clone, Debug, Eq, PartialEq)]
 pub struct RequestId(pub Uuid);
@@ -84,6 +85,7 @@ pub mod v0 {
         Cert(Box<Attributed<CertRequest>>),
         Session(Box<Attributed<SessionRequest>>),
         Job(Box<Attributed<JobRequest>>),
+        Identity(Box<Attributed<IdentityRequest>>),
     }
 
     impl Request {
@@ -97,6 +99,10 @@ pub mod v0 {
 
         pub fn job(actor: KeyId, request: JobRequest) -> Self {
             Self::Job(Box::new(Attributed { actor, request }))
+        }
+
+        pub fn identity(actor: KeyId, request: IdentityRequest) -> Self {
+            Self::Identity(Box::new(Attributed { actor, request }))
         }
 
         pub fn kind(&self) -> &'static str {
@@ -115,6 +121,10 @@ pub mod v0 {
                 Self::Job(r) => match r.request {
                     JobRequest::Start(..) => "job start",
                     JobRequest::Stop(_) => "job stop",
+                },
+                Self::Identity(r) => match r.request {
+                    IdentityRequest::Login(..) => "identity login",
+                    IdentityRequest::Revoke(..) => "identity revoke",
                 },
             }
         }
@@ -151,6 +161,23 @@ pub mod v0 {
     pub enum JobRequest {
         Start(SignedJob, JobStartParams),
         Stop(JobId),
+    }
+
+    /// Identity gossip carries evidence, not assertions: every sled
+    /// verifies a login's challenge-response signature itself, so a
+    /// registered identity never depends on another sled's honesty.
+    #[derive(BorshDeserialize, BorshSerialize, Clone, Debug, Eq, PartialEq)]
+    #[allow(clippy::large_enum_variant)]
+    pub enum IdentityRequest {
+        Login(SshPublicKey, SignedLogin),
+        Revoke(
+            KeyId,
+            #[borsh(
+                serialize_with = "borsh_ser_datetime",
+                deserialize_with = "borsh_de_datetime"
+            )]
+            DateTime<Utc>,
+        ),
     }
 
     #[derive(BorshDeserialize, BorshSerialize, Clone, Debug, Eq, PartialEq)]
@@ -324,6 +351,54 @@ mod wire_format {
               \x00\x00\x00zoo-zero\x07\x00\x00\x00abandon\x03\x00\x00\
               \x00zoo\x00\x00\x00\x00\x00\x10\x0e\x00\x00\x00\x00\x00\
               \x00\x00P\xd6\xdc\x01\x00\x00\x00\x00\xe4\x0bT\x02\x00\x00\
+              \x00\x00\x00\x00\x00",
+        );
+    }
+
+    #[test]
+    fn identity_login_request() {
+        use sush_common::authn::ChallengeResponse;
+        use sush_common::keys::{EncodedSignature, Signed, SshPublicKey};
+
+        // Craft deterministic evidence: nonces, then the ed25519
+        // basepoint as the verifier.
+        let mut evidence = Vec::new();
+        for nonce in ["abandon", "ability"] {
+            evidence.extend((nonce.len() as u32).to_le_bytes());
+            evidence.extend(nonce.as_bytes());
+        }
+        evidence.push(0x58);
+        evidence.extend([0x66; 31]);
+        let response = ChallengeResponse::try_from_slice(&evidence).unwrap();
+
+        let openssh = "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAILM+rvN+ot98qgEN796jTiQfZfG1KaT0PtFDJ13gEiGB test@sush";
+        let mut key = Vec::new();
+        key.extend((openssh.len() as u32).to_le_bytes());
+        key.extend(openssh.as_bytes());
+        let public_key = SshPublicKey::try_from_slice(&key).unwrap();
+
+        let signed = Signed::new(
+            response,
+            KeyId::from("zoo-zero".to_string()),
+            EncodedSignature {
+                r: "abandon".to_string(),
+                s: "zoo".to_string(),
+                flags: 0,
+                counter: 0,
+            },
+        );
+        let msg: VersionedMessage = Message::Request(Request::identity(
+            KeyId::from("zoo-zero".to_string()),
+            IdentityRequest::Login(public_key, signed),
+        ))
+        .into();
+        assert_wire_format(
+            msg,
+            b"\x00\x00\x03\x08\x00\x00\x00zoo-zero\x00Z\x00\x00\x00ssh-e\
+              d25519 AAAAC3NzaC1lZDI1NTE5AAAAILM+rvN+ot98qgEN796jTiQfZfG\
+              1KaT0PtFDJ13gEiGB test@sush\x07\x00\x00\x00abandon\x07\x00\
+              \x00\x00abilityXfffffffffffffffffffffffffffffff\x08\x00\
+              \x00\x00zoo-zero\x07\x00\x00\x00abandon\x03\x00\x00\x00zoo\
               \x00\x00\x00\x00\x00",
         );
     }

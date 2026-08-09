@@ -10,7 +10,7 @@ use std::path::Path;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use chrono::{DateTime, Utc};
+use chrono::Utc;
 use http_range_header::SyntacticallyCorrectRange as Range;
 use lru::LruCache;
 use sled_hardware_types::BaseboardId;
@@ -36,7 +36,7 @@ use sush_common::keys::{KeyError, KeyId, SshPublicKey};
 use crate::error::JobError;
 use crate::executor::PathIsolation;
 use crate::job::SocketSender;
-use crate::messages::v0::{CertRequest, JobRequest, Request, SessionRequest};
+use crate::messages::v0::{CertRequest, IdentityRequest, JobRequest, Request, SessionRequest};
 use crate::output::{JobOutputDir, JobOutputFileStream};
 use crate::state::{GossipNetwork, MAX_CERTS, State, StateManager};
 
@@ -48,13 +48,6 @@ const MAX_CACHED_IDENTITIES: NonZeroUsize = NonZeroUsize::new(1_000).unwrap();
 /// is sized so a flood must sustain hundreds of requests per second
 /// for the whole nonce TTL to lock a user out.
 const MAX_OUTSTANDING_NONCES: NonZeroUsize = NonZeroUsize::new(10_000).unwrap();
-
-/// Maximum number of revoked SSH keys remembered for login refusal.
-/// Any authenticated key may revoke, so a flood of junk revocations
-/// can evict a real one. Entries never expire, so unlike nonces the
-/// eviction is permanent. This is sized so the flood takes thousands
-/// of authenticated, attributed, logged requests.
-const MAX_REVOKED_KEYS: NonZeroUsize = NonZeroUsize::new(10_000).unwrap();
 
 /// Maximum amount of time we're willing to wait for job start or stop.
 const WAIT_TIMEOUT: Duration = Duration::from_secs(600);
@@ -87,7 +80,6 @@ pub struct JobManager {
     log: Logger,
     nonces: Arc<Mutex<LruCache<Nonce, Instant>>>,
     identities: Arc<Mutex<LruCache<(KeyId, Nonce), CachedIdentity>>>,
-    revoked_keys: Arc<Mutex<LruCache<KeyId, DateTime<Utc>>>>,
     output_dir: JobOutputDir,
     own_baseboard: BaseboardId,
     state: watch::Receiver<State>, // from the state manager
@@ -145,7 +137,6 @@ impl JobManager {
             log: log.new(o!("component" => "job manager")),
             nonces: Arc::new(Mutex::new(LruCache::new(MAX_OUTSTANDING_NONCES))),
             identities: Arc::new(Mutex::new(LruCache::new(MAX_CACHED_IDENTITIES))),
-            revoked_keys: Arc::new(Mutex::new(LruCache::new(MAX_REVOKED_KEYS))),
             own_baseboard,
             output_dir,
             state: rx_state,
@@ -179,6 +170,17 @@ impl JobManager {
     async fn job_request(&self, authn: &Identity, request: JobRequest) -> Result<(), JobError> {
         self.tx_req
             .send(Request::job(authn.key_id.clone(), request))
+            .await
+            .map_err(|_| JobError::ChannelClosed)
+    }
+
+    async fn identity_request(
+        &self,
+        actor: KeyId,
+        request: IdentityRequest,
+    ) -> Result<(), JobError> {
+        self.tx_req
+            .send(Request::identity(actor, request))
             .await
             .map_err(|_| JobError::ChannelClosed)
     }
@@ -277,6 +279,26 @@ impl JobManager {
             Authn::Bound(bound) => {
                 let mut identities = self.identities.lock().await;
                 let cache_key = (bound.key_id.clone(), bound.nonce.clone());
+                // A login elsewhere on the rack reaches us as a
+                // registered identity. Adopt it on first use.
+                if !identities.contains(&cache_key) {
+                    let Some(registered) =
+                        self.state.borrow().registered_identity(&cache_key).cloned()
+                    else {
+                        unauthorized!("unknown identity");
+                    };
+                    debug!(self.log, "adopting registered identity"; "key_id" => %bound.key_id);
+                    identities.put(
+                        cache_key.clone(),
+                        CachedIdentity {
+                            identity: registered.identity,
+                            verifier: registered.verifier,
+                            window: SeqWindow::default(),
+                            authenticated: Instant::now(),
+                            last_used: Instant::now(),
+                        },
+                    );
+                }
                 let Some(cached) = identities.get_mut(&cache_key) else {
                     unauthorized!("unknown identity");
                 };
@@ -305,7 +327,7 @@ impl JobManager {
         }
 
         // Refuse revoked keys.
-        if self.revoked_keys.lock().await.get(&key_id).is_some() {
+        if self.state.borrow().is_key_revoked(&key_id) {
             unauthorized!("key is revoked");
         }
 
@@ -325,13 +347,14 @@ impl JobManager {
             unauthorized!("invalid key ID");
         }
         let response = credentials.clone().into_challenge_response();
-        let verified = try_authn!(response.verify_with_ssh_public_key(&public_key));
-        let identity = try_authn!(Identity::new(public_key.to_owned(), verified, now));
+        let verified = try_authn!(response.clone().verify_with_ssh_public_key(&public_key));
+        let identity = try_authn!(Identity::new(public_key.clone(), verified, now));
 
-        // Authenticated! Cache the identity and its request verifier.
+        // Authenticated! Cache the identity and its request verifier,
+        // and gossip the evidence.
         debug!(self.log, "authenticated credentials for identity"; "key_id" => %key_id);
         self.identities.lock().await.put(
-            (key_id.to_owned(), nonce),
+            (key_id.clone(), nonce),
             CachedIdentity {
                 identity: identity.clone(),
                 verifier: credentials.epk,
@@ -340,7 +363,10 @@ impl JobManager {
                 last_used: Instant::now(),
             },
         );
-        Ok(identity)
+        let login = IdentityRequest::Login(public_key, response);
+        self.identity_request(key_id, login)
+            .await
+            .map(|()| identity)
     }
 
     pub async fn identities(&self, _authn: &Identity) -> Result<Vec<Identity>, JobError> {
@@ -354,15 +380,27 @@ impl JobManager {
             .collect())
     }
 
-    pub async fn iam_revoke(&self, _authn: &Identity, key_id: KeyId) -> Result<(), JobError> {
+    pub async fn iam_revoke(
+        &self,
+        authn: &Identity,
+        key_id: KeyId,
+        wait: bool,
+    ) -> Result<(), JobError> {
         let now = Utc::now();
         let mut identities = self.identities.lock().await;
         for (_, cached) in identities.iter_mut().filter(|((id, _), _)| *id == key_id) {
             cached.identity.time_revoked = Some(now);
         }
         drop(identities);
-        self.revoked_keys.lock().await.put(key_id.clone(), now);
-        info!(self.log, "revoked identity"; "key_id" => %key_id);
+        info!(self.log, "revoking identity"; "key_id" => %key_id, "actor" => %authn.key_id);
+        self.identity_request(
+            authn.key_id.clone(),
+            IdentityRequest::Revoke(key_id.clone(), now),
+        )
+        .await?;
+        if wait {
+            self.wait_for(self.wait_for_key_revocation(key_id)).await?;
+        }
         Ok(())
     }
 
@@ -378,6 +416,10 @@ impl JobManager {
 
     fn wait_for_revocation(&self, key_id: KeyId) -> impl FnMut(&State) -> bool {
         move |state| state.is_cert_revoked(&key_id)
+    }
+
+    fn wait_for_key_revocation(&self, key_id: KeyId) -> impl FnMut(&State) -> bool {
+        move |state| state.is_key_revoked(&key_id)
     }
 
     fn wait_for_session(&self, session_id: SessionId) -> impl FnMut(&State) -> bool {

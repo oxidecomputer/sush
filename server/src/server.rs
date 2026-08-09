@@ -139,6 +139,7 @@ impl SushApi for ApiServer {
         ctx: RequestContext<Self::Context>,
         headers: Header<Authorization>,
         params: PathParams<KeyIdParam>,
+        query: QueryParams<WaitParam>,
     ) -> Result<HttpResponseUpdatedNoContent, HttpError> {
         let mgr = ctx.context();
         let Authorization { authorization } = headers.into_inner();
@@ -146,7 +147,8 @@ impl SushApi for ApiServer {
             .iam(authorization, None, request_line(&ctx.request))
             .await?;
         let KeyIdParam { key_id } = params.into_inner();
-        mgr.iam_revoke(&authn, key_id).await?;
+        let WaitParam { wait } = query.into_inner();
+        mgr.iam_revoke(&authn, key_id, wait).await?;
         Ok(HttpResponseUpdatedNoContent())
     }
 

@@ -89,14 +89,14 @@ pub trait SushApi {
 
     /// Revoke an SSH identity.
     ///
-    /// Expires the key's cached identities and refuses its future
-    /// logins. Identities are not shared across the rack, so this
-    /// applies only to the server handling the request.
+    /// Expires the key's identities and refuses its future logins,
+    /// across the rack.
     #[endpoint { method = POST, path = "/iam/{key_id}/revoke" }]
     async fn iam_revoke(
         ctx: RequestContext<Self::Context>,
         headers: Header<Authorization>,
         params: PathParams<KeyIdParam>,
+        query: QueryParams<WaitParam>,
     ) -> Result<HttpResponseUpdatedNoContent, HttpError>;
 
     // Session management.

@@ -14,6 +14,7 @@
 use std::fmt;
 use std::ops::Deref;
 
+use borsh::io::{Error as BorshError, ErrorKind as BorshErrorKind, Read, Write};
 use borsh::{BorshDeserialize, BorshSerialize};
 use bytes::{Buf as _, BufMut as _, BytesMut};
 use chrono::{DateTime, Utc};
@@ -154,6 +155,20 @@ impl Deref for SshPublicKey {
 
     fn deref(&self) -> &Self::Target {
         &self.0
+    }
+}
+
+impl BorshSerialize for SshPublicKey {
+    fn serialize<W: Write>(&self, writer: &mut W) -> borsh::io::Result<()> {
+        BorshSerialize::serialize(&self.to_string(), writer)
+    }
+}
+
+impl BorshDeserialize for SshPublicKey {
+    fn deserialize_reader<R: Read>(reader: &mut R) -> borsh::io::Result<Self> {
+        ssh_key::PublicKey::from_openssh(&String::deserialize_reader(reader)?)
+            .map(Self)
+            .map_err(|err| BorshError::new(BorshErrorKind::InvalidData, err))
     }
 }
 

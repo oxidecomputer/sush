@@ -321,7 +321,6 @@ pub enum IdentityCommand {
     Login,
 
     /// Revoke an SSH identity and refuse its future logins.
-    /// Applies only to the server handling the request.
     Revoke { key_id: KeyId },
 }
 
@@ -672,7 +671,7 @@ async fn iam(
         IdentityCommand::Revoke { key_id } => {
             let key_id = ctx.really_revoke("SSH identity", key_id)?;
             with_login(ctx, client, async || {
-                client.iam_revoke().key_id(&key_id).send().await
+                client.iam_revoke().key_id(&key_id).wait(true).send().await
             })
             .await?;
             ctx.revoked("SSH identity", key_id)

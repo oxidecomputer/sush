@@ -242,7 +242,7 @@
     "/iam/{key_id}/revoke": {
       "post": {
         "summary": "Revoke an SSH identity.",
-        "description": "Expires the key's cached identities and refuses its future logins. Identities are not shared across the rack, so this applies only to the server handling the request.",
+        "description": "Expires the key's identities and refuses its future logins, across the rack.",
         "operationId": "iam_revoke",
         "parameters": [
           {
@@ -259,6 +259,14 @@
             "required": true,
             "schema": {
               "$ref": "#/components/schemas/KeyId"
+            }
+          },
+          {
+            "in": "query",
+            "name": "wait",
+            "description": "Wait for the subject to appear in the state.",
+            "schema": {
+              "type": "boolean"
             }
           }
         ],
