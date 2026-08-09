@@ -4,6 +4,7 @@
 
 //! Oxide Support Shell integration tests.
 
+use std::collections::BTreeMap;
 use std::net::SocketAddr;
 use std::sync::Arc;
 use std::time::Duration;
@@ -13,6 +14,7 @@ use dropshot::{ConfigDropshot, ServerBuilder};
 use function_name::named;
 use futures::{SinkExt as _, StreamExt as _};
 use tokio::io::{AsyncRead, AsyncWrite};
+use tokio::sync::watch;
 use tokio::test;
 use tokio::time::timeout;
 use tokio_tungstenite::WebSocketStream;
@@ -24,6 +26,8 @@ use sush_api::sush_api_mod::api_description;
 use sush_client::{AuthzSigner, Client, Error as ClientError};
 use sush_common::interactive::{InteractiveJobControl, InteractiveJobMessage};
 use sush_common::jobs::{Access, JobLimits, JobOutputStream, Session, SessionId};
+use sush_common::targets::Cubbies;
+use sush_server::proxy::Targets;
 use sush_server::{ApiServer, ProxyServer};
 
 use crate::test_utils::{
@@ -137,16 +141,15 @@ async fn client_proxy_server() {
         .expect("failed to start server");
     let server_addr = server.local_addr();
 
-    // Spin up a proxy server.
+    // Spin up a proxy server routing to it.
+    let (tx_targets, rx_targets) = watch::channel(Targets {
+        sleds: BTreeMap::from([(test_baseboard_id(), server_addr)]),
+        cubbies: Cubbies::from([(14, test_baseboard_id())]),
+    });
     let shutdown_proxy = CancellationToken::new();
-    let proxy = ProxyServer::start(
-        &log,
-        local_addr(),
-        server.local_addr(),
-        shutdown_proxy.clone(),
-    )
-    .await
-    .expect("can't start proxy server");
+    let proxy = ProxyServer::start(&log, local_addr(), rx_targets, shutdown_proxy.clone())
+        .await
+        .expect("can't start proxy server");
     let proxy_addr = proxy.local_addr();
     assert_ne!(server_addr, proxy_addr);
 
@@ -168,6 +171,80 @@ async fn client_proxy_server() {
         .expect("can't authenticate")
         .into_inner();
     assert_eq!(iam, identity, "who am I?");
+
+    // Attach to an interactive job through the proxy, routed by the
+    // target path segment, and echo bytes over the bridged upgrade.
+    let session = Session::new(SessionId::new());
+    client
+        .session_start()
+        .session_id(session.session_id())
+        .send()
+        .await
+        .expect("can't start session");
+    let job_id = session.next_job_id();
+    let job = root
+        .sign_job_request(&job_id, "cat > /dev/null", true)
+        .await;
+    let JobLimits {
+        max_cpu,
+        max_mem,
+        max_fsize,
+    } = JobLimits::default();
+    client
+        .job_start()
+        .job_id(&job_id)
+        .max_cpu(max_cpu)
+        .max_mem(max_mem)
+        .max_fsize(max_fsize)
+        .rows(24)
+        .cols(80)
+        .wait(JobWait::Start)
+        .body(job.into_signed())
+        .send()
+        .await
+        .expect("can't start job");
+    let socket = client
+        .job_attach()
+        .job_id(&job_id)
+        .target(test_baseboard_id().to_string())
+        .send()
+        .await
+        .expect("can't attach via proxy")
+        .into_inner();
+    let mut stream = WebSocketStream::from_raw_socket(socket, Role::Client, None).await;
+    let InteractiveJobControl::WindowChange(_) = next_control_message(&mut stream).await;
+    let hello = Bytes::from(format!("Hello, {job_id}!"));
+    stream
+        .send(
+            InteractiveJobMessage::Data(hello.clone())
+                .try_into()
+                .expect("can't encode message"),
+        )
+        .await
+        .expect("can't send message");
+    assert_eq!(next_data_message(&mut stream).await, &hello);
+
+    // A target the proxy cannot route is refused at the proxy.
+    let Err(unrouted) = client
+        .job_output()
+        .job_id(&job_id)
+        .stream(JobOutputStream::Stdout)
+        .target("913-0000019:BRM99999999")
+        .send()
+        .await
+    else {
+        panic!("expected no route to an unknown baseboard");
+    };
+    if let ClientError::UnexpectedResponse(response) = unrouted {
+        assert_eq!(response.status(), 502);
+    }
+
+    // With no sleds in the table, everything is refused.
+    tx_targets.send(Targets::default()).unwrap();
+    let unavailable = client.iam().body(None).send().await.unwrap_err();
+    if let ClientError::UnexpectedResponse(response) = unavailable {
+        assert_eq!(response.status(), 503);
+    }
 
     shutdown_proxy.cancel();
     server.close().await.expect("can't shutdown server");
