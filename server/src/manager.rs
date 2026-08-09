@@ -8,9 +8,9 @@
 use std::num::NonZeroUsize;
 use std::path::PathBuf;
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
-use chrono::{DateTime, Utc};
+use chrono::Utc;
 use http_range_header::SyntacticallyCorrectRange as Range;
 use lru::LruCache;
 use sled_hardware_types::BaseboardId;
@@ -23,7 +23,10 @@ use tokio_util::sync::CancellationToken;
 use x509_cert::Certificate;
 
 use sush_api::{JobStartParams, JobStopParams, JobWait};
-use sush_common::authn::{Credentials, Identity, Nonce};
+use sush_common::authn::{
+    Authn, BoundRequest, Credentials, IDENTITY_IDLE_TTL, IDENTITY_MAX_TTL, Identity, NONCE_TTL,
+    Nonce, RequestVerifier, SeqWindow,
+};
 use sush_common::jobs::JobOutputStream;
 use sush_common::jobs::{Access, JobId, JobStatusMap, Session, SessionId, SignedJob};
 use sush_common::keys::{KeyError, KeyId, SshPublicKey};
@@ -47,13 +50,34 @@ const MAX_OUTSTANDING_NONCES: NonZeroUsize = NonZeroUsize::new(100).unwrap();
 /// Maximum amount of time we're willing to wait for job start or stop.
 const WAIT_TIMEOUT: Duration = Duration::from_secs(600);
 
+/// An authenticated identity and the state that authorizes its
+/// requests: the ephemeral verifier, the spent sequence numbers, and
+/// its lifetime, kept on the monotonic clock because the wall clock
+/// may step by decades when NTP first syncs.
+#[derive(Debug)]
+struct CachedIdentity {
+    identity: Identity,
+    verifier: RequestVerifier,
+    window: SeqWindow,
+    authenticated: Instant,
+    last_used: Instant,
+}
+
+impl CachedIdentity {
+    fn is_still_valid(&self) -> bool {
+        self.identity.time_revoked.is_none()
+            && self.authenticated.elapsed() < IDENTITY_MAX_TTL
+            && self.last_used.elapsed() < IDENTITY_IDLE_TTL
+    }
+}
+
 /// NB: All tables must have a fixed maximum size!
 #[derive(Debug)]
 #[allow(clippy::type_complexity)]
 pub struct JobManager {
     log: Logger,
-    nonces: Arc<Mutex<LruCache<Nonce, DateTime<Utc>>>>,
-    identities: Arc<Mutex<LruCache<(KeyId, Nonce), (Identity, Credentials)>>>,
+    nonces: Arc<Mutex<LruCache<Nonce, Instant>>>,
+    identities: Arc<Mutex<LruCache<(KeyId, Nonce), CachedIdentity>>>,
     output_dir: JobOutputDir,
     own_baseboard: BaseboardId,
     state: watch::Receiver<State>, // from the state manager
@@ -157,11 +181,14 @@ impl JobManager {
 
     // Identity management.
 
-    /// Authenticate and cache authorization credentials.
+    /// Authenticate initial credentials at `iam`, or authorize a bound
+    /// request against a cached identity. `request` is the request
+    /// line: the method and the target exactly as received.
     pub async fn iam(
         &self,
         authorization: Option<String>,
         public_key: Option<SshPublicKey>,
+        request: (&str, &str),
     ) -> Result<Identity, JobError> {
         // NB: Do not use the `?` operator in this function! We must ensure
         // that all authentication failures are logged and receive a proper
@@ -170,7 +197,7 @@ impl JobManager {
             ($error:expr) => {{
                 warn!(self.log, "authentication failed"; "error" => %$error);
                 let nonce = Nonce::generate();
-                self.nonces.lock().await.put(nonce.clone(), Utc::now());
+                self.nonces.lock().await.put(nonce.clone(), Instant::now());
                 return Err(JobError::unauthorized(nonce));
             }};
         }
@@ -193,39 +220,44 @@ impl JobManager {
         let Some(authorization) = authorization else {
             unauthorized!("missing authorization")
         };
-        let credentials: Credentials = try_authn!(authorization.parse());
-        let Credentials {
-            key_id,
-            nonce,
-            cnonce,
-            signature,
-        } = credentials.clone();
-
-        // Check the identity cache.
         let now = Utc::now();
-        {
-            let mut identities = self.identities.lock().await;
-            let cache_key = (key_id.clone(), nonce.clone());
-            if let Some((identity, cached_credentials)) = identities.get(&cache_key).cloned() {
-                if !identity.is_still_valid(&now) {
-                    assert!(identities.pop(&cache_key).is_some());
-                } else if cached_credentials.cnonce == cnonce
-                    && cached_credentials.signature == signature
-                {
-                    assert_eq!(cached_credentials.nonce, nonce);
-                    debug!(self.log, "credentials cache hit"; "key_id" => %key_id);
-                    return Ok(identity);
-                } else {
-                    unauthorized!("invalid credentials for cached identity");
+        let credentials = match try_authn!(authorization.parse::<Authn>()) {
+            // A bound request authorizes against a cached identity.
+            Authn::Bound(bound) => {
+                let mut identities = self.identities.lock().await;
+                let cache_key = (bound.key_id.clone(), bound.nonce.clone());
+                let Some(cached) = identities.get_mut(&cache_key) else {
+                    unauthorized!("unknown identity");
+                };
+                if !cached.is_still_valid() {
+                    identities.pop(&cache_key);
+                    unauthorized!("identity expired");
                 }
+                let (method, target) = request;
+                let received = BoundRequest::new(method, target, bound.seq);
+                try_authn!(cached.verifier.verify(&received, &bound));
+                if !cached.window.spend(bound.seq) {
+                    unauthorized!("sequence number already spent");
+                }
+                cached.last_used = Instant::now();
+                debug!(self.log, "bound request authorized"; "key_id" => %bound.key_id);
+                return Ok(cached.identity.clone());
             }
+            Authn::Initial(credentials) => *credentials,
+        };
+        let Credentials { key_id, nonce, .. } = credentials.clone();
+
+        // Initial credentials authenticate only at `iam` itself.
+        let (method, target) = request;
+        if method != "POST" || target.split('?').next() != Some("/iam") {
+            unauthorized!("initial credentials presented outside iam");
         }
 
         // Claim the nonce.
-        let Some(generated) = self.nonces.lock().await.pop(&nonce) else {
+        let Some(minted) = self.nonces.lock().await.pop(&nonce) else {
             unauthorized!("nonce not found");
         };
-        if !Nonce::is_still_valid(&generated, &now) {
+        if minted.elapsed() >= NONCE_TTL {
             unauthorized!("nonce expired");
         };
 
@@ -240,24 +272,29 @@ impl JobManager {
         let verified = try_authn!(response.verify_with_ssh_public_key(&public_key));
         let identity = try_authn!(Identity::new(public_key.to_owned(), verified, now));
 
-        // Authenticated! Cache the identity & credentials.
+        // Authenticated! Cache the identity and its request verifier.
         debug!(self.log, "authenticated credentials for identity"; "key_id" => %key_id);
-        self.identities
-            .lock()
-            .await
-            .put((key_id.to_owned(), nonce), (identity.clone(), credentials));
+        self.identities.lock().await.put(
+            (key_id.to_owned(), nonce),
+            CachedIdentity {
+                identity: identity.clone(),
+                verifier: credentials.epk,
+                window: SeqWindow::default(),
+                authenticated: Instant::now(),
+                last_used: Instant::now(),
+            },
+        );
         Ok(identity)
     }
 
     pub async fn identities(&self, _authn: &Identity) -> Result<Vec<Identity>, JobError> {
-        let now = Utc::now();
         Ok(self
             .identities
             .lock()
             .await
             .iter()
-            .filter(|(_, (identity, _credentials))| identity.is_still_valid(&now))
-            .map(|(_, (identity, _credentials))| identity.to_owned())
+            .filter(|(_, cached)| cached.is_still_valid())
+            .map(|(_, cached)| cached.identity.to_owned())
             .collect())
     }
 

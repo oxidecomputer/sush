@@ -18,13 +18,14 @@ use serde_json::{json, to_string as to_json_string, to_string_pretty as to_json_
 use x509_cert::Certificate;
 use x509_cert::der::Encode as _;
 
-use sush_common::authn::{Credentials, Identity};
+use sush_common::authn::Identity;
 use sush_common::jobs::{
     Access, JobId, JobOutputState, JobOutputStream, JobStatus, JobStatusMap, Session, SessionId,
     SignedJob, job_status_to_json_map,
 };
 use sush_common::keys::{KeyId, Signature, SshPublicKey};
 
+use crate::AuthzSigner;
 use crate::commands::{CommandError, GlobalArgs};
 use crate::context::{CommandContext, OutputFormat};
 
@@ -34,7 +35,7 @@ pub struct Cli {
     output: Arc<Mutex<OutputFormat>>,
     progress: Arc<Mutex<Option<ProgressBar>>>,
     session: Arc<Mutex<Option<Session>>>,
-    credentials: Arc<Mutex<Option<Credentials>>>,
+    credentials: AuthzSigner,
 }
 
 fn byte_size(len: u64) -> bytesize::Display {
@@ -62,12 +63,8 @@ impl CommandContext for Cli {
 
     // Session management
 
-    fn get_credentials(&self) -> Option<Credentials> {
-        self.credentials.lock().unwrap().clone()
-    }
-
-    fn set_credentials(&mut self, credentials: Option<Credentials>) {
-        *self.credentials.lock().unwrap() = credentials;
+    fn authz_signer(&self) -> AuthzSigner {
+        self.credentials.clone()
     }
 
     fn session_id(&self) -> Option<SessionId> {
@@ -116,11 +113,7 @@ impl CommandContext for Cli {
                 println!("{}", json!({"attach_allowed": key_id, "access": access}))
             }
             OutputFormat::Text => {
-                let how = match access {
-                    Access::ReadOnly => "read-only",
-                    Access::ReadWrite => "read-write",
-                };
-                println!("✅ Allowed {how} attach for `{key_id}`")
+                println!("✅ Allowed {} attach for `{key_id}`", access.as_str())
             }
         }
     }

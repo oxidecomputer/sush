@@ -20,7 +20,7 @@ use tokio_util::sync::CancellationToken;
 
 use sush_api::JobWait;
 use sush_api::sush_api_mod::api_description;
-use sush_client::{Client, Error as ClientError};
+use sush_client::{AuthzSigner, Client, Error as ClientError};
 use sush_common::interactive::{InteractiveJobControl, InteractiveJobMessage};
 use sush_common::jobs::{Access, JobLimits, JobOutputStream, Session, SessionId};
 use sush_server::{ApiServer, ProxyServer};
@@ -53,16 +53,17 @@ async fn client_server() {
 
     // Connect and authenticate to the server.
     let addr = server.local_addr();
-    let client = Client::new(&format!("http://{addr}"));
+    let signer = AuthzSigner::default();
+    let client = Client::new(&format!("http://{addr}"), signer.clone());
     let ClientError::ErrorResponse(unauthz) = client.iam().body(None).send().await.unwrap_err()
     else {
         panic!("expected error response")
     };
     assert_eq!(unauthz.status(), 401, "expected 401 Unauthorized");
     let (identity, credentials) = authz(&client, unauthz, &mut root).await;
+    signer.set(Some(credentials));
     let iam = client
         .iam()
-        .authorization(credentials.to_string())
         .body(None)
         .send()
         .await
@@ -75,7 +76,6 @@ async fn client_server() {
     client
         .session_start()
         .session_id(session.session_id())
-        .authorization(credentials.to_string())
         .send()
         .await
         .expect("can't start session");
@@ -90,7 +90,6 @@ async fn client_server() {
     } = JobLimits::default();
     client
         .job_start()
-        .authorization(credentials.to_string())
         .job_id(&job_id)
         .max_cpu(max_cpu)
         .max_mem(max_mem)
@@ -107,7 +106,6 @@ async fn client_server() {
         .job_id(&job_id)
         .stream(JobOutputStream::Stdout)
         .target("*")
-        .authorization(credentials.to_string())
         .send()
         .await
         .expect("can't get job output")
@@ -152,16 +150,17 @@ async fn client_proxy_server() {
     assert_ne!(server_addr, proxy_addr);
 
     // Connect and authenticate to the server via the proxy.
-    let client = Client::new(&format!("http://{proxy_addr}"));
+    let signer = AuthzSigner::default();
+    let client = Client::new(&format!("http://{proxy_addr}"), signer.clone());
     let ClientError::ErrorResponse(unauthz) = client.iam().body(None).send().await.unwrap_err()
     else {
         panic!("expected error response")
     };
     assert_eq!(unauthz.status(), 401, "expected 401 Unauthorized");
     let (identity, credentials) = authz(&client, unauthz, &mut root).await;
+    signer.set(Some(credentials));
     let iam = client
         .iam()
-        .authorization(credentials.to_string())
         .body(None)
         .send()
         .await
@@ -225,16 +224,17 @@ async fn interactive_job() {
 
     // Connect and authenticate to the server.
     let addr = server.local_addr();
-    let client = Client::new(&format!("http://{addr}"));
+    let signer = AuthzSigner::default();
+    let client = Client::new(&format!("http://{addr}"), signer.clone());
     let ClientError::ErrorResponse(unauthz) = client.iam().body(None).send().await.unwrap_err()
     else {
         panic!("expected error response")
     };
     assert_eq!(unauthz.status(), 401, "expected 401 Unauthorized");
     let (identity, credentials) = authz(&client, unauthz, &mut root).await;
+    signer.set(Some(credentials));
     let iam = client
         .iam()
-        .authorization(credentials.to_string())
         .body(None)
         .send()
         .await
@@ -247,7 +247,6 @@ async fn interactive_job() {
     client
         .session_start()
         .session_id(session.session_id())
-        .authorization(credentials.to_string())
         .send()
         .await
         .expect("can't start session");
@@ -262,7 +261,6 @@ async fn interactive_job() {
     } = JobLimits::default();
     client
         .job_start()
-        .authorization(credentials.to_string())
         .job_id(&job_id)
         .max_cpu(max_cpu)
         .max_mem(max_mem)
@@ -280,7 +278,6 @@ async fn interactive_job() {
         .job_attach()
         .job_id(&job_id)
         .target(test_baseboard_id().to_string())
-        .authorization(credentials.to_string())
         .send()
         .await
         .expect("can't attach to job")
@@ -310,7 +307,6 @@ async fn interactive_job() {
         .job_attach()
         .job_id(&job_id)
         .target(test_baseboard_id().to_string())
-        .authorization(credentials.to_string())
         .send()
         .await
         .expect("can't attach second client to job")
@@ -335,19 +331,23 @@ async fn interactive_job() {
     assert_eq!(next_data_message(&mut stream1).await, &again);
     assert_eq!(next_data_message(&mut stream2).await, &again);
 
-    // A guest key authenticates but cannot attach until granted.
+    // A guest key authenticates, on its own client, but cannot attach
+    // until granted.
     let mut guest_key = ephemeral_test_root();
-    let ClientError::ErrorResponse(unauthz) = client.iam().body(None).send().await.unwrap_err()
+    let guest_signer = AuthzSigner::default();
+    let guest_client = Client::new(&format!("http://{addr}"), guest_signer.clone());
+    let ClientError::ErrorResponse(unauthz) =
+        guest_client.iam().body(None).send().await.unwrap_err()
     else {
         panic!("expected error response")
     };
-    let (guest, guest_credentials) = authz(&client, unauthz, &mut guest_key).await;
+    let (guest, guest_authz) = authz(&guest_client, unauthz, &mut guest_key).await;
+    guest_signer.set(Some(guest_authz));
     let guest_attach = async || {
-        client
+        guest_client
             .job_attach()
             .job_id(&job_id)
             .target(test_baseboard_id().to_string())
-            .authorization(guest_credentials.to_string())
             .send()
             .await
     };
@@ -363,7 +363,6 @@ async fn interactive_job() {
         .session_id(session.session_id())
         .key_id(guest.key_id.clone())
         .access(Access::ReadOnly)
-        .authorization(credentials.to_string())
         .send()
         .await
         .expect("can't allow attach");
@@ -411,7 +410,6 @@ async fn interactive_job() {
         .session_deny_attach()
         .session_id(session.session_id())
         .key_id(guest.key_id.clone())
-        .authorization(credentials.to_string())
         .send()
         .await
         .expect("can't deny attach");
@@ -430,7 +428,6 @@ async fn interactive_job() {
         .session_id(session.session_id())
         .key_id(guest.key_id.clone())
         .access(Access::ReadWrite)
-        .authorization(credentials.to_string())
         .send()
         .await
         .expect("can't allow attach");
@@ -469,7 +466,6 @@ async fn interactive_job() {
     // Stop the job.
     client
         .job_stop()
-        .authorization(credentials.to_string())
         .job_id(&job_id)
         .wait(JobWait::Stop)
         .send()
@@ -480,7 +476,6 @@ async fn interactive_job() {
     // from the read-only guest.
     let mut output = client
         .job_output()
-        .authorization(credentials.to_string())
         .job_id(&job_id)
         .stream(JobOutputStream::Stdout)
         .target(test_baseboard_id().to_string())

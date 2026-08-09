@@ -689,6 +689,15 @@ pub enum Access {
     ReadWrite,
 }
 
+impl Access {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Self::ReadOnly => "read-only",
+            Self::ReadWrite => "read-write",
+        }
+    }
+}
+
 /// Either the standard output or standard error of a job.
 #[derive(
     BorshDeserialize,

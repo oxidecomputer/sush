@@ -298,6 +298,14 @@ pub enum JobWait {
 }
 
 impl JobWait {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Self::None => "none",
+            Self::Start => "start",
+            Self::Stop => "stop",
+        }
+    }
+
     pub fn is_none(&self) -> bool {
         matches!(self, Self::None)
     }

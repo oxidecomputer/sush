@@ -18,8 +18,9 @@ use tokio_util::sync::CancellationToken;
 use x509_cert::name::Name;
 use x509_cert::time::Validity;
 
+use sush_client::context::Authz;
 use sush_client::{Client, ResponseValue};
-use sush_common::authn::{Challenge, ChallengeResponse, Credentials, Identity, Nonce};
+use sush_common::authn::{Challenge, ChallengeResponse, Credentials, Identity, Nonce, RequestKey};
 use sush_common::codephrases::generate_id;
 use sush_common::jobs::{JobId, JobStartRequest, VerifiedJob};
 use sush_common::keys::{EphemeralKey, KeyType, Signer};
@@ -95,7 +96,7 @@ pub fn test_logger(test_name: &'static str) -> Logger {
 pub async fn fake_identity(key: &mut EphemeralKey) -> Identity {
     let nonce = Nonce::generate();
     let challenge = Challenge::new(nonce.clone());
-    let response = ChallengeResponse::new(challenge);
+    let response = ChallengeResponse::new(challenge, RequestKey::new().verifier());
     let signed = key.sign(response).await.unwrap();
     let verified = signed.verify_with_cert(key.cert()).unwrap();
     Identity::new(key.ssh_public_key(), verified, Utc::now()).unwrap()
@@ -142,7 +143,7 @@ pub async fn authz<E>(
     client: &Client,
     response: ResponseValue<E>,
     key: &mut EphemeralKey,
-) -> (Identity, Credentials) {
+) -> (Identity, Authz) {
     let challenge = response
         .headers()
         .get("WWW-Authenticate")
@@ -151,7 +152,8 @@ pub async fn authz<E>(
         .expect("invalid WWW-Authenticate header")
         .parse::<Challenge>()
         .expect("malformed WWW-Authenticate header");
-    let response = ChallengeResponse::new(challenge);
+    let request_key = RequestKey::new();
+    let response = ChallengeResponse::new(challenge, request_key.verifier());
     let signed = key.sign(response).await.unwrap();
     let verified = signed
         .verify_with_ssh_public_key(&key.ssh_public_key())
@@ -167,5 +169,5 @@ pub async fn authz<E>(
         .await
         .unwrap()
         .into_inner();
-    (identity, credentials)
+    (identity, Authz::new(credentials, request_key))
 }

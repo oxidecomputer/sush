@@ -23,7 +23,8 @@ use tokio_util::sync::CancellationToken;
 use x509_cert::time::Validity;
 
 use sush_api::{JobStartParams, JobStopParams, JobWait};
-use sush_common::authn::{Challenge, ChallengeResponse, Credentials, Identity};
+use sush_client::context::Authz;
+use sush_common::authn::{Challenge, ChallengeResponse, Credentials, Identity, RequestKey};
 use sush_common::jobs::{
     Access, JobId, JobLimits, JobOutputState, JobOutputStream::*, JobStatus, ProcessError, Session,
     SessionId,
@@ -1397,13 +1398,15 @@ async fn output_ranges() {
 async fn iam() {
     let log = test_logger(function_name!());
     let (mgr, mut root, _dir, _shutdown) = manager_and_test_root(log).await;
-    let JobError::Unauthorized(nonce) = mgr.iam(None, None).await.unwrap_err() else {
+    let JobError::Unauthorized(nonce) = mgr.iam(None, None, ("POST", "/iam")).await.unwrap_err()
+    else {
         panic!("should not be authorized yet");
     };
 
     // Construct credentials.
     let challenge = Challenge::new(nonce.clone());
-    let response = ChallengeResponse::new(challenge);
+    let request_key = RequestKey::new();
+    let response = ChallengeResponse::new(challenge, request_key.verifier());
     let signed = root.sign(response).await.unwrap();
     let verified = signed.verify_with_cert(root.cert()).unwrap();
     let mut credentials = Credentials::new(verified);
@@ -1411,9 +1414,22 @@ async fn iam() {
     let key_id = public_key.key_id().unwrap();
     credentials.key_id = key_id.clone(); // override cert key ID
 
-    // Register our identity.
+    // Register our identity. Initial credentials work only at `iam`.
+    assert!(
+        mgr.iam(
+            Some(credentials.to_string()),
+            Some(public_key.clone()),
+            ("GET", "/sessions"),
+        )
+        .await
+        .is_err()
+    );
     let identity = mgr
-        .iam(Some(credentials.to_string()), Some(public_key.clone()))
+        .iam(
+            Some(credentials.to_string()),
+            Some(public_key.clone()),
+            ("POST", "/iam"),
+        )
         .await
         .unwrap();
     let Identity {
@@ -1429,12 +1445,29 @@ async fn iam() {
     assert!(iam_authenticated <= Utc::now());
     assert!(iam_revoked.is_none());
 
-    // Authenticate successfully.
+    // A bound request authorizes; replaying its header does not, nor
+    // does presenting it against a different request line.
+    let authz = Authz::new(credentials.clone(), request_key);
+    let header = authz.header("GET", "/sessions");
     assert_eq!(
-        mgr.iam(Some(credentials.to_string()), None)
+        mgr.iam(Some(header.clone()), None, ("GET", "/sessions"))
             .await
             .unwrap()
             .key_id,
         key_id,
+    );
+    assert!(
+        mgr.iam(Some(header), None, ("GET", "/sessions"))
+            .await
+            .is_err()
+    );
+    let header = authz.header("GET", "/sessions");
+    assert!(mgr.iam(Some(header), None, ("GET", "/jobs")).await.is_err());
+
+    // Replayed initial credentials are rejected: the nonce is spent.
+    assert!(
+        mgr.iam(Some(credentials.to_string()), None, ("POST", "/iam"))
+            .await
+            .is_err()
     );
 }

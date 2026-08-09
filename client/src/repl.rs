@@ -18,19 +18,19 @@ use shlex::split as split_command;
 use x509_cert::Certificate;
 use xdg::BaseDirectories;
 
-use sush_common::authn::{Credentials, Identity};
+use sush_common::authn::Identity;
 use sush_common::jobs::{
     Access, JobId, JobOutputStream, JobStatusMap, Session, SessionId, SignedJob,
 };
 use sush_common::keys::{KeyId, SshPublicKey};
 
-use crate::Client;
 use crate::cli::Cli;
 use crate::commands::{
     ClientCommand, CommandError, GlobalArgs, SSH_AUTH_SOCK, SUSH_JOB_ID, SUSH_KEY_ID,
     SUSH_OUTPUT_FORMAT, SUSH_URL,
 };
 use crate::context::{CommandContext, OutputFormat};
+use crate::{AuthzSigner, Client};
 
 const PREFIX: &str = "sush";
 const HISTORY_FILE: &str = "history.txt";
@@ -200,12 +200,8 @@ impl CommandContext for Repl {
 
     // Session management
 
-    fn get_credentials(&self) -> Option<Credentials> {
-        self.cli.get_credentials()
-    }
-
-    fn set_credentials(&mut self, credentials: Option<Credentials>) {
-        self.cli.set_credentials(credentials)
+    fn authz_signer(&self) -> AuthzSigner {
+        self.cli.authz_signer()
     }
 
     fn session_id(&self) -> Option<SessionId> {

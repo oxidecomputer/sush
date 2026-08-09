@@ -35,7 +35,9 @@ use tokio_tungstenite::tungstenite::error::Error as WebSocketError;
 use tokio_tungstenite::tungstenite::protocol::Role;
 
 use sush_api::JobWait;
-use sush_common::authn::{AuthnError, Challenge, ChallengeResponse, Credentials, Identity};
+use sush_common::authn::{
+    AuthnError, Challenge, ChallengeResponse, Credentials, Identity, RequestKey,
+};
 use sush_common::interactive::InteractiveJobError;
 use sush_common::jobs::JobOutputStream::{self, Stderr, Stdout};
 #[cfg(feature = "permslip")]
@@ -47,7 +49,7 @@ use sush_common::jobs::{
 use sush_common::keys::{KeyError, KeyId, Signer as _};
 
 use crate::ByteStream;
-use crate::context::{CommandContext, OutputFormat};
+use crate::context::{Authz, CommandContext, OutputFormat};
 use crate::identity::{IdentityError, SshAgentConnection};
 use crate::interactive::interactive_job;
 #[cfg(feature = "permslip")]
@@ -76,6 +78,9 @@ const DEFAULT_CHUNK_SIZE: ByteSize = ByteSize::mib(32);
 
 /// Default number of simultaneous downloads for large output.
 const PARALLEL_CHUNKS: NonZeroU8 = NonZeroU8::new(8).unwrap();
+
+/// Most simultaneous downloads allowed; see [`parallel_chunks`].
+const MAX_PARALLEL_CHUNKS: NonZeroU8 = NonZeroU8::new(64).unwrap();
 
 // Job polling and spinner update intervals.
 const JOB_START_UPDATE_INTERVAL: Duration = Duration::from_millis(250);
@@ -210,9 +215,27 @@ pub struct JobOutput {
     #[arg(short, long, default_value_t = DEFAULT_CHUNK_SIZE, requires = "file")]
     chunk_size: ByteSize,
 
-    /// Number of simultaneous downloads for large output [max: 255].
-    #[arg(short, long, default_value_t = PARALLEL_CHUNKS, requires = "file")]
+    /// Number of simultaneous downloads for large output [max: 64].
+    #[arg(short, long,
+          default_value_t = PARALLEL_CHUNKS,
+          requires = "file",
+          value_parser = parallel_chunks)]
     parallel: NonZeroU8,
+}
+
+/// Parse and bound `--parallel`. The ceiling keeps a download's
+/// in-flight spread comfortably inside the server's sequence window
+/// (see [`sush_common::authn::SEQ_WINDOW`]).
+fn parallel_chunks(s: &str) -> Result<NonZeroU8, String> {
+    let n: NonZeroU8 = s
+        .parse()
+        .map_err(|_| String::from("expected a count from 1 to 64"))?;
+    if n > MAX_PARALLEL_CHUNKS {
+        return Err(format!(
+            "at most {MAX_PARALLEL_CHUNKS} simultaneous downloads"
+        ));
+    }
+    Ok(n)
 }
 
 /// Support Shell job management command
@@ -455,7 +478,10 @@ impl ClientCommand {
             ctx.set_output_format(output);
         }
 
-        let client = args.url.as_ref().map(|url| Client::new(url));
+        let client = args
+            .url
+            .as_ref()
+            .map(|url| Client::new(url, ctx.authz_signer()));
         match (self, client) {
             (ClientCommand::Cert { command }, Some(client)) => cert(ctx, &client, command).await,
 
@@ -503,7 +529,7 @@ async fn authenticate<E>(
     ctx: &mut impl CommandContext,
     client: &Client,
     response: ResponseValue<E>,
-) -> Result<(Identity, Credentials), CommandError> {
+) -> Result<(Identity, Authz), CommandError> {
     let mut ssh_agent = if let Some(ssh_auth_sock) = &ctx.get_globals().ssh_auth_sock {
         SshAgentConnection::connect(ssh_auth_sock).await?
     } else {
@@ -519,7 +545,8 @@ async fn authenticate<E>(
         .to_str()
         .map_err(|_| CommandError::InvalidAuthorization)?
         .parse::<Challenge>()?;
-    let response = ChallengeResponse::new(challenge);
+    let key = RequestKey::new();
+    let response = ChallengeResponse::new(challenge, key.verifier());
     ctx.please_touch(&public_key)?;
     let signed = select! {
         s = ssh_agent.sign(response) => s?,
@@ -534,29 +561,25 @@ async fn authenticate<E>(
         .send()
         .await?
         .into_inner();
-    Ok((identity, credentials))
+    Ok((identity, Authz::new(credentials, key)))
 }
 
-/// Retry a request with transparent authorization.
-async fn with_authz<T, E, Req>(
+/// Make a request as someone who is logged in, logging in if needed.
+/// The client's pre-send hook signs each attempt.
+async fn with_login<T, E, Req>(
     ctx: &mut impl CommandContext,
     client: &Client,
     mut make_request: Req,
 ) -> Result<T, CommandError>
 where
-    Req: AsyncFnMut(&str) -> Result<T, ClientError<E>>,
+    Req: AsyncFnMut() -> Result<T, ClientError<E>>,
     CommandError: From<ClientError<E>>,
 {
-    let authz = ctx
-        .get_credentials()
-        .map(|creds| creds.to_string())
-        .unwrap_or_default();
-    match make_request(&authz).await {
+    match make_request().await {
         Err(ClientError::ErrorResponse(err)) if err.status() == StatusCode::UNAUTHORIZED => {
-            let (_identity, credentials) = authenticate(ctx, client, err).await?;
-            let authz = credentials.to_string();
-            ctx.set_credentials(Some(credentials));
-            Ok(make_request(&authz).await?)
+            let (_identity, authz) = authenticate(ctx, client, err).await?;
+            ctx.set_credentials(Some(authz));
+            Ok(make_request().await?)
         }
         Err(err) => Err(err.into()),
         Ok(res) => Ok(res),
@@ -590,11 +613,9 @@ async fn iam(
         }
 
         IdentityCommand::List => {
-            let identities = with_authz(ctx, client, async |authz| {
-                client.identities().authorization(authz).send().await
-            })
-            .await?
-            .into_inner();
+            let identities = with_login(ctx, client, async || client.identities().send().await)
+                .await?
+                .into_inner();
             for identity in identities {
                 ctx.iam(&identity)?;
             }
@@ -602,11 +623,9 @@ async fn iam(
         }
 
         IdentityCommand::Login => {
-            let identity = with_authz(ctx, client, async |authz| {
-                client.iam().authorization(authz).body(None).send().await
-            })
-            .await?
-            .into_inner();
+            let identity = with_login(ctx, client, async || client.iam().body(None).send().await)
+                .await?
+                .into_inner();
             ctx.iam(&identity)
         }
     }
@@ -623,13 +642,8 @@ async fn cert(
             let mut file = File::open(&path).map_err(io_error)?;
             let mut cert = Vec::new();
             file.read_to_end(&mut cert).map_err(io_error)?;
-            let key_id = with_authz(ctx, client, async |authz| {
-                client
-                    .import_cert()
-                    .authorization(authz)
-                    .body(cert.clone())
-                    .send()
-                    .await
+            let key_id = with_login(ctx, client, async || {
+                client.import_cert().body(cert.clone()).send().await
             })
             .await?
             .into_inner();
@@ -637,13 +651,8 @@ async fn cert(
         }
 
         CertCommand::Chain { key_id } => {
-            let certs = with_authz(ctx, client, async |authz| {
-                client
-                    .cert_chain()
-                    .key_id(&key_id)
-                    .authorization(authz)
-                    .send()
-                    .await
+            let certs = with_login(ctx, client, async || {
+                client.cert_chain().key_id(&key_id).send().await
             })
             .await?
             .into_inner();
@@ -660,11 +669,9 @@ async fn session(
 ) -> Result<(), CommandError> {
     match (command, client) {
         (SessionCommand::Attach { session_id }, Some(client)) => {
-            let session = with_authz(ctx, client, async |authz| {
-                client.session().authorization(authz).send().await
-            })
-            .await?
-            .into_inner();
+            let session = with_login(ctx, client, async || client.session().send().await)
+                .await?
+                .into_inner();
             if let Some(session_id) = session_id
                 && *session.session_id() != session_id
             {
@@ -690,12 +697,11 @@ async fn session(
             } else {
                 Session::new(SessionId::new())
             };
-            with_authz(ctx, client, async |authz| {
+            with_login(ctx, client, async || {
                 client
                     .session_start()
                     .session_id(session.session_id())
                     .wait(wait)
-                    .authorization(authz)
                     .send()
                     .await
             })
@@ -714,13 +720,12 @@ async fn session(
             } else {
                 Access::ReadOnly
             };
-            with_authz(ctx, client, async |authz| {
+            with_login(ctx, client, async || {
                 client
                     .session_allow_attach()
                     .session_id(session_id.clone())
                     .key_id(key_id.clone())
                     .access(access)
-                    .authorization(authz)
                     .send()
                     .await
             })
@@ -733,12 +738,11 @@ async fn session(
             let Some(session_id) = ctx.session_id() else {
                 return Err(CommandError::MissingSession);
             };
-            with_authz(ctx, client, async |authz| {
+            with_login(ctx, client, async || {
                 client
                     .session_deny_attach()
                     .session_id(session_id.clone())
                     .key_id(key_id.clone())
-                    .authorization(authz)
                     .send()
                     .await
             })
@@ -752,11 +756,10 @@ async fn session(
             let Some(session_id) = session_id.as_ref().or(ctx_session_id.as_ref()) else {
                 return Err(CommandError::MissingSession);
             };
-            with_authz(ctx, client, async |authz| {
+            with_login(ctx, client, async || {
                 client
                     .session_stop()
                     .session_id(session_id.clone())
-                    .authorization(authz)
                     .send()
                     .await
             })
@@ -825,27 +828,24 @@ async fn job(
                 if ctx.session_id().is_none()
                     && let Some(client) = client
                 {
-                    let session = match with_authz(ctx, client, async |authz| {
-                        client.session().authorization(authz).send().await
-                    })
-                    .await
-                    {
-                        Ok(resp) => resp.into_inner(),
-                        Err(CommandError::NotFound) => {
-                            let session = Session::new(SessionId::new());
-                            with_authz(ctx, client, async |authz| {
-                                client
-                                    .session_start()
-                                    .session_id(session.session_id())
-                                    .authorization(authz)
-                                    .send()
-                                    .await
-                            })
-                            .await?;
-                            session
-                        }
-                        Err(err) => return Err(err),
-                    };
+                    let session =
+                        match with_login(ctx, client, async || client.session().send().await).await
+                        {
+                            Ok(resp) => resp.into_inner(),
+                            Err(CommandError::NotFound) => {
+                                let session = Session::new(SessionId::new());
+                                with_login(ctx, client, async || {
+                                    client
+                                        .session_start()
+                                        .session_id(session.session_id())
+                                        .send()
+                                        .await
+                                })
+                                .await?;
+                                session
+                            }
+                            Err(err) => return Err(err),
+                        };
                     ctx.session_started(session)?;
                 }
                 ctx.next_job_id()?
@@ -912,12 +912,11 @@ async fn job(
         }
 
         (JobCommand::History { limit, offset }, Some(client)) => {
-            let history = with_authz(ctx, client, async |authz| {
+            let history = with_login(ctx, client, async || {
                 client
                     .job_history()
                     .limit(limit)
                     .offset(offset)
-                    .authorization(authz)
                     .send()
                     .await
             })
@@ -970,7 +969,7 @@ async fn job_start(
         max_fsize,
     } = limits.as_limits();
     let mut start_ctx = ctx.clone();
-    let start = with_authz(&mut start_ctx, client, async |authz| {
+    let start = with_login(&mut start_ctx, client, async || {
         let mut start = client
             .job_start()
             .job_id(job.job_id())
@@ -978,7 +977,6 @@ async fn job_start(
             .max_mem(max_mem)
             .max_fsize(max_fsize)
             .wait(wait)
-            .authorization(authz)
             .body(job.clone());
         if let Some(term) = term.as_ref() {
             start = start.term(term);
@@ -1047,13 +1045,12 @@ async fn job_start(
         // Show the job status and output.
         job_status(ctx, client, &job_id).await?;
         for stream in [Stdout, Stderr] {
-            match with_authz(ctx, client, async |authz| {
+            match with_login(ctx, client, async || {
                 client
                     .job_output()
                     .job_id(&job_id)
                     .target(target.to_string())
                     .stream(stream)
-                    .authorization(authz)
                     .send()
                     .await
             })
@@ -1078,12 +1075,11 @@ async fn job_stop(
     client: &Client,
     job_id: &JobId,
 ) -> Result<(), CommandError> {
-    with_authz(ctx, client, async |authz| {
+    with_login(ctx, client, async || {
         client
             .job_stop()
             .job_id(job_id)
             .wait(JobWait::Stop)
-            .authorization(authz)
             .send()
             .await
     })
@@ -1096,13 +1092,8 @@ async fn job_status(
     client: &Client,
     job_id: &JobId,
 ) -> Result<(), CommandError> {
-    let status = with_authz(ctx, client, async |authz| {
-        client
-            .job_status()
-            .job_id(job_id)
-            .authorization(authz)
-            .send()
-            .await
+    let status = with_login(ctx, client, async || {
+        client.job_status().job_id(job_id).send().await
     })
     .await?
     .into_inner();
@@ -1162,13 +1153,8 @@ async fn job_output(
 ) -> Result<(), CommandError> {
     // Fetch job status for output length and hash.
     let status = job_status_try_from_json_map(
-        with_authz(ctx, client, async |authz| {
-            client
-                .job_status()
-                .job_id(&job_id)
-                .authorization(authz)
-                .send()
-                .await
+        with_login(ctx, client, async || {
+            client.job_status().job_id(&job_id).send().await
         })
         .await?
         .into_inner(),
@@ -1238,7 +1224,7 @@ async fn job_output(
 
         // Download and write the output in parallel (unordered) chunks.
         ctx.job_output_started(&job_id, stream, "Downloading", *len);
-        let chunks = job_output_chunks(ctx, client, &job_id, target, stream, *len, chunk_size);
+        let chunks = job_output_chunks(client, &job_id, target, stream, *len, chunk_size);
         let par = parallel.get() as usize;
         let mut chunks_par = stream::iter(chunks).buffer_unordered(par);
         while let Some(chunk) = chunks_par.next().await {
@@ -1270,14 +1256,13 @@ async fn job_output(
     } else {
         // Download and print the output all at once. If hash verification
         // fails here, do not print any output.
-        let byte_stream = with_authz(ctx, client, {
-            async |authz| {
+        let byte_stream = with_login(ctx, client, {
+            async || {
                 client
                     .job_output()
                     .job_id(&job_id)
                     .target(target.to_string())
                     .stream(stream)
-                    .authorization(authz)
                     .send()
                     .await
             }
@@ -1293,7 +1278,6 @@ async fn job_output(
 
 /// Prepare a vector of futures that fetch chunks of output.
 fn job_output_chunks<'a>(
-    ctx: &mut impl CommandContext,
     client: &'a Client,
     job_id: &'a JobId,
     target: &'a BaseboardId,
@@ -1303,16 +1287,10 @@ fn job_output_chunks<'a>(
 ) -> Vec<Pin<Box<FutureChunk<'a>>>> {
     let mut chunks = Vec::new();
     let mut start = 0;
-    // TODO: transparent authn for long downloads
-    let authz = ctx
-        .get_credentials()
-        .map(|creds| creds.to_string())
-        .unwrap_or_default();
     while start < len {
         let end = (start + chunk_size.get() - 1).min(len - 1);
         let range = Range { start, end };
-        chunks.push({
-            let authz = authz.clone();
+        chunks.push(
             async move {
                 let bytes = range.bytes();
                 let stream = client
@@ -1321,14 +1299,13 @@ fn job_output_chunks<'a>(
                     .target(target.to_string())
                     .stream(stream)
                     .range(&bytes)
-                    .authorization(&authz)
                     .send()
                     .await?
                     .into_inner();
                 Ok(Chunk(range, stream))
             }
-            .boxed()
-        });
+            .boxed(),
+        );
         start = end + 1;
     }
     chunks
@@ -1369,12 +1346,11 @@ async fn job_attach(
     job_id: &JobId,
     target: &BaseboardId,
 ) -> Result<(), CommandError> {
-    match with_authz(ctx, client, async |authz| {
+    match with_login(ctx, client, async || {
         client
             .job_attach()
             .job_id(job_id)
             .target(target.to_string())
-            .authorization(authz)
             .send()
             .await
     })
@@ -1402,11 +1378,9 @@ async fn resolve_target(
     // Eventually, "*" will mean "all sleds", but for now
     // we take it as "the current sled".
     Ok(if target == "*" {
-        with_authz(ctx, client, async |authz| {
-            client.target().authorization(authz).send().await
-        })
-        .await?
-        .into_inner()
+        with_login(ctx, client, async || client.target().send().await)
+            .await?
+            .into_inner()
     } else {
         target
             .parse()

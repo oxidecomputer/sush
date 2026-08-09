@@ -6,18 +6,53 @@
 
 use std::fmt;
 use std::path::Path;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 
 use clap::ValueEnum;
 use x509_cert::Certificate;
 
-use sush_common::authn::{Credentials, Identity};
+use sush_common::authn::{BoundRequest, Credentials, Identity, RequestKey};
 use sush_common::jobs::{
     Access, JobId, JobOutputStream, JobStatusMap, Session, SessionId, SignedJob,
 };
 use sush_common::keys::{KeyId, SshPublicKey};
 
+use crate::AuthzSigner;
 use crate::commands::{CommandError, GlobalArgs};
+
+/// Authorization state: the credentials that authenticated us, and the
+/// ephemeral key that binds each request we make.
+#[derive(Clone, Debug)]
+pub struct Authz {
+    pub credentials: Credentials,
+    key: RequestKey,
+    seq: Arc<AtomicU64>,
+}
+
+impl Authz {
+    pub fn new(credentials: Credentials, key: RequestKey) -> Self {
+        Self {
+            credentials,
+            key,
+            seq: Arc::new(AtomicU64::new(1)),
+        }
+    }
+
+    /// The `Authorization` header binding one request.
+    pub fn header(&self, method: &str, target: &str) -> String {
+        let seq = self.seq.fetch_add(1, Ordering::Relaxed);
+        let request = BoundRequest::new(method, target, seq);
+        self.key
+            .bind(
+                self.credentials.key_id.clone(),
+                self.credentials.nonce.clone(),
+                &request,
+            )
+            .to_string()
+    }
+}
 
 /// What kind of output to emit.
 #[derive(Clone, Copy, Debug, Default, ValueEnum)]
@@ -53,8 +88,13 @@ pub trait CommandContext: Clone + Send + Sync {
     fn pre_parse_hook(&mut self, _command: &str) {}
 
     // Session management
-    fn get_credentials(&self) -> Option<Credentials>;
-    fn set_credentials(&mut self, credentials: Option<Credentials>);
+    fn authz_signer(&self) -> AuthzSigner;
+    fn get_credentials(&self) -> Option<Authz> {
+        self.authz_signer().get()
+    }
+    fn set_credentials(&mut self, credentials: Option<Authz>) {
+        self.authz_signer().set(credentials)
+    }
     fn session_id(&self) -> Option<SessionId>;
     fn next_job_id(&self) -> Result<JobId, CommandError>;
     fn session_started(&mut self, session: Session) -> Result<(), CommandError>;
