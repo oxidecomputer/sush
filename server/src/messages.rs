@@ -288,5 +288,45 @@ mod wire_format {
         );
     }
 
+    #[test]
+    fn job_start_request() {
+        use sush_common::jobs::JobStartRequest;
+        use sush_common::keys::{EncodedSignature, Signed};
+
+        let request = JobStartRequest::new(
+            "abandon-abandon-abandon-abandon-abandon-abandon-abandon-ability"
+                .parse()
+                .unwrap(),
+            "echo hello",
+            false,
+            "14,16".parse().unwrap(),
+        );
+        let signed = Signed::new(
+            request,
+            KeyId::from("zoo-zero".to_string()),
+            EncodedSignature {
+                r: "abandon".to_string(),
+                s: "zoo".to_string(),
+                flags: 0,
+                counter: 0,
+            },
+        );
+        let msg: VersionedMessage = Message::Request(Request::job(
+            KeyId::from("zoo-zero".to_string()),
+            JobRequest::Start(signed, JobStartParams::default()),
+        ))
+        .into();
+        assert_wire_format(
+            msg,
+            b"\x00\x00\x02\x08\x00\x00\x00zoo-zero\x00\x3f\x00\x00\x00ab\
+              andon-abandon-abandon-abandon-abandon-abandon-abandon-abil\
+              ity\x0a\x00\x00\x00echo hello\x00\x05\x00\x00\x0014,16\x08\
+              \x00\x00\x00zoo-zero\x07\x00\x00\x00abandon\x03\x00\x00\
+              \x00zoo\x00\x00\x00\x00\x00\x10\x0e\x00\x00\x00\x00\x00\
+              \x00\x00P\xd6\xdc\x01\x00\x00\x00\x00\xe4\x0bT\x02\x00\x00\
+              \x00\x00\x00\x00\x00",
+        );
+    }
+
     // TODO: snapshot more messages
 }

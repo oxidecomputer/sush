@@ -13,6 +13,7 @@ use x509_cert::Certificate;
 use x509_cert::der::{Decode as _, Encode as _};
 
 use crate::jobs::JobId;
+use crate::targets::Target;
 
 /// Borsh-encode a [`blake3::Hash`] as its 32 raw bytes.
 ///
@@ -59,6 +60,16 @@ pub fn borsh_de_baseboard_id<R: Read>(reader: &mut R) -> Result<BaseboardId> {
         part_number: String::deserialize_reader(reader)?,
         serial_number: String::deserialize_reader(reader)?,
     })
+}
+
+pub fn borsh_ser_target<W: Write>(value: &Target, writer: &mut W) -> Result<()> {
+    value.to_string().serialize(writer)
+}
+
+pub fn borsh_de_target<R: Read>(reader: &mut R) -> Result<Target> {
+    String::deserialize_reader(reader)?
+        .parse()
+        .map_err(|err| Error::new(ErrorKind::InvalidData, err))
 }
 
 pub fn borsh_ser_cert<W: Write>(value: &Certificate, writer: &mut W) -> Result<()> {

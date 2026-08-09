@@ -26,8 +26,8 @@ use sush_api::{JobStartParams, JobStopParams, JobWait};
 use sush_client::context::Authz;
 use sush_common::authn::{Challenge, ChallengeResponse, Credentials, Identity, RequestKey};
 use sush_common::jobs::{
-    Access, JobId, JobLimits, JobOutputState, JobOutputStream::*, JobStatus, ProcessError, Session,
-    SessionId,
+    Access, JobId, JobLimits, JobOutputState, JobOutputStream::*, JobStartRequest, JobStatus,
+    ProcessError, Session, SessionId,
 };
 use sush_common::keys::{EphemeralKey, KeyError, KeyId, KeyType, Signer as _, pem_cert_chain};
 use sush_server::gossip::isolated;
@@ -1018,6 +1018,53 @@ async fn cert_revoke() {
     })
     .await
     .expect("tombstone never consumed the import");
+}
+
+/// A job runs only on the sleds its signed target names. Jobs naming
+/// another baseboard, or a cubby while no mapping is known, are
+/// processed but never run here, and the causal chain moves on.
+#[named]
+#[tokio::test]
+async fn job_targets() {
+    let log = test_logger(function_name!());
+    let (mgr, mut root, _dir, _shutdown) = manager_and_test_root(log).await;
+    let authn = fake_identity(&mut root).await;
+    let session_id = SessionId::new();
+    let mut session = Session::new(session_id.clone());
+    mgr.session_start(&authn, session_id, true).await.unwrap();
+
+    let mut start = async |command: &str, target: &str| {
+        let job_id = session.next_job_id();
+        let request = JobStartRequest::new(job_id.clone(), command, false, target.parse().unwrap());
+        let job = root
+            .sign(request)
+            .await
+            .unwrap()
+            .verify_with_cert(root.cert())
+            .unwrap();
+        mgr.job_start(&authn, job.clone().into_signed(), JobStartParams::default())
+            .await
+            .unwrap();
+        session.job_started(job.into_signed());
+        job_id
+    };
+
+    let elsewhere = start("true", "913-0000019:BRM00000000").await;
+    let by_cubby = start("true", "14").await;
+    let here = start("true", &test_baseboard_id().to_string()).await;
+
+    // The targeted job runs, which proves the untargeted ones were
+    // already processed and skipped.
+    timeout(Duration::from_secs(30), mgr.wait_for_job_status(&here))
+        .await
+        .expect("timed out waiting for targeted job")
+        .unwrap();
+    for skipped in [elsewhere, by_cubby] {
+        assert!(matches!(
+            mgr.job_status(&authn, &skipped).await,
+            Err(JobError::JobNotFound(_)),
+        ));
+    }
 }
 
 /// Identity revocation: live bound credentials die and the key may

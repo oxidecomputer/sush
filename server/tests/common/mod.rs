@@ -29,6 +29,7 @@ use sush_common::authn::{Challenge, ChallengeResponse, Identity, Nonce, RequestK
 use sush_common::codephrases::generate_id;
 use sush_common::jobs::{JobId, JobStartRequest, SignedJob};
 use sush_common::keys::{EphemeralKey, KeyType, Signer as _};
+use sush_common::targets::Target;
 use sush_server::gossip::GossipConfig;
 use sush_server::link::CorpusSource;
 use tempfile::TempDir;
@@ -149,9 +150,14 @@ pub async fn fake_identity(key: &mut EphemeralKey) -> Identity {
 
 /// Sign a batch job request with `root`.
 pub async fn sign_job(root: &mut EphemeralKey, job_id: &JobId, command: &str) -> SignedJob {
-    root.sign(JobStartRequest::new(job_id.to_owned(), command, false))
-        .await
-        .unwrap()
+    root.sign(JobStartRequest::new(
+        job_id.to_owned(),
+        command,
+        false,
+        Target::All,
+    ))
+    .await
+    .unwrap()
 }
 
 pub fn sprockets_config(dir: &Utf8PathBuf, node: usize) -> SprocketsConfig {

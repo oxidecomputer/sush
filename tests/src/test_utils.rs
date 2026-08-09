@@ -25,6 +25,7 @@ use sush_common::authn::{Challenge, ChallengeResponse, Credentials, Identity, No
 use sush_common::codephrases::generate_id;
 use sush_common::jobs::{JobId, JobStartRequest, VerifiedJob};
 use sush_common::keys::{EphemeralKey, KeyType, Signer};
+use sush_common::targets::Target;
 use sush_server::executor::PathIsolation;
 use sush_server::gossip::isolated;
 use sush_server::output::{JobOutputDir, JobOutputFileStream};
@@ -81,6 +82,7 @@ impl SignJobRequest for EphemeralKey {
             job_id.to_owned(),
             command,
             interactive,
+            Target::All,
         ))
         .await
         .expect("failed to sign job")

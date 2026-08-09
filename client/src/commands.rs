@@ -49,6 +49,7 @@ use sush_common::jobs::{
     SignedJob, job_status_try_from_json_map,
 };
 use sush_common::keys::{KeyError, KeyId, Signer as _};
+use sush_common::targets::Target;
 
 use crate::ByteStream;
 use crate::context::{Authz, CommandContext, OutputFormat};
@@ -457,6 +458,11 @@ pub struct JobStartArgs {
     #[arg(short, long)]
     interactive: bool,
 
+    /// Where the job runs: every sled (`*`), or a comma-separated list
+    /// of cubby numbers and baseboard IDs.
+    #[arg(short = 'T', long, default_value = "*")]
+    target: Target,
+
     /// Use `permslip` to sign job requests with this key name.
     #[cfg(feature = "permslip")]
     #[arg(short, long, env = SUSH_PERMSLIP_KEY, value_name = "KEY_NAME")]
@@ -855,6 +861,7 @@ async fn job(
                         ref job_id,
                         ref permslip_url,
                         ref interactive,
+                        ref target,
                         ..
                     },
             },
@@ -900,6 +907,7 @@ async fn job(
                 job_id.to_owned(),
                 command,
                 *interactive,
+                target.clone(),
             ));
             pin!(sign);
             ctx.job_signing_started(&job_id);

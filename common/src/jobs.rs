@@ -24,13 +24,15 @@ use sled_hardware_types::{BaseboardId, BaseboardIdParseError};
 use thiserror::Error;
 
 use crate::borsh::{
-    borsh_de_datetime, borsh_de_hash, borsh_de_job_id, borsh_ser_datetime, borsh_ser_hash,
+    borsh_de_datetime, borsh_de_hash, borsh_de_job_id, borsh_de_target, borsh_ser_datetime,
+    borsh_ser_hash, borsh_ser_target,
 };
 use crate::codephrases::{
     InvalidCodephrase, WORD_SEPARATOR, decode_phrase, generate_id, id_phrase,
 };
 use crate::interactive::InteractiveJobError;
 use crate::keys::{KeyId, Signed, ToBeSigned, Verified};
+use crate::targets::Target;
 
 /// A globally unique identifier for a job within a session.
 #[derive(
@@ -256,6 +258,13 @@ pub struct JobStartRequest {
     pub command: String,
     #[serde(default, skip_serializing_if = "is_false")]
     pub interactive: bool,
+    /// The sleds this job runs on.
+    #[borsh(
+        serialize_with = "borsh_ser_target",
+        deserialize_with = "borsh_de_target"
+    )]
+    #[serde(default, skip_serializing_if = "Target::is_all")]
+    pub target: Target,
 }
 
 fn is_false(x: &bool) -> bool {
@@ -265,11 +274,17 @@ fn is_false(x: &bool) -> bool {
 impl JobStartRequest {
     const TYPE_NAME: &[u8] = b"sush_common::jobs::JobStartRequest";
 
-    pub fn new<S: AsRef<str>>(job_id: JobId, command: S, interactive: bool) -> Self {
+    pub fn new<S: AsRef<str>>(
+        job_id: JobId,
+        command: S,
+        interactive: bool,
+        target: Target,
+    ) -> Self {
         Self {
             job_id,
             command: command.as_ref().to_string(),
             interactive,
+            target,
         }
     }
 
@@ -283,6 +298,10 @@ impl JobStartRequest {
 
     pub fn interactive(&self) -> bool {
         self.interactive
+    }
+
+    pub fn target(&self) -> &Target {
+        &self.target
     }
 }
 
@@ -299,11 +318,13 @@ impl ToBeSigned for JobStartRequest {
             job_id,
             command,
             interactive,
+            target,
         } = self;
         hash_with_len(Self::TYPE_NAME);
         hash_with_len(job_id.as_bytes());
         hash_with_len(command.as_bytes());
         hash_with_len(if *interactive { &[1] } else { &[0] });
+        hash_with_len(target.to_string().as_bytes());
         hasher.finalize().as_bytes().to_vec()
     }
 }

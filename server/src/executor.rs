@@ -177,6 +177,7 @@ async fn job_spawn(
         job_id,
         command,
         interactive,
+        target: _,
     } = request.payload().clone();
     let JobStartParams {
         limits: requested,

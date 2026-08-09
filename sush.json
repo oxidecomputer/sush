@@ -1361,6 +1361,10 @@
           },
           "interactive": {
             "type": "boolean"
+          },
+          "target": {
+            "description": "The sleds this job runs on.",
+            "type": "string"
           }
         },
         "required": [

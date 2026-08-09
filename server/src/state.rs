@@ -27,6 +27,7 @@ use x509_cert::der::Encode as _;
 use sush_api::JobStartParams;
 use sush_common::jobs::{Access, JobId, JobStatus, JobStatusMap, Session, SessionId, SignedJob};
 use sush_common::keys::{KeyError, KeyId, Signature};
+use sush_common::targets::Cubbies;
 
 use crate::executor::{Executor, PathIsolation};
 use crate::history::JobHistory;
@@ -175,11 +176,13 @@ impl<'a> SessionGuard<'a> {
         history: &mut JobHistory,
         running: &RunningJobs,
         own_baseboard: &BaseboardId,
+        cubbies: &Cubbies,
         job: SignedJob,
         params: JobStartParams,
         actor: &KeyId,
     ) {
         let job_id = job.job_id().clone();
+        let targeted = job.payload().target().includes(own_baseboard, cubbies);
         if history.contains(&job_id) {
             // Note but otherwise ignore the duplicate job.
             info!(log, "already started job"; "job_id" => %job_id);
@@ -189,20 +192,24 @@ impl<'a> SessionGuard<'a> {
             // We have no choice; drop the job on the floor.
             warn!(log, "too many jobs queued"; "job_id" => %job_id, "max" => MAX_QUEUED_JOBS);
         } else {
-            // Insert the job into our queue and record its new status.
+            // Insert the job into our queue. Every job joins the
+            // queue to keep the causal chain whole, but only jobs
+            // targeting this sled record a local status.
             self.queued_jobs.insert(job_id.clone(), (job, params));
-            history.set_job_status(
-                &job_id,
-                own_baseboard,
-                JobStatus::Queued {
-                    job_id: job_id.clone(),
-                    time_queued: Utc::now(),
-                    actor: actor.clone(),
-                },
-                None,
-                Some(self.queued_jobs),
-                running,
-            );
+            if targeted {
+                history.set_job_status(
+                    &job_id,
+                    own_baseboard,
+                    JobStatus::Queued {
+                        job_id: job_id.clone(),
+                        time_queued: Utc::now(),
+                        actor: actor.clone(),
+                    },
+                    None,
+                    Some(self.queued_jobs),
+                    running,
+                );
+            }
         }
     }
 
@@ -240,6 +247,7 @@ impl<'a> SessionGuard<'a> {
     pub fn execute_ready_jobs(
         &mut self,
         own_baseboard: &BaseboardId,
+        cubbies: &Cubbies,
         certs: &mut Certificates,
         history: &mut JobHistory,
         executor: &mut Executor,
@@ -248,10 +256,13 @@ impl<'a> SessionGuard<'a> {
         while let Some((request, params)) = self.next_queued_job() {
             let (tx_attachment, rx_attachment) = watch::channel(None);
             let job_id = request.payload().job_id().to_owned();
-            if history
-                .get_job_status(&job_id)
-                .map(|status| matches!(status.get(own_baseboard), Some(JobStatus::Queued { .. })))
-                .unwrap_or(true)
+            if request.payload().target().includes(own_baseboard, cubbies)
+                && history
+                    .get_job_status(&job_id)
+                    .map(|status| {
+                        matches!(status.get(own_baseboard), Some(JobStatus::Queued { .. }))
+                    })
+                    .unwrap_or(true)
             {
                 executor.job_start(certs, request.clone(), params, tx_attachment);
                 attachments.insert(job_id.clone(), rx_attachment);
@@ -281,6 +292,8 @@ pub struct State {
     /// Hard-coded root certificate key IDs. Self-signed certificates
     /// not in this set will be revoked with prejudice.
     roots: Box<[KeyId]>,
+    /// Baseboards by cubby number, as much of it as is known.
+    cubbies: Cubbies,
 }
 
 impl State {
@@ -307,6 +320,7 @@ impl State {
             tombstones: LruCache::new(MAX_TOMBSTONES),
             certs,
             roots: roots.clone(),
+            cubbies: Default::default(),
         };
         new.validate_certs(&roots);
         for root in &roots {
@@ -578,6 +592,7 @@ impl State {
                             );
                             session.execute_ready_jobs(
                                 &self.own_baseboard,
+                                &self.cubbies,
                                 &mut self.certs,
                                 &mut self.history,
                                 executor,
@@ -623,12 +638,14 @@ impl State {
                                 &mut self.history,
                                 &self.running,
                                 &self.own_baseboard,
+                                &self.cubbies,
                                 signed.clone(),
                                 params.clone(),
                                 actor,
                             );
                             session.execute_ready_jobs(
                                 &self.own_baseboard,
+                                &self.cubbies,
                                 &mut self.certs,
                                 &mut self.history,
                                 executor,
