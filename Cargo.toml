@@ -31,12 +31,12 @@ p256 = { version = "0.13", features = ["ecdsa"] }
 pem-rfc7468 = { version = "0.7", features = ["std"] }
 permission-slip-client = { git = "https://github.com/oxidecomputer/permission-slip" }
 permission-slip-common = { git = "https://github.com/oxidecomputer/permission-slip" }
-progenitor = "0.11"
-progenitor-client = "0.11"
+progenitor = "0.14"
+progenitor-client = "0.14"
 pwd = "1"
 rand = "0.8"
 rand_core = "0.6"
-reqwest = "0.12"
+reqwest = { version = "0.13", features = ["json"] }
 rlimit = "0.10"
 rumors = { git = "https://github.com/oxidecomputer/rumors", rev = "66aea68b6578345275de3cf14151c4707345773f" }
 rustix = { version = "1", features = ["fs", "process", "pty", "termios"] }

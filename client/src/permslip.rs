@@ -34,7 +34,12 @@ impl PermslipSigner {
         let token = tokens.token().await.map_err(PermslipError::token)?;
         builder = builder.token(token.into_header_value().map_err(PermslipError::token)?);
         Ok(Self {
-            client: Client::new_with_client(url, builder.build()?),
+            client: Client::new_with_client(
+                url,
+                builder
+                    .build()
+                    .map_err(|err| PermslipError::Client(err.to_string()))?,
+            ),
             key_name: key_name.as_ref().to_owned(),
         })
     }
@@ -123,8 +128,6 @@ pub enum PermslipError {
     Key(#[from] KeyError),
     #[error(transparent)]
     Pem(#[from] pem_rfc7468::Error),
-    #[error(transparent)]
-    Reqwest(#[from] reqwest::Error),
     #[error("authentication token: {0}")]
     Token(String),
 }
