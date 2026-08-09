@@ -25,8 +25,8 @@ use x509_cert::der::DecodePem as _;
 
 use sush_api::{
     AccessParam, Authorization, AuthorizedRangeRequest, JobAttachParams, JobHistoryParams,
-    JobIdParam, JobOutputParams, JobStartParams, JobStopParams, KeyIdParam, SessionAndJobIds,
-    SessionAndKeyIds, SessionIdParam, SushApi, WaitParam,
+    JobIdParam, JobOutputParams, JobStartParams, JobStopParams, KeyIdParam, RoutingParam,
+    SessionAndJobIds, SessionAndKeyIds, SessionIdParam, SushApi, WaitParam,
 };
 use sush_common::authn::Identity;
 use sush_common::jobs::{JsonJobStatusMap, Session, SignedJob, job_status_to_json_map};
@@ -111,6 +111,7 @@ impl SushApi for ApiServer {
     async fn iam(
         ctx: RequestContext<Self::Context>,
         headers: Header<Authorization>,
+        _query: QueryParams<RoutingParam>,
         body: TypedBody<Option<SshPublicKey>>,
     ) -> Result<HttpResponseOk<Identity>, HttpError> {
         let mgr = ctx.context();
@@ -310,6 +311,7 @@ impl SushApi for ApiServer {
         ctx: RequestContext<Self::Context>,
         headers: Header<AuthorizedRangeRequest>,
         params: PathParams<JobOutputParams>,
+        _query: QueryParams<RoutingParam>,
     ) -> Result<Response<Body>, HttpError> {
         let mgr = ctx.context();
         let headers = headers.into_inner();
@@ -350,6 +352,7 @@ impl SushApi for ApiServer {
         ctx: RequestContext<Self::Context>,
         headers: Header<Authorization>,
         params: PathParams<JobAttachParams>,
+        _query: QueryParams<RoutingParam>,
         upgrade: WebsocketUpgrade,
     ) -> WebsocketEndpointResult {
         let mgr = ctx.context();
@@ -405,13 +408,8 @@ impl SushApi for ApiServer {
 
     async fn target(
         ctx: RequestContext<Self::Context>,
-        headers: Header<Authorization>,
+        _query: QueryParams<RoutingParam>,
     ) -> Result<HttpResponseOk<BaseboardId>, HttpError> {
-        let mgr = ctx.context();
-        let Authorization { authorization } = headers.into_inner();
-        let _authn = mgr
-            .iam(authorization, None, request_line(&ctx.request))
-            .await?;
-        Ok(HttpResponseOk(mgr.own_baseboard().to_owned()))
+        Ok(HttpResponseOk(ctx.context().own_baseboard().to_owned()))
     }
 }

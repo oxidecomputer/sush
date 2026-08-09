@@ -196,6 +196,15 @@
             "schema": {
               "type": "string"
             }
+          },
+          {
+            "in": "query",
+            "name": "via",
+            "description": "Where a proxy should route this request.",
+            "schema": {
+              "nullable": true,
+              "type": "string"
+            }
           }
         ],
         "requestBody": {
@@ -357,6 +366,15 @@
             "schema": {
               "type": "string"
             }
+          },
+          {
+            "in": "query",
+            "name": "via",
+            "description": "Where a proxy should route this request.",
+            "schema": {
+              "nullable": true,
+              "type": "string"
+            }
           }
         ],
         "responses": {
@@ -416,6 +434,15 @@
             "required": true,
             "schema": {
               "$ref": "#/components/schemas/JobOutputStream"
+            }
+          },
+          {
+            "in": "query",
+            "name": "via",
+            "description": "Where a proxy should route this request.",
+            "schema": {
+              "nullable": true,
+              "type": "string"
             }
           }
         ],
@@ -892,13 +919,15 @@
     "/target": {
       "get": {
         "summary": "Get the baseboard ID of the sled handling this request.",
+        "description": "Unauthenticated: discovery must work before anyone can log in, and this reveals only the sled's baseboard. Routed through a proxy, this resolves a target expression to a baseboard.",
         "operationId": "target",
         "parameters": [
           {
-            "in": "header",
-            "name": "authorization",
-            "description": "Authorization to access some resource, such as a signature.\n\nSee: <https://developer.mozilla.org/en-US/docs/Web/HTTP/Reference/Headers/Authorization>",
+            "in": "query",
+            "name": "via",
+            "description": "Where a proxy should route this request.",
             "schema": {
+              "nullable": true,
               "type": "string"
             }
           }

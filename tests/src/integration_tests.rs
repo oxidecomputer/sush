@@ -239,6 +239,18 @@ async fn client_proxy_server() {
         assert_eq!(response.status(), 502);
     }
 
+    // `/target` needs no login and, through the proxy, resolves
+    // routing expressions.
+    let anon = Client::new(&format!("http://{proxy_addr}"), AuthzSigner::default());
+    let resolved = anon
+        .target()
+        .via("14")
+        .send()
+        .await
+        .expect("can't resolve a cubby via the proxy")
+        .into_inner();
+    assert_eq!(resolved, test_baseboard_id());
+
     // With no sleds in the table, everything is refused.
     tx_targets.send(Targets::default()).unwrap();
     let unavailable = client.iam().body(None).send().await.unwrap_err();

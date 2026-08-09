@@ -151,7 +151,7 @@ impl Router {
 }
 
 /// The target a request names, if any. A `*` path segment names no
-/// particular sled, so the query may still route.
+/// particular sled, so the `via` query parameter may still route.
 fn named_target<B>(request: &Request<B>) -> Option<Result<Target, String>> {
     let uri = request.uri();
     let segments: Vec<&str> = uri.path().trim_start_matches('/').split('/').collect();
@@ -161,7 +161,7 @@ fn named_target<B>(request: &Request<B>) -> Option<Result<Target, String>> {
             query.split('&').find_map(|param| {
                 param
                     .split_once('=')
-                    .filter(|(key, _)| *key == "target")
+                    .filter(|(key, _)| *key == "via")
                     .map(|(_, value)| value)
             })
         }),
@@ -313,15 +313,15 @@ mod test {
             Some(Ok(target("test part:0000"))),
         );
         assert_eq!(
-            named_target(&request("/iam?target=test%20part:0000")),
+            named_target(&request("/iam?via=test%20part:0000")),
             Some(Ok(target("test part:0000"))),
         );
         assert_eq!(
-            named_target(&request("/jobs/some-job/attach/*?target=14,16")),
+            named_target(&request("/jobs/some-job/output/*/stdout?via=14,16")),
             Some(Ok(target("14,16"))),
         );
         assert_eq!(named_target(&request("/jobs/some-job/attach/*")), None);
-        assert_eq!(named_target(&request("/iam?target=*")), None);
+        assert_eq!(named_target(&request("/iam?via=*")), None);
         assert_eq!(
             named_target(&request("/jobs/some-job/output/nonsense/stdout")),
             Some(Err(String::from("nonsense"))),

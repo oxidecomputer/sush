@@ -49,7 +49,7 @@ use sush_common::jobs::{
     SignedJob, job_status_try_from_json_map,
 };
 use sush_common::keys::{KeyError, KeyId, Signer as _};
-use sush_common::targets::Target;
+use sush_common::targets::{SledId, Target};
 
 use crate::ByteStream;
 use crate::context::{Authz, CommandContext, OutputFormat};
@@ -395,9 +395,9 @@ pub enum JobCommand {
     /// Get the standard output of a job.
     #[clap(alias = "output")]
     Stdout {
-        /// The baseboard ID of the sled from which output should be fetched.
+        /// The sled from which output should be fetched.
         #[arg(short = 'T', long, default_value = "*")]
-        target: String,
+        target: Target,
 
         #[clap(flatten)]
         output: JobOutput,
@@ -406,9 +406,9 @@ pub enum JobCommand {
     /// Get the standard error of a job.
     #[clap(alias = "error")]
     Stderr {
-        /// The baseboard ID of the sled from which output should be fetched.
+        /// The sled from which output should be fetched.
         #[arg(short = 'T', long, default_value = "*")]
-        target: String,
+        target: Target,
 
         #[clap(flatten)]
         output: JobOutput,
@@ -420,9 +420,9 @@ pub enum JobCommand {
         #[clap(env = SUSH_JOB_ID)]
         job_id: JobId,
 
-        /// The baseboard ID of the sled to attach to.
+        /// The sled to attach to.
         #[arg(short = 'T', long, default_value = "*")]
-        target: String,
+        target: Target,
     },
 
     /// Show status of previously started jobs.
@@ -550,6 +550,7 @@ impl ClientCommand {
 async fn authenticate<E>(
     ctx: &mut impl CommandContext,
     client: &Client,
+    via: Option<&BaseboardId>,
     response: ResponseValue<E>,
 ) -> Result<(Identity, Authz), CommandError> {
     let mut ssh_agent = if let Some(ssh_auth_sock) = &ctx.get_globals().ssh_auth_sock {
@@ -576,13 +577,14 @@ async fn authenticate<E>(
     };
     let verified = signed.verify_with_ssh_public_key(&public_key)?;
     let credentials = Credentials::new(verified);
-    let identity = client
+    let mut request = client
         .iam()
         .authorization(credentials.to_string())
-        .body(public_key.to_string())
-        .send()
-        .await?
-        .into_inner();
+        .body(public_key.to_string());
+    if let Some(via) = via {
+        request = request.via(via.to_string());
+    }
+    let identity = request.send().await?.into_inner();
     Ok((identity, Authz::new(credentials, key)))
 }
 
@@ -591,6 +593,22 @@ async fn authenticate<E>(
 async fn with_login<T, E, Req>(
     ctx: &mut impl CommandContext,
     client: &Client,
+    make_request: Req,
+) -> Result<T, CommandError>
+where
+    Req: AsyncFnMut() -> Result<T, ClientError<E>>,
+    CommandError: From<ClientError<E>>,
+{
+    with_login_via(ctx, client, None, make_request).await
+}
+
+/// Like [`with_login`], for requests a proxy routes to a particular
+/// sled. Identities live on one sled, so the login must go where the
+/// request it retries went.
+async fn with_login_via<T, E, Req>(
+    ctx: &mut impl CommandContext,
+    client: &Client,
+    via: Option<&BaseboardId>,
     mut make_request: Req,
 ) -> Result<T, CommandError>
 where
@@ -599,7 +617,7 @@ where
 {
     match make_request().await {
         Err(ClientError::ErrorResponse(err)) if err.status() == StatusCode::UNAUTHORIZED => {
-            let (_identity, authz) = authenticate(ctx, client, err).await?;
+            let (_identity, authz) = authenticate(ctx, client, via, err).await?;
             ctx.set_credentials(Some(authz));
             Ok(make_request().await?)
         }
@@ -943,17 +961,17 @@ async fn job(
         (JobCommand::Status { job_id }, Some(client)) => job_status(ctx, client, &job_id).await,
 
         (JobCommand::Stdout { target, output }, Some(client)) => {
-            let target = resolve_target(ctx, client, &target).await?;
+            let target = resolve_target(client, &target).await?;
             job_output(ctx, client, &target, Stdout, output).await
         }
 
         (JobCommand::Stderr { target, output }, Some(client)) => {
-            let target = resolve_target(ctx, client, &target).await?;
+            let target = resolve_target(client, &target).await?;
             job_output(ctx, client, &target, Stderr, output).await
         }
 
         (JobCommand::Attach { job_id, target }, Some(client)) => {
-            let target = resolve_target(ctx, client, &target).await?;
+            let target = resolve_target(client, &target).await?;
             job_attach(ctx, client, &job_id, &target).await?;
             Ok(())
         }
@@ -989,9 +1007,9 @@ async fn job_start(
     job: SignedJob,
     start_args: JobStartArgs,
 ) -> Result<(), CommandError> {
-    // Eventually, the target will be embedded in the signed job request.
-    // But for now, just get it from the server.
-    let target = resolve_target(ctx, client, "*").await?;
+    // Resolve the signed request's target to one sled to watch and
+    // fetch output from.
+    let target = resolve_target(client, job.payload().target()).await?;
 
     // Set up the job request and parameters.
     let job_id = job.job_id().to_owned();
@@ -1092,7 +1110,7 @@ async fn job_start(
         // Show the job status and output.
         job_status(ctx, client, &job_id).await?;
         for stream in [Stdout, Stderr] {
-            match with_login(ctx, client, async || {
+            match with_login_via(ctx, client, Some(&target), async || {
                 client
                     .job_output()
                     .job_id(&job_id)
@@ -1200,7 +1218,7 @@ async fn job_output(
 ) -> Result<(), CommandError> {
     // Fetch job status for output length and hash.
     let status = job_status_try_from_json_map(
-        with_login(ctx, client, async || {
+        with_login_via(ctx, client, Some(target), async || {
             client.job_status().job_id(&job_id).send().await
         })
         .await?
@@ -1303,7 +1321,7 @@ async fn job_output(
     } else {
         // Download and print the output all at once. If hash verification
         // fails here, do not print any output.
-        let byte_stream = with_login(ctx, client, {
+        let byte_stream = with_login_via(ctx, client, Some(target), {
             async || {
                 client
                     .job_output()
@@ -1393,7 +1411,7 @@ async fn job_attach(
     job_id: &JobId,
     target: &BaseboardId,
 ) -> Result<(), CommandError> {
-    match with_login(ctx, client, async || {
+    match with_login_via(ctx, client, Some(target), async || {
         client
             .job_attach()
             .job_id(job_id)
@@ -1417,22 +1435,21 @@ async fn job_attach(
     }
 }
 
-async fn resolve_target(
-    ctx: &mut impl CommandContext,
-    client: &Client,
-    target: &str,
-) -> Result<BaseboardId, CommandError> {
-    // Eventually, "*" will mean "all sleds", but for now
-    // we take it as "the current sled".
-    Ok(if target == "*" {
-        with_login(ctx, client, async || client.target().send().await)
-            .await?
-            .into_inner()
-    } else {
-        target
-            .parse()
-            .map_err(CommandError::BaseboardIdParseError)?
-    })
+/// Resolve a target to the baseboard of one sled it names. A single
+/// baseboard resolves locally. Anything else asks `/target`, routed
+/// by the expression, so a proxy resolves cubbies and `*` means the
+/// handling sled.
+async fn resolve_target(client: &Client, target: &Target) -> Result<BaseboardId, CommandError> {
+    if let Target::Sleds(sleds) = target
+        && let [SledId::Baseboard(baseboard)] = sleds.as_slice()
+    {
+        return Ok(baseboard.clone());
+    }
+    let mut request = client.target();
+    if !target.is_all() {
+        request = request.via(target.to_string());
+    }
+    Ok(request.send().await?.into_inner())
 }
 
 /// What went wrong parsing, preparing, or executing a client command.
