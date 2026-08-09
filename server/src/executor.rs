@@ -18,7 +18,7 @@ use futures::Stream;
 use pwd::Passwd;
 use rustix::io::close;
 use rustix::process::{Pid, Signal, ioctl_tiocsctty, kill_process_group, setsid};
-use slog::{Logger, debug, error, o};
+use slog::{Logger, debug, error, o, warn};
 use tokio::fs::{DirBuilder, OpenOptions};
 use tokio::process::{Child, Command};
 use tokio::spawn;
@@ -179,12 +179,19 @@ async fn job_spawn(
         interactive,
     } = request.payload().clone();
     let JobStartParams {
-        limits,
+        limits: requested,
         term,
         rows,
         cols,
         wait: _,
     } = params;
+    let limits = requested.clone().clamp();
+    if limits != requested {
+        warn!(
+            log, "clamped requested job limits";
+            "requested" => ?requested, "limits" => ?limits,
+        );
+    }
 
     // Report all I/O errors as job events.
     let io_err = |what| move |err: io::Error| ProcessError::io(what, err);

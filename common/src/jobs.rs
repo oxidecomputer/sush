@@ -635,6 +635,18 @@ pub struct JobLimits {
 }
 
 impl JobLimits {
+    /// Clamp each limit to the default ceiling. Limits arrive as
+    /// unsigned request parameters, which may narrow the server's
+    /// limits but never widen them.
+    pub fn clamp(self) -> Self {
+        let ceiling = Self::default();
+        Self {
+            max_cpu: self.max_cpu.min(ceiling.max_cpu),
+            max_mem: self.max_mem.min(ceiling.max_mem),
+            max_fsize: self.max_fsize.min(ceiling.max_fsize),
+        }
+    }
+
     pub fn apply(&self) -> Result<(), IoError> {
         let Self {
             max_cpu,
@@ -653,12 +665,12 @@ impl JobLimits {
     }
 }
 
-/// Default limits should be increased as needed.
+/// The default limits are also the ceilings: see [`JobLimits::clamp`].
 impl Default for JobLimits {
     fn default() -> Self {
         JobLimits {
-            max_cpu: 60,
-            max_mem: GB,
+            max_cpu: 3600,
+            max_mem: 8 * GB,
             max_fsize: 10 * GB,
         }
     }
@@ -745,5 +757,27 @@ impl FromStr for JobOutputStream {
             "stderr" => Ok(Self::Stderr),
             _ => Err(InvalidOutputStream),
         }
+    }
+}
+
+#[cfg(test)]
+mod test {
+    use super::*;
+
+    /// Requested limits may narrow the default ceiling, never widen it.
+    #[test]
+    fn limits_clamp() {
+        let narrowed = JobLimits {
+            max_cpu: 1,
+            max_mem: GB,
+            max_fsize: GB,
+        };
+        assert_eq!(narrowed.clone().clamp(), narrowed);
+        let widened = JobLimits {
+            max_cpu: u64::MAX,
+            max_mem: u64::MAX,
+            max_fsize: u64::MAX,
+        };
+        assert_eq!(widened.clamp(), JobLimits::default());
     }
 }
