@@ -235,21 +235,31 @@ pub mod v0 {
 
 #[cfg(test)]
 mod wire_format {
+    use std::env;
+    use std::fs::{read, write};
+
     use super::v0::*;
     use super::*;
 
-    /// Serialize a message and compare against a pinned hex snapshot.
+    /// Serialize a message and compare against the snapshot in
+    /// `tests/output/`, or rewrite it under `EXPECTORATE=overwrite`.
     ///
     /// If this test fails, STOP! You have changed the gossip wire format!
     /// Because borsh enum tags are positional, reordering or inserting
     /// variants (or editing any struct these messages contain) silently
     /// changes how *old* bytes decode. Either revert the schema change
-    /// or introduce a new [`VersionedMessage`] variant and re-pin these
+    /// or introduce a new [`VersionedMessage`] variant and re-pin the
     /// snapshots.
     #[track_caller]
-    fn assert_wire_format(message: VersionedMessage, expected: &[u8]) {
+    fn assert_wire_format(name: &str, message: VersionedMessage) {
         let bytes = borsh::to_vec(&message).unwrap();
-        assert_eq!(bytes, expected, "gossip wire format changed: {bytes:02x?}");
+        let path = format!("tests/output/{name}.bin");
+        if env::var("EXPECTORATE").as_deref() == Ok("overwrite") {
+            write(&path, &bytes).unwrap();
+        } else {
+            let expected = read(&path).expect("missing snapshot");
+            assert_eq!(bytes, expected, "gossip wire format changed: {bytes:02x?}");
+        }
         let decoded: VersionedMessage = borsh::from_slice(&bytes).unwrap();
         assert_eq!(decoded, message, "wire format should round-trip");
     }
@@ -261,10 +271,7 @@ mod wire_format {
             SessionRequest::Start(SessionId::from("abandon-ability")),
         ))
         .into();
-        assert_wire_format(
-            msg,
-            b"\x00\x00\x01\x08\x00\x00\x00zoo-zero\x00\x0f\x00\x00\x00abandon-ability",
-        );
+        assert_wire_format("session-start-request", msg);
     }
 
     #[test]
@@ -274,10 +281,7 @@ mod wire_format {
             SessionRequest::Stop(SessionId::from("abandon-ability")),
         ))
         .into();
-        assert_wire_format(
-            msg,
-            b"\x00\x00\x01\x08\x00\x00\x00zoo-zero\x01\x0f\x00\x00\x00abandon-ability",
-        );
+        assert_wire_format("session-stop-request", msg);
     }
 
     #[test]
@@ -291,11 +295,7 @@ mod wire_format {
             ),
         ))
         .into();
-        assert_wire_format(
-            msg,
-            b"\x00\x00\x01\x08\x00\x00\x00zoo-zero\x03\x0f\x00\x00\x00abandon-ability\
-              \x0a\x00\x00\x00able-about\x01",
-        );
+        assert_wire_format("session-allow-attach-request", msg);
     }
 
     #[test]
@@ -308,11 +308,7 @@ mod wire_format {
             ),
         ))
         .into();
-        assert_wire_format(
-            msg,
-            b"\x00\x00\x01\x08\x00\x00\x00zoo-zero\x04\x0f\x00\x00\x00abandon-ability\
-              \x0a\x00\x00\x00able-about",
-        );
+        assert_wire_format("session-deny-attach-request", msg);
     }
 
     #[test]
@@ -343,16 +339,7 @@ mod wire_format {
             JobRequest::Start(signed, JobStartParams::default()),
         ))
         .into();
-        assert_wire_format(
-            msg,
-            b"\x00\x00\x02\x08\x00\x00\x00zoo-zero\x00\x3f\x00\x00\x00ab\
-              andon-abandon-abandon-abandon-abandon-abandon-abandon-abil\
-              ity\x0a\x00\x00\x00echo hello\x00\x05\x00\x00\x0014,16\x08\
-              \x00\x00\x00zoo-zero\x07\x00\x00\x00abandon\x03\x00\x00\
-              \x00zoo\x00\x00\x00\x00\x00\x10\x0e\x00\x00\x00\x00\x00\
-              \x00\x00P\xd6\xdc\x01\x00\x00\x00\x00\xe4\x0bT\x02\x00\x00\
-              \x00\x00\x00\x00\x00",
-        );
+        assert_wire_format("job-start-request", msg);
     }
 
     #[test]
@@ -392,15 +379,7 @@ mod wire_format {
             IdentityRequest::Login(public_key, signed),
         ))
         .into();
-        assert_wire_format(
-            msg,
-            b"\x00\x00\x03\x08\x00\x00\x00zoo-zero\x00Z\x00\x00\x00ssh-e\
-              d25519 AAAAC3NzaC1lZDI1NTE5AAAAILM+rvN+ot98qgEN796jTiQfZfG\
-              1KaT0PtFDJ13gEiGB test@sush\x07\x00\x00\x00abandon\x07\x00\
-              \x00\x00abilityXfffffffffffffffffffffffffffffff\x08\x00\
-              \x00\x00zoo-zero\x07\x00\x00\x00abandon\x03\x00\x00\x00zoo\
-              \x00\x00\x00\x00\x00",
-        );
+        assert_wire_format("identity-login-request", msg);
     }
 
     // TODO: snapshot more messages
