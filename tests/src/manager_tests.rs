@@ -336,7 +336,12 @@ async fn cancel_queued_job() {
     .expect("should be able to start job A");
     session.job_started(job_a.into_signed());
 
-    // Queue job B ...
+    // Queue job B behind a hole in the job chain, so it cannot start
+    // before we cancel it: the executor only runs the job whose id the
+    // chain expects next, and it never sees this one.
+    let hole_id = session.next_job_id();
+    let hole = root.sign_job_request(&hole_id, "true", false).await;
+    session.job_started(hole.into_signed());
     let command_b = "false";
     let job_id_b = session.next_job_id();
     let job_b = root.sign_job_request(&job_id_b, command_b, false).await;
