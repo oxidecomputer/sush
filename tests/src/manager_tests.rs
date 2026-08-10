@@ -583,7 +583,9 @@ async fn attribution() {
         Some(&authn.key_id)
     );
 
-    // Job B queues behind long-running job A, attributed.
+    // Job B queues behind a hole in the job chain, attributed. The
+    // executor only runs the job whose id the chain expects next, and
+    // it never sees this one, so B stays queued until cancelled.
     let job_id_a = session.next_job_id();
     let job_a = root.sign_job_request(&job_id_a, "sleep 60", false).await;
     mgr.job_start(
@@ -597,6 +599,9 @@ async fn attribution() {
     .await
     .unwrap();
     session.job_started(job_a.into_signed());
+    let hole_id = session.next_job_id();
+    let hole = root.sign_job_request(&hole_id, "true", false).await;
+    session.job_started(hole.into_signed());
     let job_id_b = session.next_job_id();
     let job_b = root.sign_job_request(&job_id_b, "true", false).await;
     mgr.job_start(
