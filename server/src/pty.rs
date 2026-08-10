@@ -16,7 +16,7 @@ use std::pin::Pin;
 use std::task::{Context, Poll, ready};
 
 use rustix::fs::{Mode, OFlags, fcntl_setfl, open};
-use rustix::io::{read, write};
+use rustix::io::{FdFlags, fcntl_setfd, read, write};
 use rustix::pty::{OpenptFlags, grantpt, openpt, ptsname, unlockpt};
 use rustix::termios::{tcgetwinsize, tcsetwinsize};
 
@@ -26,9 +26,12 @@ use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
 use sush_common::interactive::WindowSize;
 
 /// Open and configure a Unix pseudoterminal. We return a reader/control
-/// handle, a write handle, the slave fd, and its path.
+/// handle, a write handle, the slave fd, and its path. The master gets
+/// CLOEXEC after the fact, because illumos cannot set it atomically at
+/// open.
 pub fn open_pty() -> io::Result<(PtyReader, PtyWriter, OwnedFd, PathBuf)> {
-    let pty = openpt(OpenptFlags::RDWR | OpenptFlags::NOCTTY | OpenptFlags::CLOEXEC)?;
+    let pty = openpt(OpenptFlags::RDWR | OpenptFlags::NOCTTY)?;
+    fcntl_setfd(&pty, FdFlags::CLOEXEC)?;
     grantpt(&pty)?;
     unlockpt(&pty)?;
     fcntl_setfl(&pty, OFlags::NONBLOCK)?;
