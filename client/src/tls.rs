@@ -4,6 +4,10 @@
 
 //! TLS for reaching a proxy, whose certificate chain leads to the
 //! sled's platform identity, verified against the platform PKI roots.
+//!
+//! Verification proves only that the server holds a key some RoT
+//! vouched for. TLS only provides transport privacy for job traffic.
+//! We do not support expiration, revocation, or server-name binding.
 
 use std::sync::Arc;
 use std::time::Duration;
