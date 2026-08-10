@@ -1,5 +1,5 @@
 #!/bin/bash
-#: name = "client (linux)"
+#: name = "Build Linux client"
 #: variety = "basic"
 #: target = "ubuntu-22.04"
 #: rust_toolchain = true

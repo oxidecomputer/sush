@@ -1,5 +1,5 @@
 #!/bin/bash
-#: name = "client (helios)"
+#: name = "Build Helios client"
 #: variety = "basic"
 #: target = "helios-2.0"
 #: rust_toolchain = true
