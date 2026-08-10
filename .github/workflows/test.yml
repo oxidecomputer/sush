@@ -1,5 +1,8 @@
 name: Test
-on: [push, pull_request]
+on:
+  push:
+    branches: [main]
+  pull_request:
 jobs:
   Test:
     runs-on: ubuntu-22.04-8core
@@ -43,7 +46,7 @@ jobs:
   # The permslip feature pulls in permission-slip, which is private, so
   # this job only runs where the OIDC exchange can succeed.
   Permslip:
-    if: github.event_name == 'push' && github.repository == 'oxidecomputer/sush'
+    if: github.repository == 'oxidecomputer/sush'
     runs-on: ubuntu-22.04-8core
     permissions:
       contents: read
