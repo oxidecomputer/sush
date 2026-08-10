@@ -154,7 +154,8 @@ pub struct GlobalArgs {
     #[clap(global = true)]
     pub url: Option<String>,
 
-    /// PEM roots that a proxy's TLS certificate must chain to.
+    /// PEM roots that a proxy's TLS certificate must chain to,
+    /// replacing the baked-in platform identity roots.
     #[arg(long = "proxy-root", env = SUSH_PROXY_ROOT, value_name = "PEM")]
     #[clap(global = true)]
     pub proxy_roots: Vec<PathBuf>,
@@ -507,19 +508,23 @@ impl ClientCommand {
         }
 
         let client = match args.url.as_ref() {
-            Some(url) if !args.proxy_roots.is_empty() => {
-                let mut roots = Vec::new();
-                for path in &args.proxy_roots {
-                    let pem = read(path).map_err(|err| CommandError::io(path, err))?;
-                    roots.push(Certificate::from_pem(&pem)?);
-                }
+            Some(url) => {
+                let roots = if args.proxy_roots.is_empty() {
+                    tls::platform_roots()?
+                } else {
+                    let mut roots = Vec::new();
+                    for path in &args.proxy_roots {
+                        let pem = read(path).map_err(|err| CommandError::io(path, err))?;
+                        roots.push(Certificate::from_pem(&pem)?);
+                    }
+                    roots
+                };
                 Some(Client::new_with_client(
                     url,
                     tls::client(roots)?,
                     ctx.authz_signer(),
                 ))
             }
-            Some(url) => Some(Client::new(url, ctx.authz_signer())),
             None => None,
         };
         match (self, client) {

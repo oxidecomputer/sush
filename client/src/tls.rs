@@ -18,19 +18,36 @@ use slog::{Discard, Logger, o};
 use sprockets_tls::keys::RotCertVerifier;
 use thiserror::Error;
 use x509_cert::Certificate;
-use x509_cert::der::{Decode as _, Encode as _};
+use x509_cert::der::{Decode as _, DecodePem as _, Encode as _};
 
 /// The same request timeout as the generated default client.
 const TIMEOUT: Duration = Duration::from_secs(600);
 
+/// The platform identity roots baked into the client: the same
+/// idcerts the sled OS ships.
+const PLATFORM_ROOTS: &[&[u8]] = &[
+    include_bytes!("../certs/staging.pem"),
+    include_bytes!("../certs/production.pem"),
+];
+
 #[derive(Debug, Error)]
 pub enum ProxyTlsError {
+    #[error("certificate: {0}")]
+    Der(#[from] x509_cert::der::Error),
     #[error(transparent)]
     Reqwest(#[from] reqwest::Error),
     #[error("TLS configuration: {0}")]
     Rustls(#[from] rustls::Error),
     #[error("platform identity verifier: {0}")]
     Verifier(String),
+}
+
+/// The baked-in platform roots.
+pub fn platform_roots() -> Result<Vec<Certificate>, ProxyTlsError> {
+    PLATFORM_ROOTS
+        .iter()
+        .map(|pem| Ok(Certificate::from_pem(pem)?))
+        .collect()
 }
 
 /// A `reqwest` client that accepts servers whose certificate chains
