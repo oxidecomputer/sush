@@ -378,6 +378,12 @@ pub const SEQ_WINDOW: u64 = 256;
 /// concurrent requests arrive out of order without opening a replay.
 /// Anything older is refused. Bit `age` of `seen` marks
 /// `highest - age` as spent.
+///
+/// Each server keeps its own windows, so a captured request may be
+/// replayed to a server that has not spent its sequence number yet.
+/// State requests are deduplicated rack-wide by the state machine.
+/// Requests served from local state (output reads, attaches) can be
+/// re-issued to any sled their signed target resolves to.
 #[derive(Clone, Copy, Debug, Default)]
 pub struct SeqWindow {
     highest: u64,
