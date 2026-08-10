@@ -34,7 +34,7 @@ progenitor-client = "0.11"
 pwd = "1"
 rand = "0.8"
 rand_core = "0.6"
-reqwest = "0.12"
+reqwest = { version = "0.12", default-features = false, features = ["charset", "http2"] }
 rlimit = "0.10"
 rumors = { git = "https://github.com/oxidecomputer/rumors", rev = "748325407feb4c61f558713bad431281f8326ac4" }
 rustix = { version = "1", features = ["fs", "process", "pty", "termios"] }
