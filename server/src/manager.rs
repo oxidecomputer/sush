@@ -32,6 +32,7 @@ use sush_common::authn::{
 use sush_common::jobs::JobOutputStream;
 use sush_common::jobs::{Access, JobId, JobStatusMap, Session, SessionId, SignedJob};
 use sush_common::keys::{KeyError, KeyId, SshPublicKey};
+use sush_common::targets::Cubbies;
 
 use crate::error::JobError;
 use crate::executor::PathIsolation;
@@ -90,11 +91,13 @@ pub struct JobManager {
 impl JobManager {
     /// Trust the root certificates in `roots`, one PEM-encoded certificate
     /// per file.
+    #[allow(clippy::too_many_arguments)]
     pub async fn new(
         log: Logger,
         path_isolation: PathIsolation,
         output_dir: JobOutputDir,
         own_baseboard: BaseboardId,
+        cubbies: watch::Receiver<Cubbies>,
         universe: watch::Receiver<GossipNetwork>,
         roots: &[impl AsRef<Path>],
         shutdown: CancellationToken,
@@ -105,6 +108,7 @@ impl JobManager {
             path_isolation,
             output_dir,
             own_baseboard,
+            cubbies,
             universe,
             &roots,
             shutdown,
@@ -112,11 +116,13 @@ impl JobManager {
         .await
     }
 
+    #[allow(clippy::too_many_arguments)]
     pub async fn with_root_certs(
         log: Logger,
         path_isolation: PathIsolation,
         output_dir: JobOutputDir,
         own_baseboard: BaseboardId,
+        cubbies: watch::Receiver<Cubbies>,
         universe: watch::Receiver<GossipNetwork>,
         roots: &[Certificate],
         shutdown: CancellationToken,
@@ -129,6 +135,7 @@ impl JobManager {
             output_dir.clone(),
             own_baseboard.clone(),
             requests,
+            cubbies,
             universe,
             roots,
             shutdown,

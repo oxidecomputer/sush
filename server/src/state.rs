@@ -847,6 +847,8 @@ impl StateManager {
     /// everything resets. Versions do not compare across universes, so no
     /// session or history bookkeeping can survive a migration; running jobs
     /// continue, and their events land in the new universe.
+    ///
+    /// `cubbies` follows the rack's cubby map, which survives migrations.
     #[allow(clippy::too_many_arguments)]
     pub fn run<R>(
         log: Logger,
@@ -854,6 +856,7 @@ impl StateManager {
         output_dir: JobOutputDir,
         own_baseboard: BaseboardId,
         mut requests: R,
+        mut cubbies: watch::Receiver<Cubbies>,
         universe: watch::Receiver<GossipNetwork>,
         roots: &[Certificate],
         shutdown: CancellationToken,
@@ -862,7 +865,9 @@ impl StateManager {
         R: Stream<Item = Request> + Send + Unpin + 'static,
     {
         // We report our current state through a watch channel.
-        let (tx_state, rx_state) = watch::channel(State::new(own_baseboard.clone(), roots)?);
+        let mut initial_state = State::new(own_baseboard.clone(), roots)?;
+        initial_state.cubbies = cubbies.borrow_and_update().clone();
+        let (tx_state, rx_state) = watch::channel(initial_state);
         let roots = roots.to_vec();
 
         // We process messages in causal order, so that we can rely on
@@ -970,6 +975,13 @@ impl StateManager {
                             },
                         },
 
+                        // Follow the rack's cubby map.
+                        Ok(()) = cubbies.changed() => {
+                            tx_state.send_modify(|state| {
+                                state.cubbies = cubbies.borrow_and_update().clone();
+                            });
+                        },
+
                         // Follow the gossip manager to a new universe,
                         // unless we're already draining.
                         Ok(()) = async {
@@ -994,7 +1006,8 @@ impl StateManager {
                         // TODO: re-inject local job state (policy pending).
                         tx_state.send_modify(|state| {
                             *state = State::new(own_baseboard.clone(), &roots)
-                                .expect("roots validated at startup")
+                                .expect("roots validated at startup");
+                            state.cubbies = cubbies.borrow().clone();
                         });
                         *rumors = fresh;
                     }

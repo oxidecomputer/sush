@@ -17,6 +17,7 @@ use slog::{Drain as _, Logger, o};
 use slog_term::{FullFormat, PlainSyncDecorator, TestStdoutWriter};
 use sprockets_tls_test_utils::{OutputFileExistsBehavior, generate_config};
 use tempfile::TempDir;
+use tokio::sync::watch;
 use tokio_util::sync::CancellationToken;
 use x509_cert::name::Name;
 use x509_cert::time::Validity;
@@ -27,7 +28,7 @@ use sush_common::authn::{Challenge, ChallengeResponse, Credentials, Identity, No
 use sush_common::codephrases::generate_id;
 use sush_common::jobs::{JobId, JobStartRequest, VerifiedJob};
 use sush_common::keys::{EphemeralKey, KeyType, Signer};
-use sush_common::targets::Target;
+use sush_common::targets::{Cubbies, Target};
 use sush_server::executor::PathIsolation;
 use sush_server::gossip::isolated;
 use sush_server::output::{JobOutputDir, JobOutputFileStream};
@@ -70,21 +71,33 @@ pub trait SignJobRequest {
         job_id: &JobId,
         command: S,
         interactive: bool,
-    ) -> VerifiedJob;
-}
+    ) -> VerifiedJob {
+        self.sign_job_request_for(job_id, command, interactive, Target::All)
+            .await
+    }
 
-impl SignJobRequest for EphemeralKey {
-    async fn sign_job_request<S: AsRef<str>>(
+    async fn sign_job_request_for<S: AsRef<str>>(
         &mut self,
         job_id: &JobId,
         command: S,
         interactive: bool,
+        target: Target,
+    ) -> VerifiedJob;
+}
+
+impl SignJobRequest for EphemeralKey {
+    async fn sign_job_request_for<S: AsRef<str>>(
+        &mut self,
+        job_id: &JobId,
+        command: S,
+        interactive: bool,
+        target: Target,
     ) -> VerifiedJob {
         self.sign(JobStartRequest::new(
             job_id.to_owned(),
             command,
             interactive,
-            Target::All,
+            target,
         ))
         .await
         .expect("failed to sign job")
@@ -194,6 +207,7 @@ pub async fn manager_test_root_and_peer(
         PathIsolation::InsecureDisable,
         JobOutputDir::fixed(dir.path()),
         test_baseboard_id(),
+        no_cubbies(),
         gossip,
         &[root.cert().to_owned()],
         shutdown.clone(),
@@ -201,6 +215,11 @@ pub async fn manager_test_root_and_peer(
     .await
     .unwrap();
     (mgr, root, peer, dir, shutdown)
+}
+
+/// A cubby map that will never be known.
+pub fn no_cubbies() -> watch::Receiver<Cubbies> {
+    watch::channel(Cubbies::new()).1
 }
 
 pub async fn authz<E>(

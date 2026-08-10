@@ -19,6 +19,7 @@ use tokio_util::sync::CancellationToken;
 use sush_api::{JobStartParams, JobWait};
 use sush_common::jobs::{JobStatus, Session, SessionId};
 use sush_common::keys::pem_cert_chain;
+use sush_common::targets::Cubbies;
 use sush_server::executor::PathIsolation;
 use sush_server::gossip::spawn_gossip;
 use sush_server::output::JobOutputDir;
@@ -65,11 +66,13 @@ impl Sled {
             part_number: "sled".to_string(),
             serial_number: identity.to_string(),
         };
+        let (_cubbies, cubbies) = watch::channel(Cubbies::new());
         let mgr = JobManager::new(
             log.clone(),
             PathIsolation::InsecureDisable,
             JobOutputDir::fixed(output.path()),
             baseboard.clone(),
+            cubbies,
             universe.clone(),
             std::slice::from_ref(root_pem),
             shutdown.clone(),

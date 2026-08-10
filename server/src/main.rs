@@ -12,12 +12,14 @@ use clap::Parser;
 use dropshot::{ConfigDropshot, ConfigLogging, ConfigLoggingLevel, HandlerTaskMode, ServerBuilder};
 use sled_hardware_types::BaseboardId;
 use tokio::signal::unix::{SignalKind, signal};
+use tokio::sync::watch;
 use tokio::{select, spawn};
 use tokio_util::sync::CancellationToken;
 use x509_cert::Certificate;
 use x509_cert::der::DecodePem as _;
 
 use sush_api::sush_api_mod::api_description;
+use sush_common::targets::Cubbies;
 use sush_server::executor::PathIsolation;
 use sush_server::gossip::isolated;
 use sush_server::manager::JobManager;
@@ -100,11 +102,13 @@ async fn main() -> Result<(), String> {
     let roots = builtin_root_certs()?;
 
     let shutdown = listen_for_shutdown()?;
+    let (_cubbies, cubbies) = watch::channel(Cubbies::new());
     let mut mgr = JobManager::with_root_certs(
         log.clone(),
         path_isolation,
         JobOutputDir::fixed(directory),
         baseboard,
+        cubbies,
         gossip,
         &roots,
         shutdown.clone(),

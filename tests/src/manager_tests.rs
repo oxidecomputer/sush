@@ -30,6 +30,7 @@ use sush_common::jobs::{
     ProcessError, Session, SessionId,
 };
 use sush_common::keys::{EphemeralKey, KeyError, KeyId, KeyType, Signer as _, pem_cert_chain};
+use sush_common::targets::{Cubbies, Target};
 use sush_server::gossip::isolated;
 use sush_server::io::BATCH_OUTPUT_BUFFER_SIZE;
 use sush_server::messages::v0::{CertRequest, IdentityRequest, Message, Request, SessionRequest};
@@ -38,7 +39,7 @@ use sush_server::{JobError, JobManager, seed_gossip};
 
 use crate::test_utils::{
     IntoBytes as _, SignJobRequest as _, ephemeral_test_root, ephemeral_test_subject,
-    fake_identity, manager_and_test_root, manager_login, manager_test_root_and_peer,
+    fake_identity, manager_and_test_root, manager_login, manager_test_root_and_peer, no_cubbies,
     test_baseboard_id, test_logger,
 };
 use sush_server::executor::PathIsolation;
@@ -431,6 +432,103 @@ async fn job_output_perms() {
 
 #[named]
 #[tokio::test]
+async fn cubby_targets() {
+    // A cubby target only matches through the rack's cubby map.
+    let log = test_logger(function_name!());
+    let dir = TempDir::with_prefix("sush-").unwrap();
+    let mut root = ephemeral_test_root();
+    let (cubbies, cubbies_rx) = watch::channel(Cubbies::new());
+    let mgr = JobManager::with_root_certs(
+        log,
+        PathIsolation::InsecureDisable,
+        JobOutputDir::fixed(dir.path()),
+        test_baseboard_id(),
+        cubbies_rx,
+        isolated(seed_gossip()),
+        &[root.cert().to_owned()],
+        CancellationToken::new(),
+    )
+    .await
+    .unwrap();
+    let authn = fake_identity(&mut root).await;
+    let session_id = SessionId::new();
+    let mut session = Session::new(session_id.clone());
+    mgr.session_start(&authn, session_id.clone(), true)
+        .await
+        .unwrap();
+    let target: Target = "14".parse().unwrap();
+
+    // With the map empty, a cubby-targeted job records no status here.
+    // The all-target job behind it in the session's job chain proves
+    // it was processed, not merely still queued.
+    let skipped_id = session.next_job_id();
+    let job = root
+        .sign_job_request_for(&skipped_id, "true", false, target.clone())
+        .await;
+    mgr.job_start(&authn, job.clone().into_signed(), JobStartParams::default())
+        .await
+        .unwrap();
+    session.job_started(job.into_signed());
+    let job_id = session.next_job_id();
+    let job = root.sign_job_request(&job_id, "true", false).await;
+    mgr.job_start(
+        &authn,
+        job.clone().into_signed(),
+        JobStartParams {
+            wait: JobWait::Stop,
+            ..Default::default()
+        },
+    )
+    .await
+    .unwrap();
+    session.job_started(job.into_signed());
+    assert!(matches!(
+        mgr.job_status(&authn, &skipped_id).await.unwrap_err(),
+        JobError::JobNotFound(jid) if jid == skipped_id
+    ));
+
+    // Name this baseboard in the map. The update lands whenever the
+    // state task gets to it, so probe with fresh jobs until one takes.
+    cubbies
+        .send(Cubbies::from([(14, test_baseboard_id())]))
+        .unwrap();
+    loop {
+        let job_id = session.next_job_id();
+        let job = root
+            .sign_job_request_for(&job_id, "true", false, target.clone())
+            .await;
+        mgr.job_start(&authn, job.clone().into_signed(), JobStartParams::default())
+            .await
+            .unwrap();
+        session.job_started(job.into_signed());
+        sleep(Duration::from_millis(50)).await;
+        if mgr.job_status(&authn, &job_id).await.is_ok() {
+            break;
+        }
+    }
+
+    // Now cubby-targeted jobs run here.
+    let job_id = session.next_job_id();
+    let job = root
+        .sign_job_request_for(&job_id, "true", false, target)
+        .await;
+    mgr.job_start(
+        &authn,
+        job.clone().into_signed(),
+        JobStartParams {
+            wait: JobWait::Stop,
+            ..Default::default()
+        },
+    )
+    .await
+    .unwrap();
+    session.job_started(job.into_signed());
+    let status = mgr.job_status(&authn, &job_id).await.unwrap()[mgr.own_baseboard()].clone();
+    check_status_stopped(status, &job_id, Ok(0), Some(0), Some(0));
+}
+
+#[named]
+#[tokio::test]
 async fn root_certs_from_files() {
     // The sled-agent embedding configures roots as paths, so the manager reads
     // them itself.
@@ -446,6 +544,7 @@ async fn root_certs_from_files() {
         PathIsolation::InsecureDisable,
         JobOutputDir::fixed(dir.path()),
         test_baseboard_id(),
+        no_cubbies(),
         isolated(seed_gossip()),
         &[path],
         CancellationToken::new(),
@@ -491,6 +590,7 @@ async fn bad_root_cert_files() {
                 PathIsolation::InsecureDisable,
                 JobOutputDir::fixed(dir.path()),
                 test_baseboard_id(),
+                no_cubbies(),
                 isolated(seed_gossip()),
                 &[path],
                 CancellationToken::new(),
@@ -520,6 +620,7 @@ async fn job_output_dir_moves() {
         PathIsolation::InsecureDisable,
         JobOutputDir::new(rx_dirs),
         test_baseboard_id(),
+        no_cubbies(),
         isolated(seed_gossip()),
         &[root.cert().to_owned()],
         CancellationToken::new(),
@@ -612,6 +713,7 @@ async fn universe_swap() {
         PathIsolation::InsecureDisable,
         JobOutputDir::fixed(dir.path()),
         test_baseboard_id(),
+        no_cubbies(),
         universe_rx,
         &[root.cert().to_owned()],
         CancellationToken::new(),
@@ -745,6 +847,7 @@ async fn cert_chain() {
         PathIsolation::InsecureDisable,
         JobOutputDir::fixed(dir.path()),
         baseboard,
+        no_cubbies(),
         gossip,
         &roots,
         shutdown,
@@ -1337,6 +1440,7 @@ async fn hostile_imports_cannot_displace() {
         PathIsolation::InsecureDisable,
         JobOutputDir::fixed(dir.path()),
         baseboard,
+        no_cubbies(),
         isolated(seed),
         from_ref(&root_cert),
         shutdown,
@@ -1481,6 +1585,7 @@ async fn homonym_issuer_resolves_to_true_parent() {
         PathIsolation::InsecureDisable,
         JobOutputDir::fixed(dir.path()),
         baseboard,
+        no_cubbies(),
         isolated(seed),
         from_ref(&root_cert),
         shutdown,
