@@ -5,7 +5,7 @@ on:
   pull_request:
 jobs:
   Test:
-    runs-on: ubuntu-22.04-8core
+    runs-on: ubuntu-22.04
     permissions:
       contents: read
       id-token: write
@@ -47,7 +47,7 @@ jobs:
   # this job only runs where the OIDC exchange can succeed.
   Permslip:
     if: github.repository == 'oxidecomputer/sush'
-    runs-on: ubuntu-22.04-8core
+    runs-on: ubuntu-22.04
     permissions:
       contents: read
       id-token: write
