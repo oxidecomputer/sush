@@ -3,6 +3,8 @@ name = "sush-tests"
 description = "Oxide Support Shell Integration Tests"
 version = "0.1.0"
 edition = "2024"
+license = "MPL-2.0"
+repository = "https://github.com/oxidecomputer/sush"
 publish = false
 
 [dependencies]

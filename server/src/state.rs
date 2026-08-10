@@ -1,13 +1,19 @@
+// This Source Code Form is subject to the terms of the Mozilla Public
+// License, v. 2.0. If a copy of the MPL was not distributed with this
+// file, You can obtain one at https://mozilla.org/MPL/2.0/.
+
 //! Session state manager.
 //!
 //! Manage sessions and their associated jobs by sending and receiving
 //! messages via the gossip protocol.
 
 use std::collections::BTreeMap;
+use std::num::NonZeroUsize;
 use std::sync::Arc;
 
 use chrono::{DateTime, Utc};
 use futures::{Stream, StreamExt};
+use lru::LruCache;
 use rumors::{Key, Rumors, Version};
 use sled_hardware_types::BaseboardId;
 use slog::{Logger, debug, error, info, o, warn};
@@ -19,7 +25,7 @@ use x509_cert::Certificate;
 use x509_cert::der::Encode as _;
 
 use sush_api::JobStartParams;
-use sush_common::jobs::{JobId, JobStatus, JobStatusMap, Session, SessionId, SignedJob};
+use sush_common::jobs::{Access, JobId, JobStatus, JobStatusMap, Session, SessionId, SignedJob};
 use sush_common::keys::{KeyError, KeyId, Signature};
 
 use crate::executor::{Executor, PathIsolation};
@@ -49,6 +55,9 @@ pub const MAX_CERTS: usize = 100;
 /// of out-of-order, duplicate, or malformed submissions.
 pub const MAX_QUEUED_JOBS: usize = 1_000;
 
+/// Maximum number of revocations held for certificates not yet seen.
+pub const MAX_TOMBSTONES: NonZeroUsize = NonZeroUsize::new(100).unwrap();
+
 #[derive(Clone, Debug)]
 pub enum SessionState {
     Inactive {
@@ -64,6 +73,8 @@ pub enum SessionState {
         session: Box<Session>,
         /// Jobs waiting to run in this session.
         queued_jobs: QueuedJobs,
+        /// Keys the starter has granted attach access, and how much.
+        attach_grants: BTreeMap<KeyId, Access>,
     },
 }
 
@@ -97,6 +108,24 @@ impl SessionState {
             Inactive { .. } => None,
             Active { session, .. } => Some(session),
         }
+    }
+
+    /// The attach access `key_id` has to this session's interactive
+    /// jobs, if any.
+    pub fn attach_access(&self, key_id: &KeyId) -> Option<Access> {
+        use SessionState::*;
+        let Active {
+            session,
+            attach_grants,
+            ..
+        } = self
+        else {
+            return None;
+        };
+        if session.started_by() == Some(key_id) {
+            return Some(Access::ReadWrite);
+        }
+        attach_grants.get(key_id).copied()
     }
 
     fn queued_jobs(&self) -> Option<&QueuedJobs> {
@@ -139,6 +168,7 @@ impl<'a> SessionGuard<'a> {
         self.queued_jobs.remove(&self.inner.next_job_id())
     }
 
+    #[allow(clippy::too_many_arguments)]
     pub fn enqueue_job(
         &mut self,
         log: &Logger,
@@ -147,6 +177,7 @@ impl<'a> SessionGuard<'a> {
         own_baseboard: &BaseboardId,
         job: SignedJob,
         params: JobStartParams,
+        actor: &KeyId,
     ) {
         let job_id = job.job_id().clone();
         if history.contains(&job_id) {
@@ -166,6 +197,7 @@ impl<'a> SessionGuard<'a> {
                 JobStatus::Queued {
                     job_id: job_id.clone(),
                     time_queued: Utc::now(),
+                    actor: actor.clone(),
                 },
                 None,
                 Some(self.queued_jobs),
@@ -177,6 +209,7 @@ impl<'a> SessionGuard<'a> {
     pub fn cancel_job(
         &mut self,
         job_id: &JobId,
+        actor: &KeyId,
         own_baseboard: &BaseboardId,
         history: &mut JobHistory,
         running: &RunningJobs,
@@ -190,6 +223,7 @@ impl<'a> SessionGuard<'a> {
                 None | Some(JobStatus::Queued { .. }) => Some(JobStatus::Cancelled {
                     job_id: job_id.clone(),
                     time_cancelled: Utc::now(),
+                    actor: actor.clone(),
                 }),
                 _ => None,
             },
@@ -241,6 +275,9 @@ pub struct State {
     attachments: AttachmentPoints,
     /// Job request signing certificates.
     certs: Certificates,
+    /// Revocations of certificates we have never seen. Bounded and
+    /// apart from `certs`, so revocation spam evicts only itself.
+    tombstones: LruCache<KeyId, DateTime<Utc>>,
     /// Hard-coded root certificate key IDs. Self-signed certificates
     /// not in this set will be revoked with prejudice.
     roots: Box<[KeyId]>,
@@ -264,6 +301,7 @@ impl State {
             history: Default::default(),
             session: Default::default(),
             attachments: Default::default(),
+            tombstones: LruCache::new(MAX_TOMBSTONES),
             certs,
             roots: roots.clone(),
         };
@@ -282,6 +320,10 @@ impl State {
         self.session.session()
     }
 
+    pub fn attach_access(&self, key_id: &KeyId) -> Option<Access> {
+        self.session.attach_access(key_id)
+    }
+
     pub fn history(&self) -> &JobHistory {
         &self.history
     }
@@ -290,19 +332,34 @@ impl State {
         self.history.get_job_status(job_id)
     }
 
-    fn import_cert(&mut self, cert: &Certificate) -> Result<KeyId, KeyError> {
-        if self.certs.len() >= MAX_CERTS {
-            return Err(KeyError::TooManyCerts(MAX_CERTS));
+    /// Import the first certificate seen for a key. Re-importing the
+    /// identical certificate is a no-op. Anything else at an occupied
+    /// key ID is refused, so no import can displace an established
+    /// certificate.
+    fn cert_import(&mut self, cert: &Certificate) -> Result<KeyId, KeyError> {
+        if cert.tbs_certificate.subject == cert.tbs_certificate.issuer {
+            return Err(KeyError::SelfSigned);
         }
-
         let key_id = KeyId::try_from(cert)?;
-        if let Some(CertState::Revoked(_, when)) = self.certs.get(&key_id) {
-            return Err(KeyError::Revoked(key_id, *when));
+        // A tombstone becomes a durable revocation once its
+        // certificate shows up. `certs` may briefly exceed `MAX_CERTS`
+        // by the tombstone count.
+        if let Some(when) = self.tombstones.pop(&key_id) {
+            self.certs
+                .insert(key_id.clone(), CertState::Revoked(key_id.clone(), when));
+            return Err(KeyError::Revoked(key_id, when));
         }
-
-        self.certs
-            .insert(key_id.clone(), CertState::Unknown(Box::new(cert.clone())));
-        Ok(key_id)
+        match self.certs.get(&key_id) {
+            Some(CertState::Revoked(_, when)) => Err(KeyError::Revoked(key_id, *when)),
+            Some(existing) if existing.cert() == Some(cert) => Ok(key_id),
+            Some(_) => Err(KeyError::CertConflict(key_id)),
+            None if self.certs.len() >= MAX_CERTS => Err(KeyError::TooManyCerts(MAX_CERTS)),
+            None => {
+                self.certs
+                    .insert(key_id.clone(), CertState::Unknown(Box::new(cert.clone())));
+                Ok(key_id)
+            }
+        }
     }
 
     pub fn cert_chain(&self, key_id: &KeyId) -> Result<Vec<Certificate>, KeyError> {
@@ -311,6 +368,15 @@ impl State {
 
     pub fn num_certs(&self) -> usize {
         self.certs.len()
+    }
+
+    pub fn is_root(&self, key_id: &KeyId) -> bool {
+        self.roots.contains(key_id)
+    }
+
+    pub fn is_cert_revoked(&self, key_id: &KeyId) -> bool {
+        matches!(self.certs.get(key_id), Some(CertState::Revoked(..)))
+            || self.tombstones.peek(key_id).is_some()
     }
 
     fn update(
@@ -326,31 +392,30 @@ impl State {
         use SessionState::*;
         match message.as_ref() {
             V0(Message::Request(request)) => match request {
-                Request::Cert(cert_request) => match cert_request.as_ref() {
-                    CertRequest::Import(cert) => match self.import_cert(cert) {
+                Request::Cert(attributed) => match attributed.as_parts() {
+                    (actor, CertRequest::Import(cert)) => match self.cert_import(cert) {
                         Ok(key_id) => {
-                            info!(log, "imported certificate"; "key_id" => %key_id);
+                            info!(log, "imported certificate"; "key_id" => %key_id, "actor" => %actor);
                             self.validate_certs(&self.roots.clone());
                         }
                         Err(error) => {
-                            error!(log, "ignoring invalid certificate"; "cert" => ?cert, "error" => %error);
+                            error!(log, "ignoring invalid certificate"; "error" => %error);
                         }
                     },
-                    CertRequest::Revoke(key_id, when) => {
+                    (actor, CertRequest::Revoke(key_id, when)) => {
                         if self.roots.contains(key_id) {
                             error!(log, "refusing to revoke root certificate"; "key_id" => %key_id);
                         } else if let Some(cert) = self.certs.get_mut(key_id) {
                             *cert = CertState::Revoked(key_id.clone(), *when);
-                            info!(log, "revoked known certificate"; "key_id" => %key_id);
+                            info!(log, "revoked known certificate"; "key_id" => %key_id, "actor" => %actor);
                         } else {
-                            self.certs
-                                .insert(key_id.clone(), CertState::Revoked(key_id.clone(), *when));
-                            info!(log, "revoked unknown certificate"; "key_id" => %key_id);
+                            self.tombstones.put(key_id.clone(), *when);
+                            info!(log, "revoked unknown certificate"; "key_id" => %key_id, "actor" => %actor);
                         }
                     }
                 },
-                Request::Session(session_request) => match session_request.as_ref() {
-                    SessionRequest::Start(session_id) => match &mut self.session {
+                Request::Session(attributed) => match attributed.as_parts() {
+                    (actor, SessionRequest::Start(session_id)) => match &mut self.session {
                         // Re-announcement of active session; absorb and ignore.
                         Active {
                             frontier, session, ..
@@ -367,11 +432,19 @@ impl State {
                         Inactive { frontier } | Active { frontier, .. }
                             if *incoming_version > *frontier =>
                         {
+                            info!(
+                                log, "session started";
+                                "session_id" => %session_id, "actor" => %actor,
+                            );
                             self.session = Active {
                                 frontier: self.session.frontier() | incoming_version.clone(),
                                 started: incoming_version.clone(),
-                                session: Box::new(Session::new(session_id.clone())),
+                                session: Box::new(Session::started(
+                                    session_id.clone(),
+                                    actor.clone(),
+                                )),
                                 queued_jobs: QueuedJobs::new(),
+                                attach_grants: BTreeMap::new(),
                             }
                         }
 
@@ -411,7 +484,7 @@ impl State {
                             *frontier |= incoming_version.clone();
                         }
                     },
-                    SessionRequest::Stop(session_id) => {
+                    (actor, SessionRequest::Stop(session_id)) => {
                         // Any session stop request for a session that isn't
                         // ours is silently ignored. Even in the case of
                         // arbitrary causal reordering (which we must handle),
@@ -427,18 +500,71 @@ impl State {
                         } = &self.session
                             && session.session_id() == session_id
                         {
+                            info!(
+                                log, "session stopped";
+                                "session_id" => %session_id, "actor" => %actor,
+                            );
                             self.session = Inactive {
                                 frontier: frontier.clone(),
                             }
                         }
                     }
-                    SessionRequest::Skip(session_id, job_id) => {
+                    (actor, SessionRequest::AllowAttach(session_id, key_id, access)) => {
+                        if let Active {
+                            session,
+                            attach_grants,
+                            ..
+                        } = &mut self.session
+                            && session.session_id() == session_id
+                        {
+                            if session.started_by() == Some(actor) {
+                                attach_grants.insert(key_id.clone(), *access);
+                                info!(
+                                    log, "attach allowed";
+                                    "key_id" => %key_id, "access" => ?access, "actor" => %actor,
+                                );
+                            } else {
+                                warn!(
+                                    log, "ignoring attach grant from non-starter";
+                                    "key_id" => %key_id, "actor" => %actor,
+                                );
+                            }
+                        }
+                    }
+                    (actor, SessionRequest::DenyAttach(session_id, key_id)) => {
+                        if let Active {
+                            session,
+                            attach_grants,
+                            ..
+                        } = &mut self.session
+                            && session.session_id() == session_id
+                        {
+                            if session.started_by() == Some(actor) {
+                                attach_grants.remove(key_id);
+                                info!(
+                                    log, "attach denied";
+                                    "key_id" => %key_id, "actor" => %actor,
+                                );
+                            } else {
+                                warn!(
+                                    log, "ignoring attach denial from non-starter";
+                                    "key_id" => %key_id, "actor" => %actor,
+                                );
+                            }
+                        }
+                    }
+                    (actor, SessionRequest::Skip(session_id, job_id)) => {
                         if let Some(mut session) = self.session.active_session()
                             && session.session_id() == session_id
                         {
+                            info!(
+                                log, "job skipped";
+                                "job_id" => %job_id, "actor" => %actor,
+                            );
                             session.skip_job(job_id);
                             session.cancel_job(
                                 job_id,
+                                actor,
                                 &self.own_baseboard,
                                 &mut self.history,
                                 &self.running,
@@ -459,8 +585,8 @@ impl State {
                         }
                     }
                 },
-                Request::Job(job_request) => match job_request.as_ref() {
-                    JobRequest::Start(signed, params) => {
+                Request::Job(attributed) => match attributed.as_parts() {
+                    (actor, JobRequest::Start(signed, params)) => {
                         // TODO: When we implement
                         // https://github.com/oxidecomputer/sush/issues/23, we
                         // should check for revocation here before executing the
@@ -492,6 +618,7 @@ impl State {
                                 &self.own_baseboard,
                                 signed.clone(),
                                 params.clone(),
+                                actor,
                             );
                             session.execute_ready_jobs(
                                 &self.own_baseboard,
@@ -502,11 +629,12 @@ impl State {
                             );
                         }
                     }
-                    JobRequest::Stop(job_id) => {
+                    (actor, JobRequest::Stop(job_id)) => {
                         executor.job_stop(job_id);
                         if let Some(mut session) = self.session.active_session() {
                             session.cancel_job(
                                 job_id,
+                                actor,
                                 &self.own_baseboard,
                                 &mut self.history,
                                 &self.running,
@@ -678,7 +806,7 @@ impl StateManager {
                             // quiesce, updating the state all the way.
                             None => requests_empty = true,
                             Some(request) => if let Some(rumors) = &rumors {
-                                debug!(log, "forwarding request to gossip network"; "request" => ?request);
+                                debug!(log, "forwarding request to gossip network"; "kind" => request.kind());
                                 rumors.send(Message::Request(request).into());
                             },
                         },
@@ -749,13 +877,16 @@ impl StateManager {
 /// ```
 ///
 /// Allowed transitions are `Unknown → Valid` on successful chain validation;
-/// `Unknown → Unknown` when an unknown issuer is encountered during validation;
-/// `Unknown → Invalid` on a permanent failure (bad signature or encoding);
-/// and any state `→ Revoked`, from which no state ever returns.
+/// `Unknown → Unknown` while no valid issuer verifies the certificate;
+/// `Unknown → Invalid` on an intrinsic failure (bad encoding, or self-signed
+/// without being a root); and any state `→ Revoked`, from which no state
+/// ever returns.
 #[derive(Debug)]
 pub enum CertState {
     Unknown(Box<Certificate>),
-    Valid(Box<Certificate>),
+    /// A validated certificate and the key ID of the issuer that
+    /// verified it, or `None` for a root.
+    Valid(Box<Certificate>, Option<KeyId>),
     Invalid(KeyError),
     Revoked(KeyId, DateTime<Utc>),
 }
@@ -766,11 +897,18 @@ impl CertState {
     }
 
     fn is_valid(&self) -> bool {
-        matches!(self, Self::Valid(_))
+        matches!(self, Self::Valid(..))
+    }
+
+    fn cert(&self) -> Option<&Certificate> {
+        match self {
+            Self::Unknown(cert) | Self::Valid(cert, _) => Some(cert),
+            Self::Invalid(_) | Self::Revoked(..) => None,
+        }
     }
 
     fn map_valid<R>(&self, f: impl FnOnce(&Certificate) -> &R) -> Option<&R> {
-        if let Self::Valid(cert) = self {
+        if let Self::Valid(cert, _) = self {
             Some(f(cert))
         } else {
             None
@@ -789,34 +927,37 @@ impl CertState {
             }
 
             // Verify the certificate signature.
-            // TODO: Mythos report #82-86: check expiry, basicConstraints, keyUsage
+            // TODO: check expiry, basicConstraints, keyUsage.
             let signature = with_err!(Signature::try_from(cert.as_ref()));
             let tbs = with_err!(cert.tbs_certificate.to_der());
             let subject = &cert.tbs_certificate.subject;
             let issuer = &cert.tbs_certificate.issuer;
-            let root = subject == issuer;
-            if root {
-                let key_id = with_err!(KeyId::try_from(issuer));
+            if subject == issuer {
+                let key_id = with_err!(KeyId::try_from(cert.as_ref()));
                 if !roots.contains(&key_id) {
                     return Self::Invalid(KeyError::SelfSigned);
                 }
                 with_err!(
                     signature.verify_with_spki(&tbs, &cert.tbs_certificate.subject_public_key_info)
                 );
-            } else {
-                let issuer_key_id = with_err!(KeyId::try_from(issuer));
-                if let Some(issuer) = certs.get(&issuer_key_id)
-                    && let Some(spki) =
-                        issuer.map_valid(|cert| &cert.tbs_certificate.subject_public_key_info)
+                return Self::Valid(cert, None);
+            }
+            // The issuer name only routes: the parent is whichever valid
+            // certificate of that name verifies the signature, so a
+            // homonym cannot take the true parent's place. Until such a
+            // parent arrives the certificate stays `Unknown`, keeping
+            // the outcome independent of delivery order.
+            for (key_id, candidate) in certs {
+                if let Some(parent) = candidate.map_valid(|cert| cert)
+                    && parent.tbs_certificate.subject == *issuer
+                    && signature
+                        .verify_with_spki(&tbs, &parent.tbs_certificate.subject_public_key_info)
+                        .is_ok()
                 {
-                    with_err!(signature.verify_with_spki(&tbs, spki));
-                } else {
-                    // Don't complain about the missing cert, because certs could
-                    // arrive out of order.
-                    return Self::Unknown(cert);
+                    return Self::Valid(cert, Some(key_id.clone()));
                 }
             }
-            Self::Valid(cert)
+            Self::Unknown(cert)
         } else {
             self
         }
@@ -858,9 +999,9 @@ pub fn cert_chain(certs: &Certificates, key_id: &KeyId) -> Result<Vec<Certificat
         if chain.len() >= MAX_CERT_CHAIN_LEN {
             return Err(KeyError::CertChainTooLong);
         }
-        let cert = match certs.get(&key_id) {
+        let (cert, parent) = match certs.get(&key_id) {
             None | Some(CertState::Unknown(_)) => return Err(KeyError::MissingCert(key_id)),
-            Some(CertState::Valid(cert)) => *cert.clone(),
+            Some(CertState::Valid(cert, parent)) => (*cert.clone(), parent.clone()),
             Some(CertState::Invalid(error)) => {
                 return Err(KeyError::InvalidCert(error.to_string()));
             }
@@ -868,11 +1009,11 @@ pub fn cert_chain(certs: &Certificates, key_id: &KeyId) -> Result<Vec<Certificat
                 return Err(KeyError::Revoked(key_id.clone(), *when));
             }
         };
-        chain.push(cert.clone());
-        if cert.tbs_certificate.subject == cert.tbs_certificate.issuer {
-            break;
+        chain.push(cert);
+        match parent {
+            None => break,
+            Some(parent) => key_id = parent,
         }
-        key_id = KeyId::try_from(&cert.tbs_certificate.issuer)?;
     }
     assert!(!chain.is_empty());
     chain.reverse();

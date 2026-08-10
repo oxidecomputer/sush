@@ -3,6 +3,8 @@ name = "sush-common"
 description = "Oxide Support Shell Common Code"
 version = "0.1.0"
 edition = "2024"
+license = "MPL-2.0"
+repository = "https://github.com/oxidecomputer/sush"
 publish = false
 
 [dependencies]
@@ -15,7 +17,6 @@ crypto-bigint.workspace = true
 ed25519-dalek.workspace = true
 http-range-header.workspace = true
 http.workspace = true
-kms-agent.workspace = true
 p256.workspace = true
 pem-rfc7468.workspace = true
 rand.workspace = true

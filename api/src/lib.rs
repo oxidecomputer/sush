@@ -1,3 +1,7 @@
+// This Source Code Form is subject to the terms of the Mozilla Public
+// License, v. 2.0. If a copy of the MPL was not distributed with this
+// file, You can obtain one at https://mozilla.org/MPL/2.0/.
+
 //! Oxide Support Shell API
 
 use std::collections::BTreeMap;
@@ -18,7 +22,8 @@ use sled_hardware_types::BaseboardId;
 
 use sush_common::authn::Identity;
 use sush_common::jobs::{
-    JobId, JobLimits, JobOutputStream, JobStatus, JsonJobStatusMap, Session, SessionId, SignedJob,
+    Access, JobId, JobLimits, JobOutputStream, JobStatus, JsonJobStatusMap, Session, SessionId,
+    SignedJob,
 };
 use sush_common::keys::{KeyId, SshPublicKey};
 
@@ -33,7 +38,7 @@ pub trait SushApi {
     ///
     /// The body should be a PEM encoded X.509 certificate.
     #[endpoint { method = PUT, path = "/certs" }]
-    async fn import_cert(
+    async fn cert_import(
         ctx: RequestContext<Self::Context>,
         headers: Header<Authorization>,
         query: QueryParams<WaitParam>,
@@ -49,6 +54,18 @@ pub trait SushApi {
         headers: Header<Authorization>,
         params: PathParams<KeyIdParam>,
     ) -> Result<HttpResponseOk<String>, HttpError>;
+
+    /// Revoke a certificate.
+    ///
+    /// Revocation is permanent and propagates across the rack.
+    /// Root certificates cannot be revoked.
+    #[endpoint { method = POST, path = "/certs/{key_id}/revoke" }]
+    async fn cert_revoke(
+        ctx: RequestContext<Self::Context>,
+        headers: Header<Authorization>,
+        params: PathParams<KeyIdParam>,
+        query: QueryParams<WaitParam>,
+    ) -> Result<HttpResponseUpdatedNoContent, HttpError>;
 
     // Identity management.
 
@@ -68,6 +85,18 @@ pub trait SushApi {
         ctx: RequestContext<Self::Context>,
         headers: Header<Authorization>,
     ) -> Result<HttpResponseOk<Vec<Identity>>, HttpError>;
+
+    /// Revoke an SSH identity.
+    ///
+    /// Expires the key's cached identities and refuses its future
+    /// logins. Identities are not shared across the rack, so this
+    /// applies only to the server handling the request.
+    #[endpoint { method = POST, path = "/iam/{key_id}/revoke" }]
+    async fn iam_revoke(
+        ctx: RequestContext<Self::Context>,
+        headers: Header<Authorization>,
+        params: PathParams<KeyIdParam>,
+    ) -> Result<HttpResponseUpdatedNoContent, HttpError>;
 
     // Session management.
 
@@ -106,6 +135,28 @@ pub trait SushApi {
         ctx: RequestContext<Self::Context>,
         headers: Header<Authorization>,
         params: PathParams<SessionAndJobIds>,
+    ) -> Result<HttpResponseUpdatedNoContent, HttpError>;
+
+    /// Grant a key attach access to this session's interactive jobs.
+    ///
+    /// Only the key that started the session may grant access.
+    #[endpoint { method = POST, path = "/sessions/{session_id}/allow/{key_id}" }]
+    async fn session_allow_attach(
+        ctx: RequestContext<Self::Context>,
+        headers: Header<Authorization>,
+        params: PathParams<SessionAndKeyIds>,
+        query: QueryParams<AccessParam>,
+    ) -> Result<HttpResponseUpdatedNoContent, HttpError>;
+
+    /// Withdraw a key's attach access.
+    ///
+    /// Only the key that started the session may withdraw access.
+    /// Already-attached connections keep the access they attached with.
+    #[endpoint { method = POST, path = "/sessions/{session_id}/deny/{key_id}" }]
+    async fn session_deny_attach(
+        ctx: RequestContext<Self::Context>,
+        headers: Header<Authorization>,
+        params: PathParams<SessionAndKeyIds>,
     ) -> Result<HttpResponseUpdatedNoContent, HttpError>;
 
     // Job management.
@@ -200,6 +251,19 @@ pub struct SessionAndJobIds {
 }
 
 #[derive(Deserialize, JsonSchema)]
+pub struct SessionAndKeyIds {
+    pub session_id: SessionId,
+    pub key_id: KeyId,
+}
+
+#[derive(Deserialize, JsonSchema)]
+pub struct AccessParam {
+    /// How much access to grant. Read-only if omitted.
+    #[serde(default)]
+    pub access: Access,
+}
+
+#[derive(Deserialize, JsonSchema)]
 pub struct JobIdParam {
     pub job_id: JobId,
 }
@@ -258,6 +322,14 @@ pub enum JobWait {
 }
 
 impl JobWait {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Self::None => "none",
+            Self::Start => "start",
+            Self::Stop => "stop",
+        }
+    }
+
     pub fn is_none(&self) -> bool {
         matches!(self, Self::None)
     }

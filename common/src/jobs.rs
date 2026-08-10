@@ -1,3 +1,7 @@
+// This Source Code Form is subject to the terms of the Mozilla Public
+// License, v. 2.0. If a copy of the MPL was not distributed with this
+// file, You can obtain one at https://mozilla.org/MPL/2.0/.
+
 //! Signed job requests.
 
 use std::collections::{BTreeMap, HashMap};
@@ -26,7 +30,7 @@ use crate::codephrases::{
     InvalidCodephrase, WORD_SEPARATOR, decode_phrase, generate_id, id_phrase,
 };
 use crate::interactive::InteractiveJobError;
-use crate::keys::{Signed, ToBeSigned, Verified};
+use crate::keys::{KeyId, Signed, ToBeSigned, Verified};
 
 /// A globally unique identifier for a job within a session.
 #[derive(
@@ -182,6 +186,9 @@ pub enum LastJob {
 pub struct Session {
     session_id: SessionId,
     last_job: LastJob,
+    /// The key that started the session, where known. Client-side
+    /// trackers leave it `None`. Servers record the verified starter.
+    started_by: Option<KeyId>,
 }
 
 impl Session {
@@ -189,11 +196,24 @@ impl Session {
         Self {
             session_id,
             last_job: LastJob::None,
+            started_by: None,
+        }
+    }
+
+    pub fn started(session_id: SessionId, actor: KeyId) -> Self {
+        Self {
+            session_id,
+            last_job: LastJob::None,
+            started_by: Some(actor),
         }
     }
 
     pub fn session_id(&self) -> &SessionId {
         &self.session_id
+    }
+
+    pub fn started_by(&self) -> Option<&KeyId> {
+        self.started_by.as_ref()
     }
 
     pub fn into_session_id(self) -> SessionId {
@@ -300,6 +320,8 @@ pub enum JobStatus {
             deserialize_with = "borsh_de_datetime"
         )]
         time_cancelled: DateTime<Utc>,
+        /// The key that requested the cancellation.
+        actor: KeyId,
     },
     Queued {
         job_id: JobId,
@@ -308,6 +330,8 @@ pub enum JobStatus {
             deserialize_with = "borsh_de_datetime"
         )]
         time_queued: DateTime<Utc>,
+        /// The key that submitted the job.
+        actor: KeyId,
     },
     Error {
         job_id: JobId,
@@ -611,6 +635,18 @@ pub struct JobLimits {
 }
 
 impl JobLimits {
+    /// Clamp each limit to the default ceiling. Limits arrive as
+    /// unsigned request parameters, which may narrow the server's
+    /// limits but never widen them.
+    pub fn clamp(self) -> Self {
+        let ceiling = Self::default();
+        Self {
+            max_cpu: self.max_cpu.min(ceiling.max_cpu),
+            max_mem: self.max_mem.min(ceiling.max_mem),
+            max_fsize: self.max_fsize.min(ceiling.max_fsize),
+        }
+    }
+
     pub fn apply(&self) -> Result<(), IoError> {
         let Self {
             max_cpu,
@@ -629,13 +665,47 @@ impl JobLimits {
     }
 }
 
-/// Default limits should be increased as needed.
+/// The default limits are also the ceilings: see [`JobLimits::clamp`].
 impl Default for JobLimits {
     fn default() -> Self {
         JobLimits {
-            max_cpu: 60,
-            max_mem: GB,
+            max_cpu: 3600,
+            max_mem: 8 * GB,
             max_fsize: 10 * GB,
+        }
+    }
+}
+
+/// Attach access to a session's interactive jobs. The session starter
+/// always has read-write access. Guests have what they were granted.
+/// Read-write means co-driving a shell the job signature authorized,
+/// so who deserves it is deployment policy. Recorded output is not
+/// gated: it is the customer's data, readable by any authenticated key.
+#[derive(
+    BorshDeserialize,
+    BorshSerialize,
+    Clone,
+    Copy,
+    Debug,
+    Default,
+    Deserialize,
+    Eq,
+    JsonSchema,
+    PartialEq,
+    Serialize,
+)]
+#[serde(rename_all = "kebab-case")]
+pub enum Access {
+    #[default]
+    ReadOnly,
+    ReadWrite,
+}
+
+impl Access {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Self::ReadOnly => "read-only",
+            Self::ReadWrite => "read-write",
         }
     }
 }
@@ -687,5 +757,27 @@ impl FromStr for JobOutputStream {
             "stderr" => Ok(Self::Stderr),
             _ => Err(InvalidOutputStream),
         }
+    }
+}
+
+#[cfg(test)]
+mod test {
+    use super::*;
+
+    /// Requested limits may narrow the default ceiling, never widen it.
+    #[test]
+    fn limits_clamp() {
+        let narrowed = JobLimits {
+            max_cpu: 1,
+            max_mem: GB,
+            max_fsize: GB,
+        };
+        assert_eq!(narrowed.clone().clamp(), narrowed);
+        let widened = JobLimits {
+            max_cpu: u64::MAX,
+            max_mem: u64::MAX,
+            max_fsize: u64::MAX,
+        };
+        assert_eq!(widened.clamp(), JobLimits::default());
     }
 }

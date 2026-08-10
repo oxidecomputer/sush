@@ -1,3 +1,7 @@
+// This Source Code Form is subject to the terms of the Mozilla Public
+// License, v. 2.0. If a copy of the MPL was not distributed with this
+// file, You can obtain one at https://mozilla.org/MPL/2.0/.
+
 //! Oxide Support Shell integration tests.
 
 use std::net::SocketAddr;
@@ -16,13 +20,14 @@ use tokio_util::sync::CancellationToken;
 
 use sush_api::JobWait;
 use sush_api::sush_api_mod::api_description;
-use sush_client::{Client, Error as ClientError};
+use sush_client::{AuthzSigner, Client, Error as ClientError};
 use sush_common::interactive::{InteractiveJobControl, InteractiveJobMessage};
-use sush_common::jobs::{JobLimits, JobOutputStream, Session, SessionId};
+use sush_common::jobs::{Access, JobLimits, JobOutputStream, Session, SessionId};
 use sush_server::{ApiServer, ProxyServer};
 
 use crate::test_utils::{
-    SignJobRequest as _, authz, manager_and_test_root, test_baseboard_id, test_logger,
+    SignJobRequest as _, authz, ephemeral_test_root, manager_and_test_root, test_baseboard_id,
+    test_logger,
 };
 
 const TIMEOUT: Duration = Duration::from_secs(10);
@@ -48,16 +53,17 @@ async fn client_server() {
 
     // Connect and authenticate to the server.
     let addr = server.local_addr();
-    let client = Client::new(&format!("http://{addr}"));
+    let signer = AuthzSigner::default();
+    let client = Client::new(&format!("http://{addr}"), signer.clone());
     let ClientError::ErrorResponse(unauthz) = client.iam().body(None).send().await.unwrap_err()
     else {
         panic!("expected error response")
     };
     assert_eq!(unauthz.status(), 401, "expected 401 Unauthorized");
     let (identity, credentials) = authz(&client, unauthz, &mut root).await;
+    signer.set(Some(credentials));
     let iam = client
         .iam()
-        .authorization(credentials.to_string())
         .body(None)
         .send()
         .await
@@ -70,7 +76,6 @@ async fn client_server() {
     client
         .session_start()
         .session_id(session.session_id())
-        .authorization(credentials.to_string())
         .send()
         .await
         .expect("can't start session");
@@ -85,7 +90,6 @@ async fn client_server() {
     } = JobLimits::default();
     client
         .job_start()
-        .authorization(credentials.to_string())
         .job_id(&job_id)
         .max_cpu(max_cpu)
         .max_mem(max_mem)
@@ -102,7 +106,6 @@ async fn client_server() {
         .job_id(&job_id)
         .stream(JobOutputStream::Stdout)
         .target("*")
-        .authorization(credentials.to_string())
         .send()
         .await
         .expect("can't get job output")
@@ -147,16 +150,17 @@ async fn client_proxy_server() {
     assert_ne!(server_addr, proxy_addr);
 
     // Connect and authenticate to the server via the proxy.
-    let client = Client::new(&format!("http://{proxy_addr}"));
+    let signer = AuthzSigner::default();
+    let client = Client::new(&format!("http://{proxy_addr}"), signer.clone());
     let ClientError::ErrorResponse(unauthz) = client.iam().body(None).send().await.unwrap_err()
     else {
         panic!("expected error response")
     };
     assert_eq!(unauthz.status(), 401, "expected 401 Unauthorized");
     let (identity, credentials) = authz(&client, unauthz, &mut root).await;
+    signer.set(Some(credentials));
     let iam = client
         .iam()
-        .authorization(credentials.to_string())
         .body(None)
         .send()
         .await
@@ -220,16 +224,17 @@ async fn interactive_job() {
 
     // Connect and authenticate to the server.
     let addr = server.local_addr();
-    let client = Client::new(&format!("http://{addr}"));
+    let signer = AuthzSigner::default();
+    let client = Client::new(&format!("http://{addr}"), signer.clone());
     let ClientError::ErrorResponse(unauthz) = client.iam().body(None).send().await.unwrap_err()
     else {
         panic!("expected error response")
     };
     assert_eq!(unauthz.status(), 401, "expected 401 Unauthorized");
     let (identity, credentials) = authz(&client, unauthz, &mut root).await;
+    signer.set(Some(credentials));
     let iam = client
         .iam()
-        .authorization(credentials.to_string())
         .body(None)
         .send()
         .await
@@ -242,7 +247,6 @@ async fn interactive_job() {
     client
         .session_start()
         .session_id(session.session_id())
-        .authorization(credentials.to_string())
         .send()
         .await
         .expect("can't start session");
@@ -257,7 +261,6 @@ async fn interactive_job() {
     } = JobLimits::default();
     client
         .job_start()
-        .authorization(credentials.to_string())
         .job_id(&job_id)
         .max_cpu(max_cpu)
         .max_mem(max_mem)
@@ -275,7 +278,6 @@ async fn interactive_job() {
         .job_attach()
         .job_id(&job_id)
         .target(test_baseboard_id().to_string())
-        .authorization(credentials.to_string())
         .send()
         .await
         .expect("can't attach to job")
@@ -305,7 +307,6 @@ async fn interactive_job() {
         .job_attach()
         .job_id(&job_id)
         .target(test_baseboard_id().to_string())
-        .authorization(credentials.to_string())
         .send()
         .await
         .expect("can't attach second client to job")
@@ -330,24 +331,151 @@ async fn interactive_job() {
     assert_eq!(next_data_message(&mut stream1).await, &again);
     assert_eq!(next_data_message(&mut stream2).await, &again);
 
+    // A guest key authenticates, on its own client, but cannot attach
+    // until granted.
+    let mut guest_key = ephemeral_test_root();
+    let guest_signer = AuthzSigner::default();
+    let guest_client = Client::new(&format!("http://{addr}"), guest_signer.clone());
+    let ClientError::ErrorResponse(unauthz) =
+        guest_client.iam().body(None).send().await.unwrap_err()
+    else {
+        panic!("expected error response")
+    };
+    let (guest, guest_authz) = authz(&guest_client, unauthz, &mut guest_key).await;
+    guest_signer.set(Some(guest_authz));
+    let guest_attach = async || {
+        guest_client
+            .job_attach()
+            .job_id(&job_id)
+            .target(test_baseboard_id().to_string())
+            .send()
+            .await
+    };
+    let denied = guest_attach().await.unwrap_err();
+    assert!(
+        matches!(denied.status(), Some(status) if status.as_u16() == 403),
+        "expected 403 Forbidden, got {denied:?}"
+    );
+
+    // Grant the guest read-only access and attach.
+    client
+        .session_allow_attach()
+        .session_id(session.session_id())
+        .key_id(guest.key_id.clone())
+        .access(Access::ReadOnly)
+        .send()
+        .await
+        .expect("can't allow attach");
+    let socket3 = timeout(TIMEOUT, async {
+        loop {
+            match guest_attach().await {
+                Ok(socket) => break socket.into_inner(),
+                Err(_) => tokio::time::sleep(Duration::from_millis(50)).await,
+            }
+        }
+    })
+    .await
+    .expect("grant never took effect");
+    let mut stream3 = WebSocketStream::from_raw_socket(socket3, Role::Client, None).await;
+    let InteractiveJobControl::WindowChange(size3) = next_control_message(&mut stream3).await;
+    assert_eq!(size3, size1);
+    let _playback = next_data_message(&mut stream3).await;
+
+    // The read-only guest's input is dropped: the starter's marker,
+    // sent after it, echoes without it.
+    let intrusion = Bytes::from("intruder input");
+    stream3
+        .send(
+            InteractiveJobMessage::Data(intrusion.clone())
+                .try_into()
+                .expect("can't encode message"),
+        )
+        .await
+        .expect("can't send message");
+    let marker = Bytes::from(format!("Marker, {job_id}!"));
+    stream1
+        .send(
+            InteractiveJobMessage::Data(marker.clone())
+                .try_into()
+                .expect("can't encode message"),
+        )
+        .await
+        .expect("can't send message");
+    assert_eq!(next_data_message(&mut stream1).await, &marker);
+    assert_eq!(next_data_message(&mut stream3).await, &marker);
+
+    // Withdraw the grant, so that the next successful attach can only
+    // mean the read-write grant that follows.
+    client
+        .session_deny_attach()
+        .session_id(session.session_id())
+        .key_id(guest.key_id.clone())
+        .send()
+        .await
+        .expect("can't deny attach");
+    timeout(TIMEOUT, async {
+        while guest_attach().await.is_ok() {
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+    })
+    .await
+    .expect("denial never took effect");
+
+    // Granted read-write, the guest's input echoes everywhere, and the
+    // old read-only socket keeps the access it attached with.
+    client
+        .session_allow_attach()
+        .session_id(session.session_id())
+        .key_id(guest.key_id.clone())
+        .access(Access::ReadWrite)
+        .send()
+        .await
+        .expect("can't allow attach");
+    let socket4 = timeout(TIMEOUT, async {
+        loop {
+            match guest_attach().await {
+                Ok(socket) => break socket.into_inner(),
+                Err(_) => tokio::time::sleep(Duration::from_millis(50)).await,
+            }
+        }
+    })
+    .await
+    .expect("upgrade never took effect");
+    let mut stream4 = WebSocketStream::from_raw_socket(socket4, Role::Client, None).await;
+    let InteractiveJobControl::WindowChange(_) = next_control_message(&mut stream4).await;
+    let _playback = next_data_message(&mut stream4).await;
+    let welcome = Bytes::from(format!("Welcome, {job_id}!"));
+    stream4
+        .send(
+            InteractiveJobMessage::Data(welcome.clone())
+                .try_into()
+                .expect("can't encode message"),
+        )
+        .await
+        .expect("can't send message");
+    assert_eq!(next_data_message(&mut stream1).await, &welcome);
+    assert_eq!(next_data_message(&mut stream3).await, &welcome);
+    assert_eq!(next_data_message(&mut stream4).await, &welcome);
+
     // Detach from the job.
     stream1.close(None).await.expect("can't close stream1");
     stream2.close(None).await.expect("can't close stream2");
+    stream3.close(None).await.expect("can't close stream3");
+    stream4.close(None).await.expect("can't close stream4");
 
     // Stop the job.
     client
         .job_stop()
-        .authorization(credentials.to_string())
         .job_id(&job_id)
         .wait(JobWait::Stop)
         .send()
         .await
         .expect("can't stop job");
 
-    // Check that the output contains both messages.
+    // Check that the output contains every echoed message, and nothing
+    // from the read-only guest.
     let mut output = client
         .job_output()
-        .authorization(credentials.to_string())
         .job_id(&job_id)
         .stream(JobOutputStream::Stdout)
         .target(test_baseboard_id().to_string())
@@ -358,6 +486,8 @@ async fn interactive_job() {
     let mut hello_again = BytesMut::new();
     hello_again.extend(hello);
     hello_again.extend(again);
+    hello_again.extend(marker);
+    hello_again.extend(welcome);
     assert_eq!(
         output
             .next()

@@ -1,16 +1,20 @@
+// This Source Code Form is subject to the terms of the Mozilla Public
+// License, v. 2.0. If a copy of the MPL was not distributed with this
+// file, You can obtain one at https://mozilla.org/MPL/2.0/.
+
 //! Manage authentication, job signature verification, and the session
 //! state machine. Does not manage jobs directly.
 
 use std::num::NonZeroUsize;
 use std::path::PathBuf;
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use chrono::{DateTime, Utc};
 use http_range_header::SyntacticallyCorrectRange as Range;
 use lru::LruCache;
 use sled_hardware_types::BaseboardId;
-use slog::{Logger, debug, o, warn};
+use slog::{Logger, debug, info, o, warn};
 use tokio::sync::{Mutex, mpsc, watch};
 use tokio::task::JoinHandle;
 use tokio::time::timeout;
@@ -19,9 +23,12 @@ use tokio_util::sync::CancellationToken;
 use x509_cert::Certificate;
 
 use sush_api::{JobStartParams, JobStopParams, JobWait};
-use sush_common::authn::{Credentials, Identity, Nonce};
+use sush_common::authn::{
+    Authn, BoundRequest, Credentials, IDENTITY_IDLE_TTL, IDENTITY_MAX_TTL, Identity, NONCE_TTL,
+    Nonce, RequestVerifier, SeqWindow,
+};
 use sush_common::jobs::JobOutputStream;
-use sush_common::jobs::{JobId, JobStatusMap, Session, SessionId, SignedJob};
+use sush_common::jobs::{Access, JobId, JobStatusMap, Session, SessionId, SignedJob};
 use sush_common::keys::{KeyError, KeyId, SshPublicKey};
 
 use crate::error::JobError;
@@ -34,22 +41,51 @@ use crate::state::{GossipNetwork, MAX_CERTS, State, StateManager};
 /// Maximum number of cached identities.
 const MAX_CACHED_IDENTITIES: NonZeroUsize = NonZeroUsize::new(1_000).unwrap();
 
-/// Maximum number of outstanding authentication nonces.
-/// We do not really expect more than one simultaneous user,
-/// nor do we expect hostile (DoS) requests, so a small value
-/// here is adequate.
-const MAX_OUTSTANDING_NONCES: NonZeroUsize = NonZeroUsize::new(100).unwrap();
+/// Maximum number of outstanding authentication nonces. Every failed
+/// request mints one, so garbage traffic evicts real challenges. This
+/// is sized so a flood must sustain hundreds of requests per second
+/// for the whole nonce TTL to lock a user out.
+const MAX_OUTSTANDING_NONCES: NonZeroUsize = NonZeroUsize::new(10_000).unwrap();
+
+/// Maximum number of revoked SSH keys remembered for login refusal.
+/// Any authenticated key may revoke, so a flood of junk revocations
+/// can evict a real one. Entries never expire, so unlike nonces the
+/// eviction is permanent. This is sized so the flood takes thousands
+/// of authenticated, attributed, logged requests.
+const MAX_REVOKED_KEYS: NonZeroUsize = NonZeroUsize::new(10_000).unwrap();
 
 /// Maximum amount of time we're willing to wait for job start or stop.
 const WAIT_TIMEOUT: Duration = Duration::from_secs(600);
+
+/// An authenticated identity and the state that authorizes its
+/// requests: the ephemeral verifier, the spent sequence numbers, and
+/// its lifetime, kept on the monotonic clock because the wall clock
+/// may step by decades when NTP first syncs.
+#[derive(Debug)]
+struct CachedIdentity {
+    identity: Identity,
+    verifier: RequestVerifier,
+    window: SeqWindow,
+    authenticated: Instant,
+    last_used: Instant,
+}
+
+impl CachedIdentity {
+    fn is_still_valid(&self) -> bool {
+        self.identity.time_revoked.is_none()
+            && self.authenticated.elapsed() < IDENTITY_MAX_TTL
+            && self.last_used.elapsed() < IDENTITY_IDLE_TTL
+    }
+}
 
 /// NB: All tables must have a fixed maximum size!
 #[derive(Debug)]
 #[allow(clippy::type_complexity)]
 pub struct JobManager {
     log: Logger,
-    nonces: Arc<Mutex<LruCache<Nonce, DateTime<Utc>>>>,
-    identities: Arc<Mutex<LruCache<(KeyId, Nonce), (Identity, Credentials)>>>,
+    nonces: Arc<Mutex<LruCache<Nonce, Instant>>>,
+    identities: Arc<Mutex<LruCache<(KeyId, Nonce), CachedIdentity>>>,
+    revoked_keys: Arc<Mutex<LruCache<KeyId, DateTime<Utc>>>>,
     output_dir: JobOutputDir,
     own_baseboard: BaseboardId,
     state: watch::Receiver<State>, // from the state manager
@@ -84,6 +120,7 @@ impl JobManager {
             log: log.new(o!("component" => "job manager")),
             nonces: Arc::new(Mutex::new(LruCache::new(MAX_OUTSTANDING_NONCES))),
             identities: Arc::new(Mutex::new(LruCache::new(MAX_CACHED_IDENTITIES))),
+            revoked_keys: Arc::new(Mutex::new(LruCache::new(MAX_REVOKED_KEYS))),
             own_baseboard,
             output_dir,
             state: rx_state,
@@ -96,32 +133,36 @@ impl JobManager {
         &self.own_baseboard
     }
 
-    async fn cert_request(&self, request: CertRequest) -> Result<(), JobError> {
+    async fn cert_request(&self, authn: &Identity, request: CertRequest) -> Result<(), JobError> {
         self.tx_req
-            .send(Request::cert(request))
+            .send(Request::cert(authn.key_id.clone(), request))
             .await
             .map_err(|_| JobError::ChannelClosed)
     }
 
-    async fn session_request(&self, request: SessionRequest) -> Result<(), JobError> {
+    async fn session_request(
+        &self,
+        authn: &Identity,
+        request: SessionRequest,
+    ) -> Result<(), JobError> {
         self.tx_req
-            .send(Request::session(request))
+            .send(Request::session(authn.key_id.clone(), request))
             .await
             .map_err(|_| JobError::ChannelClosed)
     }
 
-    async fn job_request(&self, _authn: &Identity, request: JobRequest) -> Result<(), JobError> {
+    async fn job_request(&self, authn: &Identity, request: JobRequest) -> Result<(), JobError> {
         self.tx_req
-            .send(Request::job(request))
+            .send(Request::job(authn.key_id.clone(), request))
             .await
             .map_err(|_| JobError::ChannelClosed)
     }
 
     // Certificate management.
 
-    pub async fn import_cert(
+    pub async fn cert_import(
         &self,
-        _authn: &Identity,
+        authn: &Identity,
         cert: Certificate,
         wait: bool,
     ) -> Result<(), JobError> {
@@ -132,7 +173,7 @@ impl JobManager {
             return Err(KeyError::SelfSigned.into());
         }
         let key_id = KeyId::try_from(&cert)?;
-        self.cert_request(CertRequest::Import(cert)).await?;
+        self.cert_request(authn, CertRequest::Import(cert)).await?;
         if wait {
             self.wait_for(self.wait_for_cert(key_id)).await?;
         }
@@ -147,13 +188,33 @@ impl JobManager {
         Ok(self.state.borrow().cert_chain(key_id)?)
     }
 
+    pub async fn cert_revoke(
+        &self,
+        authn: &Identity,
+        key_id: KeyId,
+        wait: bool,
+    ) -> Result<(), JobError> {
+        if self.state.borrow().is_root(&key_id) {
+            return Err(JobError::RootRevocation(key_id));
+        }
+        self.cert_request(authn, CertRequest::Revoke(key_id.clone(), Utc::now()))
+            .await?;
+        if wait {
+            self.wait_for(self.wait_for_revocation(key_id)).await?;
+        }
+        Ok(())
+    }
+
     // Identity management.
 
-    /// Authenticate and cache authorization credentials.
+    /// Authenticate initial credentials at `iam`, or authorize a bound
+    /// request against a cached identity. `request` is the request
+    /// line: the method and the target exactly as received.
     pub async fn iam(
         &self,
         authorization: Option<String>,
         public_key: Option<SshPublicKey>,
+        request: (&str, &str),
     ) -> Result<Identity, JobError> {
         // NB: Do not use the `?` operator in this function! We must ensure
         // that all authentication failures are logged and receive a proper
@@ -162,7 +223,7 @@ impl JobManager {
             ($error:expr) => {{
                 warn!(self.log, "authentication failed"; "error" => %$error);
                 let nonce = Nonce::generate();
-                self.nonces.lock().await.put(nonce.clone(), Utc::now());
+                self.nonces.lock().await.put(nonce.clone(), Instant::now());
                 return Err(JobError::unauthorized(nonce));
             }};
         }
@@ -185,39 +246,49 @@ impl JobManager {
         let Some(authorization) = authorization else {
             unauthorized!("missing authorization")
         };
-        let credentials: Credentials = try_authn!(authorization.parse());
-        let Credentials {
-            key_id,
-            nonce,
-            cnonce,
-            signature,
-        } = credentials.clone();
-
-        // Check the identity cache.
         let now = Utc::now();
-        {
-            let mut identities = self.identities.lock().await;
-            let cache_key = (key_id.clone(), nonce.clone());
-            if let Some((identity, cached_credentials)) = identities.get(&cache_key).cloned() {
-                if !identity.is_still_valid(&now) {
-                    assert!(identities.pop(&cache_key).is_some());
-                } else if cached_credentials.cnonce == cnonce
-                    && cached_credentials.signature == signature
-                {
-                    assert_eq!(cached_credentials.nonce, nonce);
-                    debug!(self.log, "credentials cache hit"; "key_id" => %key_id);
-                    return Ok(identity);
-                } else {
-                    unauthorized!("invalid credentials for cached identity");
+        let credentials = match try_authn!(authorization.parse::<Authn>()) {
+            // A bound request authorizes against a cached identity.
+            Authn::Bound(bound) => {
+                let mut identities = self.identities.lock().await;
+                let cache_key = (bound.key_id.clone(), bound.nonce.clone());
+                let Some(cached) = identities.get_mut(&cache_key) else {
+                    unauthorized!("unknown identity");
+                };
+                if !cached.is_still_valid() {
+                    identities.pop(&cache_key);
+                    unauthorized!("identity expired");
                 }
+                let (method, target) = request;
+                let received = BoundRequest::new(method, target, bound.seq);
+                try_authn!(cached.verifier.verify(&received, &bound));
+                if !cached.window.spend(bound.seq) {
+                    unauthorized!("sequence number already spent");
+                }
+                cached.last_used = Instant::now();
+                debug!(self.log, "bound request authorized"; "key_id" => %bound.key_id);
+                return Ok(cached.identity.clone());
             }
+            Authn::Initial(credentials) => *credentials,
+        };
+        let Credentials { key_id, nonce, .. } = credentials.clone();
+
+        // Initial credentials authenticate only at `iam` itself.
+        let (method, target) = request;
+        if method != "POST" || target.split('?').next() != Some("/iam") {
+            unauthorized!("initial credentials presented outside iam");
+        }
+
+        // Refuse revoked keys.
+        if self.revoked_keys.lock().await.get(&key_id).is_some() {
+            unauthorized!("key is revoked");
         }
 
         // Claim the nonce.
-        let Some(generated) = self.nonces.lock().await.pop(&nonce) else {
+        let Some(minted) = self.nonces.lock().await.pop(&nonce) else {
             unauthorized!("nonce not found");
         };
-        if !Nonce::is_still_valid(&generated, &now) {
+        if minted.elapsed() >= NONCE_TTL {
             unauthorized!("nonce expired");
         };
 
@@ -232,25 +303,42 @@ impl JobManager {
         let verified = try_authn!(response.verify_with_ssh_public_key(&public_key));
         let identity = try_authn!(Identity::new(public_key.to_owned(), verified, now));
 
-        // Authenticated! Cache the identity & credentials.
+        // Authenticated! Cache the identity and its request verifier.
         debug!(self.log, "authenticated credentials for identity"; "key_id" => %key_id);
-        self.identities
-            .lock()
-            .await
-            .put((key_id.to_owned(), nonce), (identity.clone(), credentials));
+        self.identities.lock().await.put(
+            (key_id.to_owned(), nonce),
+            CachedIdentity {
+                identity: identity.clone(),
+                verifier: credentials.epk,
+                window: SeqWindow::default(),
+                authenticated: Instant::now(),
+                last_used: Instant::now(),
+            },
+        );
         Ok(identity)
     }
 
     pub async fn identities(&self, _authn: &Identity) -> Result<Vec<Identity>, JobError> {
-        let now = Utc::now();
         Ok(self
             .identities
             .lock()
             .await
             .iter()
-            .filter(|(_, (identity, _credentials))| identity.is_still_valid(&now))
-            .map(|(_, (identity, _credentials))| identity.to_owned())
+            .filter(|(_, cached)| cached.is_still_valid())
+            .map(|(_, cached)| cached.identity.to_owned())
             .collect())
+    }
+
+    pub async fn iam_revoke(&self, _authn: &Identity, key_id: KeyId) -> Result<(), JobError> {
+        let now = Utc::now();
+        let mut identities = self.identities.lock().await;
+        for (_, cached) in identities.iter_mut().filter(|((id, _), _)| *id == key_id) {
+            cached.identity.time_revoked = Some(now);
+        }
+        drop(identities);
+        self.revoked_keys.lock().await.put(key_id.clone(), now);
+        info!(self.log, "revoked identity"; "key_id" => %key_id);
+        Ok(())
     }
 
     // Waiting.
@@ -261,6 +349,10 @@ impl JobManager {
 
     fn wait_for_cert(&self, key_id: KeyId) -> impl FnMut(&State) -> bool {
         move |state| state.cert_chain(&key_id).is_ok()
+    }
+
+    fn wait_for_revocation(&self, key_id: KeyId) -> impl FnMut(&State) -> bool {
+        move |state| state.is_cert_revoked(&key_id)
     }
 
     fn wait_for_session(&self, session_id: SessionId) -> impl FnMut(&State) -> bool {
@@ -324,11 +416,11 @@ impl JobManager {
 
     pub async fn session_start(
         &self,
-        _authn: &Identity,
+        authn: &Identity,
         session_id: SessionId,
         wait: bool,
     ) -> Result<(), JobError> {
-        self.session_request(SessionRequest::Start(session_id.clone()))
+        self.session_request(authn, SessionRequest::Start(session_id.clone()))
             .await?;
         if wait {
             self.wait_for(self.wait_for_session(session_id.clone()))
@@ -339,19 +431,56 @@ impl JobManager {
 
     pub async fn session_stop(
         &self,
-        _authn: &Identity,
+        authn: &Identity,
         session_id: SessionId,
     ) -> Result<(), JobError> {
-        self.session_request(SessionRequest::Stop(session_id)).await
+        self.session_request(authn, SessionRequest::Stop(session_id))
+            .await
     }
 
     pub async fn session_skip_job(
         &self,
-        _authn: &Identity,
+        authn: &Identity,
         session_id: SessionId,
         job_id: JobId,
     ) -> Result<(), JobError> {
-        self.session_request(SessionRequest::Skip(session_id, job_id))
+        self.session_request(authn, SessionRequest::Skip(session_id, job_id))
+            .await
+    }
+
+    /// Only the session starter may grant or deny attach access. The
+    /// authoritative check is in the state machine. This one fails fast.
+    fn starter_check(&self, authn: &Identity) -> Result<(), JobError> {
+        match self.state.borrow().session() {
+            None => Err(JobError::NoSession),
+            Some(session) if session.started_by() == Some(&authn.key_id) => Ok(()),
+            Some(_) => Err(JobError::NotSessionStarter),
+        }
+    }
+
+    pub async fn session_allow_attach(
+        &self,
+        authn: &Identity,
+        session_id: SessionId,
+        key_id: KeyId,
+        access: Access,
+    ) -> Result<(), JobError> {
+        self.starter_check(authn)?;
+        self.session_request(
+            authn,
+            SessionRequest::AllowAttach(session_id, key_id, access),
+        )
+        .await
+    }
+
+    pub async fn session_deny_attach(
+        &self,
+        authn: &Identity,
+        session_id: SessionId,
+        key_id: KeyId,
+    ) -> Result<(), JobError> {
+        self.starter_check(authn)?;
+        self.session_request(authn, SessionRequest::DenyAttach(session_id, key_id))
             .await
     }
 
@@ -413,7 +542,7 @@ impl JobManager {
 
     pub async fn job_output(
         &self,
-        _authn: &Identity,
+        authn: &Identity,
         job_id: &JobId,
         target: &BaseboardId,
         stream: JobOutputStream,
@@ -427,6 +556,10 @@ impl JobManager {
                 .map(|m| m.contains_key(target))
                 .unwrap_or(false)
         {
+            info!(
+                self.log, "job output read";
+                "job_id" => %job_id, "stream" => %stream, "actor" => %authn.key_id,
+            );
             self.output_dir.job_output(job_id, stream, range).await
         } else {
             Err(JobError::JobNotFound(job_id.to_owned()))
@@ -435,14 +568,21 @@ impl JobManager {
 
     pub async fn job_attachment(
         &self,
-        _authn: &Identity,
+        authn: &Identity,
         job_id: &JobId,
         target: &BaseboardId,
-    ) -> Result<SocketSender, JobError> {
+    ) -> Result<(SocketSender, Access), JobError> {
+        let Some(access) = self.state.borrow().attach_access(&authn.key_id) else {
+            return Err(JobError::AttachDenied);
+        };
         if self.own_baseboard() == target
             && let Some(attachment) = self.state.borrow().get_attachment(job_id)
         {
-            Ok(attachment.to_owned())
+            info!(
+                self.log, "job attach";
+                "job_id" => %job_id, "access" => ?access, "actor" => %authn.key_id,
+            );
+            Ok((attachment.to_owned(), access))
         } else {
             Err(JobError::JobNotFound(job_id.to_owned()))
         }

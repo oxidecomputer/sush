@@ -1,3 +1,7 @@
+// This Source Code Form is subject to the terms of the Mozilla Public
+// License, v. 2.0. If a copy of the MPL was not distributed with this
+// file, You can obtain one at https://mozilla.org/MPL/2.0/.
+
 //! Integration test utilities.
 
 use std::sync::OnceLock;
@@ -14,13 +18,15 @@ use tokio_util::sync::CancellationToken;
 use x509_cert::name::Name;
 use x509_cert::time::Validity;
 
+use sush_client::context::Authz;
 use sush_client::{Client, ResponseValue};
-use sush_common::authn::{Challenge, ChallengeResponse, Credentials, Identity, Nonce};
+use sush_common::authn::{Challenge, ChallengeResponse, Credentials, Identity, Nonce, RequestKey};
 use sush_common::codephrases::generate_id;
 use sush_common::jobs::{JobId, JobStartRequest, VerifiedJob};
 use sush_common::keys::{EphemeralKey, KeyType, Signer};
-use sush_server::JobManager;
 use sush_server::executor::PathIsolation;
+use sush_server::state::GossipNetwork;
+use sush_server::{JobError, JobManager};
 
 static TEST_BASEBOARD_ID: OnceLock<BaseboardId> = OnceLock::new();
 
@@ -90,17 +96,58 @@ pub fn test_logger(test_name: &'static str) -> Logger {
 pub async fn fake_identity(key: &mut EphemeralKey) -> Identity {
     let nonce = Nonce::generate();
     let challenge = Challenge::new(nonce.clone());
-    let response = ChallengeResponse::new(challenge);
+    let response = ChallengeResponse::new(challenge, RequestKey::new().verifier());
     let signed = key.sign(response).await.unwrap();
-    let verified = signed.verify_with_cert(key.cert()).unwrap();
+    let verified = signed
+        .verify_with_ssh_public_key(&key.ssh_public_key())
+        .unwrap();
     Identity::new(key.ssh_public_key(), verified, Utc::now()).unwrap()
+}
+
+/// Log in at the manager layer, without a client or server.
+pub async fn manager_login(mgr: &JobManager, key: &mut EphemeralKey) -> Result<Authz, JobError> {
+    let JobError::Unauthorized(nonce) = mgr.iam(None, None, ("POST", "/iam")).await.unwrap_err()
+    else {
+        panic!("expected a challenge");
+    };
+    let challenge = Challenge::new(nonce);
+    let request_key = RequestKey::new();
+    let response = ChallengeResponse::new(challenge, request_key.verifier());
+    let signed = key.sign(response).await.unwrap();
+    let public_key = key.ssh_public_key();
+    let verified = signed.verify_with_ssh_public_key(&public_key).unwrap();
+    let mut credentials = Credentials::new(verified);
+    credentials.key_id = public_key.key_id().unwrap();
+    mgr.iam(
+        Some(credentials.to_string()),
+        Some(public_key),
+        ("POST", "/iam"),
+    )
+    .await?;
+    Ok(Authz::new(credentials, request_key))
 }
 
 pub async fn manager_and_test_root(
     log: Logger,
 ) -> (JobManager, EphemeralKey, TempDir, CancellationToken) {
+    let (mgr, root, _peer, dir, shutdown) = manager_test_root_and_peer(log).await;
+    (mgr, root, dir, shutdown)
+}
+
+/// Like [`manager_and_test_root`], but also hands back a clone of the
+/// manager's gossip network, for tests that play a peer.
+pub async fn manager_test_root_and_peer(
+    log: Logger,
+) -> (
+    JobManager,
+    EphemeralKey,
+    GossipNetwork,
+    TempDir,
+    CancellationToken,
+) {
     let dir = TempDir::with_prefix("sush-").unwrap();
     let gossip = Peer::seed().into_rumors();
+    let peer = gossip.clone();
     let shutdown = CancellationToken::new();
     let root = ephemeral_test_root();
     let mgr = JobManager::new(
@@ -114,14 +161,14 @@ pub async fn manager_and_test_root(
     )
     .await
     .unwrap();
-    (mgr, root, dir, shutdown)
+    (mgr, root, peer, dir, shutdown)
 }
 
 pub async fn authz<E>(
     client: &Client,
     response: ResponseValue<E>,
     key: &mut EphemeralKey,
-) -> (Identity, Credentials) {
+) -> (Identity, Authz) {
     let challenge = response
         .headers()
         .get("WWW-Authenticate")
@@ -130,7 +177,8 @@ pub async fn authz<E>(
         .expect("invalid WWW-Authenticate header")
         .parse::<Challenge>()
         .expect("malformed WWW-Authenticate header");
-    let response = ChallengeResponse::new(challenge);
+    let request_key = RequestKey::new();
+    let response = ChallengeResponse::new(challenge, request_key.verifier());
     let signed = key.sign(response).await.unwrap();
     let verified = signed
         .verify_with_ssh_public_key(&key.ssh_public_key())
@@ -146,5 +194,5 @@ pub async fn authz<E>(
         .await
         .unwrap()
         .into_inner();
-    (identity, credentials)
+    (identity, Authz::new(credentials, request_key))
 }

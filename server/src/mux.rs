@@ -1,3 +1,7 @@
+// This Source Code Form is subject to the terms of the Mozilla Public
+// License, v. 2.0. If a copy of the MPL was not distributed with this
+// file, You can obtain one at https://mozilla.org/MPL/2.0/.
+
 //! Multiplex WebSocket I/O across a dynamic set of clients.
 //!
 //! We delegate all the hard parts: buffered sending to [`broadcast`]
@@ -18,6 +22,8 @@ use tokio_tungstenite::tungstenite::error::Error as WebSocketError;
 use tokio_tungstenite::tungstenite::protocol::Message as WebSocketMessage;
 use tokio_util::sync::CancellationToken;
 
+use sush_common::jobs::Access;
+
 use crate::job::SocketStream;
 
 /// Maximum number of messages a client is allowed to lag by
@@ -33,6 +39,7 @@ pub struct WebSocketMux {
     next_client_id: ClientId,
     recv: StreamMap<ClientId, StreamNotifyClose<SplitStream<SocketStream>>>,
     send: broadcast::Sender<WebSocketMessage>,
+    access: BTreeMap<ClientId, Access>,
     stop: BTreeMap<ClientId, CancellationToken>,
     done: FuturesUnordered<JoinHandle<ClientId>>,
 }
@@ -44,16 +51,23 @@ impl WebSocketMux {
             next_client_id: 0,
             recv: StreamMap::new(),
             send: broadcast::channel(MUX_CLIENT_CHANNEL_CAPACITY).0,
+            access: BTreeMap::new(),
             stop: BTreeMap::new(),
             done: FuturesUnordered::new(),
         }
     }
 
-    pub fn add(&mut self, stream: SocketStream, stop: CancellationToken) -> ClientId {
+    pub fn add(
+        &mut self,
+        stream: SocketStream,
+        access: Access,
+        stop: CancellationToken,
+    ) -> ClientId {
         let client_id = self.next_client_id;
         self.next_client_id += 1;
         let (mut to, from) = stream.split();
         self.recv.insert(client_id, StreamNotifyClose::new(from));
+        self.access.insert(client_id, access);
         self.stop.insert(client_id, stop.clone());
         let mut rx = self.send.subscribe();
         let handle = spawn(async move {
@@ -80,9 +94,14 @@ impl WebSocketMux {
 
     pub fn remove(&mut self, client_id: &ClientId) {
         self.recv.remove(client_id);
+        self.access.remove(client_id);
         if let Some(stop) = self.stop.remove(client_id) {
             stop.cancel();
         }
+    }
+
+    pub fn access(&self, client_id: &ClientId) -> Option<Access> {
+        self.access.get(client_id).copied()
     }
 
     pub fn send(
@@ -107,6 +126,7 @@ impl Stream for WebSocketMux {
         while let Poll::Ready(Some(result)) = Pin::new(&mut this.done).poll_next(cx) {
             if let Ok(id) = result {
                 this.recv.remove(&id);
+                this.access.remove(&id);
                 this.stop.remove(&id);
             }
         }

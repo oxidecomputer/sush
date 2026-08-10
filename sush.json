@@ -9,7 +9,7 @@
       "put": {
         "summary": "Import a certificate, verify its signature, and return a key ID for it.",
         "description": "The body should be a PEM encoded X.509 certificate.",
-        "operationId": "import_cert",
+        "operationId": "cert_import",
         "parameters": [
           {
             "in": "header",
@@ -103,6 +103,50 @@
         }
       }
     },
+    "/certs/{key_id}/revoke": {
+      "post": {
+        "summary": "Revoke a certificate.",
+        "description": "Revocation is permanent and propagates across the rack. Root certificates cannot be revoked.",
+        "operationId": "cert_revoke",
+        "parameters": [
+          {
+            "in": "header",
+            "name": "authorization",
+            "description": "Authorization to access some resource, such as a signature.\n\nSee: <https://developer.mozilla.org/en-US/docs/Web/HTTP/Reference/Headers/Authorization>",
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "in": "path",
+            "name": "key_id",
+            "required": true,
+            "schema": {
+              "$ref": "#/components/schemas/KeyId"
+            }
+          },
+          {
+            "in": "query",
+            "name": "wait",
+            "description": "Wait for the subject to appear in the state.",
+            "schema": {
+              "type": "boolean"
+            }
+          }
+        ],
+        "responses": {
+          "204": {
+            "description": "resource updated"
+          },
+          "4XX": {
+            "$ref": "#/components/responses/Error"
+          },
+          "5XX": {
+            "$ref": "#/components/responses/Error"
+          }
+        }
+      }
+    },
     "/iam": {
       "get": {
         "summary": "List cached identities.",
@@ -176,6 +220,42 @@
                 }
               }
             }
+          },
+          "4XX": {
+            "$ref": "#/components/responses/Error"
+          },
+          "5XX": {
+            "$ref": "#/components/responses/Error"
+          }
+        }
+      }
+    },
+    "/iam/{key_id}/revoke": {
+      "post": {
+        "summary": "Revoke an SSH identity.",
+        "description": "Expires the key's cached identities and refuses its future logins. Identities are not shared across the rack, so this applies only to the server handling the request.",
+        "operationId": "iam_revoke",
+        "parameters": [
+          {
+            "in": "header",
+            "name": "authorization",
+            "description": "Authorization to access some resource, such as a signature.\n\nSee: <https://developer.mozilla.org/en-US/docs/Web/HTTP/Reference/Headers/Authorization>",
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "in": "path",
+            "name": "key_id",
+            "required": true,
+            "schema": {
+              "$ref": "#/components/schemas/KeyId"
+            }
+          }
+        ],
+        "responses": {
+          "204": {
+            "description": "resource updated"
           },
           "4XX": {
             "$ref": "#/components/responses/Error"
@@ -590,6 +670,102 @@
         }
       }
     },
+    "/sessions/{session_id}/allow/{key_id}": {
+      "post": {
+        "summary": "Grant a key attach access to this session's interactive jobs.",
+        "description": "Only the key that started the session may grant access.",
+        "operationId": "session_allow_attach",
+        "parameters": [
+          {
+            "in": "header",
+            "name": "authorization",
+            "description": "Authorization to access some resource, such as a signature.\n\nSee: <https://developer.mozilla.org/en-US/docs/Web/HTTP/Reference/Headers/Authorization>",
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "in": "path",
+            "name": "session_id",
+            "required": true,
+            "schema": {
+              "$ref": "#/components/schemas/SessionId"
+            }
+          },
+          {
+            "in": "path",
+            "name": "key_id",
+            "required": true,
+            "schema": {
+              "$ref": "#/components/schemas/KeyId"
+            }
+          },
+          {
+            "in": "query",
+            "name": "access",
+            "description": "How much access to grant. Read-only if omitted.",
+            "schema": {
+              "$ref": "#/components/schemas/Access"
+            }
+          }
+        ],
+        "responses": {
+          "204": {
+            "description": "resource updated"
+          },
+          "4XX": {
+            "$ref": "#/components/responses/Error"
+          },
+          "5XX": {
+            "$ref": "#/components/responses/Error"
+          }
+        }
+      }
+    },
+    "/sessions/{session_id}/deny/{key_id}": {
+      "post": {
+        "summary": "Withdraw a key's attach access.",
+        "description": "Only the key that started the session may withdraw access. Already-attached connections keep the access they attached with.",
+        "operationId": "session_deny_attach",
+        "parameters": [
+          {
+            "in": "header",
+            "name": "authorization",
+            "description": "Authorization to access some resource, such as a signature.\n\nSee: <https://developer.mozilla.org/en-US/docs/Web/HTTP/Reference/Headers/Authorization>",
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "in": "path",
+            "name": "session_id",
+            "required": true,
+            "schema": {
+              "$ref": "#/components/schemas/SessionId"
+            }
+          },
+          {
+            "in": "path",
+            "name": "key_id",
+            "required": true,
+            "schema": {
+              "$ref": "#/components/schemas/KeyId"
+            }
+          }
+        ],
+        "responses": {
+          "204": {
+            "description": "resource updated"
+          },
+          "4XX": {
+            "$ref": "#/components/responses/Error"
+          },
+          "5XX": {
+            "$ref": "#/components/responses/Error"
+          }
+        }
+      }
+    },
     "/sessions/{session_id}/skip/{job_id}": {
       "post": {
         "summary": "Burn a job ID in the current session.",
@@ -820,9 +996,18 @@
                   "time_cancelled": {
                     "type": "string",
                     "format": "date-time"
+                  },
+                  "actor": {
+                    "description": "The key that requested the cancellation.",
+                    "allOf": [
+                      {
+                        "$ref": "#/components/schemas/KeyId"
+                      }
+                    ]
                   }
                 },
                 "required": [
+                  "actor",
                   "job_id",
                   "time_cancelled"
                 ]
@@ -845,9 +1030,18 @@
                   "time_queued": {
                     "type": "string",
                     "format": "date-time"
+                  },
+                  "actor": {
+                    "description": "The key that submitted the job.",
+                    "allOf": [
+                      {
+                        "$ref": "#/components/schemas/KeyId"
+                      }
+                    ]
                   }
                 },
                 "required": [
+                  "actor",
                   "job_id",
                   "time_queued"
                 ]
@@ -1207,6 +1401,15 @@
           },
           "last_job": {
             "$ref": "#/components/schemas/LastJob"
+          },
+          "started_by": {
+            "nullable": true,
+            "description": "The key that started the session, where known. Client-side trackers leave it `None`. Servers record the verified starter.",
+            "allOf": [
+              {
+                "$ref": "#/components/schemas/KeyId"
+              }
+            ]
           }
         },
         "required": [
@@ -1277,6 +1480,14 @@
           "none",
           "start",
           "stop"
+        ]
+      },
+      "Access": {
+        "description": "Attach access to a session's interactive jobs. The session starter always has read-write access. Guests have what they were granted. Read-write means co-driving a shell the job signature authorized, so who deserves it is deployment policy. Recorded output is not gated: it is the customer's data, readable by any authenticated key.",
+        "type": "string",
+        "enum": [
+          "read-only",
+          "read-write"
         ]
       }
     },

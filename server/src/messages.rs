@@ -1,3 +1,7 @@
+// This Source Code Form is subject to the terms of the Mozilla Public
+// License, v. 2.0. If a copy of the MPL was not distributed with this
+// file, You can obtain one at https://mozilla.org/MPL/2.0/.
+
 //! Messages gossiped via rumors.
 
 use chrono::{DateTime, Utc};
@@ -16,7 +20,7 @@ use sush_common::borsh::{
     borsh_ser_cert, borsh_ser_datetime,
 };
 use sush_common::jobs::JobOutputState;
-use sush_common::jobs::{JobId, ProcessError, SessionId, SignedJob};
+use sush_common::jobs::{Access, JobId, ProcessError, SessionId, SignedJob};
 use sush_common::keys::KeyId;
 
 #[derive(BorshDeserialize, BorshSerialize, Copy, Clone, Debug, Eq, PartialEq)]
@@ -57,24 +61,62 @@ pub mod v0 {
         }
     }
 
+    /// A request and the key that made it.
+    ///
+    /// The actor is attribution, not authority: it names the key whose
+    /// possession the accepting server verified, and the record is only
+    /// as truthful as that server. Execution authority comes from the
+    /// job signature alone.
+    #[derive(BorshDeserialize, BorshSerialize, Clone, Debug, Eq, PartialEq)]
+    pub struct Attributed<T> {
+        pub actor: KeyId,
+        pub request: T,
+    }
+
+    impl<T> Attributed<T> {
+        pub fn as_parts(&self) -> (&KeyId, &T) {
+            (&self.actor, &self.request)
+        }
+    }
+
     #[derive(BorshDeserialize, BorshSerialize, Clone, Debug, Eq, PartialEq)]
     pub enum Request {
-        Cert(Box<CertRequest>),
-        Session(Box<SessionRequest>),
-        Job(Box<JobRequest>),
+        Cert(Box<Attributed<CertRequest>>),
+        Session(Box<Attributed<SessionRequest>>),
+        Job(Box<Attributed<JobRequest>>),
     }
 
     impl Request {
-        pub fn cert(request: CertRequest) -> Self {
-            Self::Cert(Box::new(request))
+        pub fn cert(actor: KeyId, request: CertRequest) -> Self {
+            Self::Cert(Box::new(Attributed { actor, request }))
         }
 
-        pub fn session(request: SessionRequest) -> Self {
-            Self::Session(Box::new(request))
+        pub fn session(actor: KeyId, request: SessionRequest) -> Self {
+            Self::Session(Box::new(Attributed { actor, request }))
         }
 
-        pub fn job(request: JobRequest) -> Self {
-            Self::Job(Box::new(request))
+        pub fn job(actor: KeyId, request: JobRequest) -> Self {
+            Self::Job(Box::new(Attributed { actor, request }))
+        }
+
+        pub fn kind(&self) -> &'static str {
+            match self {
+                Self::Cert(r) => match r.request {
+                    CertRequest::Import(_) => "cert import",
+                    CertRequest::Revoke(..) => "cert revoke",
+                },
+                Self::Session(r) => match r.request {
+                    SessionRequest::Start(_) => "session start",
+                    SessionRequest::Stop(_) => "session stop",
+                    SessionRequest::Skip(..) => "session skip",
+                    SessionRequest::AllowAttach(..) => "session allow",
+                    SessionRequest::DenyAttach(..) => "session deny",
+                },
+                Self::Job(r) => match r.request {
+                    JobRequest::Start(..) => "job start",
+                    JobRequest::Stop(_) => "job stop",
+                },
+            }
         }
     }
 
@@ -101,6 +143,8 @@ pub mod v0 {
         Start(SessionId),
         Stop(SessionId),
         Skip(SessionId, JobId),
+        AllowAttach(SessionId, KeyId, Access),
+        DenyAttach(SessionId, KeyId),
     }
 
     #[derive(BorshDeserialize, BorshSerialize, Clone, Debug, Eq, PartialEq)]
@@ -185,20 +229,63 @@ mod wire_format {
 
     #[test]
     fn session_start_request() {
-        let msg: VersionedMessage = Message::Request(Request::session(SessionRequest::Start(
-            SessionId::from("abandon-ability"),
-        )))
+        let msg: VersionedMessage = Message::Request(Request::session(
+            KeyId::from("zoo-zero".to_string()),
+            SessionRequest::Start(SessionId::from("abandon-ability")),
+        ))
         .into();
-        assert_wire_format(msg, b"\x00\x00\x01\x00\x0f\x00\x00\x00abandon-ability");
+        assert_wire_format(
+            msg,
+            b"\x00\x00\x01\x08\x00\x00\x00zoo-zero\x00\x0f\x00\x00\x00abandon-ability",
+        );
     }
 
     #[test]
     fn session_stop_request() {
-        let msg: VersionedMessage = Message::Request(Request::session(SessionRequest::Stop(
-            SessionId::from("abandon-ability"),
-        )))
+        let msg: VersionedMessage = Message::Request(Request::session(
+            KeyId::from("zoo-zero".to_string()),
+            SessionRequest::Stop(SessionId::from("abandon-ability")),
+        ))
         .into();
-        assert_wire_format(msg, b"\x00\x00\x01\x01\x0f\x00\x00\x00abandon-ability");
+        assert_wire_format(
+            msg,
+            b"\x00\x00\x01\x08\x00\x00\x00zoo-zero\x01\x0f\x00\x00\x00abandon-ability",
+        );
+    }
+
+    #[test]
+    fn session_allow_attach_request() {
+        let msg: VersionedMessage = Message::Request(Request::session(
+            KeyId::from("zoo-zero".to_string()),
+            SessionRequest::AllowAttach(
+                SessionId::from("abandon-ability"),
+                KeyId::from("able-about".to_string()),
+                Access::ReadWrite,
+            ),
+        ))
+        .into();
+        assert_wire_format(
+            msg,
+            b"\x00\x00\x01\x08\x00\x00\x00zoo-zero\x03\x0f\x00\x00\x00abandon-ability\
+              \x0a\x00\x00\x00able-about\x01",
+        );
+    }
+
+    #[test]
+    fn session_deny_attach_request() {
+        let msg: VersionedMessage = Message::Request(Request::session(
+            KeyId::from("zoo-zero".to_string()),
+            SessionRequest::DenyAttach(
+                SessionId::from("abandon-ability"),
+                KeyId::from("able-about".to_string()),
+            ),
+        ))
+        .into();
+        assert_wire_format(
+            msg,
+            b"\x00\x00\x01\x08\x00\x00\x00zoo-zero\x04\x0f\x00\x00\x00abandon-ability\
+              \x0a\x00\x00\x00able-about",
+        );
     }
 
     // TODO: snapshot more messages

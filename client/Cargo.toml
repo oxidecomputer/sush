@@ -3,11 +3,18 @@ name = "sush-client"
 description = "Oxide Support Shell Client"
 version = "0.1.0"
 edition = "2024"
+license = "MPL-2.0"
+repository = "https://github.com/oxidecomputer/sush"
 publish = false
 
 [[bin]]
 name = "sush"
 path = "src/main.rs"
+
+[features]
+# Sign job requests through Permission Slip. Off by default because the
+# permission-slip repositories are private; Oxide builds turn it on.
+permslip = ["dep:permission-slip-client", "dep:permission-slip-common"]
 
 [dependencies]
 async-recursion.workspace = true
@@ -23,12 +30,11 @@ http.workspace = true
 http-range-header.workspace = true
 humantime.workspace = true
 indicatif.workspace = true
-kms-agent.workspace = true
 memmap2.workspace = true
 p256.workspace = true
 pem-rfc7468.workspace = true
-permission-slip-client.workspace = true
-permission-slip-common.workspace = true
+permission-slip-client = { workspace = true, optional = true }
+permission-slip-common = { workspace = true, optional = true }
 progenitor.workspace = true
 progenitor-client.workspace = true
 rand.workspace = true

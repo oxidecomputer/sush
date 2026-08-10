@@ -1,3 +1,7 @@
+// This Source Code Form is subject to the terms of the Mozilla Public
+// License, v. 2.0. If a copy of the MPL was not distributed with this
+// file, You can obtain one at https://mozilla.org/MPL/2.0/.
+
 //! Job server errors.
 
 use std::path::{Path, PathBuf};
@@ -13,6 +17,8 @@ use sush_common::keys::{KeyError, KeyId};
 /// What went wrong processing a client job request.
 #[derive(Debug, Error)]
 pub enum JobError {
+    #[error("Attach access to this session's jobs has not been granted")]
+    AttachDenied,
     #[error("Internal communications channel was unexpectedly closed")]
     ChannelClosed,
     #[error("Certificate decoding error: {0}")]
@@ -46,6 +52,8 @@ pub enum JobError {
     MultipleSessions,
     #[error("No current session")]
     NoSession,
+    #[error("Only the session starter may grant or deny attach access")]
+    NotSessionStarter,
     #[error("Session `{0}` is no longer current")]
     SessionNotCurrent(SessionId),
     #[error("Job output hash mismatch, file may be corrupt")]
@@ -58,6 +66,8 @@ pub enum JobError {
     PublicKeyMismatch(KeyId),
     #[error("Public key `{0}` not found")]
     PublicKeyNotFound(KeyId),
+    #[error("Root certificate `{0}` cannot be revoked")]
+    RootRevocation(KeyId),
     #[error(transparent)]
     Slice(#[from] std::array::TryFromSliceError),
     #[error(transparent)]
@@ -158,6 +168,9 @@ impl From<JobError> for HttpError {
                 err.add_header("WWW-Authenticate", challenge)
                     .expect("should be able to add WWW-Authenticate header");
                 err
+            }
+            AttachDenied | NotSessionStarter | RootRevocation(_) => {
+                HttpError::for_client_error(None, ClientErrorStatusCode::FORBIDDEN, message)
             }
             IdentityNotFound(_) | JobNotFound(_) | NoSession | OutputFileMissing(_)
             | SessionNotCurrent(_) => {

@@ -1,3 +1,7 @@
+// This Source Code Form is subject to the terms of the Mozilla Public
+// License, v. 2.0. If a copy of the MPL was not distributed with this
+// file, You can obtain one at https://mozilla.org/MPL/2.0/.
+
 //! Read, evaluate, print, loop.
 //!
 //! Inherits most of its behavior from the (non-interactive) CLI.
@@ -14,17 +18,19 @@ use shlex::split as split_command;
 use x509_cert::Certificate;
 use xdg::BaseDirectories;
 
-use sush_common::authn::{Credentials, Identity};
-use sush_common::jobs::{JobId, JobOutputStream, JobStatusMap, Session, SessionId, SignedJob};
+use sush_common::authn::Identity;
+use sush_common::jobs::{
+    Access, JobId, JobOutputStream, JobStatusMap, Session, SessionId, SignedJob,
+};
 use sush_common::keys::{KeyId, SshPublicKey};
 
-use crate::Client;
 use crate::cli::Cli;
 use crate::commands::{
     ClientCommand, CommandError, GlobalArgs, SSH_AUTH_SOCK, SUSH_JOB_ID, SUSH_KEY_ID,
     SUSH_OUTPUT_FORMAT, SUSH_URL,
 };
 use crate::context::{CommandContext, OutputFormat};
+use crate::{AuthzSigner, Client};
 
 const PREFIX: &str = "sush";
 const HISTORY_FILE: &str = "history.txt";
@@ -194,12 +200,8 @@ impl CommandContext for Repl {
 
     // Session management
 
-    fn get_credentials(&self) -> Option<Credentials> {
-        self.cli.get_credentials()
-    }
-
-    fn set_credentials(&mut self, credentials: Option<Credentials>) {
-        self.cli.set_credentials(credentials)
+    fn authz_signer(&self) -> AuthzSigner {
+        self.cli.authz_signer()
     }
 
     fn session_id(&self) -> Option<SessionId> {
@@ -218,10 +220,23 @@ impl CommandContext for Repl {
         self.cli.session_stopped(session_id)
     }
 
+    fn attach_allowed(&mut self, key_id: &KeyId, access: Access) {
+        self.cli.attach_allowed(key_id, access)
+    }
+
+    fn attach_denied(&mut self, key_id: &KeyId) {
+        self.cli.attach_denied(key_id)
+    }
+
     // Job signing certificates
 
-    fn cert_chain(&mut self, key_id: KeyId, certs: &str) -> Result<Certificate, CommandError> {
-        self.cli.cert_chain(key_id, certs)
+    fn cert_chain(
+        &mut self,
+        key_id: KeyId,
+        certs: &str,
+        roots: &[Certificate],
+    ) -> Result<Certificate, CommandError> {
+        self.cli.cert_chain(key_id, certs, roots)
     }
 
     fn cert_imported(&mut self, path: &Path, key_id: KeyId) -> Result<(), CommandError> {
@@ -332,11 +347,11 @@ impl CommandContext for Repl {
         self.cli.please_touch(identity)
     }
 
-    fn really_revoke(&mut self, key_id: KeyId) -> Result<KeyId, CommandError> {
-        self.cli.really_revoke(key_id)
+    fn really_revoke(&mut self, what: &str, key_id: KeyId) -> Result<KeyId, CommandError> {
+        self.cli.really_revoke(what, key_id)
     }
 
-    fn identity_revoked(&mut self, key_id: KeyId) -> Result<(), CommandError> {
-        self.cli.identity_revoked(key_id)
+    fn revoked(&mut self, what: &str, key_id: KeyId) -> Result<(), CommandError> {
+        self.cli.revoked(what, key_id)
     }
 }

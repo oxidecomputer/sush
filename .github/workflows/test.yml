@@ -1,5 +1,8 @@
 name: Test
-on: [push]
+on:
+  push:
+    branches: [main]
+  pull_request:
 jobs:
   Test:
     runs-on: ubuntu-22.04-8core
@@ -16,11 +19,15 @@ jobs:
     - name: Checkout
       uses: actions/checkout@v6
 
+    # Cargo fetches every git dependency at resolution time, enabled
+    # or not. So even feature-less builds need to fetch permission-slip.
+    # Forks skip this and fail here.
     - name: Get token to fetch private repositories
+      if: github.repository == 'oxidecomputer/sush'
       uses: oxidecomputer/oidcx-action@main
       with:
         service: github
-        repositories: oxidecomputer/permission-slip,oxidecomputer/kms-agent
+        repositories: oxidecomputer/permission-slip
         permissions: contents:read
         configure-git: true
 
@@ -35,3 +42,35 @@ jobs:
 
     - name: Test
       run: cargo test
+
+  # The permslip feature pulls in permission-slip, which is private, so
+  # this job only runs where the OIDC exchange can succeed.
+  Permslip:
+    if: github.repository == 'oxidecomputer/sush'
+    runs-on: ubuntu-22.04-8core
+    permissions:
+      contents: read
+      id-token: write
+    steps:
+    - name: Install Rust toolchain
+      uses: dtolnay/rust-toolchain@master
+      with:
+        toolchain: 1.91
+        components: clippy
+
+    - name: Checkout
+      uses: actions/checkout@v6
+
+    - name: Get token to fetch private repositories
+      uses: oxidecomputer/oidcx-action@main
+      with:
+        service: github
+        repositories: oxidecomputer/permission-slip
+        permissions: contents:read
+        configure-git: true
+
+    - name: Lint
+      run: cargo clippy --package sush-client --features permslip -- --no-deps --deny warnings
+
+    - name: Build
+      run: cargo build --locked --package sush-client --features permslip

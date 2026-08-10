@@ -1,7 +1,12 @@
+// This Source Code Form is subject to the terms of the Mozilla Public
+// License, v. 2.0. If a copy of the MPL was not distributed with this
+// file, You can obtain one at https://mozilla.org/MPL/2.0/.
+
 //! Job manager tests.
 
 use std::os::unix::fs::PermissionsExt as _;
 use std::path::Path;
+use std::slice::from_ref;
 use std::time::Duration;
 
 use chrono::Utc;
@@ -13,23 +18,26 @@ use sled_hardware_types::BaseboardId;
 use slog::{Discard, Logger, o};
 use tempfile::TempDir;
 use tokio::fs::metadata;
-use tokio::time::timeout;
+use tokio::time::{sleep, timeout};
 use tokio_util::sync::CancellationToken;
 use x509_cert::time::Validity;
 
 use sush_api::{JobStartParams, JobStopParams, JobWait};
-use sush_common::authn::{Challenge, ChallengeResponse, Credentials, Identity};
+use sush_client::context::Authz;
+use sush_common::authn::{Challenge, ChallengeResponse, Credentials, Identity, RequestKey};
 use sush_common::jobs::{
-    JobId, JobLimits, JobOutputState, JobOutputStream::*, JobStatus, ProcessError, Session,
+    Access, JobId, JobLimits, JobOutputState, JobOutputStream::*, JobStatus, ProcessError, Session,
     SessionId,
 };
-use sush_common::keys::{EphemeralKey, KeyError, KeyType, Signer as _};
+use sush_common::keys::{EphemeralKey, KeyError, KeyId, KeyType, Signer as _};
 use sush_server::io::BATCH_OUTPUT_BUFFER_SIZE;
+use sush_server::messages::v0::{CertRequest, Message, Request, SessionRequest};
 use sush_server::output::JobOutputDir;
 use sush_server::{JobError, JobManager};
 
 use crate::test_utils::{
-    SignJobRequest as _, ephemeral_test_subject, fake_identity, manager_and_test_root, test_logger,
+    SignJobRequest as _, ephemeral_test_subject, fake_identity, manager_and_test_root,
+    manager_login, manager_test_root_and_peer, test_logger,
 };
 use sush_server::executor::PathIsolation;
 
@@ -240,7 +248,7 @@ async fn job_stop() {
 
     assert!(matches!(
         &mgr.job_status(&authn, &job_id).await.unwrap()[baseboard_id],
-        JobStatus::Cancelled { job_id: jid, time_cancelled } if *jid == job_id && *time_cancelled <= Utc::now()
+        JobStatus::Cancelled { job_id: jid, time_cancelled, .. } if *jid == job_id && *time_cancelled <= Utc::now()
     ));
 
     // Skip the cancelled job.
@@ -340,7 +348,7 @@ async fn cancel_queued_job() {
     mgr.wait_for_job_status(&job_id_b).await.unwrap();
     assert!(matches!(
         &mgr.job_status(&authn, &job_id_b).await.unwrap()[mgr.own_baseboard()],
-        JobStatus::Queued { job_id: jid, time_queued, } if *jid == job_id_b && *time_queued <= Utc::now()
+        JobStatus::Queued { job_id: jid, time_queued, .. } if *jid == job_id_b && *time_queued <= Utc::now()
     ));
 
     // ... but immediately cancel it.
@@ -355,7 +363,7 @@ async fn cancel_queued_job() {
     .expect("should be able to stop queued job");
     assert!(matches!(
         &mgr.job_status(&authn, &job_id_b).await.unwrap()[mgr.own_baseboard()],
-        JobStatus::Cancelled { job_id: jid, time_cancelled } if *jid == job_id_b && *time_cancelled <= Utc::now()
+        JobStatus::Cancelled { job_id: jid, time_cancelled, .. } if *jid == job_id_b && *time_cancelled <= Utc::now()
     ));
 
     // Clean up.
@@ -513,7 +521,7 @@ async fn cert_chain() {
     // Test failure modes.
     assert!(
         matches!(
-            mgr.import_cert(&authn, root_cert.clone(), false)
+            mgr.cert_import(&authn, root_cert.clone(), false)
                 .await
                 .unwrap_err(),
             JobError::Key(KeyError::SelfSigned),
@@ -526,7 +534,7 @@ async fn cert_chain() {
     );
     timeout(
         Duration::from_secs(1),
-        mgr.import_cert(&authn, child.cert().clone(), true),
+        mgr.cert_import(&authn, child.cert().clone(), true),
     )
     .await
     .expect("timed out importing child")
@@ -555,6 +563,624 @@ async fn cert_chain() {
     session.job_started(job.clone().into_signed());
     let status = mgr.job_status(&authn, &job_id).await.unwrap()[mgr.own_baseboard()].clone();
     check_status_stopped(status, &job_id, Ok(0), Some(0), Some(0));
+}
+
+/// Requests record the verified key that made them: the session names
+/// its starter, and queued and cancelled jobs name their actors.
+#[named]
+#[tokio::test]
+async fn attribution() {
+    let log = test_logger(function_name!());
+    let (mgr, mut root, _dir, _shutdown) = manager_and_test_root(log).await;
+    let authn = fake_identity(&mut root).await;
+    let session_id = SessionId::new();
+    let mut session = Session::new(session_id.clone());
+    mgr.session_start(&authn, session_id.clone(), true)
+        .await
+        .unwrap();
+    assert_eq!(
+        mgr.session(&authn).unwrap().started_by(),
+        Some(&authn.key_id)
+    );
+
+    // Job B queues behind a hole in the job chain, attributed. The
+    // executor only runs the job whose id the chain expects next, and
+    // it never sees this one, so B stays queued until cancelled.
+    let job_id_a = session.next_job_id();
+    let job_a = root.sign_job_request(&job_id_a, "sleep 60", false).await;
+    mgr.job_start(
+        &authn,
+        job_a.clone().into_signed(),
+        JobStartParams {
+            wait: JobWait::Start,
+            ..Default::default()
+        },
+    )
+    .await
+    .unwrap();
+    session.job_started(job_a.into_signed());
+    let hole_id = session.next_job_id();
+    let hole = root.sign_job_request(&hole_id, "true", false).await;
+    session.job_started(hole.into_signed());
+    let job_id_b = session.next_job_id();
+    let job_b = root.sign_job_request(&job_id_b, "true", false).await;
+    mgr.job_start(
+        &authn,
+        job_b.clone().into_signed(),
+        JobStartParams::default(),
+    )
+    .await
+    .unwrap();
+    session.job_started(job_b.into_signed());
+    mgr.wait_for_job_status(&job_id_b).await.unwrap();
+    let status = mgr.job_status(&authn, &job_id_b).await.unwrap()[mgr.own_baseboard()].clone();
+    assert!(
+        matches!(&status, JobStatus::Queued { actor, .. } if *actor == authn.key_id),
+        "expected job B queued by us, got {status:?}"
+    );
+
+    // Cancelling B records the canceller.
+    mgr.job_stop(
+        &authn,
+        &job_id_b,
+        JobStopParams {
+            wait: JobWait::Stop,
+        },
+    )
+    .await
+    .unwrap();
+    let status = mgr.job_status(&authn, &job_id_b).await.unwrap()[mgr.own_baseboard()].clone();
+    assert!(
+        matches!(&status, JobStatus::Cancelled { actor, .. } if *actor == authn.key_id),
+        "expected job B cancelled by us, got {status:?}"
+    );
+    mgr.job_stop(
+        &authn,
+        &job_id_a,
+        JobStopParams {
+            wait: JobWait::Stop,
+        },
+    )
+    .await
+    .unwrap();
+}
+
+/// A revocation that precedes its certificate still lands, and
+/// revocation spam for made-up key IDs cannot block imports.
+#[named]
+#[tokio::test]
+async fn revocation_tombstones() {
+    let log = test_logger(function_name!());
+    let (mgr, mut root, peer, _dir, _shutdown) = manager_test_root_and_peer(log).await;
+    let authn = fake_identity(&mut root).await;
+    let validity = Validity::from_now(Duration::from_secs(60)).unwrap();
+    let issuer = root.subject();
+    let algorithm = root.signature_algorithm();
+    let doomed = EphemeralKey::new_child(
+        KeyType::P256,
+        ephemeral_test_subject(),
+        issuer.clone(),
+        validity,
+        &mut root,
+        algorithm.clone(),
+    )
+    .await
+    .unwrap();
+    let spared = EphemeralKey::new_child(
+        KeyType::P256,
+        ephemeral_test_subject(),
+        issuer,
+        validity,
+        &mut root,
+        algorithm,
+    )
+    .await
+    .unwrap();
+
+    // Spam revocations for keys that will never exist, then revoke the
+    // doomed child before anyone has seen its certificate.
+    let revoke = |key_id: KeyId| {
+        Message::Request(Request::cert(
+            authn.key_id.clone(),
+            CertRequest::Revoke(key_id, Utc::now()),
+        ))
+        .into()
+    };
+    for i in 0..200 {
+        peer.send(revoke(KeyId::from(format!("bogus-{i}"))));
+    }
+    peer.send(revoke(doomed.key_id().clone()));
+
+    // The revocation outlives the spam and refuses the import. The
+    // spam blocks nothing else.
+    peer.send(
+        Message::Request(Request::cert(
+            authn.key_id.clone(),
+            CertRequest::Import(doomed.cert().clone()),
+        ))
+        .into(),
+    );
+    timeout(Duration::from_secs(30), async {
+        loop {
+            match mgr.cert_chain(&authn, doomed.key_id()) {
+                Err(JobError::Key(KeyError::Revoked(..))) => break,
+                _ => sleep(Duration::from_millis(50)).await,
+            }
+        }
+    })
+    .await
+    .expect("revocation never landed");
+    timeout(
+        Duration::from_secs(30),
+        mgr.cert_import(&authn, spared.cert().clone(), true),
+    )
+    .await
+    .expect("timed out importing spared child")
+    .expect("could not import spared child");
+}
+
+/// Certificate revocation through the API: roots are refused, known
+/// certificates stop validating, and unseen certificates are
+/// tombstoned so their eventual import is refused.
+#[named]
+#[tokio::test]
+async fn cert_revoke() {
+    let log = test_logger(function_name!());
+    let (mgr, mut root, _dir, _shutdown) = manager_and_test_root(log).await;
+    let authn = fake_identity(&mut root).await;
+    let validity = Validity::from_now(Duration::from_secs(60)).unwrap();
+    let issuer = root.subject();
+    let algorithm = root.signature_algorithm();
+    let child = EphemeralKey::new_child(
+        KeyType::P256,
+        ephemeral_test_subject(),
+        issuer.clone(),
+        validity,
+        &mut root,
+        algorithm.clone(),
+    )
+    .await
+    .unwrap();
+    let unseen = EphemeralKey::new_child(
+        KeyType::P256,
+        ephemeral_test_subject(),
+        issuer,
+        validity,
+        &mut root,
+        algorithm,
+    )
+    .await
+    .unwrap();
+
+    assert!(matches!(
+        mgr.cert_revoke(&authn, root.key_id().clone(), false).await,
+        Err(JobError::RootRevocation(_)),
+    ));
+
+    mgr.cert_import(&authn, child.cert().clone(), true)
+        .await
+        .unwrap();
+    mgr.cert_revoke(&authn, child.key_id().clone(), true)
+        .await
+        .unwrap();
+    assert!(matches!(
+        mgr.cert_chain(&authn, child.key_id()),
+        Err(JobError::Key(KeyError::Revoked(..))),
+    ));
+
+    mgr.cert_revoke(&authn, unseen.key_id().clone(), true)
+        .await
+        .unwrap();
+    mgr.cert_import(&authn, unseen.cert().clone(), false)
+        .await
+        .unwrap();
+    timeout(Duration::from_secs(30), async {
+        loop {
+            match mgr.cert_chain(&authn, unseen.key_id()) {
+                Err(JobError::Key(KeyError::Revoked(..))) => break,
+                _ => sleep(Duration::from_millis(50)).await,
+            }
+        }
+    })
+    .await
+    .expect("tombstone never consumed the import");
+}
+
+/// Identity revocation: live bound credentials die and the key may
+/// not log back in.
+#[named]
+#[tokio::test]
+async fn iam_revoke() {
+    let log = test_logger(function_name!());
+    let (mgr, mut root, _dir, _shutdown) = manager_and_test_root(log).await;
+    let authz = manager_login(&mgr, &mut root).await.unwrap();
+    let key_id = root.ssh_public_key().key_id().unwrap();
+    let header = authz.header("GET", "/sessions");
+    let authn = mgr
+        .iam(Some(header), None, ("GET", "/sessions"))
+        .await
+        .unwrap();
+
+    mgr.iam_revoke(&authn, key_id).await.unwrap();
+    let header = authz.header("GET", "/sessions");
+    assert!(
+        mgr.iam(Some(header), None, ("GET", "/sessions"))
+            .await
+            .is_err()
+    );
+    assert!(manager_login(&mgr, &mut root).await.is_err());
+}
+
+/// Attach access: strangers are refused, the starter grants and
+/// withdraws guest access mid-session, only the starter may grant, and
+/// grants from non-starters over gossip are ignored.
+#[named]
+#[tokio::test]
+async fn attach_grants() {
+    let log = test_logger(function_name!());
+    let (mgr, mut root, peer, _dir, _shutdown) = manager_test_root_and_peer(log).await;
+    let owner = fake_identity(&mut root).await;
+    let validity = Validity::from_now(Duration::from_secs(60)).unwrap();
+    let mut guest_key =
+        EphemeralKey::new_root(KeyType::P256, ephemeral_test_subject(), validity).unwrap();
+    let guest = fake_identity(&mut guest_key).await;
+
+    let session_id = SessionId::new();
+    let session = Session::new(session_id.clone());
+    mgr.session_start(&owner, session_id.clone(), true)
+        .await
+        .unwrap();
+    let job_id = session.next_job_id();
+    let job = root.sign_job_request(&job_id, "sleep 10", false).await;
+    mgr.job_start(
+        &owner,
+        job.into_signed(),
+        JobStartParams {
+            wait: JobWait::Start,
+            ..Default::default()
+        },
+    )
+    .await
+    .unwrap();
+
+    // The starter attaches read-write; a stranger not at all; a guest
+    // may not grant.
+    let target = mgr.own_baseboard().clone();
+    let attach = async |authn: Identity| mgr.job_attachment(&authn, &job_id, &target).await;
+    assert!(matches!(
+        attach(owner.clone()).await,
+        Ok((_, Access::ReadWrite))
+    ));
+    assert!(matches!(
+        attach(guest.clone()).await,
+        Err(JobError::AttachDenied)
+    ));
+    assert!(matches!(
+        mgr.session_allow_attach(
+            &guest,
+            session_id.clone(),
+            owner.key_id.clone(),
+            Access::ReadOnly
+        )
+        .await,
+        Err(JobError::NotSessionStarter)
+    ));
+
+    // The starter grants read-only, upgrades to read-write, then
+    // withdraws, all mid-session.
+    let granted = async |authn: Identity, want: Option<Access>| {
+        timeout(Duration::from_secs(30), async {
+            loop {
+                let access = match attach(authn.clone()).await {
+                    Ok((_, access)) => Some(access),
+                    Err(JobError::AttachDenied) => None,
+                    Err(err) => panic!("unexpected attach error: {err}"),
+                };
+                if access == want {
+                    break;
+                }
+                sleep(Duration::from_millis(50)).await;
+            }
+        })
+        .await
+        .expect("grant never took effect")
+    };
+    mgr.session_allow_attach(
+        &owner,
+        session_id.clone(),
+        guest.key_id.clone(),
+        Access::ReadOnly,
+    )
+    .await
+    .unwrap();
+    granted(guest.clone(), Some(Access::ReadOnly)).await;
+    mgr.session_allow_attach(
+        &owner,
+        session_id.clone(),
+        guest.key_id.clone(),
+        Access::ReadWrite,
+    )
+    .await
+    .unwrap();
+    granted(guest.clone(), Some(Access::ReadWrite)).await;
+    mgr.session_deny_attach(&owner, session_id.clone(), guest.key_id.clone())
+        .await
+        .unwrap();
+    granted(guest.clone(), None).await;
+
+    // A grant whose actor is not the starter is ignored. The starter's
+    // grant of a third key, sent after it on the same handle, marks it
+    // processed.
+    let mut third_key =
+        EphemeralKey::new_root(KeyType::P256, ephemeral_test_subject(), validity).unwrap();
+    let third = fake_identity(&mut third_key).await;
+    peer.send(
+        Message::Request(Request::session(
+            guest.key_id.clone(),
+            SessionRequest::AllowAttach(
+                session_id.clone(),
+                guest.key_id.clone(),
+                Access::ReadWrite,
+            ),
+        ))
+        .into(),
+    );
+    peer.send(
+        Message::Request(Request::session(
+            owner.key_id.clone(),
+            SessionRequest::AllowAttach(session_id, third.key_id.clone(), Access::ReadOnly),
+        ))
+        .into(),
+    );
+    granted(third.clone(), Some(Access::ReadOnly)).await;
+    assert!(matches!(
+        attach(guest.clone()).await,
+        Err(JobError::AttachDenied)
+    ));
+
+    mgr.job_stop(
+        &owner,
+        &job_id,
+        JobStopParams {
+            wait: JobWait::Stop,
+        },
+    )
+    .await
+    .unwrap();
+}
+
+/// Hostile certificate imports over gossip cannot displace the trust
+/// anchor or any established certificate.
+#[named]
+#[tokio::test]
+async fn hostile_imports_cannot_displace() {
+    let validity = Validity::from_now(Duration::from_secs(60)).unwrap();
+    let mut root =
+        EphemeralKey::new_root(KeyType::P256, ephemeral_test_subject(), validity).unwrap();
+    let root_cert = root.cert().to_owned();
+    let root_key_id = root.key_id().to_owned();
+    let issuer = root.subject();
+    let algorithm = root.signature_algorithm();
+    let mut child = EphemeralKey::new_child(
+        KeyType::P256,
+        ephemeral_test_subject(),
+        issuer,
+        validity,
+        &mut root,
+        algorithm.clone(),
+    )
+    .await
+    .unwrap();
+
+    let dir = TempDir::with_prefix("sush-").unwrap();
+    let log = Logger::root(Discard, o!("test" => function_name!()));
+    let baseboard = BaseboardId {
+        part_number: "test part".to_string(),
+        serial_number: "0000".to_string(),
+    };
+    let gossip = Peer::seed().into_rumors();
+    let peer = gossip.clone();
+    let shutdown = CancellationToken::new();
+    let mgr = JobManager::new(
+        log,
+        PathIsolation::InsecureDisable,
+        dir.path().to_owned(),
+        baseboard,
+        gossip,
+        from_ref(&root_cert),
+        shutdown,
+    )
+    .await
+    .unwrap();
+    let authn = fake_identity(&mut root).await;
+    timeout(
+        Duration::from_secs(1),
+        mgr.cert_import(&authn, child.cert().clone(), true),
+    )
+    .await
+    .expect("timed out importing child")
+    .expect("could not import child");
+
+    // A self-signed homonym of the root: same subject, different key,
+    // and therefore a different key ID.
+    let fake_root = EphemeralKey::new_root(KeyType::P256, root.subject(), validity).unwrap();
+    assert_ne!(fake_root.key_id(), &root_key_id);
+    let import = |key: &EphemeralKey| {
+        Message::Request(Request::cert(
+            key.key_id().clone(),
+            CertRequest::Import(key.cert().clone()),
+        ))
+        .into()
+    };
+    peer.send(import(&fake_root));
+
+    // A homonym of the root issued by an outsider.
+    let mut outsider =
+        EphemeralKey::new_root(KeyType::P256, ephemeral_test_subject(), validity).unwrap();
+    let outsider_issuer = outsider.subject();
+    let outsider_algorithm = outsider.signature_algorithm();
+    let fake_delegate = EphemeralKey::new_child(
+        KeyType::P256,
+        root.subject(),
+        outsider_issuer,
+        validity,
+        &mut outsider,
+        outsider_algorithm,
+    )
+    .await
+    .unwrap();
+    peer.send(import(&fake_delegate));
+
+    // A different certificate bearing the child's key.
+    let mut conflict = child.cert().clone();
+    conflict.tbs_certificate.validity = Validity::from_now(Duration::from_secs(120)).unwrap();
+    peer.send(
+        Message::Request(Request::cert(
+            child.key_id().clone(),
+            CertRequest::Import(conflict),
+        ))
+        .into(),
+    );
+
+    // A grandchild sent on the same handle marks the batch processed
+    // once it validates.
+    let child_issuer = child.subject();
+    let grandchild = EphemeralKey::new_child(
+        KeyType::P256,
+        ephemeral_test_subject(),
+        child_issuer,
+        validity,
+        &mut child,
+        algorithm,
+    )
+    .await
+    .unwrap();
+    peer.send(import(&grandchild));
+    timeout(Duration::from_secs(30), async {
+        while mgr.cert_chain(&authn, grandchild.key_id()).is_err() {
+            sleep(Duration::from_millis(50)).await;
+        }
+    })
+    .await
+    .expect("grandchild never validated");
+
+    // The anchor and the established chain are intact, and neither
+    // homonym ever became usable.
+    assert_eq!(
+        mgr.cert_chain(&authn, &root_key_id).unwrap(),
+        vec![root_cert.clone()]
+    );
+    assert_eq!(
+        mgr.cert_chain(&authn, child.key_id()).unwrap(),
+        vec![root_cert, child.cert().clone()]
+    );
+    assert!(mgr.cert_chain(&authn, fake_root.key_id()).is_err());
+    assert!(mgr.cert_chain(&authn, fake_delegate.key_id()).is_err());
+}
+
+/// A certificate whose subject name matches another's cannot take its
+/// place as an issuer: chains resolve through the key that verifies.
+#[named]
+#[tokio::test]
+async fn homonym_issuer_resolves_to_true_parent() {
+    let validity = Validity::from_now(Duration::from_secs(60)).unwrap();
+    let mut root =
+        EphemeralKey::new_root(KeyType::P256, ephemeral_test_subject(), validity).unwrap();
+    let root_cert = root.cert().to_owned();
+    let issuer = root.subject();
+    let algorithm = root.signature_algorithm();
+    let shared_subject = ephemeral_test_subject();
+    let mut child = EphemeralKey::new_child(
+        KeyType::P256,
+        shared_subject.clone(),
+        issuer,
+        validity,
+        &mut root,
+        algorithm.clone(),
+    )
+    .await
+    .unwrap();
+    let mut outsider =
+        EphemeralKey::new_root(KeyType::P256, ephemeral_test_subject(), validity).unwrap();
+    let outsider_issuer = outsider.subject();
+    let outsider_algorithm = outsider.signature_algorithm();
+    let homonym = EphemeralKey::new_child(
+        KeyType::P256,
+        shared_subject,
+        outsider_issuer,
+        validity,
+        &mut outsider,
+        outsider_algorithm,
+    )
+    .await
+    .unwrap();
+    assert_ne!(homonym.key_id(), child.key_id());
+
+    let dir = TempDir::with_prefix("sush-").unwrap();
+    let log = Logger::root(Discard, o!("test" => function_name!()));
+    let baseboard = BaseboardId {
+        part_number: "test part".to_string(),
+        serial_number: "0000".to_string(),
+    };
+    let gossip = Peer::seed().into_rumors();
+    let peer = gossip.clone();
+    let shutdown = CancellationToken::new();
+    let mgr = JobManager::new(
+        log,
+        PathIsolation::InsecureDisable,
+        dir.path().to_owned(),
+        baseboard,
+        gossip,
+        from_ref(&root_cert),
+        shutdown,
+    )
+    .await
+    .unwrap();
+    let authn = fake_identity(&mut root).await;
+
+    // The homonym arrives before the certificate it mimics, then the
+    // real intermediate and a grandchild that names their shared
+    // subject as its issuer.
+    peer.send(
+        Message::Request(Request::cert(
+            homonym.key_id().clone(),
+            CertRequest::Import(homonym.cert().clone()),
+        ))
+        .into(),
+    );
+    timeout(
+        Duration::from_secs(1),
+        mgr.cert_import(&authn, child.cert().clone(), true),
+    )
+    .await
+    .expect("timed out importing child")
+    .expect("could not import child");
+    let child_issuer = child.subject();
+    let grandchild = EphemeralKey::new_child(
+        KeyType::P256,
+        ephemeral_test_subject(),
+        child_issuer,
+        validity,
+        &mut child,
+        algorithm,
+    )
+    .await
+    .unwrap();
+    timeout(
+        Duration::from_secs(1),
+        mgr.cert_import(&authn, grandchild.cert().clone(), true),
+    )
+    .await
+    .expect("timed out importing grandchild")
+    .expect("could not import grandchild");
+
+    // The chain runs through the key that verifies, and the homonym
+    // never becomes usable, its issuer being a stranger.
+    assert_eq!(
+        mgr.cert_chain(&authn, grandchild.key_id()).unwrap(),
+        vec![root_cert, child.cert().clone(), grandchild.cert().clone()]
+    );
+    assert!(mgr.cert_chain(&authn, homonym.key_id()).is_err());
 }
 
 #[named]
@@ -943,13 +1569,15 @@ async fn output_ranges() {
 async fn iam() {
     let log = test_logger(function_name!());
     let (mgr, mut root, _dir, _shutdown) = manager_and_test_root(log).await;
-    let JobError::Unauthorized(nonce) = mgr.iam(None, None).await.unwrap_err() else {
+    let JobError::Unauthorized(nonce) = mgr.iam(None, None, ("POST", "/iam")).await.unwrap_err()
+    else {
         panic!("should not be authorized yet");
     };
 
     // Construct credentials.
     let challenge = Challenge::new(nonce.clone());
-    let response = ChallengeResponse::new(challenge);
+    let request_key = RequestKey::new();
+    let response = ChallengeResponse::new(challenge, request_key.verifier());
     let signed = root.sign(response).await.unwrap();
     let verified = signed.verify_with_cert(root.cert()).unwrap();
     let mut credentials = Credentials::new(verified);
@@ -957,9 +1585,22 @@ async fn iam() {
     let key_id = public_key.key_id().unwrap();
     credentials.key_id = key_id.clone(); // override cert key ID
 
-    // Register our identity.
+    // Register our identity. Initial credentials work only at `iam`.
+    assert!(
+        mgr.iam(
+            Some(credentials.to_string()),
+            Some(public_key.clone()),
+            ("GET", "/sessions"),
+        )
+        .await
+        .is_err()
+    );
     let identity = mgr
-        .iam(Some(credentials.to_string()), Some(public_key.clone()))
+        .iam(
+            Some(credentials.to_string()),
+            Some(public_key.clone()),
+            ("POST", "/iam"),
+        )
         .await
         .unwrap();
     let Identity {
@@ -975,12 +1616,29 @@ async fn iam() {
     assert!(iam_authenticated <= Utc::now());
     assert!(iam_revoked.is_none());
 
-    // Authenticate successfully.
+    // A bound request authorizes; replaying its header does not, nor
+    // does presenting it against a different request line.
+    let authz = Authz::new(credentials.clone(), request_key);
+    let header = authz.header("GET", "/sessions");
     assert_eq!(
-        mgr.iam(Some(credentials.to_string()), None)
+        mgr.iam(Some(header.clone()), None, ("GET", "/sessions"))
             .await
             .unwrap()
             .key_id,
         key_id,
+    );
+    assert!(
+        mgr.iam(Some(header), None, ("GET", "/sessions"))
+            .await
+            .is_err()
+    );
+    let header = authz.header("GET", "/sessions");
+    assert!(mgr.iam(Some(header), None, ("GET", "/jobs")).await.is_err());
+
+    // Replayed initial credentials are rejected: the nonce is spent.
+    assert!(
+        mgr.iam(Some(credentials.to_string()), None, ("POST", "/iam"))
+            .await
+            .is_err()
     );
 }

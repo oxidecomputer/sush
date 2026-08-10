@@ -1,4 +1,12 @@
+// This Source Code Form is subject to the terms of the Mozilla Public
+// License, v. 2.0. If a copy of the MPL was not distributed with this
+// file, You can obtain one at https://mozilla.org/MPL/2.0/.
+
 //! Key, signature, and certificate management.
+//!
+//! Authority to run a job comes from its signature alone. Client
+//! authentication proves possession of an SSH key for attribution.
+//! The key carries no meaning beyond what the deployment assigns it.
 
 // Handle raw SSH public keys, algorithms, and signatures.
 #![allow(clippy::disallowed_types)]
@@ -14,7 +22,6 @@ use ed25519_dalek::{
     Signature as Ed25519Signature, Signer as _, SigningKey as Ed25519SigningKey,
     VerifyingKey as Ed25519VerifyingKey,
 };
-use kms_agent_lib::protocol::{ProtocolError, SshBufReader as _, SshBufWriter as _};
 use p256::{SecretKey as P256SecretKey, ecdsa};
 use rand_core::OsRng;
 use schemars::schema::Schema;
@@ -23,7 +30,7 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest as _, Sha256};
 use signature::Verifier;
 use ssh_key::{
-    Algorithm as SshAlgorithm, EcdsaCurve, Error as SshKeyError, Signature as SshSignature,
+    Algorithm as SshAlgorithm, EcdsaCurve, Error as SshKeyError, Mpint, Signature as SshSignature,
 };
 use thiserror::Error;
 use x509_cert::der::Encode as _;
@@ -83,25 +90,17 @@ impl From<&Self> for KeyId {
     }
 }
 
-impl TryFrom<&Name> for KeyId {
+/// Key IDs are derived from a certificate's public key.
+impl TryFrom<&Certificate> for KeyId {
     type Error = KeyError;
 
-    fn try_from(name: &Name) -> Result<KeyId, Self::Error> {
-        let hash = Sha256::digest(&name.to_der()?);
+    fn try_from(cert: &Certificate) -> Result<Self, Self::Error> {
+        let hash = Sha256::digest(cert.tbs_certificate.subject_public_key_info.to_der()?);
         let phrase = id_phrase(U256::from_be_slice(hash.as_slice()));
         Ok(KeyId(phrase.join(WORD_SEPARATOR)))
     }
 }
 
-impl TryFrom<&Certificate> for KeyId {
-    type Error = KeyError;
-
-    fn try_from(cert: &Certificate) -> Result<Self, Self::Error> {
-        Self::try_from(&cert.tbs_certificate.subject)
-    }
-}
-
-#[allow(clippy::disallowed_types)]
 impl TryFrom<&ssh_key::PublicKey> for KeyId {
     type Error = KeyError;
 
@@ -267,8 +266,8 @@ impl EncodedSignature {
             ))),
             SkEcdsaSha2NistP256 => {
                 let mut bytes = BytesMut::new();
-                bytes.put_mpint(r)?;
-                bytes.put_mpint(s)?;
+                put_mpint(&mut bytes, r)?;
+                put_mpint(&mut bytes, s)?;
                 bytes.put_u8(*flags);
                 bytes.put_u32(*counter);
                 Ok(Signature::SkEcdsaSha256(SshSignature::new(
@@ -330,12 +329,12 @@ impl Signature {
             Self::SkEcdsaSha256(signature) => {
                 let (signature, flags, counter) = sk_split(signature.as_bytes())?;
                 let mut signature = BytesMut::from(signature);
-                let r = signature.try_get_mpint()?;
-                let s = signature.try_get_mpint()?;
+                let r = get_mpint(&mut signature)?;
+                let s = get_mpint(&mut signature)?;
                 let e = || KeyError::InvalidSignatureEncoding;
                 Ok(EncodedSignature {
-                    r: codephrase(U256::from_be_slice(r.as_positive_bytes().ok_or_else(e)?)),
-                    s: codephrase(U256::from_be_slice(s.as_positive_bytes().ok_or_else(e)?)),
+                    r: codephrase(u256_be(r.as_positive_bytes().ok_or_else(e)?)?),
+                    s: codephrase(u256_be(s.as_positive_bytes().ok_or_else(e)?)?),
                     flags,
                     counter,
                 })
@@ -393,12 +392,50 @@ impl Signature {
                 Verifier::verify(&public_key.0, message, &signature)?;
             }
             Self::SkEcdsaSha256(signature) | Self::SkEd25519(signature) => {
+                let (_, flags, _) = sk_split(signature.as_bytes())?;
+                if flags & SK_USER_PRESENCE == 0 {
+                    return Err(KeyError::UserPresenceRequired);
+                }
                 Verifier::verify(&public_key.0, message, signature)?;
             }
         }
         Ok(())
     }
 }
+
+/// A `U256` from up to 32 big-endian bytes. An mpint's minimal
+/// encoding may carry fewer, which `U256::from_be_slice` refuses.
+fn u256_be(bytes: &[u8]) -> Result<U256, KeyError> {
+    let Some(pad) = 32usize.checked_sub(bytes.len()) else {
+        return Err(KeyError::InvalidSignatureEncoding);
+    };
+    let mut buf = [0; 32];
+    buf[pad..].copy_from_slice(bytes);
+    Ok(U256::from_be_slice(&buf))
+}
+
+/// Append one SSH mpint, encoded from positive big-endian bytes.
+fn put_mpint(buf: &mut BytesMut, bytes: impl AsRef<[u8]>) -> Result<(), KeyError> {
+    let mpint = Mpint::from_positive_bytes(bytes.as_ref())?;
+    let bytes = mpint.as_bytes();
+    buf.put_u32(bytes.len() as u32);
+    buf.put_slice(bytes);
+    Ok(())
+}
+
+/// Take one SSH mpint off the front of `buf`.
+fn get_mpint(buf: &mut BytesMut) -> Result<Mpint, KeyError> {
+    let malformed = |_| KeyError::InvalidSignatureEncoding;
+    let length = buf.try_get_u32().map_err(malformed)? as usize;
+    if buf.remaining() < length {
+        return Err(KeyError::InvalidSignatureEncoding);
+    }
+    let blob = buf.copy_to_bytes(length);
+    Ok(Mpint::from_positive_bytes(&blob)?)
+}
+
+/// The `SK-*` signature flag bit attesting user presence (a touch).
+const SK_USER_PRESENCE: u8 = 0x01;
 
 /// Decode an `SK-*` signature into `(signature, flags, counter)`.
 /// See <https://cvsweb.openbsd.org/src/usr.bin/ssh/PROTOCOL.u2f?annotate=HEAD>
@@ -599,8 +636,9 @@ impl<T: ToBeSigned> Signed<T> {
     }
 }
 
-/// An envelope whose signature has been verified.
-#[derive(BorshDeserialize, BorshSerialize, Clone, Debug, Deserialize, JsonSchema, Serialize)]
+/// An envelope whose signature has been verified. Deliberately not
+/// deserializable, must be produced via verification.
+#[derive(BorshSerialize, Clone, Debug, JsonSchema, Serialize)]
 pub struct Verified<T> {
     signed: Signed<T>,
     verified_by: KeyId,
@@ -723,8 +761,7 @@ impl EphemeralKey {
     ) -> Result<Self, KeyError> {
         let key = SigningKey::new(key_type);
         let cert = Self::self_signed_cert(&key, subject, validity)?;
-        let subject = cert.tbs_certificate.subject.to_owned();
-        let key_id = KeyId::try_from(&subject)?;
+        let key_id = KeyId::try_from(&cert)?;
         Signature::try_from(&cert)?.verify_with_spki(
             &cert.tbs_certificate.to_der()?,
             &cert.tbs_certificate.subject_public_key_info,
@@ -742,7 +779,6 @@ impl EphemeralKey {
         signature_algorithm: AlgorithmIdentifierOwned,
     ) -> Result<Self, KeyError> {
         let key = SigningKey::new(key_type);
-        let key_id = KeyId::try_from(&subject)?;
         let tbs_certificate = Self::tbs_certificate(
             &key,
             Self::generate_serial_number()?,
@@ -754,6 +790,7 @@ impl EphemeralKey {
         let cert = Self::sign_cert(tbs_certificate, signer)
             .await
             .map_err(|e| KeyError::Signer(e.to_string()))?;
+        let key_id = KeyId::try_from(&cert)?;
         Ok(Self { key, key_id, cert })
     }
 
@@ -882,6 +919,8 @@ pub fn pem_cert_chain(certs: Vec<Certificate>) -> Result<String, KeyError> {
 pub enum KeyError {
     #[error("Certificate chain is too long")]
     CertChainTooLong,
+    #[error("A different certificate for key `{0}` is already imported")]
+    CertConflict(KeyId),
     #[error("DER encoding error: {0}")]
     Der(#[from] x509_cert::der::Error),
     #[error("Invalid certificate: {0}")]
@@ -902,8 +941,6 @@ pub enum KeyError {
     MissingCert(KeyId),
     #[error(transparent)]
     Pem(#[from] pem_rfc7468::Error),
-    #[error("SSH agent protocol error: {0}")]
-    Protocol(#[from] ProtocolError),
     #[error("Certificate for key `{0}` was revoked at {1}")]
     Revoked(KeyId, DateTime<Utc>),
     #[error("Will not import a self-signed (root) certificate")]
@@ -918,6 +955,8 @@ pub enum KeyError {
     SshKey(#[from] SshKeyError),
     #[error("Too many certificates ({0})")]
     TooManyCerts(usize),
+    #[error("Signature does not attest user presence")]
+    UserPresenceRequired,
 }
 
 impl KeyError {

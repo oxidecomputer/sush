@@ -1,3 +1,7 @@
+// This Source Code Form is subject to the terms of the Mozilla Public
+// License, v. 2.0. If a copy of the MPL was not distributed with this
+// file, You can obtain one at https://mozilla.org/MPL/2.0/.
+
 //! Batch and interactive jobs, server side.
 //!
 //! Standard output and standard error streams for all jobs are hashed
@@ -39,7 +43,7 @@ use tokio_tungstenite::tungstenite::protocol::Message as WebSocketMessage;
 use sush_common::interactive::{
     INTERACTIVE_JOB_BUFFER_SIZE, InteractiveJobControl as Control, InteractiveJobMessage as Message,
 };
-use sush_common::jobs::{JobLimits, JobOutputState, JobOutputStream::*, ProcessError};
+use sush_common::jobs::{Access, JobLimits, JobOutputState, JobOutputStream::*, ProcessError};
 use tokio_util::sync::CancellationToken;
 
 use crate::executor::kill_job;
@@ -47,8 +51,8 @@ use crate::io::JobIo;
 use crate::mux::WebSocketMux;
 
 pub type SocketStream = WebSocketStream<WebsocketConnectionRaw>;
-pub type SocketSender = mpsc::Sender<SocketStream>;
-pub type SocketReceiver = mpsc::Receiver<SocketStream>;
+pub type SocketSender = mpsc::Sender<(SocketStream, Access)>;
+pub type SocketReceiver = mpsc::Receiver<(SocketStream, Access)>;
 
 pub struct Job {
     task: JoinHandle<(Result<i32, ProcessError>, JobOutputState)>,
@@ -65,7 +69,7 @@ impl Job {
         stderr: File,
         stop: CancellationToken,
     ) -> Self {
-        let (tx_client, rx_client) = mpsc::channel::<SocketStream>(1);
+        let (tx_client, rx_client) = mpsc::channel(1);
         Self {
             task: spawn(job(log, limits, child, io, stdout, stderr, rx_client, stop)),
             tx_client,
@@ -91,7 +95,7 @@ async fn job(
     mut io: JobIo,
     mut stdout_file: File,
     mut stderr_file: File,
-    mut rx_client: mpsc::Receiver<SocketStream>,
+    mut rx_client: SocketReceiver,
     stop: CancellationToken,
 ) -> (Result<i32, ProcessError>, JobOutputState) {
     let mut stdout_hasher = Hasher::new();
@@ -172,7 +176,7 @@ async fn job(
             }
 
             // Attach a new client, send it the current window size, and play back the last buffer.
-            Some(mut client) = rx_client.recv(), if !dead => {
+            Some((mut client, access)) = rx_client.recv(), if !dead => {
                 match io.get_window_size() {
                     Err(error) => error!(log, "failed to get pseudoterminal window size"; "error" => %error),
                     Ok(size) => {
@@ -191,7 +195,7 @@ async fn job(
                     }
                 }
 
-                clients.add(client, stop.child_token());
+                clients.add(client, access, stop.child_token());
             }
 
             // Handle a message from a client.
@@ -205,7 +209,9 @@ async fn job(
                         clients.remove(&client_id);
                     }
                     Some((client_id, Ok(message))) => {
+                        let read_only = clients.access(&client_id) == Some(Access::ReadOnly);
                         match Message::try_from(message) {
+                            Ok(_) if read_only => (),
                             Ok(Message::Control(message)) => match message {
                                 Control::WindowChange(size) => {
                                     if let Err(error) = io.set_window_size(size.clone()) {

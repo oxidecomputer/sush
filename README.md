@@ -6,18 +6,16 @@ for motivation and examples.
 
 ## Local Testing Quickstart
 
-In the following, the local shell (`bash`) prompt is `lamia:...$ `
+In the following, the local shell (`bash`) prompt is `$ `
 and the Support Shell prompt is `sush# `.
 
 In one terminal, start the server:
 
 ```
-lamia:~/oxide/sush$ cargo run --bin=sush-server -- --debug
-   Compiling sush-server v0.1.0 (/home/alex/oxide/sush/server)
-    Finished `dev` profile [unoptimized + debuginfo] target(s) in 1.99s
+$ cargo run --bin=sush-server
      Running `target/debug/sush-server`
-Jan 29 14:08:17.672 INFO imported root certificate, key_id: much-hedgehog-cup-bleak-energy-village-lawn-pumpkin, component: job-manager
-Jan 29 14:08:17.672 INFO listening, local_addr: 0.0.0.0:44444
+Aug 09 03:41:44.592 INFO managing state, component: state manager
+Aug 09 03:41:44.594 INFO listening, local_addr: 0.0.0.0:44444
 ```
 
 > [!NOTE]
@@ -25,19 +23,19 @@ Jan 29 14:08:17.672 INFO listening, local_addr: 0.0.0.0:44444
 > the server, otherwise spawning commands will fail.
 
 In another terminal, point the client at the server and start it up
-in REPL mode:
+in REPL mode. Signing job requests needs a client built with the
+`permslip` feature and a reachable Permission Slip instance holding
+your signing key:
 
 ```
-lamia:~/oxide/sush$ export PERMSLIP_URL="https://permslip.inickles.0xeng.dev"
-lamia:~/oxide/sush$ export SUSH_PERMSLIP_KEY="UNTRUSTED Support Shell Prototype"
-lamia:~/oxide/sush$ export SUSH_URL="http://localhost:44444"
-lamia:~/oxide/sush$ cargo run --bin=sush -- repl
-   Compiling sush-client v0.1.0 (/home/alex/oxide/sush/client)
-    Finished `dev` profile [unoptimized + debuginfo] target(s) in 3.02s
+$ export PERMSLIP_URL="https://your-permslip-server.example"
+$ export SUSH_PERMSLIP_KEY="Your Signing Key"
+$ export SUSH_URL="http://localhost:44444"
+$ cargo run --bin=sush --features permslip -- repl
      Running `target/debug/sush repl`
 ✅ Output format set to `text`
 ✅ Server URL set to `http://localhost:44444`
-✅ SSH agent socket set to `/run/user/1000/keyring/ssh`
+✅ SSH agent socket set to `/run/user/1000/ssh-agent.sock`
 ✅ SSH key ID unset
 sush# 
 ```
@@ -75,9 +73,9 @@ To run an interactive job with a pseudoterminal, you can use `job start
 sush# job start --interactive bash
 ✅ Signed request for job `drop-fatigue-pink-spirit-eight-entry-praise-skill`
 ✅ Attached to interactive job `drop-fatigue-pink-spirit-eight-entry-praise-skill`, detach with `^]`
-lamia:~$ echo $SUSH_JOB_ID
+$ echo $SUSH_JOB_ID
 drop-fatigue-pink-spirit-eight-entry-praise-skill
-lamia:~$ 
+$ 
 ```
 
 See `help` for a list of other commands.

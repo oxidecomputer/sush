@@ -1,17 +1,23 @@
+// This Source Code Form is subject to the terms of the Mozilla Public
+// License, v. 2.0. If a copy of the MPL was not distributed with this
+// file, You can obtain one at https://mozilla.org/MPL/2.0/.
+
 //! SSH public key identity.
 
 use std::io;
 use std::path::{Path, PathBuf};
 
-use bytes::{Bytes, BytesMut};
-use kms_agent_lib::protocol::{
-    AgentRequest, AgentRequestKind, AgentResponse, AgentResponseKind, PartialMessage, ProtocolError,
-};
+use bytes::{Buf as _, Bytes, BytesMut};
 use thiserror::Error;
-use tokio::io::AsyncReadExt as _;
+use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
 use tokio::net::UnixStream;
 
 use sush_common::keys::{KeyError, KeyId, Signature, Signed, Signer, SshPublicKey, ToBeSigned};
+
+use crate::agent::{
+    self, AgentError, MAX_MESSAGE, SSH_AGENT_IDENTITIES_ANSWER, SSH_AGENT_SIGN_RESPONSE,
+    SSH_AGENTC_REQUEST_IDENTITIES, SSH_AGENTC_SIGN_REQUEST, unexpected,
+};
 
 /// An open connection to the SSH agent.
 #[derive(Debug)]
@@ -22,8 +28,6 @@ pub struct SshAgentConnection {
 }
 
 impl SshAgentConnection {
-    const BUFFER_SIZE: usize = 0x1000;
-
     pub async fn connect<P>(path: P) -> Result<SshAgentConnection, IdentityError>
     where
         P: AsRef<Path>,
@@ -43,19 +47,16 @@ impl SshAgentConnection {
     }
 
     pub async fn list_identities(&mut self) -> Result<Vec<SshPublicKey>, IdentityError> {
-        let request = AgentRequest::RequestIdentities;
-        let response = self.request(&request).await?;
-        match response {
-            AgentResponse::IdentitiesAnswer { keys } => Ok(keys
-                .into_iter()
-                .map(SshPublicKey::from)
-                .filter(SshPublicKey::is_acceptable_algorithm)
-                .collect()),
-            response => Err(IdentityError::InvalidResponse(
-                request.kind(),
-                response.kind(),
-            )),
-        }
+        let (kind, payload) = self.transact(agent::request_identities()).await?;
+        let keys = match kind {
+            SSH_AGENT_IDENTITIES_ANSWER => agent::identities_answer(payload)?,
+            got => return Err(unexpected(SSH_AGENTC_REQUEST_IDENTITIES, got).into()),
+        };
+        Ok(keys
+            .into_iter()
+            .map(SshPublicKey::from)
+            .filter(SshPublicKey::is_acceptable_algorithm)
+            .collect())
     }
 
     /// Get and cache an SSH public key to use for authentication.
@@ -96,53 +97,39 @@ impl SshAgentConnection {
         key: &SshPublicKey,
         message: &[u8],
     ) -> Result<Signature, IdentityError> {
-        let request = AgentRequest::SignRequest {
-            key: key.to_owned().into_inner(),
-            data: Bytes::copy_from_slice(message),
-            flags: 0,
-        };
-
-        let response = self.request(&request).await?;
-        match response {
-            AgentResponse::SignResponse { signature } => Ok(signature.try_into()?),
-            response => Err(IdentityError::InvalidResponse(
-                request.kind(),
-                response.kind(),
-            )),
+        let request = agent::sign_request(key, message)?;
+        let (kind, payload) = self.transact(request).await?;
+        match kind {
+            SSH_AGENT_SIGN_RESPONSE => Ok(agent::sign_response(payload)?.try_into()?),
+            got => Err(unexpected(SSH_AGENTC_SIGN_REQUEST, got).into()),
         }
     }
 
-    /// Make an arbitrary request to the SSH agent and wait for a response.
-    async fn request(&mut self, request: &AgentRequest) -> Result<AgentResponse, IdentityError> {
-        let request_bytes = request.to_bytes()?;
-        let sock_err = |err| self.sock_error(err);
-        self.sock.writable().await.map_err(sock_err)?;
-        loop {
-            match self.sock.try_write(&request_bytes) {
-                Ok(_) => break,
-                Err(e) if e.kind() == io::ErrorKind::WouldBlock => continue,
-                Err(e) => return Err(self.sock_error(e)),
-            }
+    /// One request-response exchange with the agent, returning the
+    /// response's type byte and payload.
+    async fn transact(&mut self, request: Bytes) -> Result<(u8, Bytes), IdentityError> {
+        self.sock
+            .write_all(&request)
+            .await
+            .map_err(|err| self.sock_error(err))?;
+        let length = self
+            .sock
+            .read_u32()
+            .await
+            .map_err(|err| self.sock_error(err))?;
+        if length > MAX_MESSAGE {
+            return Err(AgentError::Oversized(length.into()).into());
         }
-
-        let mut buffer = BytesMut::with_capacity(Self::BUFFER_SIZE);
-        let mut message = PartialMessage::Start;
-        self.sock.readable().await.map_err(sock_err)?;
-        loop {
-            match self.sock.read_buf(&mut buffer).await {
-                Ok(0) => break,
-                Ok(_) => {
-                    message = message.extend(&mut buffer)?;
-                    if message.is_complete() {
-                        break;
-                    }
-                    buffer.truncate(0);
-                }
-                Err(err) if err.kind() == io::ErrorKind::WouldBlock => continue,
-                Err(e) => return Err(self.sock_error(e)),
-            }
+        let mut body = BytesMut::zeroed(length as usize);
+        self.sock
+            .read_exact(&mut body)
+            .await
+            .map_err(|err| self.sock_error(err))?;
+        let mut body = body.freeze();
+        if body.is_empty() {
+            return Err(AgentError::Empty.into());
         }
-        Ok(AgentResponse::parse(message.complete()?)?)
+        Ok((body.get_u8(), body))
     }
 
     fn sock_error(&self, err: io::Error) -> IdentityError {
@@ -163,16 +150,14 @@ impl Signer for SshAgentConnection {
 /// What went wrong accessing or proving an identity.
 #[derive(Debug, Error)]
 pub enum IdentityError {
+    #[error("SSH agent protocol error: {0}")]
+    Agent(#[from] AgentError),
     #[error("I/O error accessing `{path}`: {error}")]
     FileIo { path: PathBuf, error: io::Error },
-    #[error("Invalid SSH agent response to {0}: {1}")]
-    InvalidResponse(AgentRequestKind, AgentResponseKind),
     #[error("Key error: {0}")]
     Key(#[from] KeyError),
     #[error("No usable SSH identities found, only NIST P-256 and Ed25519 keys are supported")]
     NoIdentity,
-    #[error("SSH agent protocol error: {0}")]
-    Protocol(#[from] ProtocolError),
 }
 
 impl IdentityError {

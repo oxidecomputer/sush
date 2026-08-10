@@ -1,3 +1,7 @@
+// This Source Code Form is subject to the terms of the Mozilla Public
+// License, v. 2.0. If a copy of the MPL was not distributed with this
+// file, You can obtain one at https://mozilla.org/MPL/2.0/.
+
 //! Words to be used as the constituents of code phrases.
 
 pub const WORDLIST_LEN: usize = 2048;
@@ -232,6 +236,8 @@ mod test {
             WORDLIST.len(),
             "duplicate words in word list"
         );
+        // `codephrases::index` binary searches the list.
+        assert!(WORDLIST.is_sorted(), "unsorted word list");
         assert!(
             WORDLIST
                 .iter()

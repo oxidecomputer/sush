@@ -1,3 +1,7 @@
+// This Source Code Form is subject to the terms of the Mozilla Public
+// License, v. 2.0. If a copy of the MPL was not distributed with this
+// file, You can obtain one at https://mozilla.org/MPL/2.0/.
+
 //! Use Permission Slip to sign Support Shell job requests.
 
 use ed25519_dalek::Signature as Ed25519Signature;
@@ -17,9 +21,6 @@ use x509_cert::der::pem::{PemLabel as _, decode_vec as decode_pem};
 use x509_cert::spki::AlgorithmIdentifierOwned;
 
 use sush_common::keys::{KeyError, KeyId, Signature, Signed, Signer, ToBeSigned};
-
-/// The default Permission Slip (aka Online Signing Service) server.
-pub const DEFAULT_PERMSLIP_URL: &str = "https://signer-us-west.corp.oxide.computer";
 
 pub struct PermslipSigner {
     client: Client,
@@ -80,24 +81,26 @@ impl Signer for PermslipSigner {
             .client
             .sign()
             .params(json_to_string(&json!(params))?)
-            .body(message)
+            .body(message.clone())
             .send()
             .await?
             .into_inner();
+        let signature = match Signed::<T>::signature_algorithm_from_spki(&spki.algorithm)? {
+            AlgorithmIdentifierOwned {
+                oid: ID_ED_25519,
+                parameters: None,
+            } => Signature::Ed25519(Ed25519Signature::from_slice(&signature)?),
+            AlgorithmIdentifierOwned {
+                oid: ECDSA_WITH_SHA_256,
+                parameters: None,
+            } => Signature::EcdsaSha256(ecdsa::Signature::from_der(&signature)?),
+            _ => return Err(Self::Error::InvalidSignature),
+        };
+        signature.verify_with_spki(&message, spki)?;
         Ok(Signed::new(
             thing,
             KeyId::try_from(&cert)?,
-            match Signed::<T>::signature_algorithm_from_spki(&spki.algorithm)? {
-                AlgorithmIdentifierOwned {
-                    oid: ID_ED_25519,
-                    parameters: None,
-                } => Signature::Ed25519(Ed25519Signature::from_slice(&signature)?).encode()?,
-                AlgorithmIdentifierOwned {
-                    oid: ECDSA_WITH_SHA_256,
-                    parameters: None,
-                } => Signature::EcdsaSha256(ecdsa::Signature::from_der(&signature)?).encode()?,
-                _ => return Err(Self::Error::InvalidSignature),
-            },
+            signature.encode()?,
         ))
     }
 }
