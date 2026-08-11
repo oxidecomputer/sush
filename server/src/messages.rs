@@ -266,11 +266,15 @@ mod wire_format {
         assert_eq!(decoded, message, "wire format should round-trip");
     }
 
+    fn sid(name: &str) -> SessionId {
+        name.parse().unwrap()
+    }
+
     #[test]
     fn session_start_request() {
         let msg: VersionedMessage = Message::Request(Request::session(
             KeyId::from("zoo-zero".to_string()),
-            SessionRequest::Start(SessionId::from("abandon-ability")),
+            SessionRequest::Start(sid("abandon-ability")),
         ))
         .into();
         assert_wire_format("session-start-request", msg);
@@ -280,7 +284,7 @@ mod wire_format {
     fn session_stop_request() {
         let msg: VersionedMessage = Message::Request(Request::session(
             KeyId::from("zoo-zero".to_string()),
-            SessionRequest::Stop(SessionId::from("abandon-ability")),
+            SessionRequest::Stop(sid("abandon-ability")),
         ))
         .into();
         assert_wire_format("session-stop-request", msg);
@@ -291,7 +295,7 @@ mod wire_format {
         let msg: VersionedMessage = Message::Request(Request::session(
             KeyId::from("zoo-zero".to_string()),
             SessionRequest::AllowAttach(
-                SessionId::from("abandon-ability"),
+                sid("abandon-ability"),
                 KeyId::from("able-about".to_string()),
                 Access::ReadWrite,
             ),
@@ -305,7 +309,7 @@ mod wire_format {
         let msg: VersionedMessage = Message::Request(Request::session(
             KeyId::from("zoo-zero".to_string()),
             SessionRequest::DenyAttach(
-                SessionId::from("abandon-ability"),
+                sid("abandon-ability"),
                 KeyId::from("able-about".to_string()),
             ),
         ))

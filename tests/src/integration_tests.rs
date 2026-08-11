@@ -94,7 +94,7 @@ async fn client_server() {
     assert_eq!(iam, identity, "who am I?");
 
     // Start a session and run a job.
-    let session = Session::new(SessionId::new());
+    let session = Session::new(SessionId::random());
     client
         .session_start()
         .session_id(session.session_id())
@@ -191,7 +191,7 @@ async fn client_proxy_server() {
 
     // Attach to an interactive job through the proxy, routed by the
     // target path segment, and echo bytes over the bridged upgrade.
-    let session = Session::new(SessionId::new());
+    let session = Session::new(SessionId::random());
     client
         .session_start()
         .session_id(session.session_id())
@@ -534,7 +534,7 @@ async fn interactive_job() {
     assert_eq!(iam, identity, "who am I?");
 
     // Start a session and run an interactive job.
-    let session = Session::new(SessionId::new());
+    let session = Session::new(SessionId::random());
     client
         .session_start()
         .session_id(session.session_id())

@@ -183,7 +183,7 @@ impl SushApi for ApiServer {
             .await?;
         let WaitParam { wait } = query.into_inner();
         let SessionIdParam { session_id } = params.into_inner();
-        mgr.session_start(&authn, session_id.clone(), wait).await?;
+        mgr.session_start(&authn, session_id, wait).await?;
         Ok(HttpResponseUpdatedNoContent())
     }
 

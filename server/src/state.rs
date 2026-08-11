@@ -173,7 +173,7 @@ struct SessionGuard<'a> {
 }
 
 impl<'a> SessionGuard<'a> {
-    pub fn session_id(&self) -> &SessionId {
+    pub fn session_id(&self) -> SessionId {
         self.inner.session_id()
     }
 
@@ -434,6 +434,7 @@ impl State {
         self.revoked_keys.peek(key_id).is_some()
     }
 
+    #[allow(clippy::result_large_err)]
     fn update(
         &mut self,
         log: &Logger,
@@ -474,7 +475,7 @@ impl State {
                         // Re-announcement of active session; absorb and ignore.
                         Active {
                             frontier, session, ..
-                        } if session.session_id() == session_id => {
+                        } if session.session_id() == *session_id => {
                             *frontier |= incoming_version.clone();
                             info!(log, "duplicate session start"; "session_id" => %session_id);
                         }
@@ -494,10 +495,7 @@ impl State {
                             self.session = Active {
                                 frontier: self.session.frontier() | incoming_version.clone(),
                                 started: incoming_version.clone(),
-                                session: Box::new(Session::started(
-                                    session_id.clone(),
-                                    actor.clone(),
-                                )),
+                                session: Box::new(Session::started(*session_id, actor.clone())),
                                 queued_jobs: QueuedJobs::new(),
                                 attach_grants: BTreeMap::new(),
                             }
@@ -515,9 +513,9 @@ impl State {
                             ..
                         } if incoming_version.partial_cmp(frontier).is_none() => {
                             let error = Error::ConcurrentSessions {
-                                own_session: session.session_id().clone(),
+                                own_session: session.session_id(),
                                 own_version: started.clone(),
-                                incoming_session: session_id.clone(),
+                                incoming_session: *session_id,
                                 incoming_version: incoming_version.clone(),
                             };
                             self.session = Inactive {
@@ -553,7 +551,7 @@ impl State {
                         if let Active {
                             frontier, session, ..
                         } = &self.session
-                            && session.session_id() == session_id
+                            && session.session_id() == *session_id
                         {
                             info!(
                                 log, "session stopped";
@@ -570,7 +568,7 @@ impl State {
                             attach_grants,
                             ..
                         } = &mut self.session
-                            && session.session_id() == session_id
+                            && session.session_id() == *session_id
                         {
                             if session.started_by() == Some(actor) {
                                 attach_grants.insert(key_id.clone(), *access);
@@ -592,7 +590,7 @@ impl State {
                             attach_grants,
                             ..
                         } = &mut self.session
-                            && session.session_id() == session_id
+                            && session.session_id() == *session_id
                         {
                             if session.started_by() == Some(actor) {
                                 attach_grants.remove(key_id);
@@ -610,7 +608,7 @@ impl State {
                     }
                     (actor, SessionRequest::Skip(session_id, job_id)) => {
                         if let Some(mut session) = self.session.active_session()
-                            && session.session_id() == session_id
+                            && session.session_id() == *session_id
                         {
                             info!(
                                 log, "job skipped";

@@ -109,7 +109,7 @@ mod test {
         let sneaky = borsh::to_vec(&"ALPHA-BRAVO".to_string()).unwrap();
         assert!(borsh::from_slice::<JobId>(&sneaky).is_err());
 
-        let good = borsh::to_vec(&SessionId::new().first_job_id().to_string()).unwrap();
+        let good = borsh::to_vec(&SessionId::random().first_job_id().to_string()).unwrap();
         assert!(borsh::from_slice::<JobId>(&good).is_ok());
     }
 }

@@ -27,9 +27,7 @@ use crate::borsh::{
     borsh_de_datetime, borsh_de_hash, borsh_de_job_id, borsh_de_target, borsh_ser_datetime,
     borsh_ser_hash, borsh_ser_target,
 };
-use crate::codephrases::{
-    InvalidCodephrase, WORD_SEPARATOR, decode_phrase, generate_id, id_phrase,
-};
+use crate::codephrases::{InvalidCodephrase, WORD_SEPARATOR, decode_phrase, id_phrase};
 use crate::interactive::InteractiveJobError;
 use crate::keys::{KeyId, Signed, ToBeSigned, Verified};
 use crate::targets::Target;
@@ -110,69 +108,40 @@ impl slog::Value for JobId {
     }
 }
 
-/// A globally unique identifier for a session.
-#[derive(
-    BorshDeserialize,
-    BorshSerialize,
-    Clone,
-    Debug,
-    Deserialize,
-    Eq,
-    Hash,
-    JsonSchema,
-    Ord,
-    PartialEq,
-    PartialOrd,
-    Serialize,
-)]
-pub struct SessionId(String);
+codephrase_newtype! {
+    /// A globally unique identifier for a session.
+    #[derive(
+        BorshDeserialize,
+        BorshSerialize,
+        Copy,
+        Clone,
+        Deserialize,
+        Eq,
+        Hash,
+        JsonSchema,
+        Ord,
+        PartialEq,
+        PartialOrd,
+        Serialize,
+    )]
+    pub struct SessionId = Truncated;
+}
 
-#[allow(clippy::new_without_default)]
 impl SessionId {
-    pub fn new() -> Self {
-        Self(generate_id())
-    }
-
     pub fn first_job_id(&self) -> JobId {
-        U256::from_be_slice(hash(self.0.as_bytes()).as_bytes()).into()
+        U256::from_be_slice(hash(&self.0.to_be_bytes()).as_bytes()).into()
     }
 
     pub fn next_job_id(&self, last_job: &LastJob) -> JobId {
         U256::from_be_slice(
             match last_job {
-                LastJob::None => hash(&[b"None", self.0.as_bytes()].concat()),
+                LastJob::None => hash(&[b"None", self.0.to_be_bytes().as_slice()].concat()),
                 LastJob::Some(job) => hash(&[b"Some", job.to_be_signed().as_slice()].concat()),
                 LastJob::Burned(job_id) => hash(&[b"Burned", job_id.as_bytes()].concat()),
             }
             .as_bytes(),
         )
         .into()
-    }
-}
-
-impl Deref for SessionId {
-    type Target = str;
-
-    fn deref(&self) -> &Self::Target {
-        &self.0
-    }
-}
-
-impl fmt::Display for SessionId {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "{}", self.0)
-    }
-}
-
-impl From<&Self> for SessionId {
-    fn from(other: &Self) -> Self {
-        other.to_owned()
-    }
-}
-
-impl<S: AsRef<str>> From<S> for SessionId {
-    fn from(s: S) -> Self {
-        Self(s.as_ref().to_string())
     }
 }
 
@@ -210,8 +179,8 @@ impl Session {
         }
     }
 
-    pub fn session_id(&self) -> &SessionId {
-        &self.session_id
+    pub fn session_id(&self) -> SessionId {
+        self.session_id
     }
 
     pub fn started_by(&self) -> Option<&KeyId> {
