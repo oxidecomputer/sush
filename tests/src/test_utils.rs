@@ -145,7 +145,7 @@ pub fn test_pki(prefix: &'static str) -> (TempDir, Utf8PathBuf) {
 }
 
 pub async fn fake_identity(key: &mut EphemeralKey) -> Identity {
-    let nonce = Nonce::generate();
+    let nonce = Nonce::random();
     let challenge = Challenge::new(nonce.clone());
     let response = ChallengeResponse::new(challenge, RequestKey::new().verifier());
     let signed = key.sign(response).await.unwrap();

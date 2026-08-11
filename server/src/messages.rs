@@ -240,6 +240,8 @@ mod wire_format {
 
     use super::v0::*;
     use super::*;
+    use std::str::FromStr as _;
+    use sush_common::authn::Nonce;
 
     /// Serialize a message and compare against the snapshot in
     /// `tests/output/`, or rewrite it under `EXPECTORATE=overwrite`.
@@ -350,9 +352,11 @@ mod wire_format {
         // Craft deterministic evidence: nonces, then the ed25519
         // basepoint as the verifier.
         let mut evidence = Vec::new();
-        for nonce in ["abandon", "ability"] {
-            evidence.extend((nonce.len() as u32).to_le_bytes());
-            evidence.extend(nonce.as_bytes());
+        for nonce in [
+            Nonce::from_str("abandon").unwrap(),
+            Nonce::from_str("ability").unwrap(),
+        ] {
+            evidence.extend(&nonce.to_be_bytes());
         }
         evidence.push(0x58);
         evidence.extend([0x66; 31]);

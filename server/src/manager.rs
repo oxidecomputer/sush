@@ -256,7 +256,7 @@ impl JobManager {
         macro_rules! unauthorized {
             ($error:expr) => {{
                 warn!(self.log, "authentication failed"; "error" => %$error);
-                let nonce = Nonce::generate();
+                let nonce = Nonce::random();
                 self.nonces.lock().await.put(nonce.clone(), Instant::now());
                 return Err(JobError::unauthorized(nonce));
             }};

@@ -139,7 +139,7 @@ pub fn ephemeral_root() -> EphemeralKey {
 
 /// An authenticated identity for `key`, as `iam` would produce.
 pub async fn fake_identity(key: &mut EphemeralKey) -> Identity {
-    let challenge = Challenge::new(Nonce::generate());
+    let challenge = Challenge::new(Nonce::random());
     let response = ChallengeResponse::new(challenge, RequestKey::new().verifier());
     let signed = key.sign(response).await.unwrap();
     let verified = signed

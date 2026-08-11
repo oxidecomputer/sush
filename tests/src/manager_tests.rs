@@ -1214,7 +1214,7 @@ async fn gossiped_identities() {
 
     // A liar claims root's key with evidence signed by their own.
     let bogus_key = RequestKey::new();
-    let bogus = ChallengeResponse::new(Challenge::new(Nonce::generate()), bogus_key.verifier());
+    let bogus = ChallengeResponse::new(Challenge::new(Nonce::random()), bogus_key.verifier());
     let signed_by_liar = liar.sign(bogus).await.unwrap();
     let bogus_verified = signed_by_liar
         .clone()
@@ -1233,8 +1233,7 @@ async fn gossiped_identities() {
 
     // Real evidence authorizes here without ever logging in here.
     let request_key = RequestKey::new();
-    let response =
-        ChallengeResponse::new(Challenge::new(Nonce::generate()), request_key.verifier());
+    let response = ChallengeResponse::new(Challenge::new(Nonce::random()), request_key.verifier());
     let signed = root.sign(response).await.unwrap();
     let verified = signed.clone().verify_with_ssh_public_key(&root_pk).unwrap();
     let mut credentials = Credentials::new(verified);

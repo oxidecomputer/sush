@@ -1068,10 +1068,10 @@ mod test {
         .unwrap();
         let mut signatures = HashSet::new();
         for _ in 0..100 {
-            let nonce = Nonce::generate();
-            let signed = key.sign(nonce.as_bytes()).await.unwrap();
+            let nonce = Nonce::random();
+            let signed = key.sign(nonce.to_be_bytes()).await.unwrap();
             assert_eq!(signed.key_id(), key.key_id());
-            assert_eq!(*signed.payload(), nonce.as_bytes());
+            assert_eq!(*signed.payload(), nonce.to_be_bytes());
             let signature = signed.signature();
             assert!(signatures.insert(signature.clone()), "duplicate signature");
             let signature_string = serde_json::to_string(&signature).unwrap();
@@ -1084,7 +1084,7 @@ mod test {
             );
             let verified = signed.verify_with_cert(key.cert()).unwrap();
             assert_eq!(verified.verified_by(), key.key_id());
-            assert_eq!(verified.into_payload(), nonce.as_bytes());
+            assert_eq!(verified.into_payload(), nonce.to_be_bytes());
         }
     }
 }
