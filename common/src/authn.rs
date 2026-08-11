@@ -268,7 +268,7 @@ impl BoundRequest {
             seq,
         } = self;
         hash(Self::TYPE_NAME);
-        hash(key_id.as_bytes());
+        hash(&key_id.to_be_bytes());
         hash(&nonce.to_be_bytes());
         hash(method.as_bytes());
         hash(target.as_bytes());
@@ -311,7 +311,7 @@ impl FromStr for BoundCredentials {
     fn from_str(s: &str) -> Result<Self, Self::Err> {
         let mut params = AuthnParams::from_str(s)?;
         let creds = Self {
-            key_id: params.get("key-id")?,
+            key_id: params.parse("key-id")?,
             nonce: params.parse("nonce")?,
             seq: params.parse("seq")?,
             signature: EncodedSignature {
@@ -523,7 +523,7 @@ impl FromStr for Credentials {
         let creds = Self {
             nonce: params.parse("nonce")?,
             cnonce: params.parse("cnonce")?,
-            key_id: params.get("key-id")?,
+            key_id: params.parse("key-id")?,
             epk: params.parse("epk")?,
             signature: EncodedSignature {
                 r: params.get("r")?,
@@ -730,7 +730,11 @@ mod test {
         let key = RequestKey::new();
         let verifier = key.verifier();
         let request = BoundRequest::new("get", "/jobs?limit=1", 7);
-        let creds = key.bind(KeyId::from("baz".to_string()), Nonce::random(), &request);
+        let creds = key.bind(
+            KeyId::from_str("abandon").unwrap(),
+            Nonce::random(),
+            &request,
+        );
         assert_eq!(
             creds.to_string().parse::<BoundCredentials>().unwrap(),
             creds
@@ -759,7 +763,7 @@ mod test {
         // The identity is part of the signed material: credentials
         // re-labeled with another key ID or nonce do not verify.
         let relabeled = BoundCredentials {
-            key_id: KeyId::from("qux".to_string()),
+            key_id: KeyId::from_str("ability").unwrap(),
             ..creds.clone()
         };
         assert!(verifier.verify(&request, &relabeled).is_err());
@@ -835,21 +839,21 @@ mod test {
         let epk = RequestKey::new().verifier();
         assert!(matches!(
             Credentials::from_str(
-                "Sush nonce=abandon,cnonce=ability,key-id=baz,epk=plugh,r=r,s=s,flags=0,counter=0"
+                "Sush nonce=abandon,cnonce=ability,key-id=able,epk=plugh,r=r,s=s,flags=0,counter=0"
             )
             .unwrap_err(),
             AuthnError::InvalidParam
         ));
         assert!(matches!(
             Credentials::from_str(&format!(
-                "Sush nonce=abandon,cnonce=ability,key-id=baz,epk={epk},r=r,s=s,flags=0,counter=foo"
+                "Sush nonce=abandon,cnonce=ability,key-id=able,epk={epk},r=r,s=s,flags=0,counter=foo"
             ))
             .unwrap_err(),
             AuthnError::InvalidParam
         ));
         assert!(matches!(
             Credentials::from_str(&format!(
-                "Sush nonce=abandon,cnonce=ability,key-id=baz,epk={epk},r=r,s=s,flags=0,counter=0,foo=bar"
+                "Sush nonce=abandon,cnonce=ability,key-id=able,epk={epk},r=r,s=s,flags=0,counter=0,foo=bar"
             ))
             .unwrap_err(),
             AuthnError::TooManyParams

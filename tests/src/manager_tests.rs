@@ -1010,8 +1010,8 @@ async fn revocation_tombstones() {
         ))
         .into()
     };
-    for i in 0..200 {
-        peer.send(revoke(KeyId::from(format!("bogus-{i}"))));
+    for _ in 0..200 {
+        peer.send(revoke(KeyId::random()));
     }
     peer.send(revoke(doomed.key_id().clone()));
 

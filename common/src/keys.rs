@@ -29,7 +29,6 @@ use rand_core::OsRng;
 use schemars::schema::Schema;
 use schemars::{JsonSchema, SchemaGenerator};
 use serde::{Deserialize, Serialize};
-use sha2::{Digest as _, Sha256};
 use signature::Verifier;
 use ssh_key::{
     Algorithm as SshAlgorithm, EcdsaCurve, Error as SshKeyError, Mpint, Signature as SshSignature,
@@ -46,44 +45,25 @@ use x509_cert::spki::{AlgorithmIdentifierOwned, SubjectPublicKeyInfo};
 use x509_cert::time::Validity;
 use x509_cert::{Certificate, TbsCertificate, Version};
 
-use crate::codephrases::{InvalidCodephrase, WORD_SEPARATOR, codephrase, decode_phrase, id_phrase};
+use crate::codephrases::{InvalidCodephrase, WORD_SEPARATOR, codephrase, decode_phrase};
 
-/// SHA-256 of a certificate subject or an identity public key,
-/// encoded as a pseudorandom code phrase for storage & transport.
-#[derive(
-    BorshDeserialize,
-    BorshSerialize,
-    Clone,
-    Debug,
-    Deserialize,
-    Eq,
-    Hash,
-    JsonSchema,
-    Ord,
-    PartialEq,
-    PartialOrd,
-    Serialize,
-)]
-pub struct KeyId(String);
-
-impl Deref for KeyId {
-    type Target = str;
-
-    fn deref(&self) -> &Self::Target {
-        &self.0
-    }
-}
-
-impl fmt::Display for KeyId {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "{}", self.0)
-    }
-}
-
-impl From<String> for KeyId {
-    fn from(s: String) -> Self {
-        Self(s)
-    }
+codephrase_newtype! {
+    /// SHA-256 of a certificate subject or an identity public key,
+    /// encoded as a pseudorandom code phrase for storage & transport.
+    #[derive(
+        BorshDeserialize,
+        BorshSerialize,
+        Clone,
+        Deserialize,
+        Eq,
+        Hash,
+        JsonSchema,
+        Ord,
+        PartialEq,
+        PartialOrd,
+        Serialize,
+    )]
+    pub struct KeyId = Truncated;
 }
 
 impl From<&Self> for KeyId {
@@ -97,9 +77,8 @@ impl TryFrom<&Certificate> for KeyId {
     type Error = KeyError;
 
     fn try_from(cert: &Certificate) -> Result<Self, Self::Error> {
-        let hash = Sha256::digest(cert.tbs_certificate.subject_public_key_info.to_der()?);
-        let phrase = id_phrase(U256::from_be_slice(hash.as_slice()));
-        Ok(KeyId(phrase.join(WORD_SEPARATOR)))
+        let hash = blake3::hash(&cert.tbs_certificate.subject_public_key_info.to_der()?);
+        Ok(KeyId::from_hash(hash))
     }
 }
 
@@ -107,9 +86,8 @@ impl TryFrom<&ssh_key::PublicKey> for KeyId {
     type Error = KeyError;
 
     fn try_from(public_key: &ssh_key::PublicKey) -> Result<Self, Self::Error> {
-        let hash = Sha256::digest(public_key.to_bytes()?);
-        let phrase = id_phrase(U256::from_be_slice(hash.as_slice()));
-        Ok(KeyId(phrase.join(WORD_SEPARATOR)))
+        let hash = blake3::hash(&public_key.to_bytes()?);
+        Ok(KeyId::from_hash(hash))
     }
 }
 

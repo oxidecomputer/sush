@@ -159,6 +159,7 @@ pub mod v0 {
     }
 
     #[derive(BorshDeserialize, BorshSerialize, Clone, Debug, Eq, PartialEq)]
+    #[allow(clippy::large_enum_variant)]
     pub enum JobRequest {
         Start(SignedJob, JobStartParams),
         Stop(JobId),
@@ -274,7 +275,7 @@ mod wire_format {
     #[test]
     fn session_start_request() {
         let msg: VersionedMessage = Message::Request(Request::session(
-            KeyId::from("zoo-zero".to_string()),
+            KeyId::from_str("zoo-zero").unwrap(),
             SessionRequest::Start(sid("abandon-ability")),
         ))
         .into();
@@ -284,7 +285,7 @@ mod wire_format {
     #[test]
     fn session_stop_request() {
         let msg: VersionedMessage = Message::Request(Request::session(
-            KeyId::from("zoo-zero".to_string()),
+            KeyId::from_str("zoo-zero").unwrap(),
             SessionRequest::Stop(sid("abandon-ability")),
         ))
         .into();
@@ -294,10 +295,10 @@ mod wire_format {
     #[test]
     fn session_allow_attach_request() {
         let msg: VersionedMessage = Message::Request(Request::session(
-            KeyId::from("zoo-zero".to_string()),
+            KeyId::from_str("zoo-zero").unwrap(),
             SessionRequest::AllowAttach(
                 sid("abandon-ability"),
-                KeyId::from("able-about".to_string()),
+                KeyId::from_str("able-about").unwrap(),
                 Access::ReadWrite,
             ),
         ))
@@ -308,10 +309,10 @@ mod wire_format {
     #[test]
     fn session_deny_attach_request() {
         let msg: VersionedMessage = Message::Request(Request::session(
-            KeyId::from("zoo-zero".to_string()),
+            KeyId::from_str("zoo-zero").unwrap(),
             SessionRequest::DenyAttach(
                 sid("abandon-ability"),
-                KeyId::from("able-about".to_string()),
+                KeyId::from_str("able-about").unwrap(),
             ),
         ))
         .into();
@@ -333,7 +334,7 @@ mod wire_format {
         );
         let signed = Signed::new(
             request,
-            KeyId::from("zoo-zero".to_string()),
+            KeyId::from_str("zoo-zero").unwrap(),
             EncodedSignature {
                 r: "abandon".to_string(),
                 s: "zoo".to_string(),
@@ -342,7 +343,7 @@ mod wire_format {
             },
         );
         let msg: VersionedMessage = Message::Request(Request::job(
-            KeyId::from("zoo-zero".to_string()),
+            KeyId::from_str("zoo-zero").unwrap(),
             JobRequest::Start(signed, JobStartParams::default()),
         ))
         .into();
@@ -375,7 +376,7 @@ mod wire_format {
 
         let signed = Signed::new(
             response,
-            KeyId::from("zoo-zero".to_string()),
+            KeyId::from_str("zoo-zero").unwrap(),
             EncodedSignature {
                 r: "abandon".to_string(),
                 s: "zoo".to_string(),
@@ -384,7 +385,7 @@ mod wire_format {
             },
         );
         let msg: VersionedMessage = Message::Request(Request::identity(
-            KeyId::from("zoo-zero".to_string()),
+            KeyId::from_str("zoo-zero").unwrap(),
             IdentityRequest::Login(public_key, signed),
         ))
         .into();
