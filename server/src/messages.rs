@@ -44,6 +44,7 @@ pub mod v0 {
     use super::*;
 
     #[derive(BorshDeserialize, BorshSerialize, Clone, Debug, Eq, PartialEq)]
+    #[allow(clippy::large_enum_variant)]
     pub enum Message {
         Request(Request),
         Event(

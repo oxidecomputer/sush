@@ -112,7 +112,7 @@ async fn client_server() {
     } = JobLimits::default();
     client
         .job_start()
-        .job_id(&job_id)
+        .job_id(job_id)
         .max_cpu(max_cpu)
         .max_mem(max_mem)
         .max_fsize(max_fsize)
@@ -125,7 +125,7 @@ async fn client_server() {
     // Check the job output.
     let mut output = client
         .job_output()
-        .job_id(&job_id)
+        .job_id(job_id)
         .stream(JobOutputStream::Stdout)
         .target("*")
         .send()
@@ -209,7 +209,7 @@ async fn client_proxy_server() {
     } = JobLimits::default();
     client
         .job_start()
-        .job_id(&job_id)
+        .job_id(job_id)
         .max_cpu(max_cpu)
         .max_mem(max_mem)
         .max_fsize(max_fsize)
@@ -222,7 +222,7 @@ async fn client_proxy_server() {
         .expect("can't start job");
     let socket = client
         .job_attach()
-        .job_id(&job_id)
+        .job_id(job_id)
         .target(test_baseboard_id().to_string())
         .send()
         .await
@@ -244,7 +244,7 @@ async fn client_proxy_server() {
     // A target the proxy cannot route is refused at the proxy.
     let Err(unrouted) = client
         .job_output()
-        .job_id(&job_id)
+        .job_id(job_id)
         .stream(JobOutputStream::Stdout)
         .target("913-0000019:BRM99999999")
         .send()
@@ -552,7 +552,7 @@ async fn interactive_job() {
     } = JobLimits::default();
     client
         .job_start()
-        .job_id(&job_id)
+        .job_id(job_id)
         .max_cpu(max_cpu)
         .max_mem(max_mem)
         .max_fsize(max_fsize)
@@ -567,7 +567,7 @@ async fn interactive_job() {
     // Attach to the job.
     let socket1 = client
         .job_attach()
-        .job_id(&job_id)
+        .job_id(job_id)
         .target(test_baseboard_id().to_string())
         .send()
         .await
@@ -596,7 +596,7 @@ async fn interactive_job() {
     // and playback.
     let socket2 = client
         .job_attach()
-        .job_id(&job_id)
+        .job_id(job_id)
         .target(test_baseboard_id().to_string())
         .send()
         .await
@@ -637,7 +637,7 @@ async fn interactive_job() {
     let guest_attach = async || {
         guest_client
             .job_attach()
-            .job_id(&job_id)
+            .job_id(job_id)
             .target(test_baseboard_id().to_string())
             .send()
             .await
@@ -757,7 +757,7 @@ async fn interactive_job() {
     // Stop the job.
     client
         .job_stop()
-        .job_id(&job_id)
+        .job_id(job_id)
         .wait(JobWait::Stop)
         .send()
         .await
@@ -767,7 +767,7 @@ async fn interactive_job() {
     // from the read-only guest.
     let mut output = client
         .job_output()
-        .job_id(&job_id)
+        .job_id(job_id)
         .stream(JobOutputStream::Stdout)
         .target(test_baseboard_id().to_string())
         .send()

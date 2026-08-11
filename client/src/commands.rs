@@ -1132,7 +1132,7 @@ async fn job_start(
             match with_login_via(ctx, client, Some(&target), async || {
                 client
                     .job_output()
-                    .job_id(&job_id)
+                    .job_id(job_id)
                     .target(target.to_string())
                     .stream(stream)
                     .send()
@@ -1238,7 +1238,7 @@ async fn job_output(
     // Fetch job status for output length and hash.
     let status = job_status_try_from_json_map(
         with_login_via(ctx, client, Some(target), async || {
-            client.job_status().job_id(&job_id).send().await
+            client.job_status().job_id(job_id).send().await
         })
         .await?
         .into_inner(),
@@ -1344,7 +1344,7 @@ async fn job_output(
             async || {
                 client
                     .job_output()
-                    .job_id(&job_id)
+                    .job_id(job_id)
                     .target(target.to_string())
                     .stream(stream)
                     .send()

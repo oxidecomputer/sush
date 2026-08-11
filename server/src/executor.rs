@@ -130,9 +130,9 @@ impl Executor {
         };
 
         let stop = self.shutdown.child_token();
-        self.stop.insert(job_id.clone(), stop.clone());
+        self.stop.insert(job_id, stop.clone());
         spawn(job_spawn(
-            self.log.new(o!("job_id" => job_id.clone())),
+            self.log.new(o!("job_id" => job_id)),
             events,
             self.output_dir.clone(),
             verified_request,
@@ -372,7 +372,7 @@ async fn job_spawn(
 
     // Announce the birth of our new job!
     let _ = events
-        .send(Event::Job(JobEvent::Start(job_id.clone(), Utc::now())))
+        .send(Event::Job(JobEvent::Start(job_id, Utc::now())))
         .await;
 
     // Wait for the job to die and send an event when it does.
@@ -381,7 +381,7 @@ async fn job_spawn(
             Ok((result, state)) => {
                 let _ = events
                     .send(Event::Job(JobEvent::Stop(
-                        job_id.clone(),
+                        job_id,
                         Utc::now(),
                         result,
                         state,
@@ -391,7 +391,7 @@ async fn job_spawn(
             Err(error) => {
                 let _ = events
                     .send(Event::Job(JobEvent::Error(
-                        job_id.clone(),
+                        job_id,
                         Utc::now(),
                         ProcessError::Join(error.to_string()),
                     )))

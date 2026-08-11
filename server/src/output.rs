@@ -195,7 +195,7 @@ impl JobOutputDir {
             Ok(len) => Ok(len),
             Err(err) if err.kind() == io::ErrorKind::NotFound => Ok(0),
             Err(err) => Err(ExecutionError::io(
-                job_id.clone(),
+                *job_id,
                 format!("getting length of {}", path.display()),
                 err,
             )),

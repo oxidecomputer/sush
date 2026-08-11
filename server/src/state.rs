@@ -182,7 +182,7 @@ impl<'a> SessionGuard<'a> {
     }
 
     pub fn skip_job(&mut self, job_id: &JobId) {
-        self.inner.skip_job(job_id.clone())
+        self.inner.skip_job(*job_id)
     }
 
     pub fn next_queued_job(&mut self) -> Option<(SignedJob, JobStartParams)> {
@@ -201,7 +201,7 @@ impl<'a> SessionGuard<'a> {
         params: JobStartParams,
         actor: &KeyId,
     ) {
-        let job_id = job.job_id().clone();
+        let job_id = *job.job_id();
         let targeted = job.payload().target().includes(own_baseboard, cubbies);
         if history.contains(&job_id) {
             // Note but otherwise ignore the duplicate job.
@@ -215,13 +215,13 @@ impl<'a> SessionGuard<'a> {
             // Insert the job into our queue. Every job joins the
             // queue to keep the causal chain whole, but only jobs
             // targeting this sled record a local status.
-            self.queued_jobs.insert(job_id.clone(), (job, params));
+            self.queued_jobs.insert(job_id, (job, params));
             if targeted {
                 history.set_job_status(
                     &job_id,
                     own_baseboard,
                     JobStatus::Queued {
-                        job_id: job_id.clone(),
+                        job_id,
                         time_queued: Utc::now(),
                         actor: actor.clone(),
                     },
@@ -248,7 +248,7 @@ impl<'a> SessionGuard<'a> {
             None,
             |old_status| match old_status {
                 None | Some(JobStatus::Queued { .. }) => Some(JobStatus::Cancelled {
-                    job_id: job_id.clone(),
+                    job_id: *job_id,
                     time_cancelled: Utc::now(),
                     actor: actor.clone(),
                 }),
@@ -285,7 +285,7 @@ impl<'a> SessionGuard<'a> {
                     .unwrap_or(true)
             {
                 executor.job_start(certs, request.clone(), params, tx_attachment);
-                attachments.insert(job_id.clone(), rx_attachment);
+                attachments.insert(job_id, rx_attachment);
             }
             self.job_started(request);
         }
@@ -745,13 +745,12 @@ impl State {
                 Event::Job(job_event) => match job_event {
                     JobEvent::Start(job_id, when) => {
                         info!(log, "job started"; "job_id" => %job_id, "when" => %when);
-                        self.running
-                            .insert((job_id.clone(), baseboard_id.clone()), *when);
+                        self.running.insert((*job_id, baseboard_id.clone()), *when);
                         self.history.set_job_status(
                             job_id,
                             baseboard_id,
                             JobStatus::Started {
-                                job_id: job_id.clone(),
+                                job_id: *job_id,
                                 time_started: *when,
                             },
                             Some(incoming_version.rank()),
@@ -764,7 +763,7 @@ impl State {
                         if baseboard_id == &self.own_baseboard {
                             self.attachments.remove(job_id);
                         }
-                        self.running.remove(&(job_id.clone(), baseboard_id.clone()));
+                        self.running.remove(&(*job_id, baseboard_id.clone()));
                         self.history.transition_job_status(
                             job_id,
                             baseboard_id,
@@ -772,7 +771,7 @@ impl State {
                             |old_status| match old_status {
                                 Some(JobStatus::Started { time_started, .. }) => {
                                     Some(JobStatus::Stopped {
-                                        job_id: job_id.clone(),
+                                        job_id: *job_id,
                                         time_started: *time_started,
                                         time_stopped: *when,
                                         result: result.clone(),
@@ -793,12 +792,12 @@ impl State {
                         if baseboard_id == &self.own_baseboard {
                             self.attachments.remove(job_id);
                         }
-                        self.running.remove(&(job_id.clone(), baseboard_id.clone()));
+                        self.running.remove(&(*job_id, baseboard_id.clone()));
                         self.history.set_job_status(
                             job_id,
                             baseboard_id,
                             JobStatus::Error {
-                                job_id: job_id.clone(),
+                                job_id: *job_id,
                                 time_error: *when,
                                 error: error.clone(),
                             },

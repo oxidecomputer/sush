@@ -251,8 +251,8 @@ async fn job_stop() {
     ));
 
     // Skip the cancelled job.
-    session.skip_job(job_id.clone());
-    mgr.session_skip_job(&authn, session_id, job_id.clone())
+    session.skip_job(job_id);
+    mgr.session_skip_job(&authn, session_id, job_id)
         .await
         .expect("should be able to skip cancelled job");
 
@@ -1125,7 +1125,7 @@ async fn job_targets() {
 
     let mut start = async |command: &str, target: &str| {
         let job_id = session.next_job_id();
-        let request = JobStartRequest::new(job_id.clone(), command, false, target.parse().unwrap());
+        let request = JobStartRequest::new(job_id, command, false, target.parse().unwrap());
         let job = root
             .sign(request)
             .await
