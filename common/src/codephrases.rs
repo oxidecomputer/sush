@@ -9,11 +9,21 @@
 //! that must be readily transmissible over low bandwidth channels (e.g.,
 //! email, voice, printed or handwritten notes, etc.).
 
-use crypto_bigint::{CheckedAdd as _, CheckedMul as _, Limb, Random as _, Reciprocal, U256};
+use std::str::FromStr;
+
+use crypto_bigint::{
+    ArrayEncoding as _, CheckedAdd as _, CheckedMul as _, Encoding as _, Limb, Random as _,
+    Reciprocal, U256,
+};
 use rand_core::OsRng;
+use schemars::JsonSchema;
+use serde::de::Error as _;
+use serde::{Deserialize, Deserializer, Serialize, Serializer};
 use thiserror::Error;
 
 use crate::wordlist::{WORDLIST, WORDLIST_LEN};
+use borsh::{BorshDeserialize, BorshSerialize};
+use std::io::prelude::{Read, Write};
 
 /// Entropy is treated as an integer whose base is to be changed
 /// to 2048, which gives us indexes into the BIP-39 word list.
@@ -34,6 +44,174 @@ pub const PHRASE_WORDS_ID: usize = 8;
 /// free to use ASCII hyphen (`-`) as the default word separator. Decoding
 /// will also accept arbitrary ASCII whitespace as word separators.
 pub const WORD_SEPARATOR: &str = "-";
+
+const TRUNCATED_MASK: U256 = U256::from_u128(2u128.pow(88) - 1);
+
+/// Random code phrase like `abstract misery favorite ordinary moon talk`.
+#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct Codephrase(U256);
+
+impl Codephrase {
+    /// Generate a new random codephrase.
+    pub fn random() -> Self {
+        Self(U256::random(&mut OsRng))
+    }
+
+    pub fn truncate(self) -> Self {
+        Self(self.0.bitand(&TRUNCATED_MASK))
+    }
+
+    pub fn from_be_bytes(bytes: [u8; 32]) -> Self {
+        Self(U256::from_be_bytes(bytes))
+    }
+
+    /// Get the underlying big-endian byte representation of the codephrase.
+    pub fn to_be_bytes(&self) -> [u8; 32] {
+        self.0.to_be_byte_array().into()
+    }
+}
+
+impl std::fmt::Display for Codephrase {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&codephrase(self.0).join(WORD_SEPARATOR))
+    }
+}
+
+impl std::fmt::Debug for Codephrase {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "Codephrase({self})")
+    }
+}
+
+impl FromStr for Codephrase {
+    type Err = InvalidCodephrase;
+
+    fn from_str(value: &str) -> Result<Self, Self::Err> {
+        Ok(Self(decode_phrase(value)?))
+    }
+}
+
+impl Serialize for Codephrase {
+    fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        serializer.serialize_str(&self.to_string())
+    }
+}
+
+impl<'de> Deserialize<'de> for Codephrase {
+    fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        let string = <String as Deserialize>::deserialize(deserializer)?;
+        Ok(Self(decode_phrase(&string).map_err(D::Error::custom)?))
+    }
+}
+
+impl BorshSerialize for Codephrase {
+    fn serialize<W: Write>(&self, writer: &mut W) -> std::io::Result<()> {
+        <[u8; 32] as BorshSerialize>::serialize(&self.to_be_bytes(), writer)
+    }
+}
+
+impl BorshDeserialize for Codephrase {
+    fn deserialize_reader<R: Read>(reader: &mut R) -> std::io::Result<Self> {
+        let bytes = <[u8; 32] as BorshDeserialize>::deserialize_reader(reader)?;
+        Ok(Self(U256::from_be_byte_array(bytes.into())))
+    }
+}
+
+// Treat a codephrase as a string in JSON schemas.
+impl JsonSchema for Codephrase {
+    fn schema_name() -> String {
+        String::schema_name()
+    }
+
+    fn json_schema(generator: &mut schemars::r#gen::SchemaGenerator) -> schemars::schema::Schema {
+        String::json_schema(generator)
+    }
+
+    fn is_referenceable() -> bool {
+        String::is_referenceable()
+    }
+
+    fn schema_id() -> std::borrow::Cow<'static, str> {
+        String::schema_id()
+    }
+}
+
+#[macro_export]
+macro_rules! codephrase_newtype {
+    ($(#[$meta:meta])* $vis:vis struct $name:ident = $len:ident;) => {
+        $(#[$meta])*
+        $vis struct $name($crate::codephrases::Codephrase);
+
+        impl $name {
+            #[allow(unused)]
+            $vis fn random() -> Self {
+                let mut codephrase = $crate::codephrases::Codephrase::random();
+                match $crate::codephrases::CodephraseLength::$len {
+                    $crate::codephrases::CodephraseLength::Full => {}
+                    $crate::codephrases::CodephraseLength::Truncated => {
+                        codephrase = codephrase.truncate();
+                    }
+                }
+                Self(codephrase)
+            }
+
+            #[allow(unused)]
+            $vis fn from_hash(hash: blake3::Hash) -> Self {
+                let mut codephrase = $crate::codephrases::Codephrase::from_be_bytes(*hash.as_bytes());
+                match $crate::codephrases::CodephraseLength::$len {
+                    $crate::codephrases::CodephraseLength::Full => {}
+                    $crate::codephrases::CodephraseLength::Truncated => {
+                        codephrase = codephrase.truncate();
+                    }
+                }
+                Self(codephrase)
+            }
+
+            #[allow(unused)]
+            $vis fn from_be_bytes(bytes: [u8; 32]) -> Self {
+                let mut codephrase = $crate::codephrases::Codephrase::from_be_bytes(bytes);
+                match $crate::codephrases::CodephraseLength::$len {
+                    $crate::codephrases::CodephraseLength::Full => {}
+                    $crate::codephrases::CodephraseLength::Truncated => {
+                        codephrase = codephrase.truncate();
+                    }
+                }
+                Self(codephrase)
+            }
+
+            #[allow(unused)]
+            $vis fn to_be_bytes(&self) -> [u8; 32] {
+                self.0.to_be_bytes()
+            }
+        }
+
+        impl std::fmt::Debug for $name {
+            fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+                write!(f, "{}({})", stringify!($name), self.0)
+            }
+        }
+
+        impl std::fmt::Display for $name {
+            fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+                <$crate::codephrases::Codephrase as std::fmt::Display>::fmt(&self.0, f)
+            }
+        }
+
+        impl std::str::FromStr for $name {
+            type Err = $crate::codephrases::InvalidCodephrase;
+
+            fn from_str(s: &str) -> Result<$name, Self::Err> {
+                Ok($name(s.parse()?))
+            }
+        }
+    }
+}
+
+#[derive(Clone, Copy)]
+pub enum CodephraseLength {
+    Full,
+    Truncated,
+}
 
 /// Decoding a phrase failed.
 #[derive(Debug, Error)]
