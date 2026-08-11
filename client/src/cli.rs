@@ -15,6 +15,7 @@ use humantime::format_duration;
 use indicatif::{ProgressBar, ProgressStyle};
 use rustix::io::ioctl_fionread;
 use serde_json::{json, to_string as to_json_string, to_string_pretty as to_json_string_pretty};
+use sled_hardware_types::BaseboardId;
 use x509_cert::Certificate;
 use x509_cert::der::Encode as _;
 
@@ -27,7 +28,7 @@ use sush_common::keys::{KeyId, Signature, SshPublicKey};
 
 use crate::AuthzSigner;
 use crate::commands::{CommandError, GlobalArgs};
-use crate::context::{CommandContext, OutputFormat};
+use crate::context::{CommandContext, OutputFormat, StatusDisplayStyle};
 
 #[derive(Clone, Debug, Default)]
 pub struct Cli {
@@ -218,6 +219,13 @@ impl CommandContext for Cli {
         error
     }
 
+    fn job_output_target(&mut self, target: &BaseboardId) {
+        match self.get_output_format() {
+            OutputFormat::Json => println!("{}", json!({ "target": target.to_string() })),
+            OutputFormat::Text => println!("⟹  {target}  ⟸"),
+        }
+    }
+
     fn job_output(
         &mut self,
         _job_id: &JobId,
@@ -397,7 +405,7 @@ impl CommandContext for Cli {
         }
     }
 
-    fn job_status(&mut self, _job_id: &JobId, status: &JobStatusMap) {
+    fn job_status(&mut self, job_id: &JobId, status: &JobStatusMap, style: StatusDisplayStyle) {
         fn format_elapsed_duration(duration: TimeDelta) -> String {
             if let Ok(duration) = duration.to_std() {
                 format_duration(duration).to_string()
@@ -409,6 +417,60 @@ impl CommandContext for Cli {
         // TODO: parallel status display
         match self.get_output_format() {
             OutputFormat::Json => println!("{}", json!(job_status_to_json_map(status.clone()))),
+            OutputFormat::Text if matches!(style, StatusDisplayStyle::Short) => {
+                let icon = if status.values().any(|s| {
+                    matches!(
+                        s,
+                        JobStatus::Error { .. }
+                            | JobStatus::Cancelled { .. }
+                            | JobStatus::Stopped { result: Err(_), .. }
+                    )
+                }) {
+                    "❌"
+                } else {
+                    "✅"
+                };
+                let width = status
+                    .keys()
+                    .map(|b| b.to_string().len())
+                    .max()
+                    .unwrap_or(0);
+                println!("{icon} Job ID:\t{job_id}");
+                for (baseboard_id, status) in status {
+                    let id = baseboard_id.to_string();
+                    match status {
+                        JobStatus::Cancelled {
+                            time_cancelled,
+                            actor,
+                            ..
+                        } => {
+                            println!("   {id:<width$}  Cancelled at {time_cancelled} by {actor}")
+                        }
+                        JobStatus::Queued {
+                            time_queued, actor, ..
+                        } => println!("   {id:<width$}  Queued at {time_queued} by {actor}"),
+                        JobStatus::Started { time_started, .. } => {
+                            println!("   {id:<width$}  Started at {time_started}")
+                        }
+                        JobStatus::Stopped { result, output, .. } => {
+                            let duration = format_elapsed_duration(status.time_elapsed());
+                            let stdout_len = byte_size(output.stdout_len);
+                            let stderr_len = byte_size(output.stderr_len);
+                            let result = match result {
+                                Ok(exit_status) => format!("exit {exit_status}"),
+                                Err(err) => err.to_string(),
+                            };
+                            println!(
+                                "   {id:<width$}  Stopped, {result} ({duration}), \
+                                    {stdout_len} out, {stderr_len} err"
+                            )
+                        }
+                        JobStatus::Error {
+                            time_error, error, ..
+                        } => println!("   {id:<width$}  Error at {time_error}: {error}"),
+                    }
+                }
+            }
             OutputFormat::Text => {
                 for (baseboard_id, status) in status {
                     match status {

@@ -52,7 +52,7 @@ use sush_common::keys::{KeyError, KeyId, Signer as _};
 use sush_common::targets::{SledId, Target};
 
 use crate::ByteStream;
-use crate::context::{Authz, CommandContext, OutputFormat};
+use crate::context::{Authz, CommandContext, OutputFormat, StatusDisplayStyle};
 use crate::identity::{IdentityError, SshAgentConnection};
 use crate::interactive::interactive_job;
 #[cfg(feature = "permslip")]
@@ -193,6 +193,31 @@ impl ClientArgs {
         ctx.set_globals(self.globals.clone());
         self.command.clone().execute(ctx).await
     }
+}
+
+/// A rack-wide target can't combine with `--binary` or `--file`.
+#[tokio::test]
+async fn output_needs_target() {
+    use crate::cli::Cli;
+
+    let client =
+        Client::new_with_client("http://[::1]:1", reqwest::Client::new(), Default::default());
+    let output = JobOutput::try_parse_from([
+        "job-stdout",
+        "--binary",
+        "sea-say-sting-palm-tunnel-festival-pull-bid",
+    ])
+    .unwrap();
+    let err = job_output(
+        &mut Cli::default(),
+        &client,
+        &"*".parse::<Target>().unwrap(),
+        Stdout,
+        output,
+    )
+    .await
+    .unwrap_err();
+    assert!(matches!(err, CommandError::OutputNeedsTarget));
 }
 
 /// [`ClientArgs`] must satisfy Clap's internal consistency asserts
@@ -397,6 +422,10 @@ pub enum JobCommand {
         /// The job whose status should be fetched.
         #[clap(env = SUSH_JOB_ID)]
         job_id: JobId,
+
+        /// Show full per-sled status instead of one line per sled.
+        #[arg(short, long)]
+        full: bool,
     },
 
     /// Get the standard output of a job.
@@ -977,15 +1006,20 @@ async fn job(
             Ok(())
         }
 
-        (JobCommand::Status { job_id }, Some(client)) => job_status(ctx, client, &job_id).await,
+        (JobCommand::Status { job_id, full }, Some(client)) => {
+            let style = if full {
+                StatusDisplayStyle::Full
+            } else {
+                StatusDisplayStyle::Short
+            };
+            job_status(ctx, client, &job_id, style).await
+        }
 
         (JobCommand::Stdout { target, output }, Some(client)) => {
-            let target = resolve_target(client, &target).await?;
             job_output(ctx, client, &target, Stdout, output).await
         }
 
         (JobCommand::Stderr { target, output }, Some(client)) => {
-            let target = resolve_target(client, &target).await?;
             job_output(ctx, client, &target, Stderr, output).await
         }
 
@@ -1010,7 +1044,7 @@ async fn job(
                 let status = job_status_try_from_json_map(job)
                     .map_err(CommandError::BaseboardIdParseError)?;
                 if let Some(s) = status.values().next() {
-                    ctx.job_status(s.job_id(), &status);
+                    ctx.job_status(s.job_id(), &status, StatusDisplayStyle::Short);
                 }
             }
             Ok(())
@@ -1078,7 +1112,9 @@ async fn job_start(
         start.await?;
         ctx.job_started(&job);
         match job_attach(ctx, client, &job_id, &target).await {
-            Ok(()) | Err(CommandError::NotFound) => job_status(ctx, client, &job_id).await?,
+            Ok(()) | Err(CommandError::NotFound) => {
+                job_status(ctx, client, &job_id, StatusDisplayStyle::Short).await?
+            }
             Err(error) => return Err(error),
         }
     } else if wait.is_some() {
@@ -1127,7 +1163,7 @@ async fn job_start(
         }
 
         // Show the job status and output.
-        job_status(ctx, client, &job_id).await?;
+        job_status(ctx, client, &job_id, StatusDisplayStyle::Short).await?;
         for stream in [Stdout, Stderr] {
             match with_login_via(ctx, client, Some(&target), async || {
                 client
@@ -1175,6 +1211,7 @@ async fn job_status(
     ctx: &mut impl CommandContext,
     client: &Client,
     job_id: &JobId,
+    style: StatusDisplayStyle,
 ) -> Result<(), CommandError> {
     let status = with_login(ctx, client, async || {
         client.job_status().job_id(job_id).send().await
@@ -1184,6 +1221,7 @@ async fn job_status(
     ctx.job_status(
         job_id,
         &job_status_try_from_json_map(status).map_err(CommandError::BaseboardIdParseError)?,
+        style,
     );
     Ok(())
 }
@@ -1222,6 +1260,42 @@ type FutureChunk<'a> = dyn Future<Output = Result<Chunk, CommandError>> + Send +
 
 /// Download job output.
 async fn job_output(
+    ctx: &mut impl CommandContext,
+    client: &Client,
+    target: &Target,
+    stream: JobOutputStream,
+    args: JobOutput,
+) -> Result<(), CommandError> {
+    if !target.is_all() {
+        let baseboard = resolve_target(client, target).await?;
+        return job_output_from(ctx, client, &baseboard, stream, args).await;
+    }
+    if args.binary || args.file.is_some() {
+        return Err(CommandError::OutputNeedsTarget);
+    }
+
+    // Fetch output from every sled with a recorded status.
+    let status = job_status_try_from_json_map(
+        with_login(ctx, client, async || {
+            client.job_status().job_id(&args.job_id).send().await
+        })
+        .await?
+        .into_inner(),
+    )
+    .map_err(CommandError::BaseboardIdParseError)?;
+    if status.is_empty() {
+        return Err(CommandError::NotFound);
+    }
+    for baseboard in status.keys() {
+        ctx.job_output_target(baseboard);
+        if let Err(error) = job_output_from(ctx, client, baseboard, stream, args.clone()).await {
+            let _ = ctx.job_error(error);
+        }
+    }
+    Ok(())
+}
+
+async fn job_output_from(
     ctx: &mut impl CommandContext,
     client: &Client,
     target: &BaseboardId,
@@ -1550,6 +1624,8 @@ pub enum CommandError {
         expected: JobOutputHash,
         received: JobOutputHash,
     },
+    #[error("❌ `--binary` and `--file` need a specific `--target`")]
+    OutputNeedsTarget,
     #[cfg(feature = "permslip")]
     #[error("❌ permslip error: {0}")]
     Permslip(#[from] PermslipError),

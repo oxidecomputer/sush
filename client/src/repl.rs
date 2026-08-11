@@ -15,6 +15,7 @@ use clap::Parser;
 use rustyline::DefaultEditor;
 use rustyline::error::ReadlineError;
 use shlex::split as split_command;
+use sled_hardware_types::BaseboardId;
 use x509_cert::Certificate;
 use xdg::BaseDirectories;
 
@@ -29,7 +30,7 @@ use crate::commands::{
     ClientCommand, CommandError, GlobalArgs, SSH_AUTH_SOCK, SUSH_JOB_ID, SUSH_KEY_ID,
     SUSH_OUTPUT_FORMAT, SUSH_URL,
 };
-use crate::context::{CommandContext, OutputFormat};
+use crate::context::{CommandContext, OutputFormat, StatusDisplayStyle};
 use crate::{AuthzSigner, Client};
 
 const PREFIX: &str = "sush";
@@ -260,6 +261,10 @@ impl CommandContext for Repl {
         self.cli.job_error(error)
     }
 
+    fn job_output_target(&mut self, target: &BaseboardId) {
+        self.cli.job_output_target(target)
+    }
+
     fn job_output(&mut self, job_id: &JobId, stream: JobOutputStream, output: &[u8], binary: bool) {
         self.set_job_id(Some(job_id.to_owned()));
         self.cli.job_output(job_id, stream, output, binary);
@@ -325,9 +330,9 @@ impl CommandContext for Repl {
         self.cli.job_signed(job, show);
     }
 
-    fn job_status(&mut self, job_id: &JobId, status: &JobStatusMap) {
+    fn job_status(&mut self, job_id: &JobId, status: &JobStatusMap, style: StatusDisplayStyle) {
         self.set_job_id(Some(job_id.to_owned()));
-        self.cli.job_status(job_id, status);
+        self.cli.job_status(job_id, status, style);
     }
 
     fn read_signed_job(&mut self) -> Result<SignedJob, CommandError> {
