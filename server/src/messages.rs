@@ -336,8 +336,8 @@ mod wire_format {
             request,
             KeyId::from_str("zoo-zero").unwrap(),
             EncodedSignature {
-                r: "abandon".to_string(),
-                s: "zoo".to_string(),
+                r: "abandon".parse().unwrap(),
+                s: "zoo".parse().unwrap(),
                 flags: 0,
                 counter: 0,
             },
@@ -378,8 +378,8 @@ mod wire_format {
             response,
             KeyId::from_str("zoo-zero").unwrap(),
             EncodedSignature {
-                r: "abandon".to_string(),
-                s: "zoo".to_string(),
+                r: "abandon".parse().unwrap(),
+                s: "zoo".parse().unwrap(),
                 flags: 0,
                 counter: 0,
             },

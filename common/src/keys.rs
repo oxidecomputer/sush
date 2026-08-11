@@ -18,7 +18,7 @@ use borsh::io::{Error as BorshError, ErrorKind as BorshErrorKind, Read, Write};
 use borsh::{BorshDeserialize, BorshSerialize};
 use bytes::{Buf as _, BufMut as _, BytesMut};
 use chrono::{DateTime, Utc};
-use crypto_bigint::{ArrayEncoding as _, Random as _, U128, U256};
+use crypto_bigint::{ArrayEncoding as _, Random as _, U128};
 use ed25519_dalek::{
     Signature as Ed25519Signature, Signer as _, SigningKey as Ed25519SigningKey,
     VerifyingKey as Ed25519VerifyingKey,
@@ -45,7 +45,7 @@ use x509_cert::spki::{AlgorithmIdentifierOwned, SubjectPublicKeyInfo};
 use x509_cert::time::Validity;
 use x509_cert::{Certificate, TbsCertificate, Version};
 
-use crate::codephrases::{InvalidCodephrase, WORD_SEPARATOR, codephrase, decode_phrase};
+use crate::codephrases::InvalidCodephrase;
 
 codephrase_newtype! {
     /// SHA-256 of a certificate subject or an identity public key,
@@ -165,6 +165,42 @@ impl JsonSchema for SshPublicKey {
     }
 }
 
+codephrase_newtype! {
+    /// The component `r` of a signature _(r, s)_ over a 256 bit elliptic curve.
+    #[derive(
+        BorshDeserialize,
+        BorshSerialize,
+        Clone,
+        Deserialize,
+        Eq,
+        Hash,
+        JsonSchema,
+        Ord,
+        PartialEq,
+        PartialOrd,
+        Serialize,
+    )]
+    pub struct EccR = Full;
+}
+
+codephrase_newtype! {
+    /// The component `s` of a signature _(r, s)_ over a 256 bit elliptic curve.
+    #[derive(
+        BorshDeserialize,
+        BorshSerialize,
+        Clone,
+        Deserialize,
+        Eq,
+        Hash,
+        JsonSchema,
+        Ord,
+        PartialEq,
+        PartialOrd,
+        Serialize,
+    )]
+    pub struct EccS = Full;
+}
+
 /// Code phrase encoded signature.
 ///
 /// The decoded phrases `r` and `s` together comprise a signature
@@ -188,8 +224,8 @@ impl JsonSchema for SshPublicKey {
     Serialize,
 )]
 pub struct EncodedSignature {
-    pub r: String,
-    pub s: String,
+    pub r: EccR,
+    pub s: EccS,
 
     #[serde(default, skip_serializing_if = "is_zero_flags")]
     pub flags: u8,
@@ -219,8 +255,8 @@ impl EncodedSignature {
             flags: _,
             counter: _,
         } = self;
-        let r = decode_phrase(r)?.to_be_byte_array();
-        let s = decode_phrase(s)?.to_be_byte_array();
+        let r = r.to_be_bytes();
+        let s = s.to_be_bytes();
         match signature_algorithm {
             AlgorithmIdentifierOwned {
                 oid: ECDSA_WITH_SHA_256,
@@ -231,10 +267,7 @@ impl EncodedSignature {
             AlgorithmIdentifierOwned {
                 oid: ID_ED_25519,
                 parameters: None,
-            } => Ok(Signature::Ed25519(Ed25519Signature::from_components(
-                r.into(),
-                s.into(),
-            ))),
+            } => Ok(Signature::Ed25519(Ed25519Signature::from_components(r, s))),
             _ => Err(KeyError::InvalidPublicKeyAlgorithm),
         }
     }
@@ -248,16 +281,13 @@ impl EncodedSignature {
             flags,
             counter,
         } = self;
-        let r = decode_phrase(r)?.to_be_byte_array();
-        let s = decode_phrase(s)?.to_be_byte_array();
+        let r = r.to_be_bytes();
+        let s = s.to_be_bytes();
         match algorithm {
             Ecdsa { curve: NistP256 } => Ok(Signature::EcdsaSha256(
                 ecdsa::Signature::from_scalars(r, s)?,
             )),
-            Ed25519 => Ok(Signature::Ed25519(Ed25519Signature::from_components(
-                r.into(),
-                s.into(),
-            ))),
+            Ed25519 => Ok(Signature::Ed25519(Ed25519Signature::from_components(r, s))),
             SkEcdsaSha2NistP256 => {
                 let mut bytes = BytesMut::new();
                 put_mpint(&mut bytes, r)?;
@@ -306,17 +336,16 @@ impl Signature {
     }
 
     pub fn encode(&self) -> Result<EncodedSignature, KeyError> {
-        let codephrase = |x: U256| codephrase(x).join(WORD_SEPARATOR);
         match self {
             Self::EcdsaSha256(signature) => Ok(EncodedSignature {
-                r: codephrase(U256::from_be_byte_array(signature.r().to_bytes())),
-                s: codephrase(U256::from_be_byte_array(signature.s().to_bytes())),
+                r: EccR::from_be_bytes(signature.r().to_bytes().into()),
+                s: EccS::from_be_bytes(signature.s().to_bytes().into()),
                 flags: 0,
                 counter: 0,
             }),
             Self::Ed25519(signature) => Ok(EncodedSignature {
-                r: codephrase(U256::from_be_slice(signature.r_bytes())),
-                s: codephrase(U256::from_be_slice(signature.s_bytes())),
+                r: EccR::from_be_bytes(*signature.r_bytes()),
+                s: EccS::from_be_bytes(*signature.s_bytes()),
                 flags: 0,
                 counter: 0,
             }),
@@ -327,8 +356,8 @@ impl Signature {
                 let s = get_mpint(&mut signature)?;
                 let e = || KeyError::InvalidSignatureEncoding;
                 Ok(EncodedSignature {
-                    r: codephrase(u256_be(r.as_positive_bytes().ok_or_else(e)?)?),
-                    s: codephrase(u256_be(s.as_positive_bytes().ok_or_else(e)?)?),
+                    r: EccR::from_be_bytes(u256_be(r.as_positive_bytes().ok_or_else(e)?)?),
+                    s: EccS::from_be_bytes(u256_be(s.as_positive_bytes().ok_or_else(e)?)?),
                     flags,
                     counter,
                 })
@@ -337,8 +366,8 @@ impl Signature {
                 let (signature, flags, counter) = sk_split(signature.as_bytes())?;
                 let signature = Ed25519Signature::from_slice(signature)?;
                 Ok(EncodedSignature {
-                    r: codephrase(U256::from_be_slice(signature.r_bytes())),
-                    s: codephrase(U256::from_be_slice(signature.s_bytes())),
+                    r: EccR::from_be_bytes(*signature.r_bytes()),
+                    s: EccS::from_be_bytes(*signature.s_bytes()),
                     flags,
                     counter,
                 })
@@ -399,13 +428,13 @@ impl Signature {
 
 /// A `U256` from up to 32 big-endian bytes. An mpint's minimal
 /// encoding may carry fewer, which `U256::from_be_slice` refuses.
-fn u256_be(bytes: &[u8]) -> Result<U256, KeyError> {
+fn u256_be(bytes: &[u8]) -> Result<[u8; 32], KeyError> {
     let Some(pad) = 32usize.checked_sub(bytes.len()) else {
         return Err(KeyError::InvalidSignatureEncoding);
     };
     let mut buf = [0; 32];
     buf[pad..].copy_from_slice(bytes);
-    Ok(U256::from_be_slice(&buf))
+    Ok(buf)
 }
 
 /// Append one SSH mpint, encoded from positive big-endian bytes.

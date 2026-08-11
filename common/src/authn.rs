@@ -43,7 +43,9 @@ use thiserror::Error;
 
 use crate::codephrase_newtype;
 use crate::codephrases::{InvalidCodephrase, WORD_SEPARATOR, codephrase, decode_phrase};
-use crate::keys::{EncodedSignature, KeyError, KeyId, Signed, SshPublicKey, ToBeSigned, Verified};
+use crate::keys::{
+    EccR, EccS, EncodedSignature, KeyError, KeyId, Signed, SshPublicKey, ToBeSigned, Verified,
+};
 
 /// The name of our custom HTTP authentication scheme.
 pub const AUTHN_SCHEME: &str = "Sush";
@@ -139,14 +141,13 @@ impl RequestKey {
     /// Sign `request`, yielding the credentials that authorize it.
     pub fn bind(&self, key_id: KeyId, nonce: Nonce, request: &BoundRequest) -> BoundCredentials {
         let signature = self.0.sign(&request.to_be_signed(&key_id, &nonce));
-        let phrase = |bytes: &[u8]| codephrase(U256::from_be_slice(bytes)).join(WORD_SEPARATOR);
         BoundCredentials {
             key_id,
             nonce,
             seq: request.seq,
             signature: EncodedSignature {
-                r: phrase(&signature.r_bytes()[..]),
-                s: phrase(&signature.s_bytes()[..]),
+                r: EccR::from_be_bytes(*signature.r_bytes()),
+                s: EccS::from_be_bytes(*signature.s_bytes()),
                 flags: 0,
                 counter: 0,
             },
@@ -172,11 +173,8 @@ impl RequestVerifier {
         if request.seq != credentials.seq {
             return Err(AuthnError::InvalidSignature);
         }
-        let half = |phrase: &str| -> Result<[u8; 32], AuthnError> {
-            Ok(decode_phrase(phrase)?.to_be_byte_array().into())
-        };
         let EncodedSignature { r, s, .. } = &credentials.signature;
-        let signature = Ed25519Signature::from_components(half(r)?, half(s)?);
+        let signature = Ed25519Signature::from_components(r.to_be_bytes(), s.to_be_bytes());
         self.0
             .verify_strict(
                 &request.to_be_signed(&credentials.key_id, &credentials.nonce),
@@ -315,8 +313,9 @@ impl FromStr for BoundCredentials {
             nonce: params.parse("nonce")?,
             seq: params.parse("seq")?,
             signature: EncodedSignature {
-                r: params.get("r")?,
-                s: params.get("s")?,
+                r: params.parse("r")?,
+
+                s: params.parse("s")?,
                 flags: 0,
                 counter: 0,
             },
@@ -526,8 +525,8 @@ impl FromStr for Credentials {
             key_id: params.parse("key-id")?,
             epk: params.parse("epk")?,
             signature: EncodedSignature {
-                r: params.get("r")?,
-                s: params.get("s")?,
+                r: params.parse("r")?,
+                s: params.parse("s")?,
                 flags: params.parse("flags")?,
                 counter: params.parse("counter")?,
             },
@@ -839,21 +838,21 @@ mod test {
         let epk = RequestKey::new().verifier();
         assert!(matches!(
             Credentials::from_str(
-                "Sush nonce=abandon,cnonce=ability,key-id=able,epk=plugh,r=r,s=s,flags=0,counter=0"
+                "Sush nonce=abandon,cnonce=ability,key-id=able,epk=plugh,r=burger,s=burst,flags=0,counter=0"
             )
             .unwrap_err(),
             AuthnError::InvalidParam
         ));
         assert!(matches!(
             Credentials::from_str(&format!(
-                "Sush nonce=abandon,cnonce=ability,key-id=able,epk={epk},r=r,s=s,flags=0,counter=foo"
+                "Sush nonce=abandon,cnonce=ability,key-id=able,epk={epk},r=burger,s=burst,flags=0,counter=foo"
             ))
             .unwrap_err(),
             AuthnError::InvalidParam
         ));
         assert!(matches!(
             Credentials::from_str(&format!(
-                "Sush nonce=abandon,cnonce=ability,key-id=able,epk={epk},r=r,s=s,flags=0,counter=0,foo=bar"
+                "Sush nonce=abandon,cnonce=ability,key-id=able,epk={epk},r=burger,s=burst,flags=0,counter=0,foo=bar"
             ))
             .unwrap_err(),
             AuthnError::TooManyParams
