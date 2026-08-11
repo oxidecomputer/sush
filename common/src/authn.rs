@@ -30,10 +30,9 @@ use std::str::FromStr;
 use std::time::Duration;
 
 use blake3::Hasher;
-use borsh::io::{Error, ErrorKind, Read, Write};
 use borsh::{BorshDeserialize, BorshSerialize};
 use chrono::{DateTime, Utc};
-use crypto_bigint::{ArrayEncoding as _, U256};
+use crypto_bigint::U256;
 use ed25519_dalek::{Signature as Ed25519Signature, Signer as _, SigningKey, VerifyingKey};
 use http::header::{HeaderValue, InvalidHeaderValue};
 use rand_core::OsRng;
@@ -42,7 +41,7 @@ use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
 use crate::codephrase_newtype;
-use crate::codephrases::{InvalidCodephrase, WORD_SEPARATOR, codephrase, decode_phrase};
+use crate::codephrases::InvalidCodephrase;
 use crate::keys::{
     EccR, EccS, EncodedSignature, KeyError, KeyId, Signed, SshPublicKey, ToBeSigned, Verified,
 };
@@ -135,7 +134,7 @@ impl RequestKey {
     }
 
     pub fn verifier(&self) -> RequestVerifier {
-        RequestVerifier(self.0.verifying_key())
+        RequestVerifier::from_be_bytes(*self.0.verifying_key().as_bytes())
     }
 
     /// Sign `request`, yielding the credentials that authorize it.
@@ -155,15 +154,14 @@ impl RequestKey {
     }
 }
 
-/// The server half of an ephemeral request-signing key.
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub struct RequestVerifier(VerifyingKey);
+codephrase_newtype! {
+    /// The server half of an ephemeral request-signing key.
+    #[derive(Clone, Eq, PartialEq, BorshSerialize, BorshDeserialize)]
+    pub struct RequestVerifier = Full;
+
+}
 
 impl RequestVerifier {
-    fn as_bytes(&self) -> &[u8] {
-        self.0.as_bytes()
-    }
-
     /// Verify that `credentials` sign `request`.
     pub fn verify(
         &self,
@@ -175,53 +173,20 @@ impl RequestVerifier {
         }
         let EncodedSignature { r, s, .. } = &credentials.signature;
         let signature = Ed25519Signature::from_components(r.to_be_bytes(), s.to_be_bytes());
-        self.0
-            .verify_strict(
-                &request.to_be_signed(&credentials.key_id, &credentials.nonce),
-                &signature,
-            )
-            .map_err(|_| AuthnError::InvalidSignature)
-    }
-}
 
-impl BorshSerialize for RequestVerifier {
-    fn serialize<W: Write>(&self, writer: &mut W) -> borsh::io::Result<()> {
-        writer.write_all(self.as_bytes())
-    }
-}
-
-impl BorshDeserialize for RequestVerifier {
-    fn deserialize_reader<R: Read>(reader: &mut R) -> borsh::io::Result<Self> {
-        let mut bytes = [0; 32];
-        reader.read_exact(&mut bytes)?;
-        VerifyingKey::from_bytes(&bytes)
-            .map(Self)
-            .map_err(|err| Error::new(ErrorKind::InvalidData, err))
-    }
-}
-
-impl fmt::Display for RequestVerifier {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(
-            f,
-            "{}",
-            codephrase(U256::from_be_slice(self.as_bytes())).join(WORD_SEPARATOR)
-        )
-    }
-}
-
-impl FromStr for RequestVerifier {
-    type Err = AuthnError;
-
-    fn from_str(s: &str) -> Result<Self, Self::Err> {
-        let bytes = decode_phrase(s)?.to_be_byte_array();
-        let key = VerifyingKey::from_bytes(&bytes.into()).map_err(|_| AuthnError::InvalidKey)?;
+        let key =
+            VerifyingKey::from_bytes(&self.to_be_bytes()).map_err(|_| AuthnError::InvalidKey)?;
         // A small-order key verifies anything, degrading the session
         // back to a bearer credential.
         if key.is_weak() {
             return Err(AuthnError::InvalidKey);
         }
-        Ok(Self(key))
+
+        key.verify_strict(
+            &request.to_be_signed(&credentials.key_id, &credentials.nonce),
+            &signature,
+        )
+        .map_err(|_| AuthnError::InvalidSignature)
     }
 }
 
@@ -432,7 +397,7 @@ impl ToBeSigned for ChallengeResponse {
         hash(Self::TYPE_NAME);
         hash(&nonce.to_be_bytes());
         hash(&cnonce.to_be_bytes());
-        hash(epk.as_bytes());
+        hash(&epk.to_be_bytes());
         hasher.finalize().as_bytes().to_vec()
     }
 }
@@ -768,19 +733,18 @@ mod test {
         assert!(verifier.verify(&request, &relabeled).is_err());
         let relabeled = BoundCredentials {
             nonce: Nonce::random(),
-            ..creds
+            ..creds.clone()
         };
         assert!(verifier.verify(&request, &relabeled).is_err());
 
         // A small-order ephemeral key is refused at parse.
-        let weak = codephrase(U256::from_be_slice(&{
+        let weak = RequestVerifier::from_be_bytes({
             let mut identity = [0u8; 32];
             identity[0] = 1;
             identity
-        }))
-        .join(WORD_SEPARATOR);
+        });
         assert!(matches!(
-            weak.parse::<RequestVerifier>().unwrap_err(),
+            weak.verify(&request, &creds).unwrap_err(),
             AuthnError::InvalidKey
         ));
     }
