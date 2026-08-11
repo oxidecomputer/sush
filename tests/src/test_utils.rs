@@ -25,7 +25,7 @@ use x509_cert::time::Validity;
 use sush_client::context::Authz;
 use sush_client::{Client, ResponseValue};
 use sush_common::authn::{Challenge, ChallengeResponse, Credentials, Identity, Nonce, RequestKey};
-use sush_common::codephrases::generate_id;
+use sush_common::codephrases::Codephrase;
 use sush_common::jobs::{JobId, JobStartRequest, VerifiedJob};
 use sush_common::keys::{EphemeralKey, KeyType, Signer};
 use sush_common::targets::{Cubbies, Target};
@@ -110,7 +110,7 @@ impl SignJobRequest for EphemeralKey {
 pub fn ephemeral_test_subject() -> Name {
     let mut buf = [0; 8];
     OsRng.fill_bytes(&mut buf);
-    let id = generate_id();
+    let id = Codephrase::random().truncate();
     format!("CN=Ephemeral Test Key {id},O=Oxide Computer Company,C=US")
         .parse()
         .unwrap()
