@@ -9,7 +9,6 @@
 use std::env;
 use std::ffi::OsString;
 use std::path::Path;
-use std::time::Duration;
 
 use clap::Parser;
 use rustyline::DefaultEditor;
@@ -294,18 +293,6 @@ impl CommandContext for Repl {
         self.cli.job_output_finished(job_id, stream, stage);
     }
 
-    fn job_polling_started(&mut self, job_id: &JobId, duration: Duration) {
-        self.cli.job_polling_started(job_id, duration);
-    }
-
-    fn job_polling_update(&mut self, job_id: &JobId) {
-        self.cli.job_polling_update(job_id);
-    }
-
-    fn job_polling_finished(&mut self, job_id: &JobId) {
-        self.cli.job_polling_finished(job_id);
-    }
-
     fn job_attached(&mut self, job_id: &JobId) {
         self.cli.job_attached(job_id);
     }
@@ -328,6 +315,18 @@ impl CommandContext for Repl {
 
     fn job_signed(&mut self, job: &SignedJob, show: bool) {
         self.cli.job_signed(job, show);
+    }
+
+    fn job_watch_started(&mut self, job_id: &JobId) {
+        self.cli.job_watch_started(job_id)
+    }
+
+    fn job_watch_update(&mut self, status: &JobStatusMap) {
+        self.cli.job_watch_update(status)
+    }
+
+    fn job_watch_finished(&mut self, job_id: &JobId) {
+        self.cli.job_watch_finished(job_id)
     }
 
     fn job_status(&mut self, job_id: &JobId, status: &JobStatusMap, style: StatusDisplayStyle) {

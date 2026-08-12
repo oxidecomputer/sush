@@ -415,6 +415,14 @@ impl ExecutionError {
 }
 
 impl JobStatus {
+    /// Whether this status can ever change again.
+    pub fn is_terminal(&self) -> bool {
+        matches!(
+            self,
+            Self::Cancelled { .. } | Self::Error { .. } | Self::Stopped { .. }
+        )
+    }
+
     /// The most recent timestamp recorded for this status.
     pub fn time(&self) -> DateTime<Utc> {
         match self {

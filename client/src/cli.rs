@@ -4,6 +4,8 @@
 
 //! Possibly-interactive command-line interface.
 
+use std::collections::BTreeMap;
+use std::fmt;
 use std::io::{self, BufRead as _, Read as _, Write as _, stderr, stdin, stdout};
 use std::path::Path;
 use std::sync::{Arc, Mutex};
@@ -12,7 +14,7 @@ use std::time::{Duration, SystemTime};
 use bytesize::ByteSize;
 use chrono::TimeDelta;
 use humantime::format_duration;
-use indicatif::{ProgressBar, ProgressStyle};
+use indicatif::{MultiProgress, ProgressBar, ProgressStyle};
 use rustix::io::ioctl_fionread;
 use serde_json::{json, to_string as to_json_string, to_string_pretty as to_json_string_pretty};
 use sled_hardware_types::BaseboardId;
@@ -35,12 +37,64 @@ pub struct Cli {
     globals: Arc<Mutex<GlobalArgs>>,
     output: Arc<Mutex<OutputFormat>>,
     progress: Arc<Mutex<Option<ProgressBar>>>,
+    watch: Arc<Mutex<Option<Watch>>>,
     session: Arc<Mutex<Option<Session>>>,
     credentials: AuthzSigner,
 }
 
 fn byte_size(len: u64) -> bytesize::Display {
     ByteSize::b(len).display().si()
+}
+
+fn format_elapsed_duration(duration: TimeDelta) -> String {
+    if let Ok(duration) = duration.to_std() {
+        format_duration(duration).to_string()
+    } else {
+        String::from("negative duration, times may be unreliable")
+    }
+}
+
+/// One sled's worth of job status, without the sled's name.
+fn short_status_row(status: &JobStatus) -> String {
+    match status {
+        JobStatus::Cancelled {
+            time_cancelled,
+            actor,
+            ..
+        } => format!("Cancelled at {time_cancelled} by {actor}"),
+        JobStatus::Queued {
+            time_queued, actor, ..
+        } => format!("Queued at {time_queued} by {actor}"),
+        JobStatus::Started { time_started, .. } => format!("Started at {time_started}"),
+        JobStatus::Stopped { result, output, .. } => {
+            let duration = format_elapsed_duration(status.time_elapsed());
+            let stdout_len = byte_size(output.stdout_len);
+            let stderr_len = byte_size(output.stderr_len);
+            let result = match result {
+                Ok(exit_status) => format!("exit {exit_status}"),
+                Err(err) => err.to_string(),
+            };
+            format!("Stopped, {result} ({duration}), {stdout_len} out, {stderr_len} err")
+        }
+        JobStatus::Error {
+            time_error, error, ..
+        } => format!("Error at {time_error}: {error}"),
+    }
+}
+
+/// Live per-sled status lines for a watched job.
+struct Watch {
+    multi: MultiProgress,
+    bars: BTreeMap<BaseboardId, ProgressBar>,
+    width: usize,
+}
+
+impl fmt::Debug for Watch {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("Watch")
+            .field("bars", &self.bars.keys())
+            .finish_non_exhaustive()
+    }
 }
 
 impl CommandContext for Cli {
@@ -210,7 +264,13 @@ impl CommandContext for Cli {
     fn job_stopped(&mut self, job_id: &JobId) {
         match self.get_output_format() {
             OutputFormat::Json => println!("{}", json!(job_id)),
-            OutputFormat::Text => println!("\r✅ Stopped job `{job_id}`"),
+            OutputFormat::Text => {
+                if let Some(watch) = self.watch.lock().unwrap().as_ref() {
+                    let _ = watch.multi.println(format!("✅ Stopped job `{job_id}`"));
+                } else {
+                    println!("\r✅ Stopped job `{job_id}`");
+                }
+            }
         }
     }
 
@@ -309,34 +369,61 @@ impl CommandContext for Cli {
         }
     }
 
-    fn job_polling_started(&mut self, job_id: &JobId, elapsed: Duration) {
-        let mut progress = self.progress.lock().unwrap();
-        if matches!(self.get_output_format(), OutputFormat::Text) && progress.is_none() {
-            let bar = ProgressBar::new_spinner();
-            bar.set_elapsed(elapsed);
-            bar.set_prefix(format!("Waiting for job `{job_id}`"));
-            bar.set_style(
-                ProgressStyle::with_template(
-                    "{spinner}  \
-                     {prefix} \
-                     [{elapsed_precise}] \
-                     {msg}",
-                )
-                .unwrap(),
-            );
-            *progress = Some(bar);
+    fn job_watch_started(&mut self, _job_id: &JobId) {
+        if matches!(self.get_output_format(), OutputFormat::Text) {
+            *self.watch.lock().unwrap() = Some(Watch {
+                multi: MultiProgress::new(),
+                bars: BTreeMap::new(),
+                width: 0,
+            });
         }
     }
 
-    fn job_polling_update(&mut self, _job_id: &JobId) {
-        if let Some(progress) = self.progress.lock().unwrap().as_mut() {
-            progress.tick();
+    fn job_watch_update(&mut self, status: &JobStatusMap) {
+        let mut guard = self.watch.lock().unwrap();
+        let Some(watch) = guard.as_mut() else { return };
+
+        // Widen every name column if a longer baseboard ID appears.
+        let width = status
+            .keys()
+            .map(|b| b.to_string().len())
+            .max()
+            .unwrap_or(0);
+        if width > watch.width {
+            watch.width = width;
+            for (baseboard_id, bar) in &watch.bars {
+                bar.set_prefix(format!("{:<width$}", baseboard_id.to_string()));
+            }
+        }
+        let width = watch.width;
+
+        for (baseboard_id, status) in status {
+            if !watch.bars.contains_key(baseboard_id) {
+                let index = watch.bars.range(..baseboard_id).count();
+                let bar = watch.multi.insert(index, ProgressBar::new_spinner());
+                bar.set_style(ProgressStyle::with_template("{spinner}  {prefix}  {msg}").unwrap());
+                bar.set_prefix(format!("{:<width$}", baseboard_id.to_string()));
+                bar.enable_steady_tick(Duration::from_millis(100));
+                watch.bars.insert(baseboard_id.to_owned(), bar);
+            }
+            let bar = &watch.bars[baseboard_id];
+            if bar.is_finished() {
+                continue;
+            }
+            if status.is_terminal() {
+                bar.finish_with_message(short_status_row(status));
+            } else {
+                bar.set_message(short_status_row(status));
+            }
         }
     }
 
-    fn job_polling_finished(&mut self, _job_id: &JobId) {
-        if let Some(progress) = self.progress.lock().unwrap().take() {
-            progress.finish_and_clear();
+    fn job_watch_finished(&mut self, _job_id: &JobId) {
+        if let Some(watch) = self.watch.lock().unwrap().take() {
+            for bar in watch.bars.values() {
+                bar.finish_and_clear();
+            }
+            let _ = watch.multi.clear();
         }
     }
 
@@ -406,15 +493,6 @@ impl CommandContext for Cli {
     }
 
     fn job_status(&mut self, job_id: &JobId, status: &JobStatusMap, style: StatusDisplayStyle) {
-        fn format_elapsed_duration(duration: TimeDelta) -> String {
-            if let Ok(duration) = duration.to_std() {
-                format_duration(duration).to_string()
-            } else {
-                String::from("negative duration, times may be unreliable")
-            }
-        }
-
-        // TODO: parallel status display
         match self.get_output_format() {
             OutputFormat::Json => println!("{}", json!(job_status_to_json_map(status.clone()))),
             OutputFormat::Text if matches!(style, StatusDisplayStyle::Short) => {
@@ -438,37 +516,7 @@ impl CommandContext for Cli {
                 println!("{icon} Job ID:\t{job_id}");
                 for (baseboard_id, status) in status {
                     let id = baseboard_id.to_string();
-                    match status {
-                        JobStatus::Cancelled {
-                            time_cancelled,
-                            actor,
-                            ..
-                        } => {
-                            println!("   {id:<width$}  Cancelled at {time_cancelled} by {actor}")
-                        }
-                        JobStatus::Queued {
-                            time_queued, actor, ..
-                        } => println!("   {id:<width$}  Queued at {time_queued} by {actor}"),
-                        JobStatus::Started { time_started, .. } => {
-                            println!("   {id:<width$}  Started at {time_started}")
-                        }
-                        JobStatus::Stopped { result, output, .. } => {
-                            let duration = format_elapsed_duration(status.time_elapsed());
-                            let stdout_len = byte_size(output.stdout_len);
-                            let stderr_len = byte_size(output.stderr_len);
-                            let result = match result {
-                                Ok(exit_status) => format!("exit {exit_status}"),
-                                Err(err) => err.to_string(),
-                            };
-                            println!(
-                                "   {id:<width$}  Stopped, {result} ({duration}), \
-                                    {stdout_len} out, {stderr_len} err"
-                            )
-                        }
-                        JobStatus::Error {
-                            time_error, error, ..
-                        } => println!("   {id:<width$}  Error at {time_error}: {error}"),
-                    }
+                    println!("   {id:<width$}  {}", short_status_row(status));
                 }
             }
             OutputFormat::Text => {

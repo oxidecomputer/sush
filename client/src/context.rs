@@ -8,7 +8,6 @@ use std::fmt;
 use std::path::Path;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::time::Duration;
 
 use clap::ValueEnum;
 use sled_hardware_types::BaseboardId;
@@ -135,9 +134,9 @@ pub trait CommandContext: Clone + Send + Sync {
     );
     fn job_output_update(&mut self, id: &JobId, stream: JobOutputStream, bytes: u64);
     fn job_output_finished(&mut self, id: &JobId, stream: JobOutputStream, stage: Option<&str>);
-    fn job_polling_started(&mut self, id: &JobId, duration: Duration);
-    fn job_polling_update(&mut self, id: &JobId);
-    fn job_polling_finished(&mut self, id: &JobId);
+    fn job_watch_started(&mut self, id: &JobId);
+    fn job_watch_update(&mut self, status: &JobStatusMap);
+    fn job_watch_finished(&mut self, id: &JobId);
     fn job_attached(&mut self, id: &JobId);
     fn job_detached(&mut self, id: &JobId);
     fn job_signing_started(&mut self, id: &JobId);
