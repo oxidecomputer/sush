@@ -89,8 +89,8 @@ async fn main() -> Result<(), String> {
 
     // TODO: get actual baseboard ID
     let baseboard = BaseboardId {
-        part_number: "a part".to_string(),
-        serial_number: "0001".to_string(),
+        part_number: "000-0000000".to_string(),
+        serial_number: "23333333".to_string(),
     };
 
     // TODO: get/seed Rumors network
