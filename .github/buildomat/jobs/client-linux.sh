@@ -1,7 +1,7 @@
 #!/bin/bash
 #: name = "client (linux)"
 #: variety = "basic"
-#: target = "ubuntu-22.04"
+#: target = "ubuntu-26.04"
 #: rust_toolchain = true
 #: output_rules = ["=/work/sush"]
 #: access_repos = ["oxidecomputer/permission-slip"]
@@ -15,6 +15,13 @@ set -o errexit
 set -o pipefail
 set -o xtrace
 
+# We build the client binary with MUSL to be compatible with any Linux distribution, regardless of
+# whether it uses an older glibc version than this CI job. This also makes the binary work on NixOS.
+TARGET=x86_64-unknown-linux-musl
+rustup target install "$TARGET"
+
+DEBIAN_FRONTEND=noninteractive sudo apt-get install -y musl-tools
+
 cargo --version
 rustc --version
 
@@ -24,5 +31,5 @@ export CARGO_INCREMENTAL=0
 
 mkdir -p /work
 
-cargo build --release --locked --package sush-client --features permslip
-cp target/release/sush /work/sush
+cargo build --target "$TARGET" --release --locked --package sush-client --features permslip
+cp "target/$TARGET/release/sush" /work/sush

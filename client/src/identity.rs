@@ -171,6 +171,8 @@ impl IdentityError {
 
 #[cfg(test)]
 mod test {
+    use std::time::Duration;
+
     use sush_common::codephrases::Codephrase;
     use tempfile::TempDir;
     use tokio::process::Command;
@@ -201,6 +203,14 @@ mod test {
             .arg(&sock)
             .spawn()
             .expect("failed to spawn ssh-agent");
+
+        // Wait for the agent to start up.
+        for _ in 0..20 {
+            if sock.exists() {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
 
         let status = Command::new("ssh-add")
             .arg(&key)
