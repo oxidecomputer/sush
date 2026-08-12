@@ -6,21 +6,26 @@
 
 use std::net::SocketAddr;
 use std::path::PathBuf;
+use std::sync::Arc;
 
 use clap::Parser;
 use dropshot::{ConfigDropshot, ConfigLogging, ConfigLoggingLevel, HandlerTaskMode, ServerBuilder};
-use rumors::Peer;
 use sled_hardware_types::BaseboardId;
 use tokio::signal::unix::{SignalKind, signal};
+use tokio::sync::watch;
 use tokio::{select, spawn};
 use tokio_util::sync::CancellationToken;
 use x509_cert::Certificate;
 use x509_cert::der::DecodePem as _;
 
 use sush_api::sush_api_mod::api_description;
+use sush_common::targets::Cubbies;
 use sush_server::executor::PathIsolation;
+use sush_server::gossip::isolated;
 use sush_server::manager::JobManager;
+use sush_server::output::JobOutputDir;
 use sush_server::server::ApiServer;
+use sush_server::{read_root_certs, seed_gossip};
 
 const DEFAULT_ADDRESS: &str = "0.0.0.0:44444";
 const ROOT_CERTS: &[&[u8]] = &[include_bytes!("../certs/sandbox.pem")];
@@ -89,19 +94,21 @@ async fn main() -> Result<(), String> {
     };
 
     // TODO: get/seed Rumors network
-    let gossip = Peer::seed().into_rumors();
+    let gossip = isolated(seed_gossip());
 
     #[cfg(feature = "test-support")]
-    let roots = overridable_root_certs(&override_root_certs)?;
+    let roots = overridable_root_certs(&override_root_certs).await?;
     #[cfg(not(feature = "test-support"))]
     let roots = builtin_root_certs()?;
 
     let shutdown = listen_for_shutdown()?;
-    let mut mgr = JobManager::new(
+    let (_cubbies, cubbies) = watch::channel(Cubbies::new());
+    let mut mgr = JobManager::with_root_certs(
         log.clone(),
         path_isolation,
-        directory,
+        JobOutputDir::fixed(directory),
         baseboard,
+        cubbies,
         gossip,
         &roots,
         shutdown.clone(),
@@ -112,12 +119,13 @@ async fn main() -> Result<(), String> {
 
     let api = api_description::<ApiServer>()
         .map_err(|error| format!("failed to get API description: {error}"))?;
-    let server = ServerBuilder::new(api, mgr, log)
+    let server = ServerBuilder::new(api, Arc::new(mgr), log)
         .config(ConfigDropshot {
             bind_address: address,
             default_request_body_max_bytes: REQUEST_MAX_BODY_BYTES,
             default_handler_task_mode: HandlerTaskMode::Detached,
             log_headers: vec![],
+            compression: Default::default(),
         })
         .start()
         .map_err(|error| format!("failed to start server: {error}"))?;
@@ -141,17 +149,15 @@ fn builtin_root_certs() -> Result<Vec<Certificate>, String> {
 }
 
 #[cfg_attr(not(feature = "test-support"), expect(dead_code))]
-fn overridable_root_certs(override_root_certs: &[PathBuf]) -> Result<Vec<Certificate>, String> {
+async fn overridable_root_certs(
+    override_root_certs: &[PathBuf],
+) -> Result<Vec<Certificate>, String> {
     if override_root_certs.is_empty() {
         builtin_root_certs()
     } else {
-        override_root_certs
-            .iter()
-            .map(|path| {
-                Certificate::from_pem(&std::fs::read(path).map_err(|e| e.to_string())?)
-                    .map_err(|e| e.to_string())
-            })
-            .collect()
+        read_root_certs(override_root_certs)
+            .await
+            .map_err(|e| e.to_string())
     }
 }
 

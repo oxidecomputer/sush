@@ -8,9 +8,9 @@ use std::fmt;
 use std::path::Path;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::time::Duration;
 
 use clap::ValueEnum;
+use sled_hardware_types::BaseboardId;
 use x509_cert::Certificate;
 
 use sush_common::authn::{BoundRequest, Credentials, Identity, RequestKey};
@@ -60,6 +60,14 @@ pub enum OutputFormat {
     #[default]
     Text,
     Json,
+}
+
+/// How much of a job's per-sled status to show.
+#[derive(Clone, Copy, Debug, Default)]
+pub enum StatusDisplayStyle {
+    #[default]
+    Short,
+    Full,
 }
 
 impl OutputFormat {
@@ -116,6 +124,7 @@ pub trait CommandContext: Clone + Send + Sync {
     fn job_stopped(&mut self, id: &JobId);
     fn job_error(&mut self, error: CommandError) -> CommandError;
     fn job_output(&mut self, id: &JobId, stream: JobOutputStream, output: &[u8], binary: bool);
+    fn job_output_target(&mut self, target: &BaseboardId);
     fn job_output_started(
         &mut self,
         id: &JobId,
@@ -125,16 +134,16 @@ pub trait CommandContext: Clone + Send + Sync {
     );
     fn job_output_update(&mut self, id: &JobId, stream: JobOutputStream, bytes: u64);
     fn job_output_finished(&mut self, id: &JobId, stream: JobOutputStream, stage: Option<&str>);
-    fn job_polling_started(&mut self, id: &JobId, duration: Duration);
-    fn job_polling_update(&mut self, id: &JobId);
-    fn job_polling_finished(&mut self, id: &JobId);
+    fn job_watch_started(&mut self, id: &JobId);
+    fn job_watch_update(&mut self, status: &JobStatusMap);
+    fn job_watch_finished(&mut self, id: &JobId);
     fn job_attached(&mut self, id: &JobId);
     fn job_detached(&mut self, id: &JobId);
     fn job_signing_started(&mut self, id: &JobId);
     fn job_signing_update(&mut self, id: &JobId);
     fn job_signing_finished(&mut self, id: &JobId);
     fn job_signed(&mut self, job: &SignedJob, show: bool);
-    fn job_status(&mut self, id: &JobId, status: &JobStatusMap);
+    fn job_status(&mut self, id: &JobId, status: &JobStatusMap, style: StatusDisplayStyle);
     fn read_signed_job(&mut self) -> Result<SignedJob, CommandError>;
 
     // SSH agent and identity

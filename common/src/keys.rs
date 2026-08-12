@@ -14,20 +14,21 @@
 use std::fmt;
 use std::ops::Deref;
 
+use borsh::io::{Error as BorshError, ErrorKind as BorshErrorKind, Read, Write};
 use borsh::{BorshDeserialize, BorshSerialize};
 use bytes::{Buf as _, BufMut as _, BytesMut};
 use chrono::{DateTime, Utc};
-use crypto_bigint::{ArrayEncoding as _, Random as _, U128, U256};
+use crypto_bigint::{ArrayEncoding as _, Random as _, U128};
 use ed25519_dalek::{
     Signature as Ed25519Signature, Signer as _, SigningKey as Ed25519SigningKey,
     VerifyingKey as Ed25519VerifyingKey,
 };
+use p256::pkcs8::{self, EncodePrivateKey as _};
 use p256::{SecretKey as P256SecretKey, ecdsa};
 use rand_core::OsRng;
 use schemars::schema::Schema;
 use schemars::{JsonSchema, SchemaGenerator};
 use serde::{Deserialize, Serialize};
-use sha2::{Digest as _, Sha256};
 use signature::Verifier;
 use ssh_key::{
     Algorithm as SshAlgorithm, EcdsaCurve, Error as SshKeyError, Mpint, Signature as SshSignature,
@@ -44,44 +45,25 @@ use x509_cert::spki::{AlgorithmIdentifierOwned, SubjectPublicKeyInfo};
 use x509_cert::time::Validity;
 use x509_cert::{Certificate, TbsCertificate, Version};
 
-use crate::codephrases::{InvalidCodephrase, WORD_SEPARATOR, codephrase, decode_phrase, id_phrase};
+use crate::codephrases::InvalidCodephrase;
 
-/// SHA-256 of a certificate subject or an identity public key,
-/// encoded as a pseudorandom code phrase for storage & transport.
-#[derive(
-    BorshDeserialize,
-    BorshSerialize,
-    Clone,
-    Debug,
-    Deserialize,
-    Eq,
-    Hash,
-    JsonSchema,
-    Ord,
-    PartialEq,
-    PartialOrd,
-    Serialize,
-)]
-pub struct KeyId(String);
-
-impl Deref for KeyId {
-    type Target = str;
-
-    fn deref(&self) -> &Self::Target {
-        &self.0
-    }
-}
-
-impl fmt::Display for KeyId {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "{}", self.0)
-    }
-}
-
-impl From<String> for KeyId {
-    fn from(s: String) -> Self {
-        Self(s)
-    }
+codephrase_newtype! {
+    /// SHA-256 of a certificate subject or an identity public key,
+    /// encoded as a pseudorandom code phrase for storage & transport.
+    #[derive(
+        BorshDeserialize,
+        BorshSerialize,
+        Clone,
+        Deserialize,
+        Eq,
+        Hash,
+        JsonSchema,
+        Ord,
+        PartialEq,
+        PartialOrd,
+        Serialize,
+    )]
+    pub struct KeyId = Truncated;
 }
 
 impl From<&Self> for KeyId {
@@ -95,9 +77,8 @@ impl TryFrom<&Certificate> for KeyId {
     type Error = KeyError;
 
     fn try_from(cert: &Certificate) -> Result<Self, Self::Error> {
-        let hash = Sha256::digest(cert.tbs_certificate.subject_public_key_info.to_der()?);
-        let phrase = id_phrase(U256::from_be_slice(hash.as_slice()));
-        Ok(KeyId(phrase.join(WORD_SEPARATOR)))
+        let hash = blake3::hash(&cert.tbs_certificate.subject_public_key_info.to_der()?);
+        Ok(KeyId::from_hash(hash))
     }
 }
 
@@ -105,9 +86,8 @@ impl TryFrom<&ssh_key::PublicKey> for KeyId {
     type Error = KeyError;
 
     fn try_from(public_key: &ssh_key::PublicKey) -> Result<Self, Self::Error> {
-        let hash = Sha256::digest(public_key.to_bytes()?);
-        let phrase = id_phrase(U256::from_be_slice(hash.as_slice()));
-        Ok(KeyId(phrase.join(WORD_SEPARATOR)))
+        let hash = blake3::hash(&public_key.to_bytes()?);
+        Ok(KeyId::from_hash(hash))
     }
 }
 
@@ -157,6 +137,20 @@ impl Deref for SshPublicKey {
     }
 }
 
+impl BorshSerialize for SshPublicKey {
+    fn serialize<W: Write>(&self, writer: &mut W) -> borsh::io::Result<()> {
+        BorshSerialize::serialize(&self.to_string(), writer)
+    }
+}
+
+impl BorshDeserialize for SshPublicKey {
+    fn deserialize_reader<R: Read>(reader: &mut R) -> borsh::io::Result<Self> {
+        ssh_key::PublicKey::from_openssh(&String::deserialize_reader(reader)?)
+            .map(Self)
+            .map_err(|err| BorshError::new(BorshErrorKind::InvalidData, err))
+    }
+}
+
 impl JsonSchema for SshPublicKey {
     fn schema_name() -> String {
         <String as JsonSchema>::schema_name()
@@ -169,6 +163,48 @@ impl JsonSchema for SshPublicKey {
     fn is_referenceable() -> bool {
         <String as JsonSchema>::is_referenceable()
     }
+}
+
+codephrase_newtype! {
+    /// The first half of a 256 bit elliptic-curve signature: the scalar
+    /// `r` of an ECDSA pair, or the encoded point `R` of an Ed25519
+    /// signature. It is carried as an opaque 256 bit value to which only
+    /// the signature algorithm assigns meaning.
+    #[derive(
+        BorshDeserialize,
+        BorshSerialize,
+        Clone,
+        Deserialize,
+        Eq,
+        Hash,
+        JsonSchema,
+        Ord,
+        PartialEq,
+        PartialOrd,
+        Serialize,
+    )]
+    pub struct EccR = Full;
+}
+
+codephrase_newtype! {
+    /// The second half of a 256 bit elliptic-curve signature: the scalar
+    /// `s` of an ECDSA pair, or the little-endian scalar `S` of an
+    /// Ed25519 signature. It is carried as an opaque 256 bit value like
+    /// [`EccR`].
+    #[derive(
+        BorshDeserialize,
+        BorshSerialize,
+        Clone,
+        Deserialize,
+        Eq,
+        Hash,
+        JsonSchema,
+        Ord,
+        PartialEq,
+        PartialOrd,
+        Serialize,
+    )]
+    pub struct EccS = Full;
 }
 
 /// Code phrase encoded signature.
@@ -194,8 +230,8 @@ impl JsonSchema for SshPublicKey {
     Serialize,
 )]
 pub struct EncodedSignature {
-    pub r: String,
-    pub s: String,
+    pub r: EccR,
+    pub s: EccS,
 
     #[serde(default, skip_serializing_if = "is_zero_flags")]
     pub flags: u8,
@@ -225,8 +261,8 @@ impl EncodedSignature {
             flags: _,
             counter: _,
         } = self;
-        let r = decode_phrase(r)?.to_be_byte_array();
-        let s = decode_phrase(s)?.to_be_byte_array();
+        let r = r.to_be_bytes();
+        let s = s.to_be_bytes();
         match signature_algorithm {
             AlgorithmIdentifierOwned {
                 oid: ECDSA_WITH_SHA_256,
@@ -237,10 +273,7 @@ impl EncodedSignature {
             AlgorithmIdentifierOwned {
                 oid: ID_ED_25519,
                 parameters: None,
-            } => Ok(Signature::Ed25519(Ed25519Signature::from_components(
-                r.into(),
-                s.into(),
-            ))),
+            } => Ok(Signature::Ed25519(Ed25519Signature::from_components(r, s))),
             _ => Err(KeyError::InvalidPublicKeyAlgorithm),
         }
     }
@@ -254,16 +287,13 @@ impl EncodedSignature {
             flags,
             counter,
         } = self;
-        let r = decode_phrase(r)?.to_be_byte_array();
-        let s = decode_phrase(s)?.to_be_byte_array();
+        let r = r.to_be_bytes();
+        let s = s.to_be_bytes();
         match algorithm {
             Ecdsa { curve: NistP256 } => Ok(Signature::EcdsaSha256(
                 ecdsa::Signature::from_scalars(r, s)?,
             )),
-            Ed25519 => Ok(Signature::Ed25519(Ed25519Signature::from_components(
-                r.into(),
-                s.into(),
-            ))),
+            Ed25519 => Ok(Signature::Ed25519(Ed25519Signature::from_components(r, s))),
             SkEcdsaSha2NistP256 => {
                 let mut bytes = BytesMut::new();
                 put_mpint(&mut bytes, r)?;
@@ -312,17 +342,16 @@ impl Signature {
     }
 
     pub fn encode(&self) -> Result<EncodedSignature, KeyError> {
-        let codephrase = |x: U256| codephrase(x).join(WORD_SEPARATOR);
         match self {
             Self::EcdsaSha256(signature) => Ok(EncodedSignature {
-                r: codephrase(U256::from_be_byte_array(signature.r().to_bytes())),
-                s: codephrase(U256::from_be_byte_array(signature.s().to_bytes())),
+                r: EccR::from_be_bytes(signature.r().to_bytes().into()),
+                s: EccS::from_be_bytes(signature.s().to_bytes().into()),
                 flags: 0,
                 counter: 0,
             }),
             Self::Ed25519(signature) => Ok(EncodedSignature {
-                r: codephrase(U256::from_be_slice(signature.r_bytes())),
-                s: codephrase(U256::from_be_slice(signature.s_bytes())),
+                r: EccR::from_be_bytes(*signature.r_bytes()),
+                s: EccS::from_be_bytes(*signature.s_bytes()),
                 flags: 0,
                 counter: 0,
             }),
@@ -333,8 +362,8 @@ impl Signature {
                 let s = get_mpint(&mut signature)?;
                 let e = || KeyError::InvalidSignatureEncoding;
                 Ok(EncodedSignature {
-                    r: codephrase(u256_be(r.as_positive_bytes().ok_or_else(e)?)?),
-                    s: codephrase(u256_be(s.as_positive_bytes().ok_or_else(e)?)?),
+                    r: EccR::from_be_bytes(u256_be(r.as_positive_bytes().ok_or_else(e)?)?),
+                    s: EccS::from_be_bytes(u256_be(s.as_positive_bytes().ok_or_else(e)?)?),
                     flags,
                     counter,
                 })
@@ -343,8 +372,8 @@ impl Signature {
                 let (signature, flags, counter) = sk_split(signature.as_bytes())?;
                 let signature = Ed25519Signature::from_slice(signature)?;
                 Ok(EncodedSignature {
-                    r: codephrase(U256::from_be_slice(signature.r_bytes())),
-                    s: codephrase(U256::from_be_slice(signature.s_bytes())),
+                    r: EccR::from_be_bytes(*signature.r_bytes()),
+                    s: EccS::from_be_bytes(*signature.s_bytes()),
                     flags,
                     counter,
                 })
@@ -405,13 +434,13 @@ impl Signature {
 
 /// A `U256` from up to 32 big-endian bytes. An mpint's minimal
 /// encoding may carry fewer, which `U256::from_be_slice` refuses.
-fn u256_be(bytes: &[u8]) -> Result<U256, KeyError> {
+fn u256_be(bytes: &[u8]) -> Result<[u8; 32], KeyError> {
     let Some(pad) = 32usize.checked_sub(bytes.len()) else {
         return Err(KeyError::InvalidSignatureEncoding);
     };
     let mut buf = [0; 32];
     buf[pad..].copy_from_slice(bytes);
-    Ok(U256::from_be_slice(&buf))
+    Ok(buf)
 }
 
 /// Append one SSH mpint, encoded from positive big-endian bytes.
@@ -769,6 +798,41 @@ impl EphemeralKey {
         Ok(Self { key, key_id, cert })
     }
 
+    /// Ephemeral key with cert signed by an external authority,
+    /// e.g., a platform RoT. `sign` takes the TBS certificate DER
+    /// and returns raw signature bytes in whatever convention the
+    /// authority and its verifiers share. `signature_algorithm` is
+    /// the authority's claimed scheme. A nonstandard convention has
+    /// no identifier of its own, so the cert may not verify under
+    /// the algorithm it declares.
+    pub fn new_delegated<E: fmt::Display>(
+        key_type: KeyType,
+        subject: Name,
+        issuer: Name,
+        validity: Validity,
+        signature_algorithm: AlgorithmIdentifierOwned,
+        sign: impl FnOnce(&[u8]) -> Result<Vec<u8>, E>,
+    ) -> Result<Self, KeyError> {
+        let key = SigningKey::new(key_type);
+        let tbs_certificate = Self::tbs_certificate(
+            &key,
+            Self::generate_serial_number()?,
+            signature_algorithm,
+            subject,
+            issuer,
+            validity,
+        );
+        let tbs = tbs_certificate.to_der()?;
+        let signature = sign(&tbs).map_err(KeyError::signer)?;
+        let cert = Certificate {
+            signature_algorithm: tbs_certificate.signature.to_owned(),
+            signature: BitString::from_bytes(&signature)?,
+            tbs_certificate,
+        };
+        let key_id = KeyId::try_from(&cert)?;
+        Ok(Self { key, key_id, cert })
+    }
+
     /// Ephemeral key with cert signed by a parent.
     pub async fn new_child(
         key_type: KeyType,
@@ -804,6 +868,15 @@ impl EphemeralKey {
 
     pub fn cert(&self) -> &Certificate {
         &self.cert
+    }
+
+    /// Export the private key as PKCS#8 PEM, e.g., for TLS.
+    pub fn private_key_pem(&self) -> Result<String, KeyError> {
+        let pem = match &self.key {
+            SigningKey::Ed25519(key) => key.to_pkcs8_pem(LineEnding::LF)?,
+            SigningKey::P256(key) => key.to_pkcs8_pem(LineEnding::LF)?,
+        };
+        Ok(pem.to_string())
     }
 
     pub fn subject(&self) -> Name {
@@ -941,6 +1014,8 @@ pub enum KeyError {
     MissingCert(KeyId),
     #[error(transparent)]
     Pem(#[from] pem_rfc7468::Error),
+    #[error("PKCS#8 encoding error: {0}")]
+    Pkcs8(#[from] pkcs8::Error),
     #[error("Certificate for key `{0}` was revoked at {1}")]
     Revoked(KeyId, DateTime<Utc>),
     #[error("Will not import a self-signed (root) certificate")]
@@ -1006,10 +1081,10 @@ mod test {
         .unwrap();
         let mut signatures = HashSet::new();
         for _ in 0..100 {
-            let nonce = Nonce::generate();
-            let signed = key.sign(nonce.as_bytes()).await.unwrap();
+            let nonce = Nonce::random();
+            let signed = key.sign(nonce.to_be_bytes()).await.unwrap();
             assert_eq!(signed.key_id(), key.key_id());
-            assert_eq!(*signed.payload(), nonce.as_bytes());
+            assert_eq!(*signed.payload(), nonce.to_be_bytes());
             let signature = signed.signature();
             assert!(signatures.insert(signature.clone()), "duplicate signature");
             let signature_string = serde_json::to_string(&signature).unwrap();
@@ -1022,7 +1097,7 @@ mod test {
             );
             let verified = signed.verify_with_cert(key.cert()).unwrap();
             assert_eq!(verified.verified_by(), key.key_id());
-            assert_eq!(verified.into_payload(), nonce.as_bytes());
+            assert_eq!(verified.into_payload(), nonce.to_be_bytes());
         }
     }
 }

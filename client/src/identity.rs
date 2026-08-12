@@ -173,7 +173,7 @@ impl IdentityError {
 mod test {
     use std::time::Duration;
 
-    use sush_common::codephrases::{PHRASE_WORDS_ID, WORD_SEPARATOR, generate_id};
+    use sush_common::codephrases::Codephrase;
     use tempfile::TempDir;
     use tokio::process::Command;
 
@@ -224,12 +224,9 @@ mod test {
 
         let mut agent = SshAgentConnection::connect(&sock).await.unwrap();
         for key in agent.list_identities().await.unwrap() {
-            let key_id = key.key_id().unwrap();
-            assert_eq!(key_id.split(WORD_SEPARATOR).count(), PHRASE_WORDS_ID);
-
-            let nonce = generate_id();
-            let signature = agent.sign_with(&key, nonce.as_bytes()).await.unwrap();
-            key.verify(nonce.as_bytes(), &signature).unwrap();
+            let nonce = Codephrase::random();
+            let signature = agent.sign_with(&key, &nonce.to_be_bytes()).await.unwrap();
+            key.verify(&nonce.to_be_bytes(), &signature).unwrap();
         }
 
         agent_process

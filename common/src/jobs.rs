@@ -14,7 +14,6 @@ use blake3::{Hash, Hasher, hash};
 use borsh::{BorshDeserialize, BorshSerialize};
 use bytesize::GB;
 use chrono::{DateTime, TimeDelta, Utc};
-use crypto_bigint::U256;
 use rlimit::Resource;
 use schemars::schema::{Schema, SchemaObject};
 use schemars::{JsonSchema, SchemaGenerator};
@@ -24,77 +23,30 @@ use sled_hardware_types::{BaseboardId, BaseboardIdParseError};
 use thiserror::Error;
 
 use crate::borsh::{
-    borsh_de_datetime, borsh_de_hash, borsh_de_job_id, borsh_ser_datetime, borsh_ser_hash,
-};
-use crate::codephrases::{
-    InvalidCodephrase, WORD_SEPARATOR, decode_phrase, generate_id, id_phrase,
+    borsh_de_datetime, borsh_de_hash, borsh_de_target, borsh_ser_datetime, borsh_ser_hash,
+    borsh_ser_target,
 };
 use crate::interactive::InteractiveJobError;
 use crate::keys::{KeyId, Signed, ToBeSigned, Verified};
+use crate::targets::Target;
 
-/// A globally unique identifier for a job within a session.
-#[derive(
-    BorshDeserialize,
-    BorshSerialize,
-    Clone,
-    Debug,
-    Deserialize,
-    Eq,
-    Hash,
-    JsonSchema,
-    Ord,
-    PartialEq,
-    PartialOrd,
-    Serialize,
-)]
-#[serde(try_from = "String")]
-pub struct JobId(#[borsh(deserialize_with = "borsh_de_job_id")] String);
-
-impl Deref for JobId {
-    type Target = str;
-
-    fn deref(&self) -> &Self::Target {
-        &self.0
-    }
-}
-
-impl fmt::Display for JobId {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "{}", self.0)
-    }
-}
-
-impl From<&Self> for JobId {
-    fn from(other: &Self) -> Self {
-        other.to_owned()
-    }
-}
-
-impl From<U256> for JobId {
-    fn from(value: U256) -> Self {
-        Self(id_phrase(value).join(WORD_SEPARATOR))
-    }
-}
-
-impl FromStr for JobId {
-    type Err = InvalidCodephrase;
-
-    fn from_str(s: &str) -> Result<Self, Self::Err> {
-        let p = id_phrase(decode_phrase(s)?).join(WORD_SEPARATOR);
-        if p == *s {
-            Ok(Self(p))
-        } else {
-            Err(InvalidCodephrase)
-        }
-    }
-}
-
-impl TryFrom<String> for JobId {
-    type Error = InvalidCodephrase;
-
-    fn try_from(s: String) -> Result<Self, Self::Error> {
-        JobId::from_str(&s)
-    }
+codephrase_newtype! {
+    /// A globally unique identifier for a job within a session.
+    #[derive(
+        BorshDeserialize,
+        BorshSerialize,
+        Copy,
+        Clone,
+        Deserialize,
+        Eq,
+        Hash,
+        JsonSchema,
+        Ord,
+        PartialEq,
+        PartialOrd,
+        Serialize,
+    )]
+    pub struct JobId = Truncated;
 }
 
 impl slog::Value for JobId {
@@ -104,73 +56,46 @@ impl slog::Value for JobId {
         key: slog::Key,
         serializer: &mut dyn slog::Serializer,
     ) -> slog::Result {
-        serializer.emit_str(key, self)
+        serializer.emit_str(key, &self.0.to_string())
     }
 }
 
-/// A globally unique identifier for a session.
-#[derive(
-    BorshDeserialize,
-    BorshSerialize,
-    Clone,
-    Debug,
-    Deserialize,
-    Eq,
-    Hash,
-    JsonSchema,
-    Ord,
-    PartialEq,
-    PartialOrd,
-    Serialize,
-)]
-pub struct SessionId(String);
-
-#[allow(clippy::new_without_default)]
-impl SessionId {
-    pub fn new() -> Self {
-        Self(generate_id())
+impl From<&JobId> for JobId {
+    fn from(value: &JobId) -> Self {
+        *value
     }
+}
 
+codephrase_newtype! {
+    /// A globally unique identifier for a session.
+    #[derive(
+        BorshDeserialize,
+        BorshSerialize,
+        Copy,
+        Clone,
+        Deserialize,
+        Eq,
+        Hash,
+        JsonSchema,
+        Ord,
+        PartialEq,
+        PartialOrd,
+        Serialize,
+    )]
+    pub struct SessionId = Truncated;
+}
+
+impl SessionId {
     pub fn first_job_id(&self) -> JobId {
-        U256::from_be_slice(hash(self.0.as_bytes()).as_bytes()).into()
+        JobId::from_hash(hash(&self.0.to_be_bytes()))
     }
 
     pub fn next_job_id(&self, last_job: &LastJob) -> JobId {
-        U256::from_be_slice(
-            match last_job {
-                LastJob::None => hash(&[b"None", self.0.as_bytes()].concat()),
-                LastJob::Some(job) => hash(&[b"Some", job.to_be_signed().as_slice()].concat()),
-                LastJob::Burned(job_id) => hash(&[b"Burned", job_id.as_bytes()].concat()),
-            }
-            .as_bytes(),
-        )
-        .into()
-    }
-}
-
-impl Deref for SessionId {
-    type Target = str;
-
-    fn deref(&self) -> &Self::Target {
-        &self.0
-    }
-}
-
-impl fmt::Display for SessionId {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "{}", self.0)
-    }
-}
-
-impl From<&Self> for SessionId {
-    fn from(other: &Self) -> Self {
-        other.to_owned()
-    }
-}
-
-impl<S: AsRef<str>> From<S> for SessionId {
-    fn from(s: S) -> Self {
-        Self(s.as_ref().to_string())
+        JobId::from_hash(match last_job {
+            LastJob::None => hash(&[b"None", self.0.to_be_bytes().as_slice()].concat()),
+            LastJob::Some(job) => hash(&[b"Some", job.to_be_signed().as_slice()].concat()),
+            LastJob::Burned(job_id) => hash(&[b"Burned", job_id.to_be_bytes().as_slice()].concat()),
+        })
     }
 }
 
@@ -208,8 +133,8 @@ impl Session {
         }
     }
 
-    pub fn session_id(&self) -> &SessionId {
-        &self.session_id
+    pub fn session_id(&self) -> SessionId {
+        self.session_id
     }
 
     pub fn started_by(&self) -> Option<&KeyId> {
@@ -256,6 +181,13 @@ pub struct JobStartRequest {
     pub command: String,
     #[serde(default, skip_serializing_if = "is_false")]
     pub interactive: bool,
+    /// The sleds this job runs on.
+    #[borsh(
+        serialize_with = "borsh_ser_target",
+        deserialize_with = "borsh_de_target"
+    )]
+    #[serde(default, skip_serializing_if = "Target::is_all")]
+    pub target: Target,
 }
 
 fn is_false(x: &bool) -> bool {
@@ -265,11 +197,17 @@ fn is_false(x: &bool) -> bool {
 impl JobStartRequest {
     const TYPE_NAME: &[u8] = b"sush_common::jobs::JobStartRequest";
 
-    pub fn new<S: AsRef<str>>(job_id: JobId, command: S, interactive: bool) -> Self {
+    pub fn new<S: AsRef<str>>(
+        job_id: JobId,
+        command: S,
+        interactive: bool,
+        target: Target,
+    ) -> Self {
         Self {
             job_id,
             command: command.as_ref().to_string(),
             interactive,
+            target,
         }
     }
 
@@ -283,6 +221,10 @@ impl JobStartRequest {
 
     pub fn interactive(&self) -> bool {
         self.interactive
+    }
+
+    pub fn target(&self) -> &Target {
+        &self.target
     }
 }
 
@@ -299,11 +241,13 @@ impl ToBeSigned for JobStartRequest {
             job_id,
             command,
             interactive,
+            target,
         } = self;
         hash_with_len(Self::TYPE_NAME);
-        hash_with_len(job_id.as_bytes());
+        hash_with_len(&job_id.to_be_bytes());
         hash_with_len(command.as_bytes());
         hash_with_len(if *interactive { &[1] } else { &[0] });
+        hash_with_len(target.to_string().as_bytes());
         hasher.finalize().as_bytes().to_vec()
     }
 }
@@ -471,6 +415,14 @@ impl ExecutionError {
 }
 
 impl JobStatus {
+    /// Whether this status can ever change again.
+    pub fn is_terminal(&self) -> bool {
+        matches!(
+            self,
+            Self::Cancelled { .. } | Self::Error { .. } | Self::Stopped { .. }
+        )
+    }
+
     /// The most recent timestamp recorded for this status.
     pub fn time(&self) -> DateTime<Utc> {
         match self {

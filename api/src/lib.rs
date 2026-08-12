@@ -74,6 +74,7 @@ pub trait SushApi {
     async fn iam(
         ctx: RequestContext<Self::Context>,
         headers: Header<Authorization>,
+        query: QueryParams<RoutingParam>,
         body: TypedBody<Option<SshPublicKey>>,
     ) -> Result<HttpResponseOk<Identity>, HttpError>;
 
@@ -88,14 +89,14 @@ pub trait SushApi {
 
     /// Revoke an SSH identity.
     ///
-    /// Expires the key's cached identities and refuses its future
-    /// logins. Identities are not shared across the rack, so this
-    /// applies only to the server handling the request.
+    /// Expires the key's identities and refuses its future logins,
+    /// across the rack.
     #[endpoint { method = POST, path = "/iam/{key_id}/revoke" }]
     async fn iam_revoke(
         ctx: RequestContext<Self::Context>,
         headers: Header<Authorization>,
         params: PathParams<KeyIdParam>,
+        query: QueryParams<WaitParam>,
     ) -> Result<HttpResponseUpdatedNoContent, HttpError>;
 
     // Session management.
@@ -194,6 +195,7 @@ pub trait SushApi {
         ctx: RequestContext<Self::Context>,
         headers: Header<AuthorizedRangeRequest>,
         params: PathParams<JobOutputParams>,
+        query: QueryParams<RoutingParam>,
     ) -> Result<Response<Body>, HttpError>;
 
     /// Attach to an interactive job.
@@ -205,6 +207,7 @@ pub trait SushApi {
         ctx: RequestContext<Self::Context>,
         headers: Header<Authorization>,
         params: PathParams<JobAttachParams>,
+        query: QueryParams<RoutingParam>,
         upgrade: WebsocketUpgrade,
     ) -> WebsocketEndpointResult;
 
@@ -220,11 +223,22 @@ pub trait SushApi {
     ) -> Result<HttpResponseOk<Vec<JsonJobStatusMap>>, HttpError>;
 
     /// Get the baseboard ID of the sled handling this request.
+    ///
+    /// Unauthenticated: discovery must work before anyone can log in,
+    /// and this reveals only the sled's baseboard. Routed through a
+    /// proxy, this resolves a target expression to a baseboard.
     #[endpoint { method = GET, path = "/target" }]
     async fn target(
         ctx: RequestContext<Self::Context>,
-        headers: Header<Authorization>,
+        query: QueryParams<RoutingParam>,
     ) -> Result<HttpResponseOk<BaseboardId>, HttpError>;
+}
+
+/// A routing hint for a fronting proxy. Sleds ignore it.
+#[derive(Deserialize, JsonSchema)]
+pub struct RoutingParam {
+    /// Where a proxy should route this request.
+    pub via: Option<String>,
 }
 
 #[derive(Deserialize, JsonSchema)]

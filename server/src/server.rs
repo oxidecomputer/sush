@@ -4,6 +4,8 @@
 
 //! API server for the Oxide Support Shell.
 
+use std::sync::Arc;
+
 use dropshot::{
     Body, CONTENT_TYPE_OCTET_STREAM, ClientErrorStatusCode, Header, HttpError, HttpResponseOk,
     HttpResponseUpdatedNoContent, Path as PathParams, Query as QueryParams, RequestContext,
@@ -23,8 +25,8 @@ use x509_cert::der::DecodePem as _;
 
 use sush_api::{
     AccessParam, Authorization, AuthorizedRangeRequest, JobAttachParams, JobHistoryParams,
-    JobIdParam, JobOutputParams, JobStartParams, JobStopParams, KeyIdParam, SessionAndJobIds,
-    SessionAndKeyIds, SessionIdParam, SushApi, WaitParam,
+    JobIdParam, JobOutputParams, JobStartParams, JobStopParams, KeyIdParam, RoutingParam,
+    SessionAndJobIds, SessionAndKeyIds, SessionIdParam, SushApi, WaitParam,
 };
 use sush_common::authn::Identity;
 use sush_common::jobs::{JsonJobStatusMap, Session, SignedJob, job_status_to_json_map};
@@ -48,7 +50,7 @@ fn request_line(request: &dropshot::RequestInfo) -> (&str, &str) {
 }
 
 impl SushApi for ApiServer {
-    type Context = JobManager;
+    type Context = Arc<JobManager>;
 
     // Certificate management.
 
@@ -109,6 +111,7 @@ impl SushApi for ApiServer {
     async fn iam(
         ctx: RequestContext<Self::Context>,
         headers: Header<Authorization>,
+        _query: QueryParams<RoutingParam>,
         body: TypedBody<Option<SshPublicKey>>,
     ) -> Result<HttpResponseOk<Identity>, HttpError> {
         let mgr = ctx.context();
@@ -136,6 +139,7 @@ impl SushApi for ApiServer {
         ctx: RequestContext<Self::Context>,
         headers: Header<Authorization>,
         params: PathParams<KeyIdParam>,
+        query: QueryParams<WaitParam>,
     ) -> Result<HttpResponseUpdatedNoContent, HttpError> {
         let mgr = ctx.context();
         let Authorization { authorization } = headers.into_inner();
@@ -143,7 +147,8 @@ impl SushApi for ApiServer {
             .iam(authorization, None, request_line(&ctx.request))
             .await?;
         let KeyIdParam { key_id } = params.into_inner();
-        mgr.iam_revoke(&authn, key_id).await?;
+        let WaitParam { wait } = query.into_inner();
+        mgr.iam_revoke(&authn, key_id, wait).await?;
         Ok(HttpResponseUpdatedNoContent())
     }
 
@@ -178,7 +183,7 @@ impl SushApi for ApiServer {
             .await?;
         let WaitParam { wait } = query.into_inner();
         let SessionIdParam { session_id } = params.into_inner();
-        mgr.session_start(&authn, session_id.clone(), wait).await?;
+        mgr.session_start(&authn, session_id, wait).await?;
         Ok(HttpResponseUpdatedNoContent())
     }
 
@@ -308,6 +313,7 @@ impl SushApi for ApiServer {
         ctx: RequestContext<Self::Context>,
         headers: Header<AuthorizedRangeRequest>,
         params: PathParams<JobOutputParams>,
+        _query: QueryParams<RoutingParam>,
     ) -> Result<Response<Body>, HttpError> {
         let mgr = ctx.context();
         let headers = headers.into_inner();
@@ -348,6 +354,7 @@ impl SushApi for ApiServer {
         ctx: RequestContext<Self::Context>,
         headers: Header<Authorization>,
         params: PathParams<JobAttachParams>,
+        _query: QueryParams<RoutingParam>,
         upgrade: WebsocketUpgrade,
     ) -> WebsocketEndpointResult {
         let mgr = ctx.context();
@@ -403,13 +410,8 @@ impl SushApi for ApiServer {
 
     async fn target(
         ctx: RequestContext<Self::Context>,
-        headers: Header<Authorization>,
+        _query: QueryParams<RoutingParam>,
     ) -> Result<HttpResponseOk<BaseboardId>, HttpError> {
-        let mgr = ctx.context();
-        let Authorization { authorization } = headers.into_inner();
-        let _authn = mgr
-            .iam(authorization, None, request_line(&ctx.request))
-            .await?;
-        Ok(HttpResponseOk(mgr.own_baseboard().to_owned()))
+        Ok(HttpResponseOk(ctx.context().own_baseboard().to_owned()))
     }
 }

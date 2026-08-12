@@ -104,7 +104,7 @@ impl JobHistory {
         if let Some(queued) = queued {
             ineligible.extend(queued.keys().cloned());
         }
-        ineligible.extend(running.iter().map(|((id, _), _)| id.clone()));
+        ineligible.extend(running.iter().map(|((id, _), _)| *id));
 
         // Cache causal jobs.
         let causal = self

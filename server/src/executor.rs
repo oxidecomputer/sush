@@ -130,9 +130,9 @@ impl Executor {
         };
 
         let stop = self.shutdown.child_token();
-        self.stop.insert(job_id.clone(), stop.clone());
+        self.stop.insert(job_id, stop.clone());
         spawn(job_spawn(
-            self.log.new(o!("job_id" => job_id.clone())),
+            self.log.new(o!("job_id" => job_id)),
             events,
             self.output_dir.clone(),
             verified_request,
@@ -177,6 +177,7 @@ async fn job_spawn(
         job_id,
         command,
         interactive,
+        target: _,
     } = request.payload().clone();
     let JobStartParams {
         limits: requested,
@@ -185,12 +186,25 @@ async fn job_spawn(
         cols,
         wait: _,
     } = params;
-    let limits = requested.clone().clamp();
+    let mut limits = requested.clone().clamp();
     if limits != requested {
         warn!(
             log, "clamped requested job limits";
             "requested" => ?requested, "limits" => ?limits,
         );
+    }
+
+    // Ensure consistent output dirs.
+    let dirs = output_dir.current();
+
+    // Clamp max file size to output requirements.
+    if limits.max_fsize > dirs.max_fsize() {
+        warn!(
+            log, "clamping requested job output size limit";
+            "requested" => limits.max_fsize,
+            "max_fsize" => dirs.max_fsize(),
+        );
+        limits.max_fsize = dirs.max_fsize();
     }
 
     // Report all I/O errors as job events.
@@ -210,7 +224,7 @@ async fn job_spawn(
     // Set up output directories and files.
     let dir_mode = 0o700;
     let file_mode = 0o600;
-    let job_dir = output_dir.job_output_dir(&job_id);
+    let job_dir = dirs.job_output_dir(&job_id);
     with_io_err!(
         DirBuilder::new()
             .recursive(true)
@@ -219,8 +233,8 @@ async fn job_spawn(
             .await,
         format!("creating job output directory `{}`", job_dir.display())
     );
-    let stdout_path = output_dir.job_output_path(&job_id, Stdout);
-    let stderr_path = output_dir.job_output_path(&job_id, Stderr);
+    let stdout_path = dirs.job_output_path(&job_id, Stdout);
+    let stderr_path = dirs.job_output_path(&job_id, Stderr);
     let stdout_file = with_io_err!(
         OpenOptions::new()
             .create_new(true)
@@ -358,7 +372,7 @@ async fn job_spawn(
 
     // Announce the birth of our new job!
     let _ = events
-        .send(Event::Job(JobEvent::Start(job_id.clone(), Utc::now())))
+        .send(Event::Job(JobEvent::Start(job_id, Utc::now())))
         .await;
 
     // Wait for the job to die and send an event when it does.
@@ -367,7 +381,7 @@ async fn job_spawn(
             Ok((result, state)) => {
                 let _ = events
                     .send(Event::Job(JobEvent::Stop(
-                        job_id.clone(),
+                        job_id,
                         Utc::now(),
                         result,
                         state,
@@ -377,7 +391,7 @@ async fn job_spawn(
             Err(error) => {
                 let _ = events
                     .send(Event::Job(JobEvent::Error(
-                        job_id.clone(),
+                        job_id,
                         Utc::now(),
                         ProcessError::Join(error.to_string()),
                     )))

@@ -7,11 +7,16 @@
 #[macro_use]
 extern crate function_name;
 
+#[cfg(all(feature = "embedded", feature = "test-support"))]
+compile_error!("`test-support` must not be enabled for an embedded server");
+
 pub mod error;
 pub mod executor;
+pub mod gossip;
 pub mod history;
 pub mod io;
 pub mod job;
+pub mod link;
 pub mod manager;
 pub mod messages;
 pub mod mux;
@@ -22,6 +27,7 @@ pub mod server;
 pub mod state;
 
 pub use error::JobError;
-pub use manager::JobManager;
+pub use manager::{JobManager, read_root_certs};
 pub use proxy::ProxyServer;
 pub use server::ApiServer;
+pub use state::seed_gossip;

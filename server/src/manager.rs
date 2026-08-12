@@ -6,21 +6,23 @@
 //! state machine. Does not manage jobs directly.
 
 use std::num::NonZeroUsize;
-use std::path::PathBuf;
+use std::path::Path;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use chrono::{DateTime, Utc};
+use chrono::Utc;
 use http_range_header::SyntacticallyCorrectRange as Range;
 use lru::LruCache;
 use sled_hardware_types::BaseboardId;
 use slog::{Logger, debug, info, o, warn};
+use tokio::fs::read;
 use tokio::sync::{Mutex, mpsc, watch};
 use tokio::task::JoinHandle;
 use tokio::time::timeout;
 use tokio_stream::wrappers::ReceiverStream;
 use tokio_util::sync::CancellationToken;
 use x509_cert::Certificate;
+use x509_cert::der::DecodePem as _;
 
 use sush_api::{JobStartParams, JobStopParams, JobWait};
 use sush_common::authn::{
@@ -30,11 +32,12 @@ use sush_common::authn::{
 use sush_common::jobs::JobOutputStream;
 use sush_common::jobs::{Access, JobId, JobStatusMap, Session, SessionId, SignedJob};
 use sush_common::keys::{KeyError, KeyId, SshPublicKey};
+use sush_common::targets::Cubbies;
 
 use crate::error::JobError;
 use crate::executor::PathIsolation;
 use crate::job::SocketSender;
-use crate::messages::v0::{CertRequest, JobRequest, Request, SessionRequest};
+use crate::messages::v0::{CertRequest, IdentityRequest, JobRequest, Request, SessionRequest};
 use crate::output::{JobOutputDir, JobOutputFileStream};
 use crate::state::{GossipNetwork, MAX_CERTS, State, StateManager};
 
@@ -46,13 +49,6 @@ const MAX_CACHED_IDENTITIES: NonZeroUsize = NonZeroUsize::new(1_000).unwrap();
 /// is sized so a flood must sustain hundreds of requests per second
 /// for the whole nonce TTL to lock a user out.
 const MAX_OUTSTANDING_NONCES: NonZeroUsize = NonZeroUsize::new(10_000).unwrap();
-
-/// Maximum number of revoked SSH keys remembered for login refusal.
-/// Any authenticated key may revoke, so a flood of junk revocations
-/// can evict a real one. Entries never expire, so unlike nonces the
-/// eviction is permanent. This is sized so the flood takes thousands
-/// of authenticated, attributed, logged requests.
-const MAX_REVOKED_KEYS: NonZeroUsize = NonZeroUsize::new(10_000).unwrap();
 
 /// Maximum amount of time we're willing to wait for job start or stop.
 const WAIT_TIMEOUT: Duration = Duration::from_secs(600);
@@ -85,7 +81,6 @@ pub struct JobManager {
     log: Logger,
     nonces: Arc<Mutex<LruCache<Nonce, Instant>>>,
     identities: Arc<Mutex<LruCache<(KeyId, Nonce), CachedIdentity>>>,
-    revoked_keys: Arc<Mutex<LruCache<KeyId, DateTime<Utc>>>>,
     output_dir: JobOutputDir,
     own_baseboard: BaseboardId,
     state: watch::Receiver<State>, // from the state manager
@@ -94,16 +89,44 @@ pub struct JobManager {
 }
 
 impl JobManager {
+    /// Trust the root certificates in `roots`, one PEM-encoded certificate
+    /// per file.
+    #[allow(clippy::too_many_arguments)]
     pub async fn new(
         log: Logger,
         path_isolation: PathIsolation,
-        output_dir: PathBuf,
+        output_dir: JobOutputDir,
         own_baseboard: BaseboardId,
-        rumors: GossipNetwork,
+        cubbies: watch::Receiver<Cubbies>,
+        universe: watch::Receiver<GossipNetwork>,
+        roots: &[impl AsRef<Path>],
+        shutdown: CancellationToken,
+    ) -> Result<Self, JobError> {
+        let roots = read_root_certs(roots).await?;
+        Self::with_root_certs(
+            log,
+            path_isolation,
+            output_dir,
+            own_baseboard,
+            cubbies,
+            universe,
+            &roots,
+            shutdown,
+        )
+        .await
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub async fn with_root_certs(
+        log: Logger,
+        path_isolation: PathIsolation,
+        output_dir: JobOutputDir,
+        own_baseboard: BaseboardId,
+        cubbies: watch::Receiver<Cubbies>,
+        universe: watch::Receiver<GossipNetwork>,
         roots: &[Certificate],
         shutdown: CancellationToken,
     ) -> Result<Self, JobError> {
-        let output_dir = JobOutputDir::new(output_dir);
         let (tx_req, rx_req) = mpsc::channel(16);
         let requests = ReceiverStream::new(rx_req);
         let (rx_state, join_state) = StateManager::run(
@@ -112,15 +135,15 @@ impl JobManager {
             output_dir.clone(),
             own_baseboard.clone(),
             requests,
-            rumors,
+            cubbies,
+            universe,
             roots,
             shutdown,
-        );
+        )?;
         Ok(Self {
             log: log.new(o!("component" => "job manager")),
             nonces: Arc::new(Mutex::new(LruCache::new(MAX_OUTSTANDING_NONCES))),
             identities: Arc::new(Mutex::new(LruCache::new(MAX_CACHED_IDENTITIES))),
-            revoked_keys: Arc::new(Mutex::new(LruCache::new(MAX_REVOKED_KEYS))),
             own_baseboard,
             output_dir,
             state: rx_state,
@@ -154,6 +177,17 @@ impl JobManager {
     async fn job_request(&self, authn: &Identity, request: JobRequest) -> Result<(), JobError> {
         self.tx_req
             .send(Request::job(authn.key_id.clone(), request))
+            .await
+            .map_err(|_| JobError::ChannelClosed)
+    }
+
+    async fn identity_request(
+        &self,
+        actor: KeyId,
+        request: IdentityRequest,
+    ) -> Result<(), JobError> {
+        self.tx_req
+            .send(Request::identity(actor, request))
             .await
             .map_err(|_| JobError::ChannelClosed)
     }
@@ -222,7 +256,7 @@ impl JobManager {
         macro_rules! unauthorized {
             ($error:expr) => {{
                 warn!(self.log, "authentication failed"; "error" => %$error);
-                let nonce = Nonce::generate();
+                let nonce = Nonce::random();
                 self.nonces.lock().await.put(nonce.clone(), Instant::now());
                 return Err(JobError::unauthorized(nonce));
             }};
@@ -252,6 +286,26 @@ impl JobManager {
             Authn::Bound(bound) => {
                 let mut identities = self.identities.lock().await;
                 let cache_key = (bound.key_id.clone(), bound.nonce.clone());
+                // A login elsewhere on the rack reaches us as a
+                // registered identity. Adopt it on first use.
+                if !identities.contains(&cache_key) {
+                    let Some(registered) =
+                        self.state.borrow().registered_identity(&cache_key).cloned()
+                    else {
+                        unauthorized!("unknown identity");
+                    };
+                    debug!(self.log, "adopting registered identity"; "key_id" => %bound.key_id);
+                    identities.put(
+                        cache_key.clone(),
+                        CachedIdentity {
+                            identity: registered.identity,
+                            verifier: registered.verifier,
+                            window: SeqWindow::default(),
+                            authenticated: Instant::now(),
+                            last_used: Instant::now(),
+                        },
+                    );
+                }
                 let Some(cached) = identities.get_mut(&cache_key) else {
                     unauthorized!("unknown identity");
                 };
@@ -280,7 +334,7 @@ impl JobManager {
         }
 
         // Refuse revoked keys.
-        if self.revoked_keys.lock().await.get(&key_id).is_some() {
+        if self.state.borrow().is_key_revoked(&key_id) {
             unauthorized!("key is revoked");
         }
 
@@ -300,13 +354,14 @@ impl JobManager {
             unauthorized!("invalid key ID");
         }
         let response = credentials.clone().into_challenge_response();
-        let verified = try_authn!(response.verify_with_ssh_public_key(&public_key));
-        let identity = try_authn!(Identity::new(public_key.to_owned(), verified, now));
+        let verified = try_authn!(response.clone().verify_with_ssh_public_key(&public_key));
+        let identity = try_authn!(Identity::new(public_key.clone(), verified, now));
 
-        // Authenticated! Cache the identity and its request verifier.
+        // Authenticated! Cache the identity and its request verifier,
+        // and gossip the evidence.
         debug!(self.log, "authenticated credentials for identity"; "key_id" => %key_id);
         self.identities.lock().await.put(
-            (key_id.to_owned(), nonce),
+            (key_id.clone(), nonce),
             CachedIdentity {
                 identity: identity.clone(),
                 verifier: credentials.epk,
@@ -315,7 +370,10 @@ impl JobManager {
                 last_used: Instant::now(),
             },
         );
-        Ok(identity)
+        let login = IdentityRequest::Login(public_key, response);
+        self.identity_request(key_id, login)
+            .await
+            .map(|()| identity)
     }
 
     pub async fn identities(&self, _authn: &Identity) -> Result<Vec<Identity>, JobError> {
@@ -329,15 +387,27 @@ impl JobManager {
             .collect())
     }
 
-    pub async fn iam_revoke(&self, _authn: &Identity, key_id: KeyId) -> Result<(), JobError> {
+    pub async fn iam_revoke(
+        &self,
+        authn: &Identity,
+        key_id: KeyId,
+        wait: bool,
+    ) -> Result<(), JobError> {
         let now = Utc::now();
         let mut identities = self.identities.lock().await;
         for (_, cached) in identities.iter_mut().filter(|((id, _), _)| *id == key_id) {
             cached.identity.time_revoked = Some(now);
         }
         drop(identities);
-        self.revoked_keys.lock().await.put(key_id.clone(), now);
-        info!(self.log, "revoked identity"; "key_id" => %key_id);
+        info!(self.log, "revoking identity"; "key_id" => %key_id, "actor" => %authn.key_id);
+        self.identity_request(
+            authn.key_id.clone(),
+            IdentityRequest::Revoke(key_id.clone(), now),
+        )
+        .await?;
+        if wait {
+            self.wait_for(self.wait_for_key_revocation(key_id)).await?;
+        }
         Ok(())
     }
 
@@ -355,11 +425,15 @@ impl JobManager {
         move |state| state.is_cert_revoked(&key_id)
     }
 
+    fn wait_for_key_revocation(&self, key_id: KeyId) -> impl FnMut(&State) -> bool {
+        move |state| state.is_key_revoked(&key_id)
+    }
+
     fn wait_for_session(&self, session_id: SessionId) -> impl FnMut(&State) -> bool {
         move |state| {
             state
                 .session()
-                .is_some_and(|s| *s.session_id() == session_id)
+                .is_some_and(|s| s.session_id() == session_id)
         }
     }
 
@@ -386,9 +460,8 @@ impl JobManager {
     }
 
     /// Wait until the local state manager has recorded *any* status for
-    /// this job on this baseboard, including `Queued`. Used only to make
-    /// the `Queued` state observable in tests.
-    #[cfg(feature = "test-support")]
+    /// this job on this baseboard, including `Queued`. This is what makes the
+    /// `Queued` state observable.
     pub async fn wait_for_job_status(&self, job_id: &JobId) -> Result<(), JobError> {
         let job_id = job_id.to_owned();
         let baseboard = self.own_baseboard().to_owned();
@@ -420,11 +493,10 @@ impl JobManager {
         session_id: SessionId,
         wait: bool,
     ) -> Result<(), JobError> {
-        self.session_request(authn, SessionRequest::Start(session_id.clone()))
+        self.session_request(authn, SessionRequest::Start(session_id))
             .await?;
         if wait {
-            self.wait_for(self.wait_for_session(session_id.clone()))
-                .await?;
+            self.wait_for(self.wait_for_session(session_id)).await?;
         }
         Ok(())
     }
@@ -604,6 +676,17 @@ impl JobManager {
             .cloned()
             .collect())
     }
+}
+
+/// Read one PEM-encoded certificate from each of `paths`.
+pub async fn read_root_certs(paths: &[impl AsRef<Path>]) -> Result<Vec<Certificate>, JobError> {
+    let mut roots = Vec::with_capacity(paths.len());
+    for path in paths {
+        let path = path.as_ref();
+        let pem = read(path).await.map_err(JobError::file_io_for(path))?;
+        roots.push(Certificate::from_pem(&pem)?);
+    }
+    Ok(roots)
 }
 
 // See tests in `tests/src/manager_tests.rs`

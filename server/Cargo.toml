@@ -12,12 +12,14 @@ name = "sush-server"
 path = "src/main.rs"
 
 [features]
+embedded = []
 test-support = []
 
 [dependencies]
 blake3.workspace = true
 borsh.workspace = true
 bytes.workspace = true
+camino.workspace = true
 bytesize.workspace = true
 chrono.workspace = true
 clap.workspace = true
@@ -28,14 +30,17 @@ http.workspace = true
 http-body-util.workspace = true
 http-range-header.workspace = true
 hyper.workspace = true
+hyper-util.workspace = true
 libc.workspace = true
 lru.workspace = true
 memmap2.workspace = true
 p256.workspace = true
+percent-encoding.workspace = true
 pwd.workspace = true
 rumors.workspace = true
 rand_core.workspace = true
 rustix.workspace = true
+rustls.workspace = true
 schemars.workspace = true
 serde.workspace = true
 serde_json.workspace = true
@@ -43,12 +48,14 @@ sha2.workspace = true
 sled-hardware-types.workspace = true
 slog.workspace = true
 slog-term.workspace = true
+sprockets-tls.workspace = true
 ssh-key.workspace = true
 sush-api = { path = "../api" }
 sush-common = { path = "../common" }
 tempfile.workspace = true
 thiserror.workspace = true
 tokio.workspace = true
+tokio-rustls.workspace = true
 tokio-stream.workspace = true
 tokio-util.workspace = true
 tokio-tungstenite.workspace = true
@@ -56,4 +63,7 @@ uuid.workspace = true
 x509-cert.workspace = true
 
 [dev-dependencies]
+attest-mock.workspace = true
 function_name.workspace = true
+rumors = { workspace = true, features = ["conformance"] }
+sprockets-tls-test-utils.workspace = true

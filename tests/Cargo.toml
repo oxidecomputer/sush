@@ -9,17 +9,22 @@ publish = false
 
 [dependencies]
 bytes.workspace = true
+camino.workspace = true
 chrono.workspace = true
 dropshot.workspace = true
+ed25519-dalek.workspace = true
 function_name.workspace = true
 futures.workspace = true
 http-range-header.workspace = true
 pwd.workspace = true
 rand_core.workspace = true
 rumors.workspace = true
+sha3.workspace = true
 sled-hardware-types.workspace = true
 slog.workspace = true
 slog-term.workspace = true
+sprockets-tls.workspace = true
+sprockets-tls-test-utils.workspace = true
 sush-api = { path = "../api" }
 sush-client = { path = "../client" }
 sush-common = { path = "../common" }

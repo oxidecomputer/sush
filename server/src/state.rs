@@ -14,7 +14,7 @@ use std::sync::Arc;
 use chrono::{DateTime, Utc};
 use futures::{Stream, StreamExt};
 use lru::LruCache;
-use rumors::{Key, Rumors, Version};
+use rumors::{Key, Peer, Rumors, Version};
 use sled_hardware_types::BaseboardId;
 use slog::{Logger, debug, error, info, o, warn};
 use tokio::sync::watch;
@@ -25,14 +25,17 @@ use x509_cert::Certificate;
 use x509_cert::der::Encode as _;
 
 use sush_api::JobStartParams;
+use sush_common::authn::{Identity, Nonce, RequestVerifier, SignedLogin};
 use sush_common::jobs::{Access, JobId, JobStatus, JobStatusMap, Session, SessionId, SignedJob};
-use sush_common::keys::{KeyError, KeyId, Signature};
+use sush_common::keys::{KeyError, KeyId, Signature, SshPublicKey};
+use sush_common::targets::Cubbies;
 
 use crate::executor::{Executor, PathIsolation};
 use crate::history::JobHistory;
 use crate::job::SocketSender;
 use crate::messages::v0::{
-    CertRequest, Error, Event, JobEvent, JobRequest, Message, Request, SessionRequest,
+    CertRequest, Error, Event, IdentityRequest, JobEvent, JobRequest, Message, Request,
+    SessionRequest,
 };
 use crate::messages::{VersionedMessage, VersionedMessage::*};
 use crate::output::JobOutputDir;
@@ -57,6 +60,24 @@ pub const MAX_QUEUED_JOBS: usize = 1_000;
 
 /// Maximum number of revocations held for certificates not yet seen.
 pub const MAX_TOMBSTONES: NonZeroUsize = NonZeroUsize::new(100).unwrap();
+
+/// Maximum number of registered identities. Evicting a real login
+/// only costs its holder a fresh key touch.
+pub const MAX_REGISTERED_IDENTITIES: NonZeroUsize = NonZeroUsize::new(1_000).unwrap();
+
+/// Maximum number of revoked SSH keys remembered for login refusal.
+/// Any authenticated key may revoke, so a flood of junk revocations
+/// can evict a real one. Entries never expire, so unlike nonces the
+/// eviction is permanent. This is sized so the flood takes thousands
+/// of authenticated, attributed, logged requests.
+pub const MAX_REVOKED_KEYS: NonZeroUsize = NonZeroUsize::new(10_000).unwrap();
+
+/// A rack-wide record of a verified login.
+#[derive(Clone, Debug)]
+pub struct RegisteredIdentity {
+    pub identity: Identity,
+    pub verifier: RequestVerifier,
+}
 
 #[derive(Clone, Debug)]
 pub enum SessionState {
@@ -152,7 +173,7 @@ struct SessionGuard<'a> {
 }
 
 impl<'a> SessionGuard<'a> {
-    pub fn session_id(&self) -> &SessionId {
+    pub fn session_id(&self) -> SessionId {
         self.inner.session_id()
     }
 
@@ -161,7 +182,7 @@ impl<'a> SessionGuard<'a> {
     }
 
     pub fn skip_job(&mut self, job_id: &JobId) {
-        self.inner.skip_job(job_id.clone())
+        self.inner.skip_job(*job_id)
     }
 
     pub fn next_queued_job(&mut self) -> Option<(SignedJob, JobStartParams)> {
@@ -175,11 +196,13 @@ impl<'a> SessionGuard<'a> {
         history: &mut JobHistory,
         running: &RunningJobs,
         own_baseboard: &BaseboardId,
+        cubbies: &Cubbies,
         job: SignedJob,
         params: JobStartParams,
         actor: &KeyId,
     ) {
-        let job_id = job.job_id().clone();
+        let job_id = *job.job_id();
+        let targeted = job.payload().target().includes(own_baseboard, cubbies);
         if history.contains(&job_id) {
             // Note but otherwise ignore the duplicate job.
             info!(log, "already started job"; "job_id" => %job_id);
@@ -189,20 +212,24 @@ impl<'a> SessionGuard<'a> {
             // We have no choice; drop the job on the floor.
             warn!(log, "too many jobs queued"; "job_id" => %job_id, "max" => MAX_QUEUED_JOBS);
         } else {
-            // Insert the job into our queue and record its new status.
-            self.queued_jobs.insert(job_id.clone(), (job, params));
-            history.set_job_status(
-                &job_id,
-                own_baseboard,
-                JobStatus::Queued {
-                    job_id: job_id.clone(),
-                    time_queued: Utc::now(),
-                    actor: actor.clone(),
-                },
-                None,
-                Some(self.queued_jobs),
-                running,
-            );
+            // Insert the job into our queue. Every job joins the
+            // queue to keep the causal chain whole, but only jobs
+            // targeting this sled record a local status.
+            self.queued_jobs.insert(job_id, (job, params));
+            if targeted {
+                history.set_job_status(
+                    &job_id,
+                    own_baseboard,
+                    JobStatus::Queued {
+                        job_id,
+                        time_queued: Utc::now(),
+                        actor: actor.clone(),
+                    },
+                    None,
+                    Some(self.queued_jobs),
+                    running,
+                );
+            }
         }
     }
 
@@ -221,7 +248,7 @@ impl<'a> SessionGuard<'a> {
             None,
             |old_status| match old_status {
                 None | Some(JobStatus::Queued { .. }) => Some(JobStatus::Cancelled {
-                    job_id: job_id.clone(),
+                    job_id: *job_id,
                     time_cancelled: Utc::now(),
                     actor: actor.clone(),
                 }),
@@ -240,6 +267,7 @@ impl<'a> SessionGuard<'a> {
     pub fn execute_ready_jobs(
         &mut self,
         own_baseboard: &BaseboardId,
+        cubbies: &Cubbies,
         certs: &mut Certificates,
         history: &mut JobHistory,
         executor: &mut Executor,
@@ -248,13 +276,16 @@ impl<'a> SessionGuard<'a> {
         while let Some((request, params)) = self.next_queued_job() {
             let (tx_attachment, rx_attachment) = watch::channel(None);
             let job_id = request.payload().job_id().to_owned();
-            if history
-                .get_job_status(&job_id)
-                .map(|status| matches!(status.get(own_baseboard), Some(JobStatus::Queued { .. })))
-                .unwrap_or(true)
+            if request.payload().target().includes(own_baseboard, cubbies)
+                && history
+                    .get_job_status(&job_id)
+                    .map(|status| {
+                        matches!(status.get(own_baseboard), Some(JobStatus::Queued { .. }))
+                    })
+                    .unwrap_or(true)
             {
                 executor.job_start(certs, request.clone(), params, tx_attachment);
-                attachments.insert(job_id.clone(), rx_attachment);
+                attachments.insert(job_id, rx_attachment);
             }
             self.job_started(request);
         }
@@ -281,19 +312,28 @@ pub struct State {
     /// Hard-coded root certificate key IDs. Self-signed certificates
     /// not in this set will be revoked with prejudice.
     roots: Box<[KeyId]>,
+    /// Baseboards by cubby number, as much of it as is known.
+    cubbies: Cubbies,
+    /// Verified logins, rack-wide.
+    identities: LruCache<(KeyId, Nonce), RegisteredIdentity>,
+    /// SSH keys refused at login.
+    revoked_keys: LruCache<KeyId, DateTime<Utc>>,
 }
 
 impl State {
-    pub fn new(own_baseboard: BaseboardId, root_certs: &[Certificate]) -> Self {
+    /// Fails if any root certificate is malformed or does not validate. Roots
+    /// are supplied by whoever configures the server, so they are not
+    /// necessarily trustworthy just because they were handed to us.
+    pub fn new(own_baseboard: BaseboardId, root_certs: &[Certificate]) -> Result<Self, KeyError> {
         let certs = root_certs
             .iter()
             .map(|cert| {
-                (
-                    KeyId::try_from(cert).expect("root certificate must be well-formed"),
+                Ok((
+                    KeyId::try_from(cert)?,
                     CertState::Unknown(Box::new(cert.clone())),
-                )
+                ))
             })
-            .collect::<BTreeMap<KeyId, CertState>>();
+            .collect::<Result<BTreeMap<KeyId, CertState>, KeyError>>()?;
         let roots: Box<[KeyId]> = certs.keys().cloned().collect();
         let mut new = Self {
             own_baseboard,
@@ -304,12 +344,19 @@ impl State {
             tombstones: LruCache::new(MAX_TOMBSTONES),
             certs,
             roots: roots.clone(),
+            cubbies: Default::default(),
+            identities: LruCache::new(MAX_REGISTERED_IDENTITIES),
+            revoked_keys: LruCache::new(MAX_REVOKED_KEYS),
         };
         new.validate_certs(&roots);
         for root in &roots {
-            assert!(new.certs[root].is_valid());
+            if !new.certs[root].is_valid() {
+                return Err(KeyError::InvalidCert(format!(
+                    "root certificate `{root}` does not validate"
+                )));
+            }
         }
-        new
+        Ok(new)
     }
 
     pub fn get_attachment(&self, job_id: &JobId) -> Option<SocketSender> {
@@ -379,6 +426,15 @@ impl State {
             || self.tombstones.peek(key_id).is_some()
     }
 
+    pub fn registered_identity(&self, key: &(KeyId, Nonce)) -> Option<&RegisteredIdentity> {
+        self.identities.peek(key)
+    }
+
+    pub fn is_key_revoked(&self, key_id: &KeyId) -> bool {
+        self.revoked_keys.peek(key_id).is_some()
+    }
+
+    #[allow(clippy::result_large_err)]
     fn update(
         &mut self,
         log: &Logger,
@@ -419,7 +475,7 @@ impl State {
                         // Re-announcement of active session; absorb and ignore.
                         Active {
                             frontier, session, ..
-                        } if session.session_id() == session_id => {
+                        } if session.session_id() == *session_id => {
                             *frontier |= incoming_version.clone();
                             info!(log, "duplicate session start"; "session_id" => %session_id);
                         }
@@ -439,10 +495,7 @@ impl State {
                             self.session = Active {
                                 frontier: self.session.frontier() | incoming_version.clone(),
                                 started: incoming_version.clone(),
-                                session: Box::new(Session::started(
-                                    session_id.clone(),
-                                    actor.clone(),
-                                )),
+                                session: Box::new(Session::started(*session_id, actor.clone())),
                                 queued_jobs: QueuedJobs::new(),
                                 attach_grants: BTreeMap::new(),
                             }
@@ -460,9 +513,9 @@ impl State {
                             ..
                         } if incoming_version.partial_cmp(frontier).is_none() => {
                             let error = Error::ConcurrentSessions {
-                                own_session: session.session_id().clone(),
+                                own_session: session.session_id(),
                                 own_version: started.clone(),
-                                incoming_session: session_id.clone(),
+                                incoming_session: *session_id,
                                 incoming_version: incoming_version.clone(),
                             };
                             self.session = Inactive {
@@ -498,7 +551,7 @@ impl State {
                         if let Active {
                             frontier, session, ..
                         } = &self.session
-                            && session.session_id() == session_id
+                            && session.session_id() == *session_id
                         {
                             info!(
                                 log, "session stopped";
@@ -515,7 +568,7 @@ impl State {
                             attach_grants,
                             ..
                         } = &mut self.session
-                            && session.session_id() == session_id
+                            && session.session_id() == *session_id
                         {
                             if session.started_by() == Some(actor) {
                                 attach_grants.insert(key_id.clone(), *access);
@@ -537,7 +590,7 @@ impl State {
                             attach_grants,
                             ..
                         } = &mut self.session
-                            && session.session_id() == session_id
+                            && session.session_id() == *session_id
                         {
                             if session.started_by() == Some(actor) {
                                 attach_grants.remove(key_id);
@@ -555,7 +608,7 @@ impl State {
                     }
                     (actor, SessionRequest::Skip(session_id, job_id)) => {
                         if let Some(mut session) = self.session.active_session()
-                            && session.session_id() == session_id
+                            && session.session_id() == *session_id
                         {
                             info!(
                                 log, "job skipped";
@@ -571,6 +624,7 @@ impl State {
                             );
                             session.execute_ready_jobs(
                                 &self.own_baseboard,
+                                &self.cubbies,
                                 &mut self.certs,
                                 &mut self.history,
                                 executor,
@@ -616,12 +670,14 @@ impl State {
                                 &mut self.history,
                                 &self.running,
                                 &self.own_baseboard,
+                                &self.cubbies,
                                 signed.clone(),
                                 params.clone(),
                                 actor,
                             );
                             session.execute_ready_jobs(
                                 &self.own_baseboard,
+                                &self.cubbies,
                                 &mut self.certs,
                                 &mut self.history,
                                 executor,
@@ -642,19 +698,59 @@ impl State {
                         }
                     }
                 },
+                Request::Identity(attributed) => match attributed.as_parts() {
+                    (actor, IdentityRequest::Login(public_key, signed)) => {
+                        match verify_login(public_key, signed) {
+                            Ok(registered) => {
+                                let identity = &registered.identity;
+                                if self.revoked_keys.peek(&identity.key_id).is_some() {
+                                    info!(
+                                        log, "refusing login for revoked key";
+                                        "key_id" => %identity.key_id, "actor" => %actor,
+                                    );
+                                } else {
+                                    info!(
+                                        log, "registered identity";
+                                        "key_id" => %identity.key_id, "actor" => %actor,
+                                    );
+                                    let key = (identity.key_id.clone(), identity.nonce.clone());
+                                    self.identities.put(key, registered);
+                                }
+                            }
+                            Err(error) => {
+                                error!(
+                                    log, "ignoring invalid login";
+                                    "error" => %error, "actor" => %actor,
+                                );
+                            }
+                        }
+                    }
+                    (actor, IdentityRequest::Revoke(key_id, when)) => {
+                        let dead: Vec<(KeyId, Nonce)> = self
+                            .identities
+                            .iter()
+                            .filter(|((id, _), _)| id == key_id)
+                            .map(|(key, _)| key.clone())
+                            .collect();
+                        for key in dead {
+                            self.identities.pop(&key);
+                        }
+                        self.revoked_keys.put(key_id.clone(), *when);
+                        info!(log, "revoked identity"; "key_id" => %key_id, "actor" => %actor);
+                    }
+                },
             },
             V0(Message::Event(baseboard_id, event)) => match event {
                 // Track the active set of known-running jobs anywhere in the rack.
                 Event::Job(job_event) => match job_event {
                     JobEvent::Start(job_id, when) => {
                         info!(log, "job started"; "job_id" => %job_id, "when" => %when);
-                        self.running
-                            .insert((job_id.clone(), baseboard_id.clone()), *when);
+                        self.running.insert((*job_id, baseboard_id.clone()), *when);
                         self.history.set_job_status(
                             job_id,
                             baseboard_id,
                             JobStatus::Started {
-                                job_id: job_id.clone(),
+                                job_id: *job_id,
                                 time_started: *when,
                             },
                             Some(incoming_version.rank()),
@@ -667,7 +763,7 @@ impl State {
                         if baseboard_id == &self.own_baseboard {
                             self.attachments.remove(job_id);
                         }
-                        self.running.remove(&(job_id.clone(), baseboard_id.clone()));
+                        self.running.remove(&(*job_id, baseboard_id.clone()));
                         self.history.transition_job_status(
                             job_id,
                             baseboard_id,
@@ -675,7 +771,7 @@ impl State {
                             |old_status| match old_status {
                                 Some(JobStatus::Started { time_started, .. }) => {
                                     Some(JobStatus::Stopped {
-                                        job_id: job_id.clone(),
+                                        job_id: *job_id,
                                         time_started: *time_started,
                                         time_stopped: *when,
                                         result: result.clone(),
@@ -696,12 +792,12 @@ impl State {
                         if baseboard_id == &self.own_baseboard {
                             self.attachments.remove(job_id);
                         }
-                        self.running.remove(&(job_id.clone(), baseboard_id.clone()));
+                        self.running.remove(&(*job_id, baseboard_id.clone()));
                         self.history.set_job_status(
                             job_id,
                             baseboard_id,
                             JobStatus::Error {
-                                job_id: job_id.clone(),
+                                job_id: *job_id,
                                 time_error: *when,
                                 error: error.clone(),
                             },
@@ -724,6 +820,16 @@ impl State {
     }
 }
 
+/// Create a fresh gossip network with this server as its only peer.
+///
+/// A peer that seeds its own network has no one to gossip with, so jobs run
+/// only on the server that accepted them, and no server learns about any other
+/// server's sessions. This stands in for joining the rack's network over
+/// sprockets on the bootstrap network.
+pub fn seed_gossip() -> GossipNetwork {
+    Peer::seed().into_rumors()
+}
+
 #[derive(Debug)]
 pub struct StateManager {}
 
@@ -733,6 +839,13 @@ impl StateManager {
     /// requests, events, or messages can be received. Returns a shared
     /// `State` that will be asynchronously updated in response to
     /// messages and events.
+    ///
+    /// `universe` follows the gossip network we belong to. When it changes,
+    /// everything resets. Versions do not compare across universes, so no
+    /// session or history bookkeeping can survive a migration; running jobs
+    /// continue, and their events land in the new universe.
+    ///
+    /// `cubbies` follows the rack's cubby map, which survives migrations.
     #[allow(clippy::too_many_arguments)]
     pub fn run<R>(
         log: Logger,
@@ -740,15 +853,19 @@ impl StateManager {
         output_dir: JobOutputDir,
         own_baseboard: BaseboardId,
         mut requests: R,
-        rumors: GossipNetwork,
+        mut cubbies: watch::Receiver<Cubbies>,
+        universe: watch::Receiver<GossipNetwork>,
         roots: &[Certificate],
         shutdown: CancellationToken,
-    ) -> (watch::Receiver<State>, JoinHandle<()>)
+    ) -> Result<(watch::Receiver<State>, JoinHandle<()>), KeyError>
     where
         R: Stream<Item = Request> + Send + Unpin + 'static,
     {
         // We report our current state through a watch channel.
-        let (tx_state, rx_state) = watch::channel(State::new(own_baseboard.clone(), roots));
+        let mut initial_state = State::new(own_baseboard.clone(), roots)?;
+        initial_state.cubbies = cubbies.borrow_and_update().clone();
+        let (tx_state, rx_state) = watch::channel(initial_state);
+        let roots = roots.to_vec();
 
         // We process messages in causal order, so that we can rely on
         // things like "the session stop happens after its corresponding
@@ -756,7 +873,8 @@ impl StateManager {
         // and computation, but makes it much easier to ensure that our
         // state machine is correct, because it now only has to be correct
         // in the face of arbitrary *causal* reorderings.
-        let mut causal_messages = rumors.causal_messages();
+        let initial = universe.borrow().clone();
+        let mut causal_messages = initial.causal_messages();
 
         // The executor needs to have access to send messages back.
         let (mut executor, mut events) = Executor::new(
@@ -767,16 +885,19 @@ impl StateManager {
         );
 
         // We will drop this once we want to drain the remaining messages.
-        let mut rumors = Some(rumors);
+        // The watch channel behind `universe` stores its own copy of the
+        // network, so holding the receiver would keep the network from
+        // draining while we wait for exactly that.
+        let mut gossip = Some((initial, universe));
 
-        (
+        Ok((
             rx_state,
             spawn(async move {
                 info!(log, "managing state");
 
                 // These flip both to `true` once our two input streams (local
                 // requests and local events from the executor) terminate or
-                // we're shutting down. At this point, we must drop `rumors`
+                // we're shutting down. At this point, we must drop `gossip`
                 // and thereby permit its own `unordered_messages` stream to
                 // eventually be drained; we do this so that we fully update
                 // the local state until nothing more is left to do.
@@ -786,15 +907,19 @@ impl StateManager {
                 loop {
                     let message = causal_messages.borrow_next();
 
-                    // Once we drain the requests and events, we drop `rumors` so
+                    // Once we drain the requests and events, we drop `gossip` so
                     // that if there are no outstanding copies elsewhere, we will
                     // drain it and then break.
                     //
                     // If there are still gossip sessions happening, those will
                     // complete and we will process their messages into the state.
                     if requests_empty && events_empty {
-                        rumors = None;
+                        gossip = None;
                     }
+
+                    // Applied after the select, once `message` and the
+                    // universe future have released their borrows.
+                    let mut swap = false;
 
                     select! {
                         // Forward local requests into the rumors state,
@@ -805,7 +930,7 @@ impl StateManager {
                             // we need to let all spawned tasks by the executor
                             // quiesce, updating the state all the way.
                             None => requests_empty = true,
-                            Some(request) => if let Some(rumors) = &rumors {
+                            Some(request) => if let Some((rumors, _)) = &gossip {
                                 debug!(log, "forwarding request to gossip network"; "kind" => request.kind());
                                 rumors.send(Message::Request(request).into());
                             },
@@ -814,7 +939,7 @@ impl StateManager {
                         // Handle events produced by the executor.
                         next = events.next(), if !events_empty => match next {
                             None => events_empty = true,
-                            Some(event) => if let Some(rumors) = &rumors {
+                            Some(event) => if let Some((rumors, _)) = &gossip {
                                 debug!(log, "forwarding event to gossip network"; "event" => ?event);
                                 rumors.send(Message::Event(own_baseboard.clone(), event).into());
                             },
@@ -838,7 +963,7 @@ impl StateManager {
                                 tx_state.send_modify(|state| {
                                     if let Err(error) = state.update(&log, &mut executor, key, version, message) {
                                         error!(log, "state update failed"; "error" => ?error);
-                                        if let Some(rumors) = &rumors {
+                                        if let Some((rumors, _)) = &gossip {
                                             debug!(log, "sending error to gossip network"; "error" => ?error);
                                             rumors.send(Message::Event(own_baseboard.clone(), Event::Error(error)).into());
                                         }
@@ -847,14 +972,45 @@ impl StateManager {
                             },
                         },
 
+                        // Follow the rack's cubby map.
+                        Ok(()) = cubbies.changed() => {
+                            tx_state.send_modify(|state| {
+                                state.cubbies = cubbies.borrow_and_update().clone();
+                            });
+                        },
+
+                        // Follow the gossip manager to a new universe,
+                        // unless we're already draining.
+                        Ok(()) = async {
+                            match gossip.as_mut() {
+                                Some((_, universe)) => universe.changed().await,
+                                None => std::future::pending().await,
+                            }
+                        } => swap = true,
+
                         // Stop processing requests on shutdown.
                         _ = shutdown.cancelled(), if !requests_empty => {
                             requests_empty = true;
                         }
                     }
+
+                    if swap {
+                        let (rumors, universe) =
+                            gossip.as_mut().expect("gossip present when it changes");
+                        let fresh = universe.borrow_and_update().clone();
+                        info!(log, "gossip universe changed, resetting state"; "network" => %fresh.network());
+                        causal_messages = fresh.causal_messages();
+                        // TODO: re-inject local job state (policy pending).
+                        tx_state.send_modify(|state| {
+                            *state = State::new(own_baseboard.clone(), &roots)
+                                .expect("roots validated at startup");
+                            state.cubbies = cubbies.borrow().clone();
+                        });
+                        *rumors = fresh;
+                    }
                 }
             }),
-        )
+        ))
     }
 }
 
@@ -988,6 +1144,19 @@ impl State {
             }
         }
     }
+}
+
+/// Re-verify gossiped login evidence. Identity gossip carries the
+/// signed challenge response, not another sled's conclusion, so a
+/// registered identity never depends on that sled's honesty.
+fn verify_login(
+    public_key: &SshPublicKey,
+    signed: &SignedLogin,
+) -> Result<RegisteredIdentity, KeyError> {
+    let verified = signed.clone().verify_with_ssh_public_key(public_key)?;
+    let verifier = verified.epk().clone();
+    let identity = Identity::new(public_key.clone(), verified, Utc::now())?;
+    Ok(RegisteredIdentity { identity, verifier })
 }
 
 /// Return the cert chain for the given key in root-to-leaf order.

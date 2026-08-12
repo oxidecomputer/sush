@@ -7,13 +7,17 @@
 use std::sync::OnceLock;
 use std::time::Duration;
 
+use bytes::Bytes;
+use camino::Utf8PathBuf;
 use chrono::Utc;
+use futures::TryStreamExt as _;
 use rand_core::{OsRng, RngCore as _};
-use rumors::Peer;
 use sled_hardware_types::BaseboardId;
 use slog::{Drain as _, Logger, o};
 use slog_term::{FullFormat, PlainSyncDecorator, TestStdoutWriter};
+use sprockets_tls_test_utils::{OutputFileExistsBehavior, generate_config};
 use tempfile::TempDir;
+use tokio::sync::watch;
 use tokio_util::sync::CancellationToken;
 use x509_cert::name::Name;
 use x509_cert::time::Validity;
@@ -21,12 +25,15 @@ use x509_cert::time::Validity;
 use sush_client::context::Authz;
 use sush_client::{Client, ResponseValue};
 use sush_common::authn::{Challenge, ChallengeResponse, Credentials, Identity, Nonce, RequestKey};
-use sush_common::codephrases::generate_id;
+use sush_common::codephrases::Codephrase;
 use sush_common::jobs::{JobId, JobStartRequest, VerifiedJob};
 use sush_common::keys::{EphemeralKey, KeyType, Signer};
+use sush_common::targets::{Cubbies, Target};
 use sush_server::executor::PathIsolation;
+use sush_server::gossip::isolated;
+use sush_server::output::{JobOutputDir, JobOutputFileStream};
 use sush_server::state::GossipNetwork;
-use sush_server::{JobError, JobManager};
+use sush_server::{JobError, JobManager, seed_gossip};
 
 static TEST_BASEBOARD_ID: OnceLock<BaseboardId> = OnceLock::new();
 
@@ -39,6 +46,24 @@ pub fn test_baseboard_id() -> BaseboardId {
         .clone()
 }
 
+/// Collect a job output stream into memory. Convenient for tests, which know
+/// their output is small; the server deliberately streams instead.
+#[allow(async_fn_in_trait)]
+pub trait IntoBytes {
+    async fn into_bytes(self) -> Vec<u8>;
+}
+
+impl IntoBytes for JobOutputFileStream {
+    async fn into_bytes(self) -> Vec<u8> {
+        self.try_collect::<Vec<Bytes>>()
+            .await
+            .unwrap()
+            .into_iter()
+            .flatten()
+            .collect()
+    }
+}
+
 #[allow(async_fn_in_trait)]
 pub trait SignJobRequest {
     async fn sign_job_request<S: AsRef<str>>(
@@ -46,20 +71,33 @@ pub trait SignJobRequest {
         job_id: &JobId,
         command: S,
         interactive: bool,
-    ) -> VerifiedJob;
-}
+    ) -> VerifiedJob {
+        self.sign_job_request_for(job_id, command, interactive, Target::All)
+            .await
+    }
 
-impl SignJobRequest for EphemeralKey {
-    async fn sign_job_request<S: AsRef<str>>(
+    async fn sign_job_request_for<S: AsRef<str>>(
         &mut self,
         job_id: &JobId,
         command: S,
         interactive: bool,
+        target: Target,
+    ) -> VerifiedJob;
+}
+
+impl SignJobRequest for EphemeralKey {
+    async fn sign_job_request_for<S: AsRef<str>>(
+        &mut self,
+        job_id: &JobId,
+        command: S,
+        interactive: bool,
+        target: Target,
     ) -> VerifiedJob {
         self.sign(JobStartRequest::new(
             job_id.to_owned(),
             command,
             interactive,
+            target,
         ))
         .await
         .expect("failed to sign job")
@@ -72,7 +110,7 @@ impl SignJobRequest for EphemeralKey {
 pub fn ephemeral_test_subject() -> Name {
     let mut buf = [0; 8];
     OsRng.fill_bytes(&mut buf);
-    let id = generate_id();
+    let id = Codephrase::random().truncate();
     format!("CN=Ephemeral Test Key {id},O=Oxide Computer Company,C=US")
         .parse()
         .unwrap()
@@ -93,8 +131,21 @@ pub fn test_logger(test_name: &'static str) -> Logger {
     Logger::root(drain, o!("test" => test_name))
 }
 
+/// A one-node local PKI in a fresh temp dir, standing in for the
+/// platform identity a real sled resolves from its RoT.
+pub fn test_pki(prefix: &'static str) -> (TempDir, Utf8PathBuf) {
+    let tmp = TempDir::with_prefix(prefix).unwrap();
+    let dir = Utf8PathBuf::from_path_buf(tmp.path().to_owned()).unwrap();
+    let behavior = OutputFileExistsBehavior::Overwrite;
+    let doc = generate_config(1);
+    doc.write_key_pairs(dir.clone(), behavior).unwrap();
+    doc.write_certificates(dir.clone(), behavior).unwrap();
+    doc.write_certificate_lists(dir.clone(), behavior).unwrap();
+    (tmp, dir)
+}
+
 pub async fn fake_identity(key: &mut EphemeralKey) -> Identity {
-    let nonce = Nonce::generate();
+    let nonce = Nonce::random();
     let challenge = Challenge::new(nonce.clone());
     let response = ChallengeResponse::new(challenge, RequestKey::new().verifier());
     let signed = key.sign(response).await.unwrap();
@@ -146,15 +197,17 @@ pub async fn manager_test_root_and_peer(
     CancellationToken,
 ) {
     let dir = TempDir::with_prefix("sush-").unwrap();
-    let gossip = Peer::seed().into_rumors();
-    let peer = gossip.clone();
+    let seed = seed_gossip();
+    let peer = seed.clone();
+    let gossip = isolated(seed);
     let shutdown = CancellationToken::new();
     let root = ephemeral_test_root();
-    let mgr = JobManager::new(
+    let mgr = JobManager::with_root_certs(
         log,
         PathIsolation::InsecureDisable,
-        dir.path().to_owned(),
+        JobOutputDir::fixed(dir.path()),
         test_baseboard_id(),
+        no_cubbies(),
         gossip,
         &[root.cert().to_owned()],
         shutdown.clone(),
@@ -162,6 +215,11 @@ pub async fn manager_test_root_and_peer(
     .await
     .unwrap();
     (mgr, root, peer, dir, shutdown)
+}
+
+/// A cubby map that will never be known.
+pub fn no_cubbies() -> watch::Receiver<Cubbies> {
+    watch::channel(Cubbies::new()).1
 }
 
 pub async fn authz<E>(
