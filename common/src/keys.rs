@@ -166,7 +166,10 @@ impl JsonSchema for SshPublicKey {
 }
 
 codephrase_newtype! {
-    /// The component `r` of a signature _(r, s)_ over a 256 bit elliptic curve.
+    /// The first half of a 256 bit elliptic-curve signature: the scalar
+    /// `r` of an ECDSA pair, or the encoded point `R` of an Ed25519
+    /// signature. It is carried as an opaque 256 bit value to which only
+    /// the signature algorithm assigns meaning.
     #[derive(
         BorshDeserialize,
         BorshSerialize,
@@ -184,7 +187,10 @@ codephrase_newtype! {
 }
 
 codephrase_newtype! {
-    /// The component `s` of a signature _(r, s)_ over a 256 bit elliptic curve.
+    /// The second half of a 256 bit elliptic-curve signature: the scalar
+    /// `s` of an ECDSA pair, or the little-endian scalar `S` of an
+    /// Ed25519 signature. It is carried as an opaque 256 bit value like
+    /// [`EccR`].
     #[derive(
         BorshDeserialize,
         BorshSerialize,
