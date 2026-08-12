@@ -31,7 +31,6 @@ http-range-header.workspace = true
 humantime.workspace = true
 indicatif.workspace = true
 memmap2.workspace = true
-openssl.workspace = true # Needed to build the client with `--features `openssl/vendored`.
 p256.workspace = true
 pem-rfc7468.workspace = true
 permission-slip-client = { workspace = true, optional = true }

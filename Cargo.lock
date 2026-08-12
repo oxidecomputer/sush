@@ -3560,7 +3560,6 @@ dependencies = [
  "humantime",
  "indicatif",
  "memmap2",
- "openssl",
  "p256",
  "pem-rfc7468",
  "permission-slip-client",

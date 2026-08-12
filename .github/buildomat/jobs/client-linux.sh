@@ -31,5 +31,5 @@ export CARGO_INCREMENTAL=0
 
 mkdir -p /work
 
-cargo build --target "$TARGET" --release --locked --package sush-client --features permslip --features openssl/vendored
+cargo build --target "$TARGET" --release --locked --package sush-client --features permslip
 cp "target/$TARGET/release/sush" /work/sush
