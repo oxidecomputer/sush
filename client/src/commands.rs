@@ -11,6 +11,7 @@ use std::io::{Read as _, Seek as _, SeekFrom, Write as _, stdin};
 use std::num::{NonZeroU8, NonZeroU64};
 use std::path::{Path, PathBuf};
 use std::pin::Pin;
+use std::str::FromStr;
 use std::time::Duration;
 
 use async_recursion::async_recursion;
@@ -45,8 +46,8 @@ use sush_common::jobs::JobOutputStream::{self, Stderr, Stdout};
 #[cfg(feature = "permslip")]
 use sush_common::jobs::JobStartRequest;
 use sush_common::jobs::{
-    Access, JobId, JobLimits, JobOutputHash, JobOutputState, JobStatus, Session, SessionId,
-    SignedJob, job_status_try_from_json_map,
+    Access, JobId, JobLimits, JobOutputHash, JobOutputState, JobStatus, JobStatusMap, Session,
+    SessionId, SignedJob, job_status_try_from_json_map,
 };
 use sush_common::keys::{KeyError, KeyId, Signer as _};
 use sush_common::targets::{SledId, Target};
@@ -211,13 +212,27 @@ async fn output_needs_target() {
     let err = job_output(
         &mut Cli::default(),
         &client,
-        &"*".parse::<Target>().unwrap(),
+        &"*".parse::<TargetArg>().unwrap(),
         Stdout,
         output,
     )
     .await
     .unwrap_err();
     assert!(matches!(err, CommandError::OutputNeedsTarget));
+}
+
+/// Anything the target grammar accepts stays a target; bare serials
+/// fall through; everything else still fails.
+#[test]
+fn target_arg() {
+    assert!(matches!("*".parse(), Ok(TargetArg::Target(_))));
+    assert!(matches!("14".parse(), Ok(TargetArg::Target(_))));
+    assert!(matches!(
+        "913-0000019:BRM42220030".parse(),
+        Ok(TargetArg::Target(_))
+    ));
+    assert!(matches!("brm42220030".parse(), Ok(TargetArg::Serial(s)) if s == "brm42220030"));
+    assert!("not,a:target!".parse::<TargetArg>().is_err());
 }
 
 /// [`ClientArgs`] must satisfy Clap's internal consistency asserts
@@ -433,7 +448,7 @@ pub enum JobCommand {
     Stdout {
         /// The sled from which output should be fetched.
         #[arg(short = 'T', long, default_value = "*")]
-        target: Target,
+        target: TargetArg,
 
         #[clap(flatten)]
         output: JobOutput,
@@ -444,7 +459,7 @@ pub enum JobCommand {
     Stderr {
         /// The sled from which output should be fetched.
         #[arg(short = 'T', long, default_value = "*")]
-        target: Target,
+        target: TargetArg,
 
         #[clap(flatten)]
         output: JobOutput,
@@ -458,7 +473,7 @@ pub enum JobCommand {
 
         /// The sled to attach to.
         #[arg(short = 'T', long, default_value = "*")]
-        target: Target,
+        target: TargetArg,
     },
 
     /// Show status of previously started jobs.
@@ -1024,7 +1039,10 @@ async fn job(
         }
 
         (JobCommand::Attach { job_id, target }, Some(client)) => {
-            let target = resolve_target(client, &target).await?;
+            let target = match &target {
+                TargetArg::Target(target) => resolve_target(client, target).await?,
+                TargetArg::Serial(serial) => resolve_serial(ctx, client, &job_id, serial).await?,
+            };
             job_attach(ctx, client, &job_id, &target).await?;
             Ok(())
         }
@@ -1213,17 +1231,23 @@ async fn job_status(
     job_id: &JobId,
     style: StatusDisplayStyle,
 ) -> Result<(), CommandError> {
+    let status = job_status_map(ctx, client, job_id).await?;
+    ctx.job_status(job_id, &status, style);
+    Ok(())
+}
+
+/// Fetch a job's rack-wide status map.
+async fn job_status_map(
+    ctx: &mut impl CommandContext,
+    client: &Client,
+    job_id: &JobId,
+) -> Result<JobStatusMap, CommandError> {
     let status = with_login(ctx, client, async || {
         client.job_status().job_id(job_id).send().await
     })
     .await?
     .into_inner();
-    ctx.job_status(
-        job_id,
-        &job_status_try_from_json_map(status).map_err(CommandError::BaseboardIdParseError)?,
-        style,
-    );
-    Ok(())
+    job_status_try_from_json_map(status).map_err(CommandError::BaseboardIdParseError)
 }
 
 /// Stream some bytes into a vector.
@@ -1262,10 +1286,17 @@ type FutureChunk<'a> = dyn Future<Output = Result<Chunk, CommandError>> + Send +
 async fn job_output(
     ctx: &mut impl CommandContext,
     client: &Client,
-    target: &Target,
+    target: &TargetArg,
     stream: JobOutputStream,
     args: JobOutput,
 ) -> Result<(), CommandError> {
+    let target = match target {
+        TargetArg::Serial(serial) => {
+            let baseboard = resolve_serial(ctx, client, &args.job_id, serial).await?;
+            return job_output_from(ctx, client, &baseboard, stream, args).await;
+        }
+        TargetArg::Target(target) => target,
+    };
     if !target.is_all() {
         let baseboard = resolve_target(client, target).await?;
         return job_output_from(ctx, client, &baseboard, stream, args).await;
@@ -1275,14 +1306,7 @@ async fn job_output(
     }
 
     // Fetch output from every sled with a recorded status.
-    let status = job_status_try_from_json_map(
-        with_login(ctx, client, async || {
-            client.job_status().job_id(&args.job_id).send().await
-        })
-        .await?
-        .into_inner(),
-    )
-    .map_err(CommandError::BaseboardIdParseError)?;
+    let status = job_status_map(ctx, client, &args.job_id).await?;
     if status.is_empty() {
         return Err(CommandError::NotFound);
     }
@@ -1545,9 +1569,55 @@ async fn resolve_target(client: &Client, target: &Target) -> Result<BaseboardId,
     Ok(request.send().await?.into_inner())
 }
 
+/// A target expression, or a bare serial number to resolve against
+/// the sleds that have a status for the job at hand.
+#[derive(Clone, Debug)]
+pub enum TargetArg {
+    Target(Target),
+    Serial(String),
+}
+
+impl FromStr for TargetArg {
+    type Err = <Target as FromStr>::Err;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        match s.parse() {
+            Ok(target) => Ok(Self::Target(target)),
+            Err(_) if !s.is_empty() && s.chars().all(|c| c.is_ascii_alphanumeric()) => {
+                Ok(Self::Serial(s.to_owned()))
+            }
+            Err(err) => Err(err),
+        }
+    }
+}
+
+/// Resolve a bare serial number against the sleds that have a status
+/// for a job.
+async fn resolve_serial(
+    ctx: &mut impl CommandContext,
+    client: &Client,
+    job_id: &JobId,
+    serial: &str,
+) -> Result<BaseboardId, CommandError> {
+    let status = job_status_map(ctx, client, job_id).await?;
+    let mut matches = status
+        .keys()
+        .filter(|b| b.serial_number.eq_ignore_ascii_case(serial));
+    match (matches.next(), matches.next()) {
+        (Some(baseboard), None) => Ok(baseboard.clone()),
+        (None, _) => Err(CommandError::UnknownSerial {
+            serial: serial.to_owned(),
+            job_id: job_id.to_owned(),
+        }),
+        (Some(_), Some(_)) => Err(CommandError::AmbiguousSerial(serial.to_owned())),
+    }
+}
+
 /// What went wrong parsing, preparing, or executing a client command.
 #[derive(Debug, Error)]
 pub enum CommandError {
+    #[error("❌ Serial `{0}` matches more than one sled, use a full baseboard ID")]
+    AmbiguousSerial(String),
     #[error("❌ Authentication error")]
     Authn(#[from] AuthnError),
     #[error("❌ Canceled")]
@@ -1654,6 +1724,8 @@ pub enum CommandError {
     TimedOut,
     #[error("❌ Too much output to display on terminal, try `--file`")]
     TooMuchOutput,
+    #[error("❌ No sled with serial `{serial}` has a status for job `{job_id}`")]
+    UnknownSerial { serial: String, job_id: JobId },
     #[error("❌ Chain root does not match any supplied root certificate")]
     UntrustedRoot,
     #[error("❌ Can't start interactive session: {0}")]
