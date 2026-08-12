@@ -21,6 +21,7 @@ use sush_common::keys::{KeyId, SshPublicKey};
 
 use crate::AuthzSigner;
 use crate::commands::{CommandError, GlobalArgs};
+use crate::types::SessionStartNonce;
 
 /// Authorization state: the credentials that authenticated us, and the
 /// ephemeral key that binds each request we make.
@@ -105,6 +106,11 @@ pub trait CommandContext: Clone + Send + Sync {
     }
     fn session_id(&self) -> Option<SessionId>;
     fn next_job_id(&self) -> Result<JobId, CommandError>;
+    fn session_start_params(
+        &self,
+        baseboard_id: BaseboardId,
+        nonce: SessionStartNonce,
+    ) -> Result<(), CommandError>;
     fn session_started(&mut self, session: Session) -> Result<(), CommandError>;
     fn session_stopped(&mut self, session_id: &SessionId) -> Result<(), CommandError>;
     fn attach_allowed(&mut self, key_id: &KeyId, access: Access);

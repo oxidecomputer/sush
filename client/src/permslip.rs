@@ -9,9 +9,10 @@ use p256::ecdsa;
 use permission_slip_common::params::{BlobStampParams, SignParams, StampParams};
 use permission_slip_common::{ArtifactKind, HashAlgorithm};
 use permslip_client_lib::login::{IdentityProvider, TokenProvider};
-use permslip_client_lib::types::Error as ApiError;
+use permslip_client_lib::types::{CreateSushSessionBody, CreatedSushSession, Error as ApiError};
 use permslip_client_lib::{Client, ClientRequestBuilder, Error as ClientError};
 use serde_json::{json, to_string as json_to_string};
+use sled_hardware_types::BaseboardId;
 use thiserror::Error;
 use x509_cert::Certificate;
 use x509_cert::der::Decode as _;
@@ -20,6 +21,7 @@ use x509_cert::der::oid::db::rfc8410::ID_ED_25519;
 use x509_cert::der::pem::{PemLabel as _, decode_vec as decode_pem};
 use x509_cert::spki::AlgorithmIdentifierOwned;
 
+use sush_common::jobs::SessionSushNonce;
 use sush_common::keys::{KeyError, KeyId, Signature, Signed, Signer, ToBeSigned};
 
 pub struct PermslipSigner {
@@ -42,6 +44,25 @@ impl PermslipSigner {
             ),
             key_name: key_name.as_ref().to_owned(),
         })
+    }
+
+    pub async fn create_session(
+        &self,
+        baseboard: &BaseboardId,
+        sush_nonce: SessionSushNonce,
+    ) -> Result<CreatedSushSession, PermslipError> {
+        Ok(self
+            .client
+            .create_sush_session()
+            .body(CreateSushSessionBody {
+                cpn: baseboard.part_number.clone(),
+                serial_number: baseboard.serial_number.clone(),
+                key_name: self.key_name.clone(),
+                sush_nonce: sush_nonce.to_string().into(),
+            })
+            .send()
+            .await?
+            .into_inner())
     }
 
     // TODO: fetch once

@@ -30,6 +30,7 @@ use crate::commands::{
     SUSH_OUTPUT_FORMAT, SUSH_URL,
 };
 use crate::context::{CommandContext, OutputFormat, StatusDisplayStyle};
+use crate::types::SessionStartNonce;
 use crate::{AuthzSigner, Client};
 
 const PREFIX: &str = "sush";
@@ -211,6 +212,14 @@ impl CommandContext for Repl {
 
     fn next_job_id(&self) -> Result<JobId, CommandError> {
         self.cli.next_job_id()
+    }
+
+    fn session_start_params(
+        &self,
+        baseboard_id: BaseboardId,
+        nonce: SessionStartNonce,
+    ) -> Result<(), CommandError> {
+        self.cli.session_start_params(baseboard_id, nonce)
     }
 
     fn session_started(&mut self, session: Session) -> Result<(), CommandError> {

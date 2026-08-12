@@ -46,8 +46,7 @@ use sush_common::jobs::JobOutputStream::{self, Stderr, Stdout};
 #[cfg(feature = "permslip")]
 use sush_common::jobs::JobStartRequest;
 use sush_common::jobs::{
-    Access, JobId, JobLimits, JobOutputHash, JobOutputState, JobStatus, JobStatusMap, Session,
-    SessionId, SignedJob, job_status_try_from_json_map,
+    Access, JobId, JobLimits, JobOutputHash, JobOutputState, JobStatus, JobStatusMap, Session, SessionId, SessionSignerNonce, SignedJob, job_status_try_from_json_map
 };
 use sush_common::keys::{KeyError, KeyId, Signer as _};
 use sush_common::targets::{SledId, Target};
@@ -60,7 +59,7 @@ use crate::interactive::interactive_job;
 use crate::permslip::{PermslipError, PermslipSigner};
 use crate::repl::Repl;
 use crate::tls;
-use crate::types::Error as ApiError;
+use crate::types::{Error as ApiError, SessionStartBody};
 use crate::{Client, Error as ClientError};
 
 // Names of environment variables for argument defaults
@@ -446,10 +445,27 @@ pub enum SessionCommand {
         key_id: KeyId,
     },
 
+    /// Get the parameters to send to the signer server to start a session.
+    StartParams,
+
     /// Start a new support session.
     Start {
         /// The session to start.
+        #[arg(requires = "nonce")]
         session_id: Option<SessionId>,
+
+        /// The signer nonce for the session.
+        nonce: Option<SessionSignerNonce>,
+
+        /// Use `permslip` to sign sessions and jobs with this key name.
+        #[cfg(feature = "permslip")]
+        #[arg(short, long, env = SUSH_PERMSLIP_KEY, value_name = "KEY_NAME")]
+        permslip: Option<String>,
+
+        /// The `permslip` server to contact for signing.
+        #[cfg(feature = "permslip")]
+        #[arg(long, env = PERMSLIP_URL, requires = "permslip", value_name = "URL")]
+        permslip_url: Option<String>,
 
         /// Wait for the session to become active.
         #[arg(short, long)]
@@ -878,24 +894,84 @@ async fn session(
             Ok(())
         }
 
-        (SessionCommand::Start { session_id, wait }, Some(client)) => {
-            let session = if let Some(session_id) = session_id {
-                Session::new(session_id)
-            } else {
-                Session::new(SessionId::random())
-            };
-            with_login(ctx, client, async || {
-                client
-                    .session_start()
-                    .session_id(session.session_id())
-                    .wait(wait)
-                    .send()
-                    .await
+        (SessionCommand::StartParams, Some(client)) => {
+            let (baseboard_id, nonce) = with_login(ctx, client, async || {
+                Ok((
+                    client.target().send().await?.into_inner(),
+                    client.session_start_nonce().send().await?.into_inner(),
+                ))
             })
-            .await?
-            .into_inner();
-            ctx.session_started(session)?;
+            .await?;
+            ctx.session_start_params(baseboard_id, nonce)?;
             Ok(())
+        }
+
+        #[cfg(feature = "permslip")]
+        (
+            SessionCommand::Start {
+                session_id,
+                nonce,
+                permslip,
+                permslip_url,
+                wait,
+            },
+            Some(client),
+        ) => {
+            let (session_id, nonce) =
+                if let (Some(session_id), Some(nonce)) = (session_id, nonce) {
+                    (session_id, nonce)
+                } else {
+                    use sush_common::codephrases::InvalidCodephrase;
+
+                    let Some(permslip_url) = permslip_url else {
+                        return Err(CommandError::MissingPermslipUrl);
+                    };
+                    let Some(permslip_key) = permslip else {
+                        return Err(CommandError::MissingKeyName);
+                    };
+                    let signer = PermslipSigner::new(permslip_key, &permslip_url).await?;
+
+                    let (baseboard_id, nonce) = with_login(ctx, client, async || {
+                        Ok((
+                            client.target().send().await?.into_inner(),
+                            client.session_start_nonce().send().await?.into_inner(),
+                        ))
+                    })
+                    .await?;
+
+                    let created = signer.create_session(&baseboard_id, nonce.nonce).await?;
+
+                    (
+                        created.session_id.to_string().parse().map_err(
+                            |e: InvalidCodephrase| {
+                                CommandError::UnsupportedPermslipResponse(e.to_string())
+                            },
+                        )?,
+                        created.signer_nonce.to_string().parse().map_err(
+                            |e: InvalidCodephrase| {
+                                CommandError::UnsupportedPermslipResponse(e.to_string())
+                            },
+                        )?,
+                    )
+                };
+            session_start(ctx, client, session_id, nonce, wait).await
+        }
+
+        #[cfg(not(feature = "permslip"))]
+        (
+            SessionCommand::Start {
+                session_id,
+                nonce,
+                wait,
+            },
+            Some(client),
+        ) => {
+            let (session_id, nonce) = if let (Some(session_id), Some(nonce)) = (session_id, nonce) {
+                (session_id, nonce)
+            } else {
+                return Err(CommandError::SigningUnavailable);
+            };
+            session_start(ctx, client, session_id, nonce, wait).await
         }
 
         (SessionCommand::Allow { key_id, write }, Some(client)) => {
@@ -1295,6 +1371,28 @@ async fn job_start(
         ctx.job_started(&job);
     }
     Ok(())
+}
+
+async fn session_start(
+    ctx: &mut impl CommandContext,
+    client: &Client,
+    session_id: SessionId,
+    signer_nonce: SessionSignerNonce,
+    wait: bool,
+) -> Result<(), CommandError> {
+    let session = Session::new(session_id);
+    with_login(ctx, client, async || {
+        client
+            .session_start()
+            .session_id(session.session_id())
+            .wait(wait)
+            .body(SessionStartBody { signer_nonce })
+            .send()
+            .await
+    })
+    .await?
+    .into_inner();
+    ctx.session_started(session)
 }
 
 async fn job_stop(
@@ -1877,6 +1975,9 @@ pub enum CommandError {
     Utf8(#[from] std::string::FromUtf8Error),
     #[error("❌ WebSocket error: {0}")]
     WebSocket(#[from] WebSocketError),
+    #[cfg(feature = "permslip")]
+    #[error("❌ Unsupported permslip response: {0}")]
+    UnsupportedPermslipResponse(String),
 }
 
 impl CommandError {

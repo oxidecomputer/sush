@@ -31,6 +31,7 @@ use sush_common::keys::{KeyId, Signature, SshPublicKey};
 use crate::AuthzSigner;
 use crate::commands::{CommandError, GlobalArgs};
 use crate::context::{CommandContext, OutputFormat, StatusDisplayStyle};
+use crate::types::SessionStartNonce;
 
 #[derive(Clone, Debug, Default)]
 pub struct Cli {
@@ -136,6 +137,27 @@ impl CommandContext for Cli {
         } else {
             Err(CommandError::MissingSession)
         }
+    }
+
+    fn session_start_params(
+        &self,
+        baseboard_id: BaseboardId,
+        nonce: SessionStartNonce,
+    ) -> Result<(), CommandError> {
+        match self.get_output_format() {
+            OutputFormat::Json => println!(
+                "{}",
+                json!({
+                    "baseboard_id": &baseboard_id.to_string(),
+                    "sush_nonce": &nonce.nonce,
+                })
+            ),
+            OutputFormat::Text => {
+                println!("Baseboard ID: {baseboard_id}");
+                println!("Sush Nonce:   {}", nonce.nonce);
+            }
+        }
+        Ok(())
     }
 
     fn session_started(&mut self, session: Session) -> Result<(), CommandError> {
