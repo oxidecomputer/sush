@@ -6,6 +6,7 @@
 
 pub mod authn;
 pub mod borsh;
+#[macro_use]
 pub mod codephrases;
 pub mod interactive;
 pub mod jobs;

@@ -759,7 +759,7 @@ async fn session(
                 .await?
                 .into_inner();
             if let Some(session_id) = session_id
-                && *session.session_id() != session_id
+                && session.session_id() != session_id
             {
                 return Err(CommandError::MissingSession);
             }
@@ -781,7 +781,7 @@ async fn session(
             let session = if let Some(session_id) = session_id {
                 Session::new(session_id)
             } else {
-                Session::new(SessionId::new())
+                Session::new(SessionId::random())
             };
             with_login(ctx, client, async || {
                 client
@@ -809,7 +809,7 @@ async fn session(
             with_login(ctx, client, async || {
                 client
                     .session_allow_attach()
-                    .session_id(session_id.clone())
+                    .session_id(session_id)
                     .key_id(key_id.clone())
                     .access(access)
                     .send()
@@ -827,7 +827,7 @@ async fn session(
             with_login(ctx, client, async || {
                 client
                     .session_deny_attach()
-                    .session_id(session_id.clone())
+                    .session_id(session_id)
                     .key_id(key_id.clone())
                     .send()
                     .await
@@ -843,11 +843,7 @@ async fn session(
                 return Err(CommandError::MissingSession);
             };
             with_login(ctx, client, async || {
-                client
-                    .session_stop()
-                    .session_id(session_id.clone())
-                    .send()
-                    .await
+                client.session_stop().session_id(*session_id).send().await
             })
             .await?;
             ctx.session_stopped(session_id)?;
@@ -920,7 +916,7 @@ async fn job(
                         {
                             Ok(resp) => resp.into_inner(),
                             Err(CommandError::NotFound) => {
-                                let session = Session::new(SessionId::new());
+                                let session = Session::new(SessionId::random());
                                 with_login(ctx, client, async || {
                                     client
                                         .session_start()
@@ -1136,7 +1132,7 @@ async fn job_start(
             match with_login_via(ctx, client, Some(&target), async || {
                 client
                     .job_output()
-                    .job_id(&job_id)
+                    .job_id(job_id)
                     .target(target.to_string())
                     .stream(stream)
                     .send()
@@ -1242,7 +1238,7 @@ async fn job_output(
     // Fetch job status for output length and hash.
     let status = job_status_try_from_json_map(
         with_login_via(ctx, client, Some(target), async || {
-            client.job_status().job_id(&job_id).send().await
+            client.job_status().job_id(job_id).send().await
         })
         .await?
         .into_inner(),
@@ -1348,7 +1344,7 @@ async fn job_output(
             async || {
                 client
                     .job_output()
-                    .job_id(&job_id)
+                    .job_id(job_id)
                     .target(target.to_string())
                     .stream(stream)
                     .send()

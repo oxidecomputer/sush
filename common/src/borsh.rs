@@ -12,7 +12,6 @@ use sled_hardware_types::BaseboardId;
 use x509_cert::Certificate;
 use x509_cert::der::{Decode as _, Encode as _};
 
-use crate::jobs::JobId;
 use crate::targets::Target;
 
 /// Borsh-encode a [`blake3::Hash`] as its 32 raw bytes.
@@ -86,30 +85,4 @@ pub fn borsh_de_cert<R: Read>(reader: &mut R) -> Result<Certificate> {
             "failed to deserialize cert from DER",
         )
     })
-}
-
-pub fn borsh_de_job_id<R: Read>(reader: &mut R) -> Result<String> {
-    Ok(String::deserialize_reader(reader)?
-        .parse::<JobId>()
-        .map_err(|_| Error::new(ErrorKind::InvalidData, "failed to deserialize job ID"))?
-        .to_string())
-}
-
-#[cfg(test)]
-mod test {
-    use crate::jobs::SessionId;
-
-    use super::*;
-
-    #[test]
-    fn borsh_de_job_id() {
-        let hostile = borsh::to_vec(&"../../etc/passwd".to_string()).unwrap();
-        assert!(borsh::from_slice::<JobId>(&hostile).is_err());
-
-        let sneaky = borsh::to_vec(&"ALPHA-BRAVO".to_string()).unwrap();
-        assert!(borsh::from_slice::<JobId>(&sneaky).is_err());
-
-        let good = borsh::to_vec(&SessionId::new().first_job_id().to_string()).unwrap();
-        assert!(borsh::from_slice::<JobId>(&good).is_ok());
-    }
 }

@@ -26,7 +26,7 @@ use sprockets_tls_test_utils::{
     private_key_path, root_prefix, sprockets_auth_prefix,
 };
 use sush_common::authn::{Challenge, ChallengeResponse, Identity, Nonce, RequestKey};
-use sush_common::codephrases::generate_id;
+use sush_common::codephrases::Codephrase;
 use sush_common::jobs::{JobId, JobStartRequest, SignedJob};
 use sush_common::keys::{EphemeralKey, KeyType, Signer as _};
 use sush_common::targets::Target;
@@ -126,7 +126,7 @@ pub async fn eventually(what: &str, secs: u64, mut condition: impl AsyncFnMut() 
 pub fn ephemeral_root() -> EphemeralKey {
     let mut buf = [0; 8];
     OsRng.fill_bytes(&mut buf);
-    let id = generate_id();
+    let id = Codephrase::random().truncate();
     EphemeralKey::new_root(
         KeyType::P256,
         format!("CN=Ephemeral Test Key {id},O=Oxide Computer Company,C=US")
@@ -139,7 +139,7 @@ pub fn ephemeral_root() -> EphemeralKey {
 
 /// An authenticated identity for `key`, as `iam` would produce.
 pub async fn fake_identity(key: &mut EphemeralKey) -> Identity {
-    let challenge = Challenge::new(Nonce::generate());
+    let challenge = Challenge::new(Nonce::random());
     let response = ChallengeResponse::new(challenge, RequestKey::new().verifier());
     let signed = key.sign(response).await.unwrap();
     let verified = signed

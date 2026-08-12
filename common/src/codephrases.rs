@@ -9,8 +9,20 @@
 //! that must be readily transmissible over low bandwidth channels (e.g.,
 //! email, voice, printed or handwritten notes, etc.).
 
-use crypto_bigint::{CheckedAdd as _, CheckedMul as _, Limb, Random as _, Reciprocal, U256};
+use std::borrow::Cow;
+use std::fmt;
+use std::io::{self, Read, Write};
+use std::str::FromStr;
+
+use borsh::{BorshDeserialize, BorshSerialize};
+use crypto_bigint::{
+    ArrayEncoding as _, CheckedAdd as _, CheckedMul as _, Encoding as _, Limb, Random as _,
+    Reciprocal, U256,
+};
 use rand_core::OsRng;
+use schemars::JsonSchema;
+use serde::de::Error as _;
+use serde::{Deserialize, Deserializer, Serialize, Serializer};
 use thiserror::Error;
 
 use crate::wordlist::{WORDLIST, WORDLIST_LEN};
@@ -19,7 +31,12 @@ use crate::wordlist::{WORDLIST, WORDLIST_LEN};
 /// to 2048, which gives us indexes into the BIP-39 word list.
 /// Since 2048<sup>23</sup> < 2<sup>256</sup> < 2048<sup>24</sup>,
 /// 24 words suffice to represent 256 bits with no redundancy.
-pub const PHRASE_WORDS_256: usize = 24;
+const PHRASE_WORDS_256: usize = 24;
+
+/// The BIP-39 word list contains no punctuation of any kind, so we are
+/// free to use ASCII hyphen (`-`) as the default word separator. Decoding
+/// will also accept arbitrary ASCII whitespace as word separators.
+const WORD_SEPARATOR: &str = "-";
 
 /// With 2048 words, an 8 word code phrase has ~88 bits of entropy,
 /// making it suitable for use as a unique, hard-to-guess identifier,
@@ -28,12 +45,217 @@ pub const PHRASE_WORDS_256: usize = 24;
 /// Note that the security of the Support Shell protocol (RFD 620) does
 /// *not* rely on such identifiers being unguessable; it relies only on
 /// the strength of the signatures produced over these phrases.
-pub const PHRASE_WORDS_ID: usize = 8;
+const TRUNCATED_BITS: u32 = 88;
 
-/// The BIP-39 word list contains no punctuation of any kind, so we are
-/// free to use ASCII hyphen (`-`) as the default word separator. Decoding
-/// will also accept arbitrary ASCII whitespace as word separators.
-pub const WORD_SEPARATOR: &str = "-";
+/// Random code phrase like `abstract misery favorite ordinary moon talk`.
+#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct Codephrase(U256);
+
+impl Codephrase {
+    /// Generate a new random codephrase.
+    pub fn random() -> Self {
+        Self(U256::random(&mut OsRng))
+    }
+
+    /// Turn 256 bits of entropy into a reasonably unique code phrase.
+    /// We use the low-order words of the full codephrase, and pad to
+    /// the canonical length; these phrases are intended for machine
+    /// consumption, and are short enough for easy transmission.
+    pub fn truncate(self) -> Self {
+        let mask = U256::from_u128(2u128.pow(TRUNCATED_BITS) - 1);
+        Self(self.0.bitand(&mask))
+    }
+
+    /// Construct a codephrase from its big-endian byte representation.
+    pub fn from_be_bytes(bytes: [u8; 32]) -> Self {
+        Self(U256::from_be_bytes(bytes))
+    }
+
+    /// Get the underlying big-endian byte representation of the codephrase.
+    pub fn to_be_bytes(&self) -> [u8; 32] {
+        self.0.to_be_byte_array().into()
+    }
+}
+
+impl fmt::Display for Codephrase {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        // Turn 256 bits of entropy into an un-padded big-endian code phrase.
+        let b = Reciprocal::new(Limb(WORDLIST_LEN as u64)).expect("should have some words");
+        let mut n = self.0;
+        let mut r;
+        let mut words = Vec::with_capacity(PHRASE_WORDS_256);
+        while n > U256::ZERO {
+            (n, r) = n.ct_div_rem_limb_with_reciprocal(&b);
+            words.push(word(r.0 as usize)); // accumulate little-endian
+        }
+        words.reverse(); // emit big-endian
+
+        f.write_str(&words.join(WORD_SEPARATOR))
+    }
+}
+
+impl fmt::Debug for Codephrase {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "Codephrase({self})")
+    }
+}
+
+impl FromStr for Codephrase {
+    type Err = InvalidCodephrase;
+
+    fn from_str(value: &str) -> Result<Self, Self::Err> {
+        // Decode a big endian code phrase into 256 bits of entropy.
+        //
+        // Decoding is non-injective, or "liberal" in the sense that it will
+        // accept non-canonical codephrases, e.g., ones with spaces instead of
+        // separators, words in mixed case, or without leading zeros. This is
+        // for the comfort of humans that may have to transmit such phrases.
+        // It rejects phrases that no entropy encodes to: unknown words, more
+        // than [`PHRASE_WORDS_256`] words, or a value of 256 bits or more.
+        // The empty phrase decodes to zero. Callers that must distinguish
+        // absent input from zero should check before decoding.
+
+        let b = U256::from_u64(WORDLIST_LEN as u64);
+        let mut n = U256::ZERO;
+        let mut words = 0;
+        for word in value
+            .to_ascii_lowercase()
+            .replace(WORD_SEPARATOR, " ")
+            .split_ascii_whitespace()
+        {
+            words += 1;
+            if words > PHRASE_WORDS_256 {
+                return Err(InvalidCodephrase);
+            }
+            let r = U256::from_u64(index(word)? as u64);
+            n = Option::from(n.checked_mul(&b)).ok_or(InvalidCodephrase)?;
+            n = Option::from(n.checked_add(&r)).ok_or(InvalidCodephrase)?;
+        }
+        Ok(Self(n))
+    }
+}
+
+impl Serialize for Codephrase {
+    fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        serializer.serialize_str(&self.to_string())
+    }
+}
+
+impl<'de> Deserialize<'de> for Codephrase {
+    fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        let string = <String as Deserialize>::deserialize(deserializer)?;
+        Self::from_str(&string).map_err(D::Error::custom)
+    }
+}
+
+impl BorshSerialize for Codephrase {
+    fn serialize<W: Write>(&self, writer: &mut W) -> io::Result<()> {
+        <[u8; 32] as BorshSerialize>::serialize(&self.to_be_bytes(), writer)
+    }
+}
+
+impl BorshDeserialize for Codephrase {
+    fn deserialize_reader<R: Read>(reader: &mut R) -> io::Result<Self> {
+        let bytes = <[u8; 32] as BorshDeserialize>::deserialize_reader(reader)?;
+        Ok(Self(U256::from_be_byte_array(bytes.into())))
+    }
+}
+
+// Treat a codephrase as a string in JSON schemas.
+impl JsonSchema for Codephrase {
+    fn schema_name() -> String {
+        String::schema_name()
+    }
+
+    fn json_schema(generator: &mut schemars::r#gen::SchemaGenerator) -> schemars::schema::Schema {
+        String::json_schema(generator)
+    }
+
+    fn is_referenceable() -> bool {
+        String::is_referenceable()
+    }
+
+    fn schema_id() -> Cow<'static, str> {
+        String::schema_id()
+    }
+}
+
+#[macro_export]
+macro_rules! codephrase_newtype {
+    ($(#[$meta:meta])* $vis:vis struct $name:ident = $len:ident;) => {
+        $(#[$meta])*
+        $vis struct $name($crate::codephrases::Codephrase);
+
+        impl $name {
+            #[allow(unused)]
+            $vis fn random() -> Self {
+                let mut codephrase = $crate::codephrases::Codephrase::random();
+                match $crate::codephrases::CodephraseLength::$len {
+                    $crate::codephrases::CodephraseLength::Full => {}
+                    $crate::codephrases::CodephraseLength::Truncated => {
+                        codephrase = codephrase.truncate();
+                    }
+                }
+                Self(codephrase)
+            }
+
+            #[allow(unused)]
+            $vis fn from_hash(hash: blake3::Hash) -> Self {
+                let mut codephrase = $crate::codephrases::Codephrase::from_be_bytes(*hash.as_bytes());
+                match $crate::codephrases::CodephraseLength::$len {
+                    $crate::codephrases::CodephraseLength::Full => {}
+                    $crate::codephrases::CodephraseLength::Truncated => {
+                        codephrase = codephrase.truncate();
+                    }
+                }
+                Self(codephrase)
+            }
+
+            #[allow(unused)]
+            $vis fn from_be_bytes(bytes: [u8; 32]) -> Self {
+                let mut codephrase = $crate::codephrases::Codephrase::from_be_bytes(bytes);
+                match $crate::codephrases::CodephraseLength::$len {
+                    $crate::codephrases::CodephraseLength::Full => {}
+                    $crate::codephrases::CodephraseLength::Truncated => {
+                        codephrase = codephrase.truncate();
+                    }
+                }
+                Self(codephrase)
+            }
+
+            #[allow(unused)]
+            $vis fn to_be_bytes(&self) -> [u8; 32] {
+                self.0.to_be_bytes()
+            }
+        }
+
+        impl std::fmt::Debug for $name {
+            fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                write!(f, "{}({})", stringify!($name), self.0)
+            }
+        }
+
+        impl std::fmt::Display for $name {
+            fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                <$crate::codephrases::Codephrase as std::fmt::Display>::fmt(&self.0, f)
+            }
+        }
+
+        impl std::str::FromStr for $name {
+            type Err = $crate::codephrases::InvalidCodephrase;
+
+            fn from_str(s: &str) -> Result<$name, Self::Err> {
+                Ok($name(s.parse()?))
+            }
+        }
+    }
+}
+
+#[derive(Clone, Copy)]
+pub enum CodephraseLength {
+    Full,
+    Truncated,
+}
 
 /// Decoding a phrase failed.
 #[derive(Debug, Error)]
@@ -52,80 +274,16 @@ fn index(word: &str) -> Result<usize, InvalidCodephrase> {
     WORDLIST.binary_search(&word).map_err(|_| InvalidCodephrase)
 }
 
-/// Turn 256 bits of entropy into an un-padded big-endian code phrase.
-pub fn codephrase(value: U256) -> Vec<&'static str> {
-    let b = Reciprocal::new(Limb(WORDLIST_LEN as u64)).expect("should have some words");
-    let mut n = value;
-    let mut r;
-    let mut words = Vec::with_capacity(PHRASE_WORDS_256);
-    while n > U256::ZERO {
-        (n, r) = n.ct_div_rem_limb_with_reciprocal(&b);
-        words.push(word(r.0 as usize)); // accumulate little-endian
-    }
-    words.reverse(); // emit big-endian
-    words
-}
-
-/// Turn 256 bits of entropy into a reasonably unique code phrase.
-/// We use the low-order words of the full codephrase, and pad to
-/// the canonical length; these phrases are intended for machine
-/// consumption, and are short enough for easy transmission.
-pub fn id_phrase(value: U256) -> Vec<&'static str> {
-    let mut phrase = codephrase(value);
-    let n = phrase.len().saturating_sub(PHRASE_WORDS_ID);
-    let mut phrase = phrase.split_off(n);
-    while phrase.len() < PHRASE_WORDS_ID {
-        phrase.insert(0, word(0)); // pad w/leading zeros
-    }
-    phrase
-}
-
-/// Generate a code phrase for use as an identifier.
-pub fn generate_id() -> String {
-    id_phrase(U256::random(&mut OsRng)).join(WORD_SEPARATOR)
-}
-
-/// Decode a big endian code phrase into 256 bits of entropy.
-///
-/// Decoding is non-injective, or "liberal" in the sense that it will
-/// accept non-canonical codephrases, e.g., ones with spaces instead of
-/// separators, words in mixed case, or without leading zeros. This is
-/// for the comfort of humans that may have to transmit such phrases.
-/// It rejects phrases that no entropy encodes to: unknown words, more
-/// than [`PHRASE_WORDS_256`] words, or a value of 256 bits or more.
-/// The empty phrase decodes to zero. Callers that must distinguish
-/// absent input from zero should check before decoding.
-pub fn decode_phrase(phrase: &str) -> Result<U256, InvalidCodephrase> {
-    let b = U256::from_u64(WORDLIST_LEN as u64);
-    let mut n = U256::ZERO;
-    let mut words = 0;
-    for word in phrase
-        .to_ascii_lowercase()
-        .replace(WORD_SEPARATOR, " ")
-        .split_ascii_whitespace()
-    {
-        words += 1;
-        if words > PHRASE_WORDS_256 {
-            return Err(InvalidCodephrase);
-        }
-        let r = U256::from_u64(index(word)? as u64);
-        n = Option::from(n.checked_mul(&b)).ok_or(InvalidCodephrase)?;
-        n = Option::from(n.checked_add(&r)).ok_or(InvalidCodephrase)?;
-    }
-    Ok(n)
-}
-
 #[cfg(test)]
 mod test {
     use super::*;
-    use sha2::{Digest as _, Sha256};
     use std::collections::HashSet;
 
     fn round_trip(entropy: U256) -> String {
-        let codephrase = codephrase(entropy).join(WORD_SEPARATOR);
-        let decoded = decode_phrase(&codephrase).unwrap();
-        assert_eq!(entropy, decoded);
-        codephrase
+        let codephrase = Codephrase::from_be_bytes(entropy.to_be_bytes());
+        let decoded: Codephrase = codephrase.to_string().parse().unwrap();
+        assert_eq!(codephrase, decoded);
+        codephrase.to_string()
     }
 
     #[test]
@@ -158,44 +316,49 @@ mod test {
     #[test]
     fn non_phrases() {
         // Unknown words, wherever they appear.
-        assert!(decode_phrase("plugh").is_err());
-        assert!(decode_phrase("abandon-plugh").is_err());
+        assert!(Codephrase::from_str("plugh").is_err());
+        assert!(Codephrase::from_str("abandon-plugh").is_err());
 
         // More words than any entropy encodes to.
         let long = [word(0); PHRASE_WORDS_256 + 1].join(WORD_SEPARATOR);
-        assert!(decode_phrase(&long).is_err());
+        assert!(Codephrase::from_str(&long).is_err());
 
         // 24-word values of 256 bits or more: the smallest, exactly
         // 2^256, and the largest.
         let mut smallest = vec![word(8)];
         smallest.extend([word(0); PHRASE_WORDS_256 - 1]);
-        assert!(decode_phrase(&smallest.join(WORD_SEPARATOR)).is_err());
+        assert!(Codephrase::from_str(&smallest.join(WORD_SEPARATOR)).is_err());
         let largest = [word(WORDLIST_LEN - 1); PHRASE_WORDS_256].join(WORD_SEPARATOR);
-        assert!(decode_phrase(&largest).is_err());
+        assert!(Codephrase::from_str(&largest).is_err());
     }
 
     #[test]
     fn constant_codephrases() {
         assert_eq!(
-            round_trip(U256::from_be_slice(&Sha256::digest("test phrase one"))),
-            "abstract-summer-orange-gown-urge-model-\
-             exact-gorilla-outside-common-this-pepper-\
-             pear-dust-minimum-black-double-recipe-\
-             castle-crystal-clog-logic-delay-hamster"
+            round_trip(U256::from_be_slice(
+                blake3::hash(b"test phrase one").as_slice()
+            )),
+            "able-wet-frame-clown-gauge-gather-curious-\
+             stereo-moment-moral-mirror-net-laptop-square-\
+             toe-skill-upper-credit-cancel-flag-what-powder-\
+             guide-hold"
         );
         assert_eq!(
-            round_trip(U256::from_be_slice(&Sha256::digest("another test phrase"))),
-            "abstract-misery-favorite-ordinary-moon-talk-\
-             write-coffee-digital-slogan-spray-angry-\
-             once-jazz-random-income-garage-regret-accident-\
-             file-release-deny-reward-drastic"
+            round_trip(U256::from_be_slice(
+                blake3::hash(b"another test phrase").as_slice()
+            )),
+            "about-item-skill-author-expose-assume-language-\
+             mix-tornado-undo-dolphin-obtain-good-quarter-\
+             poem-under-system-hybrid-foil-person-together-\
+             output-exhaust-today"
         );
         assert_eq!(
-            round_trip(U256::from_be_slice(&Sha256::digest("one more for luck!"))),
-            "able-dismiss-cost-scheme-amazing-slogan-\
-             service-current-protect-feed-length-text-\
-             cruise-wisdom-beauty-angle-regret-truck-\
-             prosper-album-decline-wheel-pause-legend"
+            round_trip(U256::from_be_slice(
+                blake3::hash(b"one more for luck!").as_slice()
+            )),
+            "able-hazard-bread-decade-elegant-omit-ensure-\
+             sudden-beef-voice-remove-nut-wish-bind-birth-b\
+             leak-brush-joke-seven-amused-sunny-kite-flee-tape"
         );
     }
 
@@ -236,22 +399,17 @@ mod test {
     fn id_phrases() {
         let mut seen = HashSet::new();
         for _ in 0..10_000 {
-            let id = generate_id();
-            let n = id.split(WORD_SEPARATOR).count();
-            assert_eq!(n, PHRASE_WORDS_ID);
-            assert!(seen.insert(id.clone()), "duplicate ID {id}");
+            let id = Codephrase::random().truncate();
+            assert!(seen.insert(id), "duplicate ID {id}");
 
-            let entropy = decode_phrase(&id).unwrap();
-            round_trip(entropy);
-            assert_eq!(id, id_phrase(entropy).join(WORD_SEPARATOR));
+            let roundtrip = Codephrase::from_str(&id.to_string()).unwrap();
+            assert_eq!(id, roundtrip);
         }
     }
 
     #[test]
-    fn id_leading_zero() {
-        let v = U256::ONE.shl_vartime(66); // 7 digits, since 2048⁶ = 2⁶⁶
-        let id = id_phrase(v);
-        assert_eq!(id.len(), PHRASE_WORDS_ID);
-        assert_eq!(decode_phrase(&id.join(WORD_SEPARATOR)).unwrap(), v);
+    fn leading_zeros_after_truncation() {
+        let truncated = Codephrase::random().truncate();
+        assert_eq!(U256::from_u8(0), truncated.0.shr(TRUNCATED_BITS as _));
     }
 }

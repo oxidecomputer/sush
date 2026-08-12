@@ -44,6 +44,7 @@ pub mod v0 {
     use super::*;
 
     #[derive(BorshDeserialize, BorshSerialize, Clone, Debug, Eq, PartialEq)]
+    #[allow(clippy::large_enum_variant)]
     pub enum Message {
         Request(Request),
         Event(
@@ -158,6 +159,7 @@ pub mod v0 {
     }
 
     #[derive(BorshDeserialize, BorshSerialize, Clone, Debug, Eq, PartialEq)]
+    #[allow(clippy::large_enum_variant)]
     pub enum JobRequest {
         Start(SignedJob, JobStartParams),
         Stop(JobId),
@@ -240,6 +242,8 @@ mod wire_format {
 
     use super::v0::*;
     use super::*;
+    use std::str::FromStr as _;
+    use sush_common::authn::Nonce;
 
     /// Serialize a message and compare against the snapshot in
     /// `tests/output/`, or rewrite it under `EXPECTORATE=overwrite`.
@@ -264,11 +268,15 @@ mod wire_format {
         assert_eq!(decoded, message, "wire format should round-trip");
     }
 
+    fn sid(name: &str) -> SessionId {
+        name.parse().unwrap()
+    }
+
     #[test]
     fn session_start_request() {
         let msg: VersionedMessage = Message::Request(Request::session(
-            KeyId::from("zoo-zero".to_string()),
-            SessionRequest::Start(SessionId::from("abandon-ability")),
+            KeyId::from_str("zoo-zero").unwrap(),
+            SessionRequest::Start(sid("abandon-ability")),
         ))
         .into();
         assert_wire_format("session-start-request", msg);
@@ -277,8 +285,8 @@ mod wire_format {
     #[test]
     fn session_stop_request() {
         let msg: VersionedMessage = Message::Request(Request::session(
-            KeyId::from("zoo-zero".to_string()),
-            SessionRequest::Stop(SessionId::from("abandon-ability")),
+            KeyId::from_str("zoo-zero").unwrap(),
+            SessionRequest::Stop(sid("abandon-ability")),
         ))
         .into();
         assert_wire_format("session-stop-request", msg);
@@ -287,10 +295,10 @@ mod wire_format {
     #[test]
     fn session_allow_attach_request() {
         let msg: VersionedMessage = Message::Request(Request::session(
-            KeyId::from("zoo-zero".to_string()),
+            KeyId::from_str("zoo-zero").unwrap(),
             SessionRequest::AllowAttach(
-                SessionId::from("abandon-ability"),
-                KeyId::from("able-about".to_string()),
+                sid("abandon-ability"),
+                KeyId::from_str("able-about").unwrap(),
                 Access::ReadWrite,
             ),
         ))
@@ -301,10 +309,10 @@ mod wire_format {
     #[test]
     fn session_deny_attach_request() {
         let msg: VersionedMessage = Message::Request(Request::session(
-            KeyId::from("zoo-zero".to_string()),
+            KeyId::from_str("zoo-zero").unwrap(),
             SessionRequest::DenyAttach(
-                SessionId::from("abandon-ability"),
-                KeyId::from("able-about".to_string()),
+                sid("abandon-ability"),
+                KeyId::from_str("able-about").unwrap(),
             ),
         ))
         .into();
@@ -326,16 +334,16 @@ mod wire_format {
         );
         let signed = Signed::new(
             request,
-            KeyId::from("zoo-zero".to_string()),
+            KeyId::from_str("zoo-zero").unwrap(),
             EncodedSignature {
-                r: "abandon".to_string(),
-                s: "zoo".to_string(),
+                r: "abandon".parse().unwrap(),
+                s: "zoo".parse().unwrap(),
                 flags: 0,
                 counter: 0,
             },
         );
         let msg: VersionedMessage = Message::Request(Request::job(
-            KeyId::from("zoo-zero".to_string()),
+            KeyId::from_str("zoo-zero").unwrap(),
             JobRequest::Start(signed, JobStartParams::default()),
         ))
         .into();
@@ -350,9 +358,11 @@ mod wire_format {
         // Craft deterministic evidence: nonces, then the ed25519
         // basepoint as the verifier.
         let mut evidence = Vec::new();
-        for nonce in ["abandon", "ability"] {
-            evidence.extend((nonce.len() as u32).to_le_bytes());
-            evidence.extend(nonce.as_bytes());
+        for nonce in [
+            Nonce::from_str("abandon").unwrap(),
+            Nonce::from_str("ability").unwrap(),
+        ] {
+            evidence.extend(&nonce.to_be_bytes());
         }
         evidence.push(0x58);
         evidence.extend([0x66; 31]);
@@ -366,16 +376,16 @@ mod wire_format {
 
         let signed = Signed::new(
             response,
-            KeyId::from("zoo-zero".to_string()),
+            KeyId::from_str("zoo-zero").unwrap(),
             EncodedSignature {
-                r: "abandon".to_string(),
-                s: "zoo".to_string(),
+                r: "abandon".parse().unwrap(),
+                s: "zoo".parse().unwrap(),
                 flags: 0,
                 counter: 0,
             },
         );
         let msg: VersionedMessage = Message::Request(Request::identity(
-            KeyId::from("zoo-zero".to_string()),
+            KeyId::from_str("zoo-zero").unwrap(),
             IdentityRequest::Login(public_key, signed),
         ))
         .into();

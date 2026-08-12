@@ -117,16 +117,16 @@ async fn jobs_gossip_between_sleds() {
     // A session started on sled A becomes B's active session too.
     let authn_a = fake_identity(&mut root).await;
     let authn_b = fake_identity(&mut root).await;
-    let session_id = SessionId::new();
-    let session = Session::new(session_id.clone());
+    let session_id = SessionId::random();
+    let session = Session::new(session_id);
     a.mgr
-        .session_start(&authn_a, session_id.clone(), true)
+        .session_start(&authn_a, session_id, true)
         .await
         .unwrap();
     eventually("session gossips to B", 60, async || {
         b.mgr
             .session(&authn_b)
-            .is_some_and(|s| *s.session_id() == session_id)
+            .is_some_and(|s| s.session_id() == session_id)
     })
     .await;
 
@@ -161,15 +161,15 @@ async fn jobs_gossip_between_sleds() {
     .await;
 
     // A session started on B supersedes A's everywhere.
-    let successor = SessionId::new();
+    let successor = SessionId::random();
     b.mgr
-        .session_start(&authn_b, successor.clone(), true)
+        .session_start(&authn_b, successor, true)
         .await
         .unwrap();
     eventually("supersession gossips to A", 60, async || {
         a.mgr
             .session(&authn_a)
-            .is_some_and(|s| *s.session_id() == successor)
+            .is_some_and(|s| s.session_id() == successor)
     })
     .await;
 

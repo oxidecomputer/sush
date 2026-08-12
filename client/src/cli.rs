@@ -96,7 +96,7 @@ impl CommandContext for Cli {
     fn session_stopped(&mut self, session_id: &SessionId) -> Result<(), CommandError> {
         let mut session_guard = self.session.lock().unwrap();
         if let Some(session) = session_guard.as_ref()
-            && session.session_id() == session_id
+            && session.session_id() == *session_id
         {
             let _ = session_guard.take();
         }

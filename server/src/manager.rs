@@ -256,7 +256,7 @@ impl JobManager {
         macro_rules! unauthorized {
             ($error:expr) => {{
                 warn!(self.log, "authentication failed"; "error" => %$error);
-                let nonce = Nonce::generate();
+                let nonce = Nonce::random();
                 self.nonces.lock().await.put(nonce.clone(), Instant::now());
                 return Err(JobError::unauthorized(nonce));
             }};
@@ -433,7 +433,7 @@ impl JobManager {
         move |state| {
             state
                 .session()
-                .is_some_and(|s| *s.session_id() == session_id)
+                .is_some_and(|s| s.session_id() == session_id)
         }
     }
 
@@ -493,11 +493,10 @@ impl JobManager {
         session_id: SessionId,
         wait: bool,
     ) -> Result<(), JobError> {
-        self.session_request(authn, SessionRequest::Start(session_id.clone()))
+        self.session_request(authn, SessionRequest::Start(session_id))
             .await?;
         if wait {
-            self.wait_for(self.wait_for_session(session_id.clone()))
-                .await?;
+            self.wait_for(self.wait_for_session(session_id)).await?;
         }
         Ok(())
     }
