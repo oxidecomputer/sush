@@ -9,8 +9,12 @@
 //! that must be readily transmissible over low bandwidth channels (e.g.,
 //! email, voice, printed or handwritten notes, etc.).
 
+use std::borrow::Cow;
+use std::fmt;
+use std::io::{self, Read, Write};
 use std::str::FromStr;
 
+use borsh::{BorshDeserialize, BorshSerialize};
 use crypto_bigint::{
     ArrayEncoding as _, CheckedAdd as _, CheckedMul as _, Encoding as _, Limb, Random as _,
     Reciprocal, U256,
@@ -22,8 +26,6 @@ use serde::{Deserialize, Deserializer, Serialize, Serializer};
 use thiserror::Error;
 
 use crate::wordlist::{WORDLIST, WORDLIST_LEN};
-use borsh::{BorshDeserialize, BorshSerialize};
-use std::io::prelude::{Read, Write};
 
 /// Entropy is treated as an integer whose base is to be changed
 /// to 2048, which gives us indexes into the BIP-39 word list.
@@ -75,8 +77,8 @@ impl Codephrase {
     }
 }
 
-impl std::fmt::Display for Codephrase {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+impl fmt::Display for Codephrase {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         // Turn 256 bits of entropy into an un-padded big-endian code phrase.
         let b = Reciprocal::new(Limb(WORDLIST_LEN as u64)).expect("should have some words");
         let mut n = self.0;
@@ -92,8 +94,8 @@ impl std::fmt::Display for Codephrase {
     }
 }
 
-impl std::fmt::Debug for Codephrase {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+impl fmt::Debug for Codephrase {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         write!(f, "Codephrase({self})")
     }
 }
@@ -147,13 +149,13 @@ impl<'de> Deserialize<'de> for Codephrase {
 }
 
 impl BorshSerialize for Codephrase {
-    fn serialize<W: Write>(&self, writer: &mut W) -> std::io::Result<()> {
+    fn serialize<W: Write>(&self, writer: &mut W) -> io::Result<()> {
         <[u8; 32] as BorshSerialize>::serialize(&self.to_be_bytes(), writer)
     }
 }
 
 impl BorshDeserialize for Codephrase {
-    fn deserialize_reader<R: Read>(reader: &mut R) -> std::io::Result<Self> {
+    fn deserialize_reader<R: Read>(reader: &mut R) -> io::Result<Self> {
         let bytes = <[u8; 32] as BorshDeserialize>::deserialize_reader(reader)?;
         Ok(Self(U256::from_be_byte_array(bytes.into())))
     }
@@ -173,7 +175,7 @@ impl JsonSchema for Codephrase {
         String::is_referenceable()
     }
 
-    fn schema_id() -> std::borrow::Cow<'static, str> {
+    fn schema_id() -> Cow<'static, str> {
         String::schema_id()
     }
 }
@@ -228,13 +230,13 @@ macro_rules! codephrase_newtype {
         }
 
         impl std::fmt::Debug for $name {
-            fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+            fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
                 write!(f, "{}({})", stringify!($name), self.0)
             }
         }
 
         impl std::fmt::Display for $name {
-            fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+            fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
                 <$crate::codephrases::Codephrase as std::fmt::Display>::fmt(&self.0, f)
             }
         }
