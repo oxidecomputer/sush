@@ -48,23 +48,18 @@ test try running the command `echo $SUSH_JOB_ID`:
 ```
 sush# job start --wait "echo $SUSH_JOB_ID"
 ✅ Signed request for job `install-there-mutual-warfare-sound-live-order-man`
-✅ Job ID:      install-there-mutual-warfare-sound-live-order-man
-   Target:	a part:0001
-   Job status:	Stopped
-   Started at:	2026-08-05 16:27:58.824606210 UTC
-   Stopped at:	2026-08-05 16:27:58.892796324 UTC (68ms 190us 114ns)
-   Exit status:	0
-   Stdout len:	50 B
-   Stderr len:	0 B
-   Stdout hash:	ae5a3df9c5c629590af52baceb12021525c0be16994738977b2ed049f4f374bb
-   Stderr hash:	af1349b9f5f9a1a6a0404dea36dcc9499bcb25c9adc112b7cc9a93cae41f3262
+✅ Job ID:    install-there-mutual-warfare-sound-live-order-man
+   a part:0001  Stopped, exit 0 (68ms 190us 114ns), 50 B out, 0 B err
 ✅ Job stdout:
 install-there-mutual-warfare-sound-live-order-man
 ```
 
 The `--wait` (`-w`) flag tells `sush` to wait for the job to stop before
-returning; the default behavior is to start the job and immediately return.
-You can check the status of a (running) job with `job status`.
+returning, showing a live status line per sled while it runs; the default
+behavior is to start the job and immediately return. You can check the
+status of a (running) job with `job status`, watch it the same way with
+`job status --wait`, or see the complete job status with
+`job status --full`.
 
 To run an interactive job with a pseudoterminal, you can use `job start
 --interactive` (`-i`):
