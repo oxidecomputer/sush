@@ -11,6 +11,7 @@ use std::io::{Read as _, Seek as _, SeekFrom, Write as _, stdin};
 use std::num::{NonZeroU8, NonZeroU64};
 use std::path::{Path, PathBuf};
 use std::pin::Pin;
+use std::str::FromStr;
 use std::time::Duration;
 
 use async_recursion::async_recursion;
@@ -45,14 +46,14 @@ use sush_common::jobs::JobOutputStream::{self, Stderr, Stdout};
 #[cfg(feature = "permslip")]
 use sush_common::jobs::JobStartRequest;
 use sush_common::jobs::{
-    Access, JobId, JobLimits, JobOutputHash, JobOutputState, JobStatus, Session, SessionId,
-    SignedJob, job_status_try_from_json_map,
+    Access, JobId, JobLimits, JobOutputHash, JobOutputState, JobStatus, JobStatusMap, Session,
+    SessionId, SignedJob, job_status_try_from_json_map,
 };
 use sush_common::keys::{KeyError, KeyId, Signer as _};
 use sush_common::targets::{SledId, Target};
 
 use crate::ByteStream;
-use crate::context::{Authz, CommandContext, OutputFormat};
+use crate::context::{Authz, CommandContext, OutputFormat, StatusDisplayStyle};
 use crate::identity::{IdentityError, SshAgentConnection};
 use crate::interactive::interactive_job;
 #[cfg(feature = "permslip")]
@@ -88,7 +89,6 @@ const PARALLEL_CHUNKS: NonZeroU8 = NonZeroU8::new(8).unwrap();
 const MAX_PARALLEL_CHUNKS: NonZeroU8 = NonZeroU8::new(64).unwrap();
 
 // Job polling and spinner update intervals.
-const JOB_START_UPDATE_INTERVAL: Duration = Duration::from_millis(250);
 const JOB_STOP_RETRY_INTERVAL: Duration = Duration::from_millis(100);
 #[cfg(feature = "permslip")]
 const SIGNING_UPDATE_INTERVAL: Duration = Duration::from_millis(100);
@@ -193,6 +193,99 @@ impl ClientArgs {
         ctx.set_globals(self.globals.clone());
         self.command.clone().execute(ctx).await
     }
+}
+
+/// A rack-wide target can't combine with `--binary` or `--file`.
+#[tokio::test]
+async fn output_needs_target() {
+    use crate::cli::Cli;
+
+    let client =
+        Client::new_with_client("http://[::1]:1", reqwest::Client::new(), Default::default());
+    let output = JobOutput::try_parse_from([
+        "job-stdout",
+        "--binary",
+        "sea-say-sting-palm-tunnel-festival-pull-bid",
+    ])
+    .unwrap();
+    let err = job_output(
+        &mut Cli::default(),
+        &client,
+        &"*".parse::<TargetArg>().unwrap(),
+        Stdout,
+        output,
+    )
+    .await
+    .unwrap_err();
+    assert!(matches!(err, CommandError::OutputNeedsTarget));
+}
+
+/// The watch settles only after the sled set is stable and every sled
+/// is terminal for consecutive polls.
+#[test]
+fn watch_settling() {
+    use chrono::Utc;
+
+    fn sled(serial: &str) -> BaseboardId {
+        BaseboardId {
+            part_number: "913-0000019".to_owned(),
+            serial_number: serial.to_owned(),
+        }
+    }
+    let job_id: JobId = "sea-say-sting-palm-tunnel-festival-pull-bid"
+        .parse()
+        .unwrap();
+    let terminal = JobStatus::Cancelled {
+        job_id,
+        time_cancelled: Utc::now(),
+        actor: KeyId::random(),
+    };
+    let running = JobStatus::Started {
+        job_id,
+        time_started: Utc::now(),
+    };
+
+    let mut quiet = 0;
+    let mut status = JobStatusMap::new();
+    assert!(
+        !watch_done(1, 0, &status, &mut quiet),
+        "empty never settles"
+    );
+
+    status.insert(sled("A"), terminal.clone());
+    assert!(!watch_done(2, 0, &status, &mut quiet), "new sled resets");
+    assert!(!watch_done(3, 1, &status, &mut quiet), "first quiet poll");
+    assert!(
+        !watch_done(4, 1, &status, &mut quiet),
+        "quiet but too young for gossip"
+    );
+    assert!(watch_done(5, 1, &status, &mut quiet), "old enough, quiet");
+
+    let mut quiet = 0;
+    status.insert(sled("B"), running);
+    assert!(!watch_done(6, 2, &status, &mut quiet), "running sled holds");
+    assert_eq!(quiet, 0);
+
+    status.insert(sled("B"), terminal);
+    assert!(!watch_done(7, 2, &status, &mut quiet));
+    assert!(
+        watch_done(8, 2, &status, &mut quiet),
+        "settles once terminal"
+    );
+}
+
+/// Anything the target grammar accepts stays a target; bare serials
+/// fall through; everything else still fails.
+#[test]
+fn target_arg() {
+    assert!(matches!("*".parse(), Ok(TargetArg::Target(_))));
+    assert!(matches!("14".parse(), Ok(TargetArg::Target(_))));
+    assert!(matches!(
+        "913-0000019:BRM42220030".parse(),
+        Ok(TargetArg::Target(_))
+    ));
+    assert!(matches!("brm42220030".parse(), Ok(TargetArg::Serial(s)) if s == "brm42220030"));
+    assert!("not,a:target!".parse::<TargetArg>().is_err());
 }
 
 /// [`ClientArgs`] must satisfy Clap's internal consistency asserts
@@ -397,6 +490,14 @@ pub enum JobCommand {
         /// The job whose status should be fetched.
         #[clap(env = SUSH_JOB_ID)]
         job_id: JobId,
+
+        /// Show full per-sled status instead of one line per sled.
+        #[arg(short, long)]
+        full: bool,
+
+        /// Watch the status until the job settles on every sled.
+        #[arg(short, long)]
+        wait: bool,
     },
 
     /// Get the standard output of a job.
@@ -404,7 +505,7 @@ pub enum JobCommand {
     Stdout {
         /// The sled from which output should be fetched.
         #[arg(short = 'T', long, default_value = "*")]
-        target: Target,
+        target: TargetArg,
 
         #[clap(flatten)]
         output: JobOutput,
@@ -415,7 +516,7 @@ pub enum JobCommand {
     Stderr {
         /// The sled from which output should be fetched.
         #[arg(short = 'T', long, default_value = "*")]
-        target: Target,
+        target: TargetArg,
 
         #[clap(flatten)]
         output: JobOutput,
@@ -429,7 +530,7 @@ pub enum JobCommand {
 
         /// The sled to attach to.
         #[arg(short = 'T', long, default_value = "*")]
-        target: Target,
+        target: TargetArg,
     },
 
     /// Show status of previously started jobs.
@@ -977,20 +1078,34 @@ async fn job(
             Ok(())
         }
 
-        (JobCommand::Status { job_id }, Some(client)) => job_status(ctx, client, &job_id).await,
+        (JobCommand::Status { job_id, full, wait }, Some(client)) => {
+            let style = if full {
+                StatusDisplayStyle::Full
+            } else {
+                StatusDisplayStyle::Short
+            };
+            if wait {
+                let status = job_watch(ctx, client, &job_id).await?;
+                ctx.job_status(&job_id, &status, style);
+                Ok(())
+            } else {
+                job_status(ctx, client, &job_id, style).await
+            }
+        }
 
         (JobCommand::Stdout { target, output }, Some(client)) => {
-            let target = resolve_target(client, &target).await?;
             job_output(ctx, client, &target, Stdout, output).await
         }
 
         (JobCommand::Stderr { target, output }, Some(client)) => {
-            let target = resolve_target(client, &target).await?;
             job_output(ctx, client, &target, Stderr, output).await
         }
 
         (JobCommand::Attach { job_id, target }, Some(client)) => {
-            let target = resolve_target(client, &target).await?;
+            let target = match &target {
+                TargetArg::Target(target) => resolve_target(client, target).await?,
+                TargetArg::Serial(serial) => resolve_serial(ctx, client, &job_id, serial).await?,
+            };
             job_attach(ctx, client, &job_id, &target).await?;
             Ok(())
         }
@@ -1010,7 +1125,7 @@ async fn job(
                 let status = job_status_try_from_json_map(job)
                     .map_err(CommandError::BaseboardIdParseError)?;
                 if let Some(s) = status.values().next() {
-                    ctx.job_status(s.job_id(), &status);
+                    ctx.job_status(s.job_id(), &status, StatusDisplayStyle::Short);
                 }
             }
             Ok(())
@@ -1078,40 +1193,66 @@ async fn job_start(
         start.await?;
         ctx.job_started(&job);
         match job_attach(ctx, client, &job_id, &target).await {
-            Ok(()) | Err(CommandError::NotFound) => job_status(ctx, client, &job_id).await?,
+            Ok(()) | Err(CommandError::NotFound) => {
+                job_status(ctx, client, &job_id, StatusDisplayStyle::Short).await?
+            }
             Err(error) => return Err(error),
         }
     } else if wait.is_some() {
-        let mut interval = interval(JOB_START_UPDATE_INTERVAL);
+        // Watch the whole rack while the start request runs, and keep
+        // watching until the job settles everywhere.
+        ctx.job_watch_started(&job_id);
+        let mut ticker = interval(WATCH_INTERVAL);
+        ticker.set_missed_tick_behavior(MissedTickBehavior::Skip);
+        let mut last = JobStatusMap::new();
+        let mut sleds = 0;
+        let mut quiet = 0;
+        let mut polls = 0;
+        let mut started = false;
         let mut stopped = false;
-        interval.set_missed_tick_behavior(MissedTickBehavior::Skip);
-        ctx.job_polling_started(&job_id, interval.period());
-        loop {
+        let status = loop {
             select! {
                 // Wait for the start request to finish.
-                start_result = &mut start => {
-                    if !stopped {
-                        ctx.job_polling_finished(&job_id);
+                start_result = &mut start, if !started => {
+                    if let Err(error) = start_result {
+                        ctx.job_watch_finished(&job_id);
+                        return Err(error);
                     }
-                    start_result?;
                     ctx.job_started(&job);
-                    break;
+                    started = true;
                 }
 
-                // Periodically update the spinner.
-                _ = interval.tick() => {
-                    ctx.job_polling_update(&job_id);
+                _ = ticker.tick() => {
+                    last = match job_status_map(ctx, client, &job_id).await {
+                        Ok(status) => status,
+                        // The job may not be visible anywhere yet.
+                        Err(CommandError::NotFound) => JobStatusMap::new(),
+                        Err(error) => {
+                            ctx.job_watch_finished(&job_id);
+                            return Err(error);
+                        }
+                    };
+                    ctx.job_watch_update(&last);
+                    polls += 1;
+                    if started && watch_done(polls, sleds, &last, &mut quiet) {
+                        break last;
+                    }
+                    sleds = last.len();
                 }
 
-                // Stop the job on interrupt, but don't break out of
-                // the select loop; we must wait for the start future
-                // to resolve. But there is a race here with the start,
-                // so retry the stop a few times if needed.
-                _ = ctrl_c(), if !stopped => {
+                // While the job runs, an interrupt stops it but keeps
+                // watching: the start future must still resolve, and the
+                // stops are worth seeing. There is a race with the start,
+                // so retry the stop a few times if needed. Once the job
+                // has stopped, or after a first interrupt, an interrupt
+                // just ends the watch.
+                _ = ctrl_c() => {
+                    if started || stopped {
+                        break last;
+                    }
                     for _ in 0..3 {
                         match job_stop(ctx, client, &job_id).await {
                             Ok(_) => {
-                                ctx.job_polling_finished(&job_id);
                                 ctx.job_stopped(&job_id);
                                 stopped = true;
                                 break;
@@ -1119,15 +1260,17 @@ async fn job_start(
                             Err(CommandError::NotFound) => {
                                 sleep(JOB_STOP_RETRY_INTERVAL).await;
                             }
-                            Err(error) => return Err(error),
+                            Err(error) => {
+                                ctx.job_watch_finished(&job_id);
+                                return Err(error);
+                            }
                         }
                     }
                 }
             }
-        }
-
-        // Show the job status and output.
-        job_status(ctx, client, &job_id).await?;
+        };
+        ctx.job_watch_finished(&job_id);
+        ctx.job_status(&job_id, &status, StatusDisplayStyle::Short);
         for stream in [Stdout, Stderr] {
             match with_login_via(ctx, client, Some(&target), async || {
                 client
@@ -1175,17 +1318,79 @@ async fn job_status(
     ctx: &mut impl CommandContext,
     client: &Client,
     job_id: &JobId,
+    style: StatusDisplayStyle,
 ) -> Result<(), CommandError> {
+    let status = job_status_map(ctx, client, job_id).await?;
+    ctx.job_status(job_id, &status, style);
+    Ok(())
+}
+
+/// Fetch a job's rack-wide status map.
+async fn job_status_map(
+    ctx: &mut impl CommandContext,
+    client: &Client,
+    job_id: &JobId,
+) -> Result<JobStatusMap, CommandError> {
     let status = with_login(ctx, client, async || {
         client.job_status().job_id(job_id).send().await
     })
     .await?
     .into_inner();
-    ctx.job_status(
-        job_id,
-        &job_status_try_from_json_map(status).map_err(CommandError::BaseboardIdParseError)?,
-    );
-    Ok(())
+    job_status_try_from_json_map(status).map_err(CommandError::BaseboardIdParseError)
+}
+
+/// How often a watched job's status is refreshed.
+const WATCH_INTERVAL: Duration = Duration::from_secs(1);
+
+/// Watch a job's status across the rack, one live line per sled, until
+/// it settles or the user interrupts. Returns the last status map.
+async fn job_watch(
+    ctx: &mut impl CommandContext,
+    client: &Client,
+    job_id: &JobId,
+) -> Result<JobStatusMap, CommandError> {
+    ctx.job_watch_started(job_id);
+    let mut sleds = 0;
+    let mut quiet = 0;
+    let mut polls = 0;
+    let status = loop {
+        let status = match job_status_map(ctx, client, job_id).await {
+            Ok(status) => status,
+            Err(error) => {
+                ctx.job_watch_finished(job_id);
+                return Err(error);
+            }
+        };
+        ctx.job_watch_update(&status);
+        polls += 1;
+        if watch_done(polls, sleds, &status, &mut quiet) {
+            break status;
+        }
+        sleds = status.len();
+        select! {
+            _ = sleep(WATCH_INTERVAL) => {}
+            _ = ctrl_c() => break status,
+        }
+    };
+    ctx.job_watch_finished(job_id);
+    Ok(status)
+}
+
+/// The fewest polls a watch may run: gossip needs a few seconds to
+/// fan a job out across the rack, so a map that looks settled early
+/// is likely still missing sleds.
+const WATCH_MIN_POLLS: usize = 5;
+
+/// A watched job has settled once the watch is old enough for gossip
+/// to have named every sled, every known sled reports a terminal
+/// status, and the set of sleds has been stable for a couple of polls.
+fn watch_done(polls: usize, sleds: usize, status: &JobStatusMap, quiet: &mut usize) -> bool {
+    if !status.is_empty() && status.len() == sleds && status.values().all(JobStatus::is_terminal) {
+        *quiet += 1;
+    } else {
+        *quiet = 0;
+    }
+    polls >= WATCH_MIN_POLLS && *quiet >= 2
 }
 
 /// Stream some bytes into a vector.
@@ -1222,6 +1427,42 @@ type FutureChunk<'a> = dyn Future<Output = Result<Chunk, CommandError>> + Send +
 
 /// Download job output.
 async fn job_output(
+    ctx: &mut impl CommandContext,
+    client: &Client,
+    target: &TargetArg,
+    stream: JobOutputStream,
+    args: JobOutput,
+) -> Result<(), CommandError> {
+    let target = match target {
+        TargetArg::Serial(serial) => {
+            let baseboard = resolve_serial(ctx, client, &args.job_id, serial).await?;
+            return job_output_from(ctx, client, &baseboard, stream, args).await;
+        }
+        TargetArg::Target(target) => target,
+    };
+    if !target.is_all() {
+        let baseboard = resolve_target(client, target).await?;
+        return job_output_from(ctx, client, &baseboard, stream, args).await;
+    }
+    if args.binary || args.file.is_some() {
+        return Err(CommandError::OutputNeedsTarget);
+    }
+
+    // Fetch output from every sled with a recorded status.
+    let status = job_status_map(ctx, client, &args.job_id).await?;
+    if status.is_empty() {
+        return Err(CommandError::NotFound);
+    }
+    for baseboard in status.keys() {
+        ctx.job_output_target(baseboard);
+        if let Err(error) = job_output_from(ctx, client, baseboard, stream, args.clone()).await {
+            let _ = ctx.job_error(error);
+        }
+    }
+    Ok(())
+}
+
+async fn job_output_from(
     ctx: &mut impl CommandContext,
     client: &Client,
     target: &BaseboardId,
@@ -1471,9 +1712,55 @@ async fn resolve_target(client: &Client, target: &Target) -> Result<BaseboardId,
     Ok(request.send().await?.into_inner())
 }
 
+/// A target expression, or a bare serial number to resolve against
+/// the sleds that have a status for the job at hand.
+#[derive(Clone, Debug)]
+pub enum TargetArg {
+    Target(Target),
+    Serial(String),
+}
+
+impl FromStr for TargetArg {
+    type Err = <Target as FromStr>::Err;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        match s.parse() {
+            Ok(target) => Ok(Self::Target(target)),
+            Err(_) if !s.is_empty() && s.chars().all(|c| c.is_ascii_alphanumeric()) => {
+                Ok(Self::Serial(s.to_owned()))
+            }
+            Err(err) => Err(err),
+        }
+    }
+}
+
+/// Resolve a bare serial number against the sleds that have a status
+/// for a job.
+async fn resolve_serial(
+    ctx: &mut impl CommandContext,
+    client: &Client,
+    job_id: &JobId,
+    serial: &str,
+) -> Result<BaseboardId, CommandError> {
+    let status = job_status_map(ctx, client, job_id).await?;
+    let mut matches = status
+        .keys()
+        .filter(|b| b.serial_number.eq_ignore_ascii_case(serial));
+    match (matches.next(), matches.next()) {
+        (Some(baseboard), None) => Ok(baseboard.clone()),
+        (None, _) => Err(CommandError::UnknownSerial {
+            serial: serial.to_owned(),
+            job_id: job_id.to_owned(),
+        }),
+        (Some(_), Some(_)) => Err(CommandError::AmbiguousSerial(serial.to_owned())),
+    }
+}
+
 /// What went wrong parsing, preparing, or executing a client command.
 #[derive(Debug, Error)]
 pub enum CommandError {
+    #[error("❌ Serial `{0}` matches more than one sled, use a full baseboard ID")]
+    AmbiguousSerial(String),
     #[error("❌ Authentication error")]
     Authn(#[from] AuthnError),
     #[error("❌ Canceled")]
@@ -1550,6 +1837,8 @@ pub enum CommandError {
         expected: JobOutputHash,
         received: JobOutputHash,
     },
+    #[error("❌ `--binary` and `--file` need a specific `--target`")]
+    OutputNeedsTarget,
     #[cfg(feature = "permslip")]
     #[error("❌ permslip error: {0}")]
     Permslip(#[from] PermslipError),
@@ -1578,6 +1867,8 @@ pub enum CommandError {
     TimedOut,
     #[error("❌ Too much output to display on terminal, try `--file`")]
     TooMuchOutput,
+    #[error("❌ No sled with serial `{serial}` has a status for job `{job_id}`")]
+    UnknownSerial { serial: String, job_id: JobId },
     #[error("❌ Chain root does not match any supplied root certificate")]
     UntrustedRoot,
     #[error("❌ Can't start interactive session: {0}")]
