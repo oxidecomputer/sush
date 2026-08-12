@@ -430,18 +430,18 @@
           },
           {
             "in": "path",
-            "name": "target",
-            "required": true,
-            "schema": {
-              "type": "string"
-            }
-          },
-          {
-            "in": "path",
             "name": "stream",
             "required": true,
             "schema": {
               "$ref": "#/components/schemas/JobOutputStream"
+            }
+          },
+          {
+            "in": "path",
+            "name": "target",
+            "required": true,
+            "schema": {
+              "type": "string"
             }
           },
           {
@@ -489,26 +489,6 @@
           },
           {
             "in": "query",
-            "name": "term",
-            "description": "Terminal type for interactive jobs.",
-            "schema": {
-              "nullable": true,
-              "type": "string"
-            }
-          },
-          {
-            "in": "query",
-            "name": "rows",
-            "description": "Terminal window height for interactive jobs.",
-            "schema": {
-              "nullable": true,
-              "type": "integer",
-              "format": "uint16",
-              "minimum": 0
-            }
-          },
-          {
-            "in": "query",
             "name": "cols",
             "description": "Terminal window width for interactive jobs.",
             "schema": {
@@ -520,16 +500,19 @@
           },
           {
             "in": "query",
-            "name": "wait",
-            "description": "Wait for the job to start or stop.",
+            "name": "max_cpu",
+            "description": "Maximum CPU use in seconds.",
+            "required": true,
             "schema": {
-              "$ref": "#/components/schemas/JobWait"
+              "type": "integer",
+              "format": "uint64",
+              "minimum": 0
             }
           },
           {
             "in": "query",
-            "name": "max_cpu",
-            "description": "Maximum CPU use in seconds.",
+            "name": "max_fsize",
+            "description": "Maximum file size in bytes.",
             "required": true,
             "schema": {
               "type": "integer",
@@ -550,13 +533,30 @@
           },
           {
             "in": "query",
-            "name": "max_fsize",
-            "description": "Maximum file size in bytes.",
-            "required": true,
+            "name": "rows",
+            "description": "Terminal window height for interactive jobs.",
             "schema": {
+              "nullable": true,
               "type": "integer",
-              "format": "uint64",
+              "format": "uint16",
               "minimum": 0
+            }
+          },
+          {
+            "in": "query",
+            "name": "term",
+            "description": "Terminal type for interactive jobs.",
+            "schema": {
+              "nullable": true,
+              "type": "string"
+            }
+          },
+          {
+            "in": "query",
+            "name": "wait",
+            "description": "Wait for the job to start or stop.",
+            "schema": {
+              "$ref": "#/components/schemas/JobWait"
             }
           }
         ],
@@ -722,18 +722,18 @@
           },
           {
             "in": "path",
-            "name": "session_id",
-            "required": true,
-            "schema": {
-              "$ref": "#/components/schemas/SessionId"
-            }
-          },
-          {
-            "in": "path",
             "name": "key_id",
             "required": true,
             "schema": {
               "$ref": "#/components/schemas/KeyId"
+            }
+          },
+          {
+            "in": "path",
+            "name": "session_id",
+            "required": true,
+            "schema": {
+              "$ref": "#/components/schemas/SessionId"
             }
           },
           {
@@ -774,18 +774,18 @@
           },
           {
             "in": "path",
-            "name": "session_id",
-            "required": true,
-            "schema": {
-              "$ref": "#/components/schemas/SessionId"
-            }
-          },
-          {
-            "in": "path",
             "name": "key_id",
             "required": true,
             "schema": {
               "$ref": "#/components/schemas/KeyId"
+            }
+          },
+          {
+            "in": "path",
+            "name": "session_id",
+            "required": true,
+            "schema": {
+              "$ref": "#/components/schemas/SessionId"
             }
           }
         ],
@@ -817,18 +817,18 @@
           },
           {
             "in": "path",
-            "name": "session_id",
-            "required": true,
-            "schema": {
-              "$ref": "#/components/schemas/SessionId"
-            }
-          },
-          {
-            "in": "path",
             "name": "job_id",
             "required": true,
             "schema": {
               "$ref": "#/components/schemas/JobId"
+            }
+          },
+          {
+            "in": "path",
+            "name": "session_id",
+            "required": true,
+            "schema": {
+              "$ref": "#/components/schemas/SessionId"
             }
           }
         ],
@@ -963,9 +963,57 @@
   },
   "components": {
     "schemas": {
-      "KeyId": {
-        "description": "SHA-256 of a certificate subject or an identity public key, encoded as a pseudorandom code phrase for storage & transport.",
+      "BaseboardId": {
+        "description": "A representation of a Baseboard ID as used in the inventory subsystem.\n\nThis type is essentially the same as a `Baseboard` except it doesn't have a revision or HW type (Gimlet, PC, Unknown).",
+        "type": "object",
+        "properties": {
+          "part_number": {
+            "description": "Oxide Part Number",
+            "type": "string"
+          },
+          "serial_number": {
+            "description": "Serial number (unique for a given part number)",
+            "type": "string"
+          }
+        },
+        "required": [
+          "part_number",
+          "serial_number"
+        ]
+      },
+      "EccR": {
+        "description": "The first half of a 256 bit elliptic-curve signature: the scalar `r` of an ECDSA pair, or the encoded point `R` of an Ed25519 signature. It is carried as an opaque 256 bit value to which only the signature algorithm assigns meaning.",
         "type": "string"
+      },
+      "EccS": {
+        "description": "The second half of a 256 bit elliptic-curve signature: the scalar `s` of an ECDSA pair, or the little-endian scalar `S` of an Ed25519 signature. It is carried as an opaque 256 bit value like [`EccR`].",
+        "type": "string"
+      },
+      "EncodedSignature": {
+        "description": "Code phrase encoded signature.\n\nThe decoded phrases `r` and `s` together comprise a signature _(r, s)_ over a 256 bit elliptic curve.\n\nThe `flags` and `counter` parameters are for the [`SK-*` family of SSH public keys](https://cvsweb.openbsd.org/src/usr.bin/ssh/PROTOCOL.u2f?annotate=HEAD). They should be set to 0 for other key types.",
+        "type": "object",
+        "properties": {
+          "counter": {
+            "type": "integer",
+            "format": "uint32",
+            "minimum": 0
+          },
+          "flags": {
+            "type": "integer",
+            "format": "uint8",
+            "minimum": 0
+          },
+          "r": {
+            "$ref": "#/components/schemas/EccR"
+          },
+          "s": {
+            "$ref": "#/components/schemas/EccS"
+          }
+        },
+        "required": [
+          "r",
+          "s"
+        ]
       },
       "Error": {
         "description": "Error information from a response.",
@@ -993,11 +1041,11 @@
           "key_id": {
             "$ref": "#/components/schemas/KeyId"
           },
-          "public_key": {
-            "type": "string"
-          },
           "nonce": {
             "$ref": "#/components/schemas/Nonce"
+          },
+          "public_key": {
+            "type": "string"
           },
           "time_authenticated": {
             "type": "string",
@@ -1016,9 +1064,72 @@
           "time_authenticated"
         ]
       },
-      "Nonce": {
-        "description": "A unique random string. Authentication credentials have two of these: one generated by the server, and one by the client. This structure is agnostic to the syntax of the string.",
+      "JobId": {
+        "description": "A globally unique identifier for a job within a session.",
         "type": "string"
+      },
+      "JobOutputHash": {
+        "description": "BLAKE3 hash of job output, used as a checksum.",
+        "type": "string",
+        "format": "hex encoded hash (32 bytes)"
+      },
+      "JobOutputState": {
+        "type": "object",
+        "properties": {
+          "stderr_hash": {
+            "$ref": "#/components/schemas/JobOutputHash"
+          },
+          "stderr_len": {
+            "type": "integer",
+            "format": "uint64",
+            "minimum": 0
+          },
+          "stdout_hash": {
+            "$ref": "#/components/schemas/JobOutputHash"
+          },
+          "stdout_len": {
+            "type": "integer",
+            "format": "uint64",
+            "minimum": 0
+          }
+        },
+        "required": [
+          "stderr_hash",
+          "stderr_len",
+          "stdout_hash",
+          "stdout_len"
+        ]
+      },
+      "JobOutputStream": {
+        "description": "Either the standard output or standard error of a job.",
+        "type": "string",
+        "enum": [
+          "stdout",
+          "stderr"
+        ]
+      },
+      "JobStartRequest": {
+        "description": "A request to run the given `command` as `job_id`.",
+        "type": "object",
+        "properties": {
+          "command": {
+            "type": "string"
+          },
+          "interactive": {
+            "type": "boolean"
+          },
+          "job_id": {
+            "$ref": "#/components/schemas/JobId"
+          },
+          "target": {
+            "description": "The sleds this job runs on.",
+            "type": "string"
+          }
+        },
+        "required": [
+          "command",
+          "job_id"
+        ]
       },
       "JobStatus": {
         "oneOf": [
@@ -1028,13 +1139,6 @@
               "Cancelled": {
                 "type": "object",
                 "properties": {
-                  "job_id": {
-                    "$ref": "#/components/schemas/JobId"
-                  },
-                  "time_cancelled": {
-                    "type": "string",
-                    "format": "date-time"
-                  },
                   "actor": {
                     "description": "The key that requested the cancellation.",
                     "allOf": [
@@ -1042,6 +1146,13 @@
                         "$ref": "#/components/schemas/KeyId"
                       }
                     ]
+                  },
+                  "job_id": {
+                    "$ref": "#/components/schemas/JobId"
+                  },
+                  "time_cancelled": {
+                    "type": "string",
+                    "format": "date-time"
                   }
                 },
                 "required": [
@@ -1062,13 +1173,6 @@
               "Queued": {
                 "type": "object",
                 "properties": {
-                  "job_id": {
-                    "$ref": "#/components/schemas/JobId"
-                  },
-                  "time_queued": {
-                    "type": "string",
-                    "format": "date-time"
-                  },
                   "actor": {
                     "description": "The key that submitted the job.",
                     "allOf": [
@@ -1076,6 +1180,13 @@
                         "$ref": "#/components/schemas/KeyId"
                       }
                     ]
+                  },
+                  "job_id": {
+                    "$ref": "#/components/schemas/JobId"
+                  },
+                  "time_queued": {
+                    "type": "string",
+                    "format": "date-time"
                   }
                 },
                 "required": [
@@ -1096,15 +1207,15 @@
               "Error": {
                 "type": "object",
                 "properties": {
+                  "error": {
+                    "$ref": "#/components/schemas/ProcessError"
+                  },
                   "job_id": {
                     "$ref": "#/components/schemas/JobId"
                   },
                   "time_error": {
                     "type": "string",
                     "format": "date-time"
-                  },
-                  "error": {
-                    "$ref": "#/components/schemas/ProcessError"
                   }
                 },
                 "required": [
@@ -1153,6 +1264,12 @@
                   "job_id": {
                     "$ref": "#/components/schemas/JobId"
                   },
+                  "output": {
+                    "$ref": "#/components/schemas/JobOutputState"
+                  },
+                  "result": {
+                    "$ref": "#/components/schemas/Result_of_int32_or_ProcessError"
+                  },
                   "time_started": {
                     "type": "string",
                     "format": "date-time"
@@ -1160,12 +1277,6 @@
                   "time_stopped": {
                     "type": "string",
                     "format": "date-time"
-                  },
-                  "result": {
-                    "$ref": "#/components/schemas/Result_of_int32_or_ProcessError"
-                  },
-                  "output": {
-                    "$ref": "#/components/schemas/JobOutputState"
                   }
                 },
                 "required": [
@@ -1184,8 +1295,46 @@
           }
         ]
       },
-      "JobId": {
-        "description": "A globally unique identifier for a job within a session.",
+      "KeyId": {
+        "description": "SHA-256 of a certificate subject or an identity public key, encoded as a pseudorandom code phrase for storage & transport.",
+        "type": "string"
+      },
+      "LastJob": {
+        "oneOf": [
+          {
+            "type": "string",
+            "enum": [
+              "None"
+            ]
+          },
+          {
+            "type": "object",
+            "properties": {
+              "Some": {
+                "$ref": "#/components/schemas/Signed_for_JobStartRequest"
+              }
+            },
+            "required": [
+              "Some"
+            ],
+            "additionalProperties": false
+          },
+          {
+            "type": "object",
+            "properties": {
+              "Burned": {
+                "$ref": "#/components/schemas/JobId"
+              }
+            },
+            "required": [
+              "Burned"
+            ],
+            "additionalProperties": false
+          }
+        ]
+      },
+      "Nonce": {
+        "description": "A unique random string. Authentication credentials have two of these: one generated by the server, and one by the client. This structure is agnostic to the syntax of the string.",
         "type": "string"
       },
       "ProcessError": {
@@ -1241,10 +1390,10 @@
               "Io": {
                 "type": "object",
                 "properties": {
-                  "what": {
+                  "error": {
                     "type": "string"
                   },
-                  "error": {
+                  "what": {
                     "type": "string"
                   }
                 },
@@ -1265,13 +1414,13 @@
               "OutputLimitExceeded": {
                 "type": "object",
                 "properties": {
-                  "stream": {
-                    "$ref": "#/components/schemas/JobOutputStream"
-                  },
                   "limit": {
                     "type": "integer",
                     "format": "uint64",
                     "minimum": 0
+                  },
+                  "stream": {
+                    "$ref": "#/components/schemas/JobOutputStream"
                   }
                 },
                 "required": [
@@ -1297,14 +1446,6 @@
             ],
             "additionalProperties": false
           }
-        ]
-      },
-      "JobOutputStream": {
-        "description": "Either the standard output or standard error of a job.",
-        "type": "string",
-        "enum": [
-          "stdout",
-          "stderr"
         ]
       },
       "Result_of_int32_or_ProcessError": {
@@ -1334,115 +1475,14 @@
           }
         ]
       },
-      "JobOutputState": {
-        "type": "object",
-        "properties": {
-          "stdout_len": {
-            "type": "integer",
-            "format": "uint64",
-            "minimum": 0
-          },
-          "stderr_len": {
-            "type": "integer",
-            "format": "uint64",
-            "minimum": 0
-          },
-          "stdout_hash": {
-            "$ref": "#/components/schemas/JobOutputHash"
-          },
-          "stderr_hash": {
-            "$ref": "#/components/schemas/JobOutputHash"
-          }
-        },
-        "required": [
-          "stderr_hash",
-          "stderr_len",
-          "stdout_hash",
-          "stdout_len"
-        ]
-      },
-      "JobOutputHash": {
-        "description": "BLAKE3 hash of job output, used as a checksum.",
-        "type": "string",
-        "format": "hex encoded hash (32 bytes)"
-      },
-      "Signed_for_JobStartRequest": {
-        "description": "A signed envelope around some data.",
-        "type": "object",
-        "properties": {
-          "payload": {
-            "$ref": "#/components/schemas/JobStartRequest"
-          },
-          "key_id": {
-            "$ref": "#/components/schemas/KeyId"
-          },
-          "signature": {
-            "$ref": "#/components/schemas/EncodedSignature"
-          }
-        },
-        "required": [
-          "key_id",
-          "payload",
-          "signature"
-        ]
-      },
-      "JobStartRequest": {
-        "description": "A request to run the given `command` as `job_id`.",
-        "type": "object",
-        "properties": {
-          "job_id": {
-            "$ref": "#/components/schemas/JobId"
-          },
-          "command": {
-            "type": "string"
-          },
-          "interactive": {
-            "type": "boolean"
-          },
-          "target": {
-            "description": "The sleds this job runs on.",
-            "type": "string"
-          }
-        },
-        "required": [
-          "command",
-          "job_id"
-        ]
-      },
-      "EncodedSignature": {
-        "description": "Code phrase encoded signature.\n\nThe decoded phrases `r` and `s` together comprise a signature _(r, s)_ over a 256 bit elliptic curve.\n\nThe `flags` and `counter` parameters are for the [`SK-*` family of SSH public keys](https://cvsweb.openbsd.org/src/usr.bin/ssh/PROTOCOL.u2f?annotate=HEAD). They should be set to 0 for other key types.",
-        "type": "object",
-        "properties": {
-          "r": {
-            "type": "string"
-          },
-          "s": {
-            "type": "string"
-          },
-          "flags": {
-            "type": "integer",
-            "format": "uint8",
-            "minimum": 0
-          },
-          "counter": {
-            "type": "integer",
-            "format": "uint32",
-            "minimum": 0
-          }
-        },
-        "required": [
-          "r",
-          "s"
-        ]
-      },
       "Session": {
         "type": "object",
         "properties": {
-          "session_id": {
-            "$ref": "#/components/schemas/SessionId"
-          },
           "last_job": {
             "$ref": "#/components/schemas/LastJob"
+          },
+          "session_id": {
+            "$ref": "#/components/schemas/SessionId"
           },
           "started_by": {
             "nullable": true,
@@ -1463,56 +1503,24 @@
         "description": "A globally unique identifier for a session.",
         "type": "string"
       },
-      "LastJob": {
-        "oneOf": [
-          {
-            "type": "string",
-            "enum": [
-              "None"
-            ]
-          },
-          {
-            "type": "object",
-            "properties": {
-              "Some": {
-                "$ref": "#/components/schemas/Signed_for_JobStartRequest"
-              }
-            },
-            "required": [
-              "Some"
-            ],
-            "additionalProperties": false
-          },
-          {
-            "type": "object",
-            "properties": {
-              "Burned": {
-                "$ref": "#/components/schemas/JobId"
-              }
-            },
-            "required": [
-              "Burned"
-            ],
-            "additionalProperties": false
-          }
-        ]
-      },
-      "BaseboardId": {
-        "description": "A representation of a Baseboard ID as used in the inventory subsystem.\n\nThis type is essentially the same as a `Baseboard` except it doesn't have a revision or HW type (Gimlet, PC, Unknown).",
+      "Signed_for_JobStartRequest": {
+        "description": "A signed envelope around some data.",
         "type": "object",
         "properties": {
-          "part_number": {
-            "description": "Oxide Part Number",
-            "type": "string"
+          "key_id": {
+            "$ref": "#/components/schemas/KeyId"
           },
-          "serial_number": {
-            "description": "Serial number (unique for a given part number)",
-            "type": "string"
+          "payload": {
+            "$ref": "#/components/schemas/JobStartRequest"
+          },
+          "signature": {
+            "$ref": "#/components/schemas/EncodedSignature"
           }
         },
         "required": [
-          "part_number",
-          "serial_number"
+          "key_id",
+          "payload",
+          "signature"
         ]
       },
       "JobWait": {
