@@ -12,18 +12,32 @@
 //! which is what rumors asks of a transport it trusts.
 //!
 //! The price of the shape is a full sprockets handshake per stream, which
-//! RFD 620 accepts.
+//! RFD 620 accepts. A per-peer stash of warm connections keeps that price
+//! off the critical path during bursts: dials pop a pre-established
+//! connection when one is ready, and refills run in the background only
+//! while a peer stays active. Expiry is enforced at dial time, so the
+//! last connection of a burst may linger well past its TTL.
+//!
+//! A stashed connection can die while it waits, most plausibly when the
+//! peer restarts or its router evicts a connection that never spoke. A
+//! stream built on such a connection fails its whole session and the
+//! link is re-established, the same recovery as any other transport
+//! failure. A silently dead path is worse: a warm connection skips the
+//! dial timeout, leaving the session timeout as the backstop, which is
+//! the routed contract's own answer for established connections that
+//! go dark.
 
+use std::collections::{HashMap, VecDeque};
 use std::io;
 use std::net::{SocketAddr, SocketAddrV6};
 use std::pin::Pin;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::task::{Context, Poll};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use camino::Utf8PathBuf;
 use rumors::link::routed::{Config, Dial, Endpoint, Incoming, Listen, RoutedLink};
-use slog::{Logger, o, warn};
+use slog::{Logger, info, o, warn};
 use sprockets_tls::keys::SprocketsConfig;
 use sprockets_tls::{Client, Server};
 use tokio::io::{AsyncRead, AsyncWrite, AsyncWriteExt as _, ReadBuf};
@@ -111,13 +125,124 @@ impl Drop for SprocketsConn {
     }
 }
 
-/// Dials one attested sprockets connection per link stream.
+/// Inbound connections the link router holds mid-header. Every peer
+/// may park a stashed connection on our router, on top of the usual
+/// dial bursts, so this needs room for a whole rack of both.
+const PENDING_HEADERS: usize = 128;
+
+/// Per-peer warm connections.
+const STASH_DEPTH: usize = 1;
+
+/// How long a stashed connection stays usable.
+const STASH_TTL: Duration = Duration::from_secs(60);
+
+/// How recently a peer must have been dialed for refills to continue.
+/// Refills stop outside this window, so an idle rack makes no
+/// handshakes at all.
+const STASH_ACTIVITY: Duration = Duration::from_secs(30);
+
+/// Warm connections held per peer, ready to become streams. A dial
+/// pays a full attested handshake, with the RoT in the loop over IPCC,
+/// so a burst of streams should run against connections established
+/// off the critical path.
+struct Stash<C> {
+    peers: HashMap<SocketAddrV6, PeerStash<C>>,
+}
+
+struct PeerStash<C> {
+    conns: VecDeque<(C, Instant)>,
+    last_dial: Instant,
+    refill: Refill,
+}
+
+/// Whether a refill task is in flight for a peer.
+enum Refill {
+    Idle,
+    Pending,
+}
+
+impl<C> Stash<C> {
+    fn new() -> Self {
+        Stash {
+            peers: HashMap::new(),
+        }
+    }
+
+    /// Take the freshest warm connection for `addr`, noting the dial.
+    fn pop(&mut self, addr: &SocketAddrV6, now: Instant) -> Option<C> {
+        let peer = self.peers.get_mut(addr)?;
+        peer.last_dial = now;
+        while let Some((conn, born)) = peer.conns.pop_back() {
+            if now.duration_since(born) < STASH_TTL {
+                return Some(conn);
+            }
+        }
+        None
+    }
+
+    /// Note a fresh dial to `addr`, opening its activity window.
+    fn note_dial(&mut self, addr: SocketAddrV6, now: Instant) {
+        let peer = self.peers.entry(addr).or_insert_with(|| PeerStash {
+            conns: VecDeque::new(),
+            last_dial: now,
+            refill: Refill::Idle,
+        });
+        peer.last_dial = now;
+    }
+
+    /// Whether a refill for `addr` should start now. Claims the refill
+    /// slot when it returns true; the caller must report back with
+    /// [`refilled`](Self::refilled).
+    fn want_refill(&mut self, addr: &SocketAddrV6, now: Instant) -> bool {
+        let Some(peer) = self.peers.get_mut(addr) else {
+            return false;
+        };
+        if matches!(peer.refill, Refill::Pending)
+            || peer.conns.len() >= STASH_DEPTH
+            || now.duration_since(peer.last_dial) > STASH_ACTIVITY
+        {
+            return false;
+        }
+        peer.refill = Refill::Pending;
+        true
+    }
+
+    /// Report a claimed refill's result.
+    fn refilled(&mut self, addr: &SocketAddrV6, conn: Option<C>, now: Instant) {
+        if let Some(peer) = self.peers.get_mut(addr) {
+            assert!(matches!(peer.refill, Refill::Pending));
+            peer.refill = Refill::Idle;
+            if let Some(conn) = conn
+                && peer.conns.len() < STASH_DEPTH
+            {
+                peer.conns.push_back((conn, now));
+            }
+        }
+    }
+
+    /// Drop expired connections and forget idle peers.
+    fn sweep(&mut self, now: Instant) {
+        for peer in self.peers.values_mut() {
+            peer.conns
+                .retain(|(_, born)| now.duration_since(*born) < STASH_TTL);
+        }
+        self.peers.retain(|_, peer| {
+            matches!(peer.refill, Refill::Pending)
+                || !peer.conns.is_empty()
+                || now.duration_since(peer.last_dial) <= STASH_ACTIVITY
+        });
+    }
+}
+
+/// Dials one attested sprockets connection per link stream, keeping a
+/// warm stash per active peer so bursts skip the handshake latency.
 #[derive(Clone)]
 pub struct SprocketsDial {
     log: Logger,
     config: SprocketsConfig,
     corpus: CorpusSource,
     timeout: Duration,
+    stash: Arc<Mutex<Stash<SprocketsConn>>>,
 }
 
 impl SprocketsDial {
@@ -134,7 +259,66 @@ impl SprocketsDial {
             config,
             corpus,
             timeout,
+            stash: Arc::new(Mutex::new(Stash::new())),
         }
+    }
+
+    /// One full sprockets handshake to `addr`.
+    async fn connect(&self, addr: SocketAddrV6) -> io::Result<SprocketsConn> {
+        let started = Instant::now();
+        let config = self.config.clone();
+        let corpus = self.corpus.clone();
+        let log = self.log.clone();
+        // Sprockets connects are not cancel safe, so the handshake runs in
+        // its own task and this future only awaits the result. The corpus
+        // closure runs in the task too, so a panic there surfaces as a
+        // failed dial instead of unwinding the caller.
+        let dial = spawn(async move {
+            Client::connect(config, addr, corpus(), log)
+                .await
+                .map_err(io::Error::other)
+        });
+        match timeout(self.timeout, dial).await {
+            Ok(joined) => {
+                let conn = SprocketsConn::new(joined.map_err(io::Error::other)??);
+                info!(
+                    self.log, "handshake complete";
+                    "peer" => %addr,
+                    "elapsed_ms" => started.elapsed().as_millis(),
+                );
+                Ok(conn)
+            }
+            Err(_) => Err(io::Error::new(
+                io::ErrorKind::TimedOut,
+                format!("dialing {addr} timed out"),
+            )),
+        }
+    }
+
+    /// Start a background refill for `addr` if its stash wants one.
+    fn refill(&self, addr: SocketAddrV6) {
+        if !self
+            .stash
+            .lock()
+            .unwrap()
+            .want_refill(&addr, Instant::now())
+        {
+            return;
+        }
+        let this = self.clone();
+        spawn(async move {
+            let conn = match this.connect(addr).await {
+                Ok(conn) => Some(conn),
+                Err(err) => {
+                    warn!(this.log, "stash refill failed"; "peer" => %addr, "error" => %err);
+                    None
+                }
+            };
+            this.stash
+                .lock()
+                .unwrap()
+                .refilled(&addr, conn, Instant::now());
+        });
     }
 }
 
@@ -146,23 +330,21 @@ impl Dial for SprocketsDial {
         let SocketAddr::V6(addr) = *addr else {
             return Err(io::Error::other(format!("sush gossip needs IPv6: {addr}")));
         };
-        let config = self.config.clone();
-        let corpus = (self.corpus)();
-        let log = self.log.clone();
-        // Sprockets connects are not cancel safe, so the handshake runs in
-        // its own task and this future only awaits the result.
-        let dial = spawn(async move {
-            Client::connect(config, addr, corpus, log)
-                .await
-                .map_err(io::Error::other)
-        });
-        match timeout(self.timeout, dial).await {
-            Ok(joined) => Ok(SprocketsConn::new(joined.map_err(io::Error::other)??)),
-            Err(_) => Err(io::Error::new(
-                io::ErrorKind::TimedOut,
-                format!("dialing {addr} timed out"),
-            )),
-        }
+        let warm = {
+            let mut stash = self.stash.lock().unwrap();
+            let now = Instant::now();
+            stash.sweep(now);
+            stash.pop(&addr, now)
+        };
+        let conn = if let Some(conn) = warm {
+            conn
+        } else {
+            let conn = self.connect(addr).await?;
+            self.stash.lock().unwrap().note_dial(addr, Instant::now());
+            conn
+        };
+        self.refill(addr);
+        Ok(conn)
     }
 }
 
@@ -194,9 +376,16 @@ impl Transport {
         )
         .await?;
         let dial = SprocketsDial::new(log, config, corpus, dial_timeout);
-        let (endpoint, incoming, router) =
-            Endpoint::new(listen, SocketAddr::V6(bound), dial, Config::default())
-                .map_err(io::Error::other)?;
+        let (endpoint, incoming, router) = Endpoint::new(
+            listen,
+            SocketAddr::V6(bound),
+            dial,
+            Config {
+                pending_headers: PENDING_HEADERS,
+                ..Config::default()
+            },
+        )
+        .map_err(io::Error::other)?;
         let log = log.new(o!("component" => "link router"));
         spawn(async move {
             select! {
@@ -312,5 +501,74 @@ async fn pump(
                 }
             },
         }
+    }
+}
+
+#[cfg(test)]
+mod test {
+    use super::*;
+
+    const ADDR: SocketAddrV6 = SocketAddrV6::new(std::net::Ipv6Addr::LOCALHOST, 1, 0, 0);
+
+    #[test]
+    fn stash_lifecycle() {
+        let mut stash: Stash<u32> = Stash::new();
+        let t0 = Instant::now();
+
+        // Unknown peers neither pop nor refill.
+        assert_eq!(stash.pop(&ADDR, t0), None);
+        assert!(!stash.want_refill(&ADDR, t0));
+
+        // A fresh dial opens the activity window and claims one refill.
+        stash.note_dial(ADDR, t0);
+        assert!(stash.want_refill(&ADDR, t0));
+        assert!(!stash.want_refill(&ADDR, t0), "refill slot is claimed");
+        stash.refilled(&ADDR, Some(7), t0);
+
+        // The stash is full, so no further refill; the warm connection
+        // pops and then wants refilling again.
+        assert!(!stash.want_refill(&ADDR, t0));
+        assert_eq!(stash.pop(&ADDR, t0), Some(7));
+        assert_eq!(stash.pop(&ADDR, t0), None);
+        assert!(stash.want_refill(&ADDR, t0));
+        stash.refilled(&ADDR, None, t0);
+
+        // Expired connections do not pop.
+        assert!(stash.want_refill(&ADDR, t0));
+        stash.refilled(&ADDR, Some(8), t0);
+        assert_eq!(stash.pop(&ADDR, t0 + STASH_TTL), None);
+
+        // The expired pop counted as a dial, so the window is open just
+        // inside its boundary and closed just outside; only then does a
+        // sweep forget the peer.
+        let edge = t0 + STASH_TTL + STASH_ACTIVITY;
+        assert!(stash.want_refill(&ADDR, edge));
+        stash.refilled(&ADDR, None, edge);
+        let late = edge + Duration::from_secs(1);
+        assert!(!stash.want_refill(&ADDR, late));
+        stash.sweep(late);
+        assert!(stash.peers.is_empty());
+    }
+
+    /// A sweep must keep a peer whose refill is in flight, or the
+    /// refill would report to a forgotten peer and drop its connection.
+    #[test]
+    fn sweep_keeps_pending_refills() {
+        let mut stash: Stash<u32> = Stash::new();
+        let t0 = Instant::now();
+        stash.note_dial(ADDR, t0);
+        assert!(stash.want_refill(&ADDR, t0));
+
+        let late = t0 + STASH_TTL + STASH_ACTIVITY + Duration::from_secs(1);
+        stash.sweep(late);
+        assert!(!stash.peers.is_empty(), "pending refill retains the peer");
+        stash.refilled(&ADDR, Some(9), late);
+        assert_eq!(stash.pop(&ADDR, late), Some(9));
+
+        // Reporting a refill for a forgotten peer drops the connection.
+        stash.sweep(late + STASH_TTL + STASH_ACTIVITY + Duration::from_secs(1));
+        assert!(stash.peers.is_empty());
+        stash.refilled(&ADDR, Some(10), late);
+        assert_eq!(stash.pop(&ADDR, late), None);
     }
 }
