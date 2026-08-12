@@ -17,7 +17,7 @@ use tokio::sync::watch;
 use tokio_util::sync::CancellationToken;
 
 use sush_api::{JobStartParams, JobWait};
-use sush_common::jobs::{JobStatus, Session, SessionId};
+use sush_common::jobs::{JobStatus, Session, SessionId, SessionSignerNonce};
 use sush_common::keys::pem_cert_chain;
 use sush_common::targets::Cubbies;
 use sush_server::executor::PathIsolation;
@@ -117,10 +117,15 @@ async fn jobs_gossip_between_sleds() {
     // A session started on sled A becomes B's active session too.
     let authn_a = fake_identity(&mut root).await;
     let authn_b = fake_identity(&mut root).await;
-    let session_id = SessionId::random();
+    let signer_nonce = SessionSignerNonce::random();
+    let session_id = SessionId::compute(
+        a.mgr.own_baseboard(),
+        a.mgr.regenerate_session_sush_nonce(),
+        signer_nonce,
+    );
     let session = Session::new(session_id);
     a.mgr
-        .session_start(&authn_a, session_id, true)
+        .session_start(&authn_a, session_id, signer_nonce, true)
         .await
         .unwrap();
     eventually("session gossips to B", 60, async || {
@@ -161,9 +166,14 @@ async fn jobs_gossip_between_sleds() {
     .await;
 
     // A session started on B supersedes A's everywhere.
-    let successor = SessionId::random();
+    let successor_nonce = SessionSignerNonce::random();
+    let successor = SessionId::compute(
+        b.mgr.own_baseboard(),
+        b.mgr.regenerate_session_sush_nonce(),
+        successor_nonce,
+    );
     b.mgr
-        .session_start(&authn_b, successor, true)
+        .session_start(&authn_b, successor, successor_nonce, true)
         .await
         .unwrap();
     eventually("supersession gossips to A", 60, async || {

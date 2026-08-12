@@ -7,7 +7,7 @@
 
 use std::num::NonZeroUsize;
 use std::path::Path;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex as SyncMutex};
 use std::time::{Duration, Instant};
 
 use chrono::Utc;
@@ -29,8 +29,10 @@ use sush_common::authn::{
     Authn, BoundRequest, Credentials, IDENTITY_IDLE_TTL, IDENTITY_MAX_TTL, Identity, NONCE_TTL,
     Nonce, RequestVerifier, SeqWindow,
 };
-use sush_common::jobs::JobOutputStream;
-use sush_common::jobs::{Access, JobId, JobStatusMap, Session, SessionId, SignedJob};
+use sush_common::jobs::{
+    Access, JobId, JobStatusMap, Session, SessionId, SessionSignerNonce, SignedJob,
+};
+use sush_common::jobs::{JobOutputStream, SessionSushNonce};
 use sush_common::keys::{KeyError, KeyId, SshPublicKey};
 use sush_common::targets::Cubbies;
 
@@ -81,6 +83,7 @@ pub struct JobManager {
     log: Logger,
     nonces: Arc<Mutex<LruCache<Nonce, Instant>>>,
     identities: Arc<Mutex<LruCache<(KeyId, Nonce), CachedIdentity>>>,
+    session_sush_nonce: Arc<SyncMutex<SessionSushNonce>>,
     output_dir: JobOutputDir,
     own_baseboard: BaseboardId,
     state: watch::Receiver<State>, // from the state manager
@@ -144,6 +147,7 @@ impl JobManager {
             log: log.new(o!("component" => "job manager")),
             nonces: Arc::new(Mutex::new(LruCache::new(MAX_OUTSTANDING_NONCES))),
             identities: Arc::new(Mutex::new(LruCache::new(MAX_CACHED_IDENTITIES))),
+            session_sush_nonce: Arc::new(SyncMutex::new(SessionSushNonce::random())),
             own_baseboard,
             output_dir,
             state: rx_state,
@@ -487,12 +491,39 @@ impl JobManager {
         Ok(session.into_session_id())
     }
 
+    pub fn regenerate_session_sush_nonce(&self) -> SessionSushNonce {
+        let nonce = SessionSushNonce::random();
+        match self.session_sush_nonce.lock() {
+            Ok(mut slot) => *slot = nonce,
+            Err(mut poison) => {
+                **poison.get_mut() = nonce;
+                self.session_sush_nonce.clear_poison();
+            }
+        }
+        nonce
+    }
+
     pub async fn session_start(
         &self,
         authn: &Identity,
         session_id: SessionId,
+        signer_nonce: SessionSignerNonce,
         wait: bool,
     ) -> Result<(), JobError> {
+        // We don't care about poisoning for the nonce, it's never mutated in a way that could lead
+        // to inconsistencies in the event of a panic.
+        let sush_nonce = match self.session_sush_nonce.lock() {
+            Ok(nonce) => *nonce,
+            Err(poison) => *poison.into_inner(),
+        };
+
+        // Verify that the session ID provided by the client is meant to be sent to this instance of
+        // Sush, by checking that the signer nonce was hashed with our baseboard and nonce.
+        let computed = SessionId::compute(self.own_baseboard(), sush_nonce, signer_nonce);
+        if computed != session_id {
+            return Err(JobError::InvalidSessionId);
+        }
+
         self.session_request(authn, SessionRequest::Start(session_id))
             .await?;
         if wait {

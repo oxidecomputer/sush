@@ -27,7 +27,7 @@ use sush_client::context::Authz;
 use sush_common::authn::{Challenge, ChallengeResponse, Credentials, Identity, Nonce, RequestKey};
 use sush_common::jobs::{
     Access, JobId, JobLimits, JobOutputState, JobOutputStream::*, JobStartRequest, JobStatus,
-    ProcessError, Session, SessionId,
+    ProcessError, Session, SessionId, SessionSignerNonce,
 };
 use sush_common::keys::{EphemeralKey, KeyError, KeyId, KeyType, Signer as _, pem_cert_chain};
 use sush_common::targets::{Cubbies, Target};
@@ -104,9 +104,16 @@ async fn jobs() {
     let (mgr, mut root, _dir, _shutdown) = manager_and_test_root(log).await;
     let baseboard_id = mgr.own_baseboard();
     let authn = fake_identity(&mut root).await;
-    let session_id = SessionId::random();
+    let signer_nonce = SessionSignerNonce::random();
+    let session_id = SessionId::compute(
+        mgr.own_baseboard(),
+        mgr.regenerate_session_sush_nonce(),
+        signer_nonce,
+    );
     let mut session = Session::new(session_id);
-    mgr.session_start(&authn, session_id, true).await.unwrap();
+    mgr.session_start(&authn, session_id, signer_nonce, true)
+        .await
+        .unwrap();
 
     let job_id = session.next_job_id();
     let job = root.sign_job_request(&job_id, "true", false).await;
@@ -228,9 +235,16 @@ async fn job_stop() {
     let (mgr, mut root, _dir, _shutdown) = manager_and_test_root(log).await;
     let baseboard_id = mgr.own_baseboard();
     let authn = fake_identity(&mut root).await;
-    let session_id = SessionId::random();
+    let signer_nonce = SessionSignerNonce::random();
+    let session_id = SessionId::compute(
+        mgr.own_baseboard(),
+        mgr.regenerate_session_sush_nonce(),
+        signer_nonce,
+    );
     let mut session = Session::new(session_id);
-    mgr.session_start(&authn, session_id, true).await.unwrap();
+    mgr.session_start(&authn, session_id, signer_nonce, true)
+        .await
+        .unwrap();
 
     // Stopping a nonexistent job should mark it cancelled, and so succeed
     // immediately.
@@ -310,9 +324,16 @@ async fn cancel_queued_job() {
     let log = test_logger(function_name!());
     let (mgr, mut root, _dir, _shutdown) = manager_and_test_root(log).await;
     let authn = fake_identity(&mut root).await;
-    let session_id = SessionId::random();
+    let signer_nonce = SessionSignerNonce::random();
+    let session_id = SessionId::compute(
+        mgr.own_baseboard(),
+        mgr.regenerate_session_sush_nonce(),
+        signer_nonce,
+    );
     let mut session = Session::new(session_id);
-    mgr.session_start(&authn, session_id, true).await.unwrap();
+    mgr.session_start(&authn, session_id, signer_nonce, true)
+        .await
+        .unwrap();
 
     // Queue job A, which won't finish soon.
     let command_a = "sleep 10";
@@ -388,9 +409,16 @@ async fn job_output_perms() {
     let dir_perms = metadata(&dir).await.unwrap().permissions();
     let baseboard_id = mgr.own_baseboard();
     let authn = fake_identity(&mut root).await;
-    let session_id = SessionId::random();
+    let signer_nonce = SessionSignerNonce::random();
+    let session_id = SessionId::compute(
+        mgr.own_baseboard(),
+        mgr.regenerate_session_sush_nonce(),
+        signer_nonce,
+    );
     let session = Session::new(session_id);
-    mgr.session_start(&authn, session_id, true).await.unwrap();
+    mgr.session_start(&authn, session_id, signer_nonce, true)
+        .await
+        .unwrap();
 
     // Run a job with some output on both streams.
     let command = "echo -n foo && echo -n bar >&2";
@@ -448,9 +476,16 @@ async fn cubby_targets() {
     .await
     .unwrap();
     let authn = fake_identity(&mut root).await;
-    let session_id = SessionId::random();
+    let signer_nonce = SessionSignerNonce::random();
+    let session_id = SessionId::compute(
+        mgr.own_baseboard(),
+        mgr.regenerate_session_sush_nonce(),
+        signer_nonce,
+    );
     let mut session = Session::new(session_id);
-    mgr.session_start(&authn, session_id, true).await.unwrap();
+    mgr.session_start(&authn, session_id, signer_nonce, true)
+        .await
+        .unwrap();
     let target: Target = "14".parse().unwrap();
 
     // With the map empty, a cubby-targeted job records no status here.
@@ -549,9 +584,16 @@ async fn root_certs_from_files() {
 
     // A job signed by the configured root runs.
     let authn = fake_identity(&mut root).await;
-    let session_id = SessionId::random();
+    let signer_nonce = SessionSignerNonce::random();
+    let session_id = SessionId::compute(
+        mgr.own_baseboard(),
+        mgr.regenerate_session_sush_nonce(),
+        signer_nonce,
+    );
     let session = Session::new(session_id);
-    mgr.session_start(&authn, session_id, true).await.unwrap();
+    mgr.session_start(&authn, session_id, signer_nonce, true)
+        .await
+        .unwrap();
     let job_id = session.next_job_id();
     let job = root.sign_job_request(&job_id, "true", false).await;
     mgr.job_start(
@@ -622,9 +664,16 @@ async fn job_output_dir_moves() {
     .unwrap();
     let baseboard_id = mgr.own_baseboard();
     let authn = fake_identity(&mut root).await;
-    let session_id = SessionId::random();
+    let signer_nonce = SessionSignerNonce::random();
+    let session_id = SessionId::compute(
+        mgr.own_baseboard(),
+        mgr.regenerate_session_sush_nonce(),
+        signer_nonce,
+    );
     let mut session = Session::new(session_id);
-    mgr.session_start(&authn, session_id, true).await.unwrap();
+    mgr.session_start(&authn, session_id, signer_nonce, true)
+        .await
+        .unwrap();
 
     // Record a job's output under the first base.
     let first = session.next_job_id();
@@ -714,9 +763,16 @@ async fn universe_swap() {
     let authn = fake_identity(&mut root).await;
 
     async fn run_job(mgr: &JobManager, root: &mut EphemeralKey, authn: &Identity) -> JobId {
-        let session_id = SessionId::random();
+        let signer_nonce = SessionSignerNonce::random();
+        let session_id = SessionId::compute(
+            mgr.own_baseboard(),
+            mgr.regenerate_session_sush_nonce(),
+            signer_nonce,
+        );
         let session = Session::new(session_id);
-        mgr.session_start(authn, session_id, true).await.unwrap();
+        mgr.session_start(authn, session_id, signer_nonce, true)
+            .await
+            .unwrap();
         let job_id = session.next_job_id();
         let job = root.sign_job_request(&job_id, "true", false).await;
         mgr.job_start(
@@ -760,9 +816,16 @@ async fn shutdown() {
     let log = test_logger(function_name!());
     let (mut mgr, mut root, _dir, shutdown) = manager_and_test_root(log).await;
     let authn = fake_identity(&mut root).await;
-    let session_id = SessionId::random();
+    let signer_nonce = SessionSignerNonce::random();
+    let session_id = SessionId::compute(
+        mgr.own_baseboard(),
+        mgr.regenerate_session_sush_nonce(),
+        signer_nonce,
+    );
     let session = Session::new(session_id);
-    mgr.session_start(&authn, session_id, true).await.unwrap();
+    mgr.session_start(&authn, session_id, signer_nonce, true)
+        .await
+        .unwrap();
 
     let command = "sleep 30";
     let job_id = session.next_job_id();
@@ -871,9 +934,16 @@ async fn cert_chain() {
     );
 
     // Start a job signed with the child.
-    let session_id = SessionId::random();
+    let signer_nonce = SessionSignerNonce::random();
+    let session_id = SessionId::compute(
+        mgr.own_baseboard(),
+        mgr.regenerate_session_sush_nonce(),
+        signer_nonce,
+    );
     let mut session = Session::new(session_id);
-    mgr.session_start(&authn, session_id, true).await.unwrap();
+    mgr.session_start(&authn, session_id, signer_nonce, true)
+        .await
+        .unwrap();
     let job_id = session.next_job_id();
     let job = child.sign_job_request(&job_id, "true", false).await;
     mgr.job_start(
@@ -899,9 +969,16 @@ async fn attribution() {
     let log = test_logger(function_name!());
     let (mgr, mut root, _dir, _shutdown) = manager_and_test_root(log).await;
     let authn = fake_identity(&mut root).await;
-    let session_id = SessionId::random();
+    let signer_nonce = SessionSignerNonce::random();
+    let session_id = SessionId::compute(
+        mgr.own_baseboard(),
+        mgr.regenerate_session_sush_nonce(),
+        signer_nonce,
+    );
     let mut session = Session::new(session_id);
-    mgr.session_start(&authn, session_id, true).await.unwrap();
+    mgr.session_start(&authn, session_id, signer_nonce, true)
+        .await
+        .unwrap();
     assert_eq!(
         mgr.session(&authn).unwrap().started_by(),
         Some(&authn.key_id)
@@ -1119,9 +1196,16 @@ async fn job_targets() {
     let log = test_logger(function_name!());
     let (mgr, mut root, _dir, _shutdown) = manager_and_test_root(log).await;
     let authn = fake_identity(&mut root).await;
-    let session_id = SessionId::random();
+    let signer_nonce = SessionSignerNonce::random();
+    let session_id = SessionId::compute(
+        mgr.own_baseboard(),
+        mgr.regenerate_session_sush_nonce(),
+        signer_nonce,
+    );
     let mut session = Session::new(session_id);
-    mgr.session_start(&authn, session_id, true).await.unwrap();
+    mgr.session_start(&authn, session_id, signer_nonce, true)
+        .await
+        .unwrap();
 
     let mut start = async |command: &str, target: &str| {
         let job_id = session.next_job_id();
@@ -1265,9 +1349,16 @@ async fn attach_grants() {
         EphemeralKey::new_root(KeyType::P256, ephemeral_test_subject(), validity).unwrap();
     let guest = fake_identity(&mut guest_key).await;
 
-    let session_id = SessionId::random();
+    let signer_nonce = SessionSignerNonce::random();
+    let session_id = SessionId::compute(
+        mgr.own_baseboard(),
+        mgr.regenerate_session_sush_nonce(),
+        signer_nonce,
+    );
     let session = Session::new(session_id);
-    mgr.session_start(&owner, session_id, true).await.unwrap();
+    mgr.session_start(&owner, session_id, signer_nonce, true)
+        .await
+        .unwrap();
     let job_id = session.next_job_id();
     let job = root.sign_job_request(&job_id, "sleep 10", false).await;
     mgr.job_start(
@@ -1611,9 +1702,16 @@ async fn too_much_cpu() {
     let (mgr, mut root, _dir, _shutdown) = manager_and_test_root(log).await;
     let baseboard_id = mgr.own_baseboard();
     let authn = fake_identity(&mut root).await;
-    let session_id = SessionId::random();
+    let signer_nonce = SessionSignerNonce::random();
+    let session_id = SessionId::compute(
+        mgr.own_baseboard(),
+        mgr.regenerate_session_sush_nonce(),
+        signer_nonce,
+    );
     let session = Session::new(session_id);
-    mgr.session_start(&authn, session_id, true).await.unwrap();
+    mgr.session_start(&authn, session_id, signer_nonce, true)
+        .await
+        .unwrap();
     let job_id = session.next_job_id();
     let command = "openssl speed sha1";
     let job = root.sign_job_request(&job_id, command, false).await;
@@ -1690,9 +1788,16 @@ async fn too_much_output() {
     let log = test_logger(function_name!());
     let (mgr, mut root, _dir, _shutdown) = manager_and_test_root(log).await;
     let authn = fake_identity(&mut root).await;
-    let session_id = SessionId::random();
+    let signer_nonce = SessionSignerNonce::random();
+    let session_id = SessionId::compute(
+        mgr.own_baseboard(),
+        mgr.regenerate_session_sush_nonce(),
+        signer_nonce,
+    );
     let mut session = Session::new(session_id);
-    mgr.session_start(&authn, session_id, true).await.unwrap();
+    mgr.session_start(&authn, session_id, signer_nonce, true)
+        .await
+        .unwrap();
 
     let job_id = session.next_job_id();
     let command = "yes";
@@ -1780,9 +1885,16 @@ async fn output_ranges() {
     let (mgr, mut root, _dir, _shutdown) = manager_and_test_root(log).await;
     let baseboard_id = mgr.own_baseboard();
     let authn = fake_identity(&mut root).await;
-    let session_id = SessionId::random();
+    let signer_nonce = SessionSignerNonce::random();
+    let session_id = SessionId::compute(
+        mgr.own_baseboard(),
+        mgr.regenerate_session_sush_nonce(),
+        signer_nonce,
+    );
     let session = Session::new(session_id);
-    mgr.session_start(&authn, session_id, true).await.unwrap();
+    mgr.session_start(&authn, session_id, signer_nonce, true)
+        .await
+        .unwrap();
     let job_id = session.next_job_id();
 
     // Read some random bytes.

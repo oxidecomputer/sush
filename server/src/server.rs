@@ -26,7 +26,8 @@ use x509_cert::der::DecodePem as _;
 use sush_api::{
     AccessParam, Authorization, AuthorizedRangeRequest, JobAttachParams, JobHistoryParams,
     JobIdParam, JobOutputParams, JobStartParams, JobStopParams, KeyIdParam, RoutingParam,
-    SessionAndJobIds, SessionAndKeyIds, SessionIdParam, SushApi, WaitParam,
+    SessionAndJobIds, SessionAndKeyIds, SessionIdParam, SessionStartBody, SessionStartNonce,
+    SushApi, WaitParam,
 };
 use sush_common::authn::Identity;
 use sush_common::jobs::{JsonJobStatusMap, Session, SignedJob, job_status_to_json_map};
@@ -170,11 +171,26 @@ impl SushApi for ApiServer {
         }
     }
 
+    async fn session_start_nonce(
+        ctx: RequestContext<Self::Context>,
+        headers: Header<Authorization>,
+    ) -> Result<HttpResponseOk<SessionStartNonce>, HttpError> {
+        let mgr = ctx.context();
+        let Authorization { authorization } = headers.into_inner();
+        let _authn = mgr
+            .iam(authorization, None, request_line(&ctx.request))
+            .await?;
+        Ok(HttpResponseOk(SessionStartNonce {
+            nonce: mgr.regenerate_session_sush_nonce(),
+        }))
+    }
+
     async fn session_start(
         ctx: RequestContext<Self::Context>,
         headers: Header<Authorization>,
         params: PathParams<SessionIdParam>,
         query: QueryParams<WaitParam>,
+        body: TypedBody<SessionStartBody>,
     ) -> Result<HttpResponseUpdatedNoContent, HttpError> {
         let mgr = ctx.context();
         let Authorization { authorization } = headers.into_inner();
@@ -183,7 +199,9 @@ impl SushApi for ApiServer {
             .await?;
         let WaitParam { wait } = query.into_inner();
         let SessionIdParam { session_id } = params.into_inner();
-        mgr.session_start(&authn, session_id, wait).await?;
+        let SessionStartBody { signer_nonce } = body.into_inner();
+        mgr.session_start(&authn, session_id, signer_nonce, wait)
+            .await?;
         Ok(HttpResponseUpdatedNoContent())
     }
 

@@ -41,7 +41,9 @@ use sush_api::sush_api_mod::api_description;
 use sush_client::tls::client as tls_client;
 use sush_client::{AuthzSigner, Client, Error as ClientError};
 use sush_common::interactive::{InteractiveJobControl, InteractiveJobMessage};
-use sush_common::jobs::{Access, JobLimits, JobOutputStream, Session, SessionId};
+use sush_common::jobs::{
+    Access, JobLimits, JobOutputStream, Session, SessionId, SessionSignerNonce,
+};
 use sush_common::keys::{EphemeralKey, KeyType, pem_cert_chain};
 use sush_common::targets::Cubbies;
 use sush_server::proxy::{Targets, platform_tls};
@@ -51,6 +53,7 @@ use crate::test_utils::{
     SignJobRequest as _, authz, ephemeral_test_root, manager_and_test_root, test_baseboard_id,
     test_logger, test_pki,
 };
+use sush_client::types::SessionStartBody;
 
 const TIMEOUT: Duration = Duration::from_secs(10);
 
@@ -94,10 +97,22 @@ async fn client_server() {
     assert_eq!(iam, identity, "who am I?");
 
     // Start a session and run a job.
-    let session = Session::new(SessionId::random());
+    let signer_nonce = SessionSignerNonce::random();
+    let session = Session::new(SessionId::compute(
+        &test_baseboard_id(),
+        client
+            .session_start_nonce()
+            .send()
+            .await
+            .unwrap()
+            .into_inner()
+            .nonce,
+        signer_nonce,
+    ));
     client
         .session_start()
         .session_id(session.session_id())
+        .body(SessionStartBody { signer_nonce })
         .send()
         .await
         .expect("can't start session");
@@ -191,10 +206,22 @@ async fn client_proxy_server() {
 
     // Attach to an interactive job through the proxy, routed by the
     // target path segment, and echo bytes over the bridged upgrade.
-    let session = Session::new(SessionId::random());
+    let signer_nonce = SessionSignerNonce::random();
+    let session = Session::new(SessionId::compute(
+        &test_baseboard_id(),
+        client
+            .session_start_nonce()
+            .send()
+            .await
+            .unwrap()
+            .into_inner()
+            .nonce,
+        signer_nonce,
+    ));
     client
         .session_start()
         .session_id(session.session_id())
+        .body(SessionStartBody { signer_nonce })
         .send()
         .await
         .expect("can't start session");
@@ -534,10 +561,22 @@ async fn interactive_job() {
     assert_eq!(iam, identity, "who am I?");
 
     // Start a session and run an interactive job.
-    let session = Session::new(SessionId::random());
+    let signer_nonce = SessionSignerNonce::random();
+    let session = Session::new(SessionId::compute(
+        &test_baseboard_id(),
+        client
+            .session_start_nonce()
+            .send()
+            .await
+            .unwrap()
+            .into_inner()
+            .nonce,
+        signer_nonce,
+    ));
     client
         .session_start()
         .session_id(session.session_id())
+        .body(SessionStartBody { signer_nonce })
         .send()
         .await
         .expect("can't start session");

@@ -80,6 +80,8 @@ pub enum JobError {
     Unauthorized(Nonce),
     #[error("Unable to wait for job end")]
     Wait,
+    #[error("The provided session ID is invalid")]
+    InvalidSessionId,
 }
 
 impl JobError {
@@ -176,7 +178,8 @@ impl From<JobError> for HttpError {
             | SessionNotCurrent(_) => {
                 HttpError::for_client_error(None, ClientErrorStatusCode::NOT_FOUND, message)
             }
-            DecodeCert(_) | DuplicateJobId(_) | InvalidCommand | Json(_) | MultipleSessions => {
+            DecodeCert(_) | DuplicateJobId(_) | InvalidCommand | Json(_) | MultipleSessions
+            | InvalidSessionId => {
                 HttpError::for_client_error(None, ClientErrorStatusCode::BAD_REQUEST, message)
             }
         }

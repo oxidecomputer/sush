@@ -79,6 +79,8 @@ progenitor::generate_api!(
         KeyId = sush_common::keys::KeyId,
         Signature = sush_common::keys::Signature,
         SignedForJobStartRequest = sush_common::jobs::SignedJob,
+        SessionSignerNonce = sush_common::jobs::SessionSignerNonce,
+        SessionSushNonce = sush_common::jobs::SessionSushNonce,
     },
     timeout = 600,
 );
