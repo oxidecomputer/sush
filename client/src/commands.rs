@@ -46,7 +46,8 @@ use sush_common::jobs::JobOutputStream::{self, Stderr, Stdout};
 #[cfg(feature = "permslip")]
 use sush_common::jobs::JobStartRequest;
 use sush_common::jobs::{
-    Access, JobId, JobLimits, JobOutputHash, JobOutputState, JobStatus, JobStatusMap, Session, SessionId, SessionSignerNonce, SignedJob, job_status_try_from_json_map
+    Access, JobId, JobLimits, JobOutputHash, JobOutputState, JobStatus, JobStatusMap, Session,
+    SessionId, SessionSignerNonce, SignedJob, job_status_try_from_json_map,
 };
 use sush_common::keys::{KeyError, KeyId, Signer as _};
 use sush_common::targets::{SledId, Target};
@@ -571,9 +572,6 @@ pub struct JobStartArgs {
     /// Be sure to quote spaces and characters special to your shell!
     command: Option<String>,
 
-    /// Job ID within the session.
-    job_id: Option<JobId>,
-
     /// Job output is binary, not UTF-8 encoded text.
     #[arg(short, long, default_value_t = false, requires = "wait")]
     binary: bool,
@@ -1072,7 +1070,6 @@ async fn job(
                     ref start_args @ JobStartArgs {
                         command: Some(ref command),
                         permslip: Some(ref key_name),
-                        ref job_id,
                         ref permslip_url,
                         ref interactive,
                         ref target,
@@ -1081,44 +1078,20 @@ async fn job(
             },
             client,
         ) => {
-            let job_id = if let Some(job_id) = job_id {
-                job_id.to_owned()
-            } else {
-                // Ensure we have a session for the job.
-                if ctx.session_id().is_none()
-                    && let Some(client) = client
-                {
-                    let session =
-                        match with_login(ctx, client, async || client.session().send().await).await
-                        {
-                            Ok(resp) => resp.into_inner(),
-                            Err(CommandError::NotFound) => {
-                                let session = Session::new(SessionId::random());
-                                with_login(ctx, client, async || {
-                                    client
-                                        .session_start()
-                                        .session_id(session.session_id())
-                                        .send()
-                                        .await
-                                })
-                                .await?;
-                                session
-                            }
-                            Err(err) => return Err(err),
-                        };
-                    ctx.session_started(session)?;
-                }
-                ctx.next_job_id()?
+            let Some(session_id) = ctx.session_id() else {
+                return Err(CommandError::MissingSession);
             };
-
             let Some(permslip_url) = permslip_url else {
                 return Err(CommandError::MissingPermslipUrl);
             };
-            let mut signer = PermslipSigner::new(key_name, permslip_url).await?;
+            let job_id = ctx.next_job_id()?;
+
+            let signer = PermslipSigner::new(key_name, permslip_url).await?;
             let mut interval = interval(SIGNING_UPDATE_INTERVAL);
             interval.set_missed_tick_behavior(MissedTickBehavior::Skip);
-            let sign = signer.sign(JobStartRequest::new(
+            let sign = signer.sign_job_request(JobStartRequest::new(
                 job_id.to_owned(),
+                session_id,
                 command,
                 *interactive,
                 target.clone(),
