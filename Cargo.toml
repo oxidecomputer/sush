@@ -7,6 +7,7 @@ async-recursion = "1"
 attest-mock = { git = "https://github.com/oxidecomputer/dice-util", rev = "10952e8d9599b735b85d480af3560a11700e5b64" }
 base64 = "0.22"
 camino = "1"
+async-trait = "0.1"
 blake3 = { version = "1", features = ["mmap", "rayon"] }
 borsh = { version = "1", features = ["derive"] }
 bytes = "1"
@@ -36,11 +37,12 @@ permission-slip-common = { git = "https://github.com/oxidecomputer/permission-sl
 progenitor = "0.14"
 progenitor-client = "0.14"
 pwd = "1"
+qorb = { version = "0.4", default-features = false }
 rand = "0.8"
 rand_core = "0.6"
 reqwest = { version = "0.13", features = ["json", "rustls"] }
 rlimit = "0.10"
-rumors = { git = "https://github.com/oxidecomputer/rumors", rev = "66aea68b6578345275de3cf14151c4707345773f" }
+rumors = { git = "https://github.com/oxidecomputer/rumors", rev = "4be4b8308b38d6961e7ccaf613394e7d5bbf3f6d" }
 rustix = { version = "1", features = ["fs", "process", "pty", "termios"] }
 rustls = "0.23"
 rustyline = { version = "17", features = ["termios"] }

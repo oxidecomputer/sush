@@ -255,8 +255,8 @@ where
         }
     }
 
-    /// Tear down links and dials to peers no longer in the peer set, and
-    /// forgive any debt owed to them.
+    /// Tear down links, dials, and connection pools for peers no longer
+    /// in the peer set, and forgive any debt owed to them.
     fn prune(&mut self) {
         let want: BTreeSet<_> = self
             .peers
@@ -274,6 +274,7 @@ where
         self.live.retain(cull);
         self.dialing.retain(cull);
         self.joins.retain(|peer| want.contains(peer));
+        self.transport.retain_pools(&self.peers.borrow());
     }
 
     /// Gossip on a fresh link, or use it to join a universe that beat ours.
