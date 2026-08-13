@@ -116,7 +116,9 @@ async fn jobs() {
         .unwrap();
 
     let job_id = session.next_job_id();
-    let job = root.sign_job_request(&job_id, "true", false).await;
+    let job = root
+        .sign_job_request(job_id, session_id, "true", false)
+        .await;
     assert!(matches!(
         mgr.job_status(&authn, &job_id).await.unwrap_err(),
         JobError::JobNotFound(jid) if jid == job_id
@@ -136,7 +138,9 @@ async fn jobs() {
     check_status_stopped(status, &job_id, Ok(0), Some(0), Some(0));
 
     let job_id = session.next_job_id();
-    let job = root.sign_job_request(&job_id, "false", false).await;
+    let job = root
+        .sign_job_request(job_id, session_id, "false", false)
+        .await;
     mgr.job_start(
         &authn,
         job.clone().into_signed(),
@@ -155,7 +159,7 @@ async fn jobs() {
     let job_id_string = job_id.to_string();
     let job_id_bytes = job_id_string.as_bytes();
     let job = root
-        .sign_job_request(&job_id, "echo -n $SUSH_JOB_ID", false)
+        .sign_job_request(job_id, session_id, "echo -n $SUSH_JOB_ID", false)
         .await;
     mgr.job_start(
         &authn,
@@ -196,7 +200,9 @@ async fn jobs() {
     let home = Passwd::current_user().unwrap().dir;
     let output = format!("{home}\n");
     let job_id = session.next_job_id();
-    let job = root.sign_job_request(&job_id, "pwd", false).await;
+    let job = root
+        .sign_job_request(job_id, session_id, "pwd", false)
+        .await;
     mgr.job_start(
         &authn,
         job.clone().into_signed(),
@@ -273,7 +279,9 @@ async fn job_stop() {
     // Start a new (potentially) long-running job.
     let command = "sleep 10";
     let job_id = session.next_job_id();
-    let job = root.sign_job_request(&job_id, command, false).await;
+    let job = root
+        .sign_job_request(job_id, session_id, command, false)
+        .await;
     mgr.job_start(
         &authn,
         job.clone().into_signed(),
@@ -338,7 +346,9 @@ async fn cancel_queued_job() {
     // Queue job A, which won't finish soon.
     let command_a = "sleep 10";
     let job_id_a = session.next_job_id();
-    let job_a = root.sign_job_request(&job_id_a, command_a, false).await;
+    let job_a = root
+        .sign_job_request(job_id_a, session_id, command_a, false)
+        .await;
     mgr.job_start(
         &authn,
         job_a.clone().into_signed(),
@@ -355,11 +365,15 @@ async fn cancel_queued_job() {
     // before we cancel it: the executor only runs the job whose id the
     // chain expects next, and it never sees this one.
     let hole_id = session.next_job_id();
-    let hole = root.sign_job_request(&hole_id, "true", false).await;
+    let hole = root
+        .sign_job_request(hole_id, session_id, "true", false)
+        .await;
     session.job_started(hole.into_signed());
     let command_b = "false";
     let job_id_b = session.next_job_id();
-    let job_b = root.sign_job_request(&job_id_b, command_b, false).await;
+    let job_b = root
+        .sign_job_request(job_id_b, session_id, command_b, false)
+        .await;
     mgr.job_start(
         &authn,
         job_b.clone().into_signed(),
@@ -423,7 +437,9 @@ async fn job_output_perms() {
     // Run a job with some output on both streams.
     let command = "echo -n foo && echo -n bar >&2";
     let job_id = session.next_job_id();
-    let job = root.sign_job_request(&job_id, command, false).await;
+    let job = root
+        .sign_job_request(job_id, session_id, command, false)
+        .await;
     mgr.job_start(
         &authn,
         job.clone().into_signed(),
@@ -493,14 +509,16 @@ async fn cubby_targets() {
     // it was processed, not merely still queued.
     let skipped_id = session.next_job_id();
     let job = root
-        .sign_job_request_for(&skipped_id, "true", false, target.clone())
+        .sign_job_request_for(skipped_id, session_id, "true", false, target.clone())
         .await;
     mgr.job_start(&authn, job.clone().into_signed(), JobStartParams::default())
         .await
         .unwrap();
     session.job_started(job.into_signed());
     let job_id = session.next_job_id();
-    let job = root.sign_job_request(&job_id, "true", false).await;
+    let job = root
+        .sign_job_request(job_id, session_id, "true", false)
+        .await;
     mgr.job_start(
         &authn,
         job.clone().into_signed(),
@@ -525,7 +543,7 @@ async fn cubby_targets() {
     loop {
         let job_id = session.next_job_id();
         let job = root
-            .sign_job_request_for(&job_id, "true", false, target.clone())
+            .sign_job_request_for(job_id, session_id, "true", false, target.clone())
             .await;
         mgr.job_start(&authn, job.clone().into_signed(), JobStartParams::default())
             .await
@@ -540,7 +558,7 @@ async fn cubby_targets() {
     // Now cubby-targeted jobs run here.
     let job_id = session.next_job_id();
     let job = root
-        .sign_job_request_for(&job_id, "true", false, target)
+        .sign_job_request_for(job_id, session_id, "true", false, target)
         .await;
     mgr.job_start(
         &authn,
@@ -595,7 +613,9 @@ async fn root_certs_from_files() {
         .await
         .unwrap();
     let job_id = session.next_job_id();
-    let job = root.sign_job_request(&job_id, "true", false).await;
+    let job = root
+        .sign_job_request(job_id, session_id, "true", false)
+        .await;
     mgr.job_start(
         &authn,
         job.into_signed(),
@@ -677,7 +697,9 @@ async fn job_output_dir_moves() {
 
     // Record a job's output under the first base.
     let first = session.next_job_id();
-    let job = root.sign_job_request(&first, "echo -n foo", false).await;
+    let job = root
+        .sign_job_request(first, session_id, "echo -n foo", false)
+        .await;
     mgr.job_start(
         &authn,
         job.clone().into_signed(),
@@ -712,7 +734,9 @@ async fn job_output_dir_moves() {
 
     // New jobs are recorded under the new base.
     let second = session.next_job_id();
-    let job = root.sign_job_request(&second, "echo -n bar", false).await;
+    let job = root
+        .sign_job_request(second, session_id, "echo -n bar", false)
+        .await;
     mgr.job_start(
         &authn,
         job.clone().into_signed(),
@@ -774,7 +798,9 @@ async fn universe_swap() {
             .await
             .unwrap();
         let job_id = session.next_job_id();
-        let job = root.sign_job_request(&job_id, "true", false).await;
+        let job = root
+            .sign_job_request(job_id, session_id, "true", false)
+            .await;
         mgr.job_start(
             authn,
             job.into_signed(),
@@ -829,7 +855,9 @@ async fn shutdown() {
 
     let command = "sleep 30";
     let job_id = session.next_job_id();
-    let job = root.sign_job_request(&job_id, command, false).await;
+    let job = root
+        .sign_job_request(job_id, session_id, command, false)
+        .await;
     mgr.job_start(
         &authn,
         job.clone().into_signed(),
@@ -945,7 +973,9 @@ async fn cert_chain() {
         .await
         .unwrap();
     let job_id = session.next_job_id();
-    let job = child.sign_job_request(&job_id, "true", false).await;
+    let job = child
+        .sign_job_request(job_id, session_id, "true", false)
+        .await;
     mgr.job_start(
         &authn,
         job.clone().into_signed(),
@@ -988,7 +1018,9 @@ async fn attribution() {
     // executor only runs the job whose id the chain expects next, and
     // it never sees this one, so B stays queued until cancelled.
     let job_id_a = session.next_job_id();
-    let job_a = root.sign_job_request(&job_id_a, "sleep 60", false).await;
+    let job_a = root
+        .sign_job_request(job_id_a, session_id, "sleep 60", false)
+        .await;
     mgr.job_start(
         &authn,
         job_a.clone().into_signed(),
@@ -1001,10 +1033,14 @@ async fn attribution() {
     .unwrap();
     session.job_started(job_a.into_signed());
     let hole_id = session.next_job_id();
-    let hole = root.sign_job_request(&hole_id, "true", false).await;
+    let hole = root
+        .sign_job_request(hole_id, session_id, "true", false)
+        .await;
     session.job_started(hole.into_signed());
     let job_id_b = session.next_job_id();
-    let job_b = root.sign_job_request(&job_id_b, "true", false).await;
+    let job_b = root
+        .sign_job_request(job_id_b, session_id, "true", false)
+        .await;
     mgr.job_start(
         &authn,
         job_b.clone().into_signed(),
@@ -1209,7 +1245,8 @@ async fn job_targets() {
 
     let mut start = async |command: &str, target: &str| {
         let job_id = session.next_job_id();
-        let request = JobStartRequest::new(job_id, command, false, target.parse().unwrap());
+        let request =
+            JobStartRequest::new(job_id, session_id, command, false, target.parse().unwrap());
         let job = root
             .sign(request)
             .await
@@ -1360,7 +1397,9 @@ async fn attach_grants() {
         .await
         .unwrap();
     let job_id = session.next_job_id();
-    let job = root.sign_job_request(&job_id, "sleep 10", false).await;
+    let job = root
+        .sign_job_request(job_id, session_id, "sleep 10", false)
+        .await;
     mgr.job_start(
         &owner,
         job.into_signed(),
@@ -1714,7 +1753,9 @@ async fn too_much_cpu() {
         .unwrap();
     let job_id = session.next_job_id();
     let command = "openssl speed sha1";
-    let job = root.sign_job_request(&job_id, command, false).await;
+    let job = root
+        .sign_job_request(job_id, session_id, command, false)
+        .await;
     let job_id = job.job_id().to_owned();
     mgr.job_start(
         &authn,
@@ -1801,7 +1842,9 @@ async fn too_much_output() {
 
     let job_id = session.next_job_id();
     let command = "yes";
-    let job = root.sign_job_request(&job_id, command, false).await;
+    let job = root
+        .sign_job_request(job_id, session_id, command, false)
+        .await;
     let job_id = job.job_id().to_owned();
     let max_fsize = 0x10000;
     mgr.job_start(
@@ -1840,7 +1883,9 @@ async fn too_much_output() {
 
     let job_id = session.next_job_id();
     let command = "yes >&2";
-    let job = root.sign_job_request(&job_id, command, false).await;
+    let job = root
+        .sign_job_request(job_id, session_id, command, false)
+        .await;
     let job_id = job.job_id().to_owned();
     let max_fsize = 0x10000;
     mgr.job_start(
@@ -1900,7 +1945,9 @@ async fn output_ranges() {
     // Read some random bytes.
     let n = 1000;
     let command = &format!("head -c {n} /dev/urandom");
-    let job = root.sign_job_request(&job_id, command, false).await;
+    let job = root
+        .sign_job_request(job_id, session_id, command, false)
+        .await;
     mgr.job_start(
         &authn,
         job.clone().into_signed(),

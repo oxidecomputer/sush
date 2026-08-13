@@ -328,6 +328,9 @@ mod wire_format {
             "abandon-abandon-abandon-abandon-abandon-abandon-abandon-ability"
                 .parse()
                 .unwrap(),
+            "bamboo-bamboo-bamboo-bamboo-bamboo-bamboo-bamboo-banana"
+                .parse()
+                .unwrap(),
             "echo hello",
             false,
             "14,16".parse().unwrap(),

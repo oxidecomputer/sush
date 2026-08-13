@@ -175,6 +175,7 @@ async fn job_spawn(
     use JobOutputStream::*;
     let JobStartRequest {
         job_id,
+        session_id: _,
         command,
         interactive,
         target: _,

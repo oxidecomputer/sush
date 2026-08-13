@@ -236,6 +236,7 @@ impl Session {
 )]
 pub struct JobStartRequest {
     pub job_id: JobId,
+    pub session_id: SessionId,
     pub command: String,
     #[serde(default, skip_serializing_if = "is_false")]
     pub interactive: bool,
@@ -257,12 +258,14 @@ impl JobStartRequest {
 
     pub fn new<S: AsRef<str>>(
         job_id: JobId,
+        session_id: SessionId,
         command: S,
         interactive: bool,
         target: Target,
     ) -> Self {
         Self {
             job_id,
+            session_id,
             command: command.as_ref().to_string(),
             interactive,
             target,
@@ -297,14 +300,21 @@ impl ToBeSigned for JobStartRequest {
 
         let JobStartRequest {
             job_id,
+            session_id,
             command,
             interactive,
             target,
         } = self;
         hash_with_len(Self::TYPE_NAME);
+        hash_with_len(b"job_id");
         hash_with_len(&job_id.to_be_bytes());
+        hash_with_len(b"session_id");
+        hash_with_len(&session_id.to_be_bytes());
+        hash_with_len(b"command");
         hash_with_len(command.as_bytes());
+        hash_with_len(b"interactive");
         hash_with_len(if *interactive { &[1] } else { &[0] });
+        hash_with_len(b"target");
         hash_with_len(target.to_string().as_bytes());
         hasher.finalize().as_bytes().to_vec()
     }

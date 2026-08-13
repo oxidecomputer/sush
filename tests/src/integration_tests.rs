@@ -98,7 +98,7 @@ async fn client_server() {
 
     // Start a session and run a job.
     let signer_nonce = SessionSignerNonce::random();
-    let session = Session::new(SessionId::compute(
+    let session_id = SessionId::compute(
         &test_baseboard_id(),
         client
             .session_start_nonce()
@@ -108,7 +108,8 @@ async fn client_server() {
             .into_inner()
             .nonce,
         signer_nonce,
-    ));
+    );
+    let session = Session::new(session_id);
     client
         .session_start()
         .session_id(session.session_id())
@@ -118,7 +119,7 @@ async fn client_server() {
         .expect("can't start session");
     let job_id = session.next_job_id();
     let job = root
-        .sign_job_request(&job_id, "echo -n $SUSH_JOB_ID", false)
+        .sign_job_request(job_id, session_id, "echo -n $SUSH_JOB_ID", false)
         .await;
     let JobLimits {
         max_cpu,
@@ -207,7 +208,7 @@ async fn client_proxy_server() {
     // Attach to an interactive job through the proxy, routed by the
     // target path segment, and echo bytes over the bridged upgrade.
     let signer_nonce = SessionSignerNonce::random();
-    let session = Session::new(SessionId::compute(
+    let session_id = SessionId::compute(
         &test_baseboard_id(),
         client
             .session_start_nonce()
@@ -217,7 +218,8 @@ async fn client_proxy_server() {
             .into_inner()
             .nonce,
         signer_nonce,
-    ));
+    );
+    let session = Session::new(session_id);
     client
         .session_start()
         .session_id(session.session_id())
@@ -227,7 +229,7 @@ async fn client_proxy_server() {
         .expect("can't start session");
     let job_id = session.next_job_id();
     let job = root
-        .sign_job_request(&job_id, "cat > /dev/null", true)
+        .sign_job_request(job_id, session_id, "cat > /dev/null", true)
         .await;
     let JobLimits {
         max_cpu,
@@ -562,7 +564,7 @@ async fn interactive_job() {
 
     // Start a session and run an interactive job.
     let signer_nonce = SessionSignerNonce::random();
-    let session = Session::new(SessionId::compute(
+    let session_id = SessionId::compute(
         &test_baseboard_id(),
         client
             .session_start_nonce()
@@ -572,7 +574,8 @@ async fn interactive_job() {
             .into_inner()
             .nonce,
         signer_nonce,
-    ));
+    );
+    let session = Session::new(session_id);
     client
         .session_start()
         .session_id(session.session_id())
@@ -582,7 +585,7 @@ async fn interactive_job() {
         .expect("can't start session");
     let job_id = session.next_job_id();
     let job = root
-        .sign_job_request(&job_id, "cat > /dev/null", true)
+        .sign_job_request(job_id, session_id, "cat > /dev/null", true)
         .await;
     let JobLimits {
         max_cpu,

@@ -27,7 +27,7 @@ use sprockets_tls_test_utils::{
 };
 use sush_common::authn::{Challenge, ChallengeResponse, Identity, Nonce, RequestKey};
 use sush_common::codephrases::Codephrase;
-use sush_common::jobs::{JobId, JobStartRequest, SignedJob};
+use sush_common::jobs::{JobId, JobStartRequest, SessionId, SignedJob};
 use sush_common::keys::{EphemeralKey, KeyType, Signer as _};
 use sush_common::targets::Target;
 use sush_server::gossip::GossipConfig;
@@ -149,9 +149,15 @@ pub async fn fake_identity(key: &mut EphemeralKey) -> Identity {
 }
 
 /// Sign a batch job request with `root`.
-pub async fn sign_job(root: &mut EphemeralKey, job_id: &JobId, command: &str) -> SignedJob {
+pub async fn sign_job(
+    root: &mut EphemeralKey,
+    job_id: JobId,
+    session_id: SessionId,
+    command: &str,
+) -> SignedJob {
     root.sign(JobStartRequest::new(
-        job_id.to_owned(),
+        job_id,
+        session_id,
         command,
         false,
         Target::All,

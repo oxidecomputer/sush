@@ -26,7 +26,7 @@ use sush_client::context::Authz;
 use sush_client::{Client, ResponseValue};
 use sush_common::authn::{Challenge, ChallengeResponse, Credentials, Identity, Nonce, RequestKey};
 use sush_common::codephrases::Codephrase;
-use sush_common::jobs::{JobId, JobStartRequest, VerifiedJob};
+use sush_common::jobs::{JobId, JobStartRequest, SessionId, VerifiedJob};
 use sush_common::keys::{EphemeralKey, KeyType, Signer};
 use sush_common::targets::{Cubbies, Target};
 use sush_server::executor::PathIsolation;
@@ -68,17 +68,19 @@ impl IntoBytes for JobOutputFileStream {
 pub trait SignJobRequest {
     async fn sign_job_request<S: AsRef<str>>(
         &mut self,
-        job_id: &JobId,
+        job_id: JobId,
+        session_id: SessionId,
         command: S,
         interactive: bool,
     ) -> VerifiedJob {
-        self.sign_job_request_for(job_id, command, interactive, Target::All)
+        self.sign_job_request_for(job_id, session_id, command, interactive, Target::All)
             .await
     }
 
     async fn sign_job_request_for<S: AsRef<str>>(
         &mut self,
-        job_id: &JobId,
+        job_id: JobId,
+        session_id: SessionId,
         command: S,
         interactive: bool,
         target: Target,
@@ -88,13 +90,15 @@ pub trait SignJobRequest {
 impl SignJobRequest for EphemeralKey {
     async fn sign_job_request_for<S: AsRef<str>>(
         &mut self,
-        job_id: &JobId,
+        job_id: JobId,
+        session_id: SessionId,
         command: S,
         interactive: bool,
         target: Target,
     ) -> VerifiedJob {
         self.sign(JobStartRequest::new(
-            job_id.to_owned(),
+            job_id,
+            session_id,
             command,
             interactive,
             target,

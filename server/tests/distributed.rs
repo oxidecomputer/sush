@@ -138,7 +138,7 @@ async fn jobs_gossip_between_sleds() {
     // A job submitted to A runs on both sleds, and each sled learns the
     // other's result.
     let job_id = session.next_job_id();
-    let job = sign_job(&mut root, &job_id, "true").await;
+    let job = sign_job(&mut root, job_id, session_id, "true").await;
     a.mgr
         .job_start(
             &authn_a,
