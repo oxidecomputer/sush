@@ -4,10 +4,13 @@
 
 //! The build's provenance.
 
+use std::collections::BTreeMap;
 use std::fmt;
 
+use borsh::{BorshDeserialize, BorshSerialize};
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
+use sled_hardware_types::BaseboardId;
 
 /// The git commit of this build, "-dirty" suffixed when the tree had
 /// uncommitted changes.
@@ -22,7 +25,17 @@ pub const LONG_VERSION: &str = concat!(
 );
 
 /// One build's version and commit.
-#[derive(Clone, Debug, Deserialize, Serialize, JsonSchema)]
+#[derive(
+    BorshDeserialize,
+    BorshSerialize,
+    Clone,
+    Debug,
+    Deserialize,
+    Eq,
+    JsonSchema,
+    PartialEq,
+    Serialize,
+)]
 pub struct VersionInfo {
     /// The package version.
     pub version: String,
@@ -45,3 +58,5 @@ impl fmt::Display for VersionInfo {
         write!(f, "{} ({})", self.version, self.commit)
     }
 }
+
+pub type VersionMap = BTreeMap<BaseboardId, VersionInfo>;
