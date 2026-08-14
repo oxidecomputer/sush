@@ -385,7 +385,7 @@ pub enum ClientCommand {
     #[clap(alias = "repl")]
     Shell,
 
-    /// Report client and server build versions.
+    /// Report client and sled build versions.
     Version,
 
     /// Leave the interactive REPL.
@@ -669,11 +669,19 @@ impl ClientCommand {
             }
 
             (ClientCommand::Version, client) => {
-                let server = match client {
-                    Some(client) => Some(client.version().send().await?.into_inner()),
-                    None => None,
+                let (server, sleds) = match client {
+                    Some(client) => (
+                        Some(client.version().send().await?.into_inner()),
+                        client
+                            .versions()
+                            .send()
+                            .await
+                            .map(|sleds| sleds.into_inner())
+                            .unwrap_or_default(),
+                    ),
+                    None => (None, Vec::new()),
                 };
-                ctx.versions(&VersionInfo::current(), server.as_ref());
+                ctx.versions(&VersionInfo::current(), server.as_ref(), &sleds);
                 Ok(())
             }
 

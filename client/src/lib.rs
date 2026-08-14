@@ -79,6 +79,7 @@ progenitor::generate_api!(
         KeyId = sush_common::keys::KeyId,
         Signature = sush_common::keys::Signature,
         SignedForJobStartRequest = sush_common::jobs::SignedJob,
+        SledVersion = sush_common::targets::SledVersion,
         VersionInfo = sush_common::version::VersionInfo,
     },
     timeout = 600,

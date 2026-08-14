@@ -26,6 +26,7 @@ use sush_common::jobs::{
     SignedJob,
 };
 use sush_common::keys::{KeyId, SshPublicKey};
+use sush_common::targets::SledVersion;
 use sush_common::version::VersionInfo;
 
 /// Oxide Support Shell API
@@ -233,6 +234,15 @@ pub trait SushApi {
         ctx: RequestContext<Self::Context>,
         query: QueryParams<RoutingParam>,
     ) -> Result<HttpResponseOk<BaseboardId>, HttpError>;
+
+    /// Get the cubby, baseboard, and build of every known sled.
+    ///
+    /// Unauthenticated, like `/target`.
+    #[endpoint { method = GET, path = "/versions" }]
+    async fn versions(
+        ctx: RequestContext<Self::Context>,
+        query: QueryParams<RoutingParam>,
+    ) -> Result<HttpResponseOk<Vec<SledVersion>>, HttpError>;
 
     /// Get the version and git commit of the server's build.
     ///

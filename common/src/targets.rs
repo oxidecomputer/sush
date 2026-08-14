@@ -22,11 +22,21 @@ use serde::{Deserialize, Deserializer, Serialize, Serializer};
 use sled_hardware_types::BaseboardId;
 use thiserror::Error;
 
+use crate::version::VersionInfo;
+
 /// Baseboards by cubby number, as much of it as is known.
 pub type Cubbies = BTreeMap<u8, BaseboardId>;
 
 /// The highest cubby number in a rack.
 pub const MAX_CUBBY: u8 = 31;
+
+/// One sled's location and build.
+#[derive(Clone, Debug, Deserialize, Eq, JsonSchema, PartialEq, Serialize)]
+pub struct SledVersion {
+    pub cubby: Option<u8>,
+    pub baseboard: BaseboardId,
+    pub version: Option<VersionInfo>,
+}
 
 /// The sleds a request names.
 #[derive(Clone, Debug, Default, Eq, PartialEq)]

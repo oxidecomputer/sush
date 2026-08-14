@@ -995,6 +995,46 @@
           }
         }
       }
+    },
+    "/versions": {
+      "get": {
+        "summary": "Get the cubby, baseboard, and build of every known sled.",
+        "description": "Unauthenticated, like `/target`.",
+        "operationId": "versions",
+        "parameters": [
+          {
+            "in": "query",
+            "name": "via",
+            "description": "Where a proxy should route this request.",
+            "schema": {
+              "nullable": true,
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "successful operation",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "title": "Array_of_SledVersion",
+                  "type": "array",
+                  "items": {
+                    "$ref": "#/components/schemas/SledVersion"
+                  }
+                }
+              }
+            }
+          },
+          "4XX": {
+            "$ref": "#/components/responses/Error"
+          },
+          "5XX": {
+            "$ref": "#/components/responses/Error"
+          }
+        }
+      }
     }
   },
   "components": {
@@ -1559,12 +1599,38 @@
           "signature"
         ]
       },
+      "SledVersion": {
+        "description": "One sled's location and build.",
+        "type": "object",
+        "properties": {
+          "baseboard": {
+            "$ref": "#/components/schemas/BaseboardId"
+          },
+          "cubby": {
+            "nullable": true,
+            "type": "integer",
+            "format": "uint8",
+            "minimum": 0
+          },
+          "version": {
+            "nullable": true,
+            "allOf": [
+              {
+                "$ref": "#/components/schemas/VersionInfo"
+              }
+            ]
+          }
+        },
+        "required": [
+          "baseboard"
+        ]
+      },
       "VersionInfo": {
         "description": "One build's version and commit.",
         "type": "object",
         "properties": {
           "commit": {
-            "description": "The git commit, with a \"-dirty\" suffix for an unclean tree.",
+            "description": "The git commit, \"-dirty\" suffixed for an unclean tree.",
             "type": "string"
           },
           "version": {
