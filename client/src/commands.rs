@@ -51,6 +51,7 @@ use sush_common::jobs::{
 };
 use sush_common::keys::{KeyError, KeyId, Signer as _};
 use sush_common::targets::{SledId, Target};
+use sush_common::version::VersionInfo;
 
 use crate::ByteStream;
 use crate::context::{Authz, CommandContext, OutputFormat, StatusDisplayStyle};
@@ -179,7 +180,7 @@ pub struct GlobalArgs {
 #[derive(Debug, Parser)]
 #[clap(name = "Oxide Support Shell")]
 #[clap(author = "Oxide Computer Company")]
-#[clap(about, version)]
+#[clap(about, version = sush_common::version::LONG_VERSION)]
 pub struct ClientArgs {
     #[clap(flatten)]
     globals: GlobalArgs,
@@ -383,6 +384,9 @@ pub enum ClientCommand {
     /// Start an interactive REPL.
     #[clap(alias = "repl")]
     Shell,
+
+    /// Report client and server build versions.
+    Version,
 
     /// Leave the interactive REPL.
     #[clap(alias = "exit")]
@@ -661,6 +665,15 @@ impl ClientCommand {
 
             (ClientCommand::Shell, client) => {
                 Repl::default().run(args.clone(), client).await?;
+                Ok(())
+            }
+
+            (ClientCommand::Version, client) => {
+                let server = match client {
+                    Some(client) => Some(client.version().send().await?.into_inner()),
+                    None => None,
+                };
+                ctx.versions(&VersionInfo::current(), server.as_ref());
                 Ok(())
             }
 

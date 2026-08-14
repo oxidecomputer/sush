@@ -959,6 +959,42 @@
           }
         }
       }
+    },
+    "/version": {
+      "get": {
+        "summary": "Get the version and git commit of the server's build.",
+        "description": "Unauthenticated, like `/target`.",
+        "operationId": "version",
+        "parameters": [
+          {
+            "in": "query",
+            "name": "via",
+            "description": "Where a proxy should route this request.",
+            "schema": {
+              "nullable": true,
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "successful operation",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/VersionInfo"
+                }
+              }
+            }
+          },
+          "4XX": {
+            "$ref": "#/components/responses/Error"
+          },
+          "5XX": {
+            "$ref": "#/components/responses/Error"
+          }
+        }
+      }
     }
   },
   "components": {
@@ -1521,6 +1557,24 @@
           "key_id",
           "payload",
           "signature"
+        ]
+      },
+      "VersionInfo": {
+        "description": "One build's version and commit.",
+        "type": "object",
+        "properties": {
+          "commit": {
+            "description": "The git commit, with a \"-dirty\" suffix for an unclean tree.",
+            "type": "string"
+          },
+          "version": {
+            "description": "The package version.",
+            "type": "string"
+          }
+        },
+        "required": [
+          "commit",
+          "version"
         ]
       },
       "JobWait": {

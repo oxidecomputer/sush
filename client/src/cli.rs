@@ -27,6 +27,7 @@ use sush_common::jobs::{
     SignedJob, job_status_to_json_map,
 };
 use sush_common::keys::{KeyId, Signature, SshPublicKey};
+use sush_common::version::VersionInfo;
 
 use crate::AuthzSigner;
 use crate::commands::{CommandError, GlobalArgs};
@@ -114,6 +115,20 @@ impl CommandContext for Cli {
 
     fn set_globals(&mut self, args: GlobalArgs) {
         *self.globals.lock().unwrap() = args;
+    }
+
+    // Build provenance
+
+    fn versions(&mut self, client: &VersionInfo, server: Option<&VersionInfo>) {
+        match self.get_output_format() {
+            OutputFormat::Json => println!("{}", json!({"client": client, "server": server})),
+            OutputFormat::Text => {
+                println!("Client:\t{client}");
+                if let Some(server) = server {
+                    println!("Server:\t{server}");
+                }
+            }
+        }
     }
 
     // Session management

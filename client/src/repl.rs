@@ -23,6 +23,7 @@ use sush_common::jobs::{
     Access, JobId, JobOutputStream, JobStatusMap, Session, SessionId, SignedJob,
 };
 use sush_common::keys::{KeyId, SshPublicKey};
+use sush_common::version::VersionInfo;
 
 use crate::cli::Cli;
 use crate::commands::{
@@ -197,6 +198,12 @@ impl CommandContext for Repl {
         set_or_unset!(ssh_key_id, SUSH_KEY_ID, "SSH key ID");
 
         self.cli.set_globals(args);
+    }
+
+    // Build provenance
+
+    fn versions(&mut self, client: &VersionInfo, server: Option<&VersionInfo>) {
+        self.cli.versions(client, server)
     }
 
     // Session management
