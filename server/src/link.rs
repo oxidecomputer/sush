@@ -39,7 +39,7 @@ use rumors::link::routed::{Config, Dial, Endpoint, Incoming, Listen, RoutedLink}
 use slog::{Logger, o, warn};
 use sprockets_tls::keys::SprocketsConfig;
 use sprockets_tls::{Client, Server};
-use tokio::io::{AsyncRead, AsyncWrite, AsyncWriteExt as _, ReadBuf};
+use tokio::io::{AsyncRead, AsyncReadExt as _, AsyncWrite, AsyncWriteExt as _, ReadBuf};
 use tokio::net::TcpStream;
 use tokio::runtime::Handle;
 use tokio::sync::mpsc;
@@ -65,9 +65,11 @@ const PENDING_HEADERS: usize = STREAM_COUNT * 32;
 const ACCEPT_RETRY: Duration = Duration::from_millis(100);
 
 /// Connections per peer. The link contract's worst case is one control
-/// stream plus a full complement for each of a pair's two links. Slots
-/// are created on demand, so the cap is free when idle.
-const MAX_SLOTS: usize = 2 * STREAM_COUNT + 1;
+/// stream plus a full complement for each of a pair's two links, and
+/// claims parked on the ready byte can briefly overlap the next
+/// session's opens. Slots are created on demand, so the cap is free
+/// when idle.
+const MAX_SLOTS: usize = 3 * STREAM_COUNT + 1;
 
 /// Idle connections kept warm per peer. Taking one stream leaves a
 /// spare, so qorb fires no refill and reuses the recycled connection
@@ -347,11 +349,17 @@ impl Dial for SprocketsDial {
     }
 
     fn recycle(&self, _peer: &SocketAddr, mut conn: SprocketsConn) {
-        // The stream completed cleanly, so the connection may be
-        // reused: clear the bit and let the drop return the claim.
-        if let Conn::Pooled(handle) = &mut conn.0 {
-            handle.dirty = false;
-        }
+        // Reusable only once the peer's router says it is ready: read
+        // that byte off the session's task, then let the drop return
+        // the claim clean.
+        spawn(async move {
+            let mut ready = [0u8; 1];
+            if conn.read_exact(&mut ready).await.is_ok()
+                && let Conn::Pooled(handle) = &mut conn.0
+            {
+                handle.dirty = false;
+            }
+        });
     }
 }
 
