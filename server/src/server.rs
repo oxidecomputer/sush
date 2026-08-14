@@ -31,6 +31,7 @@ use sush_api::{
 use sush_common::authn::Identity;
 use sush_common::jobs::{JsonJobStatusMap, Session, SignedJob, job_status_to_json_map};
 use sush_common::keys::{KeyId, SshPublicKey, pem_cert_chain};
+use sush_common::version::VersionInfo;
 
 use crate::error::JobError;
 use crate::manager::JobManager;
@@ -413,5 +414,12 @@ impl SushApi for ApiServer {
         _query: QueryParams<RoutingParam>,
     ) -> Result<HttpResponseOk<BaseboardId>, HttpError> {
         Ok(HttpResponseOk(ctx.context().own_baseboard().to_owned()))
+    }
+
+    async fn version(
+        _ctx: RequestContext<Self::Context>,
+        _query: QueryParams<RoutingParam>,
+    ) -> Result<HttpResponseOk<VersionInfo>, HttpError> {
+        Ok(HttpResponseOk(VersionInfo::current()))
     }
 }

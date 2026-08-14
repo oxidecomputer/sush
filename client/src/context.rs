@@ -18,6 +18,7 @@ use sush_common::jobs::{
     Access, JobId, JobOutputStream, JobStatusMap, Session, SessionId, SignedJob,
 };
 use sush_common::keys::{KeyId, SshPublicKey};
+use sush_common::version::VersionInfo;
 
 use crate::AuthzSigner;
 use crate::commands::{CommandError, GlobalArgs};
@@ -94,6 +95,9 @@ pub trait CommandContext: Clone + Send + Sync {
     fn get_globals(&self) -> GlobalArgs;
     fn set_globals(&mut self, _args: GlobalArgs) {}
     fn pre_parse_hook(&mut self, _command: &str) {}
+
+    // Build provenance
+    fn versions(&mut self, client: &VersionInfo, server: Option<&VersionInfo>);
 
     // Session management
     fn authz_signer(&self) -> AuthzSigner;

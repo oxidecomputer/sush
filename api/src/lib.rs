@@ -26,6 +26,7 @@ use sush_common::jobs::{
     SignedJob,
 };
 use sush_common::keys::{KeyId, SshPublicKey};
+use sush_common::version::VersionInfo;
 
 /// Oxide Support Shell API
 #[api_description]
@@ -232,6 +233,15 @@ pub trait SushApi {
         ctx: RequestContext<Self::Context>,
         query: QueryParams<RoutingParam>,
     ) -> Result<HttpResponseOk<BaseboardId>, HttpError>;
+
+    /// Get the version and git commit of the server's build.
+    ///
+    /// Unauthenticated, like `/target`.
+    #[endpoint { method = GET, path = "/version" }]
+    async fn version(
+        ctx: RequestContext<Self::Context>,
+        query: QueryParams<RoutingParam>,
+    ) -> Result<HttpResponseOk<VersionInfo>, HttpError>;
 }
 
 /// A routing hint for a fronting proxy. Sleds ignore it.
