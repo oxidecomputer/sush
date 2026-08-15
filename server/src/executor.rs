@@ -22,6 +22,7 @@ use rustix::io::close;
 use rustix::process::{Pid, Signal, ioctl_tiocsctty, kill_process_group, setsid};
 use slog::{Logger, debug, error, o, warn};
 use tokio::fs::{DirBuilder, OpenOptions};
+use tokio::io::AsyncWriteExt as _;
 use tokio::process::{Child, Command};
 use tokio::spawn;
 use tokio::sync::{mpsc, watch};
@@ -256,6 +257,27 @@ async fn job_spawn(
             .open(&stderr_path)
             .await,
         format!("creating job stderr file `{}`", stderr_path.display())
+    );
+
+    // Record the signed request beside the output it produces, so
+    // the job directory attests what ran even after gossip forgets.
+    let job_path = job_dir.join("job.json");
+    let json = with_io_err!(
+        serde_json::to_vec_pretty(&*request).map_err(io::Error::other),
+        format!("encoding job request file `{}`", job_path.display())
+    );
+    let mut job_file = with_io_err!(
+        OpenOptions::new()
+            .create_new(true)
+            .write(true)
+            .mode(file_mode)
+            .open(&job_path)
+            .await,
+        format!("creating job request file `{}`", job_path.display())
+    );
+    with_io_err!(
+        job_file.write_all(&json).await,
+        format!("writing job request file `{}`", job_path.display())
     );
 
     // Set up the job command.
