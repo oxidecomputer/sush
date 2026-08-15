@@ -18,6 +18,7 @@ use sush_common::jobs::{
     Access, JobId, JobOutputStream, JobStatusMap, Session, SessionId, SignedJob,
 };
 use sush_common::keys::{KeyId, SshPublicKey};
+use sush_common::targets::SledVersion;
 use sush_common::version::VersionInfo;
 
 use crate::AuthzSigner;
@@ -97,7 +98,12 @@ pub trait CommandContext: Clone + Send + Sync {
     fn pre_parse_hook(&mut self, _command: &str) {}
 
     // Build provenance
-    fn versions(&mut self, client: &VersionInfo, server: Option<&VersionInfo>);
+    fn versions(
+        &mut self,
+        client: &VersionInfo,
+        server: Option<&VersionInfo>,
+        sleds: &[SledVersion],
+    );
 
     // Session management
     fn authz_signer(&self) -> AuthzSigner;

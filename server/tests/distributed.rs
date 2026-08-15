@@ -20,6 +20,7 @@ use sush_api::{JobStartParams, JobWait};
 use sush_common::jobs::{JobStatus, Session, SessionId};
 use sush_common::keys::pem_cert_chain;
 use sush_common::targets::Cubbies;
+use sush_common::version::VersionInfo;
 use sush_server::executor::PathIsolation;
 use sush_server::gossip::spawn_gossip;
 use sush_server::output::JobOutputDir;
@@ -111,6 +112,20 @@ async fn jobs_gossip_between_sleds() {
     // The sleds converge on one universe, resetting the losing job manager.
     eventually("universe convergence", 120, async || {
         a.universe.borrow().network() == b.universe.borrow().network()
+    })
+    .await;
+
+    // Each sled learns the other's build.
+    eventually("versions gossip", 60, async || {
+        [&a, &b].iter().all(|sled| {
+            let versions = sled.mgr.versions();
+            [&a.baseboard, &b.baseboard].iter().all(|baseboard| {
+                versions.iter().any(|row| {
+                    row.baseboard == **baseboard
+                        && row.version.as_ref() == Some(&VersionInfo::current())
+                })
+            })
+        })
     })
     .await;
 

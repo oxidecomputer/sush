@@ -4,7 +4,8 @@
 
 //! Proxy server for the Oxide Support Shell API.
 //!
-//! Terminates client connections and routes each request to a sled.
+//! Terminates client connections and routes each request to a sled,
+//! answering only `/version` itself.
 //! A request that names a target goes to the first sled the target
 //! resolves to. Anything else goes to a sticky default, because
 //! identities are cached on the sled that authenticated them.
@@ -17,7 +18,8 @@ use std::io;
 use std::net::SocketAddr;
 use std::sync::{Arc, Mutex};
 
-use http::StatusCode;
+use http::header::CONTENT_TYPE;
+use http::{Method, StatusCode};
 use http_body_util::{Either, Full};
 use hyper::body::{Bytes, Incoming};
 use hyper::client::conn::http1 as client_conn;
@@ -40,6 +42,7 @@ use tokio_rustls::TlsAcceptor;
 use tokio_util::sync::CancellationToken;
 
 use sush_common::targets::{Cubbies, SledId, Target};
+use sush_common::version::VersionInfo;
 
 /// The sush servers the proxy may route to.
 #[derive(Clone, Debug, Default)]
@@ -196,6 +199,31 @@ fn named_target<B>(request: &Request<B>) -> Option<Result<Target, String>> {
     }
 }
 
+/// The proxy answers `/version` for itself, so proxy and sled builds
+/// stay distinguishable when a rack updates gradually. A `via` still
+/// routes the request to a sled.
+fn own_version<B>(log: &Logger, request: &Request<B>) -> Option<Response<ProxyBody>> {
+    if request.method() != Method::GET
+        || request.uri().path() != "/version"
+        || named_target(request).is_some()
+    {
+        return None;
+    }
+    let response = serde_json::to_vec(&VersionInfo::current())
+        .ok()
+        .and_then(|body| {
+            Response::builder()
+                .status(StatusCode::OK)
+                .header(CONTENT_TYPE, "application/json")
+                .body(Either::Right(Full::new(body.into())))
+                .ok()
+        });
+    if response.is_none() {
+        warn!(log, "unable to answer /version; forwarding to a sled");
+    }
+    response
+}
+
 async fn listen(
     log: Logger,
     listener: TcpListener,
@@ -246,9 +274,12 @@ where
         let log = log.clone();
         let router = router.clone();
         async move {
-            Ok::<_, Infallible>(match router.route(&request) {
-                Ok(addr) => forward(log, addr, request).await,
-                Err(response) => *response,
+            Ok::<_, Infallible>(match own_version(&log, &request) {
+                Some(response) => response,
+                None => match router.route(&request) {
+                    Ok(addr) => forward(log, addr, request).await,
+                    Err(response) => *response,
+                },
             })
         }
     });
@@ -334,6 +365,24 @@ mod test {
 
     fn target(s: &str) -> Target {
         s.parse().unwrap()
+    }
+
+    /// The proxy answers `GET /version` itself unless `via` routes it.
+    /// A `*` target means the handling server, which is the proxy.
+    #[test]
+    fn version_interception() {
+        let log = Logger::root(slog::Discard, o!());
+        assert!(own_version(&log, &request("/version")).is_some());
+        assert!(own_version(&log, &request("/version?via=*")).is_some());
+        assert!(own_version(&log, &request("/version?via=14")).is_none());
+        assert!(own_version(&log, &request("/version?via=")).is_none());
+        assert!(own_version(&log, &request("/versions")).is_none());
+        let post = Request::builder()
+            .method(Method::POST)
+            .uri("/version")
+            .body(())
+            .unwrap();
+        assert!(own_version(&log, &post).is_none());
     }
 
     #[test]

@@ -29,6 +29,7 @@ use sush_common::authn::{Identity, Nonce, RequestVerifier, SignedLogin};
 use sush_common::jobs::{Access, JobId, JobStatus, JobStatusMap, Session, SessionId, SignedJob};
 use sush_common::keys::{KeyError, KeyId, Signature, SshPublicKey};
 use sush_common::targets::Cubbies;
+use sush_common::version::{VersionInfo, VersionMap};
 
 use crate::executor::{Executor, PathIsolation};
 use crate::history::JobHistory;
@@ -314,6 +315,8 @@ pub struct State {
     roots: Box<[KeyId]>,
     /// Baseboards by cubby number, as much of it as is known.
     cubbies: Cubbies,
+    /// Build provenance by sled.
+    versions: VersionMap,
     /// Verified logins, rack-wide.
     identities: LruCache<(KeyId, Nonce), RegisteredIdentity>,
     /// SSH keys refused at login.
@@ -336,6 +339,7 @@ impl State {
             .collect::<Result<BTreeMap<KeyId, CertState>, KeyError>>()?;
         let roots: Box<[KeyId]> = certs.keys().cloned().collect();
         let mut new = Self {
+            versions: [(own_baseboard.clone(), VersionInfo::current())].into(),
             own_baseboard,
             running: Default::default(),
             history: Default::default(),
@@ -369,6 +373,14 @@ impl State {
 
     pub fn attach_access(&self, key_id: &KeyId) -> Option<Access> {
         self.session.attach_access(key_id)
+    }
+
+    pub fn cubbies(&self) -> &Cubbies {
+        &self.cubbies
+    }
+
+    pub fn versions(&self) -> &VersionMap {
+        &self.versions
     }
 
     pub fn history(&self) -> &JobHistory {
@@ -813,6 +825,14 @@ impl State {
                 Event::Error(error) => {
                     error!(log, "session error"; "error" => %error);
                 }
+                Event::Version(info) => {
+                    // Our own seed is authoritative, and may be newer
+                    // than a replayed announce from a previous boot.
+                    if *baseboard_id != self.own_baseboard {
+                        info!(log, "sled version"; "sled" => %baseboard_id, "version" => %info);
+                        self.versions.insert(baseboard_id.clone(), info.clone());
+                    }
+                }
             },
         }
 
@@ -894,6 +914,17 @@ impl StateManager {
             rx_state,
             spawn(async move {
                 info!(log, "managing state");
+
+                // Announce our build.
+                if let Some((rumors, _)) = &gossip {
+                    rumors.send(
+                        Message::Event(
+                            own_baseboard.clone(),
+                            Event::Version(VersionInfo::current()),
+                        )
+                        .into(),
+                    );
+                }
 
                 // These flip both to `true` once our two input streams (local
                 // requests and local events from the executor) terminate or
@@ -1007,6 +1038,13 @@ impl StateManager {
                             state.cubbies = cubbies.borrow().clone();
                         });
                         *rumors = fresh;
+                        rumors.send(
+                            Message::Event(
+                                own_baseboard.clone(),
+                                Event::Version(VersionInfo::current()),
+                            )
+                            .into(),
+                        );
                     }
                 }
             }),

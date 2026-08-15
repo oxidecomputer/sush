@@ -5,6 +5,7 @@
 //! Manage authentication, job signature verification, and the session
 //! state machine. Does not manage jobs directly.
 
+use std::collections::BTreeSet;
 use std::num::NonZeroUsize;
 use std::path::Path;
 use std::sync::Arc;
@@ -32,7 +33,8 @@ use sush_common::authn::{
 use sush_common::jobs::JobOutputStream;
 use sush_common::jobs::{Access, JobId, JobStatusMap, Session, SessionId, SignedJob};
 use sush_common::keys::{KeyError, KeyId, SshPublicKey};
-use sush_common::targets::Cubbies;
+use sush_common::targets::{Cubbies, SledVersion};
+use sush_common::version::LONG_VERSION;
 
 use crate::error::JobError;
 use crate::executor::PathIsolation;
@@ -127,6 +129,7 @@ impl JobManager {
         roots: &[Certificate],
         shutdown: CancellationToken,
     ) -> Result<Self, JobError> {
+        info!(log, "starting sush"; "version" => LONG_VERSION);
         let (tx_req, rx_req) = mpsc::channel(16);
         let requests = ReceiverStream::new(rx_req);
         let (rx_state, join_state) = StateManager::run(
@@ -154,6 +157,26 @@ impl JobManager {
 
     pub fn own_baseboard(&self) -> &BaseboardId {
         &self.own_baseboard
+    }
+
+    /// Every sled known by cubby or by build, sorted by cubby first.
+    pub fn versions(&self) -> Vec<SledVersion> {
+        let state = self.state.borrow();
+        let mut sleds: BTreeSet<&BaseboardId> = state.versions().keys().collect();
+        sleds.extend(state.cubbies().values());
+        let mut rows: Vec<SledVersion> = sleds
+            .into_iter()
+            .map(|baseboard| SledVersion {
+                cubby: state
+                    .cubbies()
+                    .iter()
+                    .find_map(|(cubby, b)| (b == baseboard).then_some(*cubby)),
+                baseboard: baseboard.clone(),
+                version: state.versions().get(baseboard).cloned(),
+            })
+            .collect();
+        rows.sort_by_key(|row| (row.cubby.is_none(), row.cubby));
+        rows
     }
 
     async fn cert_request(&self, authn: &Identity, request: CertRequest) -> Result<(), JobError> {
