@@ -1229,10 +1229,11 @@ async fn job_start(
         max_fsize,
     } = limits.as_limits();
     let mut start_ctx = ctx.clone();
-    let start = with_login(&mut start_ctx, client, async || {
+    let start = with_login_via(&mut start_ctx, client, Some(&target), async || {
         let mut start = client
             .job_start()
             .job_id(job.job_id())
+            .target(target.to_string())
             .max_cpu(max_cpu)
             .max_mem(max_mem)
             .max_fsize(max_fsize)

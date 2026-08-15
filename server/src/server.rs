@@ -24,8 +24,8 @@ use x509_cert::Certificate;
 use x509_cert::der::DecodePem as _;
 
 use sush_api::{
-    AccessParam, Authorization, AuthorizedRangeRequest, JobAttachParams, JobHistoryParams,
-    JobIdParam, JobOutputParams, JobStartParams, JobStopParams, KeyIdParam, RoutingParam,
+    AccessParam, Authorization, AuthorizedRangeRequest, JobHistoryParams, JobIdParam,
+    JobOutputParams, JobStartParams, JobStopParams, JobTargetParams, KeyIdParam, RoutingParam,
     SessionAndJobIds, SessionAndKeyIds, SessionIdParam, SushApi, WaitParam,
 };
 use sush_common::authn::Identity;
@@ -257,7 +257,7 @@ impl SushApi for ApiServer {
     async fn job_start(
         ctx: RequestContext<Self::Context>,
         headers: Header<Authorization>,
-        params: PathParams<JobIdParam>,
+        params: PathParams<JobTargetParams>,
         query: QueryParams<JobStartParams>,
         body: TypedBody<SignedJob>,
     ) -> Result<HttpResponseUpdatedNoContent, HttpError> {
@@ -266,13 +266,13 @@ impl SushApi for ApiServer {
         let authn = mgr
             .iam(authorization, None, request_line(&ctx.request))
             .await?;
-        let JobIdParam { job_id } = params.into_inner();
+        let JobTargetParams { job_id, target: _ } = params.into_inner();
         let job = body.into_inner();
         if *job.job_id() != job_id {
             return Err(HttpError::for_client_error(
                 None,
                 ClientErrorStatusCode::BAD_REQUEST,
-                String::from("Query parameter job ID does not match body"),
+                String::from("Path parameter job ID does not match body"),
             ));
         }
         mgr.job_start(&authn, job, query.into_inner()).await?;
@@ -355,7 +355,7 @@ impl SushApi for ApiServer {
     async fn job_attach(
         ctx: RequestContext<Self::Context>,
         headers: Header<Authorization>,
-        params: PathParams<JobAttachParams>,
+        params: PathParams<JobTargetParams>,
         _query: QueryParams<RoutingParam>,
         upgrade: WebsocketUpgrade,
     ) -> WebsocketEndpointResult {
@@ -364,7 +364,7 @@ impl SushApi for ApiServer {
         let authn = mgr
             .iam(authorization, None, request_line(&ctx.request))
             .await?;
-        let JobAttachParams { job_id, target } = params.into_inner();
+        let JobTargetParams { job_id, target } = params.into_inner();
         let target = if target == "*" {
             mgr.own_baseboard().clone()
         } else {

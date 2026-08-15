@@ -360,7 +360,7 @@
           {
             "in": "path",
             "name": "job_id",
-            "description": "Which job to attach to.",
+            "description": "Which job to act on.",
             "required": true,
             "schema": {
               "$ref": "#/components/schemas/JobId"
@@ -369,7 +369,7 @@
           {
             "in": "path",
             "name": "target",
-            "description": "To be used by Nexus for routing.",
+            "description": "Used by proxies for routing.",
             "required": true,
             "schema": {
               "type": "string"
@@ -466,7 +466,7 @@
         }
       }
     },
-    "/jobs/{job_id}/start": {
+    "/jobs/{job_id}/start/{target}": {
       "post": {
         "summary": "Start an authorized job.",
         "operationId": "job_start",
@@ -482,9 +482,19 @@
           {
             "in": "path",
             "name": "job_id",
+            "description": "Which job to act on.",
             "required": true,
             "schema": {
               "$ref": "#/components/schemas/JobId"
+            }
+          },
+          {
+            "in": "path",
+            "name": "target",
+            "description": "Used by proxies for routing.",
+            "required": true,
+            "schema": {
+              "type": "string"
             }
           },
           {
