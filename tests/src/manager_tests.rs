@@ -4,8 +4,10 @@
 
 //! Job manager tests.
 
+use std::mem::MaybeUninit;
 use std::os::unix::fs::PermissionsExt as _;
 use std::path::Path;
+use std::ptr::null_mut;
 use std::slice::from_ref;
 use std::time::Duration;
 
@@ -2056,4 +2058,55 @@ async fn iam() {
             .await
             .is_err()
     );
+}
+
+/// Jobs must not inherit ignored signal dispositions. The embedding
+/// process may ignore SIGINT, and a shell cannot trap a signal that
+/// was ignored at entry, which turns ^C into a no-op in every job.
+#[named]
+#[tokio::test]
+async fn job_signal_dispositions() {
+    // Ignore and block SIGINT, as an embedding daemon might.
+    unsafe {
+        libc::signal(libc::SIGINT, libc::SIG_IGN);
+        let mut set = MaybeUninit::<libc::sigset_t>::uninit();
+        libc::sigemptyset(set.as_mut_ptr());
+        libc::sigaddset(set.as_mut_ptr(), libc::SIGINT);
+        libc::pthread_sigmask(libc::SIG_BLOCK, set.as_ptr(), null_mut());
+    }
+    let log = test_logger(function_name!());
+    let (mgr, mut root, _dir, _shutdown) = manager_and_test_root(log).await;
+    let baseboard_id = mgr.own_baseboard();
+    let authn = fake_identity(&mut root).await;
+    let session_id = SessionId::random();
+    let mut session = Session::new(session_id);
+    mgr.session_start(&authn, session_id, true).await.unwrap();
+
+    let job_id = session.next_job_id();
+    let job = root
+        .sign_job_request(
+            &job_id,
+            "trap 'echo caught' INT; kill -INT $$; echo after",
+            false,
+        )
+        .await;
+    mgr.job_start(
+        &authn,
+        job.clone().into_signed(),
+        JobStartParams {
+            wait: JobWait::Stop,
+            ..Default::default()
+        },
+    )
+    .await
+    .unwrap();
+    session.job_started(job.clone().into_signed());
+    let stdout = mgr
+        .job_output(&authn, &job_id, baseboard_id, Stdout, None)
+        .await
+        .unwrap()
+        .into_bytes()
+        .await;
+    let stdout = String::from_utf8(stdout.to_vec()).unwrap();
+    assert!(stdout.contains("caught"), "stdout: {stdout:?}");
 }
