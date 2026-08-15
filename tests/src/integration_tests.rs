@@ -326,7 +326,7 @@ async fn client_tls_proxy_server() {
     let pem = read(cert_path(pki.clone(), &root_prefix())).unwrap();
     let roots = vec![Certificate::from_pem(&pem).unwrap()];
     let signer = AuthzSigner::default();
-    let client = Client::new_with_client(&url, tls_client(roots).unwrap(), signer.clone());
+    let client = Client::new_with_client(&url, tls_client(roots, None).unwrap(), signer.clone());
     let ClientError::ErrorResponse(unauthz) = client.iam().body(None).send().await.unwrap_err()
     else {
         panic!("expected error response")
@@ -347,8 +347,11 @@ async fn client_tls_proxy_server() {
     let (_other_dir, other) = test_pki("sush-tls-other-");
     let pem = read(cert_path(other.clone(), &root_prefix())).unwrap();
     let strangers = vec![Certificate::from_pem(&pem).unwrap()];
-    let stranger =
-        Client::new_with_client(&url, tls_client(strangers).unwrap(), AuthzSigner::default());
+    let stranger = Client::new_with_client(
+        &url,
+        tls_client(strangers, None).unwrap(),
+        AuthzSigner::default(),
+    );
     assert!(stranger.iam().body(None).send().await.is_err());
 
     // A second proxy serves an ephemeral leaf the platform identity
@@ -401,7 +404,7 @@ async fn client_tls_proxy_server() {
     let roots = vec![Certificate::from_pem(&pem).unwrap()];
     let client2 = Client::new_with_client(
         &format!("https://{}", proxy2.local_addr()),
-        tls_client(roots.clone()).unwrap(),
+        tls_client(roots.clone(), None).unwrap(),
         signer.clone(),
     );
     let iam = client2
@@ -454,7 +457,7 @@ async fn client_tls_proxy_server() {
     .expect("can't start forged proxy server");
     let client3 = Client::new_with_client(
         &format!("https://{}", proxy3.local_addr()),
-        tls_client(roots).unwrap(),
+        tls_client(roots, None).unwrap(),
         signer.clone(),
     );
     assert!(client3.iam().body(None).send().await.is_err());

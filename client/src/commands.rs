@@ -650,11 +650,14 @@ impl ClientCommand {
                     }
                     roots
                 };
-                Some(Client::new_with_client(
-                    url,
-                    tls::client(roots)?,
-                    ctx.authz_signer(),
-                ))
+                {
+                    let (url, resolve) = tls::descope_url(url)?;
+                    Some(Client::new_with_client(
+                        &url,
+                        tls::client(roots, resolve)?,
+                        ctx.authz_signer(),
+                    ))
+                }
             }
             None => None,
         };

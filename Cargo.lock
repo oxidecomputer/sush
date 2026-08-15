@@ -4884,6 +4884,7 @@ dependencies = [
  "http-range-header",
  "humantime",
  "indicatif",
+ "libc",
  "memmap2",
  "p256",
  "pem-rfc7468",
