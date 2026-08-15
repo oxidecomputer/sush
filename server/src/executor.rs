@@ -301,6 +301,10 @@ async fn job_spawn(
     }
 
     // Reset signal dispositions and the signal mask.
+    // macOS has no realtime signals.
+    #[cfg(target_os = "macos")]
+    let max_signal = 31;
+    #[cfg(not(target_os = "macos"))]
     let max_signal = libc::SIGRTMAX();
     unsafe {
         cmd.pre_exec(move || {
