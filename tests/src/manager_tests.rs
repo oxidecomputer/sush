@@ -18,7 +18,7 @@ use pwd::Passwd;
 use sled_hardware_types::BaseboardId;
 use slog::{Discard, Logger, o};
 use tempfile::TempDir;
-use tokio::fs::{metadata, write};
+use tokio::fs::{metadata, read, write};
 use tokio::sync::watch;
 use tokio::time::{sleep, timeout};
 use tokio_util::sync::CancellationToken;
@@ -29,7 +29,7 @@ use sush_client::context::Authz;
 use sush_common::authn::{Challenge, ChallengeResponse, Credentials, Identity, Nonce, RequestKey};
 use sush_common::jobs::{
     Access, JobId, JobLimits, JobOutputState, JobOutputStream::*, JobStartRequest, JobStatus,
-    ProcessError, Session, SessionId,
+    ProcessError, Session, SessionId, SignedJob,
 };
 use sush_common::keys::{EphemeralKey, KeyError, KeyId, KeyType, Signer as _, pem_cert_chain};
 use sush_common::targets::{Cubbies, Target};
@@ -2129,4 +2129,38 @@ async fn interactive_target_required() {
             .await,
         Err(JobError::InteractiveTarget)
     ));
+}
+
+/// Each job's directory records the signed request beside its output.
+#[named]
+#[tokio::test]
+async fn job_json() {
+    let log = test_logger(function_name!());
+    let (mgr, mut root, dir, _shutdown) = manager_and_test_root(log).await;
+    let authn = fake_identity(&mut root).await;
+    let session_id = SessionId::random();
+    let mut session = Session::new(session_id);
+    mgr.session_start(&authn, session_id, true).await.unwrap();
+
+    let job_id = session.next_job_id();
+    let job = root.sign_job_request(&job_id, "true", false).await;
+    mgr.job_start(
+        &authn,
+        job.clone().into_signed(),
+        JobStartParams {
+            wait: JobWait::Stop,
+            ..Default::default()
+        },
+    )
+    .await
+    .unwrap();
+    session.job_started(job.clone().into_signed());
+
+    let path = dir
+        .path()
+        .join("jobs")
+        .join(job_id.to_string())
+        .join("job.json");
+    let recorded: SignedJob = serde_json::from_slice(&read(&path).await.unwrap()).unwrap();
+    assert_eq!(recorded, job.into_signed());
 }
