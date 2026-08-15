@@ -30,6 +30,7 @@ http.workspace = true
 http-range-header.workspace = true
 humantime.workspace = true
 indicatif.workspace = true
+libc.workspace = true
 memmap2.workspace = true
 p256.workspace = true
 pem-rfc7468.workspace = true

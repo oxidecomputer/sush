@@ -29,6 +29,7 @@ use rustix::termios::tcgetwinsize;
 use sled_hardware_types::BaseboardId;
 use thiserror::Error;
 use tokio::signal::ctrl_c;
+use tokio::signal::unix::{SignalKind, signal};
 use tokio::time::{MissedTickBehavior, interval, sleep};
 use tokio::{pin, select};
 use tokio_tungstenite::WebSocketStream;
@@ -605,8 +606,33 @@ impl JobStartArgs {
 }
 
 impl ClientCommand {
+    /// Interactive jobs forward SIGINT to the job, watches use it to
+    /// stop the job or end the watch, and the REPL turns it into a
+    /// fresh prompt.
+    fn handles_sigint(&self) -> bool {
+        matches!(
+            self,
+            Self::Shell
+                | Self::Job {
+                    command: JobCommand::Start { .. } | JobCommand::Attach { .. },
+                }
+        )
+    }
+
+    /// Run the command, letting an interrupt cancel it unless the
+    /// command handles SIGINT itself.
     #[async_recursion(?Send)]
     pub async fn execute(self, ctx: &mut impl CommandContext) -> Result<(), CommandError> {
+        if self.handles_sigint() {
+            return self.run(ctx).await;
+        }
+        select! {
+            result = self.run(ctx) => result,
+            _ = ctrl_c() => Err(CommandError::Canceled),
+        }
+    }
+
+    async fn run(self, ctx: &mut impl CommandContext) -> Result<(), CommandError> {
         let args = ctx.get_globals().to_owned();
         if let Some(output) = args.output {
             ctx.set_output_format(output);
@@ -624,11 +650,14 @@ impl ClientCommand {
                     }
                     roots
                 };
-                Some(Client::new_with_client(
-                    url,
-                    tls::client(roots)?,
-                    ctx.authz_signer(),
-                ))
+                {
+                    let (url, resolve) = tls::descope_url(url)?;
+                    Some(Client::new_with_client(
+                        &url,
+                        tls::client(roots, resolve)?,
+                        ctx.authz_signer(),
+                    ))
+                }
             }
             None => None,
         };
@@ -1070,6 +1099,7 @@ async fn job(
             ));
             pin!(sign);
             ctx.job_signing_started(&job_id);
+            let mut sigint = signal(SignalKind::interrupt())?;
             let job = loop {
                 select! {
                     job = &mut sign => {
@@ -1077,7 +1107,7 @@ async fn job(
                         break job?;
                     }
                     _ = interval.tick() => ctx.job_signing_update(&job_id),
-                    _ = ctrl_c() => {
+                    _ = sigint.recv() => {
                         ctx.job_signing_finished(&job_id);
                         return Err(CommandError::Canceled);
                     }
@@ -1231,6 +1261,7 @@ async fn job_start(
         let mut polls = 0;
         let mut started = false;
         let mut stopped = false;
+        let mut sigint = signal(SignalKind::interrupt())?;
         let status = loop {
             select! {
                 // Wait for the start request to finish.
@@ -1267,7 +1298,7 @@ async fn job_start(
                 // so retry the stop a few times if needed. Once the job
                 // has stopped, or after a first interrupt, an interrupt
                 // just ends the watch.
-                _ = ctrl_c() => {
+                _ = sigint.recv() => {
                     if started || stopped {
                         break last;
                     }
@@ -1374,6 +1405,7 @@ async fn job_watch(
     let mut sleds = 0;
     let mut quiet = 0;
     let mut polls = 0;
+    let mut sigint = signal(SignalKind::interrupt())?;
     let status = loop {
         let status = match job_status_map(ctx, client, job_id).await {
             Ok(status) => status,
@@ -1390,7 +1422,7 @@ async fn job_watch(
         sleds = status.len();
         select! {
             _ = sleep(WATCH_INTERVAL) => {}
-            _ = ctrl_c() => break status,
+            _ = sigint.recv() => break status,
         }
     };
     ctx.job_watch_finished(job_id);
@@ -1815,6 +1847,8 @@ pub enum CommandError {
         path: PathBuf,
         error: std::io::Error,
     },
+    #[error("❌ Signal handling error: {0}")]
+    Signal(#[from] std::io::Error),
     #[error("❌ Unauthorized, try `iam`")]
     InvalidAuthorization,
     #[error("❌ Leaf certificate does not match key `{0}`")]
