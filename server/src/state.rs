@@ -203,7 +203,7 @@ impl<'a> SessionGuard<'a> {
         actor: &KeyId,
     ) {
         let job_id = *job.job_id();
-        let targeted = job.payload().target().includes(own_baseboard, cubbies);
+        let targeted = job.payload().runs_on(own_baseboard, cubbies);
         if history.contains(&job_id) {
             // Note but otherwise ignore the duplicate job.
             info!(log, "already started job"; "job_id" => %job_id);
@@ -277,7 +277,7 @@ impl<'a> SessionGuard<'a> {
         while let Some((request, params)) = self.next_queued_job() {
             let (tx_attachment, rx_attachment) = watch::channel(None);
             let job_id = request.payload().job_id().to_owned();
-            if request.payload().target().includes(own_baseboard, cubbies)
+            if request.payload().runs_on(own_baseboard, cubbies)
                 && history
                     .get_job_status(&job_id)
                     .map(|status| {

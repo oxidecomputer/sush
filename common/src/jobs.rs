@@ -28,7 +28,7 @@ use crate::borsh::{
 };
 use crate::interactive::InteractiveJobError;
 use crate::keys::{KeyId, Signed, ToBeSigned, Verified};
-use crate::targets::Target;
+use crate::targets::{Cubbies, Target};
 
 codephrase_newtype! {
     /// A globally unique identifier for a job within a session.
@@ -208,6 +208,15 @@ impl JobStartRequest {
             command: command.as_ref().to_string(),
             interactive,
             target,
+        }
+    }
+
+    /// Interactive jobs run only on their single named baseboard.
+    pub fn runs_on(&self, baseboard: &BaseboardId, cubbies: &Cubbies) -> bool {
+        if self.interactive {
+            self.target.single_baseboard() == Some(baseboard)
+        } else {
+            self.target.includes(baseboard, cubbies)
         }
     }
 
@@ -715,6 +724,29 @@ impl FromStr for JobOutputStream {
 #[cfg(test)]
 mod test {
     use super::*;
+    use crate::targets::SledId;
+
+    /// Interactive jobs run only on their single named baseboard.
+    #[test]
+    fn interactive_targets() {
+        let sled = |serial: &str| BaseboardId {
+            part_number: "913".to_string(),
+            serial_number: serial.to_string(),
+        };
+        let me = sled("me");
+        let cubbies = Cubbies::from([(14, me.clone())]);
+        let job = |interactive, target| {
+            JobStartRequest::new(JobId::random(), "true", interactive, target)
+        };
+        let just_me = Target::Sleds(vec![SledId::Baseboard(me.clone())]);
+        assert!(job(true, just_me.clone()).runs_on(&me, &cubbies));
+        assert!(job(false, just_me).runs_on(&me, &cubbies));
+        assert!(!job(true, Target::All).runs_on(&me, &cubbies));
+        assert!(job(false, Target::All).runs_on(&me, &cubbies));
+        let my_cubby = Target::Sleds(vec![SledId::Cubby(14)]);
+        assert!(!job(true, my_cubby.clone()).runs_on(&me, &cubbies));
+        assert!(job(false, my_cubby).runs_on(&me, &cubbies));
+    }
 
     /// Requested limits may narrow the default ceiling, never widen it.
     #[test]

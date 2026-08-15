@@ -1088,6 +1088,16 @@ async fn job(
             let Some(permslip_url) = permslip_url else {
                 return Err(CommandError::MissingPermslipUrl);
             };
+            // Sign an interactive job for the sled its attachment
+            // will land on.
+            let target = if *interactive && target.single_baseboard().is_none() {
+                let Some(client) = client.as_ref() else {
+                    return Err(CommandError::InteractiveTarget);
+                };
+                Target::from(resolve_target(client, target).await?)
+            } else {
+                target.clone()
+            };
             let mut signer = PermslipSigner::new(key_name, permslip_url).await?;
             let mut interval = interval(SIGNING_UPDATE_INTERVAL);
             interval.set_missed_tick_behavior(MissedTickBehavior::Skip);
@@ -1095,7 +1105,7 @@ async fn job(
                 job_id.to_owned(),
                 command,
                 *interactive,
-                target.clone(),
+                target,
             ));
             pin!(sign);
             ctx.job_signing_started(&job_id);
@@ -1842,6 +1852,8 @@ pub enum CommandError {
     IdentityMismatch { interactive: KeyId, key_id: KeyId },
     #[error("❌ Interactive job error: {0}")]
     Interactive(#[from] InteractiveJobError),
+    #[error("❌ Interactive jobs must target exactly one sled")]
+    InteractiveTarget,
     #[error("❌ I/O error accessing `{path}`: {error}")]
     Io {
         path: PathBuf,

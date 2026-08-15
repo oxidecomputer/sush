@@ -597,6 +597,12 @@ impl JobManager {
             return Err(JobError::NoSession);
         }
 
+        // A broader target would orphan jobs on unattached sleds.
+        let payload = job.payload();
+        if payload.interactive && payload.target().single_baseboard().is_none() {
+            return Err(JobError::InteractiveTarget);
+        }
+
         // Reject job IDs we already know about, rather than silently
         // queuing a resubmission that can never advance the session's
         // job chain. Without this, a caller that resubmits an

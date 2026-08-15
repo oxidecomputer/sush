@@ -2110,3 +2110,23 @@ async fn job_signal_dispositions() {
     let stdout = String::from_utf8(stdout.to_vec()).unwrap();
     assert!(stdout.contains("caught"), "stdout: {stdout:?}");
 }
+
+/// Interactive jobs must target exactly one sled.
+#[named]
+#[tokio::test]
+async fn interactive_target_required() {
+    let log = test_logger(function_name!());
+    let (mgr, mut root, _dir, _shutdown) = manager_and_test_root(log).await;
+    let authn = fake_identity(&mut root).await;
+    let session_id = SessionId::random();
+    let session = Session::new(session_id);
+    mgr.session_start(&authn, session_id, true).await.unwrap();
+
+    let job_id = session.next_job_id();
+    let job = root.sign_job_request(&job_id, "bash", true).await;
+    assert!(matches!(
+        mgr.job_start(&authn, job.into_signed(), JobStartParams::default())
+            .await,
+        Err(JobError::InteractiveTarget)
+    ));
+}
