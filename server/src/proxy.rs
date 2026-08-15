@@ -7,8 +7,9 @@
 //! Terminates client connections and routes each request to a sled,
 //! answering only `/version` itself.
 //! A request that names a target goes to the first sled the target
-//! resolves to. Anything else goes to a sticky default, because
-//! identities are cached on the sled that authenticated them.
+//! resolves to. Anything else goes to the sled hosting the proxy
+//! when known, else a sticky default, because identities are cached
+//! on the sled that authenticated them.
 //! Requests are forwarded untouched: bound request signatures cover
 //! the exact request line, so the proxy may never rewrite one.
 
@@ -93,11 +94,13 @@ pub struct ProxyServer {
 
 impl ProxyServer {
     /// Start listening at `local_addr`, routing to `targets`.
+    /// Unrouted requests prefer `home`, the sled hosting the proxy.
     pub async fn start(
         log: &Logger,
         local_addr: SocketAddr,
         tls: Option<ServerConfig>,
         targets: watch::Receiver<Targets>,
+        home: Option<BaseboardId>,
         shutdown: CancellationToken,
     ) -> io::Result<Self> {
         let listener = TcpListener::bind(local_addr).await?;
@@ -105,6 +108,7 @@ impl ProxyServer {
         let acceptor = tls.map(|config| TlsAcceptor::from(Arc::new(config)));
         let router = Arc::new(Router {
             targets,
+            home,
             default: Mutex::new(None),
         });
         spawn(listen(
@@ -133,11 +137,12 @@ impl ProxyServer {
 /// Pick a sled for each request.
 struct Router {
     targets: watch::Receiver<Targets>,
+    home: Option<BaseboardId>,
     default: Mutex<Option<BaseboardId>>,
 }
 
 impl Router {
-    fn route(&self, request: &Request<Incoming>) -> Result<SocketAddr, Box<Response<ProxyBody>>> {
+    fn route<B>(&self, request: &Request<B>) -> Result<SocketAddr, Box<Response<ProxyBody>>> {
         let targets = self.targets.borrow();
         match named_target(request) {
             Some(Ok(target)) => targets.resolve(&target).ok_or_else(|| {
@@ -151,6 +156,11 @@ impl Router {
                 format!("unable to parse target `{bad}`"),
             ))),
             None => {
+                if let Some(home) = self.home.as_ref()
+                    && let Some(addr) = targets.sleds.get(home)
+                {
+                    return Ok(*addr);
+                }
                 let mut default = self.default.lock().unwrap();
                 if let Some(baseboard) = default.as_ref()
                     && let Some(addr) = targets.sleds.get(baseboard)
@@ -365,6 +375,36 @@ mod test {
 
     fn target(s: &str) -> Target {
         s.parse().unwrap()
+    }
+
+    /// Unrouted requests go to the home sled while the targets know
+    /// it, and otherwise to a sticky default.
+    #[test]
+    fn home_preference() {
+        let sled = |serial: &str| BaseboardId {
+            part_number: "913".to_string(),
+            serial_number: serial.to_string(),
+        };
+        let addr = |port| SocketAddr::from(([127, 0, 0, 1], port));
+        let mut targets = Targets::default();
+        targets.sleds.insert(sled("away"), addr(1));
+        targets.sleds.insert(sled("home"), addr(2));
+        let (tx, rx) = watch::channel(targets);
+        let router = Router {
+            targets: rx,
+            home: Some(sled("home")),
+            default: Mutex::new(None),
+        };
+        let get = request("/versions");
+        assert_eq!(router.route(&get).unwrap(), addr(2));
+        tx.send_modify(|t| {
+            t.sleds.remove(&sled("home"));
+        });
+        assert_eq!(router.route(&get).unwrap(), addr(1));
+        tx.send_modify(|t| {
+            t.sleds.insert(sled("home"), addr(2));
+        });
+        assert_eq!(router.route(&get).unwrap(), addr(2));
     }
 
     /// The proxy answers `GET /version` itself unless `via` routes it.
