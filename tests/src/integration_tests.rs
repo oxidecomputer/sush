@@ -164,9 +164,16 @@ async fn client_proxy_server() {
         cubbies: Cubbies::from([(14, test_baseboard_id())]),
     });
     let shutdown_proxy = CancellationToken::new();
-    let proxy = ProxyServer::start(&log, local_addr(), None, rx_targets, shutdown_proxy.clone())
-        .await
-        .expect("can't start proxy server");
+    let proxy = ProxyServer::start(
+        &log,
+        local_addr(),
+        None,
+        rx_targets,
+        None,
+        shutdown_proxy.clone(),
+    )
+    .await
+    .expect("can't start proxy server");
     let proxy_addr = proxy.local_addr();
     assert_ne!(server_addr, proxy_addr);
 
@@ -316,6 +323,7 @@ async fn client_tls_proxy_server() {
         local_addr(),
         Some(tls),
         rx_targets,
+        None,
         shutdown_proxy.clone(),
     )
     .await
@@ -396,6 +404,7 @@ async fn client_tls_proxy_server() {
         local_addr(),
         Some(delegated),
         rx_delegated,
+        None,
         shutdown_proxy.clone(),
     )
     .await
@@ -451,6 +460,7 @@ async fn client_tls_proxy_server() {
         local_addr(),
         Some(forged_tls),
         rx_forged,
+        None,
         shutdown_proxy.clone(),
     )
     .await
