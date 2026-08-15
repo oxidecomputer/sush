@@ -188,7 +188,7 @@ fn named_target<B>(request: &Request<B>) -> Option<Result<Target, String>> {
     let uri = request.uri();
     let segments: Vec<&str> = uri.path().trim_start_matches('/').split('/').collect();
     let named = match segments.as_slice() {
-        ["jobs", _, "output" | "attach", target, ..] if *target != "*" => Some(*target),
+        ["jobs", _, "attach" | "output" | "start", target, ..] if *target != "*" => Some(*target),
         _ => uri.query().and_then(|query| {
             query.split('&').find_map(|param| {
                 param
@@ -431,6 +431,11 @@ mod test {
             named_target(&request("/jobs/some-job/output/test%20part:0000/stdout")),
             Some(Ok(target("test part:0000"))),
         );
+        assert_eq!(
+            named_target(&request("/jobs/some-job/start/test%20part:0000")),
+            Some(Ok(target("test part:0000"))),
+        );
+        assert_eq!(named_target(&request("/jobs/some-job/start/*")), None);
         assert_eq!(
             named_target(&request("/jobs/some-job/attach/test%20part:0000")),
             Some(Ok(target("test part:0000"))),

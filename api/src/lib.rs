@@ -165,11 +165,11 @@ pub trait SushApi {
     // Job management.
 
     /// Start an authorized job.
-    #[endpoint { method = POST, path = "/jobs/{job_id}/start" }]
+    #[endpoint { method = POST, path = "/jobs/{job_id}/start/{target}" }]
     async fn job_start(
         ctx: RequestContext<Self::Context>,
         headers: Header<Authorization>,
-        params: PathParams<JobIdParam>,
+        params: PathParams<JobTargetParams>,
         query: QueryParams<JobStartParams>,
         body: TypedBody<SignedJob>,
     ) -> Result<HttpResponseUpdatedNoContent, HttpError>;
@@ -208,7 +208,7 @@ pub trait SushApi {
     async fn job_attach(
         ctx: RequestContext<Self::Context>,
         headers: Header<Authorization>,
-        params: PathParams<JobAttachParams>,
+        params: PathParams<JobTargetParams>,
         query: QueryParams<RoutingParam>,
         upgrade: WebsocketUpgrade,
     ) -> WebsocketEndpointResult;
@@ -303,11 +303,11 @@ pub struct JobIdParam {
 }
 
 #[derive(Deserialize, JsonSchema)]
-pub struct JobAttachParams {
-    /// Which job to attach to.
+pub struct JobTargetParams {
+    /// Which job to act on.
     pub job_id: JobId,
 
-    /// To be used by Nexus for routing.
+    /// Used by proxies for routing.
     pub target: String,
 }
 

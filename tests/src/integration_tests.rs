@@ -113,6 +113,7 @@ async fn client_server() {
     client
         .job_start()
         .job_id(job_id)
+        .target("*")
         .max_cpu(max_cpu)
         .max_mem(max_mem)
         .max_fsize(max_fsize)
@@ -217,6 +218,7 @@ async fn client_proxy_server() {
     client
         .job_start()
         .job_id(job_id)
+        .target(test_baseboard_id().to_string())
         .max_cpu(max_cpu)
         .max_mem(max_mem)
         .max_fsize(max_fsize)
@@ -566,6 +568,7 @@ async fn interactive_job() {
     client
         .job_start()
         .job_id(job_id)
+        .target(test_baseboard_id().to_string())
         .max_cpu(max_cpu)
         .max_mem(max_mem)
         .max_fsize(max_fsize)
