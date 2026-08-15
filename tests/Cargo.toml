@@ -16,6 +16,7 @@ ed25519-dalek.workspace = true
 function_name.workspace = true
 futures.workspace = true
 http-range-header.workspace = true
+libc.workspace = true
 pwd.workspace = true
 rand_core.workspace = true
 rumors.workspace = true

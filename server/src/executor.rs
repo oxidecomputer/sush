@@ -9,8 +9,10 @@
 
 use std::collections::BTreeMap;
 use std::io;
+use std::mem::MaybeUninit;
 use std::os::fd::AsRawFd as _;
 use std::process::Stdio;
+use std::ptr::null_mut;
 use std::sync::{Arc, RwLock};
 
 use chrono::Utc;
@@ -294,6 +296,20 @@ async fn job_spawn(
     unsafe {
         cmd.pre_exec(move || {
             setsid()?;
+            Ok(())
+        });
+    }
+
+    // Reset signal dispositions and the signal mask.
+    let max_signal = libc::SIGRTMAX();
+    unsafe {
+        cmd.pre_exec(move || {
+            for signal in 1..=max_signal {
+                libc::signal(signal, libc::SIG_DFL);
+            }
+            let mut none = MaybeUninit::<libc::sigset_t>::uninit();
+            libc::sigemptyset(none.as_mut_ptr());
+            libc::sigprocmask(libc::SIG_SETMASK, none.as_ptr(), null_mut());
             Ok(())
         });
     }
