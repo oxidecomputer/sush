@@ -31,22 +31,14 @@ jobs:
         permissions: contents:read
         configure-git: true
 
-    - name: Lint
-      run: |
-        cargo fmt -- --check &&
-        cargo clippy -- --no-deps --deny warnings &&
-        cargo clippy --tests -- --no-deps --deny warnings
+    - name: Install just and nextest
+      uses: taiki-e/install-action@v2
+      with:
+        tool: just,nextest
 
-    - name: Build
-      run: cargo build --locked
-
-    - name: Install nextest
-      uses: taiki-e/install-action@nextest
-
-    - name: Test
-      run: |
-        cargo nextest run --run-ignored all &&
-        cargo test --doc
+    # The recipe is the source of truth shared with local runs.
+    - name: CI
+      run: just ci
 
   # The permslip feature pulls in permission-slip, which is private,
   # so this job only runs where the OIDC exchange can succeed.
@@ -74,8 +66,8 @@ jobs:
         permissions: contents:read
         configure-git: true
 
-    - name: Lint
-      run: cargo clippy --package sush-client --features permslip -- --no-deps --deny warnings
+    - name: Install just
+      uses: taiki-e/install-action@just
 
-    - name: Build
-      run: cargo build --locked --package sush-client --features permslip
+    - name: CI
+      run: just ci-client
