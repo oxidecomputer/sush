@@ -207,7 +207,7 @@ async fn client_proxy_server() {
         .expect("can't start session");
     let job_id = session.next_job_id();
     let job = root
-        .sign_job_request(&job_id, "cat > /dev/null", true)
+        .sign_job_request_for(&job_id, "cat > /dev/null", true, test_baseboard_id().into())
         .await;
     let JobLimits {
         max_cpu,
@@ -556,7 +556,7 @@ async fn interactive_job() {
         .expect("can't start session");
     let job_id = session.next_job_id();
     let job = root
-        .sign_job_request(&job_id, "cat > /dev/null", true)
+        .sign_job_request_for(&job_id, "cat > /dev/null", true, test_baseboard_id().into())
         .await;
     let JobLimits {
         max_cpu,

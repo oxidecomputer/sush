@@ -74,6 +74,23 @@ impl Target {
     pub fn is_all(&self) -> bool {
         matches!(self, Self::All)
     }
+
+    /// A singular target or `None`.
+    pub fn single_baseboard(&self) -> Option<&BaseboardId> {
+        match self {
+            Self::All => None,
+            Self::Sleds(sleds) => match sleds.as_slice() {
+                [SledId::Baseboard(baseboard)] => Some(baseboard),
+                _ => None,
+            },
+        }
+    }
+}
+
+impl From<BaseboardId> for Target {
+    fn from(baseboard: BaseboardId) -> Self {
+        Self::Sleds(vec![SledId::Baseboard(baseboard)])
+    }
 }
 
 impl FromStr for Target {
