@@ -48,7 +48,7 @@ rlimit = "0.10"
 rumors = { git = "https://github.com/oxidecomputer/rumors", rev = "b2675dbef99b784efb817db01920ee59dac708c3" }
 rustix = { version = "1", features = ["fs", "process", "pty", "termios"] }
 rustls = "0.23"
-rustyline = { version = "17", features = ["termios"] }
+rustyline = { version = "17", features = ["signal-hook", "termios"] }
 schemars = { version = "0.8", features = ["chrono"] }
 serde = "1"
 serde_json = "1"
