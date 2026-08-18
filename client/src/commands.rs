@@ -1066,7 +1066,7 @@ async fn job(
                         match with_login(ctx, client, async || client.session().send().await).await
                         {
                             Ok(resp) => resp.into_inner(),
-                            Err(CommandError::NotFound) => {
+                            Err(CommandError::NotFound(_)) => {
                                 let session = Session::new(SessionId::random());
                                 with_login(ctx, client, async || {
                                     client
@@ -1255,7 +1255,7 @@ async fn job_start(
         start.await?;
         ctx.job_started(&job);
         match job_attach(ctx, client, &job_id, &target).await {
-            Ok(()) | Err(CommandError::NotFound) => {
+            Ok(()) | Err(CommandError::NotFound(_)) => {
                 job_status(ctx, client, &job_id, StatusDisplayStyle::Short).await?
             }
             Err(error) => return Err(error),
@@ -1289,7 +1289,7 @@ async fn job_start(
                     last = match job_status_map(ctx, client, &job_id).await {
                         Ok(status) => status,
                         // The job may not be visible anywhere yet.
-                        Err(CommandError::NotFound) => JobStatusMap::new(),
+                        Err(CommandError::NotFound(_)) => JobStatusMap::new(),
                         Err(error) => {
                             ctx.job_watch_finished(&job_id);
                             return Err(error);
@@ -1320,7 +1320,7 @@ async fn job_start(
                                 stopped = true;
                                 break;
                             }
-                            Err(CommandError::NotFound) => {
+                            Err(CommandError::NotFound(_)) => {
                                 sleep(JOB_STOP_RETRY_INTERVAL).await;
                             }
                             Err(error) => {
@@ -1334,6 +1334,16 @@ async fn job_start(
         };
         ctx.job_watch_finished(&job_id);
         ctx.job_status(&job_id, &status, StatusDisplayStyle::Short);
+        if !status
+            .values()
+            .any(|s| matches!(s, JobStatus::Stopped { .. }))
+        {
+            return Err(if status.values().all(JobStatus::is_terminal) {
+                CommandError::JobDidNotRun(job_id)
+            } else {
+                CommandError::JobStillRunning(job_id)
+            });
+        }
         for stream in [Stdout, Stderr] {
             match with_login_via(ctx, client, Some(&target), async || {
                 client
@@ -1515,7 +1525,10 @@ async fn job_output(
     // Fetch output from every sled with a recorded status.
     let status = job_status_map(ctx, client, &args.job_id).await?;
     if status.is_empty() {
-        return Err(CommandError::NotFound);
+        return Err(CommandError::NotFound(format!(
+            "Job `{}` not found",
+            args.job_id
+        )));
     }
     for baseboard in status.keys() {
         ctx.job_output_target(baseboard);
@@ -1556,7 +1569,11 @@ async fn job_output_from(
         stdout_hash,
         stderr_hash,
     } = match status.get(target) {
-        None => return Err(CommandError::NotFound),
+        None => {
+            return Err(CommandError::NotFound(format!(
+                "Job `{job_id}` not found on sled `{target}`"
+            )));
+        }
         Some(JobStatus::Cancelled { .. }) => {
             return Err(CommandError::JobCancelled(job_id.to_owned()));
         }
@@ -1870,6 +1887,8 @@ pub enum CommandError {
     InvalidRootCert,
     #[error("❌ Job `{0}` was cancelled before it started")]
     JobCancelled(JobId),
+    #[error("❌ Job `{0}` did not run")]
+    JobDidNotRun(JobId),
     #[error("❌ Job `{0}` is not yet running")]
     JobNotYetRunning(JobId),
     #[error("❌ Job `{0}` is still running")]
@@ -1892,8 +1911,8 @@ pub enum CommandError {
     MissingSession,
     #[error("❌ Missing SSH agent socket, try `--ssh-auth-sock`")]
     MissingSshAuthSock,
-    #[error("❌ Resource not found")]
-    NotFound,
+    #[error("❌ {0}")]
+    NotFound(String),
     #[error("❌ Command not supported in offline mode, try `--url`")]
     Offline,
     #[error(
@@ -1964,7 +1983,9 @@ impl From<ClientError<ApiError>> for CommandError {
             InvalidRequest(e) => CommandError::Client(format!("Invalid request: {e}")),
             CommunicationError(e) => CommandError::Client(format!("Communication error: {e}")),
             InvalidUpgrade(e) => CommandError::Client(e.to_string()),
-            ErrorResponse(e) if e.status() == StatusCode::NOT_FOUND => CommandError::NotFound,
+            ErrorResponse(e) if e.status() == StatusCode::NOT_FOUND => {
+                CommandError::NotFound(e.message.to_owned())
+            }
             ErrorResponse(e) if e.status() == StatusCode::REQUEST_TIMEOUT => CommandError::TimedOut,
             ErrorResponse(e) => CommandError::Client(e.message.to_owned()),
             ResponseBodyError(e) => CommandError::Client(e.to_string()),
@@ -1990,7 +2011,7 @@ impl From<ClientError<ByteStream>> for CommandError {
     fn from(error: ClientError<ByteStream>) -> Self {
         match error.status() {
             Some(StatusCode::PAYLOAD_TOO_LARGE) => Self::TooMuchOutput,
-            Some(StatusCode::NOT_FOUND) => Self::NotFound,
+            Some(StatusCode::NOT_FOUND) => Self::NotFound(String::from("Job output not found")),
             Some(status) => Self::Client(status.to_string()),
             None => Self::Client(error.to_string()),
         }
@@ -2000,7 +2021,9 @@ impl From<ClientError<ByteStream>> for CommandError {
 impl From<ClientError<Upgraded>> for CommandError {
     fn from(error: ClientError<Upgraded>) -> Self {
         match error.status() {
-            Some(StatusCode::NOT_FOUND) => Self::NotFound,
+            Some(StatusCode::NOT_FOUND) => {
+                Self::NotFound(String::from("Interactive job not found"))
+            }
             Some(status) => Self::Client(status.to_string()),
             None => Self::Client(error.to_string()),
         }
