@@ -14,6 +14,7 @@ use std::time::Duration;
 use chrono::Utc;
 use function_name::named;
 use http_range_header::{EndPosition, StartPosition, SyntacticallyCorrectRange as Range};
+use libc::{SIGKILL, SIGXCPU};
 use pwd::Passwd;
 use sled_hardware_types::BaseboardId;
 use slog::{Discard, Logger, o};
@@ -45,10 +46,6 @@ use crate::test_utils::{
     test_baseboard_id, test_logger,
 };
 use sush_server::executor::PathIsolation;
-
-// Signal numbers for killed jobs.
-const SIGKILL: i32 = 9;
-const SIGXCPU: i32 = 24;
 
 #[track_caller]
 fn check_status_started(status: JobStatus, expected_job_id: &JobId) {
