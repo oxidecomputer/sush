@@ -68,9 +68,10 @@ where
                 buffer.truncate(0);
             }
 
-            // Handle a message from the server.
-            Some(Ok(message)) = stream.next() => {
-                match Message::try_from(message)? {
+            // Handle a message from the server, or its disconnection.
+            message = stream.next() => {
+                let Some(message) = message else { break };
+                match Message::try_from(message?)? {
                     Message::Control(control) => match control {
                         Control::WindowChange(new) => {
                             set_window_size(stdin, &mut stdout_async, new.clone()).await?;
