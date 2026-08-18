@@ -61,7 +61,7 @@ where
             // Relay input from the terminal.
             Ok(n) = stdin_async.read_buf(&mut buffer) => {
                 // EOF or the telnet(1) “escape character”
-                if n == 0 || buffer == "" {
+                if n == 0 || buffer == "\x1d" {
                     break;
                 }
                 stream.send(Message::Data(buffer.copy_to_bytes(n)).try_into()?).await?;
