@@ -14,6 +14,7 @@ use std::time::Duration;
 use chrono::Utc;
 use function_name::named;
 use http_range_header::{EndPosition, StartPosition, SyntacticallyCorrectRange as Range};
+use libc::{SIGKILL, SIGXCPU};
 use pwd::Passwd;
 use sled_hardware_types::BaseboardId;
 use slog::{Discard, Logger, o};
@@ -45,10 +46,6 @@ use crate::test_utils::{
     test_baseboard_id, test_logger,
 };
 use sush_server::executor::PathIsolation;
-
-// Signal numbers for killed jobs.
-const SIGKILL: i32 = 9;
-const SIGXCPU: i32 = 24;
 
 #[track_caller]
 fn check_status_started(status: JobStatus, expected_job_id: &JobId) {
@@ -1611,13 +1608,12 @@ async fn homonym_issuer_resolves_to_true_parent() {
 async fn too_much_cpu() {
     let log = test_logger(function_name!());
     let (mgr, mut root, _dir, _shutdown) = manager_and_test_root(log).await;
-    let baseboard_id = mgr.own_baseboard();
     let authn = fake_identity(&mut root).await;
     let session_id = SessionId::random();
     let session = Session::new(session_id);
     mgr.session_start(&authn, session_id, true).await.unwrap();
     let job_id = session.next_job_id();
-    let command = "openssl speed sha1";
+    let command = "while :; do :; done";
     let job = root.sign_job_request(&job_id, command, false).await;
     let job_id = job.job_id().to_owned();
     mgr.job_start(
@@ -1646,44 +1642,13 @@ async fn too_much_cpu() {
     .unwrap();
     let status = mgr.job_status(&authn, &job_id).await.unwrap()[mgr.own_baseboard()].clone();
     assert!(status.time_elapsed().to_std().unwrap() < Duration::from_secs(2));
-
-    // The output of `openssl speed` changed between v3.0 and v3.5.
-    let stderr = mgr
-        .job_output(&authn, &job_id, baseboard_id, Stderr, None)
-        .await
-        .unwrap()
-        .into_bytes()
-        .await;
-    let stderr = String::from_utf8_lossy(&stderr);
-    match status {
-        JobStatus::Stopped {
-            output: JobOutputState { stderr_len: 37, .. },
-            ..
-        } => {
-            check_status_stopped(
-                status,
-                &job_id,
-                Err(ProcessError::Killed(SIGXCPU)),
-                Some(0),
-                Some(37),
-            );
-            assert_eq!(stderr, "Doing sha1 for 3s on 16 size blocks: ");
-        }
-        JobStatus::Stopped {
-            output: JobOutputState { stderr_len: 41, .. },
-            ..
-        } => {
-            check_status_stopped(
-                status,
-                &job_id,
-                Err(ProcessError::Killed(SIGXCPU)),
-                Some(0),
-                Some(41),
-            );
-            assert_eq!(stderr, "Doing sha1 ops for 3s on 16 size blocks: ");
-        }
-        _ => todo!("what does `{command}` produce on your system?"),
-    }
+    check_status_stopped(
+        status,
+        &job_id,
+        Err(ProcessError::Killed(SIGXCPU)),
+        Some(0),
+        Some(0),
+    );
 }
 
 #[named]
