@@ -1277,11 +1277,13 @@ async fn job_start(
             select! {
                 // Wait for the start request to finish.
                 start_result = &mut start, if !started => {
-                    if let Err(error) = start_result {
-                        ctx.job_watch_finished(&job_id);
-                        return Err(error);
+                    match start_result {
+                        Ok(_) | Err(CommandError::TimedOut) => ctx.job_started(&job),
+                        Err(error) => {
+                            ctx.job_watch_finished(&job_id);
+                            return Err(error);
+                        }
                     }
-                    ctx.job_started(&job);
                     started = true;
                 }
 
@@ -1981,6 +1983,7 @@ impl From<ClientError<ApiError>> for CommandError {
         use ClientError::*;
         match error {
             InvalidRequest(e) => CommandError::Client(format!("Invalid request: {e}")),
+            CommunicationError(e) if e.is_timeout() => CommandError::TimedOut,
             CommunicationError(e) => CommandError::Client(format!("Communication error: {e}")),
             InvalidUpgrade(e) => CommandError::Client(e.to_string()),
             ErrorResponse(e) if e.status() == StatusCode::NOT_FOUND => {
