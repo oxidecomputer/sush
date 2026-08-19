@@ -302,8 +302,7 @@ fn watch_settling() {
     );
 }
 
-/// Anything the target grammar accepts stays a target; bare serials
-/// fall through; everything else still fails.
+/// Anything the target grammar accepts stays a target.
 #[test]
 fn target_arg() {
     assert!(matches!("*".parse(), Ok(TargetArg::Target(_))));
@@ -312,8 +311,23 @@ fn target_arg() {
         "913-0000019:BRM42220030".parse(),
         Ok(TargetArg::Target(_))
     ));
-    assert!(matches!("brm42220030".parse(), Ok(TargetArg::Serial(s)) if s == "brm42220030"));
-    assert!("not,a:target!".parse::<TargetArg>().is_err());
+    assert!(matches!(
+        "brm42220030".parse(),
+        Ok(TargetArg::Abbreviated(sleds))
+            if matches!(sleds.as_slice(), [SledArg::Serial(s)] if s == "brm42220030")
+    ));
+    assert!(matches!(
+        "14,brm42220030".parse(),
+        Ok(TargetArg::Abbreviated(sleds))
+            if matches!(sleds.as_slice(), [SledArg::Sled(SledId::Cubby(14)), SledArg::Serial(_)])
+    ));
+    assert!(matches!(
+        "913-0000019:BRM42220036,brm42220030".parse(),
+        Ok(TargetArg::Abbreviated(sleds))
+            if matches!(sleds.as_slice(), [SledArg::Sled(SledId::Baseboard(_)), SledArg::Serial(_)])
+    ));
+    assert!("n!ot,a:target".parse::<TargetArg>().is_err());
+    assert!("*,brm42220030".parse::<TargetArg>().is_err());
 }
 
 /// [`ClientArgs`] must satisfy Clap's internal consistency asserts
@@ -610,9 +624,9 @@ pub struct JobStartArgs {
     force: bool,
 
     /// Where the job runs: every sled (`*`), or a comma-separated list
-    /// of cubby numbers and baseboard IDs.
+    /// of cubby numbers, baseboard IDs, or bare serial numbers.
     #[arg(short = 'T', long, default_value = "*")]
-    target: Target,
+    target: TargetArg,
 
     /// Use `permslip` to sign job requests with this key name.
     #[cfg(feature = "permslip")]
@@ -1127,15 +1141,24 @@ async fn job(
             let Some(permslip_url) = permslip_url else {
                 return Err(CommandError::MissingPermslipUrl);
             };
+            let target = match target {
+                TargetArg::Target(target) => target.clone(),
+                abbreviated => {
+                    let Some(client) = client.as_ref() else {
+                        return Err(CommandError::Offline);
+                    };
+                    resolve_target_arg(client, abbreviated).await?
+                }
+            };
             // Sign an interactive or streaming job for the sled its
             // attachment will land on.
             let target = if (*interactive || *streaming) && target.single_baseboard().is_none() {
                 let Some(client) = client.as_ref() else {
                     return Err(CommandError::InteractiveTarget);
                 };
-                Target::from(resolve_target(client, target).await?)
+                Target::from(resolve_target(client, &target).await?)
             } else {
-                target.clone()
+                target
             };
             // Catch output file problems before the signing ceremony.
             if *streaming {
@@ -1218,8 +1241,16 @@ async fn job(
 
         (JobCommand::Attach { job_id, target }, Some(client)) => {
             let target = match &target {
+                TargetArg::Abbreviated(sleds) => match sleds.as_slice() {
+                    [SledArg::Serial(serial)] => {
+                        resolve_serial(ctx, client, &job_id, serial).await?
+                    }
+                    _ => {
+                        let target = resolve_target_arg(client, &target).await?;
+                        resolve_target(client, &target).await?
+                    }
+                },
                 TargetArg::Target(target) => resolve_target(client, target).await?,
-                TargetArg::Serial(serial) => resolve_serial(ctx, client, &job_id, serial).await?,
             };
             job_attach(ctx, client, &job_id, &target).await?;
             Ok(())
@@ -1648,14 +1679,17 @@ async fn job_output(
     args: JobOutput,
 ) -> Result<(), CommandError> {
     let target = match target {
-        TargetArg::Serial(serial) => {
-            let baseboard = resolve_serial(ctx, client, &args.job_id, serial).await?;
-            return job_output_from(ctx, client, &baseboard, stream, args).await;
+        TargetArg::Target(target) => target.clone(),
+        TargetArg::Abbreviated(sleds) => {
+            if let [SledArg::Serial(serial)] = sleds.as_slice() {
+                let baseboard = resolve_serial(ctx, client, &args.job_id, serial).await?;
+                return job_output_from(ctx, client, &baseboard, stream, args).await;
+            }
+            resolve_target_arg(client, target).await?
         }
-        TargetArg::Target(target) => target,
     };
     if !target.is_all() {
-        let baseboard = resolve_target(client, target).await?;
+        let baseboard = resolve_target(client, &target).await?;
         return job_output_from(ctx, client, &baseboard, stream, args).await;
     }
     if args.binary || args.file.is_some() {
@@ -1997,11 +2031,18 @@ async fn resolve_target(client: &Client, target: &Target) -> Result<BaseboardId,
     Ok(request.send().await?.into_inner())
 }
 
-/// A target expression, or a bare serial number to resolve against
-/// the sleds that have a status for the job at hand.
+/// A target expression, with sleds optionally abbreviated to bare
+/// serial numbers.
 #[derive(Clone, Debug)]
 pub enum TargetArg {
     Target(Target),
+    Abbreviated(Vec<SledArg>),
+}
+
+/// One sled named in a target argument.
+#[derive(Clone, Debug)]
+pub enum SledArg {
+    Sled(SledId),
     Serial(String),
 }
 
@@ -2009,12 +2050,54 @@ impl FromStr for TargetArg {
     type Err = <Target as FromStr>::Err;
 
     fn from_str(s: &str) -> Result<Self, Self::Err> {
-        match s.parse() {
-            Ok(target) => Ok(Self::Target(target)),
-            Err(_) if !s.is_empty() && s.chars().all(|c| c.is_ascii_alphanumeric()) => {
-                Ok(Self::Serial(s.to_owned()))
+        let error = match s.parse() {
+            Ok(target) => return Ok(Self::Target(target)),
+            Err(error) => error,
+        };
+        let mut sleds = Vec::new();
+        for piece in s.split(',') {
+            let piece = piece.trim();
+            match piece.parse::<Target>() {
+                Ok(Target::Sleds(sled)) if sled.len() == 1 => {
+                    sleds.push(SledArg::Sled(sled.into_iter().next().expect("one sled")));
+                }
+                _ if !piece.is_empty() && piece.chars().all(|c| c.is_ascii_alphanumeric()) => {
+                    sleds.push(SledArg::Serial(piece.to_owned()));
+                }
+                _ => return Err(error),
             }
-            Err(err) => Err(err),
+        }
+        Ok(Self::Abbreviated(sleds))
+    }
+}
+
+/// Resolve a target argument to a target, matching bare serial
+/// numbers against the rack's sled inventory.
+async fn resolve_target_arg(client: &Client, target: &TargetArg) -> Result<Target, CommandError> {
+    match target {
+        TargetArg::Target(target) => Ok(target.clone()),
+        TargetArg::Abbreviated(sleds) => {
+            let inventory = client.versions().send().await?.into_inner();
+            sleds
+                .iter()
+                .map(|sled| match sled {
+                    SledArg::Sled(sled) => Ok(sled.clone()),
+                    SledArg::Serial(serial) => {
+                        let mut matches = inventory
+                            .iter()
+                            .map(|sled| &sled.baseboard)
+                            .filter(|b| b.serial_number.eq_ignore_ascii_case(serial));
+                        match (matches.next(), matches.next()) {
+                            (Some(baseboard), None) => Ok(SledId::Baseboard(baseboard.clone())),
+                            (None, _) => Err(CommandError::UnknownRackSerial(serial.to_owned())),
+                            (Some(_), Some(_)) => {
+                                Err(CommandError::AmbiguousSerial(serial.to_owned()))
+                            }
+                        }
+                    }
+                })
+                .collect::<Result<Vec<_>, _>>()
+                .map(Target::Sleds)
         }
     }
 }
@@ -2076,7 +2159,7 @@ pub enum CommandError {
     Interactive(#[from] InteractiveJobError),
     #[error("❌ Interactive jobs must target exactly one sled")]
     InteractiveTarget,
-    #[error("❌ I/O error accessing `{path}`: {error}")]
+    #[error("❌ Local I/O error accessing `{path}`: {error}")]
     Io {
         path: PathBuf,
         error: std::io::Error,
@@ -2164,6 +2247,8 @@ pub enum CommandError {
     TooMuchOutput,
     #[error("❌ No sled with serial `{serial}` has a status for job `{job_id}`")]
     UnknownSerial { serial: String, job_id: JobId },
+    #[error("❌ Serial `{0}` matches no sled in the rack inventory")]
+    UnknownRackSerial(String),
     #[error("❌ Chain root does not match any supplied root certificate")]
     UntrustedRoot,
     #[error("❌ Can't start interactive session: {0}")]
