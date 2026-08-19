@@ -329,7 +329,8 @@ async fn job_spawn(
     }
     cmd.env("SSH_CLIENT", "sush") // read bashrc
         .env("SUSH_JOB_ID", job_id.to_string())
-        .env("SUSH_COMMAND", &command);
+        .env("SUSH_COMMAND", &command)
+        .env("SUSH_JOB_OUTPUT_DIR", &job_dir);
 
     // Set process limits.
     unsafe {

@@ -100,7 +100,7 @@ fn check_status_stopped(
 #[tokio::test]
 async fn jobs() {
     let log = test_logger(function_name!());
-    let (mgr, mut root, _dir, _shutdown) = manager_and_test_root(log).await;
+    let (mgr, mut root, dir, _shutdown) = manager_and_test_root(log).await;
     let baseboard_id = mgr.own_baseboard();
     let authn = fake_identity(&mut root).await;
     let session_id = SessionId::random();
@@ -217,6 +217,38 @@ async fn jobs() {
             .into_bytes()
             .await
             .is_empty()
+    );
+
+    let job_id = session.next_job_id();
+    let output = dir
+        .path()
+        .join("jobs")
+        .join(job_id.to_string())
+        .display()
+        .to_string();
+    let job = root
+        .sign_job_request(&job_id, "printf %s \"$SUSH_JOB_OUTPUT_DIR\"", false)
+        .await;
+    mgr.job_start(
+        &authn,
+        job.clone().into_signed(),
+        JobStartParams {
+            wait: JobWait::Stop,
+            ..Default::default()
+        },
+    )
+    .await
+    .unwrap();
+    session.job_started(job.clone().into_signed());
+    let status = mgr.job_status(&authn, &job_id).await.unwrap()[baseboard_id].clone();
+    check_status_stopped(status, &job_id, Ok(0), Some(output.len() as u64), Some(0));
+    assert_eq!(
+        mgr.job_output(&authn, &job_id, baseboard_id, Stdout, None)
+            .await
+            .unwrap()
+            .into_bytes()
+            .await,
+        output.as_bytes(),
     );
 }
 
