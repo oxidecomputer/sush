@@ -249,32 +249,56 @@ fn watch_settling() {
         time_started: Utc::now(),
     };
 
-    let mut quiet = 0;
+    let all = Target::All;
+    let mut settling = Settling::default();
     let mut status = JobStatusMap::new();
-    assert!(
-        !watch_done(1, 0, &status, &mut quiet),
-        "empty never settles"
-    );
+    assert!(!settling.done(&all, None, &status), "empty never settles");
 
     status.insert(sled("A"), terminal.clone());
-    assert!(!watch_done(2, 0, &status, &mut quiet), "new sled resets");
-    assert!(!watch_done(3, 1, &status, &mut quiet), "first quiet poll");
+    assert!(!settling.done(&all, None, &status), "new sled resets");
+    assert!(!settling.done(&all, None, &status), "first quiet poll");
     assert!(
-        !watch_done(4, 1, &status, &mut quiet),
+        !settling.done(&all, None, &status),
         "quiet but too young for gossip"
     );
-    assert!(watch_done(5, 1, &status, &mut quiet), "old enough, quiet");
+    assert!(settling.done(&all, None, &status), "old enough, quiet");
 
-    let mut quiet = 0;
-    status.insert(sled("B"), running);
-    assert!(!watch_done(6, 2, &status, &mut quiet), "running sled holds");
-    assert_eq!(quiet, 0);
-
-    status.insert(sled("B"), terminal);
-    assert!(!watch_done(7, 2, &status, &mut quiet));
+    let mut settling = Settling::default();
+    status.insert(sled("B"), running.clone());
+    assert!(!settling.done(&all, None, &status), "running sled holds");
+    status.insert(sled("B"), terminal.clone());
     assert!(
-        watch_done(8, 2, &status, &mut quiet),
-        "settles once terminal"
+        !settling.done(&all, Some(2), &status),
+        "the rack count must hold"
+    );
+    assert!(
+        settling.done(&all, Some(2), &status),
+        "the rack count held twice"
+    );
+
+    let named: Target = format!("{},{}", sled("A"), sled("B")).parse().unwrap();
+    let mut settling = Settling::default();
+    assert!(
+        settling.done(&named, None, &status),
+        "named sleds settle on the first terminal poll"
+    );
+    let duplicates: Target = format!("{},{}", sled("A"), sled("A")).parse().unwrap();
+    let mut settling = Settling::default();
+    assert!(
+        settling.done(&duplicates, None, &status),
+        "duplicate baseboards collapse"
+    );
+    status.insert(sled("B"), running);
+    assert!(
+        !settling.done(&named, None, &status),
+        "a running named sled holds"
+    );
+    status.insert(sled("B"), terminal);
+    let missing: Target = format!("{},{}", sled("A"), sled("C")).parse().unwrap();
+    let mut settling = Settling::default();
+    assert!(
+        !settling.done(&missing, None, &status),
+        "a missing named sled holds"
     );
 }
 
@@ -1176,7 +1200,7 @@ async fn job(
                 StatusDisplayStyle::Short
             };
             if wait {
-                let status = job_watch(ctx, client, &job_id).await?;
+                let status = job_watch(ctx, client, &job_id, &Target::All).await?;
                 ctx.job_status(&job_id, &status, style);
                 Ok(())
             } else {
@@ -1310,7 +1334,7 @@ async fn job_start(
         start.await?;
         ctx.job_started(&job);
         let hasher = job_stream(ctx, client, &job_id, &target, &path, file).await?;
-        let status = job_watch(ctx, client, &job_id).await?;
+        let status = job_watch(ctx, client, &job_id, &target.clone().into()).await?;
         ctx.job_status(&job_id, &status, StatusDisplayStyle::Short);
         let Some(JobStatus::Stopped {
             result: Ok(0),
@@ -1342,12 +1366,11 @@ async fn job_start(
         // Watch the whole rack while the start request runs, and keep
         // watching until the job settles everywhere.
         ctx.job_watch_started(&job_id);
+        let job_target = job.payload().target().clone();
         let mut ticker = interval(WATCH_INTERVAL);
         ticker.set_missed_tick_behavior(MissedTickBehavior::Skip);
         let mut last = JobStatusMap::new();
-        let mut sleds = 0;
-        let mut quiet = 0;
-        let mut polls = 0;
+        let mut settling = Settling::default();
         let mut started = false;
         let mut stopped = false;
         let mut sigint = signal(SignalKind::interrupt())?;
@@ -1363,6 +1386,7 @@ async fn job_start(
                         }
                     }
                     started = true;
+                    ticker.reset_immediately();
                 }
 
                 _ = ticker.tick() => {
@@ -1376,11 +1400,10 @@ async fn job_start(
                         }
                     };
                     ctx.job_watch_update(&last);
-                    polls += 1;
-                    if started && watch_done(polls, sleds, &last, &mut quiet) {
+                    let rack = rack_sleds(client, &job_target).await;
+                    if settling.done(&job_target, rack, &last) && started {
                         break last;
                     }
-                    sleds = last.len();
                 }
 
                 // While the job runs, an interrupt stops it but keeps
@@ -1501,11 +1524,10 @@ async fn job_watch(
     ctx: &mut impl CommandContext,
     client: &Client,
     job_id: &JobId,
+    target: &Target,
 ) -> Result<JobStatusMap, CommandError> {
     ctx.job_watch_started(job_id);
-    let mut sleds = 0;
-    let mut quiet = 0;
-    let mut polls = 0;
+    let mut settling = Settling::default();
     let mut sigint = signal(SignalKind::interrupt())?;
     let status = loop {
         let status = match job_status_map(ctx, client, job_id).await {
@@ -1516,11 +1538,10 @@ async fn job_watch(
             }
         };
         ctx.job_watch_update(&status);
-        polls += 1;
-        if watch_done(polls, sleds, &status, &mut quiet) {
+        let rack = rack_sleds(client, target).await;
+        if settling.done(target, rack, &status) {
             break status;
         }
-        sleds = status.len();
         select! {
             _ = sleep(WATCH_INTERVAL) => {}
             _ = sigint.recv() => break status,
@@ -1535,16 +1556,55 @@ async fn job_watch(
 /// is likely still missing sleds.
 const WATCH_MIN_POLLS: usize = 5;
 
-/// A watched job has settled once the watch is old enough for gossip
-/// to have named every sled, every known sled reports a terminal
-/// status, and the set of sleds has been stable for a couple of polls.
-fn watch_done(polls: usize, sleds: usize, status: &JobStatusMap, quiet: &mut usize) -> bool {
-    if !status.is_empty() && status.len() == sleds && status.values().all(JobStatus::is_terminal) {
-        *quiet += 1;
-    } else {
-        *quiet = 0;
+/// Rolling settlement state for a watched job.
+#[derive(Default)]
+struct Settling {
+    polls: usize,
+    sleds: usize,
+    quiet: usize,
+    met: usize,
+}
+
+impl Settling {
+    /// A watched job has settled once every sled it runs on reports a
+    /// terminal status. A target naming only baseboards is settled as
+    /// soon as they all report. Against the rack inventory, the count
+    /// must match on consecutive polls. Either way, the watch is done
+    /// once it is old enough for gossip to have named every sled and
+    /// the set of sleds has been stable for a couple of polls.
+    fn done(&mut self, target: &Target, rack: Option<usize>, status: &JobStatusMap) -> bool {
+        self.polls += 1;
+        let terminal = !status.is_empty() && status.values().all(JobStatus::is_terminal);
+        if terminal && status.len() == self.sleds {
+            self.quiet += 1;
+        } else {
+            self.quiet = 0;
+        }
+        self.sleds = status.len();
+        if rack.is_some_and(|sleds| terminal && status.len() == sleds) {
+            self.met += 1;
+        } else {
+            self.met = 0;
+        }
+        if let Some(named) = target.named_baseboards()
+            && named
+                .into_iter()
+                .all(|sled| status.get(sled).is_some_and(JobStatus::is_terminal))
+        {
+            return true;
+        }
+        self.met >= 2 || (self.polls >= WATCH_MIN_POLLS && self.quiet >= 2)
     }
-    polls >= WATCH_MIN_POLLS && *quiet >= 2
+}
+
+/// The number of sleds in the rack's own inventory, where available.
+/// Skips the fetch for targets whose sleds are named.
+async fn rack_sleds(client: &Client, target: &Target) -> Option<usize> {
+    if target.named_baseboards().is_some() {
+        return None;
+    }
+    let sleds = client.versions().send().await.ok()?.into_inner().len();
+    (sleds > 0).then_some(sleds)
 }
 
 /// Stream some bytes into a vector.
