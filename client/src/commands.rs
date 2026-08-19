@@ -1478,23 +1478,33 @@ async fn job_start(
                 CommandError::JobStillRunning(job_id)
             });
         }
-        for stream in [Stdout, Stderr] {
-            match with_login_via(ctx, client, Some(&target), async || {
-                client
-                    .job_output()
-                    .job_id(job_id)
-                    .target(target.to_string())
-                    .stream(stream)
-                    .send()
-                    .await
-            })
-            .await
-            {
-                Ok(byte_stream) => {
-                    let output = byte_stream_to_vec(byte_stream.into_inner()).await?;
-                    ctx.job_output(&job_id, stream, &output, binary);
+        // Show the output of every sled the job ran on.
+        let multiple = status.len() > 1;
+        for baseboard in status.keys() {
+            if multiple {
+                ctx.job_output_target(baseboard);
+            }
+            for stream in [Stdout, Stderr] {
+                match with_login_via(ctx, client, Some(baseboard), async || {
+                    client
+                        .job_output()
+                        .job_id(job_id)
+                        .target(baseboard.to_string())
+                        .stream(stream)
+                        .send()
+                        .await
+                })
+                .await
+                {
+                    Ok(byte_stream) => {
+                        let output = byte_stream_to_vec(byte_stream.into_inner()).await?;
+                        ctx.job_output(&job_id, stream, &output, binary);
+                    }
+                    Err(error) if multiple => {
+                        let _ = ctx.job_error(error);
+                    }
+                    Err(error) => return Err(error),
                 }
-                Err(error) => return Err(error),
             }
         }
     } else {
