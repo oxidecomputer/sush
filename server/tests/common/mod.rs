@@ -27,7 +27,7 @@ use sprockets_tls_test_utils::{
 };
 use sush_common::authn::{Challenge, ChallengeResponse, Identity, Nonce, RequestKey};
 use sush_common::codephrases::Codephrase;
-use sush_common::jobs::{JobId, JobStartRequest, SignedJob};
+use sush_common::jobs::{JobId, JobStartRequest, SignedJob, Streaming};
 use sush_common::keys::{EphemeralKey, KeyType, Signer as _};
 use sush_common::targets::Target;
 use sush_server::gossip::GossipConfig;
@@ -154,6 +154,7 @@ pub async fn sign_job(root: &mut EphemeralKey, job_id: &JobId, command: &str) ->
         job_id.to_owned(),
         command,
         false,
+        Streaming::None,
         Target::All,
     ))
     .await

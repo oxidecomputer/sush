@@ -1207,6 +1207,9 @@
           "job_id": {
             "$ref": "#/components/schemas/JobId"
           },
+          "streaming": {
+            "$ref": "#/components/schemas/Streaming"
+          },
           "target": {
             "description": "The sleds this job runs on.",
             "type": "string"
@@ -1633,6 +1636,15 @@
         },
         "required": [
           "baseboard"
+        ]
+      },
+      "Streaming": {
+        "description": "Allow **unrecorded** streaming I/O.",
+        "type": "string",
+        "enum": [
+          "None",
+          "Input",
+          "Output"
         ]
       },
       "VersionInfo": {

@@ -164,6 +164,45 @@ impl Session {
     }
 }
 
+/// Allow **unrecorded** streaming I/O.
+#[derive(
+    BorshDeserialize,
+    BorshSerialize,
+    Clone,
+    Copy,
+    Debug,
+    Default,
+    Deserialize,
+    Eq,
+    JsonSchema,
+    PartialEq,
+    Serialize,
+)]
+pub enum Streaming {
+    #[default]
+    None,
+    Input,
+    Output,
+}
+
+impl Streaming {
+    pub fn is_none(&self) -> bool {
+        matches!(self, Self::None)
+    }
+
+    pub fn is_some(&self) -> bool {
+        !self.is_none()
+    }
+
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Self::None => "none",
+            Self::Input => "input",
+            Self::Output => "output",
+        }
+    }
+}
+
 /// A request to run the given `command` as `job_id`.
 #[derive(
     BorshDeserialize,
@@ -181,6 +220,8 @@ pub struct JobStartRequest {
     pub command: String,
     #[serde(default, skip_serializing_if = "is_false")]
     pub interactive: bool,
+    #[serde(default, skip_serializing_if = "Streaming::is_none")]
+    pub streaming: Streaming,
     /// The sleds this job runs on.
     #[borsh(
         serialize_with = "borsh_ser_target",
@@ -201,12 +242,14 @@ impl JobStartRequest {
         job_id: JobId,
         command: S,
         interactive: bool,
+        streaming: Streaming,
         target: Target,
     ) -> Self {
         Self {
             job_id,
             command: command.as_ref().to_string(),
             interactive,
+            streaming,
             target,
         }
     }
@@ -250,12 +293,18 @@ impl ToBeSigned for JobStartRequest {
             job_id,
             command,
             interactive,
+            streaming,
             target,
         } = self;
         hash_with_len(Self::TYPE_NAME);
         hash_with_len(&job_id.to_be_bytes());
         hash_with_len(command.as_bytes());
         hash_with_len(if *interactive { &[1] } else { &[0] });
+        hash_with_len(match streaming {
+            Streaming::None => &[0],
+            Streaming::Input => &[1],
+            Streaming::Output => &[2],
+        });
         hash_with_len(target.to_string().as_bytes());
         hasher.finalize().as_bytes().to_vec()
     }
@@ -736,7 +785,13 @@ mod test {
         let me = sled("me");
         let cubbies = Cubbies::from([(14, me.clone())]);
         let job = |interactive, target| {
-            JobStartRequest::new(JobId::random(), "true", interactive, target)
+            JobStartRequest::new(
+                JobId::random(),
+                "true",
+                interactive,
+                Streaming::None,
+                target,
+            )
         };
         let just_me = Target::Sleds(vec![SledId::Baseboard(me.clone())]);
         assert!(job(true, just_me.clone()).runs_on(&me, &cubbies));

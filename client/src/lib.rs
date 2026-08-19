@@ -80,6 +80,7 @@ progenitor::generate_api!(
         Signature = sush_common::keys::Signature,
         SignedForJobStartRequest = sush_common::jobs::SignedJob,
         SledVersion = sush_common::targets::SledVersion,
+        Streaming = sush_common::jobs::Streaming,
         VersionInfo = sush_common::version::VersionInfo,
     },
     timeout = 600,

@@ -7,6 +7,8 @@
 //! May be executed via either the main CLI or the interactive REPL.
 
 use std::fs::{File, OpenOptions, read};
+#[cfg(feature = "permslip")]
+use std::io::ErrorKind;
 use std::io::{Read as _, Seek as _, SeekFrom, Write as _, stdin};
 use std::num::{NonZeroU8, NonZeroU64};
 use std::path::{Path, PathBuf};
@@ -42,13 +44,13 @@ use sush_api::JobWait;
 use sush_common::authn::{
     AuthnError, Challenge, ChallengeResponse, Credentials, Identity, RequestKey,
 };
-use sush_common::interactive::InteractiveJobError;
+use sush_common::interactive::{InteractiveJobError, InteractiveJobMessage};
 use sush_common::jobs::JobOutputStream::{self, Stderr, Stdout};
 #[cfg(feature = "permslip")]
 use sush_common::jobs::JobStartRequest;
 use sush_common::jobs::{
     Access, JobId, JobLimits, JobOutputHash, JobOutputState, JobStatus, JobStatusMap, Session,
-    SessionId, SignedJob, job_status_try_from_json_map,
+    SessionId, SignedJob, Streaming, job_status_try_from_json_map,
 };
 use sush_common::keys::{KeyError, KeyId, Signer as _};
 use sush_common::targets::{SledId, Target};
@@ -571,6 +573,18 @@ pub struct JobStartArgs {
     #[arg(short, long)]
     interactive: bool,
 
+    /// Stream the job's output to an attached client instead of recording it.
+    #[arg(short = 'S', long, conflicts_with = "interactive")]
+    streaming: bool,
+
+    /// File that streamed output should be written to.
+    #[arg(short, long)]
+    file: Option<PathBuf>,
+
+    /// Overwrite the output file if it exists.
+    #[arg(long, requires = "file")]
+    force: bool,
+
     /// Where the job runs: every sled (`*`), or a comma-separated list
     /// of cubby numbers and baseboard IDs.
     #[arg(short = 'T', long, default_value = "*")]
@@ -1049,6 +1063,7 @@ async fn job(
                         ref job_id,
                         ref permslip_url,
                         ref interactive,
+                        ref streaming,
                         ref target,
                         ..
                     },
@@ -1088,15 +1103,29 @@ async fn job(
             let Some(permslip_url) = permslip_url else {
                 return Err(CommandError::MissingPermslipUrl);
             };
-            // Sign an interactive job for the sled its attachment
-            // will land on.
-            let target = if *interactive && target.single_baseboard().is_none() {
+            // Sign an interactive or streaming job for the sled its
+            // attachment will land on.
+            let target = if (*interactive || *streaming) && target.single_baseboard().is_none() {
                 let Some(client) = client.as_ref() else {
                     return Err(CommandError::InteractiveTarget);
                 };
                 Target::from(resolve_target(client, target).await?)
             } else {
                 target.clone()
+            };
+            // Catch output file problems before the signing ceremony.
+            if *streaming {
+                let Some(path) = &start_args.file else {
+                    return Err(CommandError::StreamingNeedsFile);
+                };
+                if !start_args.force && path.exists() {
+                    return Err(CommandError::io(path, ErrorKind::AlreadyExists.into()));
+                }
+            }
+            let streaming = if *streaming {
+                Streaming::Output
+            } else {
+                Streaming::None
             };
             let mut signer = PermslipSigner::new(key_name, permslip_url).await?;
             let mut interval = interval(SIGNING_UPDATE_INTERVAL);
@@ -1105,6 +1134,7 @@ async fn job(
                 job_id.to_owned(),
                 command,
                 *interactive,
+                streaming,
                 target,
             ));
             pin!(sign);
@@ -1213,10 +1243,13 @@ async fn job_start(
         limits,
         term,
         wait,
+        file,
+        force,
         ..
     } = start_args;
     let interactive = job.payload().interactive;
-    let wait = if interactive {
+    let streaming = matches!(job.payload().streaming, Streaming::Output);
+    let wait = if interactive || streaming {
         JobWait::Start
     } else if wait {
         JobWait::Stop
@@ -1259,6 +1292,51 @@ async fn job_start(
                 job_status(ctx, client, &job_id, StatusDisplayStyle::Short).await?
             }
             Err(error) => return Err(error),
+        }
+    } else if streaming {
+        let Some(path) = file else {
+            return Err(CommandError::StreamingNeedsFile);
+        };
+        let mut options = OpenOptions::new();
+        options.write(true);
+        if force {
+            options.create(true);
+        } else {
+            options.create_new(true);
+        }
+        let file = options
+            .open(&path)
+            .map_err(|error| CommandError::io(&path, error))?;
+        start.await?;
+        ctx.job_started(&job);
+        let hasher = job_stream(ctx, client, &job_id, &target, &path, file).await?;
+        let status = job_watch(ctx, client, &job_id).await?;
+        ctx.job_status(&job_id, &status, StatusDisplayStyle::Short);
+        let Some(JobStatus::Stopped {
+            result: Ok(0),
+            output:
+                JobOutputState {
+                    stdout_len,
+                    stdout_hash,
+                    ..
+                },
+            ..
+        }) = status.get(&target)
+        else {
+            return Err(CommandError::StreamUnverified(job_id));
+        };
+        if *stdout_len != hasher.count() {
+            return Err(CommandError::LengthMismatch {
+                expected: *stdout_len,
+                received: hasher.count(),
+            });
+        }
+        let received = JobOutputHash::from(hasher.finalize());
+        if received != *stdout_hash {
+            return Err(CommandError::OutputHashMismatch {
+                expected: stdout_hash.to_owned(),
+                received,
+            });
         }
     } else if wait.is_some() {
         // Watch the whole rack while the start request runs, and keep
@@ -1778,6 +1856,48 @@ async fn job_attach(
     }
 }
 
+/// Receive a streaming job's output into an open file, returning the
+/// hasher fed by the received bytes.
+async fn job_stream(
+    ctx: &mut impl CommandContext,
+    client: &Client,
+    job_id: &JobId,
+    target: &BaseboardId,
+    path: &Path,
+    mut file: File,
+) -> Result<Hasher, CommandError> {
+    let io_error = |error| CommandError::io(path, error);
+    let socket = with_login_via(ctx, client, Some(target), async || {
+        client
+            .job_attach()
+            .job_id(job_id)
+            .target(target.to_string())
+            .send()
+            .await
+    })
+    .await?
+    .into_inner();
+    let mut stream = WebSocketStream::from_raw_socket(socket, Role::Client, None).await;
+    file.set_len(0).map_err(io_error)?;
+    let mut hasher = Hasher::new();
+    ctx.job_output_started(job_id, Stdout, "Streaming", 0);
+    while let Some(message) = stream.next().await {
+        match InteractiveJobMessage::try_from(message.map_err(InteractiveJobError::from)?)? {
+            InteractiveJobMessage::Data(bytes) => {
+                hasher.update(&bytes);
+                file.write_all(&bytes).map_err(io_error)?;
+                ctx.job_output_update(job_id, Stdout, bytes.len() as u64);
+            }
+            InteractiveJobMessage::Close => break,
+            InteractiveJobMessage::Control(_) | InteractiveJobMessage::Ignore => (),
+        }
+    }
+    file.flush().map_err(io_error)?;
+    ctx.job_output_finished(job_id, Stdout, Some("✅ Streamed"));
+    let _ = stream.close(None).await;
+    Ok(hasher)
+}
+
 /// Resolve a target to the baseboard of one sled it names. A single
 /// baseboard resolves locally. Anything else asks `/target`, routed
 /// by the expression, so a proxy resolves cubbies and `*` means the
@@ -1948,6 +2068,10 @@ pub enum CommandError {
     #[cfg(not(feature = "permslip"))]
     #[error("❌ Signing unavailable: built without the `permslip` feature")]
     SigningUnavailable,
+    #[error("❌ Streaming jobs need `--file`")]
+    StreamingNeedsFile,
+    #[error("❌ Job `{0}` did not exit cleanly, streamed output is unverified")]
+    StreamUnverified(JobId),
     #[error("❌ Can't parse target baseboard ID: {0}")]
     BaseboardIdParseError(sled_hardware_types::BaseboardIdParseError),
     #[error("❌ SSH key error: {0}")]

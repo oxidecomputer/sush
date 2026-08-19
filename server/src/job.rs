@@ -43,7 +43,9 @@ use tokio_tungstenite::tungstenite::protocol::Message as WebSocketMessage;
 use sush_common::interactive::{
     INTERACTIVE_JOB_BUFFER_SIZE, InteractiveJobControl as Control, InteractiveJobMessage as Message,
 };
-use sush_common::jobs::{Access, JobLimits, JobOutputState, JobOutputStream::*, ProcessError};
+use sush_common::jobs::{
+    Access, JobLimits, JobOutputState, JobOutputStream::*, ProcessError, Streaming,
+};
 use tokio_util::sync::CancellationToken;
 
 use crate::executor::kill_job;
@@ -54,12 +56,17 @@ pub type SocketStream = WebSocketStream<WebsocketConnectionRaw>;
 pub type SocketSender = mpsc::Sender<(SocketStream, Access)>;
 pub type SocketReceiver = mpsc::Receiver<(SocketStream, Access)>;
 
+/// How long a finished streaming job waits for its consumer to
+/// attach or make progress.
+const STREAMING_LINGER: Duration = Duration::from_secs(600);
+
 pub struct Job {
     task: JoinHandle<(Result<i32, ProcessError>, JobOutputState)>,
     tx_client: SocketSender,
 }
 
 impl Job {
+    #[allow(clippy::too_many_arguments)]
     pub fn start(
         log: Logger,
         limits: JobLimits,
@@ -67,11 +74,14 @@ impl Job {
         io: JobIo,
         stdout: File,
         stderr: File,
+        streaming: Streaming,
         stop: CancellationToken,
     ) -> Self {
         let (tx_client, rx_client) = mpsc::channel(1);
         Self {
-            task: spawn(job(log, limits, child, io, stdout, stderr, rx_client, stop)),
+            task: spawn(job(
+                log, limits, child, io, stdout, stderr, streaming, rx_client, stop,
+            )),
             tx_client,
         }
     }
@@ -95,6 +105,7 @@ async fn job(
     mut io: JobIo,
     mut stdout_file: File,
     mut stderr_file: File,
+    streaming: Streaming,
     mut rx_client: SocketReceiver,
     stop: CancellationToken,
 ) -> (Result<i32, ProcessError>, JobOutputState) {
@@ -104,22 +115,54 @@ async fn job(
     let mut fatal = Option::<ProcessError>::None;
     let mut killed = false;
     let mut dead = false;
+    let streaming = matches!(streaming, Streaming::Output);
+    let mut pending = Option::<Bytes>::None;
+    let mut attached = false;
+    let (tx_output, rx_output) = mpsc::channel(1);
+    let (tx_socket, rx_socket) = mpsc::channel(1);
+    if streaming {
+        spawn(stream_output(
+            log.clone(),
+            rx_socket,
+            rx_output,
+            stop.clone(),
+        ));
+    }
+    let mut eof = false;
     let drain_timeout = sleep(Duration::default());
     pin!(drain_timeout);
+    let linger = sleep(Duration::default());
+    pin!(linger);
     loop {
+        // A finished stream is done once its consumer has taken every chunk.
+        if eof && attached && pending.is_none() {
+            break;
+        }
         select! {
             // Read available job output, record it, and relay it to the clients
             // if there are any. We try to read regardless of whether the process
             // is known to be dead; it is essential to drain output that may be
             // sent before it dies, but which arrives after detection of its death.
-            read = io.read_output() => {
+            read = io.read_output(), if pending.is_none() && !eof => {
                 match read {
                     Ok((buf, _)) if buf.is_empty() => {
                         debug!(log, "EOF on all job output streams");
-                        break;
+                        if !streaming {
+                            break;
+                        }
+                        eof = true;
+                        linger.as_mut().reset(Instant::now() + STREAMING_LINGER);
                     }
                     Ok((buf, stream)) => {
+                        if dead && streaming {
+                            drain_timeout.as_mut().reset(Instant::now() + io.drain_timeout());
+                        }
                         match stream {
+                            Stdout if streaming => {
+                                stdout_hasher.update(&buf);
+                                pending = Some(buf);
+                                continue;
+                            }
                             Stdout => {
                                 stdout_hasher.update(&buf);
                                 if let Err(error) = stdout_file.write_all(&buf).await {
@@ -167,6 +210,11 @@ async fn job(
                         if !dead {
                             error!(log, "error reading from job process"; "error" => %error);
                         }
+                        if streaming {
+                            eof = true;
+                            linger.as_mut().reset(Instant::now() + STREAMING_LINGER);
+                            continue;
+                        }
                         if let Err(error) = clients.send(Message::Close.try_into().unwrap()) {
                             error!(log, "failed to send close message to clients"; "error" => %error);
                         }
@@ -175,8 +223,34 @@ async fn job(
                 }
             }
 
+            permit = tx_output.reserve(), if pending.is_some() => {
+                match permit {
+                    Ok(permit) => {
+                        if dead {
+                            drain_timeout.as_mut().reset(Instant::now() + io.drain_timeout());
+                        }
+                        if eof {
+                            linger.as_mut().reset(Instant::now() + STREAMING_LINGER);
+                        }
+                        if let Some(buf) = pending.take() {
+                            permit.send(buf);
+                        }
+                    }
+                    Err(_) => pending = None,
+                }
+            }
+
             // Attach a new client, send it the current window size, and play back the last buffer.
-            Some((mut client, access)) = rx_client.recv(), if !dead => {
+            // Streaming jobs accept one read-write consumer, even posthumously.
+            Some((mut client, access)) = rx_client.recv(), if !dead || streaming => {
+                if streaming {
+                    if access != Access::ReadWrite || attached || tx_socket.try_send(client).is_err() {
+                        debug!(log, "refused streaming client");
+                    } else {
+                        attached = true;
+                    }
+                    continue;
+                }
                 match io.get_window_size() {
                     Err(error) => error!(log, "failed to get pseudoterminal window size"; "error" => %error),
                     Ok(size) => {
@@ -259,8 +333,14 @@ async fn job(
                 dead = true;
             }
 
+            // Give up on a stream whose consumer never drained it.
+            _ = &mut linger, if eof => {
+                warn!(log, "streaming consumer never drained the output");
+                break;
+            }
+
             // Give output a chance to drain from a dead process.
-            _ = &mut drain_timeout, if dead => {
+            _ = &mut drain_timeout, if dead && !eof => {
                 match io {
                     JobIo::Interactive { .. } => debug!(log, "drained job output"),
                     JobIo::Batch { .. } => warn!(
@@ -272,6 +352,10 @@ async fn job(
                 break;
             }
         }
+    }
+
+    if let Some(buf) = pending {
+        let _ = tx_output.try_send(buf);
     }
 
     // Reap the process.
@@ -301,6 +385,27 @@ async fn job(
     };
 
     (result, output_state)
+}
+
+/// Deliver streamed output to the single attached client.
+async fn stream_output(
+    log: Logger,
+    mut rx_socket: mpsc::Receiver<SocketStream>,
+    mut rx_output: mpsc::Receiver<Bytes>,
+    stop: CancellationToken,
+) {
+    let Some(mut client) = rx_socket.recv().await else {
+        return;
+    };
+    while let Some(buf) = rx_output.recv().await {
+        if let Err(error) = client.send(Message::Data(buf).try_into().unwrap()).await {
+            error!(log, "failed to stream output to client"; "error" => %error);
+            stop.cancel();
+            return;
+        }
+    }
+    let _ = client.send(Message::Close.try_into().unwrap()).await;
+    let _ = client.close(None).await;
 }
 
 fn process_exit(exit_status: ExitStatus) -> Result<i32, ProcessError> {
@@ -382,6 +487,7 @@ mod test {
                     .open("/dev/null")
                     .await
                     .unwrap(),
+                Streaming::None,
                 stop,
             );
             assert_eq!(job.wait().await.unwrap().0.unwrap(), 0);
