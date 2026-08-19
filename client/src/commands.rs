@@ -1940,22 +1940,44 @@ async fn job_stream(
     let mut stream = WebSocketStream::from_raw_socket(socket, Role::Client, None).await;
     file.set_len(0).map_err(io_error)?;
     let mut hasher = Hasher::new();
+    let mut sigint = signal(SignalKind::interrupt())?;
     ctx.job_output_started(job_id, Stdout, "Streaming", 0);
-    while let Some(message) = stream.next().await {
-        match InteractiveJobMessage::try_from(message.map_err(InteractiveJobError::from)?)? {
-            InteractiveJobMessage::Data(bytes) => {
-                hasher.update(&bytes);
-                file.write_all(&bytes).map_err(io_error)?;
-                ctx.job_output_update(job_id, Stdout, bytes.len() as u64);
+    let result = loop {
+        select! {
+            message = stream.next() => {
+                let Some(message) = message else { break Ok(()) };
+                let message = match message.map_err(InteractiveJobError::from) {
+                    Ok(message) => message,
+                    Err(error) => break Err(error.into()),
+                };
+                match InteractiveJobMessage::try_from(message) {
+                    Ok(InteractiveJobMessage::Data(bytes)) => {
+                        hasher.update(&bytes);
+                        if let Err(error) = file.write_all(&bytes).map_err(io_error) {
+                            break Err(error);
+                        }
+                        ctx.job_output_update(job_id, Stdout, bytes.len() as u64);
+                    }
+                    Ok(InteractiveJobMessage::Close) => break Ok(()),
+                    Ok(InteractiveJobMessage::Control(_) | InteractiveJobMessage::Ignore) => (),
+                    Err(error) => break Err(error.into()),
+                }
             }
-            InteractiveJobMessage::Close => break,
-            InteractiveJobMessage::Control(_) | InteractiveJobMessage::Ignore => (),
+            _ = sigint.recv() => break Err(CommandError::Canceled),
+        }
+    };
+    match result {
+        Ok(()) => {
+            file.flush().map_err(io_error)?;
+            ctx.job_output_finished(job_id, Stdout, Some("✅ Streamed"));
+            let _ = stream.close(None).await;
+            Ok(hasher)
+        }
+        Err(error) => {
+            ctx.job_output_finished(job_id, Stdout, Some("❌ Received"));
+            Err(error)
         }
     }
-    file.flush().map_err(io_error)?;
-    ctx.job_output_finished(job_id, Stdout, Some("✅ Streamed"));
-    let _ = stream.close(None).await;
-    Ok(hasher)
 }
 
 /// Resolve a target to the baseboard of one sled it names. A single
