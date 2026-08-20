@@ -10,7 +10,7 @@
 //! against a mapping the rack learns at runtime, so a target is
 //! evaluated lazily, against what is known when it is asked.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
 use std::str::FromStr;
 
@@ -83,6 +83,20 @@ impl Target {
                 [SledId::Baseboard(baseboard)] => Some(baseboard),
                 _ => None,
             },
+        }
+    }
+
+    /// Every sled this target names, when it names only baseboards.
+    pub fn named_baseboards(&self) -> Option<BTreeSet<&BaseboardId>> {
+        match self {
+            Self::All => None,
+            Self::Sleds(sleds) => sleds
+                .iter()
+                .map(|sled| match sled {
+                    SledId::Baseboard(baseboard) => Some(baseboard),
+                    SledId::Cubby(_) => None,
+                })
+                .collect(),
         }
     }
 }

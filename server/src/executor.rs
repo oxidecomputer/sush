@@ -32,7 +32,7 @@ use tokio_util::sync::CancellationToken;
 use sush_api::JobStartParams;
 use sush_common::interactive::WindowSize;
 use sush_common::jobs::{
-    JobId, JobOutputStream, JobStartRequest, ProcessError, SignedJob, VerifiedJob,
+    JobId, JobOutputStream, JobStartRequest, ProcessError, SignedJob, Streaming, VerifiedJob,
 };
 
 use crate::io::JobIo;
@@ -180,7 +180,8 @@ async fn job_spawn(
         job_id,
         command,
         interactive,
-        target: _,
+        streaming,
+        target,
     } = request.payload().clone();
     let JobStartParams {
         limits: requested,
@@ -208,6 +209,22 @@ async fn job_spawn(
             "max_fsize" => dirs.max_fsize(),
         );
         limits.max_fsize = dirs.max_fsize();
+    }
+
+    if interactive && streaming.is_some() {
+        let error = ProcessError::InvalidJob("interactive jobs cannot stream".to_string());
+        send_error(&log, &job_id, &events, error).await;
+        return;
+    }
+    if matches!(streaming, Streaming::Input) {
+        let error = ProcessError::InvalidJob("streaming input is not implemented".to_string());
+        send_error(&log, &job_id, &events, error).await;
+        return;
+    }
+    if streaming.is_some() && target.single_baseboard().is_none() {
+        let error = ProcessError::InvalidJob("streaming jobs must target one sled".to_string());
+        send_error(&log, &job_id, &events, error).await;
+        return;
     }
 
     // Report all I/O errors as job events.
@@ -238,16 +255,23 @@ async fn job_spawn(
     );
     let stdout_path = dirs.job_output_path(&job_id, Stdout);
     let stderr_path = dirs.job_output_path(&job_id, Stderr);
-    let stdout_file = with_io_err!(
-        OpenOptions::new()
-            .create_new(true)
-            .read(true) // needed for interactive job output playback
-            .write(true)
-            .mode(file_mode)
-            .open(&stdout_path)
-            .await,
-        format!("creating job stdout file `{}`", stdout_path.display())
-    );
+    let stdout_file = if matches!(streaming, Streaming::Output) {
+        with_io_err!(
+            OpenOptions::new().write(true).open("/dev/null").await,
+            "opening /dev/null for streamed output".to_string()
+        )
+    } else {
+        with_io_err!(
+            OpenOptions::new()
+                .create_new(true)
+                .read(true) // needed for interactive job output playback
+                .write(true)
+                .mode(file_mode)
+                .open(&stdout_path)
+                .await,
+            format!("creating job stdout file `{}`", stdout_path.display())
+        )
+    };
     let stderr_file = with_io_err!(
         OpenOptions::new()
             .create_new(true)
@@ -305,7 +329,8 @@ async fn job_spawn(
     }
     cmd.env("SSH_CLIENT", "sush") // read bashrc
         .env("SUSH_JOB_ID", job_id.to_string())
-        .env("SUSH_COMMAND", &command);
+        .env("SUSH_COMMAND", &command)
+        .env("SUSH_JOB_OUTPUT_DIR", &job_dir);
 
     // Set process limits.
     unsafe {
@@ -382,6 +407,7 @@ async fn job_spawn(
             io,
             stdout_file,
             stderr_file,
+            streaming,
             stop,
         )
     } else {
@@ -397,12 +423,13 @@ async fn job_spawn(
             child.stderr.take().expect("batch job should have stderr"),
         );
         Job::start(
-            log.new(o!("interactive" => interactive)),
+            log.new(o!("interactive" => interactive, "streaming" => streaming.as_str())),
             limits,
             child,
             io,
             stdout_file,
             stderr_file,
+            streaming,
             stop,
         )
     };

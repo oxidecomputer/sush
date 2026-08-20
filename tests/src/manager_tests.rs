@@ -30,7 +30,7 @@ use sush_client::context::Authz;
 use sush_common::authn::{Challenge, ChallengeResponse, Credentials, Identity, Nonce, RequestKey};
 use sush_common::jobs::{
     Access, JobId, JobLimits, JobOutputState, JobOutputStream::*, JobStartRequest, JobStatus,
-    ProcessError, Session, SessionId, SignedJob,
+    ProcessError, Session, SessionId, SignedJob, Streaming,
 };
 use sush_common::keys::{EphemeralKey, KeyError, KeyId, KeyType, Signer as _, pem_cert_chain};
 use sush_common::targets::{Cubbies, Target};
@@ -100,7 +100,7 @@ fn check_status_stopped(
 #[tokio::test]
 async fn jobs() {
     let log = test_logger(function_name!());
-    let (mgr, mut root, _dir, _shutdown) = manager_and_test_root(log).await;
+    let (mgr, mut root, dir, _shutdown) = manager_and_test_root(log).await;
     let baseboard_id = mgr.own_baseboard();
     let authn = fake_identity(&mut root).await;
     let session_id = SessionId::random();
@@ -217,6 +217,38 @@ async fn jobs() {
             .into_bytes()
             .await
             .is_empty()
+    );
+
+    let job_id = session.next_job_id();
+    let output = dir
+        .path()
+        .join("jobs")
+        .join(job_id.to_string())
+        .display()
+        .to_string();
+    let job = root
+        .sign_job_request(&job_id, "printf %s \"$SUSH_JOB_OUTPUT_DIR\"", false)
+        .await;
+    mgr.job_start(
+        &authn,
+        job.clone().into_signed(),
+        JobStartParams {
+            wait: JobWait::Stop,
+            ..Default::default()
+        },
+    )
+    .await
+    .unwrap();
+    session.job_started(job.clone().into_signed());
+    let status = mgr.job_status(&authn, &job_id).await.unwrap()[baseboard_id].clone();
+    check_status_stopped(status, &job_id, Ok(0), Some(output.len() as u64), Some(0));
+    assert_eq!(
+        mgr.job_output(&authn, &job_id, baseboard_id, Stdout, None)
+            .await
+            .unwrap()
+            .into_bytes()
+            .await,
+        output.as_bytes(),
     );
 }
 
@@ -1124,7 +1156,13 @@ async fn job_targets() {
 
     let mut start = async |command: &str, target: &str| {
         let job_id = session.next_job_id();
-        let request = JobStartRequest::new(job_id, command, false, target.parse().unwrap());
+        let request = JobStartRequest::new(
+            job_id,
+            command,
+            false,
+            Streaming::None,
+            target.parse().unwrap(),
+        );
         let job = root
             .sign(request)
             .await
@@ -2128,4 +2166,48 @@ async fn job_json() {
         .join("job.json");
     let recorded: SignedJob = serde_json::from_slice(&read(&path).await.unwrap()).unwrap();
     assert_eq!(recorded, job.into_signed());
+}
+
+#[named]
+#[tokio::test]
+async fn streaming_validation() {
+    let log = test_logger(function_name!());
+    let (mgr, mut root, _dir, _shutdown) = manager_and_test_root(log).await;
+    let authn = fake_identity(&mut root).await;
+    let session_id = SessionId::random();
+    let mut session = Session::new(session_id);
+    mgr.session_start(&authn, session_id, true).await.unwrap();
+
+    let mut expect_invalid = async |streaming, target: Target| {
+        let job_id = session.next_job_id();
+        let job = root
+            .sign_full_job_request(&job_id, "true", false, streaming, target)
+            .await;
+        session.job_started(job.clone().into_signed());
+        mgr.job_start(&authn, job.into_signed(), JobStartParams::default())
+            .await
+            .unwrap();
+        let status = timeout(Duration::from_secs(5), async {
+            loop {
+                if let Ok(status) = mgr.job_status(&authn, &job_id).await
+                    && let Some(status) = status.get(mgr.own_baseboard())
+                    && status.is_terminal()
+                {
+                    break status.clone();
+                }
+                sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .unwrap();
+        assert!(matches!(status, JobStatus::Error { .. }), "{status:?}");
+    };
+
+    expect_invalid(Streaming::Output, Target::All).await;
+    expect_invalid(
+        Streaming::Output,
+        format!("{},14", test_baseboard_id()).parse().unwrap(),
+    )
+    .await;
+    expect_invalid(Streaming::Input, test_baseboard_id().into()).await;
 }

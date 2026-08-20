@@ -26,7 +26,7 @@ use sush_client::context::Authz;
 use sush_client::{Client, ResponseValue};
 use sush_common::authn::{Challenge, ChallengeResponse, Credentials, Identity, Nonce, RequestKey};
 use sush_common::codephrases::Codephrase;
-use sush_common::jobs::{JobId, JobStartRequest, VerifiedJob};
+use sush_common::jobs::{JobId, JobStartRequest, Streaming, VerifiedJob};
 use sush_common::keys::{EphemeralKey, KeyType, Signer};
 use sush_common::targets::{Cubbies, Target};
 use sush_server::executor::PathIsolation;
@@ -82,21 +82,47 @@ pub trait SignJobRequest {
         command: S,
         interactive: bool,
         target: Target,
-    ) -> VerifiedJob;
-}
+    ) -> VerifiedJob {
+        self.sign_full_job_request(job_id, command, interactive, Streaming::None, target)
+            .await
+    }
 
-impl SignJobRequest for EphemeralKey {
-    async fn sign_job_request_for<S: AsRef<str>>(
+    /// Sign a batch job request with unrecorded output streaming.
+    async fn sign_streaming_job_request<S: AsRef<str>>(
+        &mut self,
+        job_id: &JobId,
+        command: S,
+        target: Target,
+    ) -> VerifiedJob {
+        self.sign_full_job_request(job_id, command, false, Streaming::Output, target)
+            .await
+    }
+
+    /// Sign a job request with every field specified.
+    async fn sign_full_job_request<S: AsRef<str>>(
         &mut self,
         job_id: &JobId,
         command: S,
         interactive: bool,
+        streaming: Streaming,
+        target: Target,
+    ) -> VerifiedJob;
+}
+
+impl SignJobRequest for EphemeralKey {
+    async fn sign_full_job_request<S: AsRef<str>>(
+        &mut self,
+        job_id: &JobId,
+        command: S,
+        interactive: bool,
+        streaming: Streaming,
         target: Target,
     ) -> VerifiedJob {
         self.sign(JobStartRequest::new(
             job_id.to_owned(),
             command,
             interactive,
+            streaming,
             target,
         ))
         .await

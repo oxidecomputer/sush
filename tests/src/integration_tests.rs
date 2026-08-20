@@ -18,7 +18,7 @@ use futures::{SinkExt as _, StreamExt as _};
 use tokio::io::{AsyncRead, AsyncWrite};
 use tokio::sync::watch;
 use tokio::test;
-use tokio::time::timeout;
+use tokio::time::{sleep, timeout};
 use tokio_tungstenite::WebSocketStream;
 use tokio_tungstenite::tungstenite::protocol::Role;
 use tokio_util::sync::CancellationToken;
@@ -41,7 +41,10 @@ use sush_api::sush_api_mod::api_description;
 use sush_client::tls::client as tls_client;
 use sush_client::{AuthzSigner, Client, Error as ClientError};
 use sush_common::interactive::{InteractiveJobControl, InteractiveJobMessage};
-use sush_common::jobs::{Access, JobLimits, JobOutputStream, Session, SessionId};
+use sush_common::jobs::{
+    Access, JobLimits, JobOutputState, JobOutputStream, JobStatus, Session, SessionId,
+    job_status_try_from_json_map,
+};
 use sush_common::keys::{EphemeralKey, KeyType, pem_cert_chain};
 use sush_common::targets::Cubbies;
 use sush_server::proxy::{Targets, platform_tls};
@@ -803,4 +806,269 @@ async fn interactive_job() {
             .expect("can't get output bytes"),
         hello_again,
     );
+}
+
+#[named]
+#[test]
+async fn streaming_job() {
+    const LEN: usize = 0x40000;
+
+    // Spin up a server.
+    let log = test_logger(function_name!());
+    let (mgr, mut root, _dir, _shutdown) = manager_and_test_root(log.clone()).await;
+    let api = api_description::<ApiServer>().unwrap();
+    let server = ServerBuilder::new(api, Arc::new(mgr), log)
+        .config(ConfigDropshot {
+            bind_address: local_addr(),
+            ..Default::default()
+        })
+        .start()
+        .expect("failed to start server");
+
+    // Connect and authenticate to the server.
+    let addr = server.local_addr();
+    let signer = AuthzSigner::default();
+    let client = Client::new(&format!("http://{addr}"), signer.clone());
+    let ClientError::ErrorResponse(unauthz) = client.iam().body(None).send().await.unwrap_err()
+    else {
+        panic!("expected error response")
+    };
+    let (_identity, credentials) = authz(&client, unauthz, &mut root).await;
+    signer.set(Some(credentials));
+
+    // Start a streaming job too big for its pipe, so it blocks until we attach.
+    let session = Session::new(SessionId::random());
+    client
+        .session_start()
+        .session_id(session.session_id())
+        .send()
+        .await
+        .expect("can't start session");
+    let job_id = session.next_job_id();
+    let job = root
+        .sign_streaming_job_request(
+            &job_id,
+            "dd if=/dev/zero bs=4096 count=64 2>/dev/null",
+            test_baseboard_id().into(),
+        )
+        .await;
+    let JobLimits {
+        max_cpu,
+        max_mem,
+        max_fsize,
+    } = JobLimits::default();
+    client
+        .job_start()
+        .job_id(job_id)
+        .target(test_baseboard_id().to_string())
+        .max_cpu(max_cpu)
+        .max_mem(max_mem)
+        .max_fsize(max_fsize)
+        .wait(JobWait::Start)
+        .body(job.into_signed())
+        .send()
+        .await
+        .expect("can't start job");
+
+    // Attach and collect the whole stream.
+    let socket = client
+        .job_attach()
+        .job_id(job_id)
+        .target(test_baseboard_id().to_string())
+        .send()
+        .await
+        .expect("can't attach to job")
+        .into_inner();
+    let mut stream = WebSocketStream::from_raw_socket(socket, Role::Client, None).await;
+    let mut streamed = BytesMut::new();
+    loop {
+        let recvd = timeout(TIMEOUT, stream.next())
+            .await
+            .expect("timed out waiting for streamed output")
+            .expect("stream ended without close")
+            .expect("can't get next stream item");
+        match InteractiveJobMessage::try_from(recvd).expect("can't decode message") {
+            InteractiveJobMessage::Data(bytes) => streamed.extend(bytes),
+            InteractiveJobMessage::Close => break,
+            message => panic!("unexpected message: {message:?}"),
+        }
+    }
+    assert_eq!(streamed.len(), LEN);
+    assert!(streamed.iter().all(|byte| *byte == 0));
+
+    // The status records the length and hash of the unrecorded stream.
+    let status = timeout(TIMEOUT, async {
+        loop {
+            let status = job_status_try_from_json_map(
+                client
+                    .job_status()
+                    .job_id(job_id)
+                    .send()
+                    .await
+                    .expect("can't get job status")
+                    .into_inner(),
+            )
+            .expect("can't parse job status")[&test_baseboard_id()]
+                .clone();
+            if status.is_terminal() {
+                break status;
+            }
+            sleep(Duration::from_millis(50)).await;
+        }
+    })
+    .await
+    .expect("timed out waiting for job stop");
+    let JobStatus::Stopped {
+        result,
+        output:
+            JobOutputState {
+                stdout_len,
+                stderr_len,
+                stdout_hash,
+                ..
+            },
+        ..
+    } = status
+    else {
+        panic!("expected stopped status");
+    };
+    assert_eq!(result, Ok(0));
+    assert_eq!(stdout_len, LEN as u64);
+    assert_eq!(stderr_len, 0);
+    assert_eq!(stdout_hash, blake3::hash(&streamed).into());
+
+    // Streamed output is never stored, so it cannot be fetched.
+    let Err(error) = client
+        .job_output()
+        .job_id(job_id)
+        .stream(JobOutputStream::Stdout)
+        .target(test_baseboard_id().to_string())
+        .send()
+        .await
+    else {
+        panic!("streamed output should not be fetchable")
+    };
+    assert_eq!(error.status().map(|status| status.as_u16()), Some(404));
+}
+
+#[named]
+#[test]
+async fn streaming_job_linger() {
+    // Spin up a server.
+    let log = test_logger(function_name!());
+    let (mgr, mut root, _dir, _shutdown) = manager_and_test_root(log.clone()).await;
+    let api = api_description::<ApiServer>().unwrap();
+    let server = ServerBuilder::new(api, Arc::new(mgr), log)
+        .config(ConfigDropshot {
+            bind_address: local_addr(),
+            ..Default::default()
+        })
+        .start()
+        .expect("failed to start server");
+
+    // Connect and authenticate to the server.
+    let addr = server.local_addr();
+    let signer = AuthzSigner::default();
+    let client = Client::new(&format!("http://{addr}"), signer.clone());
+    let ClientError::ErrorResponse(unauthz) = client.iam().body(None).send().await.unwrap_err()
+    else {
+        panic!("expected error response")
+    };
+    let (_identity, credentials) = authz(&client, unauthz, &mut root).await;
+    signer.set(Some(credentials));
+
+    // Run a streaming job small enough to finish before anyone attaches.
+    let session = Session::new(SessionId::random());
+    client
+        .session_start()
+        .session_id(session.session_id())
+        .send()
+        .await
+        .expect("can't start session");
+    let job_id = session.next_job_id();
+    let job = root
+        .sign_streaming_job_request(&job_id, "echo -n hello", test_baseboard_id().into())
+        .await;
+    let JobLimits {
+        max_cpu,
+        max_mem,
+        max_fsize,
+    } = JobLimits::default();
+    client
+        .job_start()
+        .job_id(job_id)
+        .target(test_baseboard_id().to_string())
+        .max_cpu(max_cpu)
+        .max_mem(max_mem)
+        .max_fsize(max_fsize)
+        .wait(JobWait::Start)
+        .body(job.into_signed())
+        .send()
+        .await
+        .expect("can't start job");
+    sleep(Duration::from_millis(300)).await;
+
+    // A posthumous attach still collects the whole stream.
+    let socket = client
+        .job_attach()
+        .job_id(job_id)
+        .target(test_baseboard_id().to_string())
+        .send()
+        .await
+        .expect("can't attach to job")
+        .into_inner();
+    let mut stream = WebSocketStream::from_raw_socket(socket, Role::Client, None).await;
+    let mut streamed = BytesMut::new();
+    loop {
+        let recvd = timeout(TIMEOUT, stream.next())
+            .await
+            .expect("timed out waiting for streamed output")
+            .expect("stream ended without close")
+            .expect("can't get next stream item");
+        match InteractiveJobMessage::try_from(recvd).expect("can't decode message") {
+            InteractiveJobMessage::Data(bytes) => streamed.extend(bytes),
+            InteractiveJobMessage::Close => break,
+            message => panic!("unexpected message: {message:?}"),
+        }
+    }
+    assert_eq!(streamed, "hello");
+
+    // The status records the length and hash of the unrecorded stream.
+    let status = timeout(TIMEOUT, async {
+        loop {
+            let status = job_status_try_from_json_map(
+                client
+                    .job_status()
+                    .job_id(job_id)
+                    .send()
+                    .await
+                    .expect("can't get job status")
+                    .into_inner(),
+            )
+            .expect("can't parse job status")[&test_baseboard_id()]
+                .clone();
+            if status.is_terminal() {
+                break status;
+            }
+            sleep(Duration::from_millis(50)).await;
+        }
+    })
+    .await
+    .expect("timed out waiting for job stop");
+    let JobStatus::Stopped {
+        result,
+        output:
+            JobOutputState {
+                stdout_len,
+                stdout_hash,
+                ..
+            },
+        ..
+    } = status
+    else {
+        panic!("expected stopped status");
+    };
+    assert_eq!(result, Ok(0));
+    assert_eq!(stdout_len, streamed.len() as u64);
+    assert_eq!(stdout_hash, blake3::hash(&streamed).into());
 }

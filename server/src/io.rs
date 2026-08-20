@@ -14,6 +14,7 @@ use std::io;
 use std::time::Duration;
 
 use bytes::{Bytes, BytesMut};
+use rustix::io::Errno;
 use tokio::io::{AsyncRead, AsyncReadExt as _, AsyncWriteExt as _};
 use tokio::process::{ChildStderr, ChildStdout};
 use tokio::sync::mpsc;
@@ -112,10 +113,16 @@ impl JobIo {
     pub async fn read_output(&mut self) -> io::Result<(Bytes, JobOutputStream)> {
         match self {
             Self::Interactive { pty, .. } => loop {
-                match pty.read().await? {
-                    Some(b) => return Ok((b, Stdout)),
-                    None if pty.eof => return Ok((Bytes::new(), Stdout)),
-                    None => (), // drained, keep reading
+                match pty.read().await {
+                    Ok(Some(b)) => return Ok((b, Stdout)),
+                    Ok(None) if pty.eof => return Ok((Bytes::new(), Stdout)),
+                    Ok(None) => (), // drained, keep reading
+                    Err(error) if Errno::from_io_error(&error) == Some(Errno::IO) => {
+                        // A pty master reads EIO once its last slave closes,
+                        // which is EOF here, not an error.
+                        return Ok((Bytes::new(), Stdout));
+                    }
+                    Err(error) => return Err(error),
                 }
             },
             Self::Batch { stdout, stderr } => loop {
@@ -162,11 +169,11 @@ impl JobIo {
 
     /// How long to keep reading output after the child dies.
     ///
-    /// For a pty there is no EOF; a short quiet period is the
-    /// only way to know we've drained (OpenSSH does this too).
-    /// Pipes deliver EOF once every writer exits, so this is only
-    /// a backstop against a descendant that escaped the process
-    /// group while holding the inherited pipe open.
+    /// For a pty there is no portable EOF signal; a short quiet period
+    /// is the only way to know we've drained (OpenSSH does this too).
+    /// Pipes deliver EOF once every writer exits, so this is only a
+    /// backstop against a descendant that escaped the process group
+    /// while holding the inherited pipe open.
     pub fn drain_timeout(&self) -> Duration {
         match self {
             Self::Interactive { .. } => Duration::from_millis(10),

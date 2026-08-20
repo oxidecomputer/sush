@@ -353,18 +353,36 @@ impl CommandContext for Cli {
     ) {
         let mut progress = self.progress.lock().unwrap();
         if matches!(self.get_output_format(), OutputFormat::Text) && progress.is_none() {
-            let bar = ProgressBar::new(total_length);
+            // With no known total, show a spinner and a running byte count.
+            let bar = if total_length == 0 {
+                let bar = ProgressBar::new_spinner();
+                bar.set_style(
+                    ProgressStyle::with_template(
+                        "{spinner}  \
+                         {prefix} \
+                         [{elapsed_precise}] \
+                         {decimal_bytes:>7} \
+                         {msg}",
+                    )
+                    .unwrap(),
+                );
+                bar.enable_steady_tick(Duration::from_millis(100));
+                bar
+            } else {
+                let bar = ProgressBar::new(total_length);
+                bar.set_style(
+                    ProgressStyle::with_template(
+                        "{prefix} \
+                         [{elapsed_precise}] \
+                         {bar:40.cyan/blue} \
+                         {decimal_bytes:>7}/{decimal_total_bytes:7} \
+                         {msg}",
+                    )
+                    .unwrap(),
+                );
+                bar
+            };
             bar.set_prefix(format!("{stage} {stream}"));
-            bar.set_style(
-                ProgressStyle::with_template(
-                    "{prefix} \
-                     [{elapsed_precise}] \
-                     {bar:40.cyan/blue} \
-                     {decimal_bytes:>7}/{decimal_total_bytes:7} \
-                     {msg}",
-                )
-                .unwrap(),
-            );
             *progress = Some(bar);
         }
     }
@@ -384,7 +402,7 @@ impl CommandContext for Cli {
         if let Some(progress) = self.progress.lock().unwrap().take() {
             progress.finish_and_clear();
             if let Some(stage) = stage {
-                let length = ByteSize::b(progress.length().unwrap_or(0));
+                let length = ByteSize::b(progress.length().unwrap_or(progress.position()));
                 let elapsed = progress.elapsed();
                 println!(
                     "{stage} {stream}:\t{} in {} ({:.0} MB/s)",
