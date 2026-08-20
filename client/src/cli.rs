@@ -309,7 +309,7 @@ impl CommandContext for Cli {
     fn job_output_target(&mut self, target: &BaseboardId) {
         match self.get_output_format() {
             OutputFormat::Json => println!("{}", json!({ "target": target.to_string() })),
-            OutputFormat::Text => println!("⟹  {target}  ⟸"),
+            OutputFormat::Text => println!(" » {target} «"),
         }
     }
 
