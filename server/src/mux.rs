@@ -16,6 +16,7 @@ use futures::stream::{FuturesUnordered, SplitStream};
 use futures::{SinkExt as _, Stream, StreamExt};
 use tokio::sync::broadcast;
 use tokio::task::JoinHandle;
+use tokio::time::{Duration, timeout};
 use tokio::{select, spawn};
 use tokio_stream::{StreamMap, StreamNotifyClose};
 use tokio_tungstenite::tungstenite::error::Error as WebSocketError;
@@ -29,6 +30,9 @@ use crate::job::SocketStream;
 /// Maximum number of messages a client is allowed to lag by
 /// before it is disconnected.
 pub const MUX_CLIENT_CHANNEL_CAPACITY: usize = 100;
+
+/// How long a writer task may spend closing its socket.
+const CLOSE_TIMEOUT: Duration = Duration::from_secs(5);
 
 /// Client identifiers are opaque and ephemeral. We use monotonically
 /// increasing integers because they're simple and cheap.
@@ -89,7 +93,7 @@ impl WebSocketMux {
                 _ = io => {}
                 _ = stop.cancelled() => {}
             }
-            let _ = to.close().await;
+            let _ = timeout(CLOSE_TIMEOUT, to.close()).await;
             stop.cancel();
             client_id
         });
@@ -118,6 +122,14 @@ impl WebSocketMux {
 
     pub fn is_empty(&self) -> bool {
         self.recv.is_empty()
+    }
+}
+
+impl Drop for WebSocketMux {
+    fn drop(&mut self) {
+        for stop in self.stop.values() {
+            stop.cancel();
+        }
     }
 }
 
