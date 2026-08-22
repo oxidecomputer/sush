@@ -1425,7 +1425,7 @@ async fn job_start(
                 }
 
                 _ = ticker.tick() => {
-                    last = match job_status_map(ctx, client, &job_id).await {
+                    last = match job_status_map(ctx, client, &job_id, job_target.single_baseboard()).await {
                         Ok(status) => status,
                         // The job may not be visible anywhere yet.
                         Err(CommandError::NotFound(_)) => JobStatusMap::new(),
@@ -1545,19 +1545,26 @@ async fn job_status(
     job_id: &JobId,
     style: StatusDisplayStyle,
 ) -> Result<(), CommandError> {
-    let status = job_status_map(ctx, client, job_id).await?;
+    let status = job_status_map(ctx, client, job_id, None).await?;
     ctx.job_status(job_id, &status, style);
     Ok(())
 }
 
-/// Fetch a job's rack-wide status map.
+/// Fetch a job's rack-wide status map. Routing `via` a single-sled
+/// target gets its authoritative status and keeps the login on the
+/// sled that already knows it.
 async fn job_status_map(
     ctx: &mut impl CommandContext,
     client: &Client,
     job_id: &JobId,
+    via: Option<&BaseboardId>,
 ) -> Result<JobStatusMap, CommandError> {
-    let status = with_login(ctx, client, async || {
-        client.job_status().job_id(job_id).send().await
+    let status = with_login_via(ctx, client, via, async || {
+        let mut request = client.job_status().job_id(job_id);
+        if let Some(via) = via {
+            request = request.via(via.to_string());
+        }
+        request.send().await
     })
     .await?
     .into_inner();
@@ -1579,7 +1586,7 @@ async fn job_watch(
     let mut settling = Settling::default();
     let mut sigint = signal(SignalKind::interrupt())?;
     let status = loop {
-        let status = match job_status_map(ctx, client, job_id).await {
+        let status = match job_status_map(ctx, client, job_id, target.single_baseboard()).await {
             Ok(status) => status,
             Err(error) => {
                 ctx.job_watch_finished(job_id);
@@ -1719,7 +1726,7 @@ async fn job_output(
     }
 
     // Fetch output from every sled with a recorded status.
-    let status = job_status_map(ctx, client, &args.job_id).await?;
+    let status = job_status_map(ctx, client, &args.job_id, None).await?;
     if status.is_empty() {
         return Err(CommandError::NotFound(format!(
             "Job `{}` not found",
@@ -2158,7 +2165,7 @@ async fn resolve_serial(
     job_id: &JobId,
     serial: &str,
 ) -> Result<BaseboardId, CommandError> {
-    let status = job_status_map(ctx, client, job_id).await?;
+    let status = job_status_map(ctx, client, job_id, None).await?;
     let mut matches = status
         .keys()
         .filter(|b| b.serial_number.eq_ignore_ascii_case(serial));

@@ -189,6 +189,7 @@ pub trait SushApi {
         ctx: RequestContext<Self::Context>,
         headers: Header<Authorization>,
         params: PathParams<JobIdParam>,
+        query: QueryParams<RoutingParam>,
     ) -> Result<HttpResponseOk<JsonJobStatusMap>, HttpError>;
 
     /// Get (a subset of) the standard output or standard error of a job.

@@ -613,6 +613,15 @@
             "schema": {
               "$ref": "#/components/schemas/JobId"
             }
+          },
+          {
+            "in": "query",
+            "name": "via",
+            "description": "Where a proxy should route this request.",
+            "schema": {
+              "nullable": true,
+              "type": "string"
+            }
           }
         ],
         "responses": {
