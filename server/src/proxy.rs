@@ -7,9 +7,8 @@
 //! Terminates client connections and routes each request to a sled,
 //! answering only `/version` itself.
 //! A request that names a target goes to the first sled the target
-//! resolves to. Anything else goes to the sled hosting the proxy
-//! when known, else a sticky default, because identities are cached
-//! on the sled that authenticated them.
+//! resolves to. Anything else goes to the sled hosting the proxy,
+//! which any request may reach.
 //! Requests are forwarded untouched: bound request signatures cover
 //! the exact request line, so the proxy may never rewrite one.
 
@@ -17,7 +16,7 @@ use std::collections::BTreeMap;
 use std::convert::Infallible;
 use std::io;
 use std::net::SocketAddr;
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 
 use http::header::CONTENT_TYPE;
 use http::{Method, StatusCode};
@@ -106,11 +105,7 @@ impl ProxyServer {
         let listener = TcpListener::bind(local_addr).await?;
         let local_addr = listener.local_addr()?;
         let acceptor = tls.map(|config| TlsAcceptor::from(Arc::new(config)));
-        let router = Arc::new(Router {
-            targets,
-            home,
-            default: Mutex::new(None),
-        });
+        let router = Arc::new(Router { targets, home });
         spawn(listen(
             log.new(o!("component" => "proxy")),
             listener,
@@ -138,7 +133,6 @@ impl ProxyServer {
 struct Router {
     targets: watch::Receiver<Targets>,
     home: Option<BaseboardId>,
-    default: Mutex<Option<BaseboardId>>,
 }
 
 impl Router {
@@ -155,29 +149,21 @@ impl Router {
                 StatusCode::BAD_REQUEST,
                 format!("unable to parse target `{bad}`"),
             ))),
-            None => {
-                if let Some(home) = self.home.as_ref()
-                    && let Some(addr) = targets.sleds.get(home)
-                {
-                    return Ok(*addr);
-                }
-                let mut default = self.default.lock().unwrap();
-                if let Some(baseboard) = default.as_ref()
-                    && let Some(addr) = targets.sleds.get(baseboard)
-                {
-                    return Ok(*addr);
-                }
-                match targets.sleds.iter().next() {
-                    Some((baseboard, addr)) => {
-                        *default = Some(baseboard.clone());
-                        Ok(*addr)
-                    }
+            None => match self.home.as_ref() {
+                Some(home) => targets.sleds.get(home).copied().ok_or_else(|| {
+                    Box::new(error_response(
+                        StatusCode::SERVICE_UNAVAILABLE,
+                        format!("home sled `{home}` unknown to the proxy"),
+                    ))
+                }),
+                None => match targets.sleds.iter().next() {
+                    Some((_, addr)) => Ok(*addr),
                     None => Err(Box::new(error_response(
                         StatusCode::SERVICE_UNAVAILABLE,
                         "no sleds known to the proxy",
                     ))),
-                }
-            }
+                },
+            },
         }
     }
 }
@@ -377,8 +363,8 @@ mod test {
         s.parse().unwrap()
     }
 
-    /// Unrouted requests go to the home sled while the targets know
-    /// it, and otherwise to a sticky default.
+    /// Unrouted requests go to the home sled, or fail while the
+    /// targets don't know it. Without a home, any sled will do.
     #[test]
     fn home_preference() {
         let sled = |serial: &str| BaseboardId {
@@ -391,20 +377,27 @@ mod test {
         targets.sleds.insert(sled("home"), addr(2));
         let (tx, rx) = watch::channel(targets);
         let router = Router {
-            targets: rx,
+            targets: rx.clone(),
             home: Some(sled("home")),
-            default: Mutex::new(None),
         };
         let get = request("/versions");
         assert_eq!(router.route(&get).unwrap(), addr(2));
         tx.send_modify(|t| {
             t.sleds.remove(&sled("home"));
         });
-        assert_eq!(router.route(&get).unwrap(), addr(1));
+        assert_eq!(
+            router.route(&get).unwrap_err().status(),
+            StatusCode::SERVICE_UNAVAILABLE
+        );
         tx.send_modify(|t| {
             t.sleds.insert(sled("home"), addr(2));
         });
         assert_eq!(router.route(&get).unwrap(), addr(2));
+        let homeless = Router {
+            targets: rx,
+            home: None,
+        };
+        assert_eq!(homeless.route(&get).unwrap(), addr(1));
     }
 
     /// The proxy answers `GET /version` itself unless `via` routes it.
