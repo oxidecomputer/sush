@@ -1169,6 +1169,9 @@ async fn job(
                     return Err(CommandError::io(path, ErrorKind::AlreadyExists.into()));
                 }
             }
+            if let Some(client) = client.as_ref() {
+                preflight_target(ctx, client, &target).await?;
+            }
             let streaming = if *streaming {
                 Streaming::Output
             } else {
@@ -1403,6 +1406,7 @@ async fn job_start(
         let mut last = JobStatusMap::new();
         let mut settling = Settling::default();
         let mut started = false;
+        let mut stalled = false;
         let mut stopped = false;
         let mut sigint = signal(SignalKind::interrupt())?;
         let status = loop {
@@ -1434,6 +1438,10 @@ async fn job_start(
                     let rack = rack_sleds(client, &job_target).await;
                     if settling.done(&job_target, rack, &last) && started {
                         break last;
+                    }
+                    if !stalled && last.is_empty() && settling.polls >= WATCH_STALL_POLLS {
+                        ctx.job_watch_stalled(&job_id);
+                        stalled = true;
                     }
                 }
 
@@ -1596,6 +1604,10 @@ async fn job_watch(
 /// fan a job out across the rack, so a map that looks settled early
 /// is likely still missing sleds.
 const WATCH_MIN_POLLS: usize = 5;
+
+/// How many polls a watch may go without any sled reporting a status
+/// before warning that the job may never run.
+const WATCH_STALL_POLLS: usize = 15;
 
 /// Rolling settlement state for a watched job.
 #[derive(Default)]
@@ -2079,6 +2091,32 @@ impl FromStr for TargetArg {
         }
         Ok(Self::Abbreviated(sleds))
     }
+}
+
+/// Confirm before signing a job for a sled that doesn't appear in inventory.
+#[cfg(feature = "permslip")]
+async fn preflight_target(
+    ctx: &mut impl CommandContext,
+    client: &Client,
+    target: &Target,
+) -> Result<(), CommandError> {
+    let Target::Sleds(sleds) = target else {
+        return Ok(());
+    };
+    let Ok(inventory) = client.versions().send().await else {
+        return Ok(());
+    };
+    let inventory = inventory.into_inner();
+    for sled in sleds {
+        let known = match sled {
+            SledId::Baseboard(baseboard) => inventory.iter().any(|s| &s.baseboard == baseboard),
+            SledId::Cubby(cubby) => inventory.iter().any(|s| s.cubby == Some(*cubby)),
+        };
+        if !known {
+            ctx.really_target(sled)?;
+        }
+    }
+    Ok(())
 }
 
 /// Resolve a target argument to a target, matching bare serial
