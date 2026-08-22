@@ -64,6 +64,10 @@ const STREAMING_LINGER: Duration = Duration::from_secs(600);
 /// before the job is cancelled.
 const STREAMING_SEND_TIMEOUT: Duration = Duration::from_secs(60);
 
+/// How long a dead streaming job may drain in total, since an
+/// escaped descendant can hold the output pipe open forever.
+const STREAMING_DRAIN_LIMIT: Duration = Duration::from_secs(60);
+
 pub struct Job {
     task: JoinHandle<(Result<i32, ProcessError>, JobOutputState)>,
     tx_client: SocketSender,
@@ -137,6 +141,8 @@ async fn job(
     pin!(drain_timeout);
     let linger = sleep(Duration::default());
     pin!(linger);
+    let drain_limit = sleep(Duration::default());
+    pin!(drain_limit);
     loop {
         // A finished stream is done once its consumer has taken every chunk.
         if eof && attached && pending.is_none() {
@@ -330,7 +336,16 @@ async fn job(
             _ = child.wait(), if !dead => {
                 debug!(log, "reaped job process");
                 drain_timeout.as_mut().reset(Instant::now() + io.drain_timeout());
+                if streaming {
+                    drain_limit.as_mut().reset(Instant::now() + STREAMING_DRAIN_LIMIT);
+                }
                 dead = true;
+            }
+
+            // Cut off a dead stream that never reaches EOF.
+            _ = &mut drain_limit, if streaming && dead && !eof => {
+                warn!(log, "streaming job output never closed");
+                break;
             }
 
             // Give up on a stream whose consumer never drained it.
