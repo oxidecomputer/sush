@@ -61,6 +61,7 @@ impl WebSocketMux {
         &mut self,
         stream: SocketStream,
         access: Access,
+        initial: Vec<WebSocketMessage>,
         stop: CancellationToken,
     ) -> ClientId {
         let client_id = self.next_client_id;
@@ -71,18 +72,22 @@ impl WebSocketMux {
         self.stop.insert(client_id, stop.clone());
         let mut rx = self.send.subscribe();
         let handle = spawn(async move {
-            loop {
-                select! {
-                    recvd = rx.recv() => {
-                        let Ok(message) = recvd else { break };
-                        if to.send(message).await.is_err() {
-                            break
-                        }
-                    }
-                    _ = stop.cancelled() => {
-                        break;
+            let io = async {
+                for message in initial {
+                    if to.send(message).await.is_err() {
+                        return;
                     }
                 }
+                loop {
+                    let Ok(message) = rx.recv().await else { return };
+                    if to.send(message).await.is_err() {
+                        return;
+                    }
+                }
+            };
+            select! {
+                _ = io => {}
+                _ = stop.cancelled() => {}
             }
             let _ = to.close().await;
             stop.cancel();

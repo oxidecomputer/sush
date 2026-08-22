@@ -35,7 +35,7 @@ use tokio::io::{AsyncReadExt as _, AsyncSeekExt as _, AsyncWriteExt as _};
 use tokio::process::Child;
 use tokio::sync::mpsc;
 use tokio::task::{JoinError, JoinHandle};
-use tokio::time::{Duration, Instant, sleep};
+use tokio::time::{Duration, Instant, sleep, timeout};
 use tokio::{pin, select, spawn};
 use tokio_tungstenite::WebSocketStream;
 use tokio_tungstenite::tungstenite::protocol::Message as WebSocketMessage;
@@ -59,6 +59,10 @@ pub type SocketReceiver = mpsc::Receiver<(SocketStream, Access)>;
 /// How long a finished streaming job waits for its consumer to
 /// attach or make progress.
 const STREAMING_LINGER: Duration = Duration::from_secs(600);
+
+/// How long a single send to a streaming consumer may stall
+/// before the job is cancelled.
+const STREAMING_SEND_TIMEOUT: Duration = Duration::from_secs(60);
 
 pub struct Job {
     task: JoinHandle<(Result<i32, ProcessError>, JobOutputState)>,
@@ -242,7 +246,7 @@ async fn job(
 
             // Attach a new client, send it the current window size, and play back the last buffer.
             // Streaming jobs accept one read-write consumer, even posthumously.
-            Some((mut client, access)) = rx_client.recv(), if !dead || streaming => {
+            Some((client, access)) = rx_client.recv(), if !dead || streaming => {
                 if streaming {
                     if access != Access::ReadWrite || attached || tx_socket.try_send(client).is_err() {
                         debug!(log, "refused streaming client");
@@ -251,25 +255,21 @@ async fn job(
                     }
                     continue;
                 }
+                let mut initial = Vec::new();
                 match io.get_window_size() {
                     Err(error) => error!(log, "failed to get pseudoterminal window size"; "error" => %error),
                     Ok(size) => {
-                        match client.send(Message::Control(Control::WindowChange(size.clone())).try_into().unwrap()).await {
-                            Err(error) => error!(log, "failed to send pty window size"; "error" => %error),
-                            Ok(()) => debug!(log, "sent pty window size"; "size" => ?size),
-                        }
+                        debug!(log, "sending pty window size"; "size" => ?size);
+                        initial.push(Message::Control(Control::WindowChange(size)).try_into().unwrap());
                     }
                 }
 
                 if let Ok(Some(playback)) = playback_buffer(&mut stdout_file, INTERACTIVE_JOB_BUFFER_SIZE).await {
-                    let playback_len = playback.len();
-                    match client.send(Message::Data(playback).try_into().unwrap()).await {
-                        Err(error) => error!(log, "failed to play back job output"; "error" => %error),
-                        Ok(()) => debug!(log, "played back output"; "bytes" => playback_len),
-                    }
+                    debug!(log, "playing back output"; "bytes" => playback.len());
+                    initial.push(Message::Data(playback).try_into().unwrap());
                 }
 
-                clients.add(client, access, stop.child_token());
+                clients.add(client, access, initial, stop.child_token());
             }
 
             // Handle a message from a client.
@@ -398,14 +398,24 @@ async fn stream_output(
         return;
     };
     while let Some(buf) = rx_output.recv().await {
-        if let Err(error) = client.send(Message::Data(buf).try_into().unwrap()).await {
-            error!(log, "failed to stream output to client"; "error" => %error);
-            stop.cancel();
-            return;
+        match timeout(
+            STREAMING_SEND_TIMEOUT,
+            client.send(Message::Data(buf).try_into().unwrap()),
+        )
+        .await
+        {
+            Ok(Ok(())) => continue,
+            Ok(Err(error)) => error!(log, "failed to stream output to client"; "error" => %error),
+            Err(_) => error!(log, "timed out streaming output to client"),
         }
+        stop.cancel();
+        return;
     }
-    let _ = client.send(Message::Close.try_into().unwrap()).await;
-    let _ = client.close(None).await;
+    let _ = timeout(STREAMING_SEND_TIMEOUT, async {
+        let _ = client.send(Message::Close.try_into().unwrap()).await;
+        let _ = client.close(None).await;
+    })
+    .await;
 }
 
 fn process_exit(exit_status: ExitStatus) -> Result<i32, ProcessError> {
