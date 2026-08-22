@@ -143,6 +143,8 @@ async fn job(
     pin!(linger);
     let drain_limit = sleep(Duration::default());
     pin!(drain_limit);
+    let attach_deadline = sleep(STREAMING_LINGER);
+    pin!(attach_deadline);
     loop {
         // A finished stream is done once its consumer has taken every chunk.
         if eof && attached && pending.is_none() {
@@ -348,9 +350,17 @@ async fn job(
                 break;
             }
 
+            // Give up on a live stream whose consumer never attached.
+            _ = &mut attach_deadline, if streaming && !attached && !eof => {
+                warn!(log, "streaming consumer never attached");
+                stop.cancel();
+                break;
+            }
+
             // Give up on a stream whose consumer never drained it.
             _ = &mut linger, if eof => {
                 warn!(log, "streaming consumer never drained the output");
+                stop.cancel();
                 break;
             }
 
