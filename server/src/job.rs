@@ -29,6 +29,7 @@ use blake3::Hasher;
 use bytes::{Bytes, BytesMut};
 use dropshot::WebsocketConnectionRaw;
 use futures::{SinkExt as _, StreamExt as _};
+use rustix::process::Signal;
 use slog::{Logger, debug, error, info, warn};
 use tokio::fs::File;
 use tokio::io::{AsyncReadExt as _, AsyncSeekExt as _, AsyncWriteExt as _};
@@ -48,7 +49,7 @@ use sush_common::jobs::{
 };
 use tokio_util::sync::CancellationToken;
 
-use crate::executor::kill_job;
+use crate::executor::{job_pgid, kill_job};
 use crate::io::JobIo;
 use crate::mux::WebSocketMux;
 
@@ -67,6 +68,12 @@ const STREAMING_SEND_TIMEOUT: Duration = Duration::from_secs(60);
 /// How long a dead streaming job may drain in total, since an
 /// escaped descendant can hold the output pipe open forever.
 const STREAMING_DRAIN_LIMIT: Duration = Duration::from_secs(60);
+
+/// How long a stopped job may clean up after SIGTERM before SIGKILL.
+const KILL_GRACE: Duration = Duration::from_secs(5);
+
+/// How many times a failed SIGKILL is retried before giving up.
+const KILL_ATTEMPTS: usize = 3;
 
 pub struct Job {
     task: JoinHandle<(Result<i32, ProcessError>, JobOutputState)>,
@@ -121,7 +128,9 @@ async fn job(
     let mut stderr_hasher = Hasher::new();
     let mut clients = WebSocketMux::new();
     let mut fatal = Option::<ProcessError>::None;
+    let pgid = job_pgid(&child);
     let mut killed = false;
+    let mut kills = 0;
     let mut dead = false;
     let streaming = matches!(streaming, Streaming::Output);
     let mut pending = Option::<Bytes>::None;
@@ -145,6 +154,8 @@ async fn job(
     pin!(drain_limit);
     let attach_deadline = sleep(STREAMING_LINGER);
     pin!(attach_deadline);
+    let kill_timeout = sleep(Duration::default());
+    pin!(kill_timeout);
     loop {
         // A finished stream is done once its consumer has taken every chunk.
         if eof && attached && pending.is_none() {
@@ -326,10 +337,19 @@ async fn job(
                 }
             }
 
-            // Stop job on cancellation signal, but only once.
+            // Stop job on cancellation signal: terminate first, then kill.
             _ = stop.cancelled(), if !killed => {
-                kill_job(&log, &child);
+                kill_job(&log, pgid, Signal::TERM);
+                kill_timeout.as_mut().reset(Instant::now() + KILL_GRACE);
                 killed = true;
+            }
+
+            // Upgrade to SIGKILL a stopped group that outlives its grace
+            // period, even if its leader is already dead.
+            _ = &mut kill_timeout, if killed && kills < KILL_ATTEMPTS => {
+                kill_job(&log, pgid, Signal::KILL);
+                kill_timeout.as_mut().reset(Instant::now() + KILL_GRACE);
+                kills += 1;
             }
 
             // Notice when the job dies, but do not exit the loop;
@@ -387,7 +407,7 @@ async fn job(
     let exit_status = select! {
         status = child.wait() => status,
         _ = stop.cancelled(), if !killed => {
-            kill_job(&log, &child);
+            kill_job(&log, pgid, Signal::KILL);
             child.wait().await
         }
     };

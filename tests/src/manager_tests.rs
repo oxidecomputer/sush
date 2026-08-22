@@ -14,7 +14,7 @@ use std::time::Duration;
 use chrono::Utc;
 use function_name::named;
 use http_range_header::{EndPosition, StartPosition, SyntacticallyCorrectRange as Range};
-use libc::{SIGKILL, SIGXCPU};
+use libc::{SIGTERM, SIGXCPU};
 use pwd::Passwd;
 use sled_hardware_types::BaseboardId;
 use slog::{Discard, Logger, o};
@@ -329,7 +329,7 @@ async fn job_stop() {
     check_status_stopped(
         status,
         &job_id,
-        Err(ProcessError::Killed(SIGKILL)),
+        Err(ProcessError::Killed(SIGTERM)),
         Some(0),
         Some(0),
     );
@@ -820,7 +820,7 @@ async fn shutdown() {
     check_status_stopped(
         status,
         &job_id,
-        Err(ProcessError::Killed(SIGKILL)),
+        Err(ProcessError::Killed(SIGTERM)),
         Some(0),
         Some(0),
     );
