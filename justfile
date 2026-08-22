@@ -4,7 +4,7 @@ check:
     cargo check --workspace --all-targets
 
 lint:
-    cargo fmt --check && cargo clippy --tests
+    cargo fmt --check && cargo clippy --tests -- --no-deps --deny warnings
 
 test *FILTER:
     cargo nextest run --workspace {{FILTER}}
