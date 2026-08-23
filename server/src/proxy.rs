@@ -274,7 +274,13 @@ where
                 Some(response) => response,
                 None => match router.route(&request) {
                     Ok(addr) => forward(log, addr, request).await,
-                    Err(response) => *response,
+                    Err(response) => {
+                        warn!(
+                            log, "request not routable";
+                            "uri" => %request.uri(), "status" => %response.status()
+                        );
+                        *response
+                    }
                 },
             })
         }
