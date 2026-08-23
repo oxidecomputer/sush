@@ -169,8 +169,8 @@ impl JobIo {
 
     /// How long to keep reading output after the child dies.
     ///
-    /// For a pty there is no portable EOF signal; a short quiet period
-    /// is the only way to know we've drained (OpenSSH does this too).
+    /// For a pty there is no portable EOF signal; a short window
+    /// after death is the best we can do (OpenSSH does this too).
     /// Pipes deliver EOF once every writer exits, so this is only a
     /// backstop against a descendant that escaped the process group
     /// while holding the inherited pipe open.
