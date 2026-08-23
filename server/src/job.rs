@@ -357,6 +357,7 @@ async fn job(
             // Upgrade to SIGKILL a stopped group that outlives its grace
             // period, even if its leader is already dead.
             _ = &mut kill_timeout, if killed && kills < KILL_ATTEMPTS => {
+                warn!(log, "job survived SIGTERM grace period, upgrading to SIGKILL");
                 kill_job(&log, pgid, Signal::KILL);
                 kill_timeout.as_mut().reset(Instant::now() + KILL_GRACE);
                 kills += 1;
@@ -413,10 +414,15 @@ async fn job(
         let _ = tx_output.try_send(buf);
     }
 
-    // Reap the process.
+    // Reap the process. A stopped job that exited the loop alive
+    // still gets its SIGKILL upgrade after the grace period.
     let exit_status = select! {
         status = child.wait() => status,
         _ = stop.cancelled(), if !killed => {
+            kill_job(&log, pgid, Signal::KILL);
+            child.wait().await
+        }
+        _ = sleep(KILL_GRACE), if killed && !dead => {
             kill_job(&log, pgid, Signal::KILL);
             child.wait().await
         }
