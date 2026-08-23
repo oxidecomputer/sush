@@ -1757,14 +1757,7 @@ async fn job_output_from(
     }: JobOutput,
 ) -> Result<(), CommandError> {
     // Fetch job status for output length and hash.
-    let status = job_status_try_from_json_map(
-        with_login_via(ctx, client, Some(target), async || {
-            client.job_status().job_id(job_id).send().await
-        })
-        .await?
-        .into_inner(),
-    )
-    .map_err(CommandError::BaseboardIdParseError)?;
+    let status = job_status_map(ctx, client, &job_id, Some(target)).await?;
 
     let JobOutputState {
         stdout_len,
