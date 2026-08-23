@@ -27,7 +27,7 @@ use sush_common::jobs::{
     SignedJob, job_status_to_json_map,
 };
 use sush_common::keys::{KeyId, Signature, SshPublicKey};
-use sush_common::targets::{MAX_CUBBY, SledVersion};
+use sush_common::targets::{MAX_CUBBY, SledId, SledVersion};
 use sush_common::version::VersionInfo;
 
 use crate::AuthzSigner;
@@ -463,6 +463,15 @@ impl CommandContext for Cli {
         }
     }
 
+    fn job_watch_stalled(&mut self, job_id: &JobId) {
+        let guard = self.watch.lock().unwrap();
+        if let Some(watch) = guard.as_ref() {
+            let _ = watch.multi.println(format!(
+                "❗ No sled has reported a status for job `{job_id}`"
+            ));
+        }
+    }
+
     fn job_watch_finished(&mut self, _job_id: &JobId) {
         if let Some(watch) = self.watch.lock().unwrap().take() {
             for bar in watch.bars.values() {
@@ -755,6 +764,21 @@ impl CommandContext for Cli {
             }
         }
         Ok(())
+    }
+
+    fn really_target(&mut self, sled: &SledId) -> Result<(), CommandError> {
+        match self.get_output_format() {
+            OutputFormat::Json => Ok(()),
+            OutputFormat::Text => {
+                let prompt =
+                    format!("❓ Sled `{sled}` is not in the rack inventory. Proceed (yes/no)? ");
+                if read_bool(&prompt)? {
+                    Ok(())
+                } else {
+                    Err(CommandError::Canceled)
+                }
+            }
+        }
     }
 
     fn really_revoke(&mut self, what: &str, key_id: KeyId) -> Result<KeyId, CommandError> {

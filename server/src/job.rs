@@ -29,13 +29,14 @@ use blake3::Hasher;
 use bytes::{Bytes, BytesMut};
 use dropshot::WebsocketConnectionRaw;
 use futures::{SinkExt as _, StreamExt as _};
+use rustix::process::Signal;
 use slog::{Logger, debug, error, info, warn};
 use tokio::fs::File;
 use tokio::io::{AsyncReadExt as _, AsyncSeekExt as _, AsyncWriteExt as _};
 use tokio::process::Child;
 use tokio::sync::mpsc;
 use tokio::task::{JoinError, JoinHandle};
-use tokio::time::{Duration, Instant, sleep};
+use tokio::time::{Duration, Instant, sleep, timeout};
 use tokio::{pin, select, spawn};
 use tokio_tungstenite::WebSocketStream;
 use tokio_tungstenite::tungstenite::protocol::Message as WebSocketMessage;
@@ -48,7 +49,7 @@ use sush_common::jobs::{
 };
 use tokio_util::sync::CancellationToken;
 
-use crate::executor::kill_job;
+use crate::executor::{job_pgid, kill_job};
 use crate::io::JobIo;
 use crate::mux::WebSocketMux;
 
@@ -59,6 +60,20 @@ pub type SocketReceiver = mpsc::Receiver<(SocketStream, Access)>;
 /// How long a finished streaming job waits for its consumer to
 /// attach or make progress.
 const STREAMING_LINGER: Duration = Duration::from_secs(600);
+
+/// How long a single send to a streaming consumer may stall
+/// before the job is cancelled.
+const STREAMING_SEND_TIMEOUT: Duration = Duration::from_secs(60);
+
+/// How long a dead streaming job may drain in total, since an
+/// escaped descendant can hold the output pipe open forever.
+const STREAMING_DRAIN_LIMIT: Duration = Duration::from_secs(60);
+
+/// How long a stopped job may clean up after SIGTERM before SIGKILL.
+const KILL_GRACE: Duration = Duration::from_secs(5);
+
+/// How many times a failed SIGKILL is retried before giving up.
+const KILL_ATTEMPTS: usize = 3;
 
 pub struct Job {
     task: JoinHandle<(Result<i32, ProcessError>, JobOutputState)>,
@@ -113,7 +128,9 @@ async fn job(
     let mut stderr_hasher = Hasher::new();
     let mut clients = WebSocketMux::new();
     let mut fatal = Option::<ProcessError>::None;
+    let pgid = job_pgid(&child);
     let mut killed = false;
+    let mut kills = 0;
     let mut dead = false;
     let streaming = matches!(streaming, Streaming::Output);
     let mut pending = Option::<Bytes>::None;
@@ -133,6 +150,12 @@ async fn job(
     pin!(drain_timeout);
     let linger = sleep(Duration::default());
     pin!(linger);
+    let drain_limit = sleep(Duration::default());
+    pin!(drain_limit);
+    let attach_deadline = sleep(STREAMING_LINGER);
+    pin!(attach_deadline);
+    let kill_timeout = sleep(Duration::default());
+    pin!(kill_timeout);
     loop {
         // A finished stream is done once its consumer has taken every chunk.
         if eof && attached && pending.is_none() {
@@ -242,7 +265,7 @@ async fn job(
 
             // Attach a new client, send it the current window size, and play back the last buffer.
             // Streaming jobs accept one read-write consumer, even posthumously.
-            Some((mut client, access)) = rx_client.recv(), if !dead || streaming => {
+            Some((client, access)) = rx_client.recv(), if !dead || streaming => {
                 if streaming {
                     if access != Access::ReadWrite || attached || tx_socket.try_send(client).is_err() {
                         debug!(log, "refused streaming client");
@@ -251,25 +274,31 @@ async fn job(
                     }
                     continue;
                 }
+                let mut initial = Vec::new();
                 match io.get_window_size() {
                     Err(error) => error!(log, "failed to get pseudoterminal window size"; "error" => %error),
                     Ok(size) => {
-                        match client.send(Message::Control(Control::WindowChange(size.clone())).try_into().unwrap()).await {
-                            Err(error) => error!(log, "failed to send pty window size"; "error" => %error),
-                            Ok(()) => debug!(log, "sent pty window size"; "size" => ?size),
+                        debug!(log, "sending pty window size"; "size" => ?size);
+                        initial.push(Message::Control(Control::WindowChange(size)).try_into().unwrap());
+                    }
+                }
+
+                match playback_buffer(&mut stdout_file, INTERACTIVE_JOB_BUFFER_SIZE).await {
+                    Ok(Some(playback)) => {
+                        debug!(log, "playing back output"; "bytes" => playback.len());
+                        initial.push(Message::Data(playback).try_into().unwrap());
+                    }
+                    Ok(None) => (),
+                    Err(error) => {
+                        error!(log, "failed to play back job output"; "error" => %error);
+                        if let Err(error) = stdout_file.seek(SeekFrom::End(0)).await {
+                            error!(log, "failed to restore output file position"; "error" => %error);
+                            stop.cancel();
                         }
                     }
                 }
 
-                if let Ok(Some(playback)) = playback_buffer(&mut stdout_file, INTERACTIVE_JOB_BUFFER_SIZE).await {
-                    let playback_len = playback.len();
-                    match client.send(Message::Data(playback).try_into().unwrap()).await {
-                        Err(error) => error!(log, "failed to play back job output"; "error" => %error),
-                        Ok(()) => debug!(log, "played back output"; "bytes" => playback_len),
-                    }
-                }
-
-                clients.add(client, access, stop.child_token());
+                clients.add(client, access, initial, stop.child_token());
             }
 
             // Handle a message from a client.
@@ -318,10 +347,20 @@ async fn job(
                 }
             }
 
-            // Stop job on cancellation signal, but only once.
+            // Stop job on cancellation signal: terminate first, then kill.
             _ = stop.cancelled(), if !killed => {
-                kill_job(&log, &child);
+                kill_job(&log, pgid, Signal::TERM);
+                kill_timeout.as_mut().reset(Instant::now() + KILL_GRACE);
                 killed = true;
+            }
+
+            // Upgrade to SIGKILL a stopped group that outlives its grace
+            // period, even if its leader is already dead.
+            _ = &mut kill_timeout, if killed && kills < KILL_ATTEMPTS => {
+                warn!(log, "job survived SIGTERM grace period, upgrading to SIGKILL");
+                kill_job(&log, pgid, Signal::KILL);
+                kill_timeout.as_mut().reset(Instant::now() + KILL_GRACE);
+                kills += 1;
             }
 
             // Notice when the job dies, but do not exit the loop;
@@ -330,12 +369,29 @@ async fn job(
             _ = child.wait(), if !dead => {
                 debug!(log, "reaped job process");
                 drain_timeout.as_mut().reset(Instant::now() + io.drain_timeout());
+                if streaming {
+                    drain_limit.as_mut().reset(Instant::now() + STREAMING_DRAIN_LIMIT);
+                }
                 dead = true;
+            }
+
+            // Cut off a dead stream that never reaches EOF.
+            _ = &mut drain_limit, if streaming && dead && !eof => {
+                warn!(log, "streaming job output never closed");
+                break;
+            }
+
+            // Give up on a live stream whose consumer never attached.
+            _ = &mut attach_deadline, if streaming && !attached && !eof => {
+                warn!(log, "streaming consumer never attached");
+                stop.cancel();
+                break;
             }
 
             // Give up on a stream whose consumer never drained it.
             _ = &mut linger, if eof => {
                 warn!(log, "streaming consumer never drained the output");
+                stop.cancel();
                 break;
             }
 
@@ -358,11 +414,16 @@ async fn job(
         let _ = tx_output.try_send(buf);
     }
 
-    // Reap the process.
+    // Reap the process. A stopped job that exited the loop alive
+    // still gets its SIGKILL upgrade after the grace period.
     let exit_status = select! {
         status = child.wait() => status,
         _ = stop.cancelled(), if !killed => {
-            kill_job(&log, &child);
+            kill_job(&log, pgid, Signal::KILL);
+            child.wait().await
+        }
+        _ = sleep(KILL_GRACE), if killed && !dead => {
+            kill_job(&log, pgid, Signal::KILL);
             child.wait().await
         }
     };
@@ -398,14 +459,24 @@ async fn stream_output(
         return;
     };
     while let Some(buf) = rx_output.recv().await {
-        if let Err(error) = client.send(Message::Data(buf).try_into().unwrap()).await {
-            error!(log, "failed to stream output to client"; "error" => %error);
-            stop.cancel();
-            return;
+        match timeout(
+            STREAMING_SEND_TIMEOUT,
+            client.send(Message::Data(buf).try_into().unwrap()),
+        )
+        .await
+        {
+            Ok(Ok(())) => continue,
+            Ok(Err(error)) => error!(log, "failed to stream output to client"; "error" => %error),
+            Err(_) => error!(log, "timed out streaming output to client"),
         }
+        stop.cancel();
+        return;
     }
-    let _ = client.send(Message::Close.try_into().unwrap()).await;
-    let _ = client.close(None).await;
+    let _ = timeout(STREAMING_SEND_TIMEOUT, async {
+        let _ = client.send(Message::Close.try_into().unwrap()).await;
+        let _ = client.close(None).await;
+    })
+    .await;
 }
 
 fn process_exit(exit_status: ExitStatus) -> Result<i32, ProcessError> {
@@ -424,8 +495,8 @@ fn process_exit(exit_status: ExitStatus) -> Result<i32, ProcessError> {
 }
 
 /// Fetch the last few bytes of the output file for client play back.
-/// Errors here indicate problems with the output file, and so should
-/// be treated as job-ending.
+/// On error the file position may be anywhere; the caller must restore
+/// it before the file is written again, or end the job.
 async fn playback_buffer(
     output_file: &mut File,
     output_bytes: usize,

@@ -1169,6 +1169,9 @@ async fn job(
                     return Err(CommandError::io(path, ErrorKind::AlreadyExists.into()));
                 }
             }
+            if let Some(client) = client.as_ref() {
+                preflight_target(ctx, client, &target).await?;
+            }
             let streaming = if *streaming {
                 Streaming::Output
             } else {
@@ -1211,7 +1214,7 @@ async fn job(
         }
 
         (JobCommand::Stop { job_id }, Some(client)) => {
-            job_stop(ctx, client, &job_id).await?;
+            job_stop(ctx, client, &job_id, None).await?;
             ctx.job_stopped(&job_id);
             Ok(())
         }
@@ -1403,6 +1406,7 @@ async fn job_start(
         let mut last = JobStatusMap::new();
         let mut settling = Settling::default();
         let mut started = false;
+        let mut stalled = false;
         let mut stopped = false;
         let mut sigint = signal(SignalKind::interrupt())?;
         let status = loop {
@@ -1421,7 +1425,7 @@ async fn job_start(
                 }
 
                 _ = ticker.tick() => {
-                    last = match job_status_map(ctx, client, &job_id).await {
+                    last = match job_status_map(ctx, client, &job_id, job_target.single_baseboard()).await {
                         Ok(status) => status,
                         // The job may not be visible anywhere yet.
                         Err(CommandError::NotFound(_)) => JobStatusMap::new(),
@@ -1434,6 +1438,10 @@ async fn job_start(
                     let rack = rack_sleds(client, &job_target).await;
                     if settling.done(&job_target, rack, &last) && started {
                         break last;
+                    }
+                    if !stalled && last.is_empty() && settling.polls >= WATCH_STALL_POLLS {
+                        ctx.job_watch_stalled(&job_id);
+                        stalled = true;
                     }
                 }
 
@@ -1448,7 +1456,7 @@ async fn job_start(
                         break last;
                     }
                     for _ in 0..3 {
-                        match job_stop(ctx, client, &job_id).await {
+                        match job_stop(ctx, client, &job_id, job_target.single_baseboard()).await {
                             Ok(_) => {
                                 ctx.job_stopped(&job_id);
                                 stopped = true;
@@ -1518,14 +1526,14 @@ async fn job_stop(
     ctx: &mut impl CommandContext,
     client: &Client,
     job_id: &JobId,
+    via: Option<&BaseboardId>,
 ) -> Result<(), CommandError> {
-    with_login(ctx, client, async || {
-        client
-            .job_stop()
-            .job_id(job_id)
-            .wait(JobWait::Stop)
-            .send()
-            .await
+    with_login_via(ctx, client, via, async || {
+        let mut request = client.job_stop().job_id(job_id).wait(JobWait::Stop);
+        if let Some(via) = via {
+            request = request.via(via.to_string());
+        }
+        request.send().await
     })
     .await?;
     Ok(())
@@ -1537,19 +1545,26 @@ async fn job_status(
     job_id: &JobId,
     style: StatusDisplayStyle,
 ) -> Result<(), CommandError> {
-    let status = job_status_map(ctx, client, job_id).await?;
+    let status = job_status_map(ctx, client, job_id, None).await?;
     ctx.job_status(job_id, &status, style);
     Ok(())
 }
 
-/// Fetch a job's rack-wide status map.
+/// Fetch a job's rack-wide status map. Routing `via` a single-sled
+/// target gets its authoritative status and keeps the login on the
+/// sled that already knows it.
 async fn job_status_map(
     ctx: &mut impl CommandContext,
     client: &Client,
     job_id: &JobId,
+    via: Option<&BaseboardId>,
 ) -> Result<JobStatusMap, CommandError> {
-    let status = with_login(ctx, client, async || {
-        client.job_status().job_id(job_id).send().await
+    let status = with_login_via(ctx, client, via, async || {
+        let mut request = client.job_status().job_id(job_id);
+        if let Some(via) = via {
+            request = request.via(via.to_string());
+        }
+        request.send().await
     })
     .await?
     .into_inner();
@@ -1571,7 +1586,7 @@ async fn job_watch(
     let mut settling = Settling::default();
     let mut sigint = signal(SignalKind::interrupt())?;
     let status = loop {
-        let status = match job_status_map(ctx, client, job_id).await {
+        let status = match job_status_map(ctx, client, job_id, target.single_baseboard()).await {
             Ok(status) => status,
             Err(error) => {
                 ctx.job_watch_finished(job_id);
@@ -1596,6 +1611,10 @@ async fn job_watch(
 /// fan a job out across the rack, so a map that looks settled early
 /// is likely still missing sleds.
 const WATCH_MIN_POLLS: usize = 5;
+
+/// How many polls a watch may go without any sled reporting a status
+/// before warning that the job may never run.
+const WATCH_STALL_POLLS: usize = 15;
 
 /// Rolling settlement state for a watched job.
 #[derive(Default)]
@@ -1707,7 +1726,7 @@ async fn job_output(
     }
 
     // Fetch output from every sled with a recorded status.
-    let status = job_status_map(ctx, client, &args.job_id).await?;
+    let status = job_status_map(ctx, client, &args.job_id, None).await?;
     if status.is_empty() {
         return Err(CommandError::NotFound(format!(
             "Job `{}` not found",
@@ -1738,14 +1757,7 @@ async fn job_output_from(
     }: JobOutput,
 ) -> Result<(), CommandError> {
     // Fetch job status for output length and hash.
-    let status = job_status_try_from_json_map(
-        with_login_via(ctx, client, Some(target), async || {
-            client.job_status().job_id(job_id).send().await
-        })
-        .await?
-        .into_inner(),
-    )
-    .map_err(CommandError::BaseboardIdParseError)?;
+    let status = job_status_map(ctx, client, &job_id, Some(target)).await?;
 
     let JobOutputState {
         stdout_len,
@@ -2081,6 +2093,32 @@ impl FromStr for TargetArg {
     }
 }
 
+/// Confirm before signing a job for a sled that doesn't appear in inventory.
+#[cfg(feature = "permslip")]
+async fn preflight_target(
+    ctx: &mut impl CommandContext,
+    client: &Client,
+    target: &Target,
+) -> Result<(), CommandError> {
+    let Target::Sleds(sleds) = target else {
+        return Ok(());
+    };
+    let Ok(inventory) = client.versions().send().await else {
+        return Ok(());
+    };
+    let inventory = inventory.into_inner();
+    for sled in sleds {
+        let known = match sled {
+            SledId::Baseboard(baseboard) => inventory.iter().any(|s| &s.baseboard == baseboard),
+            SledId::Cubby(cubby) => inventory.iter().any(|s| s.cubby == Some(*cubby)),
+        };
+        if !known {
+            ctx.really_target(sled)?;
+        }
+    }
+    Ok(())
+}
+
 /// Resolve a target argument to a target, matching bare serial
 /// numbers against the rack's sled inventory.
 async fn resolve_target_arg(client: &Client, target: &TargetArg) -> Result<Target, CommandError> {
@@ -2120,7 +2158,7 @@ async fn resolve_serial(
     job_id: &JobId,
     serial: &str,
 ) -> Result<BaseboardId, CommandError> {
-    let status = job_status_map(ctx, client, job_id).await?;
+    let status = job_status_map(ctx, client, job_id, None).await?;
     let mut matches = status
         .keys()
         .filter(|b| b.serial_number.eq_ignore_ascii_case(serial));

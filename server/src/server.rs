@@ -299,6 +299,7 @@ impl SushApi for ApiServer {
         ctx: RequestContext<Self::Context>,
         headers: Header<Authorization>,
         params: PathParams<JobIdParam>,
+        _query: QueryParams<RoutingParam>,
     ) -> Result<HttpResponseOk<JsonJobStatusMap>, HttpError> {
         let mgr = ctx.context();
         let Authorization { authorization } = headers.into_inner();

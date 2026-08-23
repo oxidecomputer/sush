@@ -23,7 +23,7 @@ use sush_common::jobs::{
     Access, JobId, JobOutputStream, JobStatusMap, Session, SessionId, SignedJob,
 };
 use sush_common::keys::{KeyId, SshPublicKey};
-use sush_common::targets::SledVersion;
+use sush_common::targets::{SledId, SledVersion};
 use sush_common::version::VersionInfo;
 
 use crate::cli::Cli;
@@ -338,6 +338,10 @@ impl CommandContext for Repl {
         self.cli.job_watch_update(status)
     }
 
+    fn job_watch_stalled(&mut self, job_id: &JobId) {
+        self.cli.job_watch_stalled(job_id)
+    }
+
     fn job_watch_finished(&mut self, job_id: &JobId) {
         self.cli.job_watch_finished(job_id)
     }
@@ -363,6 +367,10 @@ impl CommandContext for Repl {
 
     fn please_touch(&mut self, identity: &SshPublicKey) -> Result<(), CommandError> {
         self.cli.please_touch(identity)
+    }
+
+    fn really_target(&mut self, sled: &SledId) -> Result<(), CommandError> {
+        self.cli.really_target(sled)
     }
 
     fn really_revoke(&mut self, what: &str, key_id: KeyId) -> Result<KeyId, CommandError> {

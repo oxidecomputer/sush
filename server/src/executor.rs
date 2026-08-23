@@ -18,7 +18,7 @@ use std::sync::{Arc, RwLock};
 use chrono::Utc;
 use futures::Stream;
 use pwd::Passwd;
-use rustix::io::close;
+use rustix::io::{Errno, close};
 use rustix::process::{Pid, Signal, ioctl_tiocsctty, kill_process_group, setsid};
 use slog::{Logger, debug, error, o, warn};
 use tokio::fs::{DirBuilder, OpenOptions};
@@ -488,20 +488,24 @@ async fn send_error(
     }
 }
 
-/// Kill a job's whole process group, of which `child` should be the leader.
-///
-/// TODO: 2-stage stop with `SIGTERM` and a grace period.
-pub fn kill_job(log: &Logger, child: &Child) {
-    if let Some(pid) = child.id()
-        && let Ok(pid) = pid.try_into()
-        && let Some(pid) = Pid::from_raw(pid)
-    {
-        match kill_process_group(pid, Signal::KILL) {
-            Ok(()) => debug!(log, "killed job processes"),
-            Err(error) => error!(log, "unable to kill job"; "error" => %error),
+/// A job's process group ID, which its `child` leads. Capture it
+/// before the leader is reaped, after which `id` returns nothing.
+pub fn job_pgid(child: &Child) -> Option<Pid> {
+    Pid::from_raw(child.id()?.try_into().ok()?)
+}
+
+/// Send a signal to a job's whole process group.
+pub fn kill_job(log: &Logger, pgid: Option<Pid>, signal: Signal) {
+    let Some(pgid) = pgid else {
+        debug!(log, "job has no process group");
+        return;
+    };
+    match kill_process_group(pgid, signal) {
+        Ok(()) => debug!(log, "signalled job processes"; "signal" => ?signal),
+        Err(Errno::SRCH) => debug!(log, "job processes are already dead"),
+        Err(error) => {
+            error!(log, "unable to signal job"; "signal" => ?signal, "error" => %error)
         }
-    } else {
-        debug!(log, "process is already dead or has an invalid PID");
     }
 }
 
