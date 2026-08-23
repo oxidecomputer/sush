@@ -283,9 +283,19 @@ async fn job(
                     }
                 }
 
-                if let Ok(Some(playback)) = playback_buffer(&mut stdout_file, INTERACTIVE_JOB_BUFFER_SIZE).await {
-                    debug!(log, "playing back output"; "bytes" => playback.len());
-                    initial.push(Message::Data(playback).try_into().unwrap());
+                match playback_buffer(&mut stdout_file, INTERACTIVE_JOB_BUFFER_SIZE).await {
+                    Ok(Some(playback)) => {
+                        debug!(log, "playing back output"; "bytes" => playback.len());
+                        initial.push(Message::Data(playback).try_into().unwrap());
+                    }
+                    Ok(None) => (),
+                    Err(error) => {
+                        error!(log, "failed to play back job output"; "error" => %error);
+                        if let Err(error) = stdout_file.seek(SeekFrom::End(0)).await {
+                            error!(log, "failed to restore output file position"; "error" => %error);
+                            stop.cancel();
+                        }
+                    }
                 }
 
                 clients.add(client, access, initial, stop.child_token());
@@ -479,8 +489,8 @@ fn process_exit(exit_status: ExitStatus) -> Result<i32, ProcessError> {
 }
 
 /// Fetch the last few bytes of the output file for client play back.
-/// Errors here indicate problems with the output file, and so should
-/// be treated as job-ending.
+/// On error the file position may be anywhere; the caller must restore
+/// it before the file is written again, or end the job.
 async fn playback_buffer(
     output_file: &mut File,
     output_bytes: usize,
