@@ -388,6 +388,8 @@ impl JobWait {
 pub struct JobStopParams {
     /// Wait for the job process to end.
     pub wait: JobWait,
+    /// Where a proxy should route this request. Sleds ignore it.
+    pub via: Option<String>,
 }
 
 /// Simple pagination for history list.

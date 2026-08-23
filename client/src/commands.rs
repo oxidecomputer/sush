@@ -1214,7 +1214,7 @@ async fn job(
         }
 
         (JobCommand::Stop { job_id }, Some(client)) => {
-            job_stop(ctx, client, &job_id).await?;
+            job_stop(ctx, client, &job_id, None).await?;
             ctx.job_stopped(&job_id);
             Ok(())
         }
@@ -1456,7 +1456,7 @@ async fn job_start(
                         break last;
                     }
                     for _ in 0..3 {
-                        match job_stop(ctx, client, &job_id).await {
+                        match job_stop(ctx, client, &job_id, job_target.single_baseboard()).await {
                             Ok(_) => {
                                 ctx.job_stopped(&job_id);
                                 stopped = true;
@@ -1526,14 +1526,14 @@ async fn job_stop(
     ctx: &mut impl CommandContext,
     client: &Client,
     job_id: &JobId,
+    via: Option<&BaseboardId>,
 ) -> Result<(), CommandError> {
-    with_login(ctx, client, async || {
-        client
-            .job_stop()
-            .job_id(job_id)
-            .wait(JobWait::Stop)
-            .send()
-            .await
+    with_login_via(ctx, client, via, async || {
+        let mut request = client.job_stop().job_id(job_id).wait(JobWait::Stop);
+        if let Some(via) = via {
+            request = request.via(via.to_string());
+        }
+        request.send().await
     })
     .await?;
     Ok(())

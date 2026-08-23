@@ -271,6 +271,7 @@ async fn job_stop() {
         &job_id,
         JobStopParams {
             wait: JobWait::Stop,
+            ..Default::default()
         },
     )
     .await
@@ -313,6 +314,7 @@ async fn job_stop() {
         &job_id,
         JobStopParams {
             wait: JobWait::Stop,
+            ..Default::default()
         },
     )
     .await
@@ -390,6 +392,7 @@ async fn cancel_queued_job() {
         &job_id_b,
         JobStopParams {
             wait: JobWait::Stop,
+            ..Default::default()
         },
     )
     .await
@@ -405,6 +408,7 @@ async fn cancel_queued_job() {
         &job_id_a,
         JobStopParams {
             wait: JobWait::Stop,
+            ..Default::default()
         },
     )
     .await
@@ -980,6 +984,7 @@ async fn attribution() {
         &job_id_b,
         JobStopParams {
             wait: JobWait::Stop,
+            ..Default::default()
         },
     )
     .await
@@ -994,6 +999,7 @@ async fn attribution() {
         &job_id_a,
         JobStopParams {
             wait: JobWait::Stop,
+            ..Default::default()
         },
     )
     .await
@@ -1399,6 +1405,7 @@ async fn attach_grants() {
         &job_id,
         JobStopParams {
             wait: JobWait::Stop,
+            ..Default::default()
         },
     )
     .await

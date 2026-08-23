@@ -671,6 +671,15 @@
           },
           {
             "in": "query",
+            "name": "via",
+            "description": "Where a proxy should route this request. Sleds ignore it.",
+            "schema": {
+              "nullable": true,
+              "type": "string"
+            }
+          },
+          {
+            "in": "query",
             "name": "wait",
             "description": "Wait for the job process to end.",
             "schema": {

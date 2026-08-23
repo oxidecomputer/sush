@@ -622,7 +622,7 @@ impl JobManager {
         &self,
         authn: &Identity,
         job_id: &JobId,
-        JobStopParams { wait }: JobStopParams,
+        JobStopParams { wait, .. }: JobStopParams,
     ) -> Result<(), JobError> {
         self.job_request(authn, JobRequest::Stop(job_id.to_owned()))
             .await?;
