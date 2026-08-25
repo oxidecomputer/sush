@@ -270,6 +270,43 @@ async fn jobs() {
     );
 }
 
+/// A job signed for anything but the active session is refused with
+/// an error status, not silently discarded.
+#[named]
+#[tokio::test]
+async fn job_session_enforced() {
+    let log = test_logger(function_name!());
+    let (mgr, mut root, _dir, _shutdown) = manager_and_test_root(log).await;
+    let authn = fake_identity(&mut root).await;
+
+    // With no active session, submission fails at the front door.
+    let ghost = Session::new(SessionId::random());
+    let job = root
+        .sign_job_request(ghost.next_job_id(), ghost.session_id(), "true", false)
+        .await;
+    assert!(matches!(
+        mgr.job_start(&authn, job.clone().into_signed(), JobStartParams::default())
+            .await,
+        Err(JobError::NoSession)
+    ));
+
+    // With some other session active, likewise.
+    let signer_nonce = SessionSignerNonce::random();
+    let session_id = SessionId::compute(
+        mgr.own_baseboard(),
+        mgr.regenerate_session_sush_nonce(),
+        signer_nonce,
+    );
+    mgr.session_start(&authn, session_id, signer_nonce, true)
+        .await
+        .unwrap();
+    assert!(matches!(
+        mgr.job_start(&authn, job.into_signed(), JobStartParams::default())
+            .await,
+        Err(JobError::SessionNotCurrent(id)) if id == ghost.session_id()
+    ));
+}
+
 #[named]
 #[tokio::test]
 async fn job_stop() {
@@ -2395,22 +2432,17 @@ async fn streaming_validation() {
             )
             .await;
         session.job_started(job.clone().into_signed());
-        mgr.job_start(&authn, job.into_signed(), JobStartParams::default())
-            .await
-            .unwrap();
-        let status = timeout(Duration::from_secs(5), async {
-            loop {
-                if let Ok(status) = mgr.job_status(&authn, &job_id).await
-                    && let Some(status) = status.get(mgr.own_baseboard())
-                    && status.is_terminal()
-                {
-                    break status.clone();
-                }
-                sleep(Duration::from_millis(10)).await;
-            }
-        })
+        mgr.job_start(
+            &authn,
+            job.into_signed(),
+            JobStartParams {
+                wait: JobWait::Stop,
+                ..Default::default()
+            },
+        )
         .await
         .unwrap();
+        let status = mgr.job_status(&authn, &job_id).await.unwrap()[mgr.own_baseboard()].clone();
         assert!(matches!(status, JobStatus::Error { .. }), "{status:?}");
     };
 

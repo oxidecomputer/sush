@@ -328,6 +328,10 @@ impl JobStartRequest {
         &self.job_id
     }
 
+    pub fn session_id(&self) -> SessionId {
+        self.session_id
+    }
+
     pub fn command(&self) -> &str {
         &self.command
     }

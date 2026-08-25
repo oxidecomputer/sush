@@ -621,15 +621,17 @@ impl JobManager {
         let job_id = job.job_id().to_owned();
         let wait = params.wait.to_owned();
 
-        // A job can only ever run within an active session; fail fast
-        // rather than silently queuing (or discarding) a job that can
-        // never execute.
-        if self.session(authn).is_none() {
-            return Err(JobError::NoSession);
+        // A job can only run in the session it was signed for.
+        let payload = job.payload();
+        match self.session(authn) {
+            None => return Err(JobError::NoSession),
+            Some(session) if session.session_id() != payload.session_id() => {
+                return Err(JobError::SessionNotCurrent(payload.session_id()));
+            }
+            Some(_) => (),
         }
 
         // A broader target would orphan jobs on unattached sleds.
-        let payload = job.payload();
         if payload.interactive && payload.target().single_baseboard().is_none() {
             return Err(JobError::InteractiveTarget);
         }

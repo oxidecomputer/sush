@@ -156,6 +156,17 @@ impl Executor {
         let _ = self.stop.remove(job_id);
     }
 
+    /// Announce a job that will never run here.
+    pub fn job_refused(&self, job_id: JobId, error: ProcessError) {
+        let Some(events) = self.events.read().unwrap().as_ref().cloned() else {
+            return;
+        };
+        let log = self.log.clone();
+        spawn(async move {
+            send_error(&log, &job_id, &events, error).await;
+        });
+    }
+
     pub fn output_dir(&self) -> &JobOutputDir {
         &self.output_dir
     }

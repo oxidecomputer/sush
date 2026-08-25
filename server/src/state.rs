@@ -26,7 +26,9 @@ use x509_cert::der::Encode as _;
 
 use sush_api::JobStartParams;
 use sush_common::authn::{Identity, Nonce, RequestVerifier, SignedLogin};
-use sush_common::jobs::{Access, JobId, JobStatus, JobStatusMap, Session, SessionId, SignedJob};
+use sush_common::jobs::{
+    Access, JobId, JobStatus, JobStatusMap, ProcessError, Session, SessionId, SignedJob,
+};
 use sush_common::keys::{KeyError, KeyId, Signature, SshPublicKey};
 use sush_common::targets::Cubbies;
 use sush_common::version::{VersionInfo, VersionMap};
@@ -662,7 +664,7 @@ impl State {
                         // The session must be active and must match the
                         // submitted job.
                         //
-                        // It is safe to discard all other jobs. By cases:
+                        // It is safe to refuse all other jobs. By cases:
                         //
                         // - If the job came from a session in the causal
                         // past of our own, the session has been superseded,
@@ -676,25 +678,50 @@ impl State {
                         // receive a job from a session before that
                         // session's own start (since each session is
                         // linearized by its accepting server).
-                        if let Some(mut session) = self.session.active_session() {
-                            session.enqueue_job(
-                                log,
-                                &mut self.history,
-                                &self.running,
-                                &self.own_baseboard,
-                                &self.cubbies,
-                                signed.clone(),
-                                params.clone(),
-                                actor,
-                            );
-                            session.execute_ready_jobs(
-                                &self.own_baseboard,
-                                &self.cubbies,
-                                &mut self.certs,
-                                &mut self.history,
-                                executor,
-                                &mut self.attachments,
-                            );
+                        //
+                        // Refused jobs targeting this sled record an error
+                        // status so the submitter learns their fate.
+                        let session_id = signed.payload().session_id();
+                        match self.session.active_session() {
+                            Some(mut session) if session.session_id() == session_id => {
+                                session.enqueue_job(
+                                    log,
+                                    &mut self.history,
+                                    &self.running,
+                                    &self.own_baseboard,
+                                    &self.cubbies,
+                                    signed.clone(),
+                                    params.clone(),
+                                    actor,
+                                );
+                                session.execute_ready_jobs(
+                                    &self.own_baseboard,
+                                    &self.cubbies,
+                                    &mut self.certs,
+                                    &mut self.history,
+                                    executor,
+                                    &mut self.attachments,
+                                );
+                            }
+                            _ => {
+                                let job_id = *signed.job_id();
+                                warn!(
+                                    log, "refusing job for inactive session";
+                                    "job_id" => %job_id,
+                                    "session_id" => %session_id,
+                                    "actor" => %actor,
+                                );
+                                if signed.payload().runs_on(&self.own_baseboard, &self.cubbies)
+                                    && !self.history.contains(&job_id)
+                                {
+                                    executor.job_refused(
+                                        job_id,
+                                        ProcessError::InvalidJob(format!(
+                                            "session `{session_id}` is not active"
+                                        )),
+                                    );
+                                }
+                            }
                         }
                     }
                     (actor, JobRequest::Stop(job_id)) => {
