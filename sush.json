@@ -700,6 +700,41 @@
         }
       }
     },
+    "/session-nonce": {
+      "get": {
+        "summary": "Get the sush server nonce needed to start a new session.",
+        "description": "The nonce will need to be sent to the signer server, which will give back its own nonce. Both nonces combined (along with the baseboard ID) will form the session ID.",
+        "operationId": "session_start_nonce",
+        "parameters": [
+          {
+            "in": "header",
+            "name": "authorization",
+            "description": "Authorization to access some resource, such as a signature.\n\nSee: <https://developer.mozilla.org/en-US/docs/Web/HTTP/Reference/Headers/Authorization>",
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "successful operation",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/SessionStartNonce"
+                }
+              }
+            }
+          },
+          "4XX": {
+            "$ref": "#/components/responses/Error"
+          },
+          "5XX": {
+            "$ref": "#/components/responses/Error"
+          }
+        }
+      }
+    },
     "/sessions": {
       "get": {
         "summary": "Get the current session from this server's point of view.",
@@ -952,41 +987,6 @@
         "responses": {
           "204": {
             "description": "resource updated"
-          },
-          "4XX": {
-            "$ref": "#/components/responses/Error"
-          },
-          "5XX": {
-            "$ref": "#/components/responses/Error"
-          }
-        }
-      }
-    },
-    "/sessions-nonce": {
-      "post": {
-        "summary": "Get the Sush server nonce needed to start a new session.",
-        "description": "The nonce will need to be sent to the signer server, which will give back its own nonce. Both nonces combined (along with the baseboard ID) will form the session ID.",
-        "operationId": "session_start_nonce",
-        "parameters": [
-          {
-            "in": "header",
-            "name": "authorization",
-            "description": "Authorization to access some resource, such as a signature.\n\nSee: <https://developer.mozilla.org/en-US/docs/Web/HTTP/Reference/Headers/Authorization>",
-            "schema": {
-              "type": "string"
-            }
-          }
-        ],
-        "responses": {
-          "200": {
-            "description": "successful operation",
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/SessionStartNonce"
-                }
-              }
-            }
           },
           "4XX": {
             "$ref": "#/components/responses/Error"

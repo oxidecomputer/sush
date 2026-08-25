@@ -110,11 +110,11 @@ pub trait SushApi {
         headers: Header<Authorization>,
     ) -> Result<HttpResponseOk<Session>, HttpError>;
 
-    /// Get the Sush server nonce needed to start a new session.
+    /// Get the sush server nonce needed to start a new session.
     ///
     /// The nonce will need to be sent to the signer server, which will give back its own nonce.
     /// Both nonces combined (along with the baseboard ID) will form the session ID.
-    #[endpoint { method = POST, path = "/sessions-nonce" }]
+    #[endpoint { method = GET, path = "/session-nonce" }]
     async fn session_start_nonce(
         ctx: RequestContext<Self::Context>,
         headers: Header<Authorization>,
