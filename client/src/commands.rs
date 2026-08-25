@@ -1224,7 +1224,7 @@ async fn job(
             } else {
                 Streaming::None
             };
-            let mut signer = PermslipSigner::new(key_name, permslip_url).await?;
+            let signer = PermslipSigner::new(key_name, permslip_url).await?;
             let mut interval = interval(SIGNING_UPDATE_INTERVAL);
             interval.set_missed_tick_behavior(MissedTickBehavior::Skip);
             let sign = signer.sign_job_request(JobStartRequest::new(

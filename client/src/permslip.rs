@@ -5,18 +5,15 @@
 //! Use Permission Slip to sign Support Shell job requests.
 
 use permslip_client_lib::login::{IdentityProvider, TokenProvider};
-use permslip_client_lib::types::{
-    CreateSushSessionBody, CreatedSushSession, Error as ApiError,
-    JobStartRequest as PermslipJobStartRequest,
-};
+use permslip_client_lib::types::{CreateSushSessionBody, CreatedSushSession, Error as ApiError};
 use permslip_client_lib::{Client, ClientRequestBuilder, Error as ClientError};
 use sled_hardware_types::BaseboardId;
 use thiserror::Error;
 
 use sush_common::codephrases::InvalidCodephrase;
-use sush_common::jobs::{JobStartRequest, SessionSushNonce};
-use sush_common::keys::{EncodedSignature, KeyError, Signed};
-use sush_common::targets::{InvalidTarget, Target};
+use sush_common::jobs::{JobStartRequest, SessionSushNonce, SignedJob};
+use sush_common::keys::KeyError;
+use sush_common::targets::InvalidTarget;
 
 pub struct PermslipSigner {
     client: Client,
@@ -52,7 +49,7 @@ impl PermslipSigner {
                 cpn: baseboard.part_number.clone(),
                 serial_number: baseboard.serial_number.clone(),
                 key_name: self.key_name.clone(),
-                sush_nonce: sush_nonce.to_string().into(),
+                sush_nonce,
             })
             .send()
             .await?
@@ -62,49 +59,14 @@ impl PermslipSigner {
     pub async fn sign_job_request(
         &self,
         request: JobStartRequest,
-    ) -> Result<Signed<JobStartRequest>, PermslipError> {
-        let result = self
+    ) -> Result<SignedJob, PermslipError> {
+        Ok(self
             .client
             .sign_sush_job()
-            .body(PermslipJobStartRequest {
-                command: request.command,
-                interactive: if request.interactive {
-                    Some(true)
-                } else {
-                    None
-                },
-                job_id: request.job_id.to_string().into(),
-                session_id: request.session_id.to_string().into(),
-                target: if let Target::All = request.target {
-                    None
-                } else {
-                    Some(request.target.to_string())
-                },
-            })
+            .body(request)
             .send()
             .await?
-            .into_inner();
-
-        Ok(Signed::new(
-            JobStartRequest {
-                job_id: result.payload.job_id.to_string().parse()?,
-                session_id: result.payload.session_id.to_string().parse()?,
-                command: result.payload.command,
-                interactive: result.payload.interactive.unwrap_or(false),
-                target: if let Some(target) = result.payload.target {
-                    target.parse()?
-                } else {
-                    Target::All
-                },
-            },
-            result.key_id.to_string().parse()?,
-            EncodedSignature {
-                r: result.signature.r.to_string().parse()?,
-                s: result.signature.s.to_string().parse()?,
-                flags: result.signature.flags.unwrap_or(0),
-                counter: result.signature.counter.unwrap_or(0),
-            },
-        ))
+            .into_inner())
     }
 }
 

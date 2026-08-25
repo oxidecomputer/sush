@@ -92,3 +92,10 @@ opt-level = 3
 opt-level = 3
 [profile.dev.package.sha3]
 opt-level = 3
+
+# XXX testing only, repin before push.
+[patch."https://github.com/oxidecomputer/permission-slip"]
+permission-slip-client = { path = "/home/claude/permission-slip/client" }
+permission-slip-common = { path = "/home/claude/permission-slip/common" }
+[patch."https://github.com/oxidecomputer/sush"]
+sush-common = { path = "common" }
