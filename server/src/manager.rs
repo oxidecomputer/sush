@@ -135,6 +135,7 @@ impl JobManager {
         info!(log, "starting sush"; "version" => LONG_VERSION);
         let (tx_req, rx_req) = mpsc::channel(16);
         let requests = ReceiverStream::new(rx_req);
+        let session_sush_nonce = Arc::new(SyncMutex::new(SessionSushNonce::random()));
         let (rx_state, join_state) = StateManager::run(
             log.new(o!("component" => "state manager")),
             path_isolation,
@@ -144,13 +145,14 @@ impl JobManager {
             cubbies,
             universe,
             roots,
+            session_sush_nonce.clone(),
             shutdown,
         )?;
         Ok(Self {
             log: log.new(o!("component" => "job manager")),
             nonces: Arc::new(Mutex::new(LruCache::new(MAX_OUTSTANDING_NONCES))),
             identities: Arc::new(Mutex::new(LruCache::new(MAX_CACHED_IDENTITIES))),
-            session_sush_nonce: Arc::new(SyncMutex::new(SessionSushNonce::random())),
+            session_sush_nonce,
             own_baseboard,
             output_dir,
             state: rx_state,
@@ -514,16 +516,8 @@ impl JobManager {
         Ok(session.into_session_id())
     }
 
-    pub fn regenerate_session_sush_nonce(&self) -> SessionSushNonce {
-        let nonce = SessionSushNonce::random();
-        match self.session_sush_nonce.lock() {
-            Ok(mut slot) => *slot = nonce,
-            Err(mut poison) => {
-                **poison.get_mut() = nonce;
-                self.session_sush_nonce.clear_poison();
-            }
-        }
-        nonce
+    pub fn session_sush_nonce(&self) -> SessionSushNonce {
+        *self.session_sush_nonce.lock().unwrap()
     }
 
     pub async fn session_start(
@@ -533,15 +527,11 @@ impl JobManager {
         signer_nonce: SessionSignerNonce,
         wait: bool,
     ) -> Result<(), JobError> {
-        // We don't care about poisoning for the nonce, it's never mutated in a way that could lead
-        // to inconsistencies in the event of a panic.
-        let sush_nonce = match self.session_sush_nonce.lock() {
-            Ok(nonce) => *nonce,
-            Err(poison) => *poison.into_inner(),
-        };
-
-        // Verify that the session ID provided by the client is meant to be sent to this instance of
-        // Sush, by checking that the signer nonce was hashed with our baseboard and nonce.
+        // Verify that the session ID provided by the client is meant for
+        // this instance of Sush, by checking that the signer nonce was
+        // hashed with our baseboard and nonce. The state machine rotates
+        // the nonce when a session activates.
+        let sush_nonce = *self.session_sush_nonce.lock().unwrap();
         let computed = SessionId::compute(self.own_baseboard(), sush_nonce, signer_nonce);
         if computed != session_id {
             return Err(JobError::InvalidSessionId);

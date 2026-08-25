@@ -135,7 +135,7 @@ async fn jobs_gossip_between_sleds() {
     let signer_nonce = SessionSignerNonce::random();
     let session_id = SessionId::compute(
         a.mgr.own_baseboard(),
-        a.mgr.regenerate_session_sush_nonce(),
+        a.mgr.session_sush_nonce(),
         signer_nonce,
     );
     let session = Session::new(session_id);
@@ -184,7 +184,7 @@ async fn jobs_gossip_between_sleds() {
     let successor_nonce = SessionSignerNonce::random();
     let successor = SessionId::compute(
         b.mgr.own_baseboard(),
-        b.mgr.regenerate_session_sush_nonce(),
+        b.mgr.session_sush_nonce(),
         successor_nonce,
     );
     b.mgr

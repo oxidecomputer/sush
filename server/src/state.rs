@@ -9,7 +9,7 @@
 
 use std::collections::BTreeMap;
 use std::num::NonZeroUsize;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
 use chrono::{DateTime, Utc};
 use futures::{Stream, StreamExt};
@@ -27,7 +27,8 @@ use x509_cert::der::Encode as _;
 use sush_api::JobStartParams;
 use sush_common::authn::{Identity, Nonce, RequestVerifier, SignedLogin};
 use sush_common::jobs::{
-    Access, JobId, JobStatus, JobStatusMap, ProcessError, Session, SessionId, SignedJob,
+    Access, JobId, JobStatus, JobStatusMap, ProcessError, Session, SessionId, SessionSushNonce,
+    SignedJob,
 };
 use sush_common::keys::{KeyError, KeyId, Signature, SshPublicKey};
 use sush_common::targets::Cubbies;
@@ -309,6 +310,9 @@ pub struct State {
     attachments: AttachmentPoints,
     /// Job request signing certificates.
     certs: Certificates,
+    /// The nonce binding new session IDs to this sled, shared with the
+    /// manager and rotated whenever a session activates.
+    session_sush_nonce: Arc<Mutex<SessionSushNonce>>,
     /// Revocations of certificates we have never seen. Bounded and
     /// apart from `certs`, so revocation spam evicts only itself.
     tombstones: LruCache<KeyId, DateTime<Utc>>,
@@ -329,7 +333,11 @@ impl State {
     /// Fails if any root certificate is malformed or does not validate. Roots
     /// are supplied by whoever configures the server, so they are not
     /// necessarily trustworthy just because they were handed to us.
-    pub fn new(own_baseboard: BaseboardId, root_certs: &[Certificate]) -> Result<Self, KeyError> {
+    pub fn new(
+        own_baseboard: BaseboardId,
+        root_certs: &[Certificate],
+        session_sush_nonce: Arc<Mutex<SessionSushNonce>>,
+    ) -> Result<Self, KeyError> {
         let certs = root_certs
             .iter()
             .map(|cert| {
@@ -347,6 +355,7 @@ impl State {
             history: Default::default(),
             session: Default::default(),
             attachments: Default::default(),
+            session_sush_nonce,
             tombstones: LruCache::new(MAX_TOMBSTONES),
             certs,
             roots: roots.clone(),
@@ -512,7 +521,8 @@ impl State {
                                 session: Box::new(Session::started(*session_id, actor.clone())),
                                 queued_jobs: QueuedJobs::new(),
                                 attach_grants: BTreeMap::new(),
-                            }
+                            };
+                            *self.session_sush_nonce.lock().unwrap() = SessionSushNonce::random();
                         }
 
                         // When the incoming session is concurrent, we can't
@@ -903,13 +913,15 @@ impl StateManager {
         mut cubbies: watch::Receiver<Cubbies>,
         universe: watch::Receiver<GossipNetwork>,
         roots: &[Certificate],
+        session_sush_nonce: Arc<Mutex<SessionSushNonce>>,
         shutdown: CancellationToken,
     ) -> Result<(watch::Receiver<State>, JoinHandle<()>), KeyError>
     where
         R: Stream<Item = Request> + Send + Unpin + 'static,
     {
         // We report our current state through a watch channel.
-        let mut initial_state = State::new(own_baseboard.clone(), roots)?;
+        let mut initial_state =
+            State::new(own_baseboard.clone(), roots, session_sush_nonce.clone())?;
         initial_state.cubbies = cubbies.borrow_and_update().clone();
         let (tx_state, rx_state) = watch::channel(initial_state);
         let roots = roots.to_vec();
@@ -1060,8 +1072,12 @@ impl StateManager {
                         causal_messages = fresh.causal_messages();
                         // TODO: re-inject local job state (policy pending).
                         tx_state.send_modify(|state| {
-                            *state = State::new(own_baseboard.clone(), &roots)
-                                .expect("roots validated at startup");
+                            *state = State::new(
+                                own_baseboard.clone(),
+                                &roots,
+                                state.session_sush_nonce.clone(),
+                            )
+                            .expect("roots validated at startup");
                             state.cubbies = cubbies.borrow().clone();
                         });
                         *rumors = fresh;

@@ -183,7 +183,7 @@ impl SushApi for ApiServer {
             .iam(authorization, None, request_line(&ctx.request))
             .await?;
         Ok(HttpResponseOk(SessionStartNonce {
-            nonce: mgr.regenerate_session_sush_nonce(),
+            nonce: mgr.session_sush_nonce(),
         }))
     }
 

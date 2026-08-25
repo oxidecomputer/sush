@@ -104,11 +104,8 @@ async fn jobs() {
     let baseboard_id = mgr.own_baseboard();
     let authn = fake_identity(&mut root).await;
     let signer_nonce = SessionSignerNonce::random();
-    let session_id = SessionId::compute(
-        mgr.own_baseboard(),
-        mgr.regenerate_session_sush_nonce(),
-        signer_nonce,
-    );
+    let session_id =
+        SessionId::compute(mgr.own_baseboard(), mgr.session_sush_nonce(), signer_nonce);
     let mut session = Session::new(session_id);
     mgr.session_start(&authn, session_id, signer_nonce, true)
         .await
@@ -292,11 +289,8 @@ async fn job_session_enforced() {
 
     // With some other session active, likewise.
     let signer_nonce = SessionSignerNonce::random();
-    let session_id = SessionId::compute(
-        mgr.own_baseboard(),
-        mgr.regenerate_session_sush_nonce(),
-        signer_nonce,
-    );
+    let session_id =
+        SessionId::compute(mgr.own_baseboard(), mgr.session_sush_nonce(), signer_nonce);
     mgr.session_start(&authn, session_id, signer_nonce, true)
         .await
         .unwrap();
@@ -304,6 +298,37 @@ async fn job_session_enforced() {
         mgr.job_start(&authn, job.into_signed(), JobStartParams::default())
             .await,
         Err(JobError::SessionNotCurrent(id)) if id == ghost.session_id()
+    ));
+}
+
+/// A session nonce is consumed when a session activates, but not by a
+/// failed start.
+#[named]
+#[tokio::test]
+async fn session_nonce_rotates() {
+    let log = test_logger(function_name!());
+    let (mgr, mut root, _dir, _shutdown) = manager_and_test_root(log).await;
+    let authn = fake_identity(&mut root).await;
+
+    let nonce = mgr.session_sush_nonce();
+    let bogus = SessionId::random();
+    let signer_nonce = SessionSignerNonce::random();
+    assert!(matches!(
+        mgr.session_start(&authn, bogus, signer_nonce, true).await,
+        Err(JobError::InvalidSessionId)
+    ));
+
+    let session_id = SessionId::compute(mgr.own_baseboard(), nonce, signer_nonce);
+    mgr.session_start(&authn, session_id, signer_nonce, true)
+        .await
+        .unwrap();
+
+    let stale_signer_nonce = SessionSignerNonce::random();
+    let stale = SessionId::compute(mgr.own_baseboard(), nonce, stale_signer_nonce);
+    assert!(matches!(
+        mgr.session_start(&authn, stale, stale_signer_nonce, true)
+            .await,
+        Err(JobError::InvalidSessionId)
     ));
 }
 
@@ -315,11 +340,8 @@ async fn job_stop() {
     let baseboard_id = mgr.own_baseboard();
     let authn = fake_identity(&mut root).await;
     let signer_nonce = SessionSignerNonce::random();
-    let session_id = SessionId::compute(
-        mgr.own_baseboard(),
-        mgr.regenerate_session_sush_nonce(),
-        signer_nonce,
-    );
+    let session_id =
+        SessionId::compute(mgr.own_baseboard(), mgr.session_sush_nonce(), signer_nonce);
     let mut session = Session::new(session_id);
     mgr.session_start(&authn, session_id, signer_nonce, true)
         .await
@@ -408,11 +430,8 @@ async fn cancel_queued_job() {
     let (mgr, mut root, _dir, _shutdown) = manager_and_test_root(log).await;
     let authn = fake_identity(&mut root).await;
     let signer_nonce = SessionSignerNonce::random();
-    let session_id = SessionId::compute(
-        mgr.own_baseboard(),
-        mgr.regenerate_session_sush_nonce(),
-        signer_nonce,
-    );
+    let session_id =
+        SessionId::compute(mgr.own_baseboard(), mgr.session_sush_nonce(), signer_nonce);
     let mut session = Session::new(session_id);
     mgr.session_start(&authn, session_id, signer_nonce, true)
         .await
@@ -501,11 +520,8 @@ async fn job_output_perms() {
     let baseboard_id = mgr.own_baseboard();
     let authn = fake_identity(&mut root).await;
     let signer_nonce = SessionSignerNonce::random();
-    let session_id = SessionId::compute(
-        mgr.own_baseboard(),
-        mgr.regenerate_session_sush_nonce(),
-        signer_nonce,
-    );
+    let session_id =
+        SessionId::compute(mgr.own_baseboard(), mgr.session_sush_nonce(), signer_nonce);
     let session = Session::new(session_id);
     mgr.session_start(&authn, session_id, signer_nonce, true)
         .await
@@ -570,11 +586,8 @@ async fn cubby_targets() {
     .unwrap();
     let authn = fake_identity(&mut root).await;
     let signer_nonce = SessionSignerNonce::random();
-    let session_id = SessionId::compute(
-        mgr.own_baseboard(),
-        mgr.regenerate_session_sush_nonce(),
-        signer_nonce,
-    );
+    let session_id =
+        SessionId::compute(mgr.own_baseboard(), mgr.session_sush_nonce(), signer_nonce);
     let mut session = Session::new(session_id);
     mgr.session_start(&authn, session_id, signer_nonce, true)
         .await
@@ -680,11 +693,8 @@ async fn root_certs_from_files() {
     // A job signed by the configured root runs.
     let authn = fake_identity(&mut root).await;
     let signer_nonce = SessionSignerNonce::random();
-    let session_id = SessionId::compute(
-        mgr.own_baseboard(),
-        mgr.regenerate_session_sush_nonce(),
-        signer_nonce,
-    );
+    let session_id =
+        SessionId::compute(mgr.own_baseboard(), mgr.session_sush_nonce(), signer_nonce);
     let session = Session::new(session_id);
     mgr.session_start(&authn, session_id, signer_nonce, true)
         .await
@@ -762,11 +772,8 @@ async fn job_output_dir_moves() {
     let baseboard_id = mgr.own_baseboard();
     let authn = fake_identity(&mut root).await;
     let signer_nonce = SessionSignerNonce::random();
-    let session_id = SessionId::compute(
-        mgr.own_baseboard(),
-        mgr.regenerate_session_sush_nonce(),
-        signer_nonce,
-    );
+    let session_id =
+        SessionId::compute(mgr.own_baseboard(), mgr.session_sush_nonce(), signer_nonce);
     let mut session = Session::new(session_id);
     mgr.session_start(&authn, session_id, signer_nonce, true)
         .await
@@ -865,11 +872,8 @@ async fn universe_swap() {
 
     async fn run_job(mgr: &JobManager, root: &mut EphemeralKey, authn: &Identity) -> JobId {
         let signer_nonce = SessionSignerNonce::random();
-        let session_id = SessionId::compute(
-            mgr.own_baseboard(),
-            mgr.regenerate_session_sush_nonce(),
-            signer_nonce,
-        );
+        let session_id =
+            SessionId::compute(mgr.own_baseboard(), mgr.session_sush_nonce(), signer_nonce);
         let session = Session::new(session_id);
         mgr.session_start(authn, session_id, signer_nonce, true)
             .await
@@ -920,11 +924,8 @@ async fn shutdown() {
     let (mut mgr, mut root, _dir, shutdown) = manager_and_test_root(log).await;
     let authn = fake_identity(&mut root).await;
     let signer_nonce = SessionSignerNonce::random();
-    let session_id = SessionId::compute(
-        mgr.own_baseboard(),
-        mgr.regenerate_session_sush_nonce(),
-        signer_nonce,
-    );
+    let session_id =
+        SessionId::compute(mgr.own_baseboard(), mgr.session_sush_nonce(), signer_nonce);
     let session = Session::new(session_id);
     mgr.session_start(&authn, session_id, signer_nonce, true)
         .await
@@ -1040,11 +1041,8 @@ async fn cert_chain() {
 
     // Start a job signed with the child.
     let signer_nonce = SessionSignerNonce::random();
-    let session_id = SessionId::compute(
-        mgr.own_baseboard(),
-        mgr.regenerate_session_sush_nonce(),
-        signer_nonce,
-    );
+    let session_id =
+        SessionId::compute(mgr.own_baseboard(), mgr.session_sush_nonce(), signer_nonce);
     let mut session = Session::new(session_id);
     mgr.session_start(&authn, session_id, signer_nonce, true)
         .await
@@ -1077,11 +1075,8 @@ async fn attribution() {
     let (mgr, mut root, _dir, _shutdown) = manager_and_test_root(log).await;
     let authn = fake_identity(&mut root).await;
     let signer_nonce = SessionSignerNonce::random();
-    let session_id = SessionId::compute(
-        mgr.own_baseboard(),
-        mgr.regenerate_session_sush_nonce(),
-        signer_nonce,
-    );
+    let session_id =
+        SessionId::compute(mgr.own_baseboard(), mgr.session_sush_nonce(), signer_nonce);
     let mut session = Session::new(session_id);
     mgr.session_start(&authn, session_id, signer_nonce, true)
         .await
@@ -1312,11 +1307,8 @@ async fn job_targets() {
     let (mgr, mut root, _dir, _shutdown) = manager_and_test_root(log).await;
     let authn = fake_identity(&mut root).await;
     let signer_nonce = SessionSignerNonce::random();
-    let session_id = SessionId::compute(
-        mgr.own_baseboard(),
-        mgr.regenerate_session_sush_nonce(),
-        signer_nonce,
-    );
+    let session_id =
+        SessionId::compute(mgr.own_baseboard(), mgr.session_sush_nonce(), signer_nonce);
     let mut session = Session::new(session_id);
     mgr.session_start(&authn, session_id, signer_nonce, true)
         .await
@@ -1472,11 +1464,8 @@ async fn attach_grants() {
     let guest = fake_identity(&mut guest_key).await;
 
     let signer_nonce = SessionSignerNonce::random();
-    let session_id = SessionId::compute(
-        mgr.own_baseboard(),
-        mgr.regenerate_session_sush_nonce(),
-        signer_nonce,
-    );
+    let session_id =
+        SessionId::compute(mgr.own_baseboard(), mgr.session_sush_nonce(), signer_nonce);
     let session = Session::new(session_id);
     mgr.session_start(&owner, session_id, signer_nonce, true)
         .await
@@ -1827,11 +1816,8 @@ async fn too_much_cpu() {
     let (mgr, mut root, _dir, _shutdown) = manager_and_test_root(log).await;
     let authn = fake_identity(&mut root).await;
     let signer_nonce = SessionSignerNonce::random();
-    let session_id = SessionId::compute(
-        mgr.own_baseboard(),
-        mgr.regenerate_session_sush_nonce(),
-        signer_nonce,
-    );
+    let session_id =
+        SessionId::compute(mgr.own_baseboard(), mgr.session_sush_nonce(), signer_nonce);
     let session = Session::new(session_id);
     mgr.session_start(&authn, session_id, signer_nonce, true)
         .await
@@ -1884,11 +1870,8 @@ async fn too_much_output() {
     let (mgr, mut root, _dir, _shutdown) = manager_and_test_root(log).await;
     let authn = fake_identity(&mut root).await;
     let signer_nonce = SessionSignerNonce::random();
-    let session_id = SessionId::compute(
-        mgr.own_baseboard(),
-        mgr.regenerate_session_sush_nonce(),
-        signer_nonce,
-    );
+    let session_id =
+        SessionId::compute(mgr.own_baseboard(), mgr.session_sush_nonce(), signer_nonce);
     let mut session = Session::new(session_id);
     mgr.session_start(&authn, session_id, signer_nonce, true)
         .await
@@ -1985,11 +1968,8 @@ async fn output_ranges() {
     let baseboard_id = mgr.own_baseboard();
     let authn = fake_identity(&mut root).await;
     let signer_nonce = SessionSignerNonce::random();
-    let session_id = SessionId::compute(
-        mgr.own_baseboard(),
-        mgr.regenerate_session_sush_nonce(),
-        signer_nonce,
-    );
+    let session_id =
+        SessionId::compute(mgr.own_baseboard(), mgr.session_sush_nonce(), signer_nonce);
     let session = Session::new(session_id);
     mgr.session_start(&authn, session_id, signer_nonce, true)
         .await
@@ -2290,11 +2270,8 @@ async fn job_signal_dispositions() {
     let baseboard_id = mgr.own_baseboard();
     let authn = fake_identity(&mut root).await;
     let signer_nonce = SessionSignerNonce::random();
-    let session_id = SessionId::compute(
-        mgr.own_baseboard(),
-        mgr.regenerate_session_sush_nonce(),
-        signer_nonce,
-    );
+    let session_id =
+        SessionId::compute(mgr.own_baseboard(), mgr.session_sush_nonce(), signer_nonce);
     let mut session = Session::new(session_id);
     mgr.session_start(&authn, session_id, signer_nonce, true)
         .await
@@ -2338,11 +2315,8 @@ async fn interactive_target_required() {
     let (mgr, mut root, _dir, _shutdown) = manager_and_test_root(log).await;
     let authn = fake_identity(&mut root).await;
     let signer_nonce = SessionSignerNonce::random();
-    let session_id = SessionId::compute(
-        mgr.own_baseboard(),
-        mgr.regenerate_session_sush_nonce(),
-        signer_nonce,
-    );
+    let session_id =
+        SessionId::compute(mgr.own_baseboard(), mgr.session_sush_nonce(), signer_nonce);
     let session = Session::new(session_id);
     mgr.session_start(&authn, session_id, signer_nonce, true)
         .await
@@ -2367,11 +2341,8 @@ async fn job_json() {
     let (mgr, mut root, dir, _shutdown) = manager_and_test_root(log).await;
     let authn = fake_identity(&mut root).await;
     let signer_nonce = SessionSignerNonce::random();
-    let session_id = SessionId::compute(
-        mgr.own_baseboard(),
-        mgr.regenerate_session_sush_nonce(),
-        signer_nonce,
-    );
+    let session_id =
+        SessionId::compute(mgr.own_baseboard(), mgr.session_sush_nonce(), signer_nonce);
     let mut session = Session::new(session_id);
     mgr.session_start(&authn, session_id, signer_nonce, true)
         .await
@@ -2409,11 +2380,8 @@ async fn streaming_validation() {
     let (mgr, mut root, _dir, _shutdown) = manager_and_test_root(log).await;
     let authn = fake_identity(&mut root).await;
     let signer_nonce = SessionSignerNonce::random();
-    let session_id = SessionId::compute(
-        mgr.own_baseboard(),
-        mgr.regenerate_session_sush_nonce(),
-        signer_nonce,
-    );
+    let session_id =
+        SessionId::compute(mgr.own_baseboard(), mgr.session_sush_nonce(), signer_nonce);
     let mut session = Session::new(session_id);
     mgr.session_start(&authn, session_id, signer_nonce, true)
         .await
