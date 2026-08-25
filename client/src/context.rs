@@ -18,6 +18,8 @@ use sush_common::jobs::{
     Access, JobId, JobOutputStream, JobStatusMap, Session, SessionId, SignedJob,
 };
 use sush_common::keys::{KeyId, SshPublicKey};
+use sush_common::targets::{SledId, SledVersion};
+use sush_common::version::VersionInfo;
 
 use crate::AuthzSigner;
 use crate::commands::{CommandError, GlobalArgs};
@@ -96,6 +98,14 @@ pub trait CommandContext: Clone + Send + Sync {
     fn set_globals(&mut self, _args: GlobalArgs) {}
     fn pre_parse_hook(&mut self, _command: &str) {}
 
+    // Build provenance
+    fn versions(
+        &mut self,
+        client: &VersionInfo,
+        server: Option<&VersionInfo>,
+        sleds: &[SledVersion],
+    );
+
     // Session management
     fn authz_signer(&self) -> AuthzSigner;
     fn get_credentials(&self) -> Option<Authz> {
@@ -126,6 +136,7 @@ pub trait CommandContext: Clone + Send + Sync {
     fn cert_imported(&mut self, path: &Path, key_id: KeyId) -> Result<(), CommandError>;
 
     // Job management
+    fn really_target(&mut self, sled: &SledId) -> Result<(), CommandError>;
     fn job_started(&mut self, job: &SignedJob);
     fn job_stopped(&mut self, id: &JobId);
     fn job_error(&mut self, error: CommandError) -> CommandError;
@@ -142,6 +153,7 @@ pub trait CommandContext: Clone + Send + Sync {
     fn job_output_finished(&mut self, id: &JobId, stream: JobOutputStream, stage: Option<&str>);
     fn job_watch_started(&mut self, id: &JobId);
     fn job_watch_update(&mut self, status: &JobStatusMap);
+    fn job_watch_stalled(&mut self, id: &JobId);
     fn job_watch_finished(&mut self, id: &JobId);
     fn job_attached(&mut self, id: &JobId);
     fn job_detached(&mut self, id: &JobId);

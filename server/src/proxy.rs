@@ -4,10 +4,11 @@
 
 //! Proxy server for the Oxide Support Shell API.
 //!
-//! Terminates client connections and routes each request to a sled.
+//! Terminates client connections and routes each request to a sled,
+//! answering only `/version` itself.
 //! A request that names a target goes to the first sled the target
-//! resolves to. Anything else goes to a sticky default, because
-//! identities are cached on the sled that authenticated them.
+//! resolves to. Anything else goes to the sled hosting the proxy,
+//! which any request may reach.
 //! Requests are forwarded untouched: bound request signatures cover
 //! the exact request line, so the proxy may never rewrite one.
 
@@ -15,9 +16,10 @@ use std::collections::BTreeMap;
 use std::convert::Infallible;
 use std::io;
 use std::net::SocketAddr;
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 
-use http::StatusCode;
+use http::header::CONTENT_TYPE;
+use http::{Method, StatusCode};
 use http_body_util::{Either, Full};
 use hyper::body::{Bytes, Incoming};
 use hyper::client::conn::http1 as client_conn;
@@ -40,6 +42,7 @@ use tokio_rustls::TlsAcceptor;
 use tokio_util::sync::CancellationToken;
 
 use sush_common::targets::{Cubbies, SledId, Target};
+use sush_common::version::VersionInfo;
 
 /// The sush servers the proxy may route to.
 #[derive(Clone, Debug, Default)]
@@ -90,20 +93,19 @@ pub struct ProxyServer {
 
 impl ProxyServer {
     /// Start listening at `local_addr`, routing to `targets`.
+    /// Unrouted requests prefer `home`, the sled hosting the proxy.
     pub async fn start(
         log: &Logger,
         local_addr: SocketAddr,
         tls: Option<ServerConfig>,
         targets: watch::Receiver<Targets>,
+        home: Option<BaseboardId>,
         shutdown: CancellationToken,
     ) -> io::Result<Self> {
         let listener = TcpListener::bind(local_addr).await?;
         let local_addr = listener.local_addr()?;
         let acceptor = tls.map(|config| TlsAcceptor::from(Arc::new(config)));
-        let router = Arc::new(Router {
-            targets,
-            default: Mutex::new(None),
-        });
+        let router = Arc::new(Router { targets, home });
         spawn(listen(
             log.new(o!("component" => "proxy")),
             listener,
@@ -130,11 +132,11 @@ impl ProxyServer {
 /// Pick a sled for each request.
 struct Router {
     targets: watch::Receiver<Targets>,
-    default: Mutex<Option<BaseboardId>>,
+    home: Option<BaseboardId>,
 }
 
 impl Router {
-    fn route(&self, request: &Request<Incoming>) -> Result<SocketAddr, Box<Response<ProxyBody>>> {
+    fn route<B>(&self, request: &Request<B>) -> Result<SocketAddr, Box<Response<ProxyBody>>> {
         let targets = self.targets.borrow();
         match named_target(request) {
             Some(Ok(target)) => targets.resolve(&target).ok_or_else(|| {
@@ -147,24 +149,21 @@ impl Router {
                 StatusCode::BAD_REQUEST,
                 format!("unable to parse target `{bad}`"),
             ))),
-            None => {
-                let mut default = self.default.lock().unwrap();
-                if let Some(baseboard) = default.as_ref()
-                    && let Some(addr) = targets.sleds.get(baseboard)
-                {
-                    return Ok(*addr);
-                }
-                match targets.sleds.iter().next() {
-                    Some((baseboard, addr)) => {
-                        *default = Some(baseboard.clone());
-                        Ok(*addr)
-                    }
+            None => match self.home.as_ref() {
+                Some(home) => targets.sleds.get(home).copied().ok_or_else(|| {
+                    Box::new(error_response(
+                        StatusCode::SERVICE_UNAVAILABLE,
+                        format!("home sled `{home}` unknown to the proxy"),
+                    ))
+                }),
+                None => match targets.sleds.iter().next() {
+                    Some((_, addr)) => Ok(*addr),
                     None => Err(Box::new(error_response(
                         StatusCode::SERVICE_UNAVAILABLE,
                         "no sleds known to the proxy",
                     ))),
-                }
-            }
+                },
+            },
         }
     }
 }
@@ -175,7 +174,7 @@ fn named_target<B>(request: &Request<B>) -> Option<Result<Target, String>> {
     let uri = request.uri();
     let segments: Vec<&str> = uri.path().trim_start_matches('/').split('/').collect();
     let named = match segments.as_slice() {
-        ["jobs", _, "output" | "attach", target, ..] if *target != "*" => Some(*target),
+        ["jobs", _, "attach" | "output" | "start", target, ..] if *target != "*" => Some(*target),
         _ => uri.query().and_then(|query| {
             query.split('&').find_map(|param| {
                 param
@@ -194,6 +193,31 @@ fn named_target<B>(request: &Request<B>) -> Option<Result<Target, String>> {
         Ok(target) => Some(Ok(target)),
         Err(_) => Some(Err(decoded.into_owned())),
     }
+}
+
+/// The proxy answers `/version` for itself, so proxy and sled builds
+/// stay distinguishable when a rack updates gradually. A `via` still
+/// routes the request to a sled.
+fn own_version<B>(log: &Logger, request: &Request<B>) -> Option<Response<ProxyBody>> {
+    if request.method() != Method::GET
+        || request.uri().path() != "/version"
+        || named_target(request).is_some()
+    {
+        return None;
+    }
+    let response = serde_json::to_vec(&VersionInfo::current())
+        .ok()
+        .and_then(|body| {
+            Response::builder()
+                .status(StatusCode::OK)
+                .header(CONTENT_TYPE, "application/json")
+                .body(Either::Right(Full::new(body.into())))
+                .ok()
+        });
+    if response.is_none() {
+        warn!(log, "unable to answer /version; forwarding to a sled");
+    }
+    response
 }
 
 async fn listen(
@@ -246,9 +270,18 @@ where
         let log = log.clone();
         let router = router.clone();
         async move {
-            Ok::<_, Infallible>(match router.route(&request) {
-                Ok(addr) => forward(log, addr, request).await,
-                Err(response) => *response,
+            Ok::<_, Infallible>(match own_version(&log, &request) {
+                Some(response) => response,
+                None => match router.route(&request) {
+                    Ok(addr) => forward(log, addr, request).await,
+                    Err(response) => {
+                        warn!(
+                            log, "request not routable";
+                            "uri" => %request.uri(), "status" => %response.status()
+                        );
+                        *response
+                    }
+                },
             })
         }
     });
@@ -336,12 +369,72 @@ mod test {
         s.parse().unwrap()
     }
 
+    /// Unrouted requests go to the home sled, or fail while the
+    /// targets don't know it. Without a home, any sled will do.
+    #[test]
+    fn home_preference() {
+        let sled = |serial: &str| BaseboardId {
+            part_number: "913".to_string(),
+            serial_number: serial.to_string(),
+        };
+        let addr = |port| SocketAddr::from(([127, 0, 0, 1], port));
+        let mut targets = Targets::default();
+        targets.sleds.insert(sled("away"), addr(1));
+        targets.sleds.insert(sled("home"), addr(2));
+        let (tx, rx) = watch::channel(targets);
+        let router = Router {
+            targets: rx.clone(),
+            home: Some(sled("home")),
+        };
+        let get = request("/versions");
+        assert_eq!(router.route(&get).unwrap(), addr(2));
+        tx.send_modify(|t| {
+            t.sleds.remove(&sled("home"));
+        });
+        assert_eq!(
+            router.route(&get).unwrap_err().status(),
+            StatusCode::SERVICE_UNAVAILABLE
+        );
+        tx.send_modify(|t| {
+            t.sleds.insert(sled("home"), addr(2));
+        });
+        assert_eq!(router.route(&get).unwrap(), addr(2));
+        let homeless = Router {
+            targets: rx,
+            home: None,
+        };
+        assert_eq!(homeless.route(&get).unwrap(), addr(1));
+    }
+
+    /// The proxy answers `GET /version` itself unless `via` routes it.
+    /// A `*` target means the handling server, which is the proxy.
+    #[test]
+    fn version_interception() {
+        let log = Logger::root(slog::Discard, o!());
+        assert!(own_version(&log, &request("/version")).is_some());
+        assert!(own_version(&log, &request("/version?via=*")).is_some());
+        assert!(own_version(&log, &request("/version?via=14")).is_none());
+        assert!(own_version(&log, &request("/version?via=")).is_none());
+        assert!(own_version(&log, &request("/versions")).is_none());
+        let post = Request::builder()
+            .method(Method::POST)
+            .uri("/version")
+            .body(())
+            .unwrap();
+        assert!(own_version(&log, &post).is_none());
+    }
+
     #[test]
     fn named_targets() {
         assert_eq!(
             named_target(&request("/jobs/some-job/output/test%20part:0000/stdout")),
             Some(Ok(target("test part:0000"))),
         );
+        assert_eq!(
+            named_target(&request("/jobs/some-job/start/test%20part:0000")),
+            Some(Ok(target("test part:0000"))),
+        );
+        assert_eq!(named_target(&request("/jobs/some-job/start/*")), None);
         assert_eq!(
             named_target(&request("/jobs/some-job/attach/test%20part:0000")),
             Some(Ok(target("test part:0000"))),

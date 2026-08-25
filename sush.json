@@ -360,7 +360,7 @@
           {
             "in": "path",
             "name": "job_id",
-            "description": "Which job to attach to.",
+            "description": "Which job to act on.",
             "required": true,
             "schema": {
               "$ref": "#/components/schemas/JobId"
@@ -369,7 +369,7 @@
           {
             "in": "path",
             "name": "target",
-            "description": "To be used by Nexus for routing.",
+            "description": "Used by proxies for routing.",
             "required": true,
             "schema": {
               "type": "string"
@@ -466,7 +466,7 @@
         }
       }
     },
-    "/jobs/{job_id}/start": {
+    "/jobs/{job_id}/start/{target}": {
       "post": {
         "summary": "Start an authorized job.",
         "operationId": "job_start",
@@ -482,9 +482,19 @@
           {
             "in": "path",
             "name": "job_id",
+            "description": "Which job to act on.",
             "required": true,
             "schema": {
               "$ref": "#/components/schemas/JobId"
+            }
+          },
+          {
+            "in": "path",
+            "name": "target",
+            "description": "Used by proxies for routing.",
+            "required": true,
+            "schema": {
+              "type": "string"
             }
           },
           {
@@ -603,6 +613,15 @@
             "schema": {
               "$ref": "#/components/schemas/JobId"
             }
+          },
+          {
+            "in": "query",
+            "name": "via",
+            "description": "Where a proxy should route this request.",
+            "schema": {
+              "nullable": true,
+              "type": "string"
+            }
           }
         ],
         "responses": {
@@ -648,6 +667,15 @@
             "required": true,
             "schema": {
               "$ref": "#/components/schemas/JobId"
+            }
+          },
+          {
+            "in": "query",
+            "name": "via",
+            "description": "Where a proxy should route this request. Sleds ignore it.",
+            "schema": {
+              "nullable": true,
+              "type": "string"
             }
           },
           {
@@ -1004,6 +1032,82 @@
           }
         }
       }
+    },
+    "/version": {
+      "get": {
+        "summary": "Get the version and git commit of the server's build.",
+        "description": "Unauthenticated, like `/target`.",
+        "operationId": "version",
+        "parameters": [
+          {
+            "in": "query",
+            "name": "via",
+            "description": "Where a proxy should route this request.",
+            "schema": {
+              "nullable": true,
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "successful operation",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/VersionInfo"
+                }
+              }
+            }
+          },
+          "4XX": {
+            "$ref": "#/components/responses/Error"
+          },
+          "5XX": {
+            "$ref": "#/components/responses/Error"
+          }
+        }
+      }
+    },
+    "/versions": {
+      "get": {
+        "summary": "Get the cubby, baseboard, and build of every known sled.",
+        "description": "Unauthenticated, like `/target`.",
+        "operationId": "versions",
+        "parameters": [
+          {
+            "in": "query",
+            "name": "via",
+            "description": "Where a proxy should route this request.",
+            "schema": {
+              "nullable": true,
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "successful operation",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "title": "Array_of_SledVersion",
+                  "type": "array",
+                  "items": {
+                    "$ref": "#/components/schemas/SledVersion"
+                  }
+                }
+              }
+            }
+          },
+          "4XX": {
+            "$ref": "#/components/responses/Error"
+          },
+          "5XX": {
+            "$ref": "#/components/responses/Error"
+          }
+        }
+      }
     }
   },
   "components": {
@@ -1166,6 +1270,12 @@
           "job_id": {
             "$ref": "#/components/schemas/JobId"
           },
+          "session_id": {
+            "$ref": "#/components/schemas/SessionId"
+          },
+          "streaming": {
+            "$ref": "#/components/schemas/Streaming"
+          },
           "target": {
             "description": "The sleds this job runs on.",
             "type": "string"
@@ -1173,7 +1283,8 @@
         },
         "required": [
           "command",
-          "job_id"
+          "job_id",
+          "session_id"
         ]
       },
       "JobStatus": {
@@ -1596,6 +1707,59 @@
           "key_id",
           "payload",
           "signature"
+        ]
+      },
+      "SledVersion": {
+        "description": "One sled's location and build.",
+        "type": "object",
+        "properties": {
+          "baseboard": {
+            "$ref": "#/components/schemas/BaseboardId"
+          },
+          "cubby": {
+            "nullable": true,
+            "type": "integer",
+            "format": "uint8",
+            "minimum": 0
+          },
+          "version": {
+            "nullable": true,
+            "allOf": [
+              {
+                "$ref": "#/components/schemas/VersionInfo"
+              }
+            ]
+          }
+        },
+        "required": [
+          "baseboard"
+        ]
+      },
+      "Streaming": {
+        "description": "Allow **unrecorded** streaming I/O.",
+        "type": "string",
+        "enum": [
+          "None",
+          "Input",
+          "Output"
+        ]
+      },
+      "VersionInfo": {
+        "description": "One build's version and commit.",
+        "type": "object",
+        "properties": {
+          "commit": {
+            "description": "The git commit, \"-dirty\" suffixed for an unclean tree.",
+            "type": "string"
+          },
+          "version": {
+            "description": "The package version.",
+            "type": "string"
+          }
+        },
+        "required": [
+          "commit",
+          "version"
         ]
       },
       "JobWait": {

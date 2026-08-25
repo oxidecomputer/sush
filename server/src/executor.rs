@@ -9,17 +9,20 @@
 
 use std::collections::BTreeMap;
 use std::io;
+use std::mem::MaybeUninit;
 use std::os::fd::AsRawFd as _;
 use std::process::Stdio;
+use std::ptr::null_mut;
 use std::sync::{Arc, RwLock};
 
 use chrono::Utc;
 use futures::Stream;
 use pwd::Passwd;
-use rustix::io::close;
+use rustix::io::{Errno, close};
 use rustix::process::{Pid, Signal, ioctl_tiocsctty, kill_process_group, setsid};
 use slog::{Logger, debug, error, o, warn};
 use tokio::fs::{DirBuilder, OpenOptions};
+use tokio::io::AsyncWriteExt as _;
 use tokio::process::{Child, Command};
 use tokio::spawn;
 use tokio::sync::{mpsc, watch};
@@ -29,7 +32,7 @@ use tokio_util::sync::CancellationToken;
 use sush_api::JobStartParams;
 use sush_common::interactive::WindowSize;
 use sush_common::jobs::{
-    JobId, JobOutputStream, JobStartRequest, ProcessError, SignedJob, VerifiedJob,
+    JobId, JobOutputStream, JobStartRequest, ProcessError, SignedJob, Streaming, VerifiedJob,
 };
 
 use crate::io::JobIo;
@@ -178,7 +181,8 @@ async fn job_spawn(
         session_id: _,
         command,
         interactive,
-        target: _,
+        streaming,
+        target,
     } = request.payload().clone();
     let JobStartParams {
         limits: requested,
@@ -206,6 +210,22 @@ async fn job_spawn(
             "max_fsize" => dirs.max_fsize(),
         );
         limits.max_fsize = dirs.max_fsize();
+    }
+
+    if interactive && streaming.is_some() {
+        let error = ProcessError::InvalidJob("interactive jobs cannot stream".to_string());
+        send_error(&log, &job_id, &events, error).await;
+        return;
+    }
+    if matches!(streaming, Streaming::Input) {
+        let error = ProcessError::InvalidJob("streaming input is not implemented".to_string());
+        send_error(&log, &job_id, &events, error).await;
+        return;
+    }
+    if streaming.is_some() && target.single_baseboard().is_none() {
+        let error = ProcessError::InvalidJob("streaming jobs must target one sled".to_string());
+        send_error(&log, &job_id, &events, error).await;
+        return;
     }
 
     // Report all I/O errors as job events.
@@ -236,16 +256,23 @@ async fn job_spawn(
     );
     let stdout_path = dirs.job_output_path(&job_id, Stdout);
     let stderr_path = dirs.job_output_path(&job_id, Stderr);
-    let stdout_file = with_io_err!(
-        OpenOptions::new()
-            .create_new(true)
-            .read(true) // needed for interactive job output playback
-            .write(true)
-            .mode(file_mode)
-            .open(&stdout_path)
-            .await,
-        format!("creating job stdout file `{}`", stdout_path.display())
-    );
+    let stdout_file = if matches!(streaming, Streaming::Output) {
+        with_io_err!(
+            OpenOptions::new().write(true).open("/dev/null").await,
+            "opening /dev/null for streamed output".to_string()
+        )
+    } else {
+        with_io_err!(
+            OpenOptions::new()
+                .create_new(true)
+                .read(true) // needed for interactive job output playback
+                .write(true)
+                .mode(file_mode)
+                .open(&stdout_path)
+                .await,
+            format!("creating job stdout file `{}`", stdout_path.display())
+        )
+    };
     let stderr_file = with_io_err!(
         OpenOptions::new()
             .create_new(true)
@@ -255,6 +282,27 @@ async fn job_spawn(
             .open(&stderr_path)
             .await,
         format!("creating job stderr file `{}`", stderr_path.display())
+    );
+
+    // Record the signed request beside the output it produces, so
+    // the job directory attests what ran even after gossip forgets.
+    let job_path = job_dir.join("job.json");
+    let json = with_io_err!(
+        serde_json::to_vec_pretty(&*request).map_err(io::Error::other),
+        format!("encoding job request file `{}`", job_path.display())
+    );
+    let mut job_file = with_io_err!(
+        OpenOptions::new()
+            .create_new(true)
+            .write(true)
+            .mode(file_mode)
+            .open(&job_path)
+            .await,
+        format!("creating job request file `{}`", job_path.display())
+    );
+    with_io_err!(
+        job_file.write_all(&json).await,
+        format!("writing job request file `{}`", job_path.display())
     );
 
     // Set up the job command.
@@ -282,7 +330,8 @@ async fn job_spawn(
     }
     cmd.env("SSH_CLIENT", "sush") // read bashrc
         .env("SUSH_JOB_ID", job_id.to_string())
-        .env("SUSH_COMMAND", &command);
+        .env("SUSH_COMMAND", &command)
+        .env("SUSH_JOB_OUTPUT_DIR", &job_dir);
 
     // Set process limits.
     unsafe {
@@ -295,6 +344,24 @@ async fn job_spawn(
     unsafe {
         cmd.pre_exec(move || {
             setsid()?;
+            Ok(())
+        });
+    }
+
+    // Reset signal dispositions and the signal mask.
+    // macOS has no realtime signals.
+    #[cfg(target_os = "macos")]
+    let max_signal = 31;
+    #[cfg(not(target_os = "macos"))]
+    let max_signal = libc::SIGRTMAX();
+    unsafe {
+        cmd.pre_exec(move || {
+            for signal in 1..=max_signal {
+                libc::signal(signal, libc::SIG_DFL);
+            }
+            let mut none = MaybeUninit::<libc::sigset_t>::uninit();
+            libc::sigemptyset(none.as_mut_ptr());
+            libc::sigprocmask(libc::SIG_SETMASK, none.as_ptr(), null_mut());
             Ok(())
         });
     }
@@ -341,6 +408,7 @@ async fn job_spawn(
             io,
             stdout_file,
             stderr_file,
+            streaming,
             stop,
         )
     } else {
@@ -356,12 +424,13 @@ async fn job_spawn(
             child.stderr.take().expect("batch job should have stderr"),
         );
         Job::start(
-            log.new(o!("interactive" => interactive)),
+            log.new(o!("interactive" => interactive, "streaming" => streaming.as_str())),
             limits,
             child,
             io,
             stdout_file,
             stderr_file,
+            streaming,
             stop,
         )
     };
@@ -420,20 +489,24 @@ async fn send_error(
     }
 }
 
-/// Kill a job's whole process group, of which `child` should be the leader.
-///
-/// TODO: 2-stage stop with `SIGTERM` and a grace period.
-pub fn kill_job(log: &Logger, child: &Child) {
-    if let Some(pid) = child.id()
-        && let Ok(pid) = pid.try_into()
-        && let Some(pid) = Pid::from_raw(pid)
-    {
-        match kill_process_group(pid, Signal::KILL) {
-            Ok(()) => debug!(log, "killed job processes"),
-            Err(error) => error!(log, "unable to kill job"; "error" => %error),
+/// A job's process group ID, which its `child` leads. Capture it
+/// before the leader is reaped, after which `id` returns nothing.
+pub fn job_pgid(child: &Child) -> Option<Pid> {
+    Pid::from_raw(child.id()?.try_into().ok()?)
+}
+
+/// Send a signal to a job's whole process group.
+pub fn kill_job(log: &Logger, pgid: Option<Pid>, signal: Signal) {
+    let Some(pgid) = pgid else {
+        debug!(log, "job has no process group");
+        return;
+    };
+    match kill_process_group(pgid, signal) {
+        Ok(()) => debug!(log, "signalled job processes"; "signal" => ?signal),
+        Err(Errno::SRCH) => debug!(log, "job processes are already dead"),
+        Err(error) => {
+            error!(log, "unable to signal job"; "signal" => ?signal, "error" => %error)
         }
-    } else {
-        debug!(log, "process is already dead or has an invalid PID");
     }
 }
 

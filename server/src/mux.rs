@@ -16,6 +16,7 @@ use futures::stream::{FuturesUnordered, SplitStream};
 use futures::{SinkExt as _, Stream, StreamExt};
 use tokio::sync::broadcast;
 use tokio::task::JoinHandle;
+use tokio::time::{Duration, timeout};
 use tokio::{select, spawn};
 use tokio_stream::{StreamMap, StreamNotifyClose};
 use tokio_tungstenite::tungstenite::error::Error as WebSocketError;
@@ -29,6 +30,9 @@ use crate::job::SocketStream;
 /// Maximum number of messages a client is allowed to lag by
 /// before it is disconnected.
 pub const MUX_CLIENT_CHANNEL_CAPACITY: usize = 100;
+
+/// How long a writer task may spend closing its socket.
+const CLOSE_TIMEOUT: Duration = Duration::from_secs(5);
 
 /// Client identifiers are opaque and ephemeral. We use monotonically
 /// increasing integers because they're simple and cheap.
@@ -61,6 +65,7 @@ impl WebSocketMux {
         &mut self,
         stream: SocketStream,
         access: Access,
+        initial: Vec<WebSocketMessage>,
         stop: CancellationToken,
     ) -> ClientId {
         let client_id = self.next_client_id;
@@ -71,20 +76,24 @@ impl WebSocketMux {
         self.stop.insert(client_id, stop.clone());
         let mut rx = self.send.subscribe();
         let handle = spawn(async move {
-            loop {
-                select! {
-                    recvd = rx.recv() => {
-                        let Ok(message) = recvd else { break };
-                        if to.send(message).await.is_err() {
-                            break
-                        }
-                    }
-                    _ = stop.cancelled() => {
-                        break;
+            let io = async {
+                for message in initial {
+                    if to.send(message).await.is_err() {
+                        return;
                     }
                 }
+                loop {
+                    let Ok(message) = rx.recv().await else { return };
+                    if to.send(message).await.is_err() {
+                        return;
+                    }
+                }
+            };
+            select! {
+                _ = io => {}
+                _ = stop.cancelled() => {}
             }
-            let _ = to.close().await;
+            let _ = timeout(CLOSE_TIMEOUT, to.close()).await;
             stop.cancel();
             client_id
         });
@@ -113,6 +122,14 @@ impl WebSocketMux {
 
     pub fn is_empty(&self) -> bool {
         self.recv.is_empty()
+    }
+}
+
+impl Drop for WebSocketMux {
+    fn drop(&mut self) {
+        for stop in self.stop.values() {
+            stop.cancel();
+        }
     }
 }
 

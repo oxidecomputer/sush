@@ -81,6 +81,9 @@ progenitor::generate_api!(
         SignedForJobStartRequest = sush_common::jobs::SignedJob,
         SessionSignerNonce = sush_common::jobs::SessionSignerNonce,
         SessionSushNonce = sush_common::jobs::SessionSushNonce,
+        SledVersion = sush_common::targets::SledVersion,
+        Streaming = sush_common::jobs::Streaming,
+        VersionInfo = sush_common::version::VersionInfo,
     },
     timeout = 600,
 );

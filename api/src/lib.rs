@@ -26,6 +26,8 @@ use sush_common::jobs::{
     SessionSignerNonce, SessionSushNonce, SignedJob,
 };
 use sush_common::keys::{KeyId, SshPublicKey};
+use sush_common::targets::SledVersion;
+use sush_common::version::VersionInfo;
 
 /// Oxide Support Shell API
 #[api_description]
@@ -174,11 +176,11 @@ pub trait SushApi {
     // Job management.
 
     /// Start an authorized job.
-    #[endpoint { method = POST, path = "/jobs/{job_id}/start" }]
+    #[endpoint { method = POST, path = "/jobs/{job_id}/start/{target}" }]
     async fn job_start(
         ctx: RequestContext<Self::Context>,
         headers: Header<Authorization>,
-        params: PathParams<JobIdParam>,
+        params: PathParams<JobTargetParams>,
         query: QueryParams<JobStartParams>,
         body: TypedBody<SignedJob>,
     ) -> Result<HttpResponseUpdatedNoContent, HttpError>;
@@ -198,6 +200,7 @@ pub trait SushApi {
         ctx: RequestContext<Self::Context>,
         headers: Header<Authorization>,
         params: PathParams<JobIdParam>,
+        query: QueryParams<RoutingParam>,
     ) -> Result<HttpResponseOk<JsonJobStatusMap>, HttpError>;
 
     /// Get (a subset of) the standard output or standard error of a job.
@@ -217,7 +220,7 @@ pub trait SushApi {
     async fn job_attach(
         ctx: RequestContext<Self::Context>,
         headers: Header<Authorization>,
-        params: PathParams<JobAttachParams>,
+        params: PathParams<JobTargetParams>,
         query: QueryParams<RoutingParam>,
         upgrade: WebsocketUpgrade,
     ) -> WebsocketEndpointResult;
@@ -243,6 +246,24 @@ pub trait SushApi {
         ctx: RequestContext<Self::Context>,
         query: QueryParams<RoutingParam>,
     ) -> Result<HttpResponseOk<BaseboardId>, HttpError>;
+
+    /// Get the cubby, baseboard, and build of every known sled.
+    ///
+    /// Unauthenticated, like `/target`.
+    #[endpoint { method = GET, path = "/versions" }]
+    async fn versions(
+        ctx: RequestContext<Self::Context>,
+        query: QueryParams<RoutingParam>,
+    ) -> Result<HttpResponseOk<Vec<SledVersion>>, HttpError>;
+
+    /// Get the version and git commit of the server's build.
+    ///
+    /// Unauthenticated, like `/target`.
+    #[endpoint { method = GET, path = "/version" }]
+    async fn version(
+        ctx: RequestContext<Self::Context>,
+        query: QueryParams<RoutingParam>,
+    ) -> Result<HttpResponseOk<VersionInfo>, HttpError>;
 }
 
 /// A routing hint for a fronting proxy. Sleds ignore it.
@@ -294,11 +315,11 @@ pub struct JobIdParam {
 }
 
 #[derive(Deserialize, JsonSchema)]
-pub struct JobAttachParams {
-    /// Which job to attach to.
+pub struct JobTargetParams {
+    /// Which job to act on.
     pub job_id: JobId,
 
-    /// To be used by Nexus for routing.
+    /// Used by proxies for routing.
     pub target: String,
 }
 
@@ -388,6 +409,8 @@ impl JobWait {
 pub struct JobStopParams {
     /// Wait for the job process to end.
     pub wait: JobWait,
+    /// Where a proxy should route this request. Sleds ignore it.
+    pub via: Option<String>,
 }
 
 /// Simple pagination for history list.

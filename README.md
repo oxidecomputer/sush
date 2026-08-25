@@ -1,8 +1,60 @@
 # Oxide Support Shell
 
-Proper user docs coming soon, for now see
-[RFD 620](https://rfd.shared.oxide.computer/rfd/620)
-for motivation and examples.
+The Oxide Support Shell (`sush`) is a tool that runs jobs on an
+Oxide rack. Jobs must be authorized by Oxide support, but support
+personnel need not have direct access to the rack;
+see [RFD 620](https://rfd.shared.oxide.computer/rfd/620)
+for requirements, design constraints, and intended use cases.
+
+At the core of `sush` are _signed job requests_:
+
+```json
+{
+  "payload": {
+    "job_id": "caught-cream-rifle-void-river-snack-rural-sight",
+    "command": "fortune"
+  },
+  "key_id": "much-hedgehog-cup-bleak-energy-village-lawn-pumpkin",
+  "signature": {
+    "r": "absorb-view-praise-light-gentle-casual-force-indicate-dignity-sense-woman-chapter-kiwi-slot-gown-measure-repeat-crater-crush-across-toilet-clarify-wage-toss",
+    "s": "above-already-valve-educate-can-clutch-imitate-snap-chunk-quit-mask-canvas-stadium-attend-refuse-banner-helmet-step-hood-symptom-time-beyond-earth-render"
+  }
+}
+```
+
+These are job authorizations produced by Oxide (via the Online Signing Service)
+and may be relayed to the customer, possibly over a low-bandwidth channel,
+who then relays them to the rack (via the `sush` client). When Oxide support
+runs a session directly, on our own racks or via a jumphost, the client can
+reach both the signing service and the rack, so it performs the relay itself
+and the signed requests never surface. Notice that all IDs and signature
+components are encoded as human-readable codephrases.
+
+Here is a simple job running across a four-sled racklette:
+
+```
+sush# job start -w hostname
+👋 Please confirm user presence to sign with key `federal-worth-fee-seed-skin-interest-road-luggage`
+✅ Session is now `front-edit-bless-suggest-defy-bacon-retire-person`
+✅ Signed request for job `kingdom-owner-dilemma-craft-soda-hungry-lumber-festival`
+✅ Job ID:      kingdom-owner-dilemma-craft-soda-hungry-lumber-festival
+   913-0000019:BRM23230010  Stopped, exit 0 (5ms 545us 307ns), 12 B out, 0 B err
+   913-0000019:BRM23230018  Stopped, exit 0 (6ms 165us 887ns), 12 B out, 0 B err
+   913-0000019:BRM27230037  Stopped, exit 0 (5ms 927us 316ns), 12 B out, 0 B err
+   913-0000023:2F8JEXDK     Stopped, exit 0 (5ms 282us 774ns), 9 B out, 0 B err
+ » 913-0000019:BRM23230010 «
+✅ Job stdout:
+BRM23230010
+ » 913-0000019:BRM23230018 «
+✅ Job stdout:
+BRM23230018
+ » 913-0000019:BRM27230037 «
+✅ Job stdout:
+BRM27230037
+ » 913-0000023:2F8JEXDK «
+✅ Job stdout:
+2F8JEXDK
+```
 
 ## Local Testing Quickstart
 
@@ -73,4 +125,18 @@ drop-fatigue-pink-spirit-eight-entry-praise-skill
 $ 
 ```
 
-See `help` for a list of other commands.
+Job output may also be streamed using the `--streaming` flag, which
+skips recording the job's standard output so that large core files
+and other artifacts can leave the rack without exhausting output
+storage (which may be on a ramdisk). Streamed output is written to
+a local file (`--file` is required) and verified against the recorded
+length and hash.
+
+Jobs of any type take a `--target` option naming the sleds to run on.
+The default target is `*`, meaning every sled. Comma-separated lists
+of cubby numbers, serial numbers, and full baseboard IDs are also
+accepted. Interactive and streaming jobs must target exactly one sled,
+which defaults to the sled they are talking to.
+
+The `version` command shows which versions of `sush` are running where
+in the rack. See `help` for a list of other commands.

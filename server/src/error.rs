@@ -38,6 +38,8 @@ pub enum JobError {
     InteractiveJob(#[from] InteractiveJobError),
     #[error("Command must not start with `-`")]
     InvalidCommand,
+    #[error("Interactive jobs must target exactly one sled")]
+    InteractiveTarget,
     #[error("Invalid range for output of length {0}")]
     InvalidRange(u64),
     #[error("I/O error during {what}: {error}")]
@@ -178,8 +180,8 @@ impl From<JobError> for HttpError {
             | SessionNotCurrent(_) => {
                 HttpError::for_client_error(None, ClientErrorStatusCode::NOT_FOUND, message)
             }
-            DecodeCert(_) | DuplicateJobId(_) | InvalidCommand | Json(_) | MultipleSessions
-            | InvalidSessionId => {
+            DecodeCert(_) | DuplicateJobId(_) | InteractiveTarget | InvalidCommand | Json(_)
+            | MultipleSessions | InvalidSessionId => {
                 HttpError::for_client_error(None, ClientErrorStatusCode::BAD_REQUEST, message)
             }
         }

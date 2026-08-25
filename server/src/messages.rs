@@ -23,6 +23,7 @@ use sush_common::borsh::{
 use sush_common::jobs::JobOutputState;
 use sush_common::jobs::{Access, JobId, ProcessError, SessionId, SignedJob};
 use sush_common::keys::{KeyId, SshPublicKey};
+use sush_common::version::VersionInfo;
 
 #[derive(BorshDeserialize, BorshSerialize, Copy, Clone, Debug, Eq, PartialEq)]
 pub struct RequestId(pub Uuid);
@@ -32,9 +33,7 @@ pub struct RequestId(pub Uuid);
 /// own module; everything defined there and all of their dependencies
 /// (e.g., types shared with the HTTP API, etc.) become part of the frozen
 /// version, whose Borsh encoding must not change. New versions must
-/// implement `TryInto` to convert old messages into compatible new ones;
-/// old servers must tolerate or ignore new messages they can't decode
-/// (TODO: verify and implement that policy).
+/// implement `TryInto` to convert old messages into compatible new ones.
 #[derive(BorshDeserialize, BorshSerialize, Clone, Debug, Eq, PartialEq)]
 pub enum VersionedMessage {
     V0(v0::Message),
@@ -186,6 +185,7 @@ pub mod v0 {
     pub enum Event {
         Job(JobEvent),
         Error(Error),
+        Version(VersionInfo),
     }
 
     #[derive(BorshDeserialize, BorshSerialize, Clone, Debug, Eq, PartialEq)]
@@ -321,7 +321,7 @@ mod wire_format {
 
     #[test]
     fn job_start_request() {
-        use sush_common::jobs::JobStartRequest;
+        use sush_common::jobs::{JobStartRequest, Streaming};
         use sush_common::keys::{EncodedSignature, Signed};
 
         let request = JobStartRequest::new(
@@ -333,6 +333,7 @@ mod wire_format {
                 .unwrap(),
             "echo hello",
             false,
+            Streaming::None,
             "14,16".parse().unwrap(),
         );
         let signed = Signed::new(
@@ -393,6 +394,22 @@ mod wire_format {
         ))
         .into();
         assert_wire_format("identity-login-request", msg);
+    }
+
+    #[test]
+    fn version_event() {
+        let msg: VersionedMessage = Message::Event(
+            BaseboardId {
+                part_number: "913-0000019".to_string(),
+                serial_number: "BRM42220030".to_string(),
+            },
+            Event::Version(VersionInfo {
+                version: "0.1.0".to_string(),
+                commit: "f078e863b17359031de072222bb631270f2d5157".to_string(),
+            }),
+        )
+        .into();
+        assert_wire_format("version-event", msg);
     }
 
     // TODO: snapshot more messages

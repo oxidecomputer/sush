@@ -29,7 +29,7 @@ use crate::borsh::{
 };
 use crate::interactive::InteractiveJobError;
 use crate::keys::{KeyId, Signed, ToBeSigned, Verified};
-use crate::targets::Target;
+use crate::targets::{Cubbies, Target};
 
 codephrase_newtype! {
     /// A globally unique identifier for a job within a session.
@@ -222,6 +222,45 @@ impl Session {
     }
 }
 
+/// Allow **unrecorded** streaming I/O.
+#[derive(
+    BorshDeserialize,
+    BorshSerialize,
+    Clone,
+    Copy,
+    Debug,
+    Default,
+    Deserialize,
+    Eq,
+    JsonSchema,
+    PartialEq,
+    Serialize,
+)]
+pub enum Streaming {
+    #[default]
+    None,
+    Input,
+    Output,
+}
+
+impl Streaming {
+    pub fn is_none(&self) -> bool {
+        matches!(self, Self::None)
+    }
+
+    pub fn is_some(&self) -> bool {
+        !self.is_none()
+    }
+
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Self::None => "none",
+            Self::Input => "input",
+            Self::Output => "output",
+        }
+    }
+}
+
 /// A request to run the given `command` as `job_id`.
 #[derive(
     BorshDeserialize,
@@ -240,6 +279,8 @@ pub struct JobStartRequest {
     pub command: String,
     #[serde(default, skip_serializing_if = "is_false")]
     pub interactive: bool,
+    #[serde(default, skip_serializing_if = "Streaming::is_none")]
+    pub streaming: Streaming,
     /// The sleds this job runs on.
     #[borsh(
         serialize_with = "borsh_ser_target",
@@ -261,6 +302,7 @@ impl JobStartRequest {
         session_id: SessionId,
         command: S,
         interactive: bool,
+        streaming: Streaming,
         target: Target,
     ) -> Self {
         Self {
@@ -268,7 +310,17 @@ impl JobStartRequest {
             session_id,
             command: command.as_ref().to_string(),
             interactive,
+            streaming,
             target,
+        }
+    }
+
+    /// Interactive jobs run only on their single named baseboard.
+    pub fn runs_on(&self, baseboard: &BaseboardId, cubbies: &Cubbies) -> bool {
+        if self.interactive {
+            self.target.single_baseboard() == Some(baseboard)
+        } else {
+            self.target.includes(baseboard, cubbies)
         }
     }
 
@@ -303,6 +355,7 @@ impl ToBeSigned for JobStartRequest {
             session_id,
             command,
             interactive,
+            streaming,
             target,
         } = self;
         hash_with_len(Self::TYPE_NAME);
@@ -314,6 +367,12 @@ impl ToBeSigned for JobStartRequest {
         hash_with_len(command.as_bytes());
         hash_with_len(b"interactive");
         hash_with_len(if *interactive { &[1] } else { &[0] });
+        hash_with_len(b"streaming");
+        hash_with_len(match streaming {
+            Streaming::None => &[0],
+            Streaming::Input => &[1],
+            Streaming::Output => &[2],
+        });
         hash_with_len(b"target");
         hash_with_len(target.to_string().as_bytes());
         hasher.finalize().as_bytes().to_vec()
@@ -783,6 +842,36 @@ impl FromStr for JobOutputStream {
 #[cfg(test)]
 mod test {
     use super::*;
+    use crate::targets::SledId;
+
+    /// Interactive jobs run only on their single named baseboard.
+    #[test]
+    fn interactive_targets() {
+        let sled = |serial: &str| BaseboardId {
+            part_number: "913".to_string(),
+            serial_number: serial.to_string(),
+        };
+        let me = sled("me");
+        let cubbies = Cubbies::from([(14, me.clone())]);
+        let job = |interactive, target| {
+            JobStartRequest::new(
+                JobId::random(),
+                SessionId::random(),
+                "true",
+                interactive,
+                Streaming::None,
+                target,
+            )
+        };
+        let just_me = Target::Sleds(vec![SledId::Baseboard(me.clone())]);
+        assert!(job(true, just_me.clone()).runs_on(&me, &cubbies));
+        assert!(job(false, just_me).runs_on(&me, &cubbies));
+        assert!(!job(true, Target::All).runs_on(&me, &cubbies));
+        assert!(job(false, Target::All).runs_on(&me, &cubbies));
+        let my_cubby = Target::Sleds(vec![SledId::Cubby(14)]);
+        assert!(!job(true, my_cubby.clone()).runs_on(&me, &cubbies));
+        assert!(job(false, my_cubby).runs_on(&me, &cubbies));
+    }
 
     /// Requested limits may narrow the default ceiling, never widen it.
     #[test]

@@ -7,6 +7,8 @@
 //! May be executed via either the main CLI or the interactive REPL.
 
 use std::fs::{File, OpenOptions, read};
+#[cfg(feature = "permslip")]
+use std::io::ErrorKind;
 use std::io::{Read as _, Seek as _, SeekFrom, Write as _, stdin};
 use std::num::{NonZeroU8, NonZeroU64};
 use std::path::{Path, PathBuf};
@@ -29,6 +31,7 @@ use rustix::termios::tcgetwinsize;
 use sled_hardware_types::BaseboardId;
 use thiserror::Error;
 use tokio::signal::ctrl_c;
+use tokio::signal::unix::{SignalKind, signal};
 use tokio::time::{MissedTickBehavior, interval, sleep};
 use tokio::{pin, select};
 use tokio_tungstenite::WebSocketStream;
@@ -41,16 +44,17 @@ use sush_api::JobWait;
 use sush_common::authn::{
     AuthnError, Challenge, ChallengeResponse, Credentials, Identity, RequestKey,
 };
-use sush_common::interactive::InteractiveJobError;
+use sush_common::interactive::{InteractiveJobError, InteractiveJobMessage};
 use sush_common::jobs::JobOutputStream::{self, Stderr, Stdout};
 #[cfg(feature = "permslip")]
 use sush_common::jobs::JobStartRequest;
 use sush_common::jobs::{
     Access, JobId, JobLimits, JobOutputHash, JobOutputState, JobStatus, JobStatusMap, Session,
-    SessionId, SessionSignerNonce, SignedJob, job_status_try_from_json_map,
+    SessionId, SessionSignerNonce, SignedJob, Streaming, job_status_try_from_json_map,
 };
 use sush_common::keys::{KeyError, KeyId, Signer as _};
 use sush_common::targets::{SledId, Target};
+use sush_common::version::VersionInfo;
 
 use crate::ByteStream;
 use crate::context::{Authz, CommandContext, OutputFormat, StatusDisplayStyle};
@@ -179,7 +183,7 @@ pub struct GlobalArgs {
 #[derive(Debug, Parser)]
 #[clap(name = "Oxide Support Shell")]
 #[clap(author = "Oxide Computer Company")]
-#[clap(about, version)]
+#[clap(about, version = sush_common::version::LONG_VERSION)]
 pub struct ClientArgs {
     #[clap(flatten)]
     globals: GlobalArgs,
@@ -245,37 +249,60 @@ fn watch_settling() {
         time_started: Utc::now(),
     };
 
-    let mut quiet = 0;
+    let all = Target::All;
+    let mut settling = Settling::default();
     let mut status = JobStatusMap::new();
-    assert!(
-        !watch_done(1, 0, &status, &mut quiet),
-        "empty never settles"
-    );
+    assert!(!settling.done(&all, None, &status), "empty never settles");
 
     status.insert(sled("A"), terminal.clone());
-    assert!(!watch_done(2, 0, &status, &mut quiet), "new sled resets");
-    assert!(!watch_done(3, 1, &status, &mut quiet), "first quiet poll");
+    assert!(!settling.done(&all, None, &status), "new sled resets");
+    assert!(!settling.done(&all, None, &status), "first quiet poll");
     assert!(
-        !watch_done(4, 1, &status, &mut quiet),
+        !settling.done(&all, None, &status),
         "quiet but too young for gossip"
     );
-    assert!(watch_done(5, 1, &status, &mut quiet), "old enough, quiet");
+    assert!(settling.done(&all, None, &status), "old enough, quiet");
 
-    let mut quiet = 0;
-    status.insert(sled("B"), running);
-    assert!(!watch_done(6, 2, &status, &mut quiet), "running sled holds");
-    assert_eq!(quiet, 0);
-
-    status.insert(sled("B"), terminal);
-    assert!(!watch_done(7, 2, &status, &mut quiet));
+    let mut settling = Settling::default();
+    status.insert(sled("B"), running.clone());
+    assert!(!settling.done(&all, None, &status), "running sled holds");
+    status.insert(sled("B"), terminal.clone());
     assert!(
-        watch_done(8, 2, &status, &mut quiet),
-        "settles once terminal"
+        !settling.done(&all, Some(2), &status),
+        "the rack count must hold"
+    );
+    assert!(
+        settling.done(&all, Some(2), &status),
+        "the rack count held twice"
+    );
+
+    let named: Target = format!("{},{}", sled("A"), sled("B")).parse().unwrap();
+    let mut settling = Settling::default();
+    assert!(
+        settling.done(&named, None, &status),
+        "named sleds settle on the first terminal poll"
+    );
+    let duplicates: Target = format!("{},{}", sled("A"), sled("A")).parse().unwrap();
+    let mut settling = Settling::default();
+    assert!(
+        settling.done(&duplicates, None, &status),
+        "duplicate baseboards collapse"
+    );
+    status.insert(sled("B"), running);
+    assert!(
+        !settling.done(&named, None, &status),
+        "a running named sled holds"
+    );
+    status.insert(sled("B"), terminal);
+    let missing: Target = format!("{},{}", sled("A"), sled("C")).parse().unwrap();
+    let mut settling = Settling::default();
+    assert!(
+        !settling.done(&missing, None, &status),
+        "a missing named sled holds"
     );
 }
 
-/// Anything the target grammar accepts stays a target; bare serials
-/// fall through; everything else still fails.
+/// Anything the target grammar accepts stays a target.
 #[test]
 fn target_arg() {
     assert!(matches!("*".parse(), Ok(TargetArg::Target(_))));
@@ -284,8 +311,23 @@ fn target_arg() {
         "913-0000019:BRM42220030".parse(),
         Ok(TargetArg::Target(_))
     ));
-    assert!(matches!("brm42220030".parse(), Ok(TargetArg::Serial(s)) if s == "brm42220030"));
-    assert!("not,a:target!".parse::<TargetArg>().is_err());
+    assert!(matches!(
+        "brm42220030".parse(),
+        Ok(TargetArg::Abbreviated(sleds))
+            if matches!(sleds.as_slice(), [SledArg::Serial(s)] if s == "brm42220030")
+    ));
+    assert!(matches!(
+        "14,brm42220030".parse(),
+        Ok(TargetArg::Abbreviated(sleds))
+            if matches!(sleds.as_slice(), [SledArg::Sled(SledId::Cubby(14)), SledArg::Serial(_)])
+    ));
+    assert!(matches!(
+        "913-0000019:BRM42220036,brm42220030".parse(),
+        Ok(TargetArg::Abbreviated(sleds))
+            if matches!(sleds.as_slice(), [SledArg::Sled(SledId::Baseboard(_)), SledArg::Serial(_)])
+    ));
+    assert!("n!ot,a:target".parse::<TargetArg>().is_err());
+    assert!("*,brm42220030".parse::<TargetArg>().is_err());
 }
 
 /// [`ClientArgs`] must satisfy Clap's internal consistency asserts
@@ -383,6 +425,9 @@ pub enum ClientCommand {
     /// Start an interactive REPL.
     #[clap(alias = "repl")]
     Shell,
+
+    /// Report client and sled build versions.
+    Version,
 
     /// Leave the interactive REPL.
     #[clap(alias = "exit")]
@@ -580,10 +625,22 @@ pub struct JobStartArgs {
     #[arg(short, long)]
     interactive: bool,
 
+    /// Stream the job's output to an attached client instead of recording it.
+    #[arg(short = 'S', long, conflicts_with = "interactive")]
+    streaming: bool,
+
+    /// File that streamed output should be written to.
+    #[arg(short, long)]
+    file: Option<PathBuf>,
+
+    /// Overwrite the output file if it exists.
+    #[arg(long, requires = "file")]
+    force: bool,
+
     /// Where the job runs: every sled (`*`), or a comma-separated list
-    /// of cubby numbers and baseboard IDs.
+    /// of cubby numbers, baseboard IDs, or bare serial numbers.
     #[arg(short = 'T', long, default_value = "*")]
-    target: Target,
+    target: TargetArg,
 
     /// Use `permslip` to sign job requests with this key name.
     #[cfg(feature = "permslip")]
@@ -615,8 +672,33 @@ impl JobStartArgs {
 }
 
 impl ClientCommand {
+    /// Interactive jobs forward SIGINT to the job, watches use it to
+    /// stop the job or end the watch, and the REPL turns it into a
+    /// fresh prompt.
+    fn handles_sigint(&self) -> bool {
+        matches!(
+            self,
+            Self::Shell
+                | Self::Job {
+                    command: JobCommand::Start { .. } | JobCommand::Attach { .. },
+                }
+        )
+    }
+
+    /// Run the command, letting an interrupt cancel it unless the
+    /// command handles SIGINT itself.
     #[async_recursion(?Send)]
     pub async fn execute(self, ctx: &mut impl CommandContext) -> Result<(), CommandError> {
+        if self.handles_sigint() {
+            return self.run(ctx).await;
+        }
+        select! {
+            result = self.run(ctx) => result,
+            _ = ctrl_c() => Err(CommandError::Canceled),
+        }
+    }
+
+    async fn run(self, ctx: &mut impl CommandContext) -> Result<(), CommandError> {
         let args = ctx.get_globals().to_owned();
         if let Some(output) = args.output {
             ctx.set_output_format(output);
@@ -634,11 +716,14 @@ impl ClientCommand {
                     }
                     roots
                 };
-                Some(Client::new_with_client(
-                    url,
-                    tls::client(roots)?,
-                    ctx.authz_signer(),
-                ))
+                {
+                    let (url, resolve) = tls::descope_url(url)?;
+                    Some(Client::new_with_client(
+                        &url,
+                        tls::client(roots, resolve)?,
+                        ctx.authz_signer(),
+                    ))
+                }
             }
             None => None,
         };
@@ -675,6 +760,23 @@ impl ClientCommand {
 
             (ClientCommand::Shell, client) => {
                 Repl::default().run(args.clone(), client).await?;
+                Ok(())
+            }
+
+            (ClientCommand::Version, client) => {
+                let (server, sleds) = match client {
+                    Some(client) => (
+                        Some(client.version().send().await?.into_inner()),
+                        client
+                            .versions()
+                            .send()
+                            .await
+                            .map(|sleds| sleds.into_inner())
+                            .unwrap_or_default(),
+                    ),
+                    None => (None, Vec::new()),
+                };
+                ctx.versions(&VersionInfo::current(), server.as_ref(), &sleds);
                 Ok(())
             }
 
@@ -1072,6 +1174,7 @@ async fn job(
                         permslip: Some(ref key_name),
                         ref permslip_url,
                         ref interactive,
+                        ref streaming,
                         ref target,
                         ..
                     },
@@ -1085,8 +1188,43 @@ async fn job(
                 return Err(CommandError::MissingPermslipUrl);
             };
             let job_id = ctx.next_job_id()?;
-
-            let signer = PermslipSigner::new(key_name, permslip_url).await?;
+            let target = match target {
+                TargetArg::Target(target) => target.clone(),
+                abbreviated => {
+                    let Some(client) = client.as_ref() else {
+                        return Err(CommandError::Offline);
+                    };
+                    resolve_target_arg(client, abbreviated).await?
+                }
+            };
+            // Sign an interactive or streaming job for the sled its
+            // attachment will land on.
+            let target = if (*interactive || *streaming) && target.single_baseboard().is_none() {
+                let Some(client) = client.as_ref() else {
+                    return Err(CommandError::InteractiveTarget);
+                };
+                Target::from(resolve_target(client, &target).await?)
+            } else {
+                target
+            };
+            // Catch output file problems before the signing ceremony.
+            if *streaming {
+                let Some(path) = &start_args.file else {
+                    return Err(CommandError::StreamingNeedsFile);
+                };
+                if !start_args.force && path.exists() {
+                    return Err(CommandError::io(path, ErrorKind::AlreadyExists.into()));
+                }
+            }
+            if let Some(client) = client.as_ref() {
+                preflight_target(ctx, client, &target).await?;
+            }
+            let streaming = if *streaming {
+                Streaming::Output
+            } else {
+                Streaming::None
+            };
+            let mut signer = PermslipSigner::new(key_name, permslip_url).await?;
             let mut interval = interval(SIGNING_UPDATE_INTERVAL);
             interval.set_missed_tick_behavior(MissedTickBehavior::Skip);
             let sign = signer.sign_job_request(JobStartRequest::new(
@@ -1094,10 +1232,12 @@ async fn job(
                 session_id,
                 command,
                 *interactive,
-                target.clone(),
+                streaming,
+                target,
             ));
             pin!(sign);
             ctx.job_signing_started(&job_id);
+            let mut sigint = signal(SignalKind::interrupt())?;
             let job = loop {
                 select! {
                     job = &mut sign => {
@@ -1105,7 +1245,7 @@ async fn job(
                         break job?;
                     }
                     _ = interval.tick() => ctx.job_signing_update(&job_id),
-                    _ = ctrl_c() => {
+                    _ = sigint.recv() => {
                         ctx.job_signing_finished(&job_id);
                         return Err(CommandError::Canceled);
                     }
@@ -1122,7 +1262,7 @@ async fn job(
         }
 
         (JobCommand::Stop { job_id }, Some(client)) => {
-            job_stop(ctx, client, &job_id).await?;
+            job_stop(ctx, client, &job_id, None).await?;
             ctx.job_stopped(&job_id);
             Ok(())
         }
@@ -1134,7 +1274,7 @@ async fn job(
                 StatusDisplayStyle::Short
             };
             if wait {
-                let status = job_watch(ctx, client, &job_id).await?;
+                let status = job_watch(ctx, client, &job_id, &Target::All).await?;
                 ctx.job_status(&job_id, &status, style);
                 Ok(())
             } else {
@@ -1152,8 +1292,16 @@ async fn job(
 
         (JobCommand::Attach { job_id, target }, Some(client)) => {
             let target = match &target {
+                TargetArg::Abbreviated(sleds) => match sleds.as_slice() {
+                    [SledArg::Serial(serial)] => {
+                        resolve_serial(ctx, client, &job_id, serial).await?
+                    }
+                    _ => {
+                        let target = resolve_target_arg(client, &target).await?;
+                        resolve_target(client, &target).await?
+                    }
+                },
                 TargetArg::Target(target) => resolve_target(client, target).await?,
-                TargetArg::Serial(serial) => resolve_serial(ctx, client, &job_id, serial).await?,
             };
             job_attach(ctx, client, &job_id, &target).await?;
             Ok(())
@@ -1201,10 +1349,13 @@ async fn job_start(
         limits,
         term,
         wait,
+        file,
+        force,
         ..
     } = start_args;
     let interactive = job.payload().interactive;
-    let wait = if interactive {
+    let streaming = matches!(job.payload().streaming, Streaming::Output);
+    let wait = if interactive || streaming {
         JobWait::Start
     } else if wait {
         JobWait::Stop
@@ -1217,10 +1368,11 @@ async fn job_start(
         max_fsize,
     } = limits.as_limits();
     let mut start_ctx = ctx.clone();
-    let start = with_login(&mut start_ctx, client, async || {
+    let start = with_login_via(&mut start_ctx, client, Some(&target), async || {
         let mut start = client
             .job_start()
             .job_id(job.job_id())
+            .target(target.to_string())
             .max_cpu(max_cpu)
             .max_mem(max_mem)
             .max_fsize(max_fsize)
@@ -1242,51 +1394,103 @@ async fn job_start(
         start.await?;
         ctx.job_started(&job);
         match job_attach(ctx, client, &job_id, &target).await {
-            Ok(()) | Err(CommandError::NotFound) => {
+            Ok(()) | Err(CommandError::NotFound(_)) => {
                 job_status(ctx, client, &job_id, StatusDisplayStyle::Short).await?
             }
             Err(error) => return Err(error),
+        }
+    } else if streaming {
+        let Some(path) = file else {
+            return Err(CommandError::StreamingNeedsFile);
+        };
+        let mut options = OpenOptions::new();
+        options.write(true);
+        if force {
+            options.create(true);
+        } else {
+            options.create_new(true);
+        }
+        let file = options
+            .open(&path)
+            .map_err(|error| CommandError::io(&path, error))?;
+        start.await?;
+        ctx.job_started(&job);
+        let hasher = job_stream(ctx, client, &job_id, &target, &path, file).await?;
+        let status = job_watch(ctx, client, &job_id, &target.clone().into()).await?;
+        ctx.job_status(&job_id, &status, StatusDisplayStyle::Short);
+        let Some(JobStatus::Stopped {
+            result: Ok(0),
+            output:
+                JobOutputState {
+                    stdout_len,
+                    stdout_hash,
+                    ..
+                },
+            ..
+        }) = status.get(&target)
+        else {
+            return Err(CommandError::StreamUnverified(job_id));
+        };
+        if *stdout_len != hasher.count() {
+            return Err(CommandError::LengthMismatch {
+                expected: *stdout_len,
+                received: hasher.count(),
+            });
+        }
+        let received = JobOutputHash::from(hasher.finalize());
+        if received != *stdout_hash {
+            return Err(CommandError::OutputHashMismatch {
+                expected: stdout_hash.to_owned(),
+                received,
+            });
         }
     } else if wait.is_some() {
         // Watch the whole rack while the start request runs, and keep
         // watching until the job settles everywhere.
         ctx.job_watch_started(&job_id);
+        let job_target = job.payload().target().clone();
         let mut ticker = interval(WATCH_INTERVAL);
         ticker.set_missed_tick_behavior(MissedTickBehavior::Skip);
         let mut last = JobStatusMap::new();
-        let mut sleds = 0;
-        let mut quiet = 0;
-        let mut polls = 0;
+        let mut settling = Settling::default();
         let mut started = false;
+        let mut stalled = false;
         let mut stopped = false;
+        let mut sigint = signal(SignalKind::interrupt())?;
         let status = loop {
             select! {
                 // Wait for the start request to finish.
                 start_result = &mut start, if !started => {
-                    if let Err(error) = start_result {
-                        ctx.job_watch_finished(&job_id);
-                        return Err(error);
+                    match start_result {
+                        Ok(_) | Err(CommandError::TimedOut) => ctx.job_started(&job),
+                        Err(error) => {
+                            ctx.job_watch_finished(&job_id);
+                            return Err(error);
+                        }
                     }
-                    ctx.job_started(&job);
                     started = true;
+                    ticker.reset_immediately();
                 }
 
                 _ = ticker.tick() => {
-                    last = match job_status_map(ctx, client, &job_id).await {
+                    last = match job_status_map(ctx, client, &job_id, job_target.single_baseboard()).await {
                         Ok(status) => status,
                         // The job may not be visible anywhere yet.
-                        Err(CommandError::NotFound) => JobStatusMap::new(),
+                        Err(CommandError::NotFound(_)) => JobStatusMap::new(),
                         Err(error) => {
                             ctx.job_watch_finished(&job_id);
                             return Err(error);
                         }
                     };
                     ctx.job_watch_update(&last);
-                    polls += 1;
-                    if started && watch_done(polls, sleds, &last, &mut quiet) {
+                    let rack = rack_sleds(client, &job_target).await;
+                    if settling.done(&job_target, rack, &last) && started {
                         break last;
                     }
-                    sleds = last.len();
+                    if !stalled && last.is_empty() && settling.polls >= WATCH_STALL_POLLS {
+                        ctx.job_watch_stalled(&job_id);
+                        stalled = true;
+                    }
                 }
 
                 // While the job runs, an interrupt stops it but keeps
@@ -1295,18 +1499,18 @@ async fn job_start(
                 // so retry the stop a few times if needed. Once the job
                 // has stopped, or after a first interrupt, an interrupt
                 // just ends the watch.
-                _ = ctrl_c() => {
+                _ = sigint.recv() => {
                     if started || stopped {
                         break last;
                     }
                     for _ in 0..3 {
-                        match job_stop(ctx, client, &job_id).await {
+                        match job_stop(ctx, client, &job_id, job_target.single_baseboard()).await {
                             Ok(_) => {
                                 ctx.job_stopped(&job_id);
                                 stopped = true;
                                 break;
                             }
-                            Err(CommandError::NotFound) => {
+                            Err(CommandError::NotFound(_)) => {
                                 sleep(JOB_STOP_RETRY_INTERVAL).await;
                             }
                             Err(error) => {
@@ -1320,23 +1524,43 @@ async fn job_start(
         };
         ctx.job_watch_finished(&job_id);
         ctx.job_status(&job_id, &status, StatusDisplayStyle::Short);
-        for stream in [Stdout, Stderr] {
-            match with_login_via(ctx, client, Some(&target), async || {
-                client
-                    .job_output()
-                    .job_id(job_id)
-                    .target(target.to_string())
-                    .stream(stream)
-                    .send()
-                    .await
-            })
-            .await
-            {
-                Ok(byte_stream) => {
-                    let output = byte_stream_to_vec(byte_stream.into_inner()).await?;
-                    ctx.job_output(&job_id, stream, &output, binary);
+        if !status
+            .values()
+            .any(|s| matches!(s, JobStatus::Stopped { .. }))
+        {
+            return Err(if status.values().all(JobStatus::is_terminal) {
+                CommandError::JobDidNotRun(job_id)
+            } else {
+                CommandError::JobStillRunning(job_id)
+            });
+        }
+        // Show the output of every sled the job ran on.
+        let multiple = status.len() > 1;
+        for baseboard in status.keys() {
+            if multiple {
+                ctx.job_output_target(baseboard);
+            }
+            for stream in [Stdout, Stderr] {
+                match with_login_via(ctx, client, Some(baseboard), async || {
+                    client
+                        .job_output()
+                        .job_id(job_id)
+                        .target(baseboard.to_string())
+                        .stream(stream)
+                        .send()
+                        .await
+                })
+                .await
+                {
+                    Ok(byte_stream) => {
+                        let output = byte_stream_to_vec(byte_stream.into_inner()).await?;
+                        ctx.job_output(&job_id, stream, &output, binary);
+                    }
+                    Err(error) if multiple => {
+                        let _ = ctx.job_error(error);
+                    }
+                    Err(error) => return Err(error),
                 }
-                Err(error) => return Err(error),
             }
         }
     } else {
@@ -1372,14 +1596,14 @@ async fn job_stop(
     ctx: &mut impl CommandContext,
     client: &Client,
     job_id: &JobId,
+    via: Option<&BaseboardId>,
 ) -> Result<(), CommandError> {
-    with_login(ctx, client, async || {
-        client
-            .job_stop()
-            .job_id(job_id)
-            .wait(JobWait::Stop)
-            .send()
-            .await
+    with_login_via(ctx, client, via, async || {
+        let mut request = client.job_stop().job_id(job_id).wait(JobWait::Stop);
+        if let Some(via) = via {
+            request = request.via(via.to_string());
+        }
+        request.send().await
     })
     .await?;
     Ok(())
@@ -1391,19 +1615,26 @@ async fn job_status(
     job_id: &JobId,
     style: StatusDisplayStyle,
 ) -> Result<(), CommandError> {
-    let status = job_status_map(ctx, client, job_id).await?;
+    let status = job_status_map(ctx, client, job_id, None).await?;
     ctx.job_status(job_id, &status, style);
     Ok(())
 }
 
-/// Fetch a job's rack-wide status map.
+/// Fetch a job's rack-wide status map. Routing `via` a single-sled
+/// target gets its authoritative status and keeps the login on the
+/// sled that already knows it.
 async fn job_status_map(
     ctx: &mut impl CommandContext,
     client: &Client,
     job_id: &JobId,
+    via: Option<&BaseboardId>,
 ) -> Result<JobStatusMap, CommandError> {
-    let status = with_login(ctx, client, async || {
-        client.job_status().job_id(job_id).send().await
+    let status = with_login_via(ctx, client, via, async || {
+        let mut request = client.job_status().job_id(job_id);
+        if let Some(via) = via {
+            request = request.via(via.to_string());
+        }
+        request.send().await
     })
     .await?
     .into_inner();
@@ -1419,13 +1650,13 @@ async fn job_watch(
     ctx: &mut impl CommandContext,
     client: &Client,
     job_id: &JobId,
+    target: &Target,
 ) -> Result<JobStatusMap, CommandError> {
     ctx.job_watch_started(job_id);
-    let mut sleds = 0;
-    let mut quiet = 0;
-    let mut polls = 0;
+    let mut settling = Settling::default();
+    let mut sigint = signal(SignalKind::interrupt())?;
     let status = loop {
-        let status = match job_status_map(ctx, client, job_id).await {
+        let status = match job_status_map(ctx, client, job_id, target.single_baseboard()).await {
             Ok(status) => status,
             Err(error) => {
                 ctx.job_watch_finished(job_id);
@@ -1433,14 +1664,13 @@ async fn job_watch(
             }
         };
         ctx.job_watch_update(&status);
-        polls += 1;
-        if watch_done(polls, sleds, &status, &mut quiet) {
+        let rack = rack_sleds(client, target).await;
+        if settling.done(target, rack, &status) {
             break status;
         }
-        sleds = status.len();
         select! {
             _ = sleep(WATCH_INTERVAL) => {}
-            _ = ctrl_c() => break status,
+            _ = sigint.recv() => break status,
         }
     };
     ctx.job_watch_finished(job_id);
@@ -1452,16 +1682,59 @@ async fn job_watch(
 /// is likely still missing sleds.
 const WATCH_MIN_POLLS: usize = 5;
 
-/// A watched job has settled once the watch is old enough for gossip
-/// to have named every sled, every known sled reports a terminal
-/// status, and the set of sleds has been stable for a couple of polls.
-fn watch_done(polls: usize, sleds: usize, status: &JobStatusMap, quiet: &mut usize) -> bool {
-    if !status.is_empty() && status.len() == sleds && status.values().all(JobStatus::is_terminal) {
-        *quiet += 1;
-    } else {
-        *quiet = 0;
+/// How many polls a watch may go without any sled reporting a status
+/// before warning that the job may never run.
+const WATCH_STALL_POLLS: usize = 15;
+
+/// Rolling settlement state for a watched job.
+#[derive(Default)]
+struct Settling {
+    polls: usize,
+    sleds: usize,
+    quiet: usize,
+    met: usize,
+}
+
+impl Settling {
+    /// A watched job has settled once every sled it runs on reports a
+    /// terminal status. A target naming only baseboards is settled as
+    /// soon as they all report. Against the rack inventory, the count
+    /// must match on consecutive polls. Either way, the watch is done
+    /// once it is old enough for gossip to have named every sled and
+    /// the set of sleds has been stable for a couple of polls.
+    fn done(&mut self, target: &Target, rack: Option<usize>, status: &JobStatusMap) -> bool {
+        self.polls += 1;
+        let terminal = !status.is_empty() && status.values().all(JobStatus::is_terminal);
+        if terminal && status.len() == self.sleds {
+            self.quiet += 1;
+        } else {
+            self.quiet = 0;
+        }
+        self.sleds = status.len();
+        if rack.is_some_and(|sleds| terminal && status.len() == sleds) {
+            self.met += 1;
+        } else {
+            self.met = 0;
+        }
+        if let Some(named) = target.named_baseboards()
+            && named
+                .into_iter()
+                .all(|sled| status.get(sled).is_some_and(JobStatus::is_terminal))
+        {
+            return true;
+        }
+        self.met >= 2 || (self.polls >= WATCH_MIN_POLLS && self.quiet >= 2)
     }
-    polls >= WATCH_MIN_POLLS && *quiet >= 2
+}
+
+/// The number of sleds in the rack's own inventory, where available.
+/// Skips the fetch for targets whose sleds are named.
+async fn rack_sleds(client: &Client, target: &Target) -> Option<usize> {
+    if target.named_baseboards().is_some() {
+        return None;
+    }
+    let sleds = client.versions().send().await.ok()?.into_inner().len();
+    (sleds > 0).then_some(sleds)
 }
 
 /// Stream some bytes into a vector.
@@ -1505,14 +1778,17 @@ async fn job_output(
     args: JobOutput,
 ) -> Result<(), CommandError> {
     let target = match target {
-        TargetArg::Serial(serial) => {
-            let baseboard = resolve_serial(ctx, client, &args.job_id, serial).await?;
-            return job_output_from(ctx, client, &baseboard, stream, args).await;
+        TargetArg::Target(target) => target.clone(),
+        TargetArg::Abbreviated(sleds) => {
+            if let [SledArg::Serial(serial)] = sleds.as_slice() {
+                let baseboard = resolve_serial(ctx, client, &args.job_id, serial).await?;
+                return job_output_from(ctx, client, &baseboard, stream, args).await;
+            }
+            resolve_target_arg(client, target).await?
         }
-        TargetArg::Target(target) => target,
     };
     if !target.is_all() {
-        let baseboard = resolve_target(client, target).await?;
+        let baseboard = resolve_target(client, &target).await?;
         return job_output_from(ctx, client, &baseboard, stream, args).await;
     }
     if args.binary || args.file.is_some() {
@@ -1520,9 +1796,12 @@ async fn job_output(
     }
 
     // Fetch output from every sled with a recorded status.
-    let status = job_status_map(ctx, client, &args.job_id).await?;
+    let status = job_status_map(ctx, client, &args.job_id, None).await?;
     if status.is_empty() {
-        return Err(CommandError::NotFound);
+        return Err(CommandError::NotFound(format!(
+            "Job `{}` not found",
+            args.job_id
+        )));
     }
     for baseboard in status.keys() {
         ctx.job_output_target(baseboard);
@@ -1548,14 +1827,7 @@ async fn job_output_from(
     }: JobOutput,
 ) -> Result<(), CommandError> {
     // Fetch job status for output length and hash.
-    let status = job_status_try_from_json_map(
-        with_login_via(ctx, client, Some(target), async || {
-            client.job_status().job_id(job_id).send().await
-        })
-        .await?
-        .into_inner(),
-    )
-    .map_err(CommandError::BaseboardIdParseError)?;
+    let status = job_status_map(ctx, client, &job_id, Some(target)).await?;
 
     let JobOutputState {
         stdout_len,
@@ -1563,7 +1835,11 @@ async fn job_output_from(
         stdout_hash,
         stderr_hash,
     } = match status.get(target) {
-        None => return Err(CommandError::NotFound),
+        None => {
+            return Err(CommandError::NotFound(format!(
+                "Job `{job_id}` not found on sled `{target}`"
+            )));
+        }
         Some(JobStatus::Cancelled { .. }) => {
             return Err(CommandError::JobCancelled(job_id.to_owned()));
         }
@@ -1766,6 +2042,70 @@ async fn job_attach(
     }
 }
 
+/// Receive a streaming job's output into an open file, returning the
+/// hasher fed by the received bytes.
+async fn job_stream(
+    ctx: &mut impl CommandContext,
+    client: &Client,
+    job_id: &JobId,
+    target: &BaseboardId,
+    path: &Path,
+    mut file: File,
+) -> Result<Hasher, CommandError> {
+    let io_error = |error| CommandError::io(path, error);
+    let socket = with_login_via(ctx, client, Some(target), async || {
+        client
+            .job_attach()
+            .job_id(job_id)
+            .target(target.to_string())
+            .send()
+            .await
+    })
+    .await?
+    .into_inner();
+    let mut stream = WebSocketStream::from_raw_socket(socket, Role::Client, None).await;
+    file.set_len(0).map_err(io_error)?;
+    let mut hasher = Hasher::new();
+    let mut sigint = signal(SignalKind::interrupt())?;
+    ctx.job_output_started(job_id, Stdout, "Streaming", 0);
+    let result = loop {
+        select! {
+            message = stream.next() => {
+                let Some(message) = message else { break Ok(()) };
+                let message = match message.map_err(InteractiveJobError::from) {
+                    Ok(message) => message,
+                    Err(error) => break Err(error.into()),
+                };
+                match InteractiveJobMessage::try_from(message) {
+                    Ok(InteractiveJobMessage::Data(bytes)) => {
+                        hasher.update(&bytes);
+                        if let Err(error) = file.write_all(&bytes).map_err(io_error) {
+                            break Err(error);
+                        }
+                        ctx.job_output_update(job_id, Stdout, bytes.len() as u64);
+                    }
+                    Ok(InteractiveJobMessage::Close) => break Ok(()),
+                    Ok(InteractiveJobMessage::Control(_) | InteractiveJobMessage::Ignore) => (),
+                    Err(error) => break Err(error.into()),
+                }
+            }
+            _ = sigint.recv() => break Err(CommandError::Canceled),
+        }
+    };
+    match result {
+        Ok(()) => {
+            file.flush().map_err(io_error)?;
+            ctx.job_output_finished(job_id, Stdout, Some("✅ Streamed"));
+            let _ = stream.close(None).await;
+            Ok(hasher)
+        }
+        Err(error) => {
+            ctx.job_output_finished(job_id, Stdout, Some("❌ Received"));
+            Err(error)
+        }
+    }
+}
+
 /// Resolve a target to the baseboard of one sled it names. A single
 /// baseboard resolves locally. Anything else asks `/target`, routed
 /// by the expression, so a proxy resolves cubbies and `*` means the
@@ -1783,11 +2123,18 @@ async fn resolve_target(client: &Client, target: &Target) -> Result<BaseboardId,
     Ok(request.send().await?.into_inner())
 }
 
-/// A target expression, or a bare serial number to resolve against
-/// the sleds that have a status for the job at hand.
+/// A target expression, with sleds optionally abbreviated to bare
+/// serial numbers.
 #[derive(Clone, Debug)]
 pub enum TargetArg {
     Target(Target),
+    Abbreviated(Vec<SledArg>),
+}
+
+/// One sled named in a target argument.
+#[derive(Clone, Debug)]
+pub enum SledArg {
+    Sled(SledId),
     Serial(String),
 }
 
@@ -1795,12 +2142,80 @@ impl FromStr for TargetArg {
     type Err = <Target as FromStr>::Err;
 
     fn from_str(s: &str) -> Result<Self, Self::Err> {
-        match s.parse() {
-            Ok(target) => Ok(Self::Target(target)),
-            Err(_) if !s.is_empty() && s.chars().all(|c| c.is_ascii_alphanumeric()) => {
-                Ok(Self::Serial(s.to_owned()))
+        let error = match s.parse() {
+            Ok(target) => return Ok(Self::Target(target)),
+            Err(error) => error,
+        };
+        let mut sleds = Vec::new();
+        for piece in s.split(',') {
+            let piece = piece.trim();
+            match piece.parse::<Target>() {
+                Ok(Target::Sleds(sled)) if sled.len() == 1 => {
+                    sleds.push(SledArg::Sled(sled.into_iter().next().expect("one sled")));
+                }
+                _ if !piece.is_empty() && piece.chars().all(|c| c.is_ascii_alphanumeric()) => {
+                    sleds.push(SledArg::Serial(piece.to_owned()));
+                }
+                _ => return Err(error),
             }
-            Err(err) => Err(err),
+        }
+        Ok(Self::Abbreviated(sleds))
+    }
+}
+
+/// Confirm before signing a job for a sled that doesn't appear in inventory.
+#[cfg(feature = "permslip")]
+async fn preflight_target(
+    ctx: &mut impl CommandContext,
+    client: &Client,
+    target: &Target,
+) -> Result<(), CommandError> {
+    let Target::Sleds(sleds) = target else {
+        return Ok(());
+    };
+    let Ok(inventory) = client.versions().send().await else {
+        return Ok(());
+    };
+    let inventory = inventory.into_inner();
+    for sled in sleds {
+        let known = match sled {
+            SledId::Baseboard(baseboard) => inventory.iter().any(|s| &s.baseboard == baseboard),
+            SledId::Cubby(cubby) => inventory.iter().any(|s| s.cubby == Some(*cubby)),
+        };
+        if !known {
+            ctx.really_target(sled)?;
+        }
+    }
+    Ok(())
+}
+
+/// Resolve a target argument to a target, matching bare serial
+/// numbers against the rack's sled inventory.
+async fn resolve_target_arg(client: &Client, target: &TargetArg) -> Result<Target, CommandError> {
+    match target {
+        TargetArg::Target(target) => Ok(target.clone()),
+        TargetArg::Abbreviated(sleds) => {
+            let inventory = client.versions().send().await?.into_inner();
+            sleds
+                .iter()
+                .map(|sled| match sled {
+                    SledArg::Sled(sled) => Ok(sled.clone()),
+                    SledArg::Serial(serial) => {
+                        let mut matches = inventory
+                            .iter()
+                            .map(|sled| &sled.baseboard)
+                            .filter(|b| b.serial_number.eq_ignore_ascii_case(serial));
+                        match (matches.next(), matches.next()) {
+                            (Some(baseboard), None) => Ok(SledId::Baseboard(baseboard.clone())),
+                            (None, _) => Err(CommandError::UnknownRackSerial(serial.to_owned())),
+                            (Some(_), Some(_)) => {
+                                Err(CommandError::AmbiguousSerial(serial.to_owned()))
+                            }
+                        }
+                    }
+                })
+                .collect::<Result<Vec<_>, _>>()
+                .map(Target::Sleds)
         }
     }
 }
@@ -1813,7 +2228,7 @@ async fn resolve_serial(
     job_id: &JobId,
     serial: &str,
 ) -> Result<BaseboardId, CommandError> {
-    let status = job_status_map(ctx, client, job_id).await?;
+    let status = job_status_map(ctx, client, job_id, None).await?;
     let mut matches = status
         .keys()
         .filter(|b| b.serial_number.eq_ignore_ascii_case(serial));
@@ -1860,11 +2275,15 @@ pub enum CommandError {
     IdentityMismatch { interactive: KeyId, key_id: KeyId },
     #[error("❌ Interactive job error: {0}")]
     Interactive(#[from] InteractiveJobError),
-    #[error("❌ I/O error accessing `{path}`: {error}")]
+    #[error("❌ Interactive jobs must target exactly one sled")]
+    InteractiveTarget,
+    #[error("❌ Local I/O error accessing `{path}`: {error}")]
     Io {
         path: PathBuf,
         error: std::io::Error,
     },
+    #[error("❌ Signal handling error: {0}")]
+    Signal(#[from] std::io::Error),
     #[error("❌ Unauthorized, try `iam`")]
     InvalidAuthorization,
     #[error("❌ Leaf certificate does not match key `{0}`")]
@@ -1873,6 +2292,8 @@ pub enum CommandError {
     InvalidRootCert,
     #[error("❌ Job `{0}` was cancelled before it started")]
     JobCancelled(JobId),
+    #[error("❌ Job `{0}` did not run")]
+    JobDidNotRun(JobId),
     #[error("❌ Job `{0}` is not yet running")]
     JobNotYetRunning(JobId),
     #[error("❌ Job `{0}` is still running")]
@@ -1895,8 +2316,8 @@ pub enum CommandError {
     MissingSession,
     #[error("❌ Missing SSH agent socket, try `--ssh-auth-sock`")]
     MissingSshAuthSock,
-    #[error("❌ Resource not found")]
-    NotFound,
+    #[error("❌ {0}")]
+    NotFound(String),
     #[error("❌ Command not supported in offline mode, try `--url`")]
     Offline,
     #[error(
@@ -1930,6 +2351,10 @@ pub enum CommandError {
     #[cfg(not(feature = "permslip"))]
     #[error("❌ Signing unavailable: built without the `permslip` feature")]
     SigningUnavailable,
+    #[error("❌ Streaming jobs need `--file`")]
+    StreamingNeedsFile,
+    #[error("❌ Job `{0}` did not exit cleanly, streamed output is unverified")]
+    StreamUnverified(JobId),
     #[error("❌ Can't parse target baseboard ID: {0}")]
     BaseboardIdParseError(sled_hardware_types::BaseboardIdParseError),
     #[error("❌ SSH key error: {0}")]
@@ -1940,6 +2365,8 @@ pub enum CommandError {
     TooMuchOutput,
     #[error("❌ No sled with serial `{serial}` has a status for job `{job_id}`")]
     UnknownSerial { serial: String, job_id: JobId },
+    #[error("❌ Serial `{0}` matches no sled in the rack inventory")]
+    UnknownRackSerial(String),
     #[error("❌ Chain root does not match any supplied root certificate")]
     UntrustedRoot,
     #[error("❌ Can't start interactive session: {0}")]
@@ -1968,9 +2395,12 @@ impl From<ClientError<ApiError>> for CommandError {
         use ClientError::*;
         match error {
             InvalidRequest(e) => CommandError::Client(format!("Invalid request: {e}")),
+            CommunicationError(e) if e.is_timeout() => CommandError::TimedOut,
             CommunicationError(e) => CommandError::Client(format!("Communication error: {e}")),
             InvalidUpgrade(e) => CommandError::Client(e.to_string()),
-            ErrorResponse(e) if e.status() == StatusCode::NOT_FOUND => CommandError::NotFound,
+            ErrorResponse(e) if e.status() == StatusCode::NOT_FOUND => {
+                CommandError::NotFound(e.message.to_owned())
+            }
             ErrorResponse(e) if e.status() == StatusCode::REQUEST_TIMEOUT => CommandError::TimedOut,
             ErrorResponse(e) => CommandError::Client(e.message.to_owned()),
             ResponseBodyError(e) => CommandError::Client(e.to_string()),
@@ -1996,7 +2426,7 @@ impl From<ClientError<ByteStream>> for CommandError {
     fn from(error: ClientError<ByteStream>) -> Self {
         match error.status() {
             Some(StatusCode::PAYLOAD_TOO_LARGE) => Self::TooMuchOutput,
-            Some(StatusCode::NOT_FOUND) => Self::NotFound,
+            Some(StatusCode::NOT_FOUND) => Self::NotFound(String::from("Job output not found")),
             Some(status) => Self::Client(status.to_string()),
             None => Self::Client(error.to_string()),
         }
@@ -2006,7 +2436,9 @@ impl From<ClientError<ByteStream>> for CommandError {
 impl From<ClientError<Upgraded>> for CommandError {
     fn from(error: ClientError<Upgraded>) -> Self {
         match error.status() {
-            Some(StatusCode::NOT_FOUND) => Self::NotFound,
+            Some(StatusCode::NOT_FOUND) => {
+                Self::NotFound(String::from("Interactive job not found"))
+            }
             Some(status) => Self::Client(status.to_string()),
             None => Self::Client(error.to_string()),
         }

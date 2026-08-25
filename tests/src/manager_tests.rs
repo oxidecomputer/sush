@@ -4,19 +4,22 @@
 
 //! Job manager tests.
 
+use std::mem::MaybeUninit;
 use std::os::unix::fs::PermissionsExt as _;
 use std::path::Path;
+use std::ptr::null_mut;
 use std::slice::from_ref;
 use std::time::Duration;
 
 use chrono::Utc;
 use function_name::named;
 use http_range_header::{EndPosition, StartPosition, SyntacticallyCorrectRange as Range};
+use libc::{SIGTERM, SIGXCPU};
 use pwd::Passwd;
 use sled_hardware_types::BaseboardId;
 use slog::{Discard, Logger, o};
 use tempfile::TempDir;
-use tokio::fs::{metadata, write};
+use tokio::fs::{metadata, read, write};
 use tokio::sync::watch;
 use tokio::time::{sleep, timeout};
 use tokio_util::sync::CancellationToken;
@@ -27,7 +30,7 @@ use sush_client::context::Authz;
 use sush_common::authn::{Challenge, ChallengeResponse, Credentials, Identity, Nonce, RequestKey};
 use sush_common::jobs::{
     Access, JobId, JobLimits, JobOutputState, JobOutputStream::*, JobStartRequest, JobStatus,
-    ProcessError, Session, SessionId, SessionSignerNonce,
+    ProcessError, Session, SessionId, SessionSignerNonce, SignedJob, Streaming,
 };
 use sush_common::keys::{EphemeralKey, KeyError, KeyId, KeyType, Signer as _, pem_cert_chain};
 use sush_common::targets::{Cubbies, Target};
@@ -43,10 +46,6 @@ use crate::test_utils::{
     test_baseboard_id, test_logger,
 };
 use sush_server::executor::PathIsolation;
-
-// Signal numbers for killed jobs.
-const SIGKILL: i32 = 9;
-const SIGXCPU: i32 = 24;
 
 #[track_caller]
 fn check_status_started(status: JobStatus, expected_job_id: &JobId) {
@@ -101,7 +100,7 @@ fn check_status_stopped(
 #[tokio::test]
 async fn jobs() {
     let log = test_logger(function_name!());
-    let (mgr, mut root, _dir, _shutdown) = manager_and_test_root(log).await;
+    let (mgr, mut root, dir, _shutdown) = manager_and_test_root(log).await;
     let baseboard_id = mgr.own_baseboard();
     let authn = fake_identity(&mut root).await;
     let signer_nonce = SessionSignerNonce::random();
@@ -232,6 +231,43 @@ async fn jobs() {
             .await
             .is_empty()
     );
+
+    let job_id = session.next_job_id();
+    let output = dir
+        .path()
+        .join("jobs")
+        .join(job_id.to_string())
+        .display()
+        .to_string();
+    let job = root
+        .sign_job_request(
+            job_id,
+            session.session_id(),
+            "printf %s \"$SUSH_JOB_OUTPUT_DIR\"",
+            false,
+        )
+        .await;
+    mgr.job_start(
+        &authn,
+        job.clone().into_signed(),
+        JobStartParams {
+            wait: JobWait::Stop,
+            ..Default::default()
+        },
+    )
+    .await
+    .unwrap();
+    session.job_started(job.clone().into_signed());
+    let status = mgr.job_status(&authn, &job_id).await.unwrap()[baseboard_id].clone();
+    check_status_stopped(status, &job_id, Ok(0), Some(output.len() as u64), Some(0));
+    assert_eq!(
+        mgr.job_output(&authn, &job_id, baseboard_id, Stdout, None)
+            .await
+            .unwrap()
+            .into_bytes()
+            .await,
+        output.as_bytes(),
+    );
 }
 
 #[named]
@@ -260,6 +296,7 @@ async fn job_stop() {
         &job_id,
         JobStopParams {
             wait: JobWait::Stop,
+            ..Default::default()
         },
     )
     .await
@@ -304,6 +341,7 @@ async fn job_stop() {
         &job_id,
         JobStopParams {
             wait: JobWait::Stop,
+            ..Default::default()
         },
     )
     .await
@@ -320,7 +358,7 @@ async fn job_stop() {
     check_status_stopped(
         status,
         &job_id,
-        Err(ProcessError::Killed(SIGKILL)),
+        Err(ProcessError::Killed(SIGTERM)),
         Some(0),
         Some(0),
     );
@@ -394,6 +432,7 @@ async fn cancel_queued_job() {
         &job_id_b,
         JobStopParams {
             wait: JobWait::Stop,
+            ..Default::default()
         },
     )
     .await
@@ -409,6 +448,7 @@ async fn cancel_queued_job() {
         &job_id_a,
         JobStopParams {
             wait: JobWait::Stop,
+            ..Default::default()
         },
     )
     .await
@@ -880,7 +920,7 @@ async fn shutdown() {
     check_status_stopped(
         status,
         &job_id,
-        Err(ProcessError::Killed(SIGKILL)),
+        Err(ProcessError::Killed(SIGTERM)),
         Some(0),
         Some(0),
     );
@@ -1062,6 +1102,7 @@ async fn attribution() {
         &job_id_b,
         JobStopParams {
             wait: JobWait::Stop,
+            ..Default::default()
         },
     )
     .await
@@ -1076,6 +1117,7 @@ async fn attribution() {
         &job_id_a,
         JobStopParams {
             wait: JobWait::Stop,
+            ..Default::default()
         },
     )
     .await
@@ -1245,8 +1287,14 @@ async fn job_targets() {
 
     let mut start = async |command: &str, target: &str| {
         let job_id = session.next_job_id();
-        let request =
-            JobStartRequest::new(job_id, session_id, command, false, target.parse().unwrap());
+        let request = JobStartRequest::new(
+            job_id,
+            session_id,
+            command,
+            false,
+            Streaming::None,
+            target.parse().unwrap(),
+        );
         let job = root
             .sign(request)
             .await
@@ -1492,6 +1540,7 @@ async fn attach_grants() {
         &job_id,
         JobStopParams {
             wait: JobWait::Stop,
+            ..Default::default()
         },
     )
     .await
@@ -1739,7 +1788,6 @@ async fn homonym_issuer_resolves_to_true_parent() {
 async fn too_much_cpu() {
     let log = test_logger(function_name!());
     let (mgr, mut root, _dir, _shutdown) = manager_and_test_root(log).await;
-    let baseboard_id = mgr.own_baseboard();
     let authn = fake_identity(&mut root).await;
     let signer_nonce = SessionSignerNonce::random();
     let session_id = SessionId::compute(
@@ -1752,7 +1800,7 @@ async fn too_much_cpu() {
         .await
         .unwrap();
     let job_id = session.next_job_id();
-    let command = "openssl speed sha1";
+    let command = "while :; do :; done";
     let job = root
         .sign_job_request(job_id, session_id, command, false)
         .await;
@@ -1783,44 +1831,13 @@ async fn too_much_cpu() {
     .unwrap();
     let status = mgr.job_status(&authn, &job_id).await.unwrap()[mgr.own_baseboard()].clone();
     assert!(status.time_elapsed().to_std().unwrap() < Duration::from_secs(2));
-
-    // The output of `openssl speed` changed between v3.0 and v3.5.
-    let stderr = mgr
-        .job_output(&authn, &job_id, baseboard_id, Stderr, None)
-        .await
-        .unwrap()
-        .into_bytes()
-        .await;
-    let stderr = String::from_utf8_lossy(&stderr);
-    match status {
-        JobStatus::Stopped {
-            output: JobOutputState { stderr_len: 37, .. },
-            ..
-        } => {
-            check_status_stopped(
-                status,
-                &job_id,
-                Err(ProcessError::Killed(SIGXCPU)),
-                Some(0),
-                Some(37),
-            );
-            assert_eq!(stderr, "Doing sha1 for 3s on 16 size blocks: ");
-        }
-        JobStatus::Stopped {
-            output: JobOutputState { stderr_len: 41, .. },
-            ..
-        } => {
-            check_status_stopped(
-                status,
-                &job_id,
-                Err(ProcessError::Killed(SIGXCPU)),
-                Some(0),
-                Some(41),
-            );
-            assert_eq!(stderr, "Doing sha1 ops for 3s on 16 size blocks: ");
-        }
-        _ => todo!("what does `{command}` produce on your system?"),
-    }
+    check_status_stopped(
+        status,
+        &job_id,
+        Err(ProcessError::Killed(SIGXCPU)),
+        Some(0),
+        Some(0),
+    );
 }
 
 #[named]
@@ -2215,4 +2232,193 @@ async fn iam() {
             .await
             .is_err()
     );
+}
+
+/// Jobs must not inherit ignored signal dispositions. The embedding
+/// process may ignore SIGINT, and a shell cannot trap a signal that
+/// was ignored at entry, which turns ^C into a no-op in every job.
+#[named]
+#[tokio::test]
+async fn job_signal_dispositions() {
+    // Ignore and block SIGINT, as an embedding daemon might.
+    unsafe {
+        libc::signal(libc::SIGINT, libc::SIG_IGN);
+        let mut set = MaybeUninit::<libc::sigset_t>::uninit();
+        libc::sigemptyset(set.as_mut_ptr());
+        libc::sigaddset(set.as_mut_ptr(), libc::SIGINT);
+        libc::pthread_sigmask(libc::SIG_BLOCK, set.as_ptr(), null_mut());
+    }
+    let log = test_logger(function_name!());
+    let (mgr, mut root, _dir, _shutdown) = manager_and_test_root(log).await;
+    let baseboard_id = mgr.own_baseboard();
+    let authn = fake_identity(&mut root).await;
+    let signer_nonce = SessionSignerNonce::random();
+    let session_id = SessionId::compute(
+        mgr.own_baseboard(),
+        mgr.regenerate_session_sush_nonce(),
+        signer_nonce,
+    );
+    let mut session = Session::new(session_id);
+    mgr.session_start(&authn, session_id, signer_nonce, true)
+        .await
+        .unwrap();
+
+    let job_id = session.next_job_id();
+    let job = root
+        .sign_job_request(
+            job_id,
+            session.session_id(),
+            "trap 'echo caught' INT; kill -INT $$; echo after",
+            false,
+        )
+        .await;
+    mgr.job_start(
+        &authn,
+        job.clone().into_signed(),
+        JobStartParams {
+            wait: JobWait::Stop,
+            ..Default::default()
+        },
+    )
+    .await
+    .unwrap();
+    session.job_started(job.clone().into_signed());
+    let stdout = mgr
+        .job_output(&authn, &job_id, baseboard_id, Stdout, None)
+        .await
+        .unwrap()
+        .into_bytes()
+        .await;
+    let stdout = String::from_utf8(stdout.to_vec()).unwrap();
+    assert!(stdout.contains("caught"), "stdout: {stdout:?}");
+}
+
+/// Interactive jobs must target exactly one sled.
+#[named]
+#[tokio::test]
+async fn interactive_target_required() {
+    let log = test_logger(function_name!());
+    let (mgr, mut root, _dir, _shutdown) = manager_and_test_root(log).await;
+    let authn = fake_identity(&mut root).await;
+    let signer_nonce = SessionSignerNonce::random();
+    let session_id = SessionId::compute(
+        mgr.own_baseboard(),
+        mgr.regenerate_session_sush_nonce(),
+        signer_nonce,
+    );
+    let session = Session::new(session_id);
+    mgr.session_start(&authn, session_id, signer_nonce, true)
+        .await
+        .unwrap();
+
+    let job_id = session.next_job_id();
+    let job = root
+        .sign_job_request(job_id, session.session_id(), "bash", true)
+        .await;
+    assert!(matches!(
+        mgr.job_start(&authn, job.into_signed(), JobStartParams::default())
+            .await,
+        Err(JobError::InteractiveTarget)
+    ));
+}
+
+/// Each job's directory records the signed request beside its output.
+#[named]
+#[tokio::test]
+async fn job_json() {
+    let log = test_logger(function_name!());
+    let (mgr, mut root, dir, _shutdown) = manager_and_test_root(log).await;
+    let authn = fake_identity(&mut root).await;
+    let signer_nonce = SessionSignerNonce::random();
+    let session_id = SessionId::compute(
+        mgr.own_baseboard(),
+        mgr.regenerate_session_sush_nonce(),
+        signer_nonce,
+    );
+    let mut session = Session::new(session_id);
+    mgr.session_start(&authn, session_id, signer_nonce, true)
+        .await
+        .unwrap();
+
+    let job_id = session.next_job_id();
+    let job = root
+        .sign_job_request(job_id, session.session_id(), "true", false)
+        .await;
+    mgr.job_start(
+        &authn,
+        job.clone().into_signed(),
+        JobStartParams {
+            wait: JobWait::Stop,
+            ..Default::default()
+        },
+    )
+    .await
+    .unwrap();
+    session.job_started(job.clone().into_signed());
+
+    let path = dir
+        .path()
+        .join("jobs")
+        .join(job_id.to_string())
+        .join("job.json");
+    let recorded: SignedJob = serde_json::from_slice(&read(&path).await.unwrap()).unwrap();
+    assert_eq!(recorded, job.into_signed());
+}
+
+#[named]
+#[tokio::test]
+async fn streaming_validation() {
+    let log = test_logger(function_name!());
+    let (mgr, mut root, _dir, _shutdown) = manager_and_test_root(log).await;
+    let authn = fake_identity(&mut root).await;
+    let signer_nonce = SessionSignerNonce::random();
+    let session_id = SessionId::compute(
+        mgr.own_baseboard(),
+        mgr.regenerate_session_sush_nonce(),
+        signer_nonce,
+    );
+    let mut session = Session::new(session_id);
+    mgr.session_start(&authn, session_id, signer_nonce, true)
+        .await
+        .unwrap();
+
+    let mut expect_invalid = async |streaming: Streaming, target: Target| {
+        let job_id = session.next_job_id();
+        let job = root
+            .sign_full_job_request(
+                job_id,
+                session.session_id(),
+                "true",
+                false,
+                streaming,
+                target,
+            )
+            .await;
+        session.job_started(job.clone().into_signed());
+        mgr.job_start(&authn, job.into_signed(), JobStartParams::default())
+            .await
+            .unwrap();
+        let status = timeout(Duration::from_secs(5), async {
+            loop {
+                if let Ok(status) = mgr.job_status(&authn, &job_id).await
+                    && let Some(status) = status.get(mgr.own_baseboard())
+                    && status.is_terminal()
+                {
+                    break status.clone();
+                }
+                sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .unwrap();
+        assert!(matches!(status, JobStatus::Error { .. }), "{status:?}");
+    };
+
+    expect_invalid(Streaming::Output, Target::All).await;
+    expect_invalid(
+        Streaming::Output,
+        format!("{},14", test_baseboard_id()).parse().unwrap(),
+    )
+    .await;
+    expect_invalid(Streaming::Input, test_baseboard_id().into()).await;
 }

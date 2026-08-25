@@ -27,6 +27,8 @@ use sush_common::jobs::{
     SignedJob, job_status_to_json_map,
 };
 use sush_common::keys::{KeyId, Signature, SshPublicKey};
+use sush_common::targets::{MAX_CUBBY, SledId, SledVersion};
+use sush_common::version::VersionInfo;
 
 use crate::AuthzSigner;
 use crate::commands::{CommandError, GlobalArgs};
@@ -115,6 +117,31 @@ impl CommandContext for Cli {
 
     fn set_globals(&mut self, args: GlobalArgs) {
         *self.globals.lock().unwrap() = args;
+    }
+
+    // Build provenance
+
+    fn versions(
+        &mut self,
+        client: &VersionInfo,
+        server: Option<&VersionInfo>,
+        sleds: &[SledVersion],
+    ) {
+        match self.get_output_format() {
+            OutputFormat::Json => println!(
+                "{}",
+                json!({"client": client, "server": server, "sleds": sleds})
+            ),
+            OutputFormat::Text => {
+                println!("Client:\t{client}");
+                if let Some(server) = server {
+                    println!("Server:\t{server}");
+                }
+                if !sleds.is_empty() {
+                    print!("{}", draw_rack(sleds));
+                }
+            }
+        }
     }
 
     // Session management
@@ -304,7 +331,7 @@ impl CommandContext for Cli {
     fn job_output_target(&mut self, target: &BaseboardId) {
         match self.get_output_format() {
             OutputFormat::Json => println!("{}", json!({ "target": target.to_string() })),
-            OutputFormat::Text => println!("⟹  {target}  ⟸"),
+            OutputFormat::Text => println!(" » {target} «"),
         }
     }
 
@@ -348,18 +375,36 @@ impl CommandContext for Cli {
     ) {
         let mut progress = self.progress.lock().unwrap();
         if matches!(self.get_output_format(), OutputFormat::Text) && progress.is_none() {
-            let bar = ProgressBar::new(total_length);
+            // With no known total, show a spinner and a running byte count.
+            let bar = if total_length == 0 {
+                let bar = ProgressBar::new_spinner();
+                bar.set_style(
+                    ProgressStyle::with_template(
+                        "{spinner}  \
+                         {prefix} \
+                         [{elapsed_precise}] \
+                         {decimal_bytes:>7} \
+                         {msg}",
+                    )
+                    .unwrap(),
+                );
+                bar.enable_steady_tick(Duration::from_millis(100));
+                bar
+            } else {
+                let bar = ProgressBar::new(total_length);
+                bar.set_style(
+                    ProgressStyle::with_template(
+                        "{prefix} \
+                         [{elapsed_precise}] \
+                         {bar:40.cyan/blue} \
+                         {decimal_bytes:>7}/{decimal_total_bytes:7} \
+                         {msg}",
+                    )
+                    .unwrap(),
+                );
+                bar
+            };
             bar.set_prefix(format!("{stage} {stream}"));
-            bar.set_style(
-                ProgressStyle::with_template(
-                    "{prefix} \
-                     [{elapsed_precise}] \
-                     {bar:40.cyan/blue} \
-                     {decimal_bytes:>7}/{decimal_total_bytes:7} \
-                     {msg}",
-                )
-                .unwrap(),
-            );
             *progress = Some(bar);
         }
     }
@@ -379,7 +424,7 @@ impl CommandContext for Cli {
         if let Some(progress) = self.progress.lock().unwrap().take() {
             progress.finish_and_clear();
             if let Some(stage) = stage {
-                let length = ByteSize::b(progress.length().unwrap_or(0));
+                let length = ByteSize::b(progress.length().unwrap_or(progress.position()));
                 let elapsed = progress.elapsed();
                 println!(
                     "{stage} {stream}:\t{} in {} ({:.0} MB/s)",
@@ -437,6 +482,15 @@ impl CommandContext for Cli {
             } else {
                 bar.set_message(short_status_row(status));
             }
+        }
+    }
+
+    fn job_watch_stalled(&mut self, job_id: &JobId) {
+        let guard = self.watch.lock().unwrap();
+        if let Some(watch) = guard.as_ref() {
+            let _ = watch.multi.println(format!(
+                "❗ No sled has reported a status for job `{job_id}`"
+            ));
         }
     }
 
@@ -734,6 +788,21 @@ impl CommandContext for Cli {
         Ok(())
     }
 
+    fn really_target(&mut self, sled: &SledId) -> Result<(), CommandError> {
+        match self.get_output_format() {
+            OutputFormat::Json => Ok(()),
+            OutputFormat::Text => {
+                let prompt =
+                    format!("❓ Sled `{sled}` is not in the rack inventory. Proceed (yes/no)? ");
+                if read_bool(&prompt)? {
+                    Ok(())
+                } else {
+                    Err(CommandError::Canceled)
+                }
+            }
+        }
+    }
+
     fn really_revoke(&mut self, what: &str, key_id: KeyId) -> Result<KeyId, CommandError> {
         match self.get_output_format() {
             OutputFormat::Json => Ok(key_id),
@@ -859,5 +928,116 @@ mod test {
             cli.cert_chain(key_id, &pem, &[root]).unwrap_err(),
             CommandError::CertExpired(_)
         ));
+    }
+}
+
+/// Cell text width for one sled in the rack drawing.
+const CELL: usize = 28;
+
+/// One sled cell: serial on the left, build on the right.
+fn rack_cell(sled: Option<&SledVersion>) -> String {
+    match sled {
+        Some(sled) => {
+            let build = match &sled.version {
+                Some(v) => {
+                    let dirty = if v.commit.ends_with("-dirty") {
+                        "+"
+                    } else {
+                        ""
+                    };
+                    format!("{} {:.7}{dirty}", v.version, v.commit)
+                }
+                None => String::new(),
+            };
+            format!(" {:<12.12}{:>14.14} ", sled.baseboard.serial_number, build)
+        }
+        None => " ".repeat(CELL),
+    }
+}
+
+/// Draw the rack as wicket does: 16 rows of two cubbies, numbered
+/// bottom-to-top and left-to-right per RFD 200, split where the
+/// switches and power shelves sit. Sleds known only by build (no
+/// cubby) are listed below the rack.
+fn draw_rack(sleds: &[SledVersion]) -> String {
+    let by_cubby: BTreeMap<u8, &SledVersion> = sleds
+        .iter()
+        .filter_map(|sled| sled.cubby.map(|cubby| (cubby, sled)))
+        .collect();
+    let row = |row: u8| {
+        let (left, right) = (2 * row, 2 * row + 1);
+        format!(
+            "{left:>3} │{}│{}│ {right}\n",
+            rack_cell(by_cubby.get(&left).copied()),
+            rack_cell(by_cubby.get(&right).copied()),
+        )
+    };
+    let bar = "─".repeat(CELL);
+    let mut out = format!("    ┌{bar}┬{bar}┐\n");
+    for r in (8..16).rev() {
+        out.push_str(&row(r));
+    }
+    out.push_str(&format!("    ├{bar}┼{bar}┤\n"));
+    for r in (0..8).rev() {
+        out.push_str(&row(r));
+    }
+    out.push_str(&format!("    └{bar}┴{bar}┘\n"));
+    for sled in sleds
+        .iter()
+        .filter(|sled| sled.cubby.is_none_or(|cubby| cubby > MAX_CUBBY))
+    {
+        out.push_str(&format!(" ?? │{}│\n", rack_cell(Some(sled))));
+    }
+    out
+}
+
+#[cfg(test)]
+mod rack {
+    use std::env;
+    use std::fs::{read_to_string, write};
+
+    use super::*;
+
+    fn sled(cubby: u8, serial: &str) -> SledVersion {
+        SledVersion {
+            cubby: Some(cubby),
+            baseboard: BaseboardId {
+                part_number: "913-0000019".to_string(),
+                serial_number: serial.to_string(),
+            },
+            version: Some(VersionInfo {
+                version: "0.1.0".to_string(),
+                commit: "f078e863b17359031de072222bb631270f2d5157".to_string(),
+            }),
+        }
+    }
+
+    /// Compare the rack drawing against the snapshot in
+    /// `tests/output/`, or rewrite it under `EXPECTORATE=overwrite`.
+    #[test]
+    fn rack_drawing() {
+        let mut sleds = vec![
+            sled(14, "BRM42220030"),
+            sled(15, "BRM42220036"),
+            sled(16, "2CN2M459"),
+            sled(17, "2RGCFG10"),
+        ];
+        sleds.push(SledVersion {
+            cubby: None,
+            ..sled(0, "STRAGGLER")
+        });
+        sleds.push(sled(32, "MISCUBBIED"));
+        sleds[2].version = None;
+        if let Some(version) = &mut sleds[1].version {
+            version.commit.push_str("-dirty");
+        }
+        let drawing = draw_rack(&sleds);
+        let path = "tests/output/rack.txt";
+        if env::var("EXPECTORATE").as_deref() == Ok("overwrite") {
+            write(path, &drawing).unwrap();
+        } else {
+            let expected = read_to_string(path).expect("missing snapshot");
+            assert_eq!(drawing, expected, "rack drawing changed:\n{drawing}");
+        }
     }
 }
