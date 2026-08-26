@@ -551,6 +551,7 @@ impl JobManager {
         session_id: SessionId,
     ) -> Result<(), JobError> {
         self.starter_check(authn)?;
+        self.currency_check(session_id)?;
         self.session_request(authn, SessionRequest::Stop(session_id))
             .await
     }
@@ -564,18 +565,26 @@ impl JobManager {
         job_id: JobId,
     ) -> Result<(), JobError> {
         self.starter_check(authn)?;
-        match self.session(authn) {
-            None => return Err(JobError::NoSession),
-            Some(session) if session.session_id() != session_id => {
-                return Err(JobError::SessionNotCurrent(session_id));
-            }
-            Some(session) if session.next_job_id() != job_id => {
-                return Err(JobError::NotNextJob(job_id));
-            }
-            Some(_) => (),
+        self.currency_check(session_id)?;
+        if let Some(session) = self.session(authn)
+            && session.next_job_id() != job_id
+        {
+            return Err(JobError::NotNextJob(job_id));
         }
         self.session_request(authn, SessionRequest::Skip(session_id, job_id))
             .await
+    }
+
+    /// A request naming a session other than the current one would be
+    /// silently ignored by the state machine. This check fails fast.
+    fn currency_check(&self, session_id: SessionId) -> Result<(), JobError> {
+        match self.state.borrow().session() {
+            None => Err(JobError::NoSession),
+            Some(session) if session.session_id() != session_id => {
+                Err(JobError::SessionNotCurrent(session_id))
+            }
+            Some(_) => Ok(()),
+        }
     }
 
     /// Only the session starter may stop the session, skip its jobs,
@@ -597,6 +606,7 @@ impl JobManager {
         access: Access,
     ) -> Result<(), JobError> {
         self.starter_check(authn)?;
+        self.currency_check(session_id)?;
         self.session_request(
             authn,
             SessionRequest::AllowAttach(session_id, key_id, access),
@@ -611,6 +621,7 @@ impl JobManager {
         key_id: KeyId,
     ) -> Result<(), JobError> {
         self.starter_check(authn)?;
+        self.currency_check(session_id)?;
         self.session_request(authn, SessionRequest::DenyAttach(session_id, key_id))
             .await
     }

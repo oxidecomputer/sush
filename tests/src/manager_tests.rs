@@ -1609,6 +1609,27 @@ async fn skip_and_stop_are_starter_only() {
         Err(JobError::NotNextJob(_))
     ));
 
+    // Requests naming a stale session fail rather than enqueue.
+    let stale = SessionId::random();
+    assert!(matches!(
+        mgr.session_stop(&owner, stale).await,
+        Err(JobError::SessionNotCurrent(_))
+    ));
+    assert!(matches!(
+        mgr.session_skip_job(&owner, stale, job_id).await,
+        Err(JobError::SessionNotCurrent(_))
+    ));
+    assert!(matches!(
+        mgr.session_allow_attach(&owner, stale, guest.key_id.clone(), Access::ReadOnly)
+            .await,
+        Err(JobError::SessionNotCurrent(_))
+    ));
+    assert!(matches!(
+        mgr.session_deny_attach(&owner, stale, guest.key_id.clone())
+            .await,
+        Err(JobError::SessionNotCurrent(_))
+    ));
+
     // A stop and a skip from a non-starter over gossip are ignored.
     // The starter's skip, sent after them on the same handle, marks
     // them processed. Convergence proves the session outlived the
