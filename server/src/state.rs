@@ -7,7 +7,7 @@
 //! Manage sessions and their associated jobs by sending and receiving
 //! messages via the gossip protocol.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::num::NonZeroUsize;
 use std::sync::{Arc, Mutex};
 
@@ -325,6 +325,8 @@ pub struct State {
     roots: Box<[KeyId]>,
     /// Baseboards by cubby number, as much of it as is known.
     cubbies: Cubbies,
+    /// Message versions from newer builds, each warned about once.
+    unknown_versions: BTreeSet<String>,
     /// Build provenance by sled.
     versions: VersionMap,
     /// Verified logins, rack-wide.
@@ -364,6 +366,7 @@ impl State {
             certs,
             roots: roots.clone(),
             cubbies: Default::default(),
+            unknown_versions: Default::default(),
             identities: LruCache::new(MAX_REGISTERED_IDENTITIES),
             revoked_keys: LruCache::new(MAX_REVOKED_KEYS),
         };
@@ -890,6 +893,11 @@ impl State {
                     }
                 }
             },
+            Unknown(version) => {
+                if self.unknown_versions.insert(version.clone()) {
+                    warn!(log, "ignoring messages from a newer peer"; "version" => version);
+                }
+            }
         }
 
         Ok(())

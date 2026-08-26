@@ -25,9 +25,68 @@ use sush_common::version::VersionInfo;
 /// version, whose serde shape on the gossip wire must not change. New
 /// versions must implement `TryInto` to convert old messages into
 /// compatible new ones.
-#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+///
+/// Updates go sled by sled, so mixed gossip networks exist for
+/// the whole rollout. A message from a newer peer decodes as
+/// [`Unknown`](Self::Unknown), and is ignored rather than poisoning
+/// the link. Rumors relays its original bytes, so old sleds still
+/// retain and spread messages they cannot read.
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub enum VersionedMessage {
+    /// The initial message format.
     V0(v0::Message),
+
+    /// A message from a newer version.
+    Unknown(String),
+}
+
+impl Serialize for VersionedMessage {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        use serde::ser::Error as _;
+        match self {
+            Self::V0(message) => {
+                serializer.serialize_newtype_variant("VersionedMessage", 0, "V0", message)
+            }
+            Self::Unknown(version) => Err(S::Error::custom(format!(
+                "refusing to send a message from a newer version ({version})"
+            ))),
+        }
+    }
+}
+
+impl<'de> Deserialize<'de> for VersionedMessage {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        use serde::de::{Error as _, IgnoredAny, MapAccess, Visitor};
+
+        struct VersionVisitor;
+
+        impl<'de> Visitor<'de> for VersionVisitor {
+            type Value = VersionedMessage;
+
+            fn expecting(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
+                f.write_str("a versioned message")
+            }
+
+            fn visit_map<A: MapAccess<'de>>(self, mut map: A) -> Result<Self::Value, A::Error> {
+                let Some(version) = map.next_key::<String>()? else {
+                    return Err(A::Error::custom("a versioned message without a version"));
+                };
+                Ok(match version.as_str() {
+                    "V0" => VersionedMessage::V0(map.next_value()?),
+                    _ => {
+                        map.next_value::<IgnoredAny>()?;
+                        VersionedMessage::Unknown(version)
+                    }
+                })
+            }
+
+            fn visit_str<E: serde::de::Error>(self, version: &str) -> Result<Self::Value, E> {
+                Ok(VersionedMessage::Unknown(version.to_string()))
+            }
+        }
+
+        deserializer.deserialize_any(VersionVisitor)
+    }
 }
 
 /// DER bytes for certificates, which have no serde support.
@@ -386,6 +445,32 @@ mod wire_format {
         )
         .into();
         assert_wire_format("version-event", msg);
+    }
+
+    /// A message from a newer build decodes as `Unknown` instead of
+    /// failing at the wire boundary, cannot be sent, and corruption
+    /// still fails.
+    #[test]
+    fn unknown_version_tolerated() {
+        use ciborium::value::Value;
+
+        let v1 = Value::Map(vec![(
+            Value::Text("V1".to_string()),
+            Value::Map(vec![(
+                Value::Text("frob".to_string()),
+                Value::Integer(3.into()),
+            )]),
+        )]);
+        let mut bytes = Vec::new();
+        ciborium::ser::into_writer(&v1, &mut bytes).unwrap();
+        let decoded: VersionedMessage = ciborium::de::from_reader(bytes.as_slice()).unwrap();
+        assert_eq!(decoded, VersionedMessage::Unknown("V1".to_string()));
+
+        let mut resent = Vec::new();
+        assert!(ciborium::ser::into_writer(&decoded, &mut resent).is_err());
+
+        let corrupt: Result<VersionedMessage, _> = ciborium::de::from_reader([0x01].as_slice());
+        assert!(corrupt.is_err());
     }
 
     // TODO: snapshot more messages
