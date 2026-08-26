@@ -1073,7 +1073,10 @@ async fn session(
                     ))
                 })
                 .await?;
-                session_create(permslip, permslip_url, &baseboard_id, nonce.nonce).await?
+                let (session_id, nonce) =
+                    session_create(permslip, permslip_url, &baseboard_id, nonce.nonce).await?;
+                ctx.session_created(Session::new(session_id), nonce);
+                (session_id, nonce)
             };
             session_start(ctx, client, session_id, nonce, wait).await
         }
