@@ -116,14 +116,10 @@ pub trait CommandContext: Clone + Send + Sync {
     }
     fn session_id(&self) -> Option<SessionId>;
     fn next_job_id(&self) -> Result<JobId, CommandError>;
-    fn session_start_params(
-        &self,
-        baseboard_id: BaseboardId,
-        nonce: SessionStartNonce,
-    ) -> Result<(), CommandError>;
+    fn session_start_params(&self, baseboard_id: BaseboardId, nonce: SessionStartNonce);
     fn session_created(&mut self, session: Session, signer_nonce: SessionSignerNonce);
-    fn session_started(&mut self, session: Session, force: bool) -> Result<(), CommandError>;
-    fn session_stopped(&mut self, session_id: &SessionId) -> Result<(), CommandError>;
+    fn session_started(&mut self, session: Session, force: bool);
+    fn session_stopped(&mut self, session_id: &SessionId);
     fn attach_allowed(&mut self, key_id: &KeyId, access: Access);
     fn attach_denied(&mut self, key_id: &KeyId);
 
@@ -134,7 +130,7 @@ pub trait CommandContext: Clone + Send + Sync {
         certs: &str,
         roots: &[Certificate],
     ) -> Result<Certificate, CommandError>;
-    fn cert_imported(&mut self, path: &Path, key_id: KeyId) -> Result<(), CommandError>;
+    fn cert_imported(&mut self, path: &Path, key_id: KeyId);
 
     // Job management
     fn really_target(&mut self, sled: &SledId) -> Result<(), CommandError>;
@@ -171,5 +167,5 @@ pub trait CommandContext: Clone + Send + Sync {
     fn identities(&mut self, identities: &[SshPublicKey]) -> Result<(), CommandError>;
     fn please_touch(&mut self, identity: &SshPublicKey) -> Result<(), CommandError>;
     fn really_revoke(&mut self, what: &str, key_id: KeyId) -> Result<KeyId, CommandError>;
-    fn revoked(&mut self, what: &str, key_id: KeyId) -> Result<(), CommandError>;
+    fn revoked(&mut self, what: &str, key_id: KeyId);
 }

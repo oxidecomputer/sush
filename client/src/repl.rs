@@ -231,11 +231,7 @@ impl CommandContext for Repl {
         self.cli.next_job_id()
     }
 
-    fn session_start_params(
-        &self,
-        baseboard_id: BaseboardId,
-        nonce: SessionStartNonce,
-    ) -> Result<(), CommandError> {
+    fn session_start_params(&self, baseboard_id: BaseboardId, nonce: SessionStartNonce) {
         self.cli.session_start_params(baseboard_id, nonce)
     }
 
@@ -243,11 +239,11 @@ impl CommandContext for Repl {
         self.cli.session_created(session, signer_nonce)
     }
 
-    fn session_started(&mut self, session: Session, force: bool) -> Result<(), CommandError> {
+    fn session_started(&mut self, session: Session, force: bool) {
         self.cli.session_started(session, force)
     }
 
-    fn session_stopped(&mut self, session_id: &SessionId) -> Result<(), CommandError> {
+    fn session_stopped(&mut self, session_id: &SessionId) {
         self.cli.session_stopped(session_id)
     }
 
@@ -270,7 +266,7 @@ impl CommandContext for Repl {
         self.cli.cert_chain(key_id, certs, roots)
     }
 
-    fn cert_imported(&mut self, path: &Path, key_id: KeyId) -> Result<(), CommandError> {
+    fn cert_imported(&mut self, path: &Path, key_id: KeyId) {
         self.cli.cert_imported(path, key_id)
     }
 
@@ -398,7 +394,7 @@ impl CommandContext for Repl {
         self.cli.really_revoke(what, key_id)
     }
 
-    fn revoked(&mut self, what: &str, key_id: KeyId) -> Result<(), CommandError> {
+    fn revoked(&mut self, what: &str, key_id: KeyId) {
         self.cli.revoked(what, key_id)
     }
 }

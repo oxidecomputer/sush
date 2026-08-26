@@ -963,7 +963,8 @@ async fn iam(
                 client.iam_revoke().key_id(&key_id).wait(true).send().await
             })
             .await?;
-            ctx.revoked("SSH identity", key_id)
+            ctx.revoked("SSH identity", key_id);
+            Ok(())
         }
     }
 }
@@ -984,7 +985,8 @@ async fn cert(
             })
             .await?
             .into_inner();
-            ctx.cert_imported(&path, key_id)
+            ctx.cert_imported(&path, key_id);
+            Ok(())
         }
 
         CertCommand::Chain { key_id, root_certs } => {
@@ -1008,7 +1010,8 @@ async fn cert(
                 client.cert_revoke().key_id(&key_id).wait(true).send().await
             })
             .await?;
-            ctx.revoked("certificate", key_id)
+            ctx.revoked("certificate", key_id);
+            Ok(())
         }
     }
 }
@@ -1035,7 +1038,7 @@ async fn session(
                 return Err(CommandError::MissingSession);
             }
             // The server's session state is authoritative.
-            ctx.session_started(session, true)?;
+            ctx.session_started(session, true);
             Ok(())
         }
 
@@ -1046,7 +1049,7 @@ async fn session(
             },
             None,
         ) => {
-            ctx.session_started(Session::new(session_id), force)?;
+            ctx.session_started(Session::new(session_id), force);
             Ok(())
         }
 
@@ -1058,7 +1061,7 @@ async fn session(
                 ))
             })
             .await?;
-            ctx.session_start_params(baseboard_id, nonce)?;
+            ctx.session_start_params(baseboard_id, nonce);
             Ok(())
         }
 
@@ -1173,7 +1176,7 @@ async fn session(
                 client.session_stop().session_id(*session_id).send().await
             })
             .await?;
-            ctx.session_stopped(session_id)?;
+            ctx.session_stopped(session_id);
             Ok(())
         }
 
@@ -1692,7 +1695,8 @@ async fn session_start(
     })
     .await?
     .into_inner();
-    ctx.session_started(session, true)
+    ctx.session_started(session, true);
+    Ok(())
 }
 
 async fn job_stop(

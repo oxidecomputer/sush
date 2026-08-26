@@ -261,11 +261,7 @@ impl CommandContext for Cli {
         }
     }
 
-    fn session_start_params(
-        &self,
-        baseboard_id: BaseboardId,
-        nonce: SessionStartNonce,
-    ) -> Result<(), CommandError> {
+    fn session_start_params(&self, baseboard_id: BaseboardId, nonce: SessionStartNonce) {
         match self.get_output_format() {
             OutputFormat::Json => println!(
                 "{}",
@@ -279,7 +275,6 @@ impl CommandContext for Cli {
                 println!("Sush nonce:   {}", nonce.nonce);
             }
         }
-        Ok(())
     }
 
     fn session_created(&mut self, session: Session, signer_nonce: SessionSignerNonce) {
@@ -296,16 +291,15 @@ impl CommandContext for Cli {
         }
     }
 
-    fn session_started(&mut self, session: Session, force: bool) -> Result<(), CommandError> {
+    fn session_started(&mut self, session: Session, force: bool) {
         let session_id = self.adopt_session(session, force);
         match self.get_output_format() {
             OutputFormat::Json => println!("{}", json!({"session_started": session_id})),
             OutputFormat::Text => println!("✅ Session is now `{session_id}`"),
         }
-        Ok(())
     }
 
-    fn session_stopped(&mut self, session_id: &SessionId) -> Result<(), CommandError> {
+    fn session_stopped(&mut self, session_id: &SessionId) {
         let mut session_guard = self.session.lock().unwrap();
         if let Some(session) = session_guard.as_ref()
             && session.session_id() == *session_id
@@ -317,7 +311,6 @@ impl CommandContext for Cli {
             OutputFormat::Json => println!("{}", json!({"session_stopped": session_id})),
             OutputFormat::Text => println!("✅ Stopped session `{session_id}`"),
         }
-        Ok(())
     }
 
     fn attach_allowed(&mut self, key_id: &KeyId, access: Access) {
@@ -399,7 +392,7 @@ impl CommandContext for Cli {
         chain.pop().ok_or(CommandError::EmptyCertChain)
     }
 
-    fn cert_imported(&mut self, path: &Path, key_id: KeyId) -> Result<(), CommandError> {
+    fn cert_imported(&mut self, path: &Path, key_id: KeyId) {
         match self.get_output_format() {
             OutputFormat::Json => println!("{}", json!(key_id)),
             OutputFormat::Text => println!(
@@ -408,7 +401,6 @@ impl CommandContext for Cli {
                 path.display(),
             ),
         }
-        Ok(())
     }
 
     // Job management
@@ -957,12 +949,11 @@ impl CommandContext for Cli {
         }
     }
 
-    fn revoked(&mut self, what: &str, key_id: KeyId) -> Result<(), CommandError> {
+    fn revoked(&mut self, what: &str, key_id: KeyId) {
         match self.get_output_format() {
             OutputFormat::Json => println!("{}", json!({"revoked": key_id})),
             OutputFormat::Text => println!("✅ Revoked {what} `{key_id}`"),
         }
-        Ok(())
     }
 
     fn please_touch(&mut self, identity: &SshPublicKey) -> Result<(), CommandError> {
