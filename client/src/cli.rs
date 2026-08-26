@@ -6,11 +6,14 @@
 
 use std::collections::BTreeMap;
 use std::fmt;
-use std::io::{self, BufRead as _, Read as _, Write as _, stderr, stdin, stdout};
-use std::path::Path;
+use std::fs::{self, Permissions};
+use std::io::{self, BufRead as _, ErrorKind, Read as _, Write as _, stderr, stdin, stdout};
+use std::os::unix::fs::PermissionsExt as _;
+use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, SystemTime};
 
+use atomicwrites::{AtomicFile, OverwriteBehavior};
 use bytesize::ByteSize;
 use chrono::TimeDelta;
 use humantime::format_duration;
@@ -20,6 +23,7 @@ use serde_json::{json, to_string as to_json_string, to_string_pretty as to_json_
 use sled_hardware_types::BaseboardId;
 use x509_cert::Certificate;
 use x509_cert::der::Encode as _;
+use xdg::BaseDirectories;
 
 use sush_common::authn::Identity;
 use sush_common::jobs::{
@@ -35,6 +39,9 @@ use crate::commands::{CommandError, GlobalArgs};
 use crate::context::{CommandContext, OutputFormat, StatusDisplayStyle};
 use crate::types::SessionStartNonce;
 
+pub(crate) const PREFIX: &str = "sush";
+const SESSION_FILE: &str = "session.json";
+
 #[derive(Clone, Debug, Default)]
 pub struct Cli {
     globals: Arc<Mutex<GlobalArgs>>,
@@ -42,7 +49,60 @@ pub struct Cli {
     progress: Arc<Mutex<Option<ProgressBar>>>,
     watch: Arc<Mutex<Option<Watch>>>,
     session: Arc<Mutex<Option<Session>>>,
+    session_file: Option<PathBuf>,
     credentials: AuthzSigner,
+}
+
+impl Cli {
+    /// Load the persisted session and persist its changes hereafter.
+    /// Without persistence, every one-shot command would need a fresh
+    /// `session attach`.
+    pub fn load_session(&mut self) {
+        let path = match BaseDirectories::with_prefix(PREFIX).place_state_file(SESSION_FILE) {
+            Ok(path) => path,
+            Err(error) => {
+                eprintln!("⚠️ The session will not persist: {error}");
+                return;
+            }
+        };
+        match fs::read(&path) {
+            Ok(json) => match serde_json::from_slice(&json) {
+                Ok(session) => *self.session.lock().unwrap() = Some(session),
+                Err(error) => eprintln!("⚠️ Ignoring the saved session: {error}"),
+            },
+            Err(error) if error.kind() == ErrorKind::NotFound => (),
+            Err(error) => eprintln!("⚠️ Ignoring the saved session: {error}"),
+        }
+        self.session_file = Some(path);
+    }
+
+    fn save_session(&self, session: Option<&Session>) {
+        let Some(path) = &self.session_file else {
+            return;
+        };
+        let result = match session {
+            Some(session) => serde_json::to_vec_pretty(session)
+                .map_err(io::Error::other)
+                .and_then(|json| {
+                    AtomicFile::new(path, OverwriteBehavior::AllowOverwrite)
+                        .write(|file| {
+                            file.set_permissions(Permissions::from_mode(0o600))?;
+                            file.write_all(&json)
+                        })
+                        .map_err(|error| match error {
+                            atomicwrites::Error::Internal(error)
+                            | atomicwrites::Error::User(error) => error,
+                        })
+                }),
+            None => match fs::remove_file(path) {
+                Err(error) if error.kind() != ErrorKind::NotFound => Err(error),
+                _ => Ok(()),
+            },
+        };
+        if let Err(error) = result {
+            eprintln!("⚠️ The session was not saved: {error}");
+        }
+    }
 }
 
 fn byte_size(len: u64) -> bytesize::Display {
@@ -187,9 +247,18 @@ impl CommandContext for Cli {
         Ok(())
     }
 
-    fn session_started(&mut self, session: Session) -> Result<(), CommandError> {
+    fn session_started(&mut self, session: Session, force: bool) -> Result<(), CommandError> {
         let session_id = session.session_id().to_owned();
-        *self.session.lock().unwrap() = Some(session);
+        let mut session_guard = self.session.lock().unwrap();
+        if force
+            || session_guard
+                .as_ref()
+                .is_none_or(|s| s.session_id() != session_id)
+        {
+            self.save_session(Some(&session));
+            *session_guard = Some(session);
+        }
+        drop(session_guard);
         match self.get_output_format() {
             OutputFormat::Json => println!("{}", json!({"session_started": session_id})),
             OutputFormat::Text => println!("✅ Session is now `{session_id}`"),
@@ -203,6 +272,7 @@ impl CommandContext for Cli {
             && session.session_id() == *session_id
         {
             let _ = session_guard.take();
+            self.save_session(None);
         }
         match self.get_output_format() {
             OutputFormat::Json => println!("{}", json!({"session_ended": session_id})),
@@ -307,6 +377,7 @@ impl CommandContext for Cli {
     fn job_started(&mut self, job: &SignedJob) {
         if let Some(session) = self.session.lock().unwrap().as_mut() {
             session.job_started(job.to_owned());
+            self.save_session(Some(session));
         }
     }
 
@@ -324,11 +395,13 @@ impl CommandContext for Cli {
     }
 
     fn job_skipped(&mut self, job_id: &JobId) -> bool {
-        let skipped = match self.session.lock().unwrap().as_mut() {
+        let mut session_guard = self.session.lock().unwrap();
+        let skipped = match session_guard.as_mut() {
             Some(session) => session.skip_job(*job_id),
             None => false,
         };
         if skipped {
+            self.save_session(session_guard.as_ref());
             match self.get_output_format() {
                 OutputFormat::Json => println!("{}", json!({"job_skipped": job_id})),
                 OutputFormat::Text => println!("✅ Skipped job `{job_id}`"),

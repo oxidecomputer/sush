@@ -18,6 +18,7 @@ permslip = ["dep:permission-slip-client", "dep:permission-slip-common"]
 
 [dependencies]
 async-recursion.workspace = true
+atomicwrites.workspace = true
 base64.workspace = true
 blake3.workspace = true
 bytes.workspace = true

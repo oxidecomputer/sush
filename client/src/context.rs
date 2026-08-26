@@ -121,7 +121,7 @@ pub trait CommandContext: Clone + Send + Sync {
         baseboard_id: BaseboardId,
         nonce: SessionStartNonce,
     ) -> Result<(), CommandError>;
-    fn session_started(&mut self, session: Session) -> Result<(), CommandError>;
+    fn session_started(&mut self, session: Session, force: bool) -> Result<(), CommandError>;
     fn session_stopped(&mut self, session_id: &SessionId) -> Result<(), CommandError>;
     fn attach_allowed(&mut self, key_id: &KeyId, access: Access);
     fn attach_denied(&mut self, key_id: &KeyId);

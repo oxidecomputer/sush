@@ -483,7 +483,13 @@ pub enum SessionCommand {
     },
 
     /// Attach to a current support session.
-    Attach { session_id: Option<SessionId> },
+    Attach {
+        session_id: Option<SessionId>,
+
+        /// Reset the chain position of an already-attached session.
+        #[arg(short, long)]
+        force: bool,
+    },
 
     /// Withdraw a key's attach access.
     Deny {
@@ -527,7 +533,10 @@ pub enum SessionCommand {
 
 impl Default for SessionCommand {
     fn default() -> Self {
-        Self::Attach { session_id: None }
+        Self::Attach {
+            session_id: None,
+            force: false,
+        }
     }
 }
 
@@ -978,7 +987,13 @@ async fn session(
     command: SessionCommand,
 ) -> Result<(), CommandError> {
     match (command, client) {
-        (SessionCommand::Attach { session_id }, Some(client)) => {
+        (
+            SessionCommand::Attach {
+                session_id,
+                force: _,
+            },
+            Some(client),
+        ) => {
             let session = with_login(ctx, client, async || client.session().send().await)
                 .await?
                 .into_inner();
@@ -987,17 +1002,19 @@ async fn session(
             {
                 return Err(CommandError::MissingSession);
             }
-            ctx.session_started(session)?;
+            // The server's session state is authoritative.
+            ctx.session_started(session, true)?;
             Ok(())
         }
 
         (
             SessionCommand::Attach {
                 session_id: Some(session_id),
+                force,
             },
             None,
         ) => {
-            ctx.session_started(Session::new(session_id))?;
+            ctx.session_started(Session::new(session_id), force)?;
             Ok(())
         }
 
@@ -1620,7 +1637,7 @@ async fn session_start(
     })
     .await?
     .into_inner();
-    ctx.session_started(session)
+    ctx.session_started(session, true)
 }
 
 async fn job_stop(

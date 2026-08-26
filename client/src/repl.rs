@@ -8,6 +8,8 @@
 
 use std::env;
 use std::ffi::OsString;
+use std::fs::{Permissions, set_permissions};
+use std::os::unix::fs::PermissionsExt as _;
 use std::path::Path;
 
 use clap::Parser;
@@ -26,7 +28,7 @@ use sush_common::keys::{KeyId, SshPublicKey};
 use sush_common::targets::{SledId, SledVersion};
 use sush_common::version::VersionInfo;
 
-use crate::cli::Cli;
+use crate::cli::{Cli, PREFIX};
 use crate::commands::{
     ClientCommand, CommandError, GlobalArgs, SSH_AUTH_SOCK, SUSH_JOB_ID, SUSH_KEY_ID,
     SUSH_OUTPUT_FORMAT, SUSH_URL,
@@ -35,7 +37,6 @@ use crate::context::{CommandContext, OutputFormat, StatusDisplayStyle};
 use crate::types::SessionStartNonce;
 use crate::{AuthzSigner, Client};
 
-const PREFIX: &str = "sush";
 const HISTORY_FILE: &str = "history.txt";
 
 #[derive(Debug, Parser)]
@@ -75,6 +76,7 @@ impl Repl {
         _client: Option<Client>,
     ) -> Result<(), CommandError> {
         self.set_globals(args.clone());
+        self.cli.load_session();
         let xdg = BaseDirectories::with_prefix(PREFIX);
         let history_file = xdg
             .place_state_file(HISTORY_FILE)
@@ -113,6 +115,8 @@ impl Repl {
             }
         }
         rl.save_history(&history_file)?;
+        set_permissions(&history_file, Permissions::from_mode(0o600))
+            .map_err(|error| CommandError::io(HISTORY_FILE, error))?;
         Ok(())
     }
 
@@ -235,8 +239,8 @@ impl CommandContext for Repl {
         self.cli.session_start_params(baseboard_id, nonce)
     }
 
-    fn session_started(&mut self, session: Session) -> Result<(), CommandError> {
-        self.cli.session_started(session)
+    fn session_started(&mut self, session: Session, force: bool) -> Result<(), CommandError> {
+        self.cli.session_started(session, force)
     }
 
     fn session_stopped(&mut self, session_id: &SessionId) -> Result<(), CommandError> {
