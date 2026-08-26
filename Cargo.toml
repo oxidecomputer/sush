@@ -2,11 +2,16 @@
 members = ["api", "client", "common", "server", "tests", "xtask"]
 resolver = "2"
 
+[workspace.package]
+version = "0.1.0"
+
 [workspace.dependencies]
 async-recursion = "1"
 attest-mock = { git = "https://github.com/oxidecomputer/dice-util", rev = "10952e8d9599b735b85d480af3560a11700e5b64" }
+atomicwrites = "0.4"
 base64 = "0.22"
 camino = "1"
+async-trait = "0.1"
 blake3 = { version = "1", features = ["mmap", "rayon"] }
 borsh = { version = "1", features = ["derive"] }
 bytes = "1"
@@ -31,19 +36,20 @@ memmap2 = "0.9"
 p256 = { version = "0.13", features = ["ecdsa", "pkcs8"] }
 pem-rfc7468 = { version = "0.7", features = ["std"] }
 percent-encoding = "2"
-permission-slip-client = { git = "https://github.com/oxidecomputer/permission-slip" }
-permission-slip-common = { git = "https://github.com/oxidecomputer/permission-slip" }
+permission-slip-client = { git = "https://github.com/oxidecomputer/permission-slip", rev = "2a8adcadde01518f1d39993a1cc45ec3b78b3204" }
+permission-slip-common = { git = "https://github.com/oxidecomputer/permission-slip", rev = "2a8adcadde01518f1d39993a1cc45ec3b78b3204" }
 progenitor = "0.14"
 progenitor-client = "0.14"
 pwd = "1"
+qorb = { version = "0.4", default-features = false }
 rand = "0.8"
 rand_core = "0.6"
 reqwest = { version = "0.13", features = ["json", "rustls"] }
 rlimit = "0.10"
-rumors = { git = "https://github.com/oxidecomputer/rumors", rev = "66aea68b6578345275de3cf14151c4707345773f" }
+rumors = { git = "https://github.com/oxidecomputer/rumors", rev = "b2675dbef99b784efb817db01920ee59dac708c3" }
 rustix = { version = "1", features = ["fs", "process", "pty", "termios"] }
 rustls = "0.23"
-rustyline = { version = "17", features = ["termios"] }
+rustyline = { git = "https://github.com/kkawakam/rustyline", rev = "5ab22f2f8d65e85f0b925360437ece8eeeb6db92", features = ["signal-hook", "termios"] }
 schemars = { version = "0.8", features = ["chrono"] }
 serde = "1"
 serde_json = "1"
@@ -87,3 +93,8 @@ opt-level = 3
 opt-level = 3
 [profile.dev.package.sha3]
 opt-level = 3
+
+# Unify permission-slip-client's sush-common with this workspace's,
+# so its replaced wire types are our types.
+[patch."https://github.com/oxidecomputer/sush"]
+sush-common = { path = "common" }

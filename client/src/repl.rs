@@ -8,6 +8,8 @@
 
 use std::env;
 use std::ffi::OsString;
+use std::fs::{Permissions, set_permissions};
+use std::os::unix::fs::PermissionsExt as _;
 use std::path::Path;
 
 use clap::Parser;
@@ -20,11 +22,13 @@ use xdg::BaseDirectories;
 
 use sush_common::authn::Identity;
 use sush_common::jobs::{
-    Access, JobId, JobOutputStream, JobStatusMap, Session, SessionId, SignedJob,
+    Access, JobId, JobOutputStream, JobStatusMap, Session, SessionId, SessionSignerNonce, SignedJob,
 };
 use sush_common::keys::{KeyId, SshPublicKey};
+use sush_common::targets::{SledId, SledVersion};
+use sush_common::version::VersionInfo;
 
-use crate::cli::Cli;
+use crate::cli::{Cli, PREFIX};
 use crate::commands::{
     ClientCommand, CommandError, GlobalArgs, SSH_AUTH_SOCK, SUSH_JOB_ID, SUSH_KEY_ID,
     SUSH_OUTPUT_FORMAT, SUSH_URL,
@@ -33,7 +37,6 @@ use crate::context::{CommandContext, OutputFormat, StatusDisplayStyle};
 use crate::types::SessionStartNonce;
 use crate::{AuthzSigner, Client};
 
-const PREFIX: &str = "sush";
 const HISTORY_FILE: &str = "history.txt";
 
 #[derive(Debug, Parser)]
@@ -73,6 +76,7 @@ impl Repl {
         _client: Option<Client>,
     ) -> Result<(), CommandError> {
         self.set_globals(args.clone());
+        self.cli.load_session();
         let xdg = BaseDirectories::with_prefix(PREFIX);
         let history_file = xdg
             .place_state_file(HISTORY_FILE)
@@ -111,6 +115,8 @@ impl Repl {
             }
         }
         rl.save_history(&history_file)?;
+        set_permissions(&history_file, Permissions::from_mode(0o600))
+            .map_err(|error| CommandError::io(HISTORY_FILE, error))?;
         Ok(())
     }
 
@@ -200,6 +206,17 @@ impl CommandContext for Repl {
         self.cli.set_globals(args);
     }
 
+    // Build provenance
+
+    fn versions(
+        &mut self,
+        client: &VersionInfo,
+        server: Option<&VersionInfo>,
+        sleds: &[SledVersion],
+    ) {
+        self.cli.versions(client, server, sleds)
+    }
+
     // Session management
 
     fn authz_signer(&self) -> AuthzSigner {
@@ -214,19 +231,19 @@ impl CommandContext for Repl {
         self.cli.next_job_id()
     }
 
-    fn session_start_params(
-        &self,
-        baseboard_id: BaseboardId,
-        nonce: SessionStartNonce,
-    ) -> Result<(), CommandError> {
+    fn session_start_params(&self, baseboard_id: BaseboardId, nonce: SessionStartNonce) {
         self.cli.session_start_params(baseboard_id, nonce)
     }
 
-    fn session_started(&mut self, session: Session) -> Result<(), CommandError> {
-        self.cli.session_started(session)
+    fn session_created(&mut self, session: Session, signer_nonce: SessionSignerNonce) {
+        self.cli.session_created(session, signer_nonce)
     }
 
-    fn session_stopped(&mut self, session_id: &SessionId) -> Result<(), CommandError> {
+    fn session_started(&mut self, session: Session, force: bool) {
+        self.cli.session_started(session, force)
+    }
+
+    fn session_stopped(&mut self, session_id: &SessionId) {
         self.cli.session_stopped(session_id)
     }
 
@@ -249,20 +266,24 @@ impl CommandContext for Repl {
         self.cli.cert_chain(key_id, certs, roots)
     }
 
-    fn cert_imported(&mut self, path: &Path, key_id: KeyId) -> Result<(), CommandError> {
+    fn cert_imported(&mut self, path: &Path, key_id: KeyId) {
         self.cli.cert_imported(path, key_id)
     }
 
     // Job management
 
-    fn job_started(&mut self, job: &SignedJob) {
+    fn job_started(&mut self, job: &SignedJob, show: bool) {
         self.set_job_id(Some(job.job_id().to_owned()));
-        self.cli.job_started(job);
+        self.cli.job_started(job, show);
     }
 
     fn job_stopped(&mut self, job_id: &JobId) {
         self.set_job_id(Some(job_id.to_owned()));
         self.cli.job_stopped(job_id);
+    }
+
+    fn job_skipped(&mut self, job_id: &JobId) -> bool {
+        self.cli.job_skipped(job_id)
     }
 
     fn job_error(&mut self, error: CommandError) -> CommandError {
@@ -334,6 +355,10 @@ impl CommandContext for Repl {
         self.cli.job_watch_update(status)
     }
 
+    fn job_watch_stalled(&mut self, job_id: &JobId) {
+        self.cli.job_watch_stalled(job_id)
+    }
+
     fn job_watch_finished(&mut self, job_id: &JobId) {
         self.cli.job_watch_finished(job_id)
     }
@@ -361,11 +386,15 @@ impl CommandContext for Repl {
         self.cli.please_touch(identity)
     }
 
+    fn really_target(&mut self, sled: &SledId) -> Result<(), CommandError> {
+        self.cli.really_target(sled)
+    }
+
     fn really_revoke(&mut self, what: &str, key_id: KeyId) -> Result<KeyId, CommandError> {
         self.cli.really_revoke(what, key_id)
     }
 
-    fn revoked(&mut self, what: &str, key_id: KeyId) -> Result<(), CommandError> {
+    fn revoked(&mut self, what: &str, key_id: KeyId) {
         self.cli.revoked(what, key_id)
     }
 }

@@ -9,7 +9,7 @@
 
 use std::collections::BTreeMap;
 use std::num::NonZeroUsize;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
 use chrono::{DateTime, Utc};
 use futures::{Stream, StreamExt};
@@ -26,9 +26,13 @@ use x509_cert::der::Encode as _;
 
 use sush_api::JobStartParams;
 use sush_common::authn::{Identity, Nonce, RequestVerifier, SignedLogin};
-use sush_common::jobs::{Access, JobId, JobStatus, JobStatusMap, Session, SessionId, SignedJob};
+use sush_common::jobs::{
+    Access, JobId, JobStatus, JobStatusMap, ProcessError, Session, SessionId, SessionSushNonce,
+    SignedJob,
+};
 use sush_common::keys::{KeyError, KeyId, Signature, SshPublicKey};
 use sush_common::targets::Cubbies;
+use sush_common::version::{VersionInfo, VersionMap};
 
 use crate::executor::{Executor, PathIsolation};
 use crate::history::JobHistory;
@@ -177,11 +181,15 @@ impl<'a> SessionGuard<'a> {
         self.inner.session_id()
     }
 
+    pub fn started_by(&self) -> Option<&KeyId> {
+        self.inner.started_by()
+    }
+
     pub fn job_started(&mut self, job: SignedJob) {
         self.inner.job_started(job)
     }
 
-    pub fn skip_job(&mut self, job_id: &JobId) {
+    pub fn skip_job(&mut self, job_id: &JobId) -> bool {
         self.inner.skip_job(*job_id)
     }
 
@@ -202,7 +210,7 @@ impl<'a> SessionGuard<'a> {
         actor: &KeyId,
     ) {
         let job_id = *job.job_id();
-        let targeted = job.payload().target().includes(own_baseboard, cubbies);
+        let targeted = job.payload().runs_on(own_baseboard, cubbies);
         if history.contains(&job_id) {
             // Note but otherwise ignore the duplicate job.
             info!(log, "already started job"; "job_id" => %job_id);
@@ -276,7 +284,7 @@ impl<'a> SessionGuard<'a> {
         while let Some((request, params)) = self.next_queued_job() {
             let (tx_attachment, rx_attachment) = watch::channel(None);
             let job_id = request.payload().job_id().to_owned();
-            if request.payload().target().includes(own_baseboard, cubbies)
+            if request.payload().runs_on(own_baseboard, cubbies)
                 && history
                     .get_job_status(&job_id)
                     .map(|status| {
@@ -306,6 +314,9 @@ pub struct State {
     attachments: AttachmentPoints,
     /// Job request signing certificates.
     certs: Certificates,
+    /// The nonce binding new session IDs to this sled, shared with the
+    /// manager and rotated whenever a session activates.
+    session_sush_nonce: Arc<Mutex<SessionSushNonce>>,
     /// Revocations of certificates we have never seen. Bounded and
     /// apart from `certs`, so revocation spam evicts only itself.
     tombstones: LruCache<KeyId, DateTime<Utc>>,
@@ -314,6 +325,8 @@ pub struct State {
     roots: Box<[KeyId]>,
     /// Baseboards by cubby number, as much of it as is known.
     cubbies: Cubbies,
+    /// Build provenance by sled.
+    versions: VersionMap,
     /// Verified logins, rack-wide.
     identities: LruCache<(KeyId, Nonce), RegisteredIdentity>,
     /// SSH keys refused at login.
@@ -324,7 +337,11 @@ impl State {
     /// Fails if any root certificate is malformed or does not validate. Roots
     /// are supplied by whoever configures the server, so they are not
     /// necessarily trustworthy just because they were handed to us.
-    pub fn new(own_baseboard: BaseboardId, root_certs: &[Certificate]) -> Result<Self, KeyError> {
+    pub fn new(
+        own_baseboard: BaseboardId,
+        root_certs: &[Certificate],
+        session_sush_nonce: Arc<Mutex<SessionSushNonce>>,
+    ) -> Result<Self, KeyError> {
         let certs = root_certs
             .iter()
             .map(|cert| {
@@ -336,11 +353,13 @@ impl State {
             .collect::<Result<BTreeMap<KeyId, CertState>, KeyError>>()?;
         let roots: Box<[KeyId]> = certs.keys().cloned().collect();
         let mut new = Self {
+            versions: [(own_baseboard.clone(), VersionInfo::current())].into(),
             own_baseboard,
             running: Default::default(),
             history: Default::default(),
             session: Default::default(),
             attachments: Default::default(),
+            session_sush_nonce,
             tombstones: LruCache::new(MAX_TOMBSTONES),
             certs,
             roots: roots.clone(),
@@ -369,6 +388,14 @@ impl State {
 
     pub fn attach_access(&self, key_id: &KeyId) -> Option<Access> {
         self.session.attach_access(key_id)
+    }
+
+    pub fn cubbies(&self) -> &Cubbies {
+        &self.cubbies
+    }
+
+    pub fn versions(&self) -> &VersionMap {
+        &self.versions
     }
 
     pub fn history(&self) -> &JobHistory {
@@ -498,7 +525,8 @@ impl State {
                                 session: Box::new(Session::started(*session_id, actor.clone())),
                                 queued_jobs: QueuedJobs::new(),
                                 attach_grants: BTreeMap::new(),
-                            }
+                            };
+                            *self.session_sush_nonce.lock().unwrap() = SessionSushNonce::random();
                         }
 
                         // When the incoming session is concurrent, we can't
@@ -553,12 +581,19 @@ impl State {
                         } = &self.session
                             && session.session_id() == *session_id
                         {
-                            info!(
-                                log, "session stopped";
-                                "session_id" => %session_id, "actor" => %actor,
-                            );
-                            self.session = Inactive {
-                                frontier: frontier.clone(),
+                            if session.started_by() != Some(actor) {
+                                warn!(
+                                    log, "ignoring session stop from non-starter";
+                                    "session_id" => %session_id, "actor" => %actor,
+                                );
+                            } else {
+                                info!(
+                                    log, "session stopped";
+                                    "session_id" => %session_id, "actor" => %actor,
+                                );
+                                self.session = Inactive {
+                                    frontier: frontier.clone(),
+                                }
                             }
                         }
                     }
@@ -610,26 +645,37 @@ impl State {
                         if let Some(mut session) = self.session.active_session()
                             && session.session_id() == *session_id
                         {
-                            info!(
-                                log, "job skipped";
-                                "job_id" => %job_id, "actor" => %actor,
-                            );
-                            session.skip_job(job_id);
-                            session.cancel_job(
-                                job_id,
-                                actor,
-                                &self.own_baseboard,
-                                &mut self.history,
-                                &self.running,
-                            );
-                            session.execute_ready_jobs(
-                                &self.own_baseboard,
-                                &self.cubbies,
-                                &mut self.certs,
-                                &mut self.history,
-                                executor,
-                                &mut self.attachments,
-                            );
+                            if session.started_by() != Some(actor) {
+                                warn!(
+                                    log, "ignoring job skip from non-starter";
+                                    "job_id" => %job_id, "actor" => %actor,
+                                );
+                            } else if session.skip_job(job_id) {
+                                info!(
+                                    log, "job skipped";
+                                    "job_id" => %job_id, "actor" => %actor,
+                                );
+                                session.cancel_job(
+                                    job_id,
+                                    actor,
+                                    &self.own_baseboard,
+                                    &mut self.history,
+                                    &self.running,
+                                );
+                                session.execute_ready_jobs(
+                                    &self.own_baseboard,
+                                    &self.cubbies,
+                                    &mut self.certs,
+                                    &mut self.history,
+                                    executor,
+                                    &mut self.attachments,
+                                );
+                            } else {
+                                info!(
+                                    log, "ignoring inapplicable job skip";
+                                    "job_id" => %job_id, "actor" => %actor,
+                                );
+                            }
                         } else {
                             info!(
                                 log,
@@ -650,7 +696,7 @@ impl State {
                         // The session must be active and must match the
                         // submitted job.
                         //
-                        // It is safe to discard all other jobs. By cases:
+                        // It is safe to refuse all other jobs. By cases:
                         //
                         // - If the job came from a session in the causal
                         // past of our own, the session has been superseded,
@@ -664,25 +710,50 @@ impl State {
                         // receive a job from a session before that
                         // session's own start (since each session is
                         // linearized by its accepting server).
-                        if let Some(mut session) = self.session.active_session() {
-                            session.enqueue_job(
-                                log,
-                                &mut self.history,
-                                &self.running,
-                                &self.own_baseboard,
-                                &self.cubbies,
-                                signed.clone(),
-                                params.clone(),
-                                actor,
-                            );
-                            session.execute_ready_jobs(
-                                &self.own_baseboard,
-                                &self.cubbies,
-                                &mut self.certs,
-                                &mut self.history,
-                                executor,
-                                &mut self.attachments,
-                            );
+                        //
+                        // Refused jobs targeting this sled record an error
+                        // status so the submitter learns their fate.
+                        let session_id = signed.payload().session_id();
+                        match self.session.active_session() {
+                            Some(mut session) if session.session_id() == session_id => {
+                                session.enqueue_job(
+                                    log,
+                                    &mut self.history,
+                                    &self.running,
+                                    &self.own_baseboard,
+                                    &self.cubbies,
+                                    signed.clone(),
+                                    params.clone(),
+                                    actor,
+                                );
+                                session.execute_ready_jobs(
+                                    &self.own_baseboard,
+                                    &self.cubbies,
+                                    &mut self.certs,
+                                    &mut self.history,
+                                    executor,
+                                    &mut self.attachments,
+                                );
+                            }
+                            _ => {
+                                let job_id = *signed.job_id();
+                                warn!(
+                                    log, "refusing job for inactive session";
+                                    "job_id" => %job_id,
+                                    "session_id" => %session_id,
+                                    "actor" => %actor,
+                                );
+                                if signed.payload().runs_on(&self.own_baseboard, &self.cubbies)
+                                    && !self.history.contains(&job_id)
+                                {
+                                    executor.job_refused(
+                                        job_id,
+                                        ProcessError::InvalidJob(format!(
+                                            "session `{session_id}` is not active"
+                                        )),
+                                    );
+                                }
+                            }
                         }
                     }
                     (actor, JobRequest::Stop(job_id)) => {
@@ -813,6 +884,14 @@ impl State {
                 Event::Error(error) => {
                     error!(log, "session error"; "error" => %error);
                 }
+                Event::Version(info) => {
+                    // Our own seed is authoritative, and may be newer
+                    // than a replayed announce from a previous boot.
+                    if *baseboard_id != self.own_baseboard {
+                        info!(log, "sled version"; "sled" => %baseboard_id, "version" => %info);
+                        self.versions.insert(baseboard_id.clone(), info.clone());
+                    }
+                }
             },
         }
 
@@ -856,13 +935,15 @@ impl StateManager {
         mut cubbies: watch::Receiver<Cubbies>,
         universe: watch::Receiver<GossipNetwork>,
         roots: &[Certificate],
+        session_sush_nonce: Arc<Mutex<SessionSushNonce>>,
         shutdown: CancellationToken,
     ) -> Result<(watch::Receiver<State>, JoinHandle<()>), KeyError>
     where
         R: Stream<Item = Request> + Send + Unpin + 'static,
     {
         // We report our current state through a watch channel.
-        let mut initial_state = State::new(own_baseboard.clone(), roots)?;
+        let mut initial_state =
+            State::new(own_baseboard.clone(), roots, session_sush_nonce.clone())?;
         initial_state.cubbies = cubbies.borrow_and_update().clone();
         let (tx_state, rx_state) = watch::channel(initial_state);
         let roots = roots.to_vec();
@@ -894,6 +975,17 @@ impl StateManager {
             rx_state,
             spawn(async move {
                 info!(log, "managing state");
+
+                // Announce our build.
+                if let Some((rumors, _)) = &gossip {
+                    rumors.send(
+                        Message::Event(
+                            own_baseboard.clone(),
+                            Event::Version(VersionInfo::current()),
+                        )
+                        .into(),
+                    );
+                }
 
                 // These flip both to `true` once our two input streams (local
                 // requests and local events from the executor) terminate or
@@ -1002,11 +1094,22 @@ impl StateManager {
                         causal_messages = fresh.causal_messages();
                         // TODO: re-inject local job state (policy pending).
                         tx_state.send_modify(|state| {
-                            *state = State::new(own_baseboard.clone(), &roots)
-                                .expect("roots validated at startup");
+                            *state = State::new(
+                                own_baseboard.clone(),
+                                &roots,
+                                state.session_sush_nonce.clone(),
+                            )
+                            .expect("roots validated at startup");
                             state.cubbies = cubbies.borrow().clone();
                         });
                         *rumors = fresh;
+                        rumors.send(
+                            Message::Event(
+                                own_baseboard.clone(),
+                                Event::Version(VersionInfo::current()),
+                            )
+                            .into(),
+                        );
                     }
                 }
             }),

@@ -5,6 +5,7 @@
 //! Manage authentication, job signature verification, and the session
 //! state machine. Does not manage jobs directly.
 
+use std::collections::BTreeSet;
 use std::num::NonZeroUsize;
 use std::path::Path;
 use std::sync::{Arc, Mutex as SyncMutex};
@@ -34,7 +35,8 @@ use sush_common::jobs::{
 };
 use sush_common::jobs::{JobOutputStream, SessionSushNonce};
 use sush_common::keys::{KeyError, KeyId, SshPublicKey};
-use sush_common::targets::Cubbies;
+use sush_common::targets::{Cubbies, SledVersion};
+use sush_common::version::LONG_VERSION;
 
 use crate::error::JobError;
 use crate::executor::PathIsolation;
@@ -130,8 +132,10 @@ impl JobManager {
         roots: &[Certificate],
         shutdown: CancellationToken,
     ) -> Result<Self, JobError> {
+        info!(log, "starting sush"; "version" => LONG_VERSION);
         let (tx_req, rx_req) = mpsc::channel(16);
         let requests = ReceiverStream::new(rx_req);
+        let session_sush_nonce = Arc::new(SyncMutex::new(SessionSushNonce::random()));
         let (rx_state, join_state) = StateManager::run(
             log.new(o!("component" => "state manager")),
             path_isolation,
@@ -141,13 +145,14 @@ impl JobManager {
             cubbies,
             universe,
             roots,
+            session_sush_nonce.clone(),
             shutdown,
         )?;
         Ok(Self {
             log: log.new(o!("component" => "job manager")),
             nonces: Arc::new(Mutex::new(LruCache::new(MAX_OUTSTANDING_NONCES))),
             identities: Arc::new(Mutex::new(LruCache::new(MAX_CACHED_IDENTITIES))),
-            session_sush_nonce: Arc::new(SyncMutex::new(SessionSushNonce::random())),
+            session_sush_nonce,
             own_baseboard,
             output_dir,
             state: rx_state,
@@ -158,6 +163,26 @@ impl JobManager {
 
     pub fn own_baseboard(&self) -> &BaseboardId {
         &self.own_baseboard
+    }
+
+    /// Every sled known by cubby or by build, sorted by cubby first.
+    pub fn versions(&self) -> Vec<SledVersion> {
+        let state = self.state.borrow();
+        let mut sleds: BTreeSet<&BaseboardId> = state.versions().keys().collect();
+        sleds.extend(state.cubbies().values());
+        let mut rows: Vec<SledVersion> = sleds
+            .into_iter()
+            .map(|baseboard| SledVersion {
+                cubby: state
+                    .cubbies()
+                    .iter()
+                    .find_map(|(cubby, b)| (b == baseboard).then_some(*cubby)),
+                baseboard: baseboard.clone(),
+                version: state.versions().get(baseboard).cloned(),
+            })
+            .collect();
+        rows.sort_by_key(|row| (row.cubby.is_none(), row.cubby));
+        rows
     }
 
     async fn cert_request(&self, authn: &Identity, request: CertRequest) -> Result<(), JobError> {
@@ -491,16 +516,8 @@ impl JobManager {
         Ok(session.into_session_id())
     }
 
-    pub fn regenerate_session_sush_nonce(&self) -> SessionSushNonce {
-        let nonce = SessionSushNonce::random();
-        match self.session_sush_nonce.lock() {
-            Ok(mut slot) => *slot = nonce,
-            Err(mut poison) => {
-                **poison.get_mut() = nonce;
-                self.session_sush_nonce.clear_poison();
-            }
-        }
-        nonce
+    pub fn session_sush_nonce(&self) -> SessionSushNonce {
+        *self.session_sush_nonce.lock().unwrap()
     }
 
     pub async fn session_start(
@@ -510,15 +527,11 @@ impl JobManager {
         signer_nonce: SessionSignerNonce,
         wait: bool,
     ) -> Result<(), JobError> {
-        // We don't care about poisoning for the nonce, it's never mutated in a way that could lead
-        // to inconsistencies in the event of a panic.
-        let sush_nonce = match self.session_sush_nonce.lock() {
-            Ok(nonce) => *nonce,
-            Err(poison) => *poison.into_inner(),
-        };
-
-        // Verify that the session ID provided by the client is meant to be sent to this instance of
-        // Sush, by checking that the signer nonce was hashed with our baseboard and nonce.
+        // Verify that the session ID provided by the client is meant for
+        // this instance of Sush, by checking that the signer nonce was
+        // hashed with our baseboard and nonce. The state machine rotates
+        // the nonce when a session activates.
+        let sush_nonce = *self.session_sush_nonce.lock().unwrap();
         let computed = SessionId::compute(self.own_baseboard(), sush_nonce, signer_nonce);
         if computed != session_id {
             return Err(JobError::InvalidSessionId);
@@ -537,22 +550,46 @@ impl JobManager {
         authn: &Identity,
         session_id: SessionId,
     ) -> Result<(), JobError> {
+        self.starter_check(authn)?;
+        self.currency_check(session_id)?;
         self.session_request(authn, SessionRequest::Stop(session_id))
             .await
     }
 
+    /// The authoritative skip is in the state machine, which ignores
+    /// requests that lost a race. This check fails fast and loudly.
     pub async fn session_skip_job(
         &self,
         authn: &Identity,
         session_id: SessionId,
         job_id: JobId,
     ) -> Result<(), JobError> {
+        self.starter_check(authn)?;
+        self.currency_check(session_id)?;
+        if let Some(session) = self.session(authn)
+            && session.next_job_id() != job_id
+        {
+            return Err(JobError::NotNextJob(job_id));
+        }
         self.session_request(authn, SessionRequest::Skip(session_id, job_id))
             .await
     }
 
-    /// Only the session starter may grant or deny attach access. The
-    /// authoritative check is in the state machine. This one fails fast.
+    /// A request naming a session other than the current one would be
+    /// silently ignored by the state machine. This check fails fast.
+    fn currency_check(&self, session_id: SessionId) -> Result<(), JobError> {
+        match self.state.borrow().session() {
+            None => Err(JobError::NoSession),
+            Some(session) if session.session_id() != session_id => {
+                Err(JobError::SessionNotCurrent(session_id))
+            }
+            Some(_) => Ok(()),
+        }
+    }
+
+    /// Only the session starter may stop the session, skip its jobs,
+    /// or grant and deny attach access. The authoritative check is in
+    /// the state machine. This one fails fast.
     fn starter_check(&self, authn: &Identity) -> Result<(), JobError> {
         match self.state.borrow().session() {
             None => Err(JobError::NoSession),
@@ -569,6 +606,7 @@ impl JobManager {
         access: Access,
     ) -> Result<(), JobError> {
         self.starter_check(authn)?;
+        self.currency_check(session_id)?;
         self.session_request(
             authn,
             SessionRequest::AllowAttach(session_id, key_id, access),
@@ -583,6 +621,7 @@ impl JobManager {
         key_id: KeyId,
     ) -> Result<(), JobError> {
         self.starter_check(authn)?;
+        self.currency_check(session_id)?;
         self.session_request(authn, SessionRequest::DenyAttach(session_id, key_id))
             .await
     }
@@ -598,11 +637,19 @@ impl JobManager {
         let job_id = job.job_id().to_owned();
         let wait = params.wait.to_owned();
 
-        // A job can only ever run within an active session; fail fast
-        // rather than silently queuing (or discarding) a job that can
-        // never execute.
-        if self.session(authn).is_none() {
-            return Err(JobError::NoSession);
+        // A job can only run in the session it was signed for.
+        let payload = job.payload();
+        match self.session(authn) {
+            None => return Err(JobError::NoSession),
+            Some(session) if session.session_id() != payload.session_id() => {
+                return Err(JobError::SessionNotCurrent(payload.session_id()));
+            }
+            Some(_) => (),
+        }
+
+        // A broader target would orphan jobs on unattached sleds.
+        if payload.interactive && payload.target().single_baseboard().is_none() {
+            return Err(JobError::InteractiveTarget);
         }
 
         // Reject job IDs we already know about, rather than silently
@@ -624,7 +671,7 @@ impl JobManager {
         &self,
         authn: &Identity,
         job_id: &JobId,
-        JobStopParams { wait }: JobStopParams,
+        JobStopParams { wait, .. }: JobStopParams,
     ) -> Result<(), JobError> {
         self.job_request(authn, JobRequest::Stop(job_id.to_owned()))
             .await?;

@@ -10,7 +10,7 @@
 //! against a mapping the rack learns at runtime, so a target is
 //! evaluated lazily, against what is known when it is asked.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
 use std::str::FromStr;
 
@@ -22,11 +22,21 @@ use serde::{Deserialize, Deserializer, Serialize, Serializer};
 use sled_hardware_types::BaseboardId;
 use thiserror::Error;
 
+use crate::version::VersionInfo;
+
 /// Baseboards by cubby number, as much of it as is known.
 pub type Cubbies = BTreeMap<u8, BaseboardId>;
 
 /// The highest cubby number in a rack.
 pub const MAX_CUBBY: u8 = 31;
+
+/// One sled's location and build.
+#[derive(Clone, Debug, Deserialize, Eq, JsonSchema, PartialEq, Serialize)]
+pub struct SledVersion {
+    pub cubby: Option<u8>,
+    pub baseboard: BaseboardId,
+    pub version: Option<VersionInfo>,
+}
 
 /// The sleds a request names.
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
@@ -63,6 +73,37 @@ impl Target {
 
     pub fn is_all(&self) -> bool {
         matches!(self, Self::All)
+    }
+
+    /// A singular target or `None`.
+    pub fn single_baseboard(&self) -> Option<&BaseboardId> {
+        match self {
+            Self::All => None,
+            Self::Sleds(sleds) => match sleds.as_slice() {
+                [SledId::Baseboard(baseboard)] => Some(baseboard),
+                _ => None,
+            },
+        }
+    }
+
+    /// Every sled this target names, when it names only baseboards.
+    pub fn named_baseboards(&self) -> Option<BTreeSet<&BaseboardId>> {
+        match self {
+            Self::All => None,
+            Self::Sleds(sleds) => sleds
+                .iter()
+                .map(|sled| match sled {
+                    SledId::Baseboard(baseboard) => Some(baseboard),
+                    SledId::Cubby(_) => None,
+                })
+                .collect(),
+        }
+    }
+}
+
+impl From<BaseboardId> for Target {
+    fn from(baseboard: BaseboardId) -> Self {
+        Self::Sleds(vec![SledId::Baseboard(baseboard)])
     }
 }
 

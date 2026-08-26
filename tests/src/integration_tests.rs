@@ -18,7 +18,7 @@ use futures::{SinkExt as _, StreamExt as _};
 use tokio::io::{AsyncRead, AsyncWrite};
 use tokio::sync::watch;
 use tokio::test;
-use tokio::time::timeout;
+use tokio::time::{sleep, timeout};
 use tokio_tungstenite::WebSocketStream;
 use tokio_tungstenite::tungstenite::protocol::Role;
 use tokio_util::sync::CancellationToken;
@@ -42,7 +42,8 @@ use sush_client::tls::client as tls_client;
 use sush_client::{AuthzSigner, Client, Error as ClientError};
 use sush_common::interactive::{InteractiveJobControl, InteractiveJobMessage};
 use sush_common::jobs::{
-    Access, JobLimits, JobOutputStream, Session, SessionId, SessionSignerNonce,
+    Access, JobLimits, JobOutputState, JobOutputStream, JobStatus, Session, SessionId,
+    SessionSignerNonce, job_status_try_from_json_map,
 };
 use sush_common::keys::{EphemeralKey, KeyType, pem_cert_chain};
 use sush_common::targets::Cubbies;
@@ -129,6 +130,7 @@ async fn client_server() {
     client
         .job_start()
         .job_id(job_id)
+        .target("*")
         .max_cpu(max_cpu)
         .max_mem(max_mem)
         .max_fsize(max_fsize)
@@ -180,9 +182,16 @@ async fn client_proxy_server() {
         cubbies: Cubbies::from([(14, test_baseboard_id())]),
     });
     let shutdown_proxy = CancellationToken::new();
-    let proxy = ProxyServer::start(&log, local_addr(), None, rx_targets, shutdown_proxy.clone())
-        .await
-        .expect("can't start proxy server");
+    let proxy = ProxyServer::start(
+        &log,
+        local_addr(),
+        None,
+        rx_targets,
+        None,
+        shutdown_proxy.clone(),
+    )
+    .await
+    .expect("can't start proxy server");
     let proxy_addr = proxy.local_addr();
     assert_ne!(server_addr, proxy_addr);
 
@@ -229,7 +238,13 @@ async fn client_proxy_server() {
         .expect("can't start session");
     let job_id = session.next_job_id();
     let job = root
-        .sign_job_request(job_id, session_id, "cat > /dev/null", true)
+        .sign_job_request_for(
+            job_id,
+            session_id,
+            "cat > /dev/null",
+            true,
+            test_baseboard_id().into(),
+        )
         .await;
     let JobLimits {
         max_cpu,
@@ -239,6 +254,7 @@ async fn client_proxy_server() {
     client
         .job_start()
         .job_id(job_id)
+        .target(test_baseboard_id().to_string())
         .max_cpu(max_cpu)
         .max_mem(max_mem)
         .max_fsize(max_fsize)
@@ -345,6 +361,7 @@ async fn client_tls_proxy_server() {
         local_addr(),
         Some(tls),
         rx_targets,
+        None,
         shutdown_proxy.clone(),
     )
     .await
@@ -355,7 +372,7 @@ async fn client_tls_proxy_server() {
     let pem = read(cert_path(pki.clone(), &root_prefix())).unwrap();
     let roots = vec![Certificate::from_pem(&pem).unwrap()];
     let signer = AuthzSigner::default();
-    let client = Client::new_with_client(&url, tls_client(roots).unwrap(), signer.clone());
+    let client = Client::new_with_client(&url, tls_client(roots, None).unwrap(), signer.clone());
     let ClientError::ErrorResponse(unauthz) = client.iam().body(None).send().await.unwrap_err()
     else {
         panic!("expected error response")
@@ -376,8 +393,11 @@ async fn client_tls_proxy_server() {
     let (_other_dir, other) = test_pki("sush-tls-other-");
     let pem = read(cert_path(other.clone(), &root_prefix())).unwrap();
     let strangers = vec![Certificate::from_pem(&pem).unwrap()];
-    let stranger =
-        Client::new_with_client(&url, tls_client(strangers).unwrap(), AuthzSigner::default());
+    let stranger = Client::new_with_client(
+        &url,
+        tls_client(strangers, None).unwrap(),
+        AuthzSigner::default(),
+    );
     assert!(stranger.iam().body(None).send().await.is_err());
 
     // A second proxy serves an ephemeral leaf the platform identity
@@ -422,6 +442,7 @@ async fn client_tls_proxy_server() {
         local_addr(),
         Some(delegated),
         rx_delegated,
+        None,
         shutdown_proxy.clone(),
     )
     .await
@@ -430,7 +451,7 @@ async fn client_tls_proxy_server() {
     let roots = vec![Certificate::from_pem(&pem).unwrap()];
     let client2 = Client::new_with_client(
         &format!("https://{}", proxy2.local_addr()),
-        tls_client(roots.clone()).unwrap(),
+        tls_client(roots.clone(), None).unwrap(),
         signer.clone(),
     );
     let iam = client2
@@ -477,13 +498,14 @@ async fn client_tls_proxy_server() {
         local_addr(),
         Some(forged_tls),
         rx_forged,
+        None,
         shutdown_proxy.clone(),
     )
     .await
     .expect("can't start forged proxy server");
     let client3 = Client::new_with_client(
         &format!("https://{}", proxy3.local_addr()),
-        tls_client(roots).unwrap(),
+        tls_client(roots, None).unwrap(),
         signer.clone(),
     );
     assert!(client3.iam().body(None).send().await.is_err());
@@ -585,7 +607,13 @@ async fn interactive_job() {
         .expect("can't start session");
     let job_id = session.next_job_id();
     let job = root
-        .sign_job_request(job_id, session_id, "cat > /dev/null", true)
+        .sign_job_request_for(
+            job_id,
+            session_id,
+            "cat > /dev/null",
+            true,
+            test_baseboard_id().into(),
+        )
         .await;
     let JobLimits {
         max_cpu,
@@ -595,6 +623,7 @@ async fn interactive_job() {
     client
         .job_start()
         .job_id(job_id)
+        .target(test_baseboard_id().to_string())
         .max_cpu(max_cpu)
         .max_mem(max_mem)
         .max_fsize(max_fsize)
@@ -829,4 +858,301 @@ async fn interactive_job() {
             .expect("can't get output bytes"),
         hello_again,
     );
+}
+
+#[named]
+#[test]
+async fn streaming_job() {
+    const LEN: usize = 0x40000;
+
+    // Spin up a server.
+    let log = test_logger(function_name!());
+    let (mgr, mut root, _dir, _shutdown) = manager_and_test_root(log.clone()).await;
+    let api = api_description::<ApiServer>().unwrap();
+    let server = ServerBuilder::new(api, Arc::new(mgr), log)
+        .config(ConfigDropshot {
+            bind_address: local_addr(),
+            ..Default::default()
+        })
+        .start()
+        .expect("failed to start server");
+
+    // Connect and authenticate to the server.
+    let addr = server.local_addr();
+    let signer = AuthzSigner::default();
+    let client = Client::new(&format!("http://{addr}"), signer.clone());
+    let ClientError::ErrorResponse(unauthz) = client.iam().body(None).send().await.unwrap_err()
+    else {
+        panic!("expected error response")
+    };
+    let (_identity, credentials) = authz(&client, unauthz, &mut root).await;
+    signer.set(Some(credentials));
+
+    // Start a streaming job too big for its pipe, so it blocks until we attach.
+    let signer_nonce = SessionSignerNonce::random();
+    let session_id = SessionId::compute(
+        &test_baseboard_id(),
+        client
+            .session_start_nonce()
+            .send()
+            .await
+            .unwrap()
+            .into_inner()
+            .nonce,
+        signer_nonce,
+    );
+    let session = Session::new(session_id);
+    client
+        .session_start()
+        .session_id(session.session_id())
+        .body(SessionStartBody { signer_nonce })
+        .send()
+        .await
+        .expect("can't start session");
+    let job_id = session.next_job_id();
+    let job = root
+        .sign_streaming_job_request(
+            job_id,
+            session.session_id(),
+            "dd if=/dev/zero bs=4096 count=64 2>/dev/null",
+            test_baseboard_id().into(),
+        )
+        .await;
+    let JobLimits {
+        max_cpu,
+        max_mem,
+        max_fsize,
+    } = JobLimits::default();
+    client
+        .job_start()
+        .job_id(job_id)
+        .target(test_baseboard_id().to_string())
+        .max_cpu(max_cpu)
+        .max_mem(max_mem)
+        .max_fsize(max_fsize)
+        .wait(JobWait::Start)
+        .body(job.into_signed())
+        .send()
+        .await
+        .expect("can't start job");
+
+    // Attach and collect the whole stream.
+    let socket = client
+        .job_attach()
+        .job_id(job_id)
+        .target(test_baseboard_id().to_string())
+        .send()
+        .await
+        .expect("can't attach to job")
+        .into_inner();
+    let mut stream = WebSocketStream::from_raw_socket(socket, Role::Client, None).await;
+    let mut streamed = BytesMut::new();
+    loop {
+        let recvd = timeout(TIMEOUT, stream.next())
+            .await
+            .expect("timed out waiting for streamed output")
+            .expect("stream ended without close")
+            .expect("can't get next stream item");
+        match InteractiveJobMessage::try_from(recvd).expect("can't decode message") {
+            InteractiveJobMessage::Data(bytes) => streamed.extend(bytes),
+            InteractiveJobMessage::Close => break,
+            message => panic!("unexpected message: {message:?}"),
+        }
+    }
+    assert_eq!(streamed.len(), LEN);
+    assert!(streamed.iter().all(|byte| *byte == 0));
+
+    // The status records the length and hash of the unrecorded stream.
+    let status = timeout(TIMEOUT, async {
+        loop {
+            let status = job_status_try_from_json_map(
+                client
+                    .job_status()
+                    .job_id(job_id)
+                    .send()
+                    .await
+                    .expect("can't get job status")
+                    .into_inner(),
+            )
+            .expect("can't parse job status")[&test_baseboard_id()]
+                .clone();
+            if status.is_terminal() {
+                break status;
+            }
+            sleep(Duration::from_millis(50)).await;
+        }
+    })
+    .await
+    .expect("timed out waiting for job stop");
+    let JobStatus::Stopped {
+        result,
+        output:
+            JobOutputState {
+                stdout_len,
+                stderr_len,
+                stdout_hash,
+                ..
+            },
+        ..
+    } = status
+    else {
+        panic!("expected stopped status");
+    };
+    assert_eq!(result, Ok(0));
+    assert_eq!(stdout_len, LEN as u64);
+    assert_eq!(stderr_len, 0);
+    assert_eq!(stdout_hash, blake3::hash(&streamed).into());
+
+    // Streamed output is never stored, so it cannot be fetched.
+    let Err(error) = client
+        .job_output()
+        .job_id(job_id)
+        .stream(JobOutputStream::Stdout)
+        .target(test_baseboard_id().to_string())
+        .send()
+        .await
+    else {
+        panic!("streamed output should not be fetchable")
+    };
+    assert_eq!(error.status().map(|status| status.as_u16()), Some(404));
+}
+
+#[named]
+#[test]
+async fn streaming_job_linger() {
+    // Spin up a server.
+    let log = test_logger(function_name!());
+    let (mgr, mut root, _dir, _shutdown) = manager_and_test_root(log.clone()).await;
+    let api = api_description::<ApiServer>().unwrap();
+    let server = ServerBuilder::new(api, Arc::new(mgr), log)
+        .config(ConfigDropshot {
+            bind_address: local_addr(),
+            ..Default::default()
+        })
+        .start()
+        .expect("failed to start server");
+
+    // Connect and authenticate to the server.
+    let addr = server.local_addr();
+    let signer = AuthzSigner::default();
+    let client = Client::new(&format!("http://{addr}"), signer.clone());
+    let ClientError::ErrorResponse(unauthz) = client.iam().body(None).send().await.unwrap_err()
+    else {
+        panic!("expected error response")
+    };
+    let (_identity, credentials) = authz(&client, unauthz, &mut root).await;
+    signer.set(Some(credentials));
+
+    // Run a streaming job small enough to finish before anyone attaches.
+    let signer_nonce = SessionSignerNonce::random();
+    let session_id = SessionId::compute(
+        &test_baseboard_id(),
+        client
+            .session_start_nonce()
+            .send()
+            .await
+            .unwrap()
+            .into_inner()
+            .nonce,
+        signer_nonce,
+    );
+    let session = Session::new(session_id);
+    client
+        .session_start()
+        .session_id(session.session_id())
+        .body(SessionStartBody { signer_nonce })
+        .send()
+        .await
+        .expect("can't start session");
+    let job_id = session.next_job_id();
+    let job = root
+        .sign_streaming_job_request(
+            job_id,
+            session.session_id(),
+            "echo -n hello",
+            test_baseboard_id().into(),
+        )
+        .await;
+    let JobLimits {
+        max_cpu,
+        max_mem,
+        max_fsize,
+    } = JobLimits::default();
+    client
+        .job_start()
+        .job_id(job_id)
+        .target(test_baseboard_id().to_string())
+        .max_cpu(max_cpu)
+        .max_mem(max_mem)
+        .max_fsize(max_fsize)
+        .wait(JobWait::Start)
+        .body(job.into_signed())
+        .send()
+        .await
+        .expect("can't start job");
+    sleep(Duration::from_millis(300)).await;
+
+    // A posthumous attach still collects the whole stream.
+    let socket = client
+        .job_attach()
+        .job_id(job_id)
+        .target(test_baseboard_id().to_string())
+        .send()
+        .await
+        .expect("can't attach to job")
+        .into_inner();
+    let mut stream = WebSocketStream::from_raw_socket(socket, Role::Client, None).await;
+    let mut streamed = BytesMut::new();
+    loop {
+        let recvd = timeout(TIMEOUT, stream.next())
+            .await
+            .expect("timed out waiting for streamed output")
+            .expect("stream ended without close")
+            .expect("can't get next stream item");
+        match InteractiveJobMessage::try_from(recvd).expect("can't decode message") {
+            InteractiveJobMessage::Data(bytes) => streamed.extend(bytes),
+            InteractiveJobMessage::Close => break,
+            message => panic!("unexpected message: {message:?}"),
+        }
+    }
+    assert_eq!(streamed, "hello");
+
+    // The status records the length and hash of the unrecorded stream.
+    let status = timeout(TIMEOUT, async {
+        loop {
+            let status = job_status_try_from_json_map(
+                client
+                    .job_status()
+                    .job_id(job_id)
+                    .send()
+                    .await
+                    .expect("can't get job status")
+                    .into_inner(),
+            )
+            .expect("can't parse job status")[&test_baseboard_id()]
+                .clone();
+            if status.is_terminal() {
+                break status;
+            }
+            sleep(Duration::from_millis(50)).await;
+        }
+    })
+    .await
+    .expect("timed out waiting for job stop");
+    let JobStatus::Stopped {
+        result,
+        output:
+            JobOutputState {
+                stdout_len,
+                stdout_hash,
+                ..
+            },
+        ..
+    } = status
+    else {
+        panic!("expected stopped status");
+    };
+    assert_eq!(result, Ok(0));
+    assert_eq!(stdout_len, streamed.len() as u64);
+    assert_eq!(stdout_hash, blake3::hash(&streamed).into());
 }

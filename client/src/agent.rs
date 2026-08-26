@@ -85,15 +85,17 @@ pub fn sign_request(key: &PublicKey, data: &[u8]) -> Result<Bytes, AgentError> {
     frame(body)
 }
 
-/// Parse an identities-answer payload into its keys. Comments are
-/// consumed and dropped. Key IDs derive from the key material alone.
+/// Parse an identities-answer payload into its keys, comments
+/// attached.
 pub fn identities_answer(mut payload: Bytes) -> Result<Vec<PublicKey>, AgentError> {
     let count = payload.try_get_u32()?;
     let mut keys = Vec::new();
     for _ in 0..count {
         let blob = get_string(&mut payload)?;
-        let _comment = get_string(&mut payload)?;
-        keys.push(PublicKey::from_bytes(&blob)?);
+        let comment = get_string(&mut payload)?;
+        let mut key = PublicKey::from_bytes(&blob)?;
+        key.set_comment(String::from_utf8_lossy(&comment));
+        keys.push(key);
     }
     done(payload)?;
     Ok(keys)
@@ -180,7 +182,7 @@ mod test {
         done(frame).unwrap();
     }
 
-    /// An identities-answer parses to its keys, dropping comments.
+    /// An identities-answer parses to its keys, comments attached.
     #[test]
     fn identities_answer_roundtrip() {
         let mut payload = BytesMut::new();
@@ -190,6 +192,7 @@ mod test {
         let keys = identities_answer(payload.freeze()).unwrap();
         assert_eq!(keys.len(), 1);
         assert_eq!(keys[0].key_data(), key().key_data());
+        assert_eq!(keys[0].comment(), "a comment");
     }
 
     /// Truncated and oversized payloads are rejected, not misread.

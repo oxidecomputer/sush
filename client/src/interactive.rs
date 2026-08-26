@@ -34,8 +34,8 @@ where
     let mut stdout = stdout();
     let mode = raw_mode(&stdin)?;
     let result = interactive_job_inner(&mut stdin, &mut stdout, stream).await;
-    restore_mode(&stdin, mode)?;
-    result
+    let restored = restore_mode(&stdin, &stdout, mode);
+    result.and(restored)
 }
 
 async fn interactive_job_inner<T>(
@@ -61,16 +61,17 @@ where
             // Relay input from the terminal.
             Ok(n) = stdin_async.read_buf(&mut buffer) => {
                 // EOF or the telnet(1) “escape character”
-                if n == 0 || buffer == "" {
+                if n == 0 || buffer == "\x1d" {
                     break;
                 }
                 stream.send(Message::Data(buffer.copy_to_bytes(n)).try_into()?).await?;
                 buffer.truncate(0);
             }
 
-            // Handle a message from the server.
-            Some(Ok(message)) = stream.next() => {
-                match Message::try_from(message)? {
+            // Handle a message from the server, or its disconnection.
+            message = stream.next() => {
+                let Some(message) = message else { break };
+                match Message::try_from(message?)? {
                     Message::Control(control) => match control {
                         Control::WindowChange(new) => {
                             set_window_size(stdin, &mut stdout_async, new.clone()).await?;
@@ -165,12 +166,11 @@ fn raw_mode(fd: impl AsFd) -> Result<Termios, Error> {
 /// Restore the client terminal to its previous, "cooked" mode.
 /// Does not send any terminal escape sequences, and so may not
 /// actually reset the terminal to a good state.
-fn restore_mode(fd: impl AsFd, mode: Termios) -> Result<(), Error> {
-    tcsetattr(&fd, OptionalActions::Drain, &mode)?;
-
-    // AsyncFd sets O_NONBLOCK, so we have to turn it back off again.
-    let flags = fcntl_getfl(&fd)?;
-    fcntl_setfl(&fd, flags & !OFlags::NONBLOCK)?;
-
+fn restore_mode(stdin: impl AsFd, stdout: impl AsFd, mode: Termios) -> Result<(), Error> {
+    for fd in [stdin.as_fd(), stdout.as_fd()] {
+        let flags = fcntl_getfl(fd)?;
+        fcntl_setfl(fd, flags & !OFlags::NONBLOCK)?;
+    }
+    tcsetattr(&stdin, OptionalActions::Drain, &mode)?;
     Ok(())
 }

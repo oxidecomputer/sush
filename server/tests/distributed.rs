@@ -20,6 +20,7 @@ use sush_api::{JobStartParams, JobWait};
 use sush_common::jobs::{JobStatus, Session, SessionId, SessionSignerNonce};
 use sush_common::keys::pem_cert_chain;
 use sush_common::targets::Cubbies;
+use sush_common::version::VersionInfo;
 use sush_server::executor::PathIsolation;
 use sush_server::gossip::spawn_gossip;
 use sush_server::output::JobOutputDir;
@@ -114,13 +115,27 @@ async fn jobs_gossip_between_sleds() {
     })
     .await;
 
+    // Each sled learns the other's build.
+    eventually("versions gossip", 60, async || {
+        [&a, &b].iter().all(|sled| {
+            let versions = sled.mgr.versions();
+            [&a.baseboard, &b.baseboard].iter().all(|baseboard| {
+                versions.iter().any(|row| {
+                    row.baseboard == **baseboard
+                        && row.version.as_ref() == Some(&VersionInfo::current())
+                })
+            })
+        })
+    })
+    .await;
+
     // A session started on sled A becomes B's active session too.
     let authn_a = fake_identity(&mut root).await;
     let authn_b = fake_identity(&mut root).await;
     let signer_nonce = SessionSignerNonce::random();
     let session_id = SessionId::compute(
         a.mgr.own_baseboard(),
-        a.mgr.regenerate_session_sush_nonce(),
+        a.mgr.session_sush_nonce(),
         signer_nonce,
     );
     let session = Session::new(session_id);
@@ -169,7 +184,7 @@ async fn jobs_gossip_between_sleds() {
     let successor_nonce = SessionSignerNonce::random();
     let successor = SessionId::compute(
         b.mgr.own_baseboard(),
-        b.mgr.regenerate_session_sush_nonce(),
+        b.mgr.session_sush_nonce(),
         successor_nonce,
     );
     b.mgr

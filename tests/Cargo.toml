@@ -1,13 +1,14 @@
 [package]
 name = "sush-tests"
 description = "Oxide Support Shell Integration Tests"
-version = "0.1.0"
+version.workspace = true
 edition = "2024"
 license = "MPL-2.0"
 repository = "https://github.com/oxidecomputer/sush"
 publish = false
 
 [dependencies]
+blake3.workspace = true
 bytes.workspace = true
 camino.workspace = true
 chrono.workspace = true
@@ -16,9 +17,11 @@ ed25519-dalek.workspace = true
 function_name.workspace = true
 futures.workspace = true
 http-range-header.workspace = true
+libc.workspace = true
 pwd.workspace = true
 rand_core.workspace = true
 rumors.workspace = true
+serde_json.workspace = true
 sha3.workspace = true
 sled-hardware-types.workspace = true
 slog.workspace = true
