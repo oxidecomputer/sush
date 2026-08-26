@@ -200,7 +200,7 @@ macro_rules! codephrase_newtype {
             }
 
             #[allow(unused)]
-            $vis fn from_hash(hash: blake3::Hash) -> Self {
+            $vis fn from_hash(hash: $crate::hash::Hash) -> Self {
                 let mut codephrase = $crate::codephrases::Codephrase::from_be_bytes(*hash.as_bytes());
                 match $crate::codephrases::CodephraseLength::$len {
                     $crate::codephrases::CodephraseLength::Full => {}
@@ -336,29 +336,30 @@ mod test {
     fn constant_codephrases() {
         assert_eq!(
             round_trip(U256::from_be_slice(
-                blake3::hash(b"test phrase one").as_slice()
+                crate::hash::hash(b"test phrase one").as_bytes()
             )),
-            "able-wet-frame-clown-gauge-gather-curious-\
-             stereo-moment-moral-mirror-net-laptop-square-\
-             toe-skill-upper-credit-cancel-flag-what-powder-\
-             guide-hold"
+            "above-favorite-secret-decorate-wolf-year-pencil-\
+             scan-cage-stage-neither-border-transfer-hamster-\
+             hand-journey-track-amazing-put-inmate-bread-\
+             fossil-sugar-metal"
         );
         assert_eq!(
             round_trip(U256::from_be_slice(
-                blake3::hash(b"another test phrase").as_slice()
+                crate::hash::hash(b"another test phrase").as_bytes()
             )),
-            "about-item-skill-author-expose-assume-language-\
-             mix-tornado-undo-dolphin-obtain-good-quarter-\
-             poem-under-system-hybrid-foil-person-together-\
-             output-exhaust-today"
+            "above-accident-quarter-topic-mango-chef-galaxy-\
+             brisk-company-tray-affair-lumber-raccoon-cat-\
+             devote-boy-festival-slab-trip-fantasy-drum-\
+             output-worry-chunk"
         );
         assert_eq!(
             round_trip(U256::from_be_slice(
-                blake3::hash(b"one more for luck!").as_slice()
+                crate::hash::hash(b"one more for luck!").as_bytes()
             )),
-            "able-hazard-bread-decade-elegant-omit-ensure-\
-             sudden-beef-voice-remove-nut-wish-bind-birth-b\
-             leak-brush-joke-seven-amused-sunny-kite-flee-tape"
+            "abstract-humor-genuine-clarify-flash-extend-\
+             hospital-hockey-reduce-picnic-avoid-crawl-voice-\
+             tool-cash-neck-enlist-gossip-unlock-crime-piano-\
+             gloom-search-video"
         );
     }
 

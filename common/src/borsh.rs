@@ -4,7 +4,6 @@
 
 //! Borsh ser/de helpers.
 
-use blake3::Hash;
 use borsh::io::{Error, ErrorKind, Read, Result, Write};
 use borsh::{BorshDeserialize as _, BorshSerialize as _};
 use chrono::{DateTime, Utc};
@@ -12,18 +11,18 @@ use sled_hardware_types::BaseboardId;
 use x509_cert::Certificate;
 use x509_cert::der::{Decode as _, Encode as _};
 
+use crate::hash::{Hash, OUT_LEN};
 use crate::targets::Target;
 
-/// Borsh-encode a [`blake3::Hash`] as its 32 raw bytes.
+/// Borsh-encode a [`Hash`] as its 32 raw bytes.
 ///
-/// `blake3::Hash` has no native Borsh impl; the wire form is the fixed-width
-/// digest with no length prefix.
+/// The wire form is the fixed-width digest with no length prefix.
 pub fn borsh_ser_hash<W: Write>(hash: &Hash, writer: &mut W) -> Result<()> {
     writer.write_all(hash.as_bytes())
 }
 
 pub fn borsh_de_hash<R: Read>(reader: &mut R) -> Result<Hash> {
-    let mut bytes = [0u8; blake3::OUT_LEN];
+    let mut bytes = [0u8; OUT_LEN];
     reader.read_exact(&mut bytes)?;
     Ok(Hash::from(bytes))
 }

@@ -8,6 +8,7 @@ pub mod authn;
 pub mod borsh;
 #[macro_use]
 pub mod codephrases;
+pub mod hash;
 pub mod interactive;
 pub mod jobs;
 pub mod keys;

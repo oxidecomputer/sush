@@ -1218,7 +1218,7 @@
         "type": "string"
       },
       "JobOutputHash": {
-        "description": "BLAKE3 hash of job output, used as a checksum.",
+        "description": "SHA3-256 hash of job output, used as a checksum.",
         "type": "string",
         "format": "hex encoded hash (32 bytes)"
       },

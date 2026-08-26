@@ -46,6 +46,7 @@ use x509_cert::time::Validity;
 use x509_cert::{Certificate, TbsCertificate, Version};
 
 use crate::codephrases::InvalidCodephrase;
+use crate::hash::hash;
 
 codephrase_newtype! {
     /// SHA-256 of a certificate subject or an identity public key,
@@ -77,7 +78,7 @@ impl TryFrom<&Certificate> for KeyId {
     type Error = KeyError;
 
     fn try_from(cert: &Certificate) -> Result<Self, Self::Error> {
-        let hash = blake3::hash(&cert.tbs_certificate.subject_public_key_info.to_der()?);
+        let hash = hash(&cert.tbs_certificate.subject_public_key_info.to_der()?);
         Ok(KeyId::from_hash(hash))
     }
 }
@@ -86,7 +87,7 @@ impl TryFrom<&ssh_key::PublicKey> for KeyId {
     type Error = KeyError;
 
     fn try_from(public_key: &ssh_key::PublicKey) -> Result<Self, Self::Error> {
-        let hash = blake3::hash(&public_key.to_bytes()?);
+        let hash = hash(&public_key.to_bytes()?);
         Ok(KeyId::from_hash(hash))
     }
 }

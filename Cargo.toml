@@ -12,7 +12,6 @@ atomicwrites = "0.4"
 base64 = "0.22"
 camino = "1"
 async-trait = "0.1"
-blake3 = { version = "1", features = ["mmap", "rayon"] }
 borsh = { version = "1", features = ["derive"] }
 bytes = "1"
 bytesize = "2"
@@ -23,6 +22,7 @@ dropshot = "0.17"
 ed25519-dalek = { version = "2", features = ["pkcs8", "rand_core"] }
 function_name = "0.3"
 futures = "0.3"
+hex = "0.4"
 http = "1"
 http-body-util = "0.1"
 http-range-header = "0.4"

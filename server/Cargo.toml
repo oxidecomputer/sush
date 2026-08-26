@@ -16,7 +16,6 @@ embedded = []
 test-support = []
 
 [dependencies]
-blake3.workspace = true
 borsh.workspace = true
 bytes.workspace = true
 camino.workspace = true

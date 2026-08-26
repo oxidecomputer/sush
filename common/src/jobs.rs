@@ -10,7 +10,7 @@ use std::io::Error as IoError;
 use std::ops::Deref;
 use std::str::FromStr;
 
-use blake3::{Hash, Hasher, hash};
+use crate::hash::{Hash, Hasher, hash};
 use borsh::{BorshDeserialize, BorshSerialize};
 use bytesize::GB;
 use chrono::{DateTime, TimeDelta, Utc};
@@ -356,7 +356,7 @@ impl JobStartRequest {
 }
 
 impl ToBeSigned for JobStartRequest {
-    /// BLAKE3 hash over the fields of `self`.
+    /// SHA3-256 hash over the fields of `self`.
     fn to_be_signed(&self) -> Vec<u8> {
         let mut hasher = Hasher::new();
         let mut hash_with_len = |data: &[u8]| {
@@ -622,7 +622,7 @@ pub struct JobOutputState {
     pub stderr_hash: JobOutputHash,
 }
 
-/// BLAKE3 hash of job output, used as a checksum.
+/// SHA3-256 hash of job output, used as a checksum.
 #[derive(
     BorshDeserialize,
     BorshSerialize,
@@ -684,7 +684,7 @@ where
         type Value = Hash;
 
         fn expecting(&self, f: &mut fmt::Formatter) -> fmt::Result {
-            f.write_str("a hex encoded 32 byte BLAKE3 hash")
+            f.write_str("a hex encoded 32 byte SHA3-256 hash")
         }
 
         fn visit_str<E>(self, v: &str) -> Result<Self::Value, E>

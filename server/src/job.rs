@@ -25,12 +25,12 @@ use std::io::{self, SeekFrom};
 use std::os::unix::process::ExitStatusExt as _;
 use std::process::ExitStatus;
 
-use blake3::Hasher;
 use bytes::{Bytes, BytesMut};
 use dropshot::WebsocketConnectionRaw;
 use futures::{SinkExt as _, StreamExt as _};
 use rustix::process::Signal;
 use slog::{Logger, debug, error, info, warn};
+use sush_common::hash::Hasher;
 use tokio::fs::File;
 use tokio::io::{AsyncReadExt as _, AsyncSeekExt as _, AsyncWriteExt as _};
 use tokio::process::Child;

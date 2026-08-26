@@ -17,7 +17,6 @@ use std::str::FromStr;
 use std::time::Duration;
 
 use async_recursion::async_recursion;
-use blake3::{Hasher, hash};
 use bytesize::ByteSize;
 use clap::{Parser, Subcommand};
 use futures::stream;
@@ -29,6 +28,7 @@ use progenitor_client::ResponseValue;
 use reqwest::Upgraded;
 use rustix::termios::tcgetwinsize;
 use sled_hardware_types::BaseboardId;
+use sush_common::hash::{Hasher, hash};
 use thiserror::Error;
 use tokio::signal::ctrl_c;
 use tokio::signal::unix::{SignalKind, signal};
@@ -2021,13 +2021,13 @@ async fn job_output_from(
         if *len < chunk_size.get() {
             check_hash!(hash(&output), None)
         } else {
-            // Multi-threaded BLAKE3 is very, very fast, but still takes
-            // perceptible time on multi-GB outputs. So if there's more
-            // than one chunk, hash in chunks with a progress bar.
+            // Hashing multi-GB outputs takes perceptible time. So if
+            // there's more than one chunk, hash in chunks with a
+            // progress bar.
             ctx.job_output_started(&job_id, stream, "Verifying", *len);
             let mut hasher = Hasher::new();
             for chunk in output.chunks(chunk_size.get() as usize) {
-                hasher.update_rayon(chunk);
+                hasher.update(chunk);
                 ctx.job_output_update(&job_id, stream, chunk.len() as u64);
             }
             check_hash!(hasher.finalize(), Some("✅ Verified"))

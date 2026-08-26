@@ -8,13 +8,13 @@ repository = "https://github.com/oxidecomputer/sush"
 publish = false
 
 [dependencies]
-blake3.workspace = true
 borsh.workspace = true
 bytes.workspace = true
 bytesize.workspace = true
 chrono.workspace = true
 crypto-bigint.workspace = true
 ed25519-dalek.workspace = true
+hex.workspace = true
 http-range-header.workspace = true
 http.workspace = true
 p256.workspace = true
@@ -31,6 +31,7 @@ sled-hardware-types.workspace = true
 slog.workspace = true
 ssh-key.workspace = true
 sha2.workspace = true
+sha3.workspace = true
 tempfile.workspace = true
 thiserror.workspace = true
 tokio.workspace = true

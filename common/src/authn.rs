@@ -29,7 +29,6 @@ use std::fmt;
 use std::str::FromStr;
 use std::time::Duration;
 
-use blake3::Hasher;
 use borsh::{BorshDeserialize, BorshSerialize};
 use chrono::{DateTime, Utc};
 use crypto_bigint::U256;
@@ -42,6 +41,7 @@ use thiserror::Error;
 
 use crate::codephrase_newtype;
 use crate::codephrases::InvalidCodephrase;
+use crate::hash::Hasher;
 use crate::keys::{
     EccR, EccS, EncodedSignature, KeyError, KeyId, Signed, SshPublicKey, ToBeSigned, Verified,
 };
@@ -215,9 +215,7 @@ impl BoundRequest {
         }
     }
 
-    /// BLAKE3 hash over every component, length-prefixed. The identity
-    /// is part of the signed material, so a signature spends its
-    /// sequence number for exactly one identity.
+    /// SHA3-256 hash over every component, length-prefixed.
     fn to_be_signed(&self, key_id: &KeyId, nonce: &Nonce) -> Vec<u8> {
         let mut hasher = Hasher::new();
         let mut hash = |data: &[u8]| {
@@ -385,7 +383,7 @@ impl ChallengeResponse {
 }
 
 impl ToBeSigned for ChallengeResponse {
-    /// BLAKE3 hash over the nonces and the ephemeral key.
+    /// SHA3-256 hash over the nonces and the ephemeral key.
     fn to_be_signed(&self) -> Vec<u8> {
         let mut hasher = Hasher::new();
         let mut hash = |data: &[u8]| {
