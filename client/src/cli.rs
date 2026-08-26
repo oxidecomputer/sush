@@ -19,6 +19,7 @@ use chrono::TimeDelta;
 use humantime::format_duration;
 use indicatif::{MultiProgress, ProgressBar, ProgressStyle};
 use rustix::io::ioctl_fionread;
+use serde::{Deserialize, Serialize};
 use serde_json::{json, to_string as to_json_string, to_string_pretty as to_json_string_pretty};
 use sled_hardware_types::BaseboardId;
 use x509_cert::Certificate;
@@ -99,17 +100,18 @@ impl Cli {
         let result = match session {
             Some(session) => serde_json::to_vec_pretty(session)
                 .map_err(io::Error::other)
-                .and_then(|json| {
-                    AtomicFile::new(path, OverwriteBehavior::AllowOverwrite)
-                        .write(|file| {
-                            file.set_permissions(Permissions::from_mode(0o600))?;
-                            file.write_all(&json)
-                        })
-                        .map_err(|error| match error {
-                            atomicwrites::Error::Internal(error)
-                            | atomicwrites::Error::User(error) => error,
-                        })
-                }),
+            .and_then(|json| {
+                AtomicFile::new(path, OverwriteBehavior::AllowOverwrite)
+                    .write(|file| {
+                        file.set_permissions(Permissions::from_mode(0o600))?;
+                        file.write_all(&json)
+                    })
+                    .map_err(|error| match error {
+                        atomicwrites::Error::Internal(error) | atomicwrites::Error::User(error) => {
+                            error
+                        }
+                    })
+            }),
             None => match fs::remove_file(path) {
                 Err(error) if error.kind() != ErrorKind::NotFound => Err(error),
                 _ => Ok(()),
@@ -295,7 +297,7 @@ impl CommandContext for Cli {
             self.save_session(None);
         }
         match self.get_output_format() {
-            OutputFormat::Json => println!("{}", json!({"session_ended": session_id})),
+            OutputFormat::Json => println!("{}", json!({"session_stopped": session_id})),
             OutputFormat::Text => println!("✅ Stopped session `{session_id}`"),
         }
         Ok(())
@@ -394,16 +396,30 @@ impl CommandContext for Cli {
 
     // Job management
 
-    fn job_started(&mut self, job: &SignedJob) {
+    fn job_started(&mut self, job: &SignedJob, show: bool) {
         if let Some(session) = self.session.lock().unwrap().as_mut() {
             session.job_started(job.to_owned());
             self.save_session(Some(session));
+        }
+        if !show {
+            return;
+        }
+        let job_id = job.job_id();
+        match self.get_output_format() {
+            OutputFormat::Json => println!("{}", json!({"job_started": job_id})),
+            OutputFormat::Text => {
+                if let Some(watch) = self.watch.lock().unwrap().as_ref() {
+                    let _ = watch.multi.println(format!("✅ Started job `{job_id}`"));
+                } else {
+                    println!("✅ Started job `{job_id}`");
+                }
+            }
         }
     }
 
     fn job_stopped(&mut self, job_id: &JobId) {
         match self.get_output_format() {
-            OutputFormat::Json => println!("{}", json!(job_id)),
+            OutputFormat::Json => println!("{}", json!({"job_stopped": job_id})),
             OutputFormat::Text => {
                 if let Some(watch) = self.watch.lock().unwrap().as_ref() {
                     let _ = watch.multi.println(format!("✅ Stopped job `{job_id}`"));

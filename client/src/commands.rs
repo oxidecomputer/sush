@@ -1296,7 +1296,7 @@ async fn job(
                 job_start(ctx, client, job, start_args.to_owned()).await
             } else {
                 ctx.job_signed(&job, true);
-                ctx.job_started(&job);
+                ctx.job_started(&job, false);
                 Ok(())
             }
         }
@@ -1456,7 +1456,7 @@ async fn job_start(
     // Start the job.
     if interactive {
         start.await?;
-        ctx.job_started(&job);
+        ctx.job_started(&job, true);
         match job_attach(ctx, client, &job_id, &target).await {
             Ok(()) | Err(CommandError::NotFound(_)) => {
                 job_status(ctx, client, &job_id, StatusDisplayStyle::Short).await?
@@ -1478,7 +1478,7 @@ async fn job_start(
             .open(&path)
             .map_err(|error| CommandError::io(&path, error))?;
         start.await?;
-        ctx.job_started(&job);
+        ctx.job_started(&job, true);
         let hasher = job_stream(ctx, client, &job_id, &target, &path, file).await?;
         let status = job_watch(ctx, client, &job_id, &target.clone().into()).await?;
         ctx.job_status(&job_id, &status, StatusDisplayStyle::Short);
@@ -1526,7 +1526,7 @@ async fn job_start(
                 // Wait for the start request to finish.
                 start_result = &mut start, if !started => {
                     match start_result {
-                        Ok(_) | Err(CommandError::TimedOut) => ctx.job_started(&job),
+                        Ok(_) | Err(CommandError::TimedOut) => ctx.job_started(&job, true),
                         Err(error) => {
                             ctx.job_watch_finished(&job_id);
                             return Err(error);
@@ -1629,7 +1629,7 @@ async fn job_start(
         }
     } else {
         start.await?;
-        ctx.job_started(&job);
+        ctx.job_started(&job, true);
     }
     Ok(())
 }

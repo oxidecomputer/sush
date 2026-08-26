@@ -138,7 +138,7 @@ pub trait CommandContext: Clone + Send + Sync {
 
     // Job management
     fn really_target(&mut self, sled: &SledId) -> Result<(), CommandError>;
-    fn job_started(&mut self, job: &SignedJob);
+    fn job_started(&mut self, job: &SignedJob, show: bool);
     fn job_stopped(&mut self, id: &JobId);
     fn job_skipped(&mut self, id: &JobId) -> bool;
     fn job_error(&mut self, error: CommandError) -> CommandError;
