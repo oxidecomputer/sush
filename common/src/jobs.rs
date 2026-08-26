@@ -10,7 +10,6 @@ use std::io::Error as IoError;
 use std::ops::Deref;
 use std::str::FromStr;
 
-use crate::hash::{Hash, Hasher, hash};
 use borsh::{BorshDeserialize, BorshSerialize};
 use bytesize::GB;
 use chrono::{DateTime, TimeDelta, Utc};
@@ -27,8 +26,9 @@ use crate::borsh::{
     borsh_de_datetime, borsh_de_hash, borsh_de_target, borsh_ser_datetime, borsh_ser_hash,
     borsh_ser_target,
 };
+use crate::hash::{Hash, Hasher, hash};
 use crate::interactive::InteractiveJobError;
-use crate::keys::{KeyId, Signed, ToBeSigned, Verified};
+use crate::keys::{KeyId, Signed, ToBeSigned, ToBeSignedFields, Verified};
 use crate::targets::{Cubbies, Target};
 
 codephrase_newtype! {
@@ -356,14 +356,8 @@ impl JobStartRequest {
 }
 
 impl ToBeSigned for JobStartRequest {
-    /// SHA3-256 hash over the fields of `self`.
+    /// Hash of the labeled fields of `self`, omitting defaults.
     fn to_be_signed(&self) -> Vec<u8> {
-        let mut hasher = Hasher::new();
-        let mut hash_with_len = |data: &[u8]| {
-            hasher.update(&(data.len() as u64).to_be_bytes());
-            hasher.update(data);
-        };
-
         let JobStartRequest {
             job_id,
             session_id,
@@ -372,24 +366,22 @@ impl ToBeSigned for JobStartRequest {
             streaming,
             target,
         } = self;
-        hash_with_len(Self::TYPE_NAME);
-        hash_with_len(b"job_id");
-        hash_with_len(&job_id.to_be_bytes());
-        hash_with_len(b"session_id");
-        hash_with_len(&session_id.to_be_bytes());
-        hash_with_len(b"command");
-        hash_with_len(command.as_bytes());
-        hash_with_len(b"interactive");
-        hash_with_len(if *interactive { &[1] } else { &[0] });
-        hash_with_len(b"streaming");
-        hash_with_len(match streaming {
-            Streaming::None => &[0],
-            Streaming::Input => &[1],
-            Streaming::Output => &[2],
-        });
-        hash_with_len(b"target");
-        hash_with_len(target.to_string().as_bytes());
-        hasher.finalize().as_bytes().to_vec()
+        let mut fields = ToBeSignedFields::new(Self::TYPE_NAME)
+            .field(b"job_id", &job_id.to_be_bytes())
+            .field(b"session_id", &session_id.to_be_bytes())
+            .field(b"command", command.as_bytes());
+        if *interactive {
+            fields = fields.field(b"interactive", &[1]);
+        }
+        match streaming {
+            Streaming::None => {}
+            Streaming::Input => fields = fields.field(b"streaming", &[1]),
+            Streaming::Output => fields = fields.field(b"streaming", &[2]),
+        }
+        if !target.is_all() {
+            fields = fields.field(b"target", target.to_string().as_bytes());
+        }
+        fields.finish()
     }
 }
 
@@ -858,6 +850,50 @@ mod test {
     use super::*;
     use crate::keys::{EccR, EccS, EncodedSignature};
     use crate::targets::SledId;
+
+    /// A request's defaulted fields stay out of the signed material,
+    /// so a signature made before a field existed still verifies
+    /// after it is added. The literal hash pins the scheme for
+    /// existing signatures.
+    #[test]
+    fn to_be_signed_omits_defaults() {
+        let job_id: JobId = "sea-say-sting-palm-tunnel-festival-pull-bid"
+            .parse()
+            .unwrap();
+        let session_id: SessionId = "supply-glance-fresh-desk-festival-fragile-spice-glow"
+            .parse()
+            .unwrap();
+        let request = JobStartRequest::new(
+            job_id,
+            session_id,
+            "true",
+            false,
+            Streaming::None,
+            Target::All,
+        );
+        assert_eq!(
+            request.to_be_signed(),
+            ToBeSignedFields::new(JobStartRequest::TYPE_NAME)
+                .field(b"job_id", &job_id.to_be_bytes())
+                .field(b"session_id", &session_id.to_be_bytes())
+                .field(b"command", b"true")
+                .finish()
+        );
+        assert_eq!(
+            hex::encode(request.to_be_signed()),
+            "d4113979cbe6960081753fd91c8a636601dd6b8edd839dcb83fe3c60adaed7fa"
+        );
+
+        let interactive = JobStartRequest::new(
+            job_id,
+            session_id,
+            "true",
+            true,
+            Streaming::None,
+            Target::All,
+        );
+        assert_ne!(interactive.to_be_signed(), request.to_be_signed());
+    }
 
     /// A signer that signed a job, a server that never ran it, and a
     /// server that ran it before the skip arrived all converge on the

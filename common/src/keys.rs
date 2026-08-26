@@ -46,7 +46,7 @@ use x509_cert::time::Validity;
 use x509_cert::{Certificate, TbsCertificate, Version};
 
 use crate::codephrases::InvalidCodephrase;
-use crate::hash::hash;
+use crate::hash::{Hasher, hash};
 
 codephrase_newtype! {
     /// SHA-256 of a certificate subject or an identity public key,
@@ -540,6 +540,35 @@ impl<T: AsRef<[u8]>> ToBeSigned for T {
     /// Trivial transformation for raw bytes.
     fn to_be_signed(&self) -> Vec<u8> {
         self.as_ref().to_vec()
+    }
+}
+
+/// Labeled, length-prefixed fields hashed into signable material.
+/// Callers should omit fields at their default values, so signatures
+/// made before a field existed still verify after it is added.
+/// Labels and defaults must never be reused, renamed, or changed.
+pub struct ToBeSignedFields(Hasher);
+
+impl ToBeSignedFields {
+    pub fn new(type_name: &[u8]) -> Self {
+        let mut fields = Self(Hasher::new());
+        fields.hash(type_name);
+        fields
+    }
+
+    fn hash(&mut self, data: &[u8]) {
+        self.0.update(&(data.len() as u64).to_be_bytes());
+        self.0.update(data);
+    }
+
+    pub fn field(mut self, label: &[u8], value: &[u8]) -> Self {
+        self.hash(label);
+        self.hash(value);
+        self
+    }
+
+    pub fn finish(self) -> Vec<u8> {
+        self.0.finalize().as_bytes().to_vec()
     }
 }
 

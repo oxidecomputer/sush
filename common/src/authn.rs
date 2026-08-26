@@ -41,9 +41,9 @@ use thiserror::Error;
 
 use crate::codephrase_newtype;
 use crate::codephrases::InvalidCodephrase;
-use crate::hash::Hasher;
 use crate::keys::{
-    EccR, EccS, EncodedSignature, KeyError, KeyId, Signed, SshPublicKey, ToBeSigned, Verified,
+    EccR, EccS, EncodedSignature, KeyError, KeyId, Signed, SshPublicKey, ToBeSigned,
+    ToBeSignedFields, Verified,
 };
 
 /// The name of our custom HTTP authentication scheme.
@@ -215,26 +215,20 @@ impl BoundRequest {
         }
     }
 
-    /// SHA3-256 hash over every component, length-prefixed.
+    /// Hash of the labeled components.
     fn to_be_signed(&self, key_id: &KeyId, nonce: &Nonce) -> Vec<u8> {
-        let mut hasher = Hasher::new();
-        let mut hash = |data: &[u8]| {
-            hasher.update(&(data.len() as u64).to_be_bytes());
-            hasher.update(data);
-        };
-
         let Self {
             method,
             target,
             seq,
         } = self;
-        hash(Self::TYPE_NAME);
-        hash(&key_id.to_be_bytes());
-        hash(&nonce.to_be_bytes());
-        hash(method.as_bytes());
-        hash(target.as_bytes());
-        hash(&seq.to_be_bytes());
-        hasher.finalize().as_bytes().to_vec()
+        ToBeSignedFields::new(Self::TYPE_NAME)
+            .field(b"key_id", &key_id.to_be_bytes())
+            .field(b"nonce", &nonce.to_be_bytes())
+            .field(b"method", method.as_bytes())
+            .field(b"target", target.as_bytes())
+            .field(b"seq", &seq.to_be_bytes())
+            .finish()
     }
 }
 
@@ -383,20 +377,14 @@ impl ChallengeResponse {
 }
 
 impl ToBeSigned for ChallengeResponse {
-    /// SHA3-256 hash over the nonces and the ephemeral key.
+    /// Hash of the labeled nonces and ephemeral key.
     fn to_be_signed(&self) -> Vec<u8> {
-        let mut hasher = Hasher::new();
-        let mut hash = |data: &[u8]| {
-            hasher.update(&(data.len() as u64).to_be_bytes());
-            hasher.update(data);
-        };
-
         let Self { nonce, cnonce, epk } = self;
-        hash(Self::TYPE_NAME);
-        hash(&nonce.to_be_bytes());
-        hash(&cnonce.to_be_bytes());
-        hash(&epk.to_be_bytes());
-        hasher.finalize().as_bytes().to_vec()
+        ToBeSignedFields::new(Self::TYPE_NAME)
+            .field(b"nonce", &nonce.to_be_bytes())
+            .field(b"cnonce", &cnonce.to_be_bytes())
+            .field(b"epk", &epk.to_be_bytes())
+            .finish()
     }
 }
 
