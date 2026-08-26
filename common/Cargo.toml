@@ -36,3 +36,6 @@ thiserror.workspace = true
 tokio.workspace = true
 tokio-tungstenite.workspace = true
 x509-cert.workspace = true
+
+[dev-dependencies]
+ciborium.workspace = true

@@ -181,7 +181,28 @@ impl JsonSchema for Codephrase {
 macro_rules! codephrase_newtype {
     ($(#[$meta:meta])* $vis:vis struct $name:ident = $len:ident;) => {
         $(#[$meta])*
+        #[serde(try_from = "crate::codephrases::Codephrase")]
         $vis struct $name($crate::codephrases::Codephrase);
+
+        /// Fail on values wider than the type allows, canonicalizing
+        /// both parsed and deserialized values.
+        impl TryFrom<$crate::codephrases::Codephrase> for $name {
+            type Error = $crate::codephrases::InvalidCodephrase;
+
+            fn try_from(
+                codephrase: $crate::codephrases::Codephrase,
+            ) -> Result<Self, Self::Error> {
+                match $crate::codephrases::CodephraseLength::$len {
+                    $crate::codephrases::CodephraseLength::Full => {}
+                    $crate::codephrases::CodephraseLength::Truncated => {
+                        if codephrase.truncate() != codephrase {
+                            return Err($crate::codephrases::InvalidCodephrase);
+                        }
+                    }
+                }
+                Ok(Self(codephrase))
+            }
+        }
 
         impl $name {
             #[allow(unused)]
@@ -242,7 +263,7 @@ macro_rules! codephrase_newtype {
             type Err = $crate::codephrases::InvalidCodephrase;
 
             fn from_str(s: &str) -> Result<$name, Self::Err> {
-                Ok($name(s.parse()?))
+                s.parse::<$crate::codephrases::Codephrase>()?.try_into()
             }
         }
     }
@@ -327,6 +348,25 @@ mod test {
         assert!(Codephrase::from_str(&smallest.join(WORD_SEPARATOR)).is_err());
         let largest = [word(WORDLIST_LEN - 1); PHRASE_WORDS_256].join(WORD_SEPARATOR);
         assert!(Codephrase::from_str(&largest).is_err());
+    }
+
+    #[test]
+    fn wide_values_reject_where_truncated() {
+        use crate::jobs::JobId;
+        use crate::keys::EccR;
+
+        let wide = EccR::from_be_bytes([0xff; 32]).to_string();
+        assert!(wide.parse::<EccR>().is_ok());
+        assert!(wide.parse::<JobId>().is_err());
+        assert!(serde_json::from_value::<JobId>(serde_json::json!(wide)).is_err());
+
+        let mut bytes = Vec::new();
+        ciborium::ser::into_writer(&EccR::from_be_bytes([0xff; 32]), &mut bytes).unwrap();
+        assert!(ciborium::de::from_reader::<EccR, _>(bytes.as_slice()).is_ok());
+        assert!(ciborium::de::from_reader::<JobId, _>(bytes.as_slice()).is_err());
+
+        let canonical = JobId::from_be_bytes([0xff; 32]);
+        assert_eq!(canonical.to_string().parse::<JobId>().unwrap(), canonical);
     }
 
     #[test]
