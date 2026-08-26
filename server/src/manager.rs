@@ -648,7 +648,7 @@ impl JobManager {
         }
 
         // A broader target would orphan jobs on unattached sleds.
-        if payload.interactive && payload.target().single_baseboard().is_none() {
+        if payload.is_interactive() && payload.target().single_baseboard().is_none() {
             return Err(JobError::InteractiveTarget);
         }
 

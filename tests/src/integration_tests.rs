@@ -40,6 +40,7 @@ use sush_api::JobWait;
 use sush_api::sush_api_mod::api_description;
 use sush_client::tls::client as tls_client;
 use sush_client::{AuthzSigner, Client, Error as ClientError};
+use sush_common::hash::hash;
 use sush_common::interactive::{InteractiveJobControl, InteractiveJobMessage};
 use sush_common::jobs::{
     Access, JobLimits, JobOutputState, JobOutputStream, JobStatus, Session, SessionId,
@@ -1001,7 +1002,7 @@ async fn streaming_job() {
     assert_eq!(result, Ok(0));
     assert_eq!(stdout_len, LEN as u64);
     assert_eq!(stderr_len, 0);
-    assert_eq!(stdout_hash, blake3::hash(&streamed).into());
+    assert_eq!(stdout_hash, hash(&streamed).into());
 
     // Streamed output is never stored, so it cannot be fetched.
     let Err(error) = client
@@ -1154,5 +1155,5 @@ async fn streaming_job_linger() {
     };
     assert_eq!(result, Ok(0));
     assert_eq!(stdout_len, streamed.len() as u64);
-    assert_eq!(stdout_hash, blake3::hash(&streamed).into());
+    assert_eq!(stdout_hash, hash(&streamed).into());
 }

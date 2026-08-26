@@ -11,10 +11,8 @@
 
 use std::borrow::Cow;
 use std::fmt;
-use std::io::{self, Read, Write};
 use std::str::FromStr;
 
-use borsh::{BorshDeserialize, BorshSerialize};
 use crypto_bigint::{
     ArrayEncoding as _, CheckedAdd as _, CheckedMul as _, Encoding as _, Limb, Random as _,
     Reciprocal, U256,
@@ -25,6 +23,7 @@ use serde::de::Error as _;
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
 use thiserror::Error;
 
+use crate::wire::ExactBytes;
 use crate::wordlist::{WORDLIST, WORDLIST_LEN};
 
 /// Entropy is treated as an integer whose base is to be changed
@@ -135,29 +134,27 @@ impl FromStr for Codephrase {
     }
 }
 
+/// Phrases for humans, raw big-endian bytes for binary formats.
 impl Serialize for Codephrase {
     fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
-        serializer.serialize_str(&self.to_string())
+        if serializer.is_human_readable() {
+            serializer.serialize_str(&self.to_string())
+        } else {
+            serializer.serialize_bytes(&self.to_be_bytes())
+        }
     }
 }
 
 impl<'de> Deserialize<'de> for Codephrase {
     fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
-        let string = <String as Deserialize>::deserialize(deserializer)?;
-        Self::from_str(&string).map_err(D::Error::custom)
-    }
-}
-
-impl BorshSerialize for Codephrase {
-    fn serialize<W: Write>(&self, writer: &mut W) -> io::Result<()> {
-        <[u8; 32] as BorshSerialize>::serialize(&self.to_be_bytes(), writer)
-    }
-}
-
-impl BorshDeserialize for Codephrase {
-    fn deserialize_reader<R: Read>(reader: &mut R) -> io::Result<Self> {
-        let bytes = <[u8; 32] as BorshDeserialize>::deserialize_reader(reader)?;
-        Ok(Self(U256::from_be_byte_array(bytes.into())))
+        if deserializer.is_human_readable() {
+            let string = <String as Deserialize>::deserialize(deserializer)?;
+            Self::from_str(&string).map_err(D::Error::custom)
+        } else {
+            Ok(Self::from_be_bytes(
+                deserializer.deserialize_bytes(ExactBytes::<32>)?,
+            ))
+        }
     }
 }
 
@@ -184,7 +181,28 @@ impl JsonSchema for Codephrase {
 macro_rules! codephrase_newtype {
     ($(#[$meta:meta])* $vis:vis struct $name:ident = $len:ident;) => {
         $(#[$meta])*
+        #[serde(try_from = "crate::codephrases::Codephrase")]
         $vis struct $name($crate::codephrases::Codephrase);
+
+        /// Fail on values wider than the type allows, canonicalizing
+        /// both parsed and deserialized values.
+        impl TryFrom<$crate::codephrases::Codephrase> for $name {
+            type Error = $crate::codephrases::InvalidCodephrase;
+
+            fn try_from(
+                codephrase: $crate::codephrases::Codephrase,
+            ) -> Result<Self, Self::Error> {
+                match $crate::codephrases::CodephraseLength::$len {
+                    $crate::codephrases::CodephraseLength::Full => {}
+                    $crate::codephrases::CodephraseLength::Truncated => {
+                        if codephrase.truncate() != codephrase {
+                            return Err($crate::codephrases::InvalidCodephrase);
+                        }
+                    }
+                }
+                Ok(Self(codephrase))
+            }
+        }
 
         impl $name {
             #[allow(unused)]
@@ -200,7 +218,7 @@ macro_rules! codephrase_newtype {
             }
 
             #[allow(unused)]
-            $vis fn from_hash(hash: blake3::Hash) -> Self {
+            $vis fn from_hash(hash: $crate::hash::Hash) -> Self {
                 let mut codephrase = $crate::codephrases::Codephrase::from_be_bytes(*hash.as_bytes());
                 match $crate::codephrases::CodephraseLength::$len {
                     $crate::codephrases::CodephraseLength::Full => {}
@@ -245,7 +263,7 @@ macro_rules! codephrase_newtype {
             type Err = $crate::codephrases::InvalidCodephrase;
 
             fn from_str(s: &str) -> Result<$name, Self::Err> {
-                Ok($name(s.parse()?))
+                s.parse::<$crate::codephrases::Codephrase>()?.try_into()
             }
         }
     }
@@ -333,32 +351,52 @@ mod test {
     }
 
     #[test]
+    fn wide_values_reject_where_truncated() {
+        use crate::jobs::JobId;
+        use crate::keys::EccR;
+
+        let wide = EccR::from_be_bytes([0xff; 32]).to_string();
+        assert!(wide.parse::<EccR>().is_ok());
+        assert!(wide.parse::<JobId>().is_err());
+        assert!(serde_json::from_value::<JobId>(serde_json::json!(wide)).is_err());
+
+        let mut bytes = Vec::new();
+        ciborium::ser::into_writer(&EccR::from_be_bytes([0xff; 32]), &mut bytes).unwrap();
+        assert!(ciborium::de::from_reader::<EccR, _>(bytes.as_slice()).is_ok());
+        assert!(ciborium::de::from_reader::<JobId, _>(bytes.as_slice()).is_err());
+
+        let canonical = JobId::from_be_bytes([0xff; 32]);
+        assert_eq!(canonical.to_string().parse::<JobId>().unwrap(), canonical);
+    }
+
+    #[test]
     fn constant_codephrases() {
         assert_eq!(
             round_trip(U256::from_be_slice(
-                blake3::hash(b"test phrase one").as_slice()
+                crate::hash::hash(b"test phrase one").as_bytes()
             )),
-            "able-wet-frame-clown-gauge-gather-curious-\
-             stereo-moment-moral-mirror-net-laptop-square-\
-             toe-skill-upper-credit-cancel-flag-what-powder-\
-             guide-hold"
+            "above-favorite-secret-decorate-wolf-year-pencil-\
+             scan-cage-stage-neither-border-transfer-hamster-\
+             hand-journey-track-amazing-put-inmate-bread-\
+             fossil-sugar-metal"
         );
         assert_eq!(
             round_trip(U256::from_be_slice(
-                blake3::hash(b"another test phrase").as_slice()
+                crate::hash::hash(b"another test phrase").as_bytes()
             )),
-            "about-item-skill-author-expose-assume-language-\
-             mix-tornado-undo-dolphin-obtain-good-quarter-\
-             poem-under-system-hybrid-foil-person-together-\
-             output-exhaust-today"
+            "above-accident-quarter-topic-mango-chef-galaxy-\
+             brisk-company-tray-affair-lumber-raccoon-cat-\
+             devote-boy-festival-slab-trip-fantasy-drum-\
+             output-worry-chunk"
         );
         assert_eq!(
             round_trip(U256::from_be_slice(
-                blake3::hash(b"one more for luck!").as_slice()
+                crate::hash::hash(b"one more for luck!").as_bytes()
             )),
-            "able-hazard-bread-decade-elegant-omit-ensure-\
-             sudden-beef-voice-remove-nut-wish-bind-birth-b\
-             leak-brush-joke-seven-amused-sunny-kite-flee-tape"
+            "abstract-humor-genuine-clarify-flash-extend-\
+             hospital-hockey-reduce-picnic-avoid-crawl-voice-\
+             tool-cash-neck-enlist-gossip-unlock-crime-piano-\
+             gloom-search-video"
         );
     }
 

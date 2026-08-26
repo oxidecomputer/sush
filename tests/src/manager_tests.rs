@@ -29,8 +29,8 @@ use sush_api::{JobStartParams, JobStopParams, JobWait};
 use sush_client::context::Authz;
 use sush_common::authn::{Challenge, ChallengeResponse, Credentials, Identity, Nonce, RequestKey};
 use sush_common::jobs::{
-    Access, JobId, JobLimits, JobOutputState, JobOutputStream::*, JobStartRequest, JobStatus,
-    ProcessError, Session, SessionId, SessionSignerNonce, SignedJob, Streaming,
+    Access, JobId, JobLimits, JobMode, JobOutputState, JobOutputStream::*, JobStartRequest,
+    JobStatus, ProcessError, Session, SessionId, SessionSignerNonce, SignedJob,
 };
 use sush_common::keys::{EphemeralKey, KeyError, KeyId, KeyType, Signer as _, pem_cert_chain};
 use sush_common::targets::{Cubbies, Target};
@@ -1320,8 +1320,7 @@ async fn job_targets() {
             job_id,
             session_id,
             command,
-            false,
-            Streaming::None,
+            JobMode::Batch,
             target.parse().unwrap(),
         );
         let job = root
@@ -2557,17 +2556,10 @@ async fn streaming_validation() {
         .await
         .unwrap();
 
-    let mut expect_invalid = async |streaming: Streaming, target: Target| {
+    let mut expect_invalid = async |mode: JobMode, target: Target| {
         let job_id = session.next_job_id();
         let job = root
-            .sign_full_job_request(
-                job_id,
-                session.session_id(),
-                "true",
-                false,
-                streaming,
-                target,
-            )
+            .sign_full_job_request(job_id, session.session_id(), "true", mode, target)
             .await;
         session.job_started(job.clone().into_signed());
         mgr.job_start(
@@ -2584,11 +2576,11 @@ async fn streaming_validation() {
         assert!(matches!(status, JobStatus::Error { .. }), "{status:?}");
     };
 
-    expect_invalid(Streaming::Output, Target::All).await;
+    expect_invalid(JobMode::StreamOutput, Target::All).await;
     expect_invalid(
-        Streaming::Output,
+        JobMode::StreamOutput,
         format!("{},14", test_baseboard_id()).parse().unwrap(),
     )
     .await;
-    expect_invalid(Streaming::Input, test_baseboard_id().into()).await;
+    expect_invalid(JobMode::StreamInput, test_baseboard_id().into()).await;
 }

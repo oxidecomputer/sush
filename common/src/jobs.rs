@@ -10,32 +10,24 @@ use std::io::Error as IoError;
 use std::ops::Deref;
 use std::str::FromStr;
 
-use blake3::{Hash, Hasher, hash};
-use borsh::{BorshDeserialize, BorshSerialize};
 use bytesize::GB;
 use chrono::{DateTime, TimeDelta, Utc};
 use rlimit::Resource;
 use schemars::schema::{Schema, SchemaObject};
 use schemars::{JsonSchema, SchemaGenerator};
-use serde::de::{Deserializer, Error as DeserializeError, Visitor};
-use serde::{Deserialize, Serialize, Serializer};
+use serde::{Deserialize, Serialize};
 pub use sled_hardware_types::BaseboardId;
 use sled_hardware_types::BaseboardIdParseError;
 use thiserror::Error;
 
-use crate::borsh::{
-    borsh_de_datetime, borsh_de_hash, borsh_de_target, borsh_ser_datetime, borsh_ser_hash,
-    borsh_ser_target,
-};
+use crate::hash::{Hash, Hasher, hash};
 use crate::interactive::InteractiveJobError;
-use crate::keys::{KeyId, Signed, ToBeSigned, Verified};
+use crate::keys::{KeyId, Signed, ToBeSigned, ToBeSignedFields, Verified};
 use crate::targets::{Cubbies, Target};
 
 codephrase_newtype! {
     /// A globally unique identifier for a job within a session.
     #[derive(
-        BorshDeserialize,
-        BorshSerialize,
         Copy,
         Clone,
         Deserialize,
@@ -70,8 +62,6 @@ impl From<&JobId> for JobId {
 codephrase_newtype! {
     /// A globally unique identifier for a session.
     #[derive(
-        BorshDeserialize,
-        BorshSerialize,
         Copy,
         Clone,
         Deserialize,
@@ -232,76 +222,51 @@ impl Session {
     }
 }
 
-/// Allow **unrecorded** streaming I/O.
-#[derive(
-    BorshDeserialize,
-    BorshSerialize,
-    Clone,
-    Copy,
-    Debug,
-    Default,
-    Deserialize,
-    Eq,
-    JsonSchema,
-    PartialEq,
-    Serialize,
-)]
-pub enum Streaming {
+/// How a job runs. The streaming modes allow **unrecorded** I/O.
+#[derive(Clone, Copy, Debug, Default, Deserialize, Eq, JsonSchema, PartialEq, Serialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum JobMode {
     #[default]
-    None,
-    Input,
-    Output,
+    Batch,
+    Interactive,
+    StreamInput,
+    StreamOutput,
 }
 
-impl Streaming {
-    pub fn is_none(&self) -> bool {
-        matches!(self, Self::None)
+impl JobMode {
+    pub fn is_batch(&self) -> bool {
+        matches!(self, Self::Batch)
     }
 
-    pub fn is_some(&self) -> bool {
-        !self.is_none()
+    pub fn is_interactive(&self) -> bool {
+        matches!(self, Self::Interactive)
+    }
+
+    pub fn is_streaming(&self) -> bool {
+        matches!(self, Self::StreamInput | Self::StreamOutput)
     }
 
     pub fn as_str(&self) -> &'static str {
         match self {
-            Self::None => "none",
-            Self::Input => "input",
-            Self::Output => "output",
+            Self::Batch => "batch",
+            Self::Interactive => "interactive",
+            Self::StreamInput => "stream-input",
+            Self::StreamOutput => "stream-output",
         }
     }
 }
 
 /// A request to run the given `command` as `job_id`.
-#[derive(
-    BorshDeserialize,
-    BorshSerialize,
-    Clone,
-    Debug,
-    Deserialize,
-    Eq,
-    JsonSchema,
-    PartialEq,
-    Serialize,
-)]
+#[derive(Clone, Debug, Deserialize, Eq, JsonSchema, PartialEq, Serialize)]
 pub struct JobStartRequest {
     pub job_id: JobId,
     pub session_id: SessionId,
     pub command: String,
-    #[serde(default, skip_serializing_if = "is_false")]
-    pub interactive: bool,
-    #[serde(default, skip_serializing_if = "Streaming::is_none")]
-    pub streaming: Streaming,
+    #[serde(default, skip_serializing_if = "JobMode::is_batch")]
+    pub mode: JobMode,
     /// The sleds this job runs on.
-    #[borsh(
-        serialize_with = "borsh_ser_target",
-        deserialize_with = "borsh_de_target"
-    )]
     #[serde(default, skip_serializing_if = "Target::is_all")]
     pub target: Target,
-}
-
-fn is_false(x: &bool) -> bool {
-    !x
 }
 
 impl JobStartRequest {
@@ -311,23 +276,21 @@ impl JobStartRequest {
         job_id: JobId,
         session_id: SessionId,
         command: S,
-        interactive: bool,
-        streaming: Streaming,
+        mode: JobMode,
         target: Target,
     ) -> Self {
         Self {
             job_id,
             session_id,
             command: command.as_ref().to_string(),
-            interactive,
-            streaming,
+            mode,
             target,
         }
     }
 
     /// Interactive jobs run only on their single named baseboard.
     pub fn runs_on(&self, baseboard: &BaseboardId, cubbies: &Cubbies) -> bool {
-        if self.interactive {
+        if self.mode.is_interactive() {
             self.target.single_baseboard() == Some(baseboard)
         } else {
             self.target.includes(baseboard, cubbies)
@@ -346,8 +309,8 @@ impl JobStartRequest {
         &self.command
     }
 
-    pub fn interactive(&self) -> bool {
-        self.interactive
+    pub fn is_interactive(&self) -> bool {
+        self.mode.is_interactive()
     }
 
     pub fn target(&self) -> &Target {
@@ -356,96 +319,58 @@ impl JobStartRequest {
 }
 
 impl ToBeSigned for JobStartRequest {
-    /// BLAKE3 hash over the fields of `self`.
+    /// Hash of the labeled fields of `self`, omitting defaults.
     fn to_be_signed(&self) -> Vec<u8> {
-        let mut hasher = Hasher::new();
-        let mut hash_with_len = |data: &[u8]| {
-            hasher.update(&(data.len() as u64).to_be_bytes());
-            hasher.update(data);
-        };
-
         let JobStartRequest {
             job_id,
             session_id,
             command,
-            interactive,
-            streaming,
+            mode,
             target,
         } = self;
-        hash_with_len(Self::TYPE_NAME);
-        hash_with_len(b"job_id");
-        hash_with_len(&job_id.to_be_bytes());
-        hash_with_len(b"session_id");
-        hash_with_len(&session_id.to_be_bytes());
-        hash_with_len(b"command");
-        hash_with_len(command.as_bytes());
-        hash_with_len(b"interactive");
-        hash_with_len(if *interactive { &[1] } else { &[0] });
-        hash_with_len(b"streaming");
-        hash_with_len(match streaming {
-            Streaming::None => &[0],
-            Streaming::Input => &[1],
-            Streaming::Output => &[2],
-        });
-        hash_with_len(b"target");
-        hash_with_len(target.to_string().as_bytes());
-        hasher.finalize().as_bytes().to_vec()
+        let mut fields = ToBeSignedFields::new(Self::TYPE_NAME)
+            .field(b"job_id", &job_id.to_be_bytes())
+            .field(b"session_id", &session_id.to_be_bytes())
+            .field(b"command", command.as_bytes());
+        if !mode.is_batch() {
+            fields = fields.field(b"mode", mode.as_str().as_bytes());
+        }
+        if !target.is_all() {
+            fields = fields.field(b"target", target.to_string().as_bytes());
+        }
+        fields.finish()
     }
 }
 
 pub type SignedJob = Signed<JobStartRequest>;
 pub type VerifiedJob = Verified<JobStartRequest>;
 
-#[derive(BorshDeserialize, BorshSerialize, Clone, Debug, Deserialize, JsonSchema, Serialize)]
+#[derive(Clone, Debug, Deserialize, JsonSchema, Serialize)]
 pub enum JobStatus {
     Cancelled {
         job_id: JobId,
-        #[borsh(
-            serialize_with = "borsh_ser_datetime",
-            deserialize_with = "borsh_de_datetime"
-        )]
         time_cancelled: DateTime<Utc>,
         /// The key that requested the cancellation.
         actor: KeyId,
     },
     Queued {
         job_id: JobId,
-        #[borsh(
-            serialize_with = "borsh_ser_datetime",
-            deserialize_with = "borsh_de_datetime"
-        )]
         time_queued: DateTime<Utc>,
         /// The key that submitted the job.
         actor: KeyId,
     },
     Error {
         job_id: JobId,
-        #[borsh(
-            serialize_with = "borsh_ser_datetime",
-            deserialize_with = "borsh_de_datetime"
-        )]
         time_error: DateTime<Utc>,
         error: ProcessError,
     },
     Started {
         job_id: JobId,
-        #[borsh(
-            serialize_with = "borsh_ser_datetime",
-            deserialize_with = "borsh_de_datetime"
-        )]
         time_started: DateTime<Utc>,
     },
     Stopped {
         job_id: JobId,
-        #[borsh(
-            serialize_with = "borsh_ser_datetime",
-            deserialize_with = "borsh_de_datetime"
-        )]
         time_started: DateTime<Utc>,
-        #[borsh(
-            serialize_with = "borsh_ser_datetime",
-            deserialize_with = "borsh_de_datetime"
-        )]
         time_stopped: DateTime<Utc>,
         result: Result<i32, ProcessError>,
         output: JobOutputState,
@@ -479,18 +404,7 @@ pub fn job_status_to_json_map(status_map: JobStatusMap) -> JsonJobStatusMap {
 ///
 /// We currently squash inner errors into strings to avoid excessive
 /// derivation requirements, but may come to regret that decision.
-#[derive(
-    BorshSerialize,
-    BorshDeserialize,
-    Clone,
-    Debug,
-    Deserialize,
-    Eq,
-    Error,
-    JsonSchema,
-    PartialEq,
-    Serialize,
-)]
+#[derive(Clone, Debug, Deserialize, Eq, Error, JsonSchema, PartialEq, Serialize)]
 pub enum ProcessError {
     #[error("The fate of the process is unknown")]
     Unknown,
@@ -603,18 +517,7 @@ impl JobStatus {
     }
 }
 
-#[derive(
-    BorshDeserialize,
-    BorshSerialize,
-    Clone,
-    Debug,
-    Default,
-    Deserialize,
-    Eq,
-    JsonSchema,
-    PartialEq,
-    Serialize,
-)]
+#[derive(Clone, Debug, Default, Deserialize, Eq, JsonSchema, PartialEq, Serialize)]
 pub struct JobOutputState {
     pub stdout_len: u64,
     pub stderr_len: u64,
@@ -622,24 +525,9 @@ pub struct JobOutputState {
     pub stderr_hash: JobOutputHash,
 }
 
-/// BLAKE3 hash of job output, used as a checksum.
-#[derive(
-    BorshDeserialize,
-    BorshSerialize,
-    Clone,
-    Debug,
-    Deserialize,
-    Eq,
-    JsonSchema,
-    PartialEq,
-    Serialize,
-)]
-pub struct JobOutputHash(
-    #[serde(serialize_with = "hash_ser", deserialize_with = "hash_de")]
-    #[schemars(schema_with = "hash_schema")]
-    #[borsh(serialize_with = "borsh_ser_hash", deserialize_with = "borsh_de_hash")]
-    Hash,
-);
+/// SHA3-256 hash of job output, used as a checksum.
+#[derive(Clone, Debug, Deserialize, Eq, JsonSchema, PartialEq, Serialize)]
+pub struct JobOutputHash(#[schemars(schema_with = "hash_schema")] Hash);
 
 impl Default for JobOutputHash {
     fn default() -> Self {
@@ -667,37 +555,6 @@ impl fmt::Display for JobOutputHash {
     }
 }
 
-fn hash_ser<S>(hash: &Hash, ser: S) -> Result<S::Ok, S::Error>
-where
-    S: Serializer,
-{
-    ser.serialize_str(&hash.to_string())
-}
-
-fn hash_de<'de, D>(de: D) -> Result<Hash, D::Error>
-where
-    D: Deserializer<'de>,
-{
-    struct HashVisitor;
-
-    impl<'de> Visitor<'de> for HashVisitor {
-        type Value = Hash;
-
-        fn expecting(&self, f: &mut fmt::Formatter) -> fmt::Result {
-            f.write_str("a hex encoded 32 byte BLAKE3 hash")
-        }
-
-        fn visit_str<E>(self, v: &str) -> Result<Self::Value, E>
-        where
-            E: DeserializeError,
-        {
-            Hash::from_hex(v).map_err(DeserializeError::custom)
-        }
-    }
-
-    de.deserialize_str(HashVisitor)
-}
-
 fn hash_schema(g: &mut SchemaGenerator) -> Schema {
     let mut schema: SchemaObject = <String>::json_schema(g).into();
     schema.format = Some("hex encoded hash (32 bytes)".to_owned());
@@ -705,17 +562,7 @@ fn hash_schema(g: &mut SchemaGenerator) -> Schema {
 }
 
 /// Limits on job processes.
-#[derive(
-    BorshDeserialize,
-    BorshSerialize,
-    Clone,
-    Debug,
-    Deserialize,
-    Eq,
-    JsonSchema,
-    Serialize,
-    PartialEq,
-)]
+#[derive(Clone, Debug, Deserialize, Eq, JsonSchema, Serialize, PartialEq)]
 pub struct JobLimits {
     /// Maximum CPU use in seconds.
     pub max_cpu: u64,
@@ -774,19 +621,7 @@ impl Default for JobLimits {
 /// Read-write means co-driving a shell the job signature authorized,
 /// so who deserves it is deployment policy. Recorded output is not
 /// gated: it is the customer's data, readable by any authenticated key.
-#[derive(
-    BorshDeserialize,
-    BorshSerialize,
-    Clone,
-    Copy,
-    Debug,
-    Default,
-    Deserialize,
-    Eq,
-    JsonSchema,
-    PartialEq,
-    Serialize,
-)]
+#[derive(Clone, Copy, Debug, Default, Deserialize, Eq, JsonSchema, PartialEq, Serialize)]
 #[serde(rename_all = "kebab-case")]
 pub enum Access {
     #[default]
@@ -804,18 +639,7 @@ impl Access {
 }
 
 /// Either the standard output or standard error of a job.
-#[derive(
-    BorshDeserialize,
-    BorshSerialize,
-    Clone,
-    Copy,
-    Debug,
-    Deserialize,
-    Eq,
-    JsonSchema,
-    PartialEq,
-    Serialize,
-)]
+#[derive(Clone, Copy, Debug, Deserialize, Eq, JsonSchema, PartialEq, Serialize)]
 #[serde(rename_all = "lowercase")]
 pub enum JobOutputStream {
     Stdout,
@@ -859,6 +683,42 @@ mod test {
     use crate::keys::{EccR, EccS, EncodedSignature};
     use crate::targets::SledId;
 
+    /// A request's defaulted fields stay out of the signed material,
+    /// so a signature made before a field existed still verifies
+    /// after it is added. The literal hash pins the scheme for
+    /// existing signatures.
+    #[test]
+    fn to_be_signed_omits_defaults() {
+        let job_id: JobId = "sea-say-sting-palm-tunnel-festival-pull-bid"
+            .parse()
+            .unwrap();
+        let session_id: SessionId = "supply-glance-fresh-desk-festival-fragile-spice-glow"
+            .parse()
+            .unwrap();
+        let request = JobStartRequest::new(job_id, session_id, "true", JobMode::Batch, Target::All);
+        assert_eq!(
+            request.to_be_signed(),
+            ToBeSignedFields::new(JobStartRequest::TYPE_NAME)
+                .field(b"job_id", &job_id.to_be_bytes())
+                .field(b"session_id", &session_id.to_be_bytes())
+                .field(b"command", b"true")
+                .finish()
+        );
+        assert_eq!(
+            hex::encode(request.to_be_signed()),
+            "d4113979cbe6960081753fd91c8a636601dd6b8edd839dcb83fe3c60adaed7fa"
+        );
+
+        let interactive = JobStartRequest::new(
+            job_id,
+            session_id,
+            "true",
+            JobMode::Interactive,
+            Target::All,
+        );
+        assert_ne!(interactive.to_be_signed(), request.to_be_signed());
+    }
+
     /// A signer that signed a job, a server that never ran it, and a
     /// server that ran it before the skip arrived all converge on the
     /// same next job ID after a skip. A replayed skip is refused.
@@ -869,14 +729,7 @@ mod test {
         let mut server = Session::new(session_id);
 
         let job_id = signer.next_job_id();
-        let request = JobStartRequest::new(
-            job_id,
-            session_id,
-            "true",
-            false,
-            Streaming::None,
-            Target::All,
-        );
+        let request = JobStartRequest::new(job_id, session_id, "true", JobMode::Batch, Target::All);
         let signed = Signed::new(
             request,
             KeyId::random(),
@@ -913,24 +766,18 @@ mod test {
         };
         let me = sled("me");
         let cubbies = Cubbies::from([(14, me.clone())]);
-        let job = |interactive, target| {
-            JobStartRequest::new(
-                JobId::random(),
-                SessionId::random(),
-                "true",
-                interactive,
-                Streaming::None,
-                target,
-            )
+        let job = |mode, target| {
+            JobStartRequest::new(JobId::random(), SessionId::random(), "true", mode, target)
         };
+        use JobMode::*;
         let just_me = Target::Sleds(vec![SledId::Baseboard(me.clone())]);
-        assert!(job(true, just_me.clone()).runs_on(&me, &cubbies));
-        assert!(job(false, just_me).runs_on(&me, &cubbies));
-        assert!(!job(true, Target::All).runs_on(&me, &cubbies));
-        assert!(job(false, Target::All).runs_on(&me, &cubbies));
+        assert!(job(Interactive, just_me.clone()).runs_on(&me, &cubbies));
+        assert!(job(Batch, just_me).runs_on(&me, &cubbies));
+        assert!(!job(Interactive, Target::All).runs_on(&me, &cubbies));
+        assert!(job(Batch, Target::All).runs_on(&me, &cubbies));
         let my_cubby = Target::Sleds(vec![SledId::Cubby(14)]);
-        assert!(!job(true, my_cubby.clone()).runs_on(&me, &cubbies));
-        assert!(job(false, my_cubby).runs_on(&me, &cubbies));
+        assert!(!job(Interactive, my_cubby.clone()).runs_on(&me, &cubbies));
+        assert!(job(Batch, my_cubby).runs_on(&me, &cubbies));
     }
 
     /// Requested limits may narrow the default ceiling, never widen it.

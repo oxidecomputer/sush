@@ -8,7 +8,6 @@ repository = "https://github.com/oxidecomputer/sush"
 publish = false
 
 [dependencies]
-borsh.workspace = true
 chrono.workspace = true
 dropshot.workspace = true
 http-range-header.workspace = true

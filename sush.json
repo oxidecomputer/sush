@@ -1217,8 +1217,18 @@
         "description": "A globally unique identifier for a job within a session.",
         "type": "string"
       },
+      "JobMode": {
+        "description": "How a job runs. The streaming modes allow **unrecorded** I/O.",
+        "type": "string",
+        "enum": [
+          "batch",
+          "interactive",
+          "stream-input",
+          "stream-output"
+        ]
+      },
       "JobOutputHash": {
-        "description": "BLAKE3 hash of job output, used as a checksum.",
+        "description": "SHA3-256 hash of job output, used as a checksum.",
         "type": "string",
         "format": "hex encoded hash (32 bytes)"
       },
@@ -1264,17 +1274,14 @@
           "command": {
             "type": "string"
           },
-          "interactive": {
-            "type": "boolean"
-          },
           "job_id": {
             "$ref": "#/components/schemas/JobId"
           },
+          "mode": {
+            "$ref": "#/components/schemas/JobMode"
+          },
           "session_id": {
             "$ref": "#/components/schemas/SessionId"
-          },
-          "streaming": {
-            "$ref": "#/components/schemas/Streaming"
           },
           "target": {
             "description": "The sleds this job runs on.",
@@ -1733,15 +1740,6 @@
         },
         "required": [
           "baseboard"
-        ]
-      },
-      "Streaming": {
-        "description": "Allow **unrecorded** streaming I/O.",
-        "type": "string",
-        "enum": [
-          "None",
-          "Input",
-          "Output"
         ]
       },
       "VersionInfo": {

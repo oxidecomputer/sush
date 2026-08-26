@@ -17,7 +17,6 @@ use std::str::FromStr;
 use std::time::Duration;
 
 use async_recursion::async_recursion;
-use blake3::{Hasher, hash};
 use bytesize::ByteSize;
 use clap::{Parser, Subcommand};
 use futures::stream;
@@ -29,6 +28,7 @@ use progenitor_client::ResponseValue;
 use reqwest::Upgraded;
 use rustix::termios::tcgetwinsize;
 use sled_hardware_types::BaseboardId;
+use sush_common::hash::{Hasher, hash};
 use thiserror::Error;
 use tokio::signal::ctrl_c;
 use tokio::signal::unix::{SignalKind, signal};
@@ -49,8 +49,8 @@ use sush_common::codephrases::InvalidCodephrase;
 use sush_common::interactive::{InteractiveJobError, InteractiveJobMessage};
 use sush_common::jobs::JobOutputStream::{self, Stderr, Stdout};
 use sush_common::jobs::{
-    Access, JobId, JobLimits, JobOutputHash, JobOutputState, JobStatus, JobStatusMap, Session,
-    SessionId, SessionSignerNonce, SignedJob, Streaming, job_status_try_from_json_map,
+    Access, JobId, JobLimits, JobMode, JobOutputHash, JobOutputState, JobStatus, JobStatusMap,
+    Session, SessionId, SessionSignerNonce, SignedJob, job_status_try_from_json_map,
 };
 #[cfg(feature = "permslip")]
 use sush_common::jobs::{JobStartRequest, SessionSushNonce};
@@ -1272,10 +1272,12 @@ async fn job(
             if let Some(client) = client.as_ref() {
                 preflight_target(ctx, client, &target).await?;
             }
-            let streaming = if *streaming {
-                Streaming::Output
+            let mode = if *interactive {
+                JobMode::Interactive
+            } else if *streaming {
+                JobMode::StreamOutput
             } else {
-                Streaming::None
+                JobMode::Batch
             };
             let signer = PermslipSigner::new(key_name, permslip_url).await?;
             let mut interval = interval(SIGNING_UPDATE_INTERVAL);
@@ -1284,8 +1286,7 @@ async fn job(
                 job_id.to_owned(),
                 session_id,
                 command,
-                *interactive,
-                streaming,
+                mode,
                 target,
             ));
             pin!(sign);
@@ -1430,8 +1431,8 @@ async fn job_start(
         force,
         ..
     } = start_args;
-    let interactive = job.payload().interactive;
-    let streaming = matches!(job.payload().streaming, Streaming::Output);
+    let interactive = job.payload().is_interactive();
+    let streaming = matches!(job.payload().mode, JobMode::StreamOutput);
     let wait = if interactive || streaming {
         JobWait::Start
     } else if wait {
@@ -2021,13 +2022,13 @@ async fn job_output_from(
         if *len < chunk_size.get() {
             check_hash!(hash(&output), None)
         } else {
-            // Multi-threaded BLAKE3 is very, very fast, but still takes
-            // perceptible time on multi-GB outputs. So if there's more
-            // than one chunk, hash in chunks with a progress bar.
+            // Hashing multi-GB outputs takes perceptible time. So if
+            // there's more than one chunk, hash in chunks with a
+            // progress bar.
             ctx.job_output_started(&job_id, stream, "Verifying", *len);
             let mut hasher = Hasher::new();
             for chunk in output.chunks(chunk_size.get() as usize) {
-                hasher.update_rayon(chunk);
+                hasher.update(chunk);
                 ctx.job_output_update(&job_id, stream, chunk.len() as u64);
             }
             check_hash!(hasher.finalize(), Some("✅ Verified"))

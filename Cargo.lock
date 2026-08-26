@@ -457,13 +457,13 @@ checksum = "2af50177e190e07a26ab74f8b1efbfe2ef87da2116221318cb1c2e82baf7de06"
 [[package]]
 name = "before"
 version = "0.1.0"
-source = "git+https://github.com/oxidecomputer/rumors?rev=b2675dbef99b784efb817db01920ee59dac708c3#b2675dbef99b784efb817db01920ee59dac708c3"
+source = "git+https://github.com/oxidecomputer/rumors?rev=be1d76947f75f27e7f53be438a93d350019dd026#be1d76947f75f27e7f53be438a93d350019dd026"
 dependencies = [
- "bitvec",
- "borsh",
  "bytes",
  "dashu-int",
  "dsi-bitstream",
+ "serde",
+ "serde_json",
  "static_assertions",
  "suanpan",
  "thiserror 2.0.20",
@@ -525,8 +525,6 @@ dependencies = [
  "cfg-if",
  "constant_time_eq",
  "cpufeatures 0.3.0",
- "memmap2",
- "rayon-core",
 ]
 
 [[package]]
@@ -545,30 +543,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "d2f6c7dbe95a6ed67ad9f18e57daf93a2f034c524b99fd2b76d18fdfeb6660aa"
 dependencies = [
  "hybrid-array",
-]
-
-[[package]]
-name = "borsh"
-version = "1.8.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "a88b7ea17d208c4193f2c1e6de3c35fe71f98c96982d5ced308bdcc749ff6e1f"
-dependencies = [
- "borsh-derive",
- "bytes",
- "cfg_aliases",
-]
-
-[[package]]
-name = "borsh-derive"
-version = "1.8.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "d8f347189c62a579b8cd5f80714efa178f52e461dc2e6d701d264f5ff22e566c"
-dependencies = [
- "once_cell",
- "proc-macro-crate",
- "proc-macro2",
- "quote",
- "syn 2.0.119",
 ]
 
 [[package]]
@@ -597,6 +571,9 @@ name = "bytes"
 version = "1.12.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "fc652a48c352aef3ea3aed32080501cf3ef6ed5da78602a020c991775b0aff04"
+dependencies = [
+ "serde",
+]
 
 [[package]]
 name = "bytes-utils"
@@ -934,25 +911,6 @@ name = "crossbeam-channel"
 version = "0.5.16"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "d85363c37faeca707aef026efa9f3b34d077bce547e48f770770625c6013679e"
-dependencies = [
- "crossbeam-utils",
-]
-
-[[package]]
-name = "crossbeam-deque"
-version = "0.8.7"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "5181e0de7b61eb03a81e347d6dd8797bae9da5146707b51077e2d71a54ec0ceb"
-dependencies = [
- "crossbeam-epoch",
- "crossbeam-utils",
-]
-
-[[package]]
-name = "crossbeam-epoch"
-version = "0.9.20"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "2d6914041f254d6e9176c01941b21115dcfb7089e55135a35411081bd106ef3f"
 dependencies = [
  "crossbeam-utils",
 ]
@@ -1519,7 +1477,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "39cab71617ae0d63f51a36d69f866391735b51691dbda63cf6f96d042b63efeb"
 dependencies = [
  "libc",
- "windows-sys 0.61.2",
+ "windows-sys 0.52.0",
 ]
 
 [[package]]
@@ -2370,7 +2328,7 @@ checksum = "3640c1c38b8e4e43584d8df18be5fc6b0aa314ce6ebf51b53313d4306cca8e46"
 dependencies = [
  "hermit-abi",
  "libc",
- "windows-sys 0.61.2",
+ "windows-sys 0.52.0",
 ]
 
 [[package]]
@@ -3374,15 +3332,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "proc-macro-crate"
-version = "3.5.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "e67ba7e9b2b56446f1d419b1d807906278ffa1a658a8a5d8a39dcb1f5a78614f"
-dependencies = [
- "toml_edit 0.25.13+spec-1.1.0",
-]
-
-[[package]]
 name = "proc-macro-error"
 version = "1.0.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -3586,7 +3535,7 @@ dependencies = [
  "once_cell",
  "socket2",
  "tracing",
- "windows-sys 0.61.2",
+ "windows-sys 0.52.0",
 ]
 
 [[package]]
@@ -3724,16 +3673,6 @@ dependencies = [
  "serde_with",
  "strum",
  "thiserror 2.0.20",
-]
-
-[[package]]
-name = "rayon-core"
-version = "1.13.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "22e18b0f0062d30d4230b2e85ff77fdfe4326feb054b9783a3460d8435c8ab91"
-dependencies = [
- "crossbeam-deque",
- "crossbeam-utils",
 ]
 
 [[package]]
@@ -3912,19 +3851,20 @@ dependencies = [
 [[package]]
 name = "rumors"
 version = "0.1.0"
-source = "git+https://github.com/oxidecomputer/rumors?rev=b2675dbef99b784efb817db01920ee59dac708c3#b2675dbef99b784efb817db01920ee59dac708c3"
+source = "git+https://github.com/oxidecomputer/rumors?rev=be1d76947f75f27e7f53be438a93d350019dd026#be1d76947f75f27e7f53be438a93d350019dd026"
 dependencies = [
  "async-stream",
  "before",
  "blake3",
- "borsh",
  "bytes",
+ "ciborium",
  "futures",
  "futures-util",
  "hex",
  "itertools",
  "rand 0.8.7",
  "seq-macro",
+ "serde",
  "smallvec 1.15.2",
  "static_assertions",
  "thiserror 2.0.20",
@@ -3977,7 +3917,7 @@ dependencies = [
  "errno",
  "libc",
  "linux-raw-sys 0.12.1",
- "windows-sys 0.61.2",
+ "windows-sys 0.52.0",
 ]
 
 [[package]]
@@ -4044,7 +3984,7 @@ dependencies = [
  "security-framework",
  "security-framework-sys",
  "webpki-root-certs",
- "windows-sys 0.61.2",
+ "windows-sys 0.52.0",
 ]
 
 [[package]]
@@ -4820,7 +4760,7 @@ dependencies = [
 [[package]]
 name = "suanpan"
 version = "0.1.0"
-source = "git+https://github.com/oxidecomputer/rumors?rev=b2675dbef99b784efb817db01920ee59dac708c3#b2675dbef99b784efb817db01920ee59dac708c3"
+source = "git+https://github.com/oxidecomputer/rumors?rev=be1d76947f75f27e7f53be438a93d350019dd026#be1d76947f75f27e7f53be438a93d350019dd026"
 dependencies = [
  "dashu-int",
 ]
@@ -4884,7 +4824,6 @@ checksum = "b7401a30af6cb5818bb64852270bb722533397edcfc7344954a38f420819ece2"
 name = "sush-api"
 version = "0.1.0"
 dependencies = [
- "borsh",
  "chrono",
  "dropshot",
  "http-range-header",
@@ -4903,7 +4842,6 @@ dependencies = [
  "async-recursion",
  "atomicwrites",
  "base64 0.22.1",
- "blake3",
  "bytes",
  "bytesize",
  "chrono",
@@ -4951,13 +4889,13 @@ dependencies = [
 name = "sush-common"
 version = "0.1.0"
 dependencies = [
- "blake3",
- "borsh",
  "bytes",
  "bytesize",
  "chrono",
+ "ciborium",
  "crypto-bigint",
  "ed25519-dalek",
+ "hex",
  "http 1.5.0",
  "http-range-header",
  "p256",
@@ -4970,6 +4908,7 @@ dependencies = [
  "serde",
  "serde_json",
  "sha2",
+ "sha3",
  "signature",
  "sled-hardware-types",
  "slog",
@@ -4987,12 +4926,11 @@ version = "0.1.0"
 dependencies = [
  "async-trait",
  "attest-mock",
- "blake3",
- "borsh",
  "bytes",
  "bytesize",
  "camino",
  "chrono",
+ "ciborium",
  "clap",
  "dropshot",
  "ed25519-dalek",
@@ -5033,7 +4971,6 @@ dependencies = [
  "tokio-stream",
  "tokio-tungstenite",
  "tokio-util",
- "uuid",
  "x509-cert",
 ]
 
@@ -5041,7 +4978,6 @@ dependencies = [
 name = "sush-tests"
 version = "0.1.0"
 dependencies = [
- "blake3",
  "bytes",
  "camino",
  "chrono",
@@ -5165,10 +5101,10 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "32497e9a4c7b38532efcdebeef879707aa9f794296a4f0244f6f69e9bc8574bd"
 dependencies = [
  "fastrand",
- "getrandom 0.4.3",
+ "getrandom 0.3.4",
  "once_cell",
  "rustix 1.1.4",
- "windows-sys 0.61.2",
+ "windows-sys 0.52.0",
 ]
 
 [[package]]
@@ -5452,7 +5388,7 @@ dependencies = [
  "serde",
  "serde_spanned 0.6.9",
  "toml_datetime 0.6.11",
- "toml_edit 0.22.27",
+ "toml_edit",
 ]
 
 [[package]]
@@ -5500,18 +5436,6 @@ dependencies = [
  "toml_datetime 0.6.11",
  "toml_write",
  "winnow 0.7.15",
-]
-
-[[package]]
-name = "toml_edit"
-version = "0.25.13+spec-1.1.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "6975367e4d2ef766d86af01ffad14b622fecc8d4357a998fbc4deb6e9bacaf9b"
-dependencies = [
- "indexmap 2.14.0",
- "toml_datetime 1.1.1+spec-1.1.0",
- "toml_parser",
- "winnow 1.0.4",
 ]
 
 [[package]]
@@ -5772,8 +5696,6 @@ version = "1.24.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "bf3923a6f5c4c6382e0b653c4117f48d631ea17f38ed86e2a828e6f7412f5239"
 dependencies = [
- "borsh",
- "borsh-derive",
  "getrandom 0.4.3",
  "js-sys",
  "serde_core",
@@ -5960,7 +5882,7 @@ version = "0.1.11"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "c2a7b1c03c876122aa43f3020e6c3c3ee5c05081c9a00739faf7503aeba10d22"
 dependencies = [
- "windows-sys 0.61.2",
+ "windows-sys 0.52.0",
 ]
 
 [[package]]
@@ -6135,9 +6057,6 @@ name = "winnow"
 version = "1.0.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "23b97319f7b8343df12cc98938e5c3eb436064524c8d2b4e30a1d3a36eecdf81"
-dependencies = [
- "memchr",
-]
 
 [[package]]
 name = "wit-bindgen"

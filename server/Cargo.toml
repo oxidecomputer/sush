@@ -16,8 +16,6 @@ embedded = []
 test-support = []
 
 [dependencies]
-blake3.workspace = true
-borsh.workspace = true
 bytes.workspace = true
 camino.workspace = true
 bytesize.workspace = true
@@ -61,11 +59,11 @@ tokio-rustls.workspace = true
 tokio-stream.workspace = true
 tokio-util.workspace = true
 tokio-tungstenite.workspace = true
-uuid.workspace = true
 x509-cert.workspace = true
 
 [dev-dependencies]
 attest-mock.workspace = true
+ciborium.workspace = true
 function_name.workspace = true
 rumors = { workspace = true, features = ["conformance"] }
 sprockets-tls-test-utils.workspace = true

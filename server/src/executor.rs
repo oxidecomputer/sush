@@ -32,7 +32,7 @@ use tokio_util::sync::CancellationToken;
 use sush_api::JobStartParams;
 use sush_common::interactive::WindowSize;
 use sush_common::jobs::{
-    JobId, JobOutputStream, JobStartRequest, ProcessError, SignedJob, Streaming, VerifiedJob,
+    JobId, JobMode, JobOutputStream, JobStartRequest, ProcessError, SignedJob, VerifiedJob,
 };
 
 use crate::io::JobIo;
@@ -191,8 +191,7 @@ async fn job_spawn(
         job_id,
         session_id: _,
         command,
-        interactive,
-        streaming,
+        mode,
         target,
     } = request.payload().clone();
     let JobStartParams {
@@ -223,17 +222,12 @@ async fn job_spawn(
         limits.max_fsize = dirs.max_fsize();
     }
 
-    if interactive && streaming.is_some() {
-        let error = ProcessError::InvalidJob("interactive jobs cannot stream".to_string());
-        send_error(&log, &job_id, &events, error).await;
-        return;
-    }
-    if matches!(streaming, Streaming::Input) {
+    if matches!(mode, JobMode::StreamInput) {
         let error = ProcessError::InvalidJob("streaming input is not implemented".to_string());
         send_error(&log, &job_id, &events, error).await;
         return;
     }
-    if streaming.is_some() && target.single_baseboard().is_none() {
+    if mode.is_streaming() && target.single_baseboard().is_none() {
         let error = ProcessError::InvalidJob("streaming jobs must target one sled".to_string());
         send_error(&log, &job_id, &events, error).await;
         return;
@@ -267,7 +261,7 @@ async fn job_spawn(
     );
     let stdout_path = dirs.job_output_path(&job_id, Stdout);
     let stderr_path = dirs.job_output_path(&job_id, Stderr);
-    let stdout_file = if matches!(streaming, Streaming::Output) {
+    let stdout_file = if matches!(mode, JobMode::StreamOutput) {
         with_io_err!(
             OpenOptions::new().write(true).open("/dev/null").await,
             "opening /dev/null for streamed output".to_string()
@@ -377,7 +371,7 @@ async fn job_spawn(
         });
     }
 
-    let job = if interactive {
+    let job = if mode.is_interactive() {
         // Create a pseudoterminal and wire the child up to it.
         let (pty, writer, pts, pts_path) =
             with_io_err!(open_pty(), "opening pseudoterminal".to_string());
@@ -413,13 +407,13 @@ async fn job_spawn(
         let child = with_io_err!(cmd.spawn(), "spawning interactive job".to_string());
         let io = JobIo::interactive(pty, writer, stop.child_token());
         Job::start(
-            log.new(o!("interactive" => interactive)),
+            log.new(o!("mode" => mode.as_str())),
             limits,
             child,
             io,
             stdout_file,
             stderr_file,
-            streaming,
+            mode,
             stop,
         )
     } else {
@@ -435,13 +429,13 @@ async fn job_spawn(
             child.stderr.take().expect("batch job should have stderr"),
         );
         Job::start(
-            log.new(o!("interactive" => interactive, "streaming" => streaming.as_str())),
+            log.new(o!("mode" => mode.as_str())),
             limits,
             child,
             io,
             stdout_file,
             stderr_file,
-            streaming,
+            mode,
             stop,
         )
     };

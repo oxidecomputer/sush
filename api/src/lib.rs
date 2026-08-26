@@ -7,7 +7,6 @@
 use std::collections::BTreeMap;
 use std::fmt;
 
-use borsh::{BorshDeserialize, BorshSerialize};
 use dropshot::{
     Body, ClientErrorStatusCode, Header, HttpError, HttpResponseOk, HttpResponseUpdatedNoContent,
     Path as PathParams, Query as QueryParams, RequestContext, TypedBody, WebsocketEndpointResult,
@@ -278,7 +277,7 @@ pub struct KeyIdParam {
     pub key_id: KeyId,
 }
 
-#[derive(Clone, Debug, Default, Deserialize, JsonSchema, BorshSerialize, BorshDeserialize)]
+#[derive(Clone, Debug, Default, Deserialize, JsonSchema, Serialize)]
 #[serde(default)]
 pub struct WaitParam {
     /// Wait for the subject to appear in the state.
@@ -334,41 +333,31 @@ pub struct SessionStartBody {
 }
 
 /// Job parameters _not_ specified in the signed job request.
-#[derive(
-    BorshSerialize, BorshDeserialize, Clone, Debug, Default, Deserialize, Eq, JsonSchema, PartialEq,
-)]
+#[derive(Clone, Debug, Default, Deserialize, Eq, JsonSchema, PartialEq, Serialize)]
 #[serde(default)]
 pub struct JobStartParams {
     #[serde(flatten, deserialize_with = "deserialize_job_limits")]
     pub limits: JobLimits,
 
     /// Terminal type for interactive jobs.
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub term: Option<String>,
 
     /// Terminal window height for interactive jobs.
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub rows: Option<u16>,
 
     /// Terminal window width for interactive jobs.
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub cols: Option<u16>,
 
     /// Wait for the job to start or stop.
+    #[serde(skip_serializing_if = "JobWait::is_none")]
     pub wait: JobWait,
 }
 
 /// Whether and until what state is reached to wait for a job start/stop request.
-#[derive(
-    BorshSerialize,
-    BorshDeserialize,
-    Clone,
-    Copy,
-    Debug,
-    Default,
-    Deserialize,
-    Eq,
-    JsonSchema,
-    PartialEq,
-    Serialize,
-)]
+#[derive(Clone, Copy, Debug, Default, Deserialize, Eq, JsonSchema, PartialEq, Serialize)]
 #[serde(rename_all = "lowercase")]
 pub enum JobWait {
     #[default]
@@ -404,7 +393,7 @@ impl JobWait {
     }
 }
 
-#[derive(Clone, Debug, Default, Deserialize, JsonSchema, BorshSerialize, BorshDeserialize)]
+#[derive(Clone, Debug, Default, Deserialize, JsonSchema, Serialize)]
 #[serde(default)]
 pub struct JobStopParams {
     /// Wait for the job process to end.
@@ -443,9 +432,22 @@ where
         where
             A: MapAccess<'de>,
         {
+            /// Limits arrive as strings in query parameters and as
+            /// integers on binary wires.
+            #[derive(Deserialize)]
+            #[serde(untagged)]
+            enum Limit {
+                Number(u64),
+                String(String),
+            }
+
             let mut limits = BTreeMap::<String, u64>::new();
-            while let Some((key, value)) = map.next_entry::<String, String>()? {
-                limits.insert(key, value.parse().map_err(DeserializeError::custom)?);
+            while let Some((key, value)) = map.next_entry::<String, Limit>()? {
+                let value = match value {
+                    Limit::Number(value) => value,
+                    Limit::String(value) => value.parse().map_err(DeserializeError::custom)?,
+                };
+                limits.insert(key, value);
             }
             <JobLimits as Deserialize>::deserialize(limits.into_deserializer())
         }
