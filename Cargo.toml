@@ -12,10 +12,10 @@ atomicwrites = "0.4"
 base64 = "0.22"
 camino = "1"
 async-trait = "0.1"
-borsh = { version = "1", features = ["derive"] }
 bytes = "1"
 bytesize = "2"
 chrono = { version = "0.4", features = ["serde"] }
+ciborium = "0.2"
 clap = { version = "4", features = ["derive", "env", "wrap_help"] }
 crypto-bigint = "0.5"
 dropshot = "0.17"
@@ -46,7 +46,7 @@ rand = "0.8"
 rand_core = "0.6"
 reqwest = { version = "0.13", features = ["json", "rustls"] }
 rlimit = "0.10"
-rumors = { git = "https://github.com/oxidecomputer/rumors", rev = "b2675dbef99b784efb817db01920ee59dac708c3" }
+rumors = { git = "https://github.com/oxidecomputer/rumors", rev = "be1d76947f75f27e7f53be438a93d350019dd026" }
 rustix = { version = "1", features = ["fs", "process", "pty", "termios"] }
 rustls = "0.23"
 rustyline = { git = "https://github.com/kkawakam/rustyline", rev = "5ab22f2f8d65e85f0b925360437ece8eeeb6db92", features = ["signal-hook", "termios"] }
@@ -71,7 +71,6 @@ tokio-stream = "0.1"
 tokio-fd = "0.3"
 tokio-tungstenite = "0.28"
 tokio-util = "0.7"
-uuid = { version = "1", features = ["borsh"] }
 x509-cert = { version = "0.2", features = ["pem", "std"] }
 xdg = "3"
 

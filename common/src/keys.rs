@@ -14,8 +14,6 @@
 use std::fmt;
 use std::ops::Deref;
 
-use borsh::io::{Error as BorshError, ErrorKind as BorshErrorKind, Read, Write};
-use borsh::{BorshDeserialize, BorshSerialize};
 use bytes::{Buf as _, BufMut as _, BytesMut};
 use chrono::{DateTime, Utc};
 use crypto_bigint::{ArrayEncoding as _, Random as _, U128};
@@ -52,8 +50,6 @@ codephrase_newtype! {
     /// SHA-256 of a certificate subject or an identity public key,
     /// encoded as a pseudorandom code phrase for storage & transport.
     #[derive(
-        BorshDeserialize,
-        BorshSerialize,
         Clone,
         Deserialize,
         Eq,
@@ -93,8 +89,27 @@ impl TryFrom<&ssh_key::PublicKey> for KeyId {
 }
 
 /// A (de)serializable wrapper around [`ssh_key::PublicKey`].
-#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub struct SshPublicKey(ssh_key::PublicKey);
+
+/// The OpenSSH string in every format: [`ssh_key`]'s own serde drops
+/// the comment in binary formats.
+impl Serialize for SshPublicKey {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        use serde::ser::Error as _;
+        serializer.serialize_str(&self.0.to_openssh().map_err(S::Error::custom)?)
+    }
+}
+
+impl<'de> Deserialize<'de> for SshPublicKey {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        use serde::de::Error as _;
+        let openssh = <String as Deserialize>::deserialize(deserializer)?;
+        ssh_key::PublicKey::from_openssh(&openssh)
+            .map(Self)
+            .map_err(D::Error::custom)
+    }
+}
 
 impl SshPublicKey {
     pub fn key_id(&self) -> Result<KeyId, KeyError> {
@@ -138,20 +153,6 @@ impl Deref for SshPublicKey {
     }
 }
 
-impl BorshSerialize for SshPublicKey {
-    fn serialize<W: Write>(&self, writer: &mut W) -> borsh::io::Result<()> {
-        BorshSerialize::serialize(&self.to_string(), writer)
-    }
-}
-
-impl BorshDeserialize for SshPublicKey {
-    fn deserialize_reader<R: Read>(reader: &mut R) -> borsh::io::Result<Self> {
-        ssh_key::PublicKey::from_openssh(&String::deserialize_reader(reader)?)
-            .map(Self)
-            .map_err(|err| BorshError::new(BorshErrorKind::InvalidData, err))
-    }
-}
-
 impl JsonSchema for SshPublicKey {
     fn schema_name() -> String {
         <String as JsonSchema>::schema_name()
@@ -172,8 +173,6 @@ codephrase_newtype! {
     /// signature. It is carried as an opaque 256 bit value to which only
     /// the signature algorithm assigns meaning.
     #[derive(
-        BorshDeserialize,
-        BorshSerialize,
         Clone,
         Deserialize,
         Eq,
@@ -193,8 +192,6 @@ codephrase_newtype! {
     /// Ed25519 signature. It is carried as an opaque 256 bit value like
     /// [`EccR`].
     #[derive(
-        BorshDeserialize,
-        BorshSerialize,
         Clone,
         Deserialize,
         Eq,
@@ -217,18 +214,7 @@ codephrase_newtype! {
 /// public keys](https://cvsweb.openbsd.org/src/usr.bin/ssh/PROTOCOL.u2f?annotate=HEAD).
 /// They should be set to 0 for other key types.
 #[derive(
-    BorshDeserialize,
-    BorshSerialize,
-    Clone,
-    Debug,
-    Deserialize,
-    Eq,
-    Hash,
-    JsonSchema,
-    Ord,
-    PartialEq,
-    PartialOrd,
-    Serialize,
+    Clone, Debug, Deserialize, Eq, Hash, JsonSchema, Ord, PartialEq, PartialOrd, Serialize,
 )]
 pub struct EncodedSignature {
     pub r: EccR,
@@ -573,17 +559,7 @@ impl ToBeSignedFields {
 }
 
 /// A signed envelope around some data.
-#[derive(
-    BorshDeserialize,
-    BorshSerialize,
-    Clone,
-    Debug,
-    Deserialize,
-    Eq,
-    JsonSchema,
-    PartialEq,
-    Serialize,
-)]
+#[derive(Clone, Debug, Deserialize, Eq, JsonSchema, PartialEq, Serialize)]
 pub struct Signed<T> {
     payload: T,
     key_id: KeyId,
@@ -697,7 +673,7 @@ impl<T: ToBeSigned> Signed<T> {
 
 /// An envelope whose signature has been verified. Deliberately not
 /// deserializable, must be produced via verification.
-#[derive(BorshSerialize, Clone, Debug, JsonSchema, Serialize)]
+#[derive(Clone, Debug, JsonSchema, Serialize)]
 pub struct Verified<T> {
     signed: Signed<T>,
     verified_by: KeyId,

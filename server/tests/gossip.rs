@@ -67,7 +67,7 @@ impl Node {
         self.rumors()
             .snapshot()
             .iter()
-            .any(|(_, _, m)| m.as_str() == message)
+            .any(|(_, m)| m.as_str() == message)
     }
 }
 

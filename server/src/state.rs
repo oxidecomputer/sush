@@ -14,7 +14,7 @@ use std::sync::{Arc, Mutex};
 use chrono::{DateTime, Utc};
 use futures::{Stream, StreamExt};
 use lru::LruCache;
-use rumors::{Key, Peer, Rumors, Version};
+use rumors::{Peer, Rumors, Version};
 use sled_hardware_types::BaseboardId;
 use slog::{Logger, debug, error, info, o, warn};
 use tokio::sync::watch;
@@ -466,9 +466,6 @@ impl State {
         &mut self,
         log: &Logger,
         executor: &mut Executor,
-        // We don't use the `key` here because we only redact messages once
-        // they're committed to persistent storage:
-        _key: Key,
         incoming_version: &Version,
         message: &Arc<VersionedMessage>,
     ) -> Result<(), Error> {
@@ -997,7 +994,7 @@ impl StateManager {
                 let mut events_empty = false;
 
                 loop {
-                    let message = causal_messages.borrow_next();
+                    let message = causal_messages.next();
 
                     // Once we drain the requests and events, we drop `gossip` so
                     // that if there are no outstanding copies elsewhere, we will
@@ -1045,7 +1042,7 @@ impl StateManager {
                                 info!(log, "gossip network quiescent");
                                 break;
                             }
-                            Some((key, version, message)) => {
+                            Some((version, message)) => {
                                 // We unconditionally mark the watch sender as modified
                                 // even though it might not be, because *most* of the
                                 // messages cause *some* modification of the state, and we
@@ -1053,7 +1050,7 @@ impl StateManager {
                                 // manually tracking precisely which messages *don't* modify
                                 // state. The cost is a few spurious wakeups.
                                 tx_state.send_modify(|state| {
-                                    if let Err(error) = state.update(&log, &mut executor, key, version, message) {
+                                    if let Err(error) = state.update(&log, &mut executor, &version, &message) {
                                         error!(log, "state update failed"; "error" => ?error);
                                         if let Some((rumors, _)) = &gossip {
                                             debug!(log, "sending error to gossip network"; "error" => ?error);

@@ -7,7 +7,11 @@
 use std::fmt;
 
 use hex::FromHexError;
+use serde::de::Error as _;
+use serde::{Deserialize, Deserializer, Serialize, Serializer};
 use sha3::{Digest as _, Sha3_256};
+
+use crate::wire::ExactBytes;
 
 pub const OUT_LEN: usize = 32;
 
@@ -36,6 +40,28 @@ impl From<[u8; OUT_LEN]> for Hash {
 impl fmt::Display for Hash {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.write_str(&hex::encode(self.0))
+    }
+}
+
+/// Hex for humans, raw bytes for binary formats.
+impl Serialize for Hash {
+    fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        if serializer.is_human_readable() {
+            serializer.serialize_str(&self.to_string())
+        } else {
+            serializer.serialize_bytes(&self.0)
+        }
+    }
+}
+
+impl<'de> Deserialize<'de> for Hash {
+    fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        if deserializer.is_human_readable() {
+            let hex = <String as Deserialize>::deserialize(deserializer)?;
+            Self::from_hex(&hex).map_err(D::Error::custom)
+        } else {
+            Ok(Self(deserializer.deserialize_bytes(ExactBytes::<OUT_LEN>)?))
+        }
     }
 }
 

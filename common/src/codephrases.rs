@@ -11,10 +11,8 @@
 
 use std::borrow::Cow;
 use std::fmt;
-use std::io::{self, Read, Write};
 use std::str::FromStr;
 
-use borsh::{BorshDeserialize, BorshSerialize};
 use crypto_bigint::{
     ArrayEncoding as _, CheckedAdd as _, CheckedMul as _, Encoding as _, Limb, Random as _,
     Reciprocal, U256,
@@ -25,6 +23,7 @@ use serde::de::Error as _;
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
 use thiserror::Error;
 
+use crate::wire::ExactBytes;
 use crate::wordlist::{WORDLIST, WORDLIST_LEN};
 
 /// Entropy is treated as an integer whose base is to be changed
@@ -135,29 +134,27 @@ impl FromStr for Codephrase {
     }
 }
 
+/// Phrases for humans, raw big-endian bytes for binary formats.
 impl Serialize for Codephrase {
     fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
-        serializer.serialize_str(&self.to_string())
+        if serializer.is_human_readable() {
+            serializer.serialize_str(&self.to_string())
+        } else {
+            serializer.serialize_bytes(&self.to_be_bytes())
+        }
     }
 }
 
 impl<'de> Deserialize<'de> for Codephrase {
     fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
-        let string = <String as Deserialize>::deserialize(deserializer)?;
-        Self::from_str(&string).map_err(D::Error::custom)
-    }
-}
-
-impl BorshSerialize for Codephrase {
-    fn serialize<W: Write>(&self, writer: &mut W) -> io::Result<()> {
-        <[u8; 32] as BorshSerialize>::serialize(&self.to_be_bytes(), writer)
-    }
-}
-
-impl BorshDeserialize for Codephrase {
-    fn deserialize_reader<R: Read>(reader: &mut R) -> io::Result<Self> {
-        let bytes = <[u8; 32] as BorshDeserialize>::deserialize_reader(reader)?;
-        Ok(Self(U256::from_be_byte_array(bytes.into())))
+        if deserializer.is_human_readable() {
+            let string = <String as Deserialize>::deserialize(deserializer)?;
+            Self::from_str(&string).map_err(D::Error::custom)
+        } else {
+            Ok(Self::from_be_bytes(
+                deserializer.deserialize_bytes(ExactBytes::<32>)?,
+            ))
+        }
     }
 }
 

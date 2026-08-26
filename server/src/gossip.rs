@@ -27,9 +27,10 @@ use std::io;
 use std::net::{SocketAddr, SocketAddrV6};
 use std::time::Duration;
 
-use borsh::{BorshDeserialize, BorshSerialize};
 use futures::StreamExt as _;
 use rumors::{Error, Network, Peer, Rumors, Ticks};
+use serde::Serialize;
+use serde::de::DeserializeOwned;
 use slog::{Logger, debug, info, o, warn};
 use sprockets_tls::keys::SprocketsConfig;
 use tokio::sync::watch;
@@ -103,7 +104,7 @@ pub async fn spawn_gossip<T>(
     shutdown: CancellationToken,
 ) -> io::Result<(SocketAddrV6, watch::Receiver<Rumors<T>>)>
 where
-    T: BorshDeserialize + BorshSerialize + Send + Sync + 'static,
+    T: DeserializeOwned + Serialize + Send + Sync + 'static,
 {
     let transport = Transport::new(
         log,
@@ -132,7 +133,7 @@ pub fn spawn_gossip_manager<T>(
     shutdown: CancellationToken,
 ) -> watch::Receiver<Rumors<T>>
 where
-    T: BorshDeserialize + BorshSerialize + Send + Sync + 'static,
+    T: DeserializeOwned + Serialize + Send + Sync + 'static,
 {
     let (publish, subscribe) = watch::channel(seed.clone());
     let manager = Manager {
@@ -184,7 +185,7 @@ struct Manager<T> {
 
 impl<T> Manager<T>
 where
-    T: BorshDeserialize + BorshSerialize + Send + Sync + 'static,
+    T: DeserializeOwned + Serialize + Send + Sync + 'static,
 {
     async fn run(mut self) {
         let mut tick = interval(self.config.reconnect);
@@ -330,7 +331,7 @@ where
 /// Drive sessions on one link until it fails, reporting why.
 async fn sessions<T>(rumors: &Rumors<T>, mut link: SprocketsLink, log: &Logger) -> Stopped
 where
-    T: BorshDeserialize + BorshSerialize + Send + Sync + 'static,
+    T: DeserializeOwned + Serialize + Send + Sync + 'static,
 {
     let ours = rumors.network();
     let mut driver = rumors.gossip_when(rumors.changes(), &mut link);
