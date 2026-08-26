@@ -278,6 +278,10 @@ impl CommandContext for Repl {
         self.cli.job_stopped(job_id);
     }
 
+    fn job_skipped(&mut self, job_id: &JobId) -> bool {
+        self.cli.job_skipped(job_id)
+    }
+
     fn job_error(&mut self, error: CommandError) -> CommandError {
         self.cli.job_error(error)
     }

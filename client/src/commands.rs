@@ -547,6 +547,13 @@ pub enum JobCommand {
         job_id: JobId,
     },
 
+    /// Decline a job, burning its ID and advancing the session.
+    Skip {
+        /// The job to skip.
+        #[clap(env = SUSH_JOB_ID)]
+        job_id: JobId,
+    },
+
     /// Get the status of a started job.
     Status {
         /// The job whose status should be fetched.
@@ -1265,6 +1272,30 @@ async fn job(
             job_stop(ctx, client, &job_id, None).await?;
             ctx.job_stopped(&job_id);
             Ok(())
+        }
+
+        // Offline skips advance only the local session, keeping the
+        // signer's chain in step with a rack that skipped.
+        (JobCommand::Skip { job_id }, client) => {
+            let Some(session_id) = ctx.session_id() else {
+                return Err(CommandError::MissingSession);
+            };
+            if let Some(client) = client {
+                with_login(ctx, client, async || {
+                    client
+                        .session_skip_job()
+                        .session_id(session_id)
+                        .job_id(job_id)
+                        .send()
+                        .await
+                })
+                .await?;
+            }
+            if ctx.job_skipped(&job_id) {
+                Ok(())
+            } else {
+                Err(CommandError::NotNextJob(job_id))
+            }
         }
 
         (JobCommand::Status { job_id, full, wait }, Some(client)) => {
@@ -2318,6 +2349,8 @@ pub enum CommandError {
     MissingSshAuthSock,
     #[error("❌ {0}")]
     NotFound(String),
+    #[error("❌ Job `{0}` is not the session's next job")]
+    NotNextJob(JobId),
     #[error("❌ Command not supported in offline mode, try `--url`")]
     Offline,
     #[error(

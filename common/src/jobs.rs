@@ -211,9 +211,19 @@ impl Session {
         self.last_job = LastJob::Some(job)
     }
 
-    pub fn skip_job(&mut self, job_id: JobId) {
-        if job_id == self.next_job_id() {
-            self.last_job = LastJob::Burned(job_id)
+    /// Burn `job_id`, either as the session's next job or by
+    /// rewinding it from the chain head. The rewind unwinds a
+    /// signed-but-unrun job on a signer. On a server it converges a
+    /// skip that raced the start it names, keeping the execution in
+    /// history. Returns whether the chain moved.
+    pub fn skip_job(&mut self, job_id: JobId) -> bool {
+        if job_id == self.next_job_id()
+            || matches!(&self.last_job, LastJob::Some(job) if *job.job_id() == job_id)
+        {
+            self.last_job = LastJob::Burned(job_id);
+            true
+        } else {
+            false
         }
     }
 
@@ -846,7 +856,53 @@ impl FromStr for JobOutputStream {
 #[cfg(test)]
 mod test {
     use super::*;
+    use crate::keys::{EccR, EccS, EncodedSignature};
     use crate::targets::SledId;
+
+    /// A signer that signed a job, a server that never ran it, and a
+    /// server that ran it before the skip arrived all converge on the
+    /// same next job ID after a skip. A replayed skip is refused.
+    #[test]
+    fn skip_converges_signer_and_server() {
+        let session_id = SessionId::random();
+        let mut signer = Session::new(session_id);
+        let mut server = Session::new(session_id);
+
+        let job_id = signer.next_job_id();
+        let request = JobStartRequest::new(
+            job_id,
+            session_id,
+            "true",
+            false,
+            Streaming::None,
+            Target::All,
+        );
+        let signed = Signed::new(
+            request,
+            KeyId::random(),
+            EncodedSignature {
+                r: EccR::from_be_bytes([0; 32]),
+                s: EccS::from_be_bytes([0; 32]),
+                flags: 0,
+                counter: 0,
+            },
+        );
+        signer.job_started(signed.clone());
+        assert_ne!(signer.next_job_id(), server.next_job_id());
+
+        assert!(signer.skip_job(job_id));
+        assert!(server.skip_job(job_id));
+        assert_eq!(signer.next_job_id(), server.next_job_id());
+
+        let mut racer = Session::new(session_id);
+        racer.job_started(signed);
+        assert!(racer.skip_job(job_id));
+        assert_eq!(racer.next_job_id(), server.next_job_id());
+
+        let next = server.next_job_id();
+        assert!(!server.skip_job(job_id));
+        assert_eq!(server.next_job_id(), next);
+    }
 
     /// Interactive jobs run only on their single named baseboard.
     #[test]

@@ -181,11 +181,15 @@ impl<'a> SessionGuard<'a> {
         self.inner.session_id()
     }
 
+    pub fn started_by(&self) -> Option<&KeyId> {
+        self.inner.started_by()
+    }
+
     pub fn job_started(&mut self, job: SignedJob) {
         self.inner.job_started(job)
     }
 
-    pub fn skip_job(&mut self, job_id: &JobId) {
+    pub fn skip_job(&mut self, job_id: &JobId) -> bool {
         self.inner.skip_job(*job_id)
     }
 
@@ -577,12 +581,19 @@ impl State {
                         } = &self.session
                             && session.session_id() == *session_id
                         {
-                            info!(
-                                log, "session stopped";
-                                "session_id" => %session_id, "actor" => %actor,
-                            );
-                            self.session = Inactive {
-                                frontier: frontier.clone(),
+                            if session.started_by() != Some(actor) {
+                                warn!(
+                                    log, "ignoring session stop from non-starter";
+                                    "session_id" => %session_id, "actor" => %actor,
+                                );
+                            } else {
+                                info!(
+                                    log, "session stopped";
+                                    "session_id" => %session_id, "actor" => %actor,
+                                );
+                                self.session = Inactive {
+                                    frontier: frontier.clone(),
+                                }
                             }
                         }
                     }
@@ -634,26 +645,37 @@ impl State {
                         if let Some(mut session) = self.session.active_session()
                             && session.session_id() == *session_id
                         {
-                            info!(
-                                log, "job skipped";
-                                "job_id" => %job_id, "actor" => %actor,
-                            );
-                            session.skip_job(job_id);
-                            session.cancel_job(
-                                job_id,
-                                actor,
-                                &self.own_baseboard,
-                                &mut self.history,
-                                &self.running,
-                            );
-                            session.execute_ready_jobs(
-                                &self.own_baseboard,
-                                &self.cubbies,
-                                &mut self.certs,
-                                &mut self.history,
-                                executor,
-                                &mut self.attachments,
-                            );
+                            if session.started_by() != Some(actor) {
+                                warn!(
+                                    log, "ignoring job skip from non-starter";
+                                    "job_id" => %job_id, "actor" => %actor,
+                                );
+                            } else if session.skip_job(job_id) {
+                                info!(
+                                    log, "job skipped";
+                                    "job_id" => %job_id, "actor" => %actor,
+                                );
+                                session.cancel_job(
+                                    job_id,
+                                    actor,
+                                    &self.own_baseboard,
+                                    &mut self.history,
+                                    &self.running,
+                                );
+                                session.execute_ready_jobs(
+                                    &self.own_baseboard,
+                                    &self.cubbies,
+                                    &mut self.certs,
+                                    &mut self.history,
+                                    executor,
+                                    &mut self.attachments,
+                                );
+                            } else {
+                                info!(
+                                    log, "ignoring inapplicable job skip";
+                                    "job_id" => %job_id, "actor" => %actor,
+                                );
+                            }
                         } else {
                             info!(
                                 log,

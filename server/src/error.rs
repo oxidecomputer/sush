@@ -54,7 +54,9 @@ pub enum JobError {
     MultipleSessions,
     #[error("No current session")]
     NoSession,
-    #[error("Only the session starter may grant or deny attach access")]
+    #[error("Job `{0}` is not the session's next job")]
+    NotNextJob(JobId),
+    #[error("Only the session starter may manage the session")]
     NotSessionStarter,
     #[error("Session `{0}` is no longer current")]
     SessionNotCurrent(SessionId),
@@ -183,6 +185,9 @@ impl From<JobError> for HttpError {
             DecodeCert(_) | DuplicateJobId(_) | InteractiveTarget | InvalidCommand | Json(_)
             | MultipleSessions | InvalidSessionId => {
                 HttpError::for_client_error(None, ClientErrorStatusCode::BAD_REQUEST, message)
+            }
+            NotNextJob(_) => {
+                HttpError::for_client_error(None, ClientErrorStatusCode::CONFLICT, message)
             }
         }
     }

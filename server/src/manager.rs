@@ -550,22 +550,37 @@ impl JobManager {
         authn: &Identity,
         session_id: SessionId,
     ) -> Result<(), JobError> {
+        self.starter_check(authn)?;
         self.session_request(authn, SessionRequest::Stop(session_id))
             .await
     }
 
+    /// The authoritative skip is in the state machine, which ignores
+    /// requests that lost a race. This check fails fast and loudly.
     pub async fn session_skip_job(
         &self,
         authn: &Identity,
         session_id: SessionId,
         job_id: JobId,
     ) -> Result<(), JobError> {
+        self.starter_check(authn)?;
+        match self.session(authn) {
+            None => return Err(JobError::NoSession),
+            Some(session) if session.session_id() != session_id => {
+                return Err(JobError::SessionNotCurrent(session_id));
+            }
+            Some(session) if session.next_job_id() != job_id => {
+                return Err(JobError::NotNextJob(job_id));
+            }
+            Some(_) => (),
+        }
         self.session_request(authn, SessionRequest::Skip(session_id, job_id))
             .await
     }
 
-    /// Only the session starter may grant or deny attach access. The
-    /// authoritative check is in the state machine. This one fails fast.
+    /// Only the session starter may stop the session, skip its jobs,
+    /// or grant and deny attach access. The authoritative check is in
+    /// the state machine. This one fails fast.
     fn starter_check(&self, authn: &Identity) -> Result<(), JobError> {
         match self.state.borrow().session() {
             None => Err(JobError::NoSession),

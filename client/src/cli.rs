@@ -323,6 +323,20 @@ impl CommandContext for Cli {
         }
     }
 
+    fn job_skipped(&mut self, job_id: &JobId) -> bool {
+        let skipped = match self.session.lock().unwrap().as_mut() {
+            Some(session) => session.skip_job(*job_id),
+            None => false,
+        };
+        if skipped {
+            match self.get_output_format() {
+                OutputFormat::Json => println!("{}", json!({"job_skipped": job_id})),
+                OutputFormat::Text => println!("✅ Skipped job `{job_id}`"),
+            }
+        }
+        skipped
+    }
+
     fn job_error(&mut self, error: CommandError) -> CommandError {
         eprintln!("{error}");
         error

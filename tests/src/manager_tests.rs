@@ -1573,6 +1573,155 @@ async fn attach_grants() {
     .unwrap();
 }
 
+/// Only the session starter may skip or stop a session, a skip must
+/// name the session's next job, and non-starter requests over gossip
+/// are ignored.
+#[named]
+#[tokio::test]
+async fn skip_and_stop_are_starter_only() {
+    let log = test_logger(function_name!());
+    let (mgr, mut root, peer, _dir, _shutdown) = manager_test_root_and_peer(log).await;
+    let owner = fake_identity(&mut root).await;
+    let validity = Validity::from_now(Duration::from_secs(60)).unwrap();
+    let mut guest_key =
+        EphemeralKey::new_root(KeyType::P256, ephemeral_test_subject(), validity).unwrap();
+    let guest = fake_identity(&mut guest_key).await;
+
+    let signer_nonce = SessionSignerNonce::random();
+    let session_id =
+        SessionId::compute(mgr.own_baseboard(), mgr.session_sush_nonce(), signer_nonce);
+    let job_id = Session::new(session_id).next_job_id();
+    mgr.session_start(&owner, session_id, signer_nonce, true)
+        .await
+        .unwrap();
+
+    assert!(matches!(
+        mgr.session_skip_job(&guest, session_id, job_id).await,
+        Err(JobError::NotSessionStarter)
+    ));
+    assert!(matches!(
+        mgr.session_stop(&guest, session_id).await,
+        Err(JobError::NotSessionStarter)
+    ));
+    assert!(matches!(
+        mgr.session_skip_job(&owner, session_id, JobId::random())
+            .await,
+        Err(JobError::NotNextJob(_))
+    ));
+
+    // A stop and a skip from a non-starter over gossip are ignored.
+    // The starter's skip, sent after them on the same handle, marks
+    // them processed. Convergence proves the session outlived the
+    // stop, and the cancellation actor proves whose skip applied.
+    peer.send(
+        Message::Request(Request::session(
+            guest.key_id.clone(),
+            SessionRequest::Stop(session_id),
+        ))
+        .into(),
+    );
+    peer.send(
+        Message::Request(Request::session(
+            guest.key_id.clone(),
+            SessionRequest::Skip(session_id, job_id),
+        ))
+        .into(),
+    );
+    peer.send(
+        Message::Request(Request::session(
+            owner.key_id.clone(),
+            SessionRequest::Skip(session_id, job_id),
+        ))
+        .into(),
+    );
+    timeout(Duration::from_secs(30), async {
+        loop {
+            if let Some(session) = mgr.session(&owner)
+                && session.next_job_id() != job_id
+            {
+                break;
+            }
+            sleep(Duration::from_millis(50)).await;
+        }
+    })
+    .await
+    .expect("skip never took effect");
+    let status = mgr.job_status(&owner, &job_id).await.unwrap()[mgr.own_baseboard()].clone();
+    assert!(matches!(
+        status,
+        JobStatus::Cancelled { actor, .. } if actor == owner.key_id
+    ));
+
+    assert!(matches!(
+        mgr.session_skip_job(&owner, session_id, job_id).await,
+        Err(JobError::NotNextJob(_))
+    ));
+    mgr.session_stop(&owner, session_id).await.unwrap();
+}
+
+/// A skip that races its job's start over gossip converges the chain:
+/// a sled that already ran the job rewinds to the burned position,
+/// keeping the execution in history. A deliberate skip of an executed
+/// job stays refused up front.
+#[named]
+#[tokio::test]
+async fn skip_racing_start_converges() {
+    let log = test_logger(function_name!());
+    let (mgr, mut root, peer, _dir, _shutdown) = manager_test_root_and_peer(log).await;
+    let owner = fake_identity(&mut root).await;
+
+    let signer_nonce = SessionSignerNonce::random();
+    let session_id =
+        SessionId::compute(mgr.own_baseboard(), mgr.session_sush_nonce(), signer_nonce);
+    let mut mirror = Session::new(session_id);
+    let job_id = mirror.next_job_id();
+    mgr.session_start(&owner, session_id, signer_nonce, true)
+        .await
+        .unwrap();
+
+    let job = root
+        .sign_job_request(job_id, session_id, "true", false)
+        .await;
+    mgr.job_start(
+        &owner,
+        job.into_signed(),
+        JobStartParams {
+            wait: JobWait::Stop,
+            ..Default::default()
+        },
+    )
+    .await
+    .unwrap();
+    assert!(matches!(
+        mgr.session_skip_job(&owner, session_id, job_id).await,
+        Err(JobError::NotNextJob(_))
+    ));
+
+    peer.send(
+        Message::Request(Request::session(
+            owner.key_id.clone(),
+            SessionRequest::Skip(session_id, job_id),
+        ))
+        .into(),
+    );
+    assert!(mirror.skip_job(job_id));
+    timeout(Duration::from_secs(30), async {
+        loop {
+            if let Some(session) = mgr.session(&owner)
+                && session.next_job_id() == mirror.next_job_id()
+            {
+                break;
+            }
+            sleep(Duration::from_millis(50)).await;
+        }
+    })
+    .await
+    .expect("the racing skip never converged");
+
+    let status = mgr.job_status(&owner, &job_id).await.unwrap()[mgr.own_baseboard()].clone();
+    check_status_stopped(status, &job_id, Ok(0), Some(0), Some(0));
+}
+
 /// Hostile certificate imports over gossip cannot displace the trust
 /// anchor or any established certificate.
 #[named]
