@@ -42,6 +42,14 @@ use crate::types::SessionStartNonce;
 
 pub(crate) const PREFIX: &str = "sush";
 const SESSION_FILE: &str = "session.json";
+const SESSION_FILE_VERSION: u32 = 1;
+
+/// The persisted session, versioned for future migrations.
+#[derive(Deserialize, Serialize)]
+struct SavedSession {
+    version: u32,
+    session: Session,
+}
 
 #[derive(Clone, Debug, Default)]
 pub struct Cli {
@@ -67,8 +75,14 @@ impl Cli {
             }
         };
         match fs::read(&path) {
-            Ok(json) => match serde_json::from_slice(&json) {
-                Ok(session) => *self.session.lock().unwrap() = Some(session),
+            Ok(json) => match serde_json::from_slice::<SavedSession>(&json) {
+                Ok(SavedSession {
+                    version: SESSION_FILE_VERSION,
+                    session,
+                }) => *self.session.lock().unwrap() = Some(session),
+                Ok(SavedSession { version, .. }) => {
+                    eprintln!("⚠️ Ignoring a version {version} saved session")
+                }
                 Err(error) => eprintln!("⚠️ Ignoring the saved session: {error}"),
             },
             Err(error) if error.kind() == ErrorKind::NotFound => (),
@@ -98,8 +112,11 @@ impl Cli {
             return;
         };
         let result = match session {
-            Some(session) => serde_json::to_vec_pretty(session)
-                .map_err(io::Error::other)
+            Some(session) => serde_json::to_vec_pretty(&SavedSession {
+                version: SESSION_FILE_VERSION,
+                session: session.clone(),
+            })
+            .map_err(io::Error::other)
             .and_then(|json| {
                 AtomicFile::new(path, OverwriteBehavior::AllowOverwrite)
                     .write(|file| {
