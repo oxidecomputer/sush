@@ -340,15 +340,19 @@ pub struct JobStartParams {
     pub limits: JobLimits,
 
     /// Terminal type for interactive jobs.
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub term: Option<String>,
 
     /// Terminal window height for interactive jobs.
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub rows: Option<u16>,
 
     /// Terminal window width for interactive jobs.
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub cols: Option<u16>,
 
     /// Wait for the job to start or stop.
+    #[serde(skip_serializing_if = "JobWait::is_none")]
     pub wait: JobWait,
 }
 

@@ -613,6 +613,31 @@ mod test {
 
     use super::*;
 
+    /// Values to be signed must match even across versions.
+    #[test]
+    fn pin_to_be_signed() {
+        let key_id: KeyId = "zoo-zero".parse().unwrap();
+        let nonce: Nonce = "abandon".parse().unwrap();
+        let request = BoundRequest::new("get", "/target?via=14", 7);
+        assert_eq!(
+            hex::encode(request.to_be_signed(&key_id, &nonce)),
+            "1dba1e858c79a9699cf58de26b142bf4c3bbb0549c585f13b8001130c2f912c1"
+        );
+
+        let mut epk = [0x66; 32];
+        epk[0] = 0x58;
+        let response: ChallengeResponse = serde_json::from_value(serde_json::json!({
+            "nonce": "abandon",
+            "cnonce": "ability",
+            "epk": RequestVerifier::from_be_bytes(epk),
+        }))
+        .unwrap();
+        assert_eq!(
+            hex::encode(response.to_be_signed()),
+            "9c3542d6a0ecb148b24b709d56c0ae7fc394b71adc342cc74145381c030e4348"
+        );
+    }
+
     #[tokio::test]
     async fn challenge_response() {
         let name = "CN=Ephemeral Authenticator,O=Oxide Computer Company,C=US"

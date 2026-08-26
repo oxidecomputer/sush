@@ -473,5 +473,169 @@ mod wire_format {
         assert!(corrupt.is_err());
     }
 
-    // TODO: snapshot more messages
+    #[test]
+    fn session_skip_request() {
+        let msg: VersionedMessage = Message::Request(Request::session(
+            KeyId::from_str("zoo-zero").unwrap(),
+            SessionRequest::Skip(
+                sid("bamboo-bamboo-bamboo-bamboo-bamboo-bamboo-bamboo-banana"),
+                "abandon-abandon-abandon-abandon-abandon-abandon-abandon-ability"
+                    .parse()
+                    .unwrap(),
+            ),
+        ))
+        .into();
+        assert_wire_format("session-skip-request", msg);
+    }
+
+    #[test]
+    fn job_stop_request() {
+        let msg: VersionedMessage = Message::Request(Request::job(
+            KeyId::from_str("zoo-zero").unwrap(),
+            JobRequest::Stop(
+                "abandon-abandon-abandon-abandon-abandon-abandon-abandon-ability"
+                    .parse()
+                    .unwrap(),
+            ),
+        ))
+        .into();
+        assert_wire_format("job-stop-request", msg);
+    }
+
+    #[test]
+    fn cert_requests() {
+        use x509_cert::der::DecodePem as _;
+
+        let cert = Certificate::from_pem(include_str!("../../client/certs/staging.pem")).unwrap();
+        let msg: VersionedMessage = Message::Request(Request::cert(
+            KeyId::from_str("zoo-zero").unwrap(),
+            CertRequest::Import(cert),
+        ))
+        .into();
+        assert_wire_format("cert-import-request", msg);
+
+        let msg: VersionedMessage = Message::Request(Request::cert(
+            KeyId::from_str("zoo-zero").unwrap(),
+            CertRequest::Revoke(
+                KeyId::from_str("zoo-zero").unwrap(),
+                DateTime::from_timestamp(1_756_252_800, 0).unwrap(),
+            ),
+        ))
+        .into();
+        assert_wire_format("cert-revoke-request", msg);
+    }
+
+    #[test]
+    fn identity_revoke_request() {
+        let msg: VersionedMessage = Message::Request(Request::identity(
+            KeyId::from_str("zoo-zero").unwrap(),
+            IdentityRequest::Revoke(
+                KeyId::from_str("zoo-zero").unwrap(),
+                DateTime::from_timestamp(1_756_252_800, 0).unwrap(),
+            ),
+        ))
+        .into();
+        assert_wire_format("identity-revoke-request", msg);
+    }
+
+    #[test]
+    fn job_events() {
+        use sush_common::hash::hash;
+        use sush_common::jobs::JobOutputState;
+
+        let baseboard = BaseboardId {
+            part_number: "913-0000019".to_string(),
+            serial_number: "BRM42220030".to_string(),
+        };
+        let job_id = "abandon-abandon-abandon-abandon-abandon-abandon-abandon-ability"
+            .parse()
+            .unwrap();
+        let when = DateTime::from_timestamp(1_756_252_800, 0).unwrap();
+
+        let msg: VersionedMessage =
+            Message::Event(baseboard.clone(), Event::Job(JobEvent::Start(job_id, when))).into();
+        assert_wire_format("job-start-event", msg);
+
+        let output = JobOutputState {
+            stdout_len: 22,
+            stderr_len: 0,
+            stdout_hash: hash(b"all pools are healthy\n").into(),
+            stderr_hash: hash(b"").into(),
+        };
+        let msg: VersionedMessage = Message::Event(
+            baseboard.clone(),
+            Event::Job(JobEvent::Stop(job_id, when, Ok(0), output)),
+        )
+        .into();
+        assert_wire_format("job-stop-event", msg);
+
+        let msg: VersionedMessage = Message::Event(
+            baseboard,
+            Event::Job(JobEvent::Error(
+                job_id,
+                when,
+                ProcessError::InvalidJob("interactive jobs cannot stream".to_string()),
+            )),
+        )
+        .into();
+        assert_wire_format("job-error-event", msg);
+    }
+
+    #[test]
+    fn concurrent_sessions_error() {
+        let msg: VersionedMessage = Message::Event(
+            BaseboardId {
+                part_number: "913-0000019".to_string(),
+                serial_number: "BRM42220030".to_string(),
+            },
+            Event::Error(Error::ConcurrentSessions {
+                own_session: sid("bamboo-bamboo-bamboo-bamboo-bamboo-bamboo-bamboo-banana"),
+                own_version: Version::new(),
+                incoming_session: sid("zoo-zoo-zoo-zoo-zoo-zoo-zoo-zebra"),
+                incoming_version: Version::new(),
+            }),
+        )
+        .into();
+        assert_wire_format("concurrent-sessions-error", msg);
+    }
+
+    #[test]
+    fn job_start_interactive_request() {
+        use sush_api::JobWait;
+        use sush_common::jobs::{JobMode, JobStartRequest};
+        use sush_common::keys::{EncodedSignature, Signed};
+
+        let request = JobStartRequest::new(
+            "abandon-abandon-abandon-abandon-abandon-abandon-abandon-ability"
+                .parse()
+                .unwrap(),
+            sid("bamboo-bamboo-bamboo-bamboo-bamboo-bamboo-bamboo-banana"),
+            "bash",
+            JobMode::Interactive,
+            "14".parse().unwrap(),
+        );
+        let signed = Signed::new(
+            request,
+            KeyId::from_str("zoo-zero").unwrap(),
+            EncodedSignature {
+                r: "abandon".parse().unwrap(),
+                s: "zoo".parse().unwrap(),
+                flags: 1,
+                counter: 38,
+            },
+        );
+        let params = JobStartParams {
+            term: Some("vt100".to_string()),
+            rows: Some(24),
+            cols: Some(80),
+            wait: JobWait::Start,
+            ..Default::default()
+        };
+        let msg: VersionedMessage = Message::Request(Request::job(
+            KeyId::from_str("zoo-zero").unwrap(),
+            JobRequest::Start(signed, params),
+        ))
+        .into();
+        assert_wire_format("job-start-interactive-request", msg);
+    }
 }
