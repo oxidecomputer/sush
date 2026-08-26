@@ -22,7 +22,7 @@ use xdg::BaseDirectories;
 
 use sush_common::authn::Identity;
 use sush_common::jobs::{
-    Access, JobId, JobOutputStream, JobStatusMap, Session, SessionId, SignedJob,
+    Access, JobId, JobOutputStream, JobStatusMap, Session, SessionId, SessionSignerNonce, SignedJob,
 };
 use sush_common::keys::{KeyId, SshPublicKey};
 use sush_common::targets::{SledId, SledVersion};
@@ -237,6 +237,10 @@ impl CommandContext for Repl {
         nonce: SessionStartNonce,
     ) -> Result<(), CommandError> {
         self.cli.session_start_params(baseboard_id, nonce)
+    }
+
+    fn session_created(&mut self, session: Session, signer_nonce: SessionSignerNonce) {
+        self.cli.session_created(session, signer_nonce)
     }
 
     fn session_started(&mut self, session: Session, force: bool) -> Result<(), CommandError> {

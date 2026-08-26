@@ -28,7 +28,7 @@ use xdg::BaseDirectories;
 use sush_common::authn::Identity;
 use sush_common::jobs::{
     Access, JobId, JobOutputState, JobOutputStream, JobStatus, JobStatusMap, Session, SessionId,
-    SignedJob, job_status_to_json_map,
+    SessionSignerNonce, SignedJob, job_status_to_json_map,
 };
 use sush_common::keys::{KeyId, Signature, SshPublicKey};
 use sush_common::targets::{MAX_CUBBY, SledId, SledVersion};
@@ -74,6 +74,22 @@ impl Cli {
             Err(error) => eprintln!("⚠️ Ignoring the saved session: {error}"),
         }
         self.session_file = Some(path);
+    }
+
+    /// Adopt `session` unless one with the same ID is already
+    /// attached and `force` is unset.
+    fn adopt_session(&mut self, session: Session, force: bool) -> SessionId {
+        let session_id = session.session_id();
+        let mut session_guard = self.session.lock().unwrap();
+        if force
+            || session_guard
+                .as_ref()
+                .is_none_or(|s| s.session_id() != session_id)
+        {
+            self.save_session(Some(&session));
+            *session_guard = Some(session);
+        }
+        session_id
     }
 
     fn save_session(&self, session: Option<&Session>) {
@@ -241,24 +257,28 @@ impl CommandContext for Cli {
             ),
             OutputFormat::Text => {
                 println!("Baseboard ID: {baseboard_id}");
-                println!("Sush Nonce:   {}", nonce.nonce);
+                println!("Sush nonce:   {}", nonce.nonce);
             }
         }
         Ok(())
     }
 
-    fn session_started(&mut self, session: Session, force: bool) -> Result<(), CommandError> {
-        let session_id = session.session_id().to_owned();
-        let mut session_guard = self.session.lock().unwrap();
-        if force
-            || session_guard
-                .as_ref()
-                .is_none_or(|s| s.session_id() != session_id)
-        {
-            self.save_session(Some(&session));
-            *session_guard = Some(session);
+    fn session_created(&mut self, session: Session, signer_nonce: SessionSignerNonce) {
+        let session_id = self.adopt_session(session, true);
+        match self.get_output_format() {
+            OutputFormat::Json => println!(
+                "{}",
+                json!({"session_created": session_id, "signer_nonce": signer_nonce})
+            ),
+            OutputFormat::Text => {
+                println!("✅ Session is now `{session_id}`");
+                println!("   Signer nonce: {signer_nonce}");
+            }
         }
-        drop(session_guard);
+    }
+
+    fn session_started(&mut self, session: Session, force: bool) -> Result<(), CommandError> {
+        let session_id = self.adopt_session(session, force);
         match self.get_output_format() {
             OutputFormat::Json => println!("{}", json!({"session_started": session_id})),
             OutputFormat::Text => println!("✅ Session is now `{session_id}`"),

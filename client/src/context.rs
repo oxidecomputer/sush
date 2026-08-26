@@ -15,7 +15,7 @@ use x509_cert::Certificate;
 
 use sush_common::authn::{BoundRequest, Credentials, Identity, RequestKey};
 use sush_common::jobs::{
-    Access, JobId, JobOutputStream, JobStatusMap, Session, SessionId, SignedJob,
+    Access, JobId, JobOutputStream, JobStatusMap, Session, SessionId, SessionSignerNonce, SignedJob,
 };
 use sush_common::keys::{KeyId, SshPublicKey};
 use sush_common::targets::{SledId, SledVersion};
@@ -121,6 +121,7 @@ pub trait CommandContext: Clone + Send + Sync {
         baseboard_id: BaseboardId,
         nonce: SessionStartNonce,
     ) -> Result<(), CommandError>;
+    fn session_created(&mut self, session: Session, signer_nonce: SessionSignerNonce);
     fn session_started(&mut self, session: Session, force: bool) -> Result<(), CommandError>;
     fn session_stopped(&mut self, session_id: &SessionId) -> Result<(), CommandError>;
     fn attach_allowed(&mut self, key_id: &KeyId, access: Access);

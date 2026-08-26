@@ -44,14 +44,16 @@ use sush_api::JobWait;
 use sush_common::authn::{
     AuthnError, Challenge, ChallengeResponse, Credentials, Identity, RequestKey,
 };
+#[cfg(feature = "permslip")]
+use sush_common::codephrases::InvalidCodephrase;
 use sush_common::interactive::{InteractiveJobError, InteractiveJobMessage};
 use sush_common::jobs::JobOutputStream::{self, Stderr, Stdout};
-#[cfg(feature = "permslip")]
-use sush_common::jobs::JobStartRequest;
 use sush_common::jobs::{
     Access, JobId, JobLimits, JobOutputHash, JobOutputState, JobStatus, JobStatusMap, Session,
     SessionId, SessionSignerNonce, SignedJob, Streaming, job_status_try_from_json_map,
 };
+#[cfg(feature = "permslip")]
+use sush_common::jobs::{JobStartRequest, SessionSushNonce};
 use sush_common::keys::{KeyError, KeyId, Signer as _};
 use sush_common::targets::{SledId, Target};
 use sush_common::version::VersionInfo;
@@ -495,6 +497,26 @@ pub enum SessionCommand {
     Deny {
         /// The key to withdraw access from.
         key_id: KeyId,
+    },
+
+    /// Create a session at the signing service from a rack's start
+    /// parameters.
+    #[cfg(feature = "permslip")]
+    Create {
+        /// The baseboard ID of the sled that generated the nonce.
+        #[arg(value_parser = parse_baseboard_id)]
+        baseboard_id: BaseboardId,
+
+        /// The rack's session nonce.
+        nonce: SessionSushNonce,
+
+        /// Use `permslip` to sign sessions and jobs with this key name.
+        #[arg(short, long, env = SUSH_PERMSLIP_KEY, value_name = "KEY_NAME")]
+        permslip: Option<String>,
+
+        /// The `permslip` server to contact for signing.
+        #[arg(long, env = PERMSLIP_URL, requires = "permslip", value_name = "URL")]
+        permslip_url: Option<String>,
     },
 
     /// Get the parameters to send to the signer server to start a session.
@@ -1041,44 +1063,35 @@ async fn session(
             },
             Some(client),
         ) => {
-            let (session_id, nonce) =
-                if let (Some(session_id), Some(nonce)) = (session_id, nonce) {
-                    (session_id, nonce)
-                } else {
-                    use sush_common::codephrases::InvalidCodephrase;
-
-                    let Some(permslip_url) = permslip_url else {
-                        return Err(CommandError::MissingPermslipUrl);
-                    };
-                    let Some(permslip_key) = permslip else {
-                        return Err(CommandError::MissingKeyName);
-                    };
-                    let signer = PermslipSigner::new(permslip_key, &permslip_url).await?;
-
-                    let (baseboard_id, nonce) = with_login(ctx, client, async || {
-                        Ok((
-                            client.target().send().await?.into_inner(),
-                            client.session_start_nonce().send().await?.into_inner(),
-                        ))
-                    })
-                    .await?;
-
-                    let created = signer.create_session(&baseboard_id, nonce.nonce).await?;
-
-                    (
-                        created.session_id.to_string().parse().map_err(
-                            |e: InvalidCodephrase| {
-                                CommandError::UnsupportedPermslipResponse(e.to_string())
-                            },
-                        )?,
-                        created.signer_nonce.to_string().parse().map_err(
-                            |e: InvalidCodephrase| {
-                                CommandError::UnsupportedPermslipResponse(e.to_string())
-                            },
-                        )?,
-                    )
-                };
+            let (session_id, nonce) = if let (Some(session_id), Some(nonce)) = (session_id, nonce) {
+                (session_id, nonce)
+            } else {
+                let (baseboard_id, nonce) = with_login(ctx, client, async || {
+                    Ok((
+                        client.target().send().await?.into_inner(),
+                        client.session_start_nonce().send().await?.into_inner(),
+                    ))
+                })
+                .await?;
+                session_create(permslip, permslip_url, &baseboard_id, nonce.nonce).await?
+            };
             session_start(ctx, client, session_id, nonce, wait).await
+        }
+
+        #[cfg(feature = "permslip")]
+        (
+            SessionCommand::Create {
+                baseboard_id,
+                nonce,
+                permslip,
+                permslip_url,
+            },
+            _,
+        ) => {
+            let (session_id, nonce) =
+                session_create(permslip, permslip_url, &baseboard_id, nonce).await?;
+            ctx.session_created(Session::new(session_id), nonce);
+            Ok(())
         }
 
         #[cfg(not(feature = "permslip"))]
@@ -1616,6 +1629,35 @@ async fn job_start(
         ctx.job_started(&job);
     }
     Ok(())
+}
+
+/// Parse a baseboard ID for clap.
+#[cfg(feature = "permslip")]
+fn parse_baseboard_id(value: &str) -> Result<BaseboardId, String> {
+    value.parse::<BaseboardId>().map_err(|e| e.to_string())
+}
+
+/// Ask the online signing service to create a session.
+#[cfg(feature = "permslip")]
+async fn session_create(
+    permslip: Option<String>,
+    permslip_url: Option<String>,
+    baseboard_id: &BaseboardId,
+    nonce: SessionSushNonce,
+) -> Result<(SessionId, SessionSignerNonce), CommandError> {
+    let Some(permslip_url) = permslip_url else {
+        return Err(CommandError::MissingPermslipUrl);
+    };
+    let Some(permslip_key) = permslip else {
+        return Err(CommandError::MissingKeyName);
+    };
+    let invalid = |e: InvalidCodephrase| CommandError::UnsupportedPermslipResponse(e.to_string());
+    let signer = PermslipSigner::new(permslip_key, &permslip_url).await?;
+    let created = signer.create_session(baseboard_id, nonce).await?;
+    Ok((
+        created.session_id.to_string().parse().map_err(invalid)?,
+        created.signer_nonce.to_string().parse().map_err(invalid)?,
+    ))
 }
 
 async fn session_start(
