@@ -138,8 +138,6 @@ pub struct GlobalArgs {
     #[arg(long,
           env = SUSH_OUTPUT_FORMAT,
           default_value = "text",
-          default_value_if("json", "true", "json"),
-          default_value_if("text", "true", "text"),
           value_name = "FORMAT",
           value_enum)]
     #[clap(global = true)]
@@ -180,6 +178,18 @@ pub struct GlobalArgs {
     #[arg(short, long, env = SUSH_KEY_ID)]
     #[clap(global = true)]
     pub ssh_key_id: Option<KeyId>,
+}
+
+impl GlobalArgs {
+    pub fn output_format(&self) -> Option<OutputFormat> {
+        if self.json {
+            Some(OutputFormat::Json)
+        } else if self.text {
+            Some(OutputFormat::Text)
+        } else {
+            self.output
+        }
+    }
 }
 
 #[derive(Debug, Parser)]
@@ -738,7 +748,7 @@ impl ClientCommand {
 
     async fn run(self, ctx: &mut impl CommandContext) -> Result<(), CommandError> {
         let args = ctx.get_globals().to_owned();
-        if let Some(output) = args.output {
+        if let Some(output) = args.output_format() {
             ctx.set_output_format(output);
         }
 
