@@ -82,7 +82,7 @@ progenitor::generate_api!(
         SessionSignerNonce = sush_common::jobs::SessionSignerNonce,
         SessionSushNonce = sush_common::jobs::SessionSushNonce,
         SledVersion = sush_common::targets::SledVersion,
-        Streaming = sush_common::jobs::Streaming,
+        JobMode = sush_common::jobs::JobMode,
         VersionInfo = sush_common::version::VersionInfo,
     },
     timeout = 600,

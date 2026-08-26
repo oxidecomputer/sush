@@ -321,7 +321,7 @@ mod wire_format {
 
     #[test]
     fn job_start_request() {
-        use sush_common::jobs::{JobStartRequest, Streaming};
+        use sush_common::jobs::{JobMode, JobStartRequest};
         use sush_common::keys::{EncodedSignature, Signed};
 
         let request = JobStartRequest::new(
@@ -332,8 +332,7 @@ mod wire_format {
                 .parse()
                 .unwrap(),
             "echo hello",
-            false,
-            Streaming::None,
+            JobMode::Batch,
             "14,16".parse().unwrap(),
         );
         let signed = Signed::new(

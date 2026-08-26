@@ -49,8 +49,8 @@ use sush_common::codephrases::InvalidCodephrase;
 use sush_common::interactive::{InteractiveJobError, InteractiveJobMessage};
 use sush_common::jobs::JobOutputStream::{self, Stderr, Stdout};
 use sush_common::jobs::{
-    Access, JobId, JobLimits, JobOutputHash, JobOutputState, JobStatus, JobStatusMap, Session,
-    SessionId, SessionSignerNonce, SignedJob, Streaming, job_status_try_from_json_map,
+    Access, JobId, JobLimits, JobMode, JobOutputHash, JobOutputState, JobStatus, JobStatusMap,
+    Session, SessionId, SessionSignerNonce, SignedJob, job_status_try_from_json_map,
 };
 #[cfg(feature = "permslip")]
 use sush_common::jobs::{JobStartRequest, SessionSushNonce};
@@ -1272,10 +1272,12 @@ async fn job(
             if let Some(client) = client.as_ref() {
                 preflight_target(ctx, client, &target).await?;
             }
-            let streaming = if *streaming {
-                Streaming::Output
+            let mode = if *interactive {
+                JobMode::Interactive
+            } else if *streaming {
+                JobMode::StreamOutput
             } else {
-                Streaming::None
+                JobMode::Batch
             };
             let signer = PermslipSigner::new(key_name, permslip_url).await?;
             let mut interval = interval(SIGNING_UPDATE_INTERVAL);
@@ -1284,8 +1286,7 @@ async fn job(
                 job_id.to_owned(),
                 session_id,
                 command,
-                *interactive,
-                streaming,
+                mode,
                 target,
             ));
             pin!(sign);
@@ -1430,8 +1431,8 @@ async fn job_start(
         force,
         ..
     } = start_args;
-    let interactive = job.payload().interactive;
-    let streaming = matches!(job.payload().streaming, Streaming::Output);
+    let interactive = job.payload().is_interactive();
+    let streaming = matches!(job.payload().mode, JobMode::StreamOutput);
     let wait = if interactive || streaming {
         JobWait::Start
     } else if wait {

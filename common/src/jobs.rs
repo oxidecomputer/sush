@@ -232,7 +232,7 @@ impl Session {
     }
 }
 
-/// Allow **unrecorded** streaming I/O.
+/// How a job runs. The streaming modes allow **unrecorded** I/O.
 #[derive(
     BorshDeserialize,
     BorshSerialize,
@@ -246,27 +246,34 @@ impl Session {
     PartialEq,
     Serialize,
 )]
-pub enum Streaming {
+#[serde(rename_all = "kebab-case")]
+pub enum JobMode {
     #[default]
-    None,
-    Input,
-    Output,
+    Batch,
+    Interactive,
+    StreamInput,
+    StreamOutput,
 }
 
-impl Streaming {
-    pub fn is_none(&self) -> bool {
-        matches!(self, Self::None)
+impl JobMode {
+    pub fn is_batch(&self) -> bool {
+        matches!(self, Self::Batch)
     }
 
-    pub fn is_some(&self) -> bool {
-        !self.is_none()
+    pub fn is_interactive(&self) -> bool {
+        matches!(self, Self::Interactive)
+    }
+
+    pub fn is_streaming(&self) -> bool {
+        matches!(self, Self::StreamInput | Self::StreamOutput)
     }
 
     pub fn as_str(&self) -> &'static str {
         match self {
-            Self::None => "none",
-            Self::Input => "input",
-            Self::Output => "output",
+            Self::Batch => "batch",
+            Self::Interactive => "interactive",
+            Self::StreamInput => "stream-input",
+            Self::StreamOutput => "stream-output",
         }
     }
 }
@@ -287,10 +294,8 @@ pub struct JobStartRequest {
     pub job_id: JobId,
     pub session_id: SessionId,
     pub command: String,
-    #[serde(default, skip_serializing_if = "is_false")]
-    pub interactive: bool,
-    #[serde(default, skip_serializing_if = "Streaming::is_none")]
-    pub streaming: Streaming,
+    #[serde(default, skip_serializing_if = "JobMode::is_batch")]
+    pub mode: JobMode,
     /// The sleds this job runs on.
     #[borsh(
         serialize_with = "borsh_ser_target",
@@ -300,10 +305,6 @@ pub struct JobStartRequest {
     pub target: Target,
 }
 
-fn is_false(x: &bool) -> bool {
-    !x
-}
-
 impl JobStartRequest {
     const TYPE_NAME: &[u8] = b"sush_common::jobs::JobStartRequest";
 
@@ -311,23 +312,21 @@ impl JobStartRequest {
         job_id: JobId,
         session_id: SessionId,
         command: S,
-        interactive: bool,
-        streaming: Streaming,
+        mode: JobMode,
         target: Target,
     ) -> Self {
         Self {
             job_id,
             session_id,
             command: command.as_ref().to_string(),
-            interactive,
-            streaming,
+            mode,
             target,
         }
     }
 
     /// Interactive jobs run only on their single named baseboard.
     pub fn runs_on(&self, baseboard: &BaseboardId, cubbies: &Cubbies) -> bool {
-        if self.interactive {
+        if self.mode.is_interactive() {
             self.target.single_baseboard() == Some(baseboard)
         } else {
             self.target.includes(baseboard, cubbies)
@@ -346,8 +345,8 @@ impl JobStartRequest {
         &self.command
     }
 
-    pub fn interactive(&self) -> bool {
-        self.interactive
+    pub fn is_interactive(&self) -> bool {
+        self.mode.is_interactive()
     }
 
     pub fn target(&self) -> &Target {
@@ -362,21 +361,15 @@ impl ToBeSigned for JobStartRequest {
             job_id,
             session_id,
             command,
-            interactive,
-            streaming,
+            mode,
             target,
         } = self;
         let mut fields = ToBeSignedFields::new(Self::TYPE_NAME)
             .field(b"job_id", &job_id.to_be_bytes())
             .field(b"session_id", &session_id.to_be_bytes())
             .field(b"command", command.as_bytes());
-        if *interactive {
-            fields = fields.field(b"interactive", &[1]);
-        }
-        match streaming {
-            Streaming::None => {}
-            Streaming::Input => fields = fields.field(b"streaming", &[1]),
-            Streaming::Output => fields = fields.field(b"streaming", &[2]),
+        if !mode.is_batch() {
+            fields = fields.field(b"mode", mode.as_str().as_bytes());
         }
         if !target.is_all() {
             fields = fields.field(b"target", target.to_string().as_bytes());
@@ -863,14 +856,7 @@ mod test {
         let session_id: SessionId = "supply-glance-fresh-desk-festival-fragile-spice-glow"
             .parse()
             .unwrap();
-        let request = JobStartRequest::new(
-            job_id,
-            session_id,
-            "true",
-            false,
-            Streaming::None,
-            Target::All,
-        );
+        let request = JobStartRequest::new(job_id, session_id, "true", JobMode::Batch, Target::All);
         assert_eq!(
             request.to_be_signed(),
             ToBeSignedFields::new(JobStartRequest::TYPE_NAME)
@@ -888,8 +874,7 @@ mod test {
             job_id,
             session_id,
             "true",
-            true,
-            Streaming::None,
+            JobMode::Interactive,
             Target::All,
         );
         assert_ne!(interactive.to_be_signed(), request.to_be_signed());
@@ -905,14 +890,7 @@ mod test {
         let mut server = Session::new(session_id);
 
         let job_id = signer.next_job_id();
-        let request = JobStartRequest::new(
-            job_id,
-            session_id,
-            "true",
-            false,
-            Streaming::None,
-            Target::All,
-        );
+        let request = JobStartRequest::new(job_id, session_id, "true", JobMode::Batch, Target::All);
         let signed = Signed::new(
             request,
             KeyId::random(),
@@ -949,24 +927,18 @@ mod test {
         };
         let me = sled("me");
         let cubbies = Cubbies::from([(14, me.clone())]);
-        let job = |interactive, target| {
-            JobStartRequest::new(
-                JobId::random(),
-                SessionId::random(),
-                "true",
-                interactive,
-                Streaming::None,
-                target,
-            )
+        let job = |mode, target| {
+            JobStartRequest::new(JobId::random(), SessionId::random(), "true", mode, target)
         };
+        use JobMode::*;
         let just_me = Target::Sleds(vec![SledId::Baseboard(me.clone())]);
-        assert!(job(true, just_me.clone()).runs_on(&me, &cubbies));
-        assert!(job(false, just_me).runs_on(&me, &cubbies));
-        assert!(!job(true, Target::All).runs_on(&me, &cubbies));
-        assert!(job(false, Target::All).runs_on(&me, &cubbies));
+        assert!(job(Interactive, just_me.clone()).runs_on(&me, &cubbies));
+        assert!(job(Batch, just_me).runs_on(&me, &cubbies));
+        assert!(!job(Interactive, Target::All).runs_on(&me, &cubbies));
+        assert!(job(Batch, Target::All).runs_on(&me, &cubbies));
         let my_cubby = Target::Sleds(vec![SledId::Cubby(14)]);
-        assert!(!job(true, my_cubby.clone()).runs_on(&me, &cubbies));
-        assert!(job(false, my_cubby).runs_on(&me, &cubbies));
+        assert!(!job(Interactive, my_cubby.clone()).runs_on(&me, &cubbies));
+        assert!(job(Batch, my_cubby).runs_on(&me, &cubbies));
     }
 
     /// Requested limits may narrow the default ceiling, never widen it.

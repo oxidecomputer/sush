@@ -45,7 +45,7 @@ use sush_common::interactive::{
     INTERACTIVE_JOB_BUFFER_SIZE, InteractiveJobControl as Control, InteractiveJobMessage as Message,
 };
 use sush_common::jobs::{
-    Access, JobLimits, JobOutputState, JobOutputStream::*, ProcessError, Streaming,
+    Access, JobLimits, JobMode, JobOutputState, JobOutputStream::*, ProcessError,
 };
 use tokio_util::sync::CancellationToken;
 
@@ -89,13 +89,13 @@ impl Job {
         io: JobIo,
         stdout: File,
         stderr: File,
-        streaming: Streaming,
+        mode: JobMode,
         stop: CancellationToken,
     ) -> Self {
         let (tx_client, rx_client) = mpsc::channel(1);
         Self {
             task: spawn(job(
-                log, limits, child, io, stdout, stderr, streaming, rx_client, stop,
+                log, limits, child, io, stdout, stderr, mode, rx_client, stop,
             )),
             tx_client,
         }
@@ -120,7 +120,7 @@ async fn job(
     mut io: JobIo,
     mut stdout_file: File,
     mut stderr_file: File,
-    streaming: Streaming,
+    mode: JobMode,
     mut rx_client: SocketReceiver,
     stop: CancellationToken,
 ) -> (Result<i32, ProcessError>, JobOutputState) {
@@ -132,7 +132,7 @@ async fn job(
     let mut killed = false;
     let mut kills = 0;
     let mut dead = false;
-    let streaming = matches!(streaming, Streaming::Output);
+    let streaming = matches!(mode, JobMode::StreamOutput);
     let mut pending = Option::<Bytes>::None;
     let mut attached = false;
     let (tx_output, rx_output) = mpsc::channel(1);
@@ -558,7 +558,7 @@ mod test {
                     .open("/dev/null")
                     .await
                     .unwrap(),
-                Streaming::None,
+                JobMode::Batch,
                 stop,
             );
             assert_eq!(job.wait().await.unwrap().0.unwrap(), 0);

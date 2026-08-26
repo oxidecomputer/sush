@@ -26,7 +26,7 @@ use sush_client::context::Authz;
 use sush_client::{Client, ResponseValue};
 use sush_common::authn::{Challenge, ChallengeResponse, Credentials, Identity, Nonce, RequestKey};
 use sush_common::codephrases::Codephrase;
-use sush_common::jobs::{JobId, JobStartRequest, SessionId, Streaming, VerifiedJob};
+use sush_common::jobs::{JobId, JobMode, JobStartRequest, SessionId, VerifiedJob};
 use sush_common::keys::{EphemeralKey, KeyType, Signer};
 use sush_common::targets::{Cubbies, Target};
 use sush_server::executor::PathIsolation;
@@ -85,15 +85,13 @@ pub trait SignJobRequest {
         interactive: bool,
         target: Target,
     ) -> VerifiedJob {
-        self.sign_full_job_request(
-            job_id,
-            session_id,
-            command,
-            interactive,
-            Streaming::None,
-            target,
-        )
-        .await
+        let mode = if interactive {
+            JobMode::Interactive
+        } else {
+            JobMode::Batch
+        };
+        self.sign_full_job_request(job_id, session_id, command, mode, target)
+            .await
     }
 
     /// Sign a batch job request with unrecorded output streaming.
@@ -104,15 +102,8 @@ pub trait SignJobRequest {
         command: S,
         target: Target,
     ) -> VerifiedJob {
-        self.sign_full_job_request(
-            job_id,
-            session_id,
-            command,
-            false,
-            Streaming::Output,
-            target,
-        )
-        .await
+        self.sign_full_job_request(job_id, session_id, command, JobMode::StreamOutput, target)
+            .await
     }
 
     /// Sign a job request with every field specified.
@@ -121,8 +112,7 @@ pub trait SignJobRequest {
         job_id: JobId,
         session_id: SessionId,
         command: S,
-        interactive: bool,
-        streaming: Streaming,
+        mode: JobMode,
         target: Target,
     ) -> VerifiedJob;
 }
@@ -133,17 +123,11 @@ impl SignJobRequest for EphemeralKey {
         job_id: JobId,
         session_id: SessionId,
         command: S,
-        interactive: bool,
-        streaming: Streaming,
+        mode: JobMode,
         target: Target,
     ) -> VerifiedJob {
         self.sign(JobStartRequest::new(
-            job_id,
-            session_id,
-            command,
-            interactive,
-            streaming,
-            target,
+            job_id, session_id, command, mode, target,
         ))
         .await
         .expect("failed to sign job")
