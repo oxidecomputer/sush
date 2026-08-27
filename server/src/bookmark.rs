@@ -45,8 +45,7 @@ const MAGIC: &[u8; 8] = b"SUSHBKMK";
 
 /// Envelope layout: magic, big-endian sequence number, digest of the
 /// sequence number and record together, record. The digest keeps a
-/// damaged sequence number from silently reordering the slots; the
-/// whole safety argument rides on that integer.
+/// damaged sequence number from silently reordering the slots.
 const SEQ_LEN: usize = 8;
 const DIGEST_LEN: usize = 32;
 
@@ -76,8 +75,8 @@ pub enum BookmarkIoError {
     Fenced,
 }
 
-/// This server's bookmark storage. Hands out one fenced handle per
-/// peer.
+/// This server's bookmark storage. Hands out one handle per peer,
+/// each superseding the last.
 #[derive(Clone, Debug)]
 pub struct BookmarkSource {
     shared: Arc<SharedStore>,
@@ -95,11 +94,9 @@ struct SharedStore {
     /// Serializes loads and stores across handles, so the newest
     /// record on disk is always the newest store anyone `Ok`'d.
     state: Mutex<StoreState>,
-    /// The newest sequence number committed to disk this process, and
-    /// the lock every rename takes. A store future dropped mid-write
-    /// leaves a detached blocking task whose rename would otherwise
-    /// land *after* a newer store's; renames commit in sequence order
-    /// or not at all.
+    /// The newest sequence number committed to disk by this process,
+    /// under the lock every rename takes. Renames commit in sequence
+    /// order or not at all; see [`commit`].
     committed: std::sync::Mutex<u64>,
 }
 
@@ -114,13 +111,12 @@ struct StoreState {
 impl BookmarkSource {
     /// A source persisting to `slots`, each on its own device.
     ///
-    /// The contract for integrators: construct exactly one source per
-    /// slot set per process (the fences and sequence numbers that keep
-    /// the store safe live inside it), and feed that same source to
-    /// both [`seed_gossip`](crate::seed_gossip) and
-    /// [`spawn_gossip`](crate::gossip::spawn_gossip). The caller
-    /// creates the parent directories, writable by this server's user,
-    /// one per boot M.2; the record files are created and owned here.
+    /// Construct exactly one source per slot set per process, and feed
+    /// that same source to both [`seed_gossip`](crate::seed_gossip)
+    /// and [`spawn_gossip`](crate::gossip::spawn_gossip): everything
+    /// serializing the store lives inside it. The caller creates the
+    /// parent directories, one per boot M.2, writable by this server's
+    /// user. The record files are created and owned here.
     pub fn new(log: &Logger, slots: Vec<Utf8PathBuf>) -> Self {
         Self {
             shared: Arc::new(SharedStore {
@@ -236,9 +232,9 @@ impl SushBookmark {
 }
 
 /// Rename `envelope` into place iff `seq` is newer than everything
-/// committed by this process. Runs on the blocking pool; the lock is
-/// the commit point, so a straggling write detached from a dropped
-/// store future cannot land on top of the newer record that beat it.
+/// committed by this process. A store future dropped at its await
+/// detaches the blocking write, whose rename would otherwise land on
+/// top of the newer record that beat it. Runs on the blocking pool.
 fn commit(shared: &SharedStore, path: &Utf8Path, seq: u64, envelope: &[u8]) -> io::Result<()> {
     let mut committed = shared.committed.lock().unwrap();
     if seq <= *committed {
@@ -301,9 +297,9 @@ impl Bookmark for SushBookmark {
         }
         match newest {
             Some((seq, home, record)) => {
-                // Never regress: a reserved sequence number outranks a
-                // re-read of the disk, or a cancelled write's straggler
-                // could collide with a fresh reservation.
+                // A reserved sequence number outranks a re-read of the
+                // disk. Regressing would let a cancelled write's
+                // straggler collide with a fresh reservation.
                 if seq >= state.seq {
                     state.home = Some(home);
                     state.seq = seq;
@@ -349,8 +345,8 @@ impl Bookmark for SushBookmark {
         };
         let path = self.shared.slots[home].clone();
 
-        // Reserve the sequence number first: a cancelled write may
-        // still land and must be outnumbered.
+        // Reserve the sequence number first, since a cancelled write
+        // may still land and must be outnumbered.
         state.seq += 1;
         let seq = state.seq;
         let envelope = Self::envelope(seq, &record);

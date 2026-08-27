@@ -273,8 +273,6 @@ impl<'a> SessionGuard<'a> {
         replayed: bool,
     ) {
         self.queued_jobs.remove(job_id);
-        // A replayed cancellation keeps the queue and chain honest but
-        // records no local status: whatever happened is in the history.
         if replayed {
             return;
         }
@@ -364,13 +362,13 @@ pub struct State {
     /// Baseboards by cubby number, as much of it as is known.
     cubbies: Cubbies,
     /// The causal frontier we joined this universe at, if we joined
-    /// rather than seeded it. Messages at or concurrent with it are
-    /// replayed history: they rebuild state but never execute here.
+    /// rather than seeded it.
     join_frontier: Option<Version>,
     /// Jobs whose start event on our own baseboard arrived as replayed
-    /// history: a previous life started them, so no executor of ours
-    /// will ever stop them. Cleared per job by a terminal event.
-    replayed_started: BTreeSet<JobId>,
+    /// history. A previous life started them, and no executor of ours
+    /// will ever stop them. A terminal event clears its job, so
+    /// mid-replay entries are only suspects.
+    zombies: BTreeSet<JobId>,
     /// Message versions from newer builds, each warned about once.
     unknown_versions: BTreeSet<String>,
     /// Build provenance by sled.
@@ -417,7 +415,7 @@ impl State {
             identities: LruCache::new(MAX_REGISTERED_IDENTITIES),
             revoked_keys: LruCache::new(MAX_REVOKED_KEYS),
             join_frontier,
-            replayed_started: Default::default(),
+            zombies: Default::default(),
         };
         new.validate_certs(&roots);
         for root in &roots {
@@ -463,11 +461,9 @@ impl State {
             .collect()
     }
 
-    /// Jobs a previous life of this server started and left running:
-    /// their start events arrived as replayed history and no terminal
-    /// event has. Jobs this incarnation started never appear here.
-    pub fn orphaned_jobs(&self) -> BTreeSet<JobId> {
-        self.replayed_started
+    /// Jobs a previous life of this server started and left running.
+    pub fn zombies(&self) -> BTreeSet<JobId> {
+        self.zombies
             .iter()
             .filter(|job_id| {
                 self.running
@@ -478,7 +474,7 @@ impl State {
     }
 
     /// Whether a message at `version` is live traffic rather than
-    /// replayed history: only strict causal descendants of the join
+    /// replayed history. Only strict causal descendants of the join
     /// frontier are live.
     fn is_live(&self, version: &Version) -> bool {
         self.join_frontier
@@ -908,10 +904,9 @@ impl State {
                         info!(log, "job started"; "job_id" => %job_id, "when" => %when);
                         self.running.insert((*job_id, baseboard_id.clone()), *when);
                         // A replayed start on our own baseboard is a
-                        // previous life's: only these are ever declared
-                        // interrupted.
+                        // previous life's. Only these can be zombies.
                         if *baseboard_id == self.own_baseboard && !self.is_live(incoming_version) {
-                            self.replayed_started.insert(*job_id);
+                            self.zombies.insert(*job_id);
                         }
                         self.history.set_job_status(
                             job_id,
@@ -929,7 +924,7 @@ impl State {
                         info!(log, "job stopped"; "job_id" => %job_id, "when" => %when, "result" => ?result);
                         if baseboard_id == &self.own_baseboard {
                             self.attachments.remove(job_id);
-                            self.replayed_started.remove(job_id);
+                            self.zombies.remove(job_id);
                         }
                         self.running.remove(&(*job_id, baseboard_id.clone()));
                         self.history.transition_job_status(
@@ -947,9 +942,9 @@ impl State {
                                     })
                                 }
                                 // An interrupted declaration raced this
-                                // genuine stop; the real result wins, in
-                                // either arrival order. The start time
-                                // died with the interrupted incarnation.
+                                // genuine stop. The real result wins in
+                                // either arrival order, though the start
+                                // time died with the previous life.
                                 Some(JobStatus::Error {
                                     error: ProcessError::Interrupted,
                                     time_error,
@@ -974,16 +969,17 @@ impl State {
                         error!(log, "job error"; "job_id" => %job_id, "when" => %when, "error" => %error);
                         if baseboard_id == &self.own_baseboard {
                             self.attachments.remove(job_id);
-                            self.replayed_started.remove(job_id);
+                            self.zombies.remove(job_id);
                         }
                         self.running.remove(&(*job_id, baseboard_id.clone()));
                         self.history.transition_job_status(
                             job_id,
                             baseboard_id,
                             Some(incoming_version.rank()),
-                            // An error never displaces a terminal status:
-                            // a genuine stop that raced an interrupted
-                            // declaration keeps the real result.
+                            // An error never displaces a terminal
+                            // status, so a stop that raced an
+                            // interrupted declaration keeps the real
+                            // result.
                             |old_status| match old_status {
                                 None
                                 | Some(JobStatus::Queued { .. })
@@ -1045,8 +1041,8 @@ fn apply_message(
     tx_state.send_modify(|state| {
         if let Err(error) = state.update(log, executor, version, message) {
             error!(log, "state update failed"; "error" => ?error);
-            // Replayed messages already had their say: re-gossiping
-            // their errors would grow the set on every rejoin.
+            // Re-gossiping a replayed message's error would grow the
+            // set a little more on every rejoin by every sled.
             if state.is_live(version)
                 && let Some(rumors) = rumors
             {
@@ -1080,25 +1076,25 @@ fn drain_ready(
     }
 }
 
-/// Declare historical jobs interrupted, excluding `survivors`
-/// (jobs this incarnation is really running across a universe swap)
-/// and jobs already so declared. Candidates come only from replayed
-/// start events, so a job this incarnation is running is never a
-/// candidate no matter when the scan runs. Call only at local
-/// quiescence (after [`drain_ready`]), so a job whose terminal event
-/// is already here is never falsely interrupted.
-fn interrupt_orphans(
+/// Declare interrupted every job a previous life left running,
+/// excluding `survivors` (jobs this incarnation carried across a
+/// universe swap) and jobs already reaped. Zombies come only from
+/// replayed start events, so a job this incarnation started is never
+/// a candidate. Reap only at local quiescence (after
+/// [`drain_ready`]), when a zombie whose terminal event is already
+/// here has been cleared.
+fn reap_zombies(
     log: &Logger,
     tx_state: &watch::Sender<State>,
     rumors: Option<&GossipNetwork>,
     own_baseboard: &BaseboardId,
     survivors: &BTreeSet<JobId>,
-    interrupted: &mut BTreeSet<JobId>,
+    reaped: &mut BTreeSet<JobId>,
 ) {
-    let mut orphans = tx_state.borrow().orphaned_jobs();
-    orphans.retain(|job_id| !survivors.contains(job_id) && !interrupted.contains(job_id));
-    for job_id in orphans {
-        interrupted.insert(job_id);
+    let mut zombies = tx_state.borrow().zombies();
+    zombies.retain(|job_id| !survivors.contains(job_id) && !reaped.contains(job_id));
+    for job_id in zombies {
+        reaped.insert(job_id);
         if let Some(rumors) = rumors {
             rumors.send(
                 Message::Event(
@@ -1123,11 +1119,11 @@ fn interrupt_orphans(
 /// server's sessions. This stands in for joining the rack's network over
 /// sprockets on the bootstrap network.
 ///
-/// A pristine seed's bookmark touches no storage; identities recorded
-/// there are reclaimed only after a migration returns us to their
-/// universe. Bad storage would abort every session at the persist gate,
-/// before the seed could even learn to migrate. Probe first and shed on
-/// failure.
+/// A pristine seed's bookmark touches no storage, and identities
+/// recorded there are reclaimed only after a migration returns us to
+/// their universe. Bad storage would abort every session at the
+/// persist gate, before the seed could even learn to migrate. Probe
+/// first and shed on failure.
 pub async fn seed_gossip(bookmarks: &BookmarkSource) -> GossipNetwork {
     let handle = match bookmarks.probe().await {
         Ok(()) => bookmarks.next_handle(),
@@ -1180,8 +1176,8 @@ impl StateManager {
         // and computation, but makes it much easier to ensure that our
         // state machine is correct, because it now only has to be correct
         // in the face of arbitrary *causal* reorderings.
-        // `borrow_and_update` marks the value seen: a migration that
-        // landed before we subscribed must not replay as a swap.
+        // `borrow_and_update` marks the value seen, so a migration
+        // that landed before we subscribed does not replay as a swap.
         let Universe {
             rumors: initial,
             frontier,
@@ -1221,11 +1217,11 @@ impl StateManager {
                 // Replay bookkeeping. `frontier` classifies incoming
                 // messages (at or concurrent with it means replayed
                 // history); `survivors` are jobs this incarnation itself
-                // runs across a universe swap; `interrupted` are jobs of
-                // ours the replay showed running, already declared dead.
+                // runs across a universe swap; `reaped` are zombies
+                // already declared interrupted.
                 let mut frontier = frontier;
                 let mut survivors: BTreeSet<JobId> = BTreeSet::new();
-                let mut interrupted: BTreeSet<JobId> = BTreeSet::new();
+                let mut reaped: BTreeSet<JobId> = BTreeSet::new();
 
                 // Announce our build.
                 if let Some((rumors, _)) = &gossip {
@@ -1308,11 +1304,7 @@ impl StateManager {
                                     &version,
                                     &message,
                                 );
-                                // Replayed history can show jobs of ours
-                                // running that died with a previous life.
-                                // Drain to local quiescence first, so a
-                                // job whose terminal event is already here
-                                // is never declared interrupted.
+                                // Replayed traffic can reveal zombies.
                                 if !live {
                                     drain_ready(
                                         &log,
@@ -1322,13 +1314,13 @@ impl StateManager {
                                         gossip.as_ref().map(|(rumors, _)| rumors),
                                         &own_baseboard,
                                     );
-                                    interrupt_orphans(
+                                    reap_zombies(
                                         &log,
                                         &tx_state,
                                         gossip.as_ref().map(|(rumors, _)| rumors),
                                         &own_baseboard,
                                         &survivors,
-                                        &mut interrupted,
+                                        &mut reaped,
                                     );
                                 }
                             },
@@ -1362,12 +1354,11 @@ impl StateManager {
                         let fresh = universe.borrow_and_update().clone();
                         info!(log, "gossip universe changed, resetting state"; "network" => %fresh.rumors.network());
                         causal_messages = fresh.rumors.causal_messages();
-                        // A job we declared interrupted may still show as
-                        // running (its error event races the swap); it is
-                        // no survivor.
+                        // A reaped zombie may still show as running (its
+                        // error event races the swap); it is no survivor.
                         survivors = tx_state.borrow().own_running_jobs();
-                        survivors.retain(|job_id| !interrupted.contains(job_id));
-                        interrupted = BTreeSet::new();
+                        survivors.retain(|job_id| !reaped.contains(job_id));
+                        reaped = BTreeSet::new();
                         frontier = fresh.frontier.clone();
                         // TODO: re-inject local job state (policy pending).
                         tx_state.send_modify(|state| {
@@ -1388,10 +1379,8 @@ impl StateManager {
                             )
                             .into(),
                         );
-                        // The set received at join is already local: drain
-                        // it, then declare interrupted any job of ours the
-                        // replayed history still shows running. A previous
-                        // life started them; nothing will ever stop them.
+                        // The set received at join is already local:
+                        // drain it, then reap.
                         drain_ready(
                             &log,
                             &mut causal_messages,
@@ -1400,13 +1389,13 @@ impl StateManager {
                             Some(&*rumors),
                             &own_baseboard,
                         );
-                        interrupt_orphans(
+                        reap_zombies(
                             &log,
                             &tx_state,
                             Some(&*rumors),
                             &own_baseboard,
                             &survivors,
-                            &mut interrupted,
+                            &mut reaped,
                         );
                     }
                 }

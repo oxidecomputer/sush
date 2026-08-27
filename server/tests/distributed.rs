@@ -402,7 +402,7 @@ async fn interrupted_jobs_get_stopped() {
     })
     .await;
 
-    // The job's genuine stop was in flight all along: when it lands,
+    // The job's genuine stop was in flight all along. When it lands,
     // the real result supersedes the interrupted declaration.
     let output = JobOutputState::default();
     a.universe.borrow().rumors.clone().send(
@@ -511,8 +511,8 @@ async fn stragglers_do_not_interrupt_live_jobs() {
     })
     .await;
 
-    // C reconnects; its marooned message reaches B as replayed-classified
-    // traffic and triggers the orphan scan. The live job must survive.
+    // C reconnects. Its marooned message reaches B as replayed
+    // traffic and triggers a reap, which the live job must survive.
     a.peers.send(BTreeSet::from([b.addr, c.addr])).unwrap();
     b.peers.send(BTreeSet::from([a.addr, c.addr])).unwrap();
     c.peers.send(BTreeSet::from([a.addr, b.addr])).unwrap();
@@ -586,8 +586,8 @@ async fn bookmarks_survive_restart() {
     b_shutdown.cancel();
     drop(b);
     a.peers.send(BTreeSet::new()).unwrap();
-    // Let the dead incarnation's tasks quiesce: a real reboot does,
-    // and two live sources over one slot are the store's one
+    // Let the dead incarnation's tasks quiesce, as a real reboot
+    // would. Two live sources over one slot are the store's one
     // forbidden misuse.
     tokio::time::sleep(std::time::Duration::from_millis(500)).await;
     let b = Sled::start_with_bookmarks(
