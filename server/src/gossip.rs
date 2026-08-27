@@ -14,8 +14,9 @@
 //! through a fresh link to the peer that beat it, and the process repeats
 //! until one universe remains.
 //!
-//! The manager publishes its current [`Rumors`] handle on a watch channel.
-//! A migration replaces the handle entirely; consumers must re-subscribe,
+//! The manager publishes its current [`Universe`] (the [`Rumors`] handle
+//! and the causal frontier we joined it at) on a watch channel. A
+//! migration replaces the handle entirely; consumers must re-subscribe,
 //! and everything the old universe carried is gone.
 //!
 //! TODO: re-inject local state into the new universe after a migration
@@ -28,7 +29,7 @@ use std::net::{SocketAddr, SocketAddrV6};
 use std::time::Duration;
 
 use futures::StreamExt as _;
-use rumors::{Error, Network, Peer, Rumors, Ticks};
+use rumors::{Error, Network, Peer, Rumors, Ticks, Version};
 use serde::Serialize;
 use serde::de::DeserializeOwned;
 use slog::{Logger, debug, info, o, warn};
@@ -65,11 +66,30 @@ impl Default for GossipConfig {
     }
 }
 
+/// A gossip universe and where we entered it.
+#[derive(Clone, Debug)]
+pub struct Universe<T> {
+    /// The gossiped set.
+    pub rumors: Rumors<T>,
+    /// The causal frontier of the set received when we joined,
+    /// or `None` if we seeded the universe ourselves.
+    pub frontier: Option<Version>,
+}
+
+impl<T> Universe<T> {
+    pub fn genesis(rumors: Rumors<T>) -> Self {
+        Self {
+            rumors,
+            frontier: None,
+        }
+    }
+}
+
 /// A single-peer universe that never changes. The standalone server uses
 /// this, as does a sled that cannot gossip. The receiver outlives its
 /// sender.
-pub fn isolated<T>(seed: Rumors<T>) -> watch::Receiver<Rumors<T>> {
-    let (_tx, rx) = watch::channel(seed);
+pub fn isolated<T>(seed: Rumors<T>) -> watch::Receiver<Universe<T>> {
+    let (_tx, rx) = watch::channel(Universe::genesis(seed));
     rx
 }
 
@@ -102,7 +122,7 @@ pub async fn spawn_gossip<T>(
     peers: watch::Receiver<BTreeSet<SocketAddrV6>>,
     seed: Rumors<T>,
     shutdown: CancellationToken,
-) -> io::Result<(SocketAddrV6, watch::Receiver<Rumors<T>>)>
+) -> io::Result<(SocketAddrV6, watch::Receiver<Universe<T>>)>
 where
     T: DeserializeOwned + Serialize + Send + Sync + 'static,
 {
@@ -131,11 +151,11 @@ pub fn spawn_gossip_manager<T>(
     peers: watch::Receiver<BTreeSet<SocketAddrV6>>,
     seed: Rumors<T>,
     shutdown: CancellationToken,
-) -> watch::Receiver<Rumors<T>>
+) -> watch::Receiver<Universe<T>>
 where
     T: DeserializeOwned + Serialize + Send + Sync + 'static,
 {
-    let (publish, subscribe) = watch::channel(seed.clone());
+    let (publish, subscribe) = watch::channel(Universe::genesis(seed.clone()));
     let manager = Manager {
         log: log.new(o!("component" => "gossip manager")),
         config,
@@ -173,7 +193,7 @@ struct Manager<T> {
     transport: Transport,
     peers: watch::Receiver<BTreeSet<SocketAddrV6>>,
     rumors: Rumors<T>,
-    publish: watch::Sender<Rumors<T>>,
+    publish: watch::Sender<Universe<T>>,
     drivers: JoinSet<(SocketAddr, Stopped)>,
     live: HashMap<SocketAddr, AbortHandle>,
     dials: JoinSet<Established>,
@@ -315,7 +335,11 @@ where
         match timeout(self.config.join_timeout, Peer::bootstrap().join(&mut link)).await {
             Ok(Ok(Some(joined))) => {
                 self.rumors = joined.into_rumors();
-                let _ = self.publish.send(self.rumors.clone());
+                let frontier = self.rumors.snapshot().latest().clone();
+                let _ = self.publish.send(Universe {
+                    rumors: self.rumors.clone(),
+                    frontier: Some(frontier),
+                });
                 self.joins.clear();
                 info!(self.log, "migrated"; "network" => %self.rumors.network());
             }

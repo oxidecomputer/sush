@@ -24,7 +24,7 @@ use sush_common::version::VersionInfo;
 use sush_server::executor::PathIsolation;
 use sush_server::gossip::spawn_gossip;
 use sush_server::output::JobOutputDir;
-use sush_server::state::GossipNetwork;
+use sush_server::state::GossipUniverse;
 use sush_server::{JobManager, seed_gossip};
 
 use common::{
@@ -34,7 +34,7 @@ use common::{
 
 struct Sled {
     mgr: JobManager,
-    universe: watch::Receiver<GossipNetwork>,
+    universe: watch::Receiver<GossipUniverse>,
     peers: watch::Sender<BTreeSet<SocketAddrV6>>,
     addr: SocketAddrV6,
     baseboard: BaseboardId,
@@ -111,7 +111,7 @@ async fn jobs_gossip_between_sleds() {
 
     // The sleds converge on one universe, resetting the losing job manager.
     eventually("universe convergence", 120, async || {
-        a.universe.borrow().network() == b.universe.borrow().network()
+        a.universe.borrow().rumors.network() == b.universe.borrow().rumors.network()
     })
     .await;
 
@@ -197,6 +197,121 @@ async fn jobs_gossip_between_sleds() {
             .is_some_and(|s| s.session_id() == successor)
     })
     .await;
+
+    shutdown.cancel();
+}
+
+#[tokio::test]
+async fn rejoining_replays_without_reexecuting() {
+    let (_tmp, dir) = pki("sush-replay-", 2);
+    let mut root = common::ephemeral_root();
+    let root_pem = dir.join("job-root.pem");
+    std::fs::write(
+        &root_pem,
+        pem_cert_chain(vec![root.cert().to_owned()]).unwrap(),
+    )
+    .unwrap();
+
+    let log = test_logger("rejoining_replays_without_reexecuting");
+    let shutdown = CancellationToken::new();
+
+    // Sled A runs a whole job before B exists.
+    let a = Sled::start(&log, &dir, 1, &root_pem, &shutdown).await;
+    let authn_a = fake_identity(&mut root).await;
+    let signer_nonce = SessionSignerNonce::random();
+    let session_id = SessionId::compute(
+        a.mgr.own_baseboard(),
+        a.mgr.session_sush_nonce(),
+        signer_nonce,
+    );
+    let session = Session::new(session_id);
+    a.mgr
+        .session_start(&authn_a, session_id, signer_nonce, true)
+        .await
+        .unwrap();
+    let job_id = session.next_job_id();
+    let job = sign_job(&mut root, job_id, session_id, "true").await;
+    a.mgr
+        .job_start(
+            &authn_a,
+            job,
+            JobStartParams {
+                wait: JobWait::Stop,
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+
+    // B joins later and receives the whole history as replay: it learns
+    // what happened, but the executed job must not run again here.
+    let b = Sled::start(&log, &dir, 2, &root_pem, &shutdown).await;
+    a.peers.send(BTreeSet::from([b.addr])).unwrap();
+    b.peers.send(BTreeSet::from([a.addr])).unwrap();
+    let authn_b = fake_identity(&mut root).await;
+    eventually("A's history replays on B", 120, async || {
+        b.mgr.job_status(&authn_b, &job_id).await.is_ok_and(|map| {
+            map.get(&a.baseboard)
+                .is_some_and(|s| matches!(s, JobStatus::Stopped { .. }))
+        })
+    })
+    .await;
+    assert!(
+        !b.mgr
+            .job_status(&authn_b, &job_id)
+            .await
+            .unwrap()
+            .contains_key(&b.baseboard),
+        "replayed job executed on the joining sled"
+    );
+
+    // Live traffic still executes everywhere: a fresh session's job runs
+    // on both sleds.
+    let successor_nonce = SessionSignerNonce::random();
+    let successor = SessionId::compute(
+        a.mgr.own_baseboard(),
+        a.mgr.session_sush_nonce(),
+        successor_nonce,
+    );
+    let fresh = Session::new(successor);
+    a.mgr
+        .session_start(&authn_a, successor, successor_nonce, true)
+        .await
+        .unwrap();
+    let live_job = fresh.next_job_id();
+    let job = sign_job(&mut root, live_job, successor, "true").await;
+    a.mgr
+        .job_start(
+            &authn_a,
+            job,
+            JobStartParams {
+                wait: JobWait::Stop,
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+    eventually("the live job runs on B too", 120, async || {
+        a.mgr
+            .job_status(&authn_a, &live_job)
+            .await
+            .is_ok_and(|map| {
+                map.get(&b.baseboard)
+                    .is_some_and(|s| matches!(s, JobStatus::Stopped { .. }))
+            })
+    })
+    .await;
+
+    // With B provably executing live jobs, the replayed one still never
+    // ran there.
+    assert!(
+        !b.mgr
+            .job_status(&authn_b, &job_id)
+            .await
+            .unwrap()
+            .contains_key(&b.baseboard),
+        "replayed job executed late on the joining sled"
+    );
 
     shutdown.cancel();
 }

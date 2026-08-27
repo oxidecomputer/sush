@@ -34,7 +34,7 @@ use sush_common::jobs::{
 };
 use sush_common::keys::{EphemeralKey, KeyError, KeyId, KeyType, Signer as _, pem_cert_chain};
 use sush_common::targets::{Cubbies, Target};
-use sush_server::gossip::isolated;
+use sush_server::gossip::{Universe, isolated};
 use sush_server::io::BATCH_OUTPUT_BUFFER_SIZE;
 use sush_server::messages::v0::{CertRequest, IdentityRequest, Message, Request, SessionRequest};
 use sush_server::output::{JobOutputDir, OutputDirs};
@@ -855,7 +855,7 @@ async fn universe_swap() {
     let log = test_logger(function_name!());
     let dir = TempDir::with_prefix("sush-").unwrap();
     let mut root = ephemeral_test_root();
-    let (universe, universe_rx) = watch::channel(seed_gossip());
+    let (universe, universe_rx) = watch::channel(Universe::genesis(seed_gossip()));
     let mgr = JobManager::with_root_certs(
         log,
         PathIsolation::InsecureDisable,
@@ -900,7 +900,7 @@ async fn universe_swap() {
     assert!(mgr.job_status(&authn, &job_id).await.is_ok());
 
     // Migrate. The session and the job's history are gone.
-    universe.send(seed_gossip()).unwrap();
+    universe.send(Universe::genesis(seed_gossip())).unwrap();
     timeout(Duration::from_secs(30), async {
         while mgr.session(&authn).is_some() {
             sleep(Duration::from_millis(50)).await;

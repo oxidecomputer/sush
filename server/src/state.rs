@@ -35,6 +35,7 @@ use sush_common::targets::Cubbies;
 use sush_common::version::{VersionInfo, VersionMap};
 
 use crate::executor::{Executor, PathIsolation};
+use crate::gossip::Universe;
 use crate::history::JobHistory;
 use crate::job::SocketSender;
 use crate::messages::v0::{
@@ -47,7 +48,8 @@ use crate::output::JobOutputDir;
 pub type AttachmentPoints = BTreeMap<JobId, watch::Receiver<Option<SocketSender>>>;
 pub type Certificates = BTreeMap<KeyId, CertState>;
 pub type GossipNetwork = Rumors<VersionedMessage>;
-pub type QueuedJobs = BTreeMap<JobId, (SignedJob, JobStartParams)>;
+pub type GossipUniverse = Universe<VersionedMessage>;
+pub type QueuedJobs = BTreeMap<JobId, QueuedJob>;
 pub type RunningJobs = BTreeMap<(JobId, BaseboardId), DateTime<Utc>>;
 
 /// Maximum certificate chain length.
@@ -81,6 +83,16 @@ pub const MAX_REVOKED_KEYS: NonZeroUsize = NonZeroUsize::new(10_000).unwrap();
 pub struct RegisteredIdentity {
     pub identity: Identity,
     pub verifier: RequestVerifier,
+}
+
+/// A job waiting in the session queue for its turn in the causal chain.
+/// Jobs replayed from history that predates our join keep the chain intact
+/// but never execute here.
+#[derive(Clone, Debug)]
+pub struct QueuedJob {
+    pub job: SignedJob,
+    pub params: JobStartParams,
+    pub replayed: bool,
 }
 
 #[derive(Clone, Debug)]
@@ -193,7 +205,7 @@ impl<'a> SessionGuard<'a> {
         self.inner.skip_job(*job_id)
     }
 
-    pub fn next_queued_job(&mut self) -> Option<(SignedJob, JobStartParams)> {
+    pub fn next_queued_job(&mut self) -> Option<QueuedJob> {
         self.queued_jobs.remove(&self.inner.next_job_id())
     }
 
@@ -208,6 +220,7 @@ impl<'a> SessionGuard<'a> {
         job: SignedJob,
         params: JobStartParams,
         actor: &KeyId,
+        replayed: bool,
     ) {
         let job_id = *job.job_id();
         let targeted = job.payload().runs_on(own_baseboard, cubbies);
@@ -222,9 +235,17 @@ impl<'a> SessionGuard<'a> {
         } else {
             // Insert the job into our queue. Every job joins the
             // queue to keep the causal chain whole, but only jobs
-            // targeting this sled record a local status.
-            self.queued_jobs.insert(job_id, (job, params));
-            if targeted {
+            // targeting this sled that can actually run here record
+            // a local status.
+            self.queued_jobs.insert(
+                job_id,
+                QueuedJob {
+                    job,
+                    params,
+                    replayed,
+                },
+            );
+            if targeted && !replayed {
                 history.set_job_status(
                     &job_id,
                     own_baseboard,
@@ -272,8 +293,10 @@ impl<'a> SessionGuard<'a> {
     /// in the hash chain, and there may be an unbounded number of
     /// newly-ready-to-run jobs after it in the queue. Once we reach
     /// a fixed point, we have nothing further to do.
+    #[allow(clippy::too_many_arguments)]
     pub fn execute_ready_jobs(
         &mut self,
+        log: &Logger,
         own_baseboard: &BaseboardId,
         cubbies: &Cubbies,
         certs: &mut Certificates,
@@ -281,19 +304,27 @@ impl<'a> SessionGuard<'a> {
         executor: &mut Executor,
         attachments: &mut AttachmentPoints,
     ) {
-        while let Some((request, params)) = self.next_queued_job() {
+        while let Some(QueuedJob {
+            job: request,
+            params,
+            replayed,
+        }) = self.next_queued_job()
+        {
             let (tx_attachment, rx_attachment) = watch::channel(None);
             let job_id = request.payload().job_id().to_owned();
-            if request.payload().runs_on(own_baseboard, cubbies)
-                && history
+            if request.payload().runs_on(own_baseboard, cubbies) {
+                if replayed {
+                    info!(log, "not executing replayed job"; "job_id" => %job_id);
+                } else if history
                     .get_job_status(&job_id)
                     .map(|status| {
                         matches!(status.get(own_baseboard), Some(JobStatus::Queued { .. }))
                     })
                     .unwrap_or(true)
-            {
-                executor.job_start(certs, request.clone(), params, tx_attachment);
-                attachments.insert(job_id, rx_attachment);
+                {
+                    executor.job_start(certs, request.clone(), params, tx_attachment);
+                    attachments.insert(job_id, rx_attachment);
+                }
             }
             self.job_started(request);
         }
@@ -325,6 +356,10 @@ pub struct State {
     roots: Box<[KeyId]>,
     /// Baseboards by cubby number, as much of it as is known.
     cubbies: Cubbies,
+    /// The causal frontier we joined this universe at, if we joined
+    /// rather than seeded it. Messages at or concurrent with it are
+    /// replayed history: they rebuild state but never execute here.
+    join_frontier: Option<Version>,
     /// Message versions from newer builds, each warned about once.
     unknown_versions: BTreeSet<String>,
     /// Build provenance by sled.
@@ -343,6 +378,7 @@ impl State {
         own_baseboard: BaseboardId,
         root_certs: &[Certificate],
         session_sush_nonce: Arc<Mutex<SessionSushNonce>>,
+        join_frontier: Option<Version>,
     ) -> Result<Self, KeyError> {
         let certs = root_certs
             .iter()
@@ -369,6 +405,7 @@ impl State {
             unknown_versions: Default::default(),
             identities: LruCache::new(MAX_REGISTERED_IDENTITIES),
             revoked_keys: LruCache::new(MAX_REVOKED_KEYS),
+            join_frontier,
         };
         new.validate_certs(&roots);
         for root in &roots {
@@ -663,6 +700,7 @@ impl State {
                                     &self.running,
                                 );
                                 session.execute_ready_jobs(
+                                    log,
                                     &self.own_baseboard,
                                     &self.cubbies,
                                     &mut self.certs,
@@ -714,6 +752,10 @@ impl State {
                         // Refused jobs targeting this sled record an error
                         // status so the submitter learns their fate.
                         let session_id = signed.payload().session_id();
+                        let live = self
+                            .join_frontier
+                            .as_ref()
+                            .is_none_or(|frontier| incoming_version > frontier);
                         match self.session.active_session() {
                             Some(mut session) if session.session_id() == session_id => {
                                 session.enqueue_job(
@@ -725,8 +767,10 @@ impl State {
                                     signed.clone(),
                                     params.clone(),
                                     actor,
+                                    !live,
                                 );
                                 session.execute_ready_jobs(
+                                    log,
                                     &self.own_baseboard,
                                     &self.cubbies,
                                     &mut self.certs,
@@ -743,7 +787,8 @@ impl State {
                                     "session_id" => %session_id,
                                     "actor" => %actor,
                                 );
-                                if signed.payload().runs_on(&self.own_baseboard, &self.cubbies)
+                                if live
+                                    && signed.payload().runs_on(&self.own_baseboard, &self.cubbies)
                                     && !self.history.contains(&job_id)
                                 {
                                     executor.job_refused(
@@ -904,6 +949,34 @@ impl State {
     }
 }
 
+/// Apply one gossip message to the state, reporting update errors back
+/// onto the network.
+///
+/// We unconditionally mark the watch sender as modified even though it
+/// might not be, because *most* of the messages cause *some* modification
+/// of the state, and we would rather be safe against future code changes
+/// than manually tracking precisely which messages *don't* modify state.
+/// The cost is a few spurious wakeups.
+fn apply_message(
+    log: &Logger,
+    tx_state: &watch::Sender<State>,
+    executor: &mut Executor,
+    rumors: Option<&GossipNetwork>,
+    own_baseboard: &BaseboardId,
+    version: &Version,
+    message: &Arc<VersionedMessage>,
+) {
+    tx_state.send_modify(|state| {
+        if let Err(error) = state.update(log, executor, version, message) {
+            error!(log, "state update failed"; "error" => ?error);
+            if let Some(rumors) = rumors {
+                debug!(log, "sending error to gossip network"; "error" => ?error);
+                rumors.send(Message::Event(own_baseboard.clone(), Event::Error(error)).into());
+            }
+        }
+    });
+}
+
 /// Create a fresh gossip network with this server as its only peer.
 ///
 /// A peer that seeds its own network has no one to gossip with, so jobs run
@@ -938,7 +1011,7 @@ impl StateManager {
         own_baseboard: BaseboardId,
         mut requests: R,
         mut cubbies: watch::Receiver<Cubbies>,
-        universe: watch::Receiver<GossipNetwork>,
+        universe: watch::Receiver<GossipUniverse>,
         roots: &[Certificate],
         session_sush_nonce: Arc<Mutex<SessionSushNonce>>,
         shutdown: CancellationToken,
@@ -946,21 +1019,28 @@ impl StateManager {
     where
         R: Stream<Item = Request> + Send + Unpin + 'static,
     {
-        // We report our current state through a watch channel.
-        let mut initial_state =
-            State::new(own_baseboard.clone(), roots, session_sush_nonce.clone())?;
-        initial_state.cubbies = cubbies.borrow_and_update().clone();
-        let (tx_state, rx_state) = watch::channel(initial_state);
-        let roots = roots.to_vec();
-
         // We process messages in causal order, so that we can rely on
         // things like "the session stop happens after its corresponding
         // session start". This costs a little extra in-memory bookkeeping
         // and computation, but makes it much easier to ensure that our
         // state machine is correct, because it now only has to be correct
         // in the face of arbitrary *causal* reorderings.
-        let initial = universe.borrow().clone();
+        let Universe {
+            rumors: initial,
+            frontier,
+        } = universe.borrow().clone();
         let mut causal_messages = initial.causal_messages();
+
+        // We report our current state through a watch channel.
+        let mut initial_state = State::new(
+            own_baseboard.clone(),
+            roots,
+            session_sush_nonce.clone(),
+            frontier,
+        )?;
+        initial_state.cubbies = cubbies.borrow_and_update().clone();
+        let (tx_state, rx_state) = watch::channel(initial_state);
+        let roots = roots.to_vec();
 
         // The executor needs to have access to send messages back.
         let (mut executor, mut events) = Executor::new(
@@ -1051,21 +1131,15 @@ impl StateManager {
                                 break;
                             }
                             Some((version, message)) => {
-                                // We unconditionally mark the watch sender as modified
-                                // even though it might not be, because *most* of the
-                                // messages cause *some* modification of the state, and we
-                                // would rather be safe against future code changes than
-                                // manually tracking precisely which messages *don't* modify
-                                // state. The cost is a few spurious wakeups.
-                                tx_state.send_modify(|state| {
-                                    if let Err(error) = state.update(&log, &mut executor, &version, &message) {
-                                        error!(log, "state update failed"; "error" => ?error);
-                                        if let Some((rumors, _)) = &gossip {
-                                            debug!(log, "sending error to gossip network"; "error" => ?error);
-                                            rumors.send(Message::Event(own_baseboard.clone(), Event::Error(error)).into());
-                                        }
-                                    }
-                                });
+                                apply_message(
+                                    &log,
+                                    &tx_state,
+                                    &mut executor,
+                                    gossip.as_ref().map(|(rumors, _)| rumors),
+                                    &own_baseboard,
+                                    &version,
+                                    &message,
+                                );
                             },
                         },
 
@@ -1095,19 +1169,20 @@ impl StateManager {
                         let (rumors, universe) =
                             gossip.as_mut().expect("gossip present when it changes");
                         let fresh = universe.borrow_and_update().clone();
-                        info!(log, "gossip universe changed, resetting state"; "network" => %fresh.network());
-                        causal_messages = fresh.causal_messages();
+                        info!(log, "gossip universe changed, resetting state"; "network" => %fresh.rumors.network());
+                        causal_messages = fresh.rumors.causal_messages();
                         // TODO: re-inject local job state (policy pending).
                         tx_state.send_modify(|state| {
                             *state = State::new(
                                 own_baseboard.clone(),
                                 &roots,
                                 state.session_sush_nonce.clone(),
+                                fresh.frontier.clone(),
                             )
                             .expect("roots validated at startup");
                             state.cubbies = cubbies.borrow().clone();
                         });
-                        *rumors = fresh;
+                        *rumors = fresh.rumors;
                         rumors.send(
                             Message::Event(
                                 own_baseboard.clone(),

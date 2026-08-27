@@ -16,7 +16,7 @@ use slog::Logger;
 use tokio::sync::watch;
 use tokio_util::sync::CancellationToken;
 
-use sush_server::gossip::spawn_gossip;
+use sush_server::gossip::{Universe, spawn_gossip};
 
 use common::{corpus, eventually, gossip_config, localhost, pki, sprockets_config, test_logger};
 
@@ -24,7 +24,7 @@ struct Node {
     addr: SocketAddrV6,
     initial: Network,
     peers: watch::Sender<BTreeSet<SocketAddrV6>>,
-    universe: watch::Receiver<Rumors<String>>,
+    universe: watch::Receiver<Universe<String>>,
     shutdown: CancellationToken,
 }
 
@@ -56,11 +56,11 @@ impl Node {
     }
 
     fn network(&self) -> Network {
-        self.universe.borrow().network()
+        self.universe.borrow().rumors.network()
     }
 
     fn rumors(&self) -> Rumors<String> {
-        self.universe.borrow().clone()
+        self.universe.borrow().rumors.clone()
     }
 
     fn contains(&self, message: &str) -> bool {
