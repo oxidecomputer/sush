@@ -22,6 +22,7 @@ use sush_common::jobs::{JobId, JobStatus, ProcessError, Session, SessionId, Sess
 use sush_common::keys::pem_cert_chain;
 use sush_common::targets::Cubbies;
 use sush_common::version::VersionInfo;
+use sush_server::bookmark::BookmarkSource;
 use sush_server::executor::PathIsolation;
 use sush_server::gossip::spawn_gossip;
 use sush_server::messages::v0::{Event, JobEvent, Message};
@@ -51,6 +52,25 @@ impl Sled {
         root_pem: &Utf8PathBuf,
         shutdown: &CancellationToken,
     ) -> Sled {
+        Self::start_with_bookmarks(
+            log,
+            dir,
+            identity,
+            root_pem,
+            BookmarkSource::null(),
+            shutdown,
+        )
+        .await
+    }
+
+    async fn start_with_bookmarks(
+        log: &Logger,
+        dir: &Utf8PathBuf,
+        identity: usize,
+        root_pem: &Utf8PathBuf,
+        bookmarks: BookmarkSource,
+        shutdown: &CancellationToken,
+    ) -> Sled {
         let (peers, peers_rx) = watch::channel(BTreeSet::new());
         let (addr, universe) = spawn_gossip(
             log,
@@ -59,7 +79,8 @@ impl Sled {
             corpus(dir),
             localhost(),
             peers_rx,
-            seed_gossip(),
+            seed_gossip(&bookmarks).await,
+            bookmarks,
             shutdown.clone(),
         )
         .await
@@ -375,6 +396,157 @@ async fn interrupted_jobs_get_stopped() {
                     }
                 )
             })
+        })
+    })
+    .await;
+
+    shutdown.cancel();
+}
+
+#[tokio::test]
+async fn bookmarks_survive_restart() {
+    let (_tmp, dir) = pki("sush-bookmark-", 2);
+    let mut root = common::ephemeral_root();
+    let root_pem = dir.join("job-root.pem");
+    std::fs::write(
+        &root_pem,
+        pem_cert_chain(vec![root.cert().to_owned()]).unwrap(),
+    )
+    .unwrap();
+
+    let log = test_logger("bookmarks_survive_restart");
+    let shutdown = CancellationToken::new();
+
+    // Sled A holds session history, so it wins every dominance contest.
+    let a = Sled::start(&log, &dir, 1, &root_pem, &shutdown).await;
+    let authn_a = fake_identity(&mut root).await;
+    let signer_nonce = SessionSignerNonce::random();
+    let session_id = SessionId::compute(
+        a.mgr.own_baseboard(),
+        a.mgr.session_sush_nonce(),
+        signer_nonce,
+    );
+    a.mgr
+        .session_start(&authn_a, session_id, signer_nonce, true)
+        .await
+        .unwrap();
+
+    // Sled 2 keeps its identity in a bookmark; joining records it.
+    let bookmark_dir = TempDir::with_prefix("sush-bookmark-").unwrap();
+    let slot = Utf8PathBuf::from_path_buf(bookmark_dir.path().join("bookmark")).unwrap();
+    let b_shutdown = CancellationToken::new();
+    let b = Sled::start_with_bookmarks(
+        &log,
+        &dir,
+        2,
+        &root_pem,
+        BookmarkSource::new(&log, vec![slot.clone()]),
+        &b_shutdown,
+    )
+    .await;
+    a.peers.send(BTreeSet::from([b.addr])).unwrap();
+    b.peers.send(BTreeSet::from([a.addr])).unwrap();
+    eventually("the joining sled records its identity", 120, async || {
+        slot.as_std_path().exists()
+    })
+    .await;
+    let before = std::fs::read(&slot).unwrap();
+
+    // The next incarnation reads the record back, rejoins, and
+    // advances it, reclaiming the previous life's identity.
+    b_shutdown.cancel();
+    drop(b);
+    a.peers.send(BTreeSet::new()).unwrap();
+    let b = Sled::start_with_bookmarks(
+        &log,
+        &dir,
+        2,
+        &root_pem,
+        BookmarkSource::new(&log, vec![slot.clone()]),
+        &shutdown,
+    )
+    .await;
+    a.peers.send(BTreeSet::from([b.addr])).unwrap();
+    b.peers.send(BTreeSet::from([a.addr])).unwrap();
+    eventually("universe convergence", 120, async || {
+        a.universe.borrow().rumors.network() == b.universe.borrow().rumors.network()
+    })
+    .await;
+    eventually(
+        "the record advances past the previous life",
+        120,
+        async || std::fs::read(&slot).unwrap() != before,
+    )
+    .await;
+
+    shutdown.cancel();
+}
+
+#[tokio::test]
+async fn gossip_survives_bookmark_failure() {
+    let (_tmp, dir) = pki("sush-nobookmark-", 2);
+    let mut root = common::ephemeral_root();
+    let root_pem = dir.join("job-root.pem");
+    std::fs::write(
+        &root_pem,
+        pem_cert_chain(vec![root.cert().to_owned()]).unwrap(),
+    )
+    .unwrap();
+
+    let log = test_logger("gossip_survives_bookmark_failure");
+    let shutdown = CancellationToken::new();
+
+    let a = Sled::start(&log, &dir, 1, &root_pem, &shutdown).await;
+    let authn_a = fake_identity(&mut root).await;
+    let signer_nonce = SessionSignerNonce::random();
+    let session_id = SessionId::compute(
+        a.mgr.own_baseboard(),
+        a.mgr.session_sush_nonce(),
+        signer_nonce,
+    );
+    let session = Session::new(session_id);
+    a.mgr
+        .session_start(&authn_a, session_id, signer_nonce, true)
+        .await
+        .unwrap();
+
+    // Sled 2's bookmark points into a directory that does not exist.
+    // It sheds the bookmark and gossips anyway, stranding identities
+    // rather than the rack.
+    let b = Sled::start_with_bookmarks(
+        &log,
+        &dir,
+        2,
+        &root_pem,
+        BookmarkSource::new(&log, vec![Utf8PathBuf::from("/nonexistent/sush/bookmark")]),
+        &shutdown,
+    )
+    .await;
+    a.peers.send(BTreeSet::from([b.addr])).unwrap();
+    b.peers.send(BTreeSet::from([a.addr])).unwrap();
+    eventually("universe convergence", 120, async || {
+        a.universe.borrow().rumors.network() == b.universe.borrow().rumors.network()
+    })
+    .await;
+
+    // Live jobs still run on the degraded sled.
+    let job_id = session.next_job_id();
+    let job = sign_job(&mut root, job_id, session_id, "true").await;
+    a.mgr
+        .job_start(
+            &authn_a,
+            job,
+            JobStartParams {
+                wait: JobWait::Stop,
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+    eventually("the job runs on the degraded sled", 120, async || {
+        a.mgr.job_status(&authn_a, &job_id).await.is_ok_and(|map| {
+            map.get(&b.baseboard)
+                .is_some_and(|s| matches!(s, JobStatus::Stopped { .. }))
         })
     })
     .await;

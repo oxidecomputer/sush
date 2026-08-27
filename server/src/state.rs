@@ -34,6 +34,7 @@ use sush_common::keys::{KeyError, KeyId, Signature, SshPublicKey};
 use sush_common::targets::Cubbies;
 use sush_common::version::{VersionInfo, VersionMap};
 
+use crate::bookmark::{BookmarkSource, SushBookmark};
 use crate::executor::{Executor, PathIsolation};
 use crate::gossip::Universe;
 use crate::history::JobHistory;
@@ -47,7 +48,7 @@ use crate::output::JobOutputDir;
 
 pub type AttachmentPoints = BTreeMap<JobId, watch::Receiver<Option<SocketSender>>>;
 pub type Certificates = BTreeMap<KeyId, CertState>;
-pub type GossipNetwork = Rumors<VersionedMessage>;
+pub type GossipNetwork = Rumors<VersionedMessage, SushBookmark>;
 pub type GossipUniverse = Universe<VersionedMessage>;
 pub type QueuedJobs = BTreeMap<JobId, QueuedJob>;
 pub type RunningJobs = BTreeMap<(JobId, BaseboardId), DateTime<Utc>>;
@@ -1049,8 +1050,24 @@ fn interrupt_orphans(
 /// only on the server that accepted them, and no server learns about any other
 /// server's sessions. This stands in for joining the rack's network over
 /// sprockets on the bootstrap network.
-pub fn seed_gossip() -> GossipNetwork {
-    Peer::seed().into_rumors()
+///
+/// A pristine seed's bookmark touches no storage; identities recorded
+/// there are reclaimed only after a migration returns us to their
+/// universe. Bad storage would abort every session at the persist gate,
+/// before the seed could even learn to migrate. Probe first and shed on
+/// failure.
+pub async fn seed_gossip(bookmarks: &BookmarkSource) -> GossipNetwork {
+    let handle = match bookmarks.probe().await {
+        Ok(()) => bookmarks.next_handle(),
+        Err(_) => bookmarks.shed_handle(),
+    };
+    match Peer::seed().bookmark(handle).await {
+        Ok(peer) => peer.into_rumors(),
+        Err(unbookmarked) => match unbookmarked.peer.bookmark(bookmarks.shed_handle()).await {
+            Ok(peer) => peer.into_rumors(),
+            Err(_) => unreachable!("a shed bookmark never touches storage"),
+        },
+    }
 }
 
 #[derive(Debug)]

@@ -29,6 +29,7 @@ use sush_common::codephrases::Codephrase;
 use sush_common::jobs::{JobId, JobMode, JobStartRequest, SessionId, VerifiedJob};
 use sush_common::keys::{EphemeralKey, KeyType, Signer};
 use sush_common::targets::{Cubbies, Target};
+use sush_server::bookmark::BookmarkSource;
 use sush_server::executor::PathIsolation;
 use sush_server::gossip::isolated;
 use sush_server::output::{JobOutputDir, JobOutputFileStream};
@@ -227,7 +228,7 @@ pub async fn manager_test_root_and_peer(
     CancellationToken,
 ) {
     let dir = TempDir::with_prefix("sush-").unwrap();
-    let seed = seed_gossip();
+    let seed = seed_gossip(&BookmarkSource::null()).await;
     let peer = seed.clone();
     let gossip = isolated(seed);
     let shutdown = CancellationToken::new();

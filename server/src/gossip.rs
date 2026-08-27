@@ -29,7 +29,7 @@ use std::net::{SocketAddr, SocketAddrV6};
 use std::time::Duration;
 
 use futures::StreamExt as _;
-use rumors::{Error, Network, Peer, Rumors, Ticks, Version};
+use rumors::{Error, Joined, Network, Peer, Rumors, Ticks, Version};
 use serde::Serialize;
 use serde::de::DeserializeOwned;
 use slog::{Logger, debug, info, o, warn};
@@ -42,6 +42,7 @@ use tokio_util::sync::CancellationToken;
 
 use rumors::link::routed::Endpoint;
 
+use crate::bookmark::{BookmarkSource, SushBookmark};
 use crate::link::{CorpusSource, SprocketsDial, SprocketsLink, Transport};
 
 /// Manager timing. The defaults suit a rack; tests shrink them.
@@ -70,14 +71,14 @@ impl Default for GossipConfig {
 #[derive(Clone, Debug)]
 pub struct Universe<T> {
     /// The gossiped set.
-    pub rumors: Rumors<T>,
+    pub rumors: Rumors<T, SushBookmark>,
     /// The causal frontier of the set received when we joined,
     /// or `None` if we seeded the universe ourselves.
     pub frontier: Option<Version>,
 }
 
 impl<T> Universe<T> {
-    pub fn genesis(rumors: Rumors<T>) -> Self {
+    pub fn genesis(rumors: Rumors<T, SushBookmark>) -> Self {
         Self {
             rumors,
             frontier: None,
@@ -88,7 +89,7 @@ impl<T> Universe<T> {
 /// A single-peer universe that never changes. The standalone server uses
 /// this, as does a sled that cannot gossip. The receiver outlives its
 /// sender.
-pub fn isolated<T>(seed: Rumors<T>) -> watch::Receiver<Universe<T>> {
+pub fn isolated<T>(seed: Rumors<T, SushBookmark>) -> watch::Receiver<Universe<T>> {
     let (_tx, rx) = watch::channel(Universe::genesis(seed));
     rx
 }
@@ -120,7 +121,8 @@ pub async fn spawn_gossip<T>(
     corpus: CorpusSource,
     listen_addr: SocketAddrV6,
     peers: watch::Receiver<BTreeSet<SocketAddrV6>>,
-    seed: Rumors<T>,
+    seed: Rumors<T, SushBookmark>,
+    bookmarks: BookmarkSource,
     shutdown: CancellationToken,
 ) -> io::Result<(SocketAddrV6, watch::Receiver<Universe<T>>)>
 where
@@ -136,7 +138,7 @@ where
     )
     .await?;
     let bound = transport.bound();
-    let universe = spawn_gossip_manager(log, config, transport, peers, seed, shutdown);
+    let universe = spawn_gossip_manager(log, config, transport, peers, seed, bookmarks, shutdown);
     Ok((bound, universe))
 }
 
@@ -144,12 +146,14 @@ where
 /// the addresses on `peers`, drives gossip on every link, and resolves
 /// universe collisions. The returned channel follows the current universe,
 /// starting at `seed`.
+#[allow(clippy::too_many_arguments)]
 pub fn spawn_gossip_manager<T>(
     log: &Logger,
     config: GossipConfig,
     transport: Transport,
     peers: watch::Receiver<BTreeSet<SocketAddrV6>>,
-    seed: Rumors<T>,
+    seed: Rumors<T, SushBookmark>,
+    bookmarks: BookmarkSource,
     shutdown: CancellationToken,
 ) -> watch::Receiver<Universe<T>>
 where
@@ -163,6 +167,7 @@ where
         transport,
         peers,
         rumors: seed,
+        bookmarks,
         publish,
         drivers: JoinSet::new(),
         live: HashMap::new(),
@@ -192,7 +197,8 @@ struct Manager<T> {
     endpoint: Endpoint<SprocketsDial>,
     transport: Transport,
     peers: watch::Receiver<BTreeSet<SocketAddrV6>>,
-    rumors: Rumors<T>,
+    rumors: Rumors<T, SushBookmark>,
+    bookmarks: BookmarkSource,
     publish: watch::Sender<Universe<T>>,
     drivers: JoinSet<(SocketAddr, Stopped)>,
     live: HashMap<SocketAddr, AbortHandle>,
@@ -325,6 +331,12 @@ where
     /// the swap. On failure our universe is intact and the debt stands, so
     /// the next link retries; either way all links are rebuilt, since the
     /// old ones belong to the universe we are leaving.
+    ///
+    /// The new peer gets a fresh bookmark handle, fencing off all the
+    /// abandoned universe's stores. If the received identity cannot be
+    /// persisted, we keep gossiping with a shed handle rather than take
+    /// the sled out of gossip; a stranded identity is harmless, unlike
+    /// a support shell that cannot reach a degraded rack.
     async fn migrate(&mut self, peer: SocketAddr, mut link: SprocketsLink) {
         self.drivers.abort_all();
         self.live.clear();
@@ -332,28 +344,51 @@ where
             self.log, "joining the universe that beat ours";
             "peer" => %peer, "ours" => %self.rumors.network(),
         );
-        match timeout(self.config.join_timeout, Peer::bootstrap().join(&mut link)).await {
-            Ok(Ok(Some(joined))) => {
-                self.rumors = joined.into_rumors();
-                let frontier = self.rumors.snapshot().latest().clone();
-                let _ = self.publish.send(Universe {
-                    rumors: self.rumors.clone(),
-                    frontier: Some(frontier),
-                });
-                self.joins.clear();
-                info!(self.log, "migrated"; "network" => %self.rumors.network());
+        let bootstrap = Peer::bootstrap().bookmark(self.bookmarks.next_handle());
+        match timeout(self.config.join_timeout, bootstrap.join(&mut link)).await {
+            Ok(Joined::Joined { peer }) => self.adopt(peer),
+            Ok(Joined::Unbookmarked(unbookmarked)) => {
+                warn!(
+                    self.log, "cannot persist our identity, gossiping unbookmarked";
+                    "error" => %unbookmarked.error,
+                );
+                let peer = match unbookmarked
+                    .peer
+                    .bookmark(self.bookmarks.shed_handle())
+                    .await
+                {
+                    Ok(peer) => peer,
+                    Err(_) => unreachable!("a shed bookmark never touches storage"),
+                };
+                self.adopt(peer);
             }
-            Ok(Ok(None)) => warn!(self.log, "mutual bootstrap, retrying"),
-            Ok(Err(err)) => warn!(self.log, "join failed"; "error" => %err),
+            Ok(Joined::Bailed { .. }) => warn!(self.log, "mutual bootstrap, retrying"),
+            Ok(Joined::Failed { error, .. }) => warn!(self.log, "join failed"; "error" => %error),
             Err(_) => warn!(self.log, "join timed out"),
         }
         drop(link);
         self.link_absent();
     }
+
+    /// Follow the joined peer into its universe.
+    fn adopt(&mut self, peer: Peer<T, SushBookmark>) {
+        self.rumors = peer.into_rumors();
+        let frontier = self.rumors.snapshot().latest().clone();
+        let _ = self.publish.send(Universe {
+            rumors: self.rumors.clone(),
+            frontier: Some(frontier),
+        });
+        self.joins.clear();
+        info!(self.log, "migrated"; "network" => %self.rumors.network());
+    }
 }
 
 /// Drive sessions on one link until it fails, reporting why.
-async fn sessions<T>(rumors: &Rumors<T>, mut link: SprocketsLink, log: &Logger) -> Stopped
+async fn sessions<T>(
+    rumors: &Rumors<T, SushBookmark>,
+    mut link: SprocketsLink,
+    log: &Logger,
+) -> Stopped
 where
     T: DeserializeOwned + Serialize + Send + Sync + 'static,
 {
