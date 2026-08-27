@@ -570,7 +570,7 @@ mod wire_format {
         assert_wire_format("job-stop-event", msg);
 
         let msg: VersionedMessage = Message::Event(
-            baseboard,
+            baseboard.clone(),
             Event::Job(JobEvent::Error(
                 job_id,
                 when,
@@ -579,6 +579,13 @@ mod wire_format {
         )
         .into();
         assert_wire_format("job-error-event", msg);
+
+        let msg: VersionedMessage = Message::Event(
+            baseboard,
+            Event::Job(JobEvent::Error(job_id, when, ProcessError::Interrupted)),
+        )
+        .into();
+        assert_wire_format("job-interrupted-event", msg);
     }
 
     #[test]

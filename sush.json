@@ -1507,7 +1507,8 @@
             "type": "string",
             "enum": [
               "Unknown",
-              "InvalidCommand"
+              "InvalidCommand",
+              "Interrupted"
             ]
           },
           {

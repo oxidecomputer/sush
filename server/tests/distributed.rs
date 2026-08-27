@@ -16,13 +16,15 @@ use tempfile::TempDir;
 use tokio::sync::watch;
 use tokio_util::sync::CancellationToken;
 
+use chrono::Utc;
 use sush_api::{JobStartParams, JobWait};
-use sush_common::jobs::{JobStatus, Session, SessionId, SessionSignerNonce};
+use sush_common::jobs::{JobId, JobStatus, ProcessError, Session, SessionId, SessionSignerNonce};
 use sush_common::keys::pem_cert_chain;
 use sush_common::targets::Cubbies;
 use sush_common::version::VersionInfo;
 use sush_server::executor::PathIsolation;
 use sush_server::gossip::spawn_gossip;
+use sush_server::messages::v0::{Event, JobEvent, Message};
 use sush_server::output::JobOutputDir;
 use sush_server::state::GossipUniverse;
 use sush_server::{JobManager, seed_gossip};
@@ -312,6 +314,70 @@ async fn rejoining_replays_without_reexecuting() {
             .contains_key(&b.baseboard),
         "replayed job executed late on the joining sled"
     );
+
+    shutdown.cancel();
+}
+
+#[tokio::test]
+async fn interrupted_jobs_get_stopped() {
+    let (_tmp, dir) = pki("sush-interrupted-", 2);
+    let mut root = common::ephemeral_root();
+    let root_pem = dir.join("job-root.pem");
+    std::fs::write(
+        &root_pem,
+        pem_cert_chain(vec![root.cert().to_owned()]).unwrap(),
+    )
+    .unwrap();
+
+    let log = test_logger("interrupted_jobs_get_stopped");
+    let shutdown = CancellationToken::new();
+    let a = Sled::start(&log, &dir, 1, &root_pem, &shutdown).await;
+    let authn_a = fake_identity(&mut root).await;
+
+    // A previous life of sled 2 started a job and died before stopping
+    // it: the rack's history shows it running forever.
+    let job_id: JobId = "abandon-abandon-abandon-abandon-abandon-abandon-abandon-ability"
+        .parse()
+        .unwrap();
+    let ghost = BaseboardId {
+        part_number: "sled".to_string(),
+        serial_number: "2".to_string(),
+    };
+    a.universe.borrow().rumors.clone().send(
+        Message::Event(
+            ghost.clone(),
+            Event::Job(JobEvent::Start(job_id, Utc::now())),
+        )
+        .into(),
+    );
+    eventually("A records the orphaned start", 60, async || {
+        a.mgr.job_status(&authn_a, &job_id).await.is_ok_and(|map| {
+            map.get(&ghost)
+                .is_some_and(|s| matches!(s, JobStatus::Started { .. }))
+        })
+    })
+    .await;
+
+    // Sled 2's next incarnation joins, finds its own job running in
+    // replayed history with no executor to ever stop it, and declares
+    // it interrupted for the whole rack to see.
+    let b = Sled::start(&log, &dir, 2, &root_pem, &shutdown).await;
+    a.peers.send(BTreeSet::from([b.addr])).unwrap();
+    b.peers.send(BTreeSet::from([a.addr])).unwrap();
+    eventually("the orphan is interrupted", 120, async || {
+        a.mgr.job_status(&authn_a, &job_id).await.is_ok_and(|map| {
+            map.get(&ghost).is_some_and(|s| {
+                matches!(
+                    s,
+                    JobStatus::Error {
+                        error: ProcessError::Interrupted,
+                        ..
+                    }
+                )
+            })
+        })
+    })
+    .await;
 
     shutdown.cancel();
 }

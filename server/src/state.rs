@@ -12,9 +12,9 @@ use std::num::NonZeroUsize;
 use std::sync::{Arc, Mutex};
 
 use chrono::{DateTime, Utc};
-use futures::{Stream, StreamExt};
+use futures::{FutureExt as _, Stream, StreamExt};
 use lru::LruCache;
-use rumors::{Peer, Rumors, Version};
+use rumors::{CausalMessages, Peer, Rumors, Version};
 use sled_hardware_types::BaseboardId;
 use slog::{Logger, debug, error, info, o, warn};
 use tokio::sync::watch;
@@ -440,6 +440,15 @@ impl State {
 
     pub fn history(&self) -> &JobHistory {
         &self.history
+    }
+
+    /// Jobs running on our own baseboard, according to our history.
+    pub fn own_running_jobs(&self) -> BTreeSet<JobId> {
+        self.running
+            .keys()
+            .filter(|(_, baseboard)| *baseboard == self.own_baseboard)
+            .map(|(job_id, _)| *job_id)
+            .collect()
     }
 
     pub fn get_job_status(&self, job_id: &JobId) -> Option<&JobStatusMap> {
@@ -977,6 +986,63 @@ fn apply_message(
     });
 }
 
+/// Apply every message already delivered locally, without waiting for
+/// more. Afterwards the local set is quiescent.
+fn drain_ready(
+    log: &Logger,
+    causal_messages: &mut CausalMessages<VersionedMessage>,
+    tx_state: &watch::Sender<State>,
+    executor: &mut Executor,
+    rumors: Option<&GossipNetwork>,
+    own_baseboard: &BaseboardId,
+) {
+    while let Some(Some((version, message))) = causal_messages.next().now_or_never() {
+        apply_message(
+            log,
+            tx_state,
+            executor,
+            rumors,
+            own_baseboard,
+            &version,
+            &message,
+        );
+    }
+}
+
+/// Declare historical jobs interrupted, excluding `survivors`
+/// (jobs this incarnation is really running across a universe swap)
+/// and jobs already so declared. Call only at local quiescence
+/// (after [`drain_ready`]), so a job whose terminal event is
+/// already here is never falsely interrupted.
+fn interrupt_orphans(
+    log: &Logger,
+    tx_state: &watch::Sender<State>,
+    rumors: Option<&GossipNetwork>,
+    own_baseboard: &BaseboardId,
+    survivors: &BTreeSet<JobId>,
+    interrupted: &mut BTreeSet<JobId>,
+) {
+    let mut orphans = tx_state.borrow().own_running_jobs();
+    orphans.retain(|job_id| !survivors.contains(job_id) && !interrupted.contains(job_id));
+    for job_id in orphans {
+        interrupted.insert(job_id);
+        if let Some(rumors) = rumors {
+            rumors.send(
+                Message::Event(
+                    own_baseboard.clone(),
+                    Event::Job(JobEvent::Error(
+                        job_id,
+                        Utc::now(),
+                        ProcessError::Interrupted,
+                    )),
+                )
+                .into(),
+            );
+        }
+        warn!(log, "interrupted job from a previous life"; "job_id" => %job_id);
+    }
+}
+
 /// Create a fresh gossip network with this server as its only peer.
 ///
 /// A peer that seeds its own network has no one to gossip with, so jobs run
@@ -1036,7 +1102,7 @@ impl StateManager {
             own_baseboard.clone(),
             roots,
             session_sush_nonce.clone(),
-            frontier,
+            frontier.clone(),
         )?;
         initial_state.cubbies = cubbies.borrow_and_update().clone();
         let (tx_state, rx_state) = watch::channel(initial_state);
@@ -1060,6 +1126,15 @@ impl StateManager {
             rx_state,
             spawn(async move {
                 info!(log, "managing state");
+
+                // Replay bookkeeping. `frontier` classifies incoming
+                // messages (at or concurrent with it means replayed
+                // history); `survivors` are jobs this incarnation itself
+                // runs across a universe swap; `interrupted` are jobs of
+                // ours the replay showed running, already declared dead.
+                let mut frontier = frontier;
+                let mut survivors: BTreeSet<JobId> = BTreeSet::new();
+                let mut interrupted: BTreeSet<JobId> = BTreeSet::new();
 
                 // Announce our build.
                 if let Some((rumors, _)) = &gossip {
@@ -1131,6 +1206,8 @@ impl StateManager {
                                 break;
                             }
                             Some((version, message)) => {
+                                // Past the join frontier means the message is live.
+                                let live = frontier.as_ref().is_none_or(|f| version > f);
                                 apply_message(
                                     &log,
                                     &tx_state,
@@ -1140,6 +1217,29 @@ impl StateManager {
                                     &version,
                                     &message,
                                 );
+                                // Replayed history can show jobs of ours
+                                // running that died with a previous life.
+                                // Drain to local quiescence first, so a
+                                // job whose terminal event is already here
+                                // is never declared interrupted.
+                                if !live {
+                                    drain_ready(
+                                        &log,
+                                        &mut causal_messages,
+                                        &tx_state,
+                                        &mut executor,
+                                        gossip.as_ref().map(|(rumors, _)| rumors),
+                                        &own_baseboard,
+                                    );
+                                    interrupt_orphans(
+                                        &log,
+                                        &tx_state,
+                                        gossip.as_ref().map(|(rumors, _)| rumors),
+                                        &own_baseboard,
+                                        &survivors,
+                                        &mut interrupted,
+                                    );
+                                }
                             },
                         },
 
@@ -1171,6 +1271,9 @@ impl StateManager {
                         let fresh = universe.borrow_and_update().clone();
                         info!(log, "gossip universe changed, resetting state"; "network" => %fresh.rumors.network());
                         causal_messages = fresh.rumors.causal_messages();
+                        survivors = tx_state.borrow().own_running_jobs();
+                        interrupted = BTreeSet::new();
+                        frontier = fresh.frontier.clone();
                         // TODO: re-inject local job state (policy pending).
                         tx_state.send_modify(|state| {
                             *state = State::new(
@@ -1189,6 +1292,26 @@ impl StateManager {
                                 Event::Version(VersionInfo::current()),
                             )
                             .into(),
+                        );
+                        // The set received at join is already local: drain
+                        // it, then declare interrupted any job of ours the
+                        // replayed history still shows running. A previous
+                        // life started them; nothing will ever stop them.
+                        drain_ready(
+                            &log,
+                            &mut causal_messages,
+                            &tx_state,
+                            &mut executor,
+                            Some(&*rumors),
+                            &own_baseboard,
+                        );
+                        interrupt_orphans(
+                            &log,
+                            &tx_state,
+                            Some(&*rumors),
+                            &own_baseboard,
+                            &survivors,
+                            &mut interrupted,
                         );
                     }
                 }

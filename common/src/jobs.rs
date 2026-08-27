@@ -422,6 +422,8 @@ pub enum ProcessError {
     OutputLimitExceeded { stream: JobOutputStream, limit: u64 },
     #[error("Unable to join job process: {0}")]
     Join(String),
+    #[error("The server restarted while the job was running")]
+    Interrupted,
 }
 
 impl ProcessError {
