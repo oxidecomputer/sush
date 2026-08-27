@@ -18,7 +18,9 @@ use tokio_util::sync::CancellationToken;
 
 use chrono::Utc;
 use sush_api::{JobStartParams, JobWait};
-use sush_common::jobs::{JobId, JobStatus, ProcessError, Session, SessionId, SessionSignerNonce};
+use sush_common::jobs::{
+    JobId, JobOutputState, JobStatus, ProcessError, Session, SessionId, SessionSignerNonce,
+};
 use sush_common::keys::pem_cert_chain;
 use sush_common::targets::Cubbies;
 use sush_common::version::VersionInfo;
@@ -400,6 +402,133 @@ async fn interrupted_jobs_get_stopped() {
     })
     .await;
 
+    // The job's genuine stop was in flight all along: when it lands,
+    // the real result supersedes the interrupted declaration.
+    let output = JobOutputState::default();
+    a.universe.borrow().rumors.clone().send(
+        Message::Event(
+            ghost.clone(),
+            Event::Job(JobEvent::Stop(job_id, Utc::now(), Ok(0), output)),
+        )
+        .into(),
+    );
+    eventually("the late stop supersedes the interrupt", 120, async || {
+        a.mgr.job_status(&authn_a, &job_id).await.is_ok_and(|map| {
+            map.get(&ghost)
+                .is_some_and(|s| matches!(s, JobStatus::Stopped { result: Ok(0), .. }))
+        })
+    })
+    .await;
+
+    shutdown.cancel();
+}
+
+#[tokio::test]
+async fn stragglers_do_not_interrupt_live_jobs() {
+    let (_tmp, dir) = pki("sush-straggler-", 3);
+    let mut root = common::ephemeral_root();
+    let root_pem = dir.join("job-root.pem");
+    std::fs::write(
+        &root_pem,
+        pem_cert_chain(vec![root.cert().to_owned()]).unwrap(),
+    )
+    .unwrap();
+
+    let log = test_logger("stragglers_do_not_interrupt_live_jobs");
+    let shutdown = CancellationToken::new();
+
+    // A and C converge; C then holds a message A never sees.
+    let a = Sled::start(&log, &dir, 1, &root_pem, &shutdown).await;
+    let c = Sled::start(&log, &dir, 3, &root_pem, &shutdown).await;
+    a.peers.send(BTreeSet::from([c.addr])).unwrap();
+    c.peers.send(BTreeSet::from([a.addr])).unwrap();
+    eventually("A and C converge", 120, async || {
+        a.universe.borrow().rumors.network() == c.universe.borrow().rumors.network()
+    })
+    .await;
+    a.peers.send(BTreeSet::new()).unwrap();
+    c.peers.send(BTreeSet::new()).unwrap();
+    let marooned = BaseboardId {
+        part_number: "sled".to_string(),
+        serial_number: "marooned".to_string(),
+    };
+    c.universe
+        .borrow()
+        .rumors
+        .clone()
+        .send(Message::Event(marooned.clone(), Event::Version(VersionInfo::current())).into());
+    // A also advances on its own side of the split, so the marooned
+    // message is genuinely concurrent with (not under) B's frontier.
+    let split_marker = BaseboardId {
+        part_number: "sled".to_string(),
+        serial_number: "split-marker".to_string(),
+    };
+    a.universe
+        .borrow()
+        .rumors
+        .clone()
+        .send(Message::Event(split_marker, Event::Version(VersionInfo::current())).into());
+
+    // B joins through A alone, so C's message is concurrent with B's
+    // join frontier, and starts a live job that keeps running.
+    let b = Sled::start(&log, &dir, 2, &root_pem, &shutdown).await;
+    a.peers.send(BTreeSet::from([b.addr])).unwrap();
+    b.peers.send(BTreeSet::from([a.addr])).unwrap();
+    eventually("B joins A", 120, async || {
+        a.universe.borrow().rumors.network() == b.universe.borrow().rumors.network()
+    })
+    .await;
+    let authn_a = fake_identity(&mut root).await;
+    let signer_nonce = SessionSignerNonce::random();
+    let session_id = SessionId::compute(
+        a.mgr.own_baseboard(),
+        a.mgr.session_sush_nonce(),
+        signer_nonce,
+    );
+    let session = Session::new(session_id);
+    a.mgr
+        .session_start(&authn_a, session_id, signer_nonce, true)
+        .await
+        .unwrap();
+    let job_id = session.next_job_id();
+    let job = sign_job(&mut root, job_id, session_id, "sleep 30").await;
+    a.mgr
+        .job_start(
+            &authn_a,
+            job,
+            JobStartParams {
+                wait: JobWait::Start,
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+    eventually("the live job starts on B", 120, async || {
+        a.mgr.job_status(&authn_a, &job_id).await.is_ok_and(|map| {
+            map.get(&b.baseboard)
+                .is_some_and(|s| matches!(s, JobStatus::Started { .. }))
+        })
+    })
+    .await;
+
+    // C reconnects; its marooned message reaches B as replayed-classified
+    // traffic and triggers the orphan scan. The live job must survive.
+    a.peers.send(BTreeSet::from([b.addr, c.addr])).unwrap();
+    b.peers.send(BTreeSet::from([a.addr, c.addr])).unwrap();
+    c.peers.send(BTreeSet::from([a.addr, b.addr])).unwrap();
+    let authn_b = fake_identity(&mut root).await;
+    eventually("the marooned message reaches B", 120, async || {
+        b.mgr.versions().iter().any(|row| row.baseboard == marooned)
+    })
+    .await;
+    assert!(
+        b.mgr.job_status(&authn_b, &job_id).await.is_ok_and(|map| {
+            map.get(&b.baseboard)
+                .is_some_and(|s| matches!(s, JobStatus::Started { .. }))
+        }),
+        "a straggler-triggered scan interrupted a live job"
+    );
+
     shutdown.cancel();
 }
 
@@ -457,6 +586,10 @@ async fn bookmarks_survive_restart() {
     b_shutdown.cancel();
     drop(b);
     a.peers.send(BTreeSet::new()).unwrap();
+    // Let the dead incarnation's tasks quiesce: a real reboot does,
+    // and two live sources over one slot are the store's one
+    // forbidden misuse.
+    tokio::time::sleep(std::time::Duration::from_millis(500)).await;
     let b = Sled::start_with_bookmarks(
         &log,
         &dir,
