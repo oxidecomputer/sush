@@ -4925,6 +4925,7 @@ name = "sush-server"
 version = "0.1.0"
 dependencies = [
  "async-trait",
+ "atomicwrites",
  "attest-mock",
  "bytes",
  "bytesize",
