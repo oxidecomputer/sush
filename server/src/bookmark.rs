@@ -43,6 +43,20 @@ use tokio::task::spawn_blocking;
 /// A change to our envelope means a new magic.
 const MAGIC: &[u8; 8] = b"SUSHBKMK";
 
+/// Envelope layout: magic, big-endian sequence number, digest of the
+/// sequence number and record together, record. The digest keeps a
+/// damaged sequence number from silently reordering the slots; the
+/// whole safety argument rides on that integer.
+const SEQ_LEN: usize = 8;
+const DIGEST_LEN: usize = 32;
+
+fn digest(seq: u64, record: &[u8]) -> [u8; DIGEST_LEN] {
+    let mut hasher = sush_common::hash::Hasher::new();
+    hasher.update(&seq.to_be_bytes());
+    hasher.update(record);
+    *hasher.finalize().as_bytes()
+}
+
 /// What a bookmark load or store failed at.
 #[derive(Debug, Error)]
 pub enum BookmarkIoError {
@@ -81,6 +95,12 @@ struct SharedStore {
     /// Serializes loads and stores across handles, so the newest
     /// record on disk is always the newest store anyone `Ok`'d.
     state: Mutex<StoreState>,
+    /// The newest sequence number committed to disk this process, and
+    /// the lock every rename takes. A store future dropped mid-write
+    /// leaves a detached blocking task whose rename would otherwise
+    /// land *after* a newer store's; renames commit in sequence order
+    /// or not at all.
+    committed: std::sync::Mutex<u64>,
 }
 
 #[derive(Debug, Default)]
@@ -93,6 +113,14 @@ struct StoreState {
 
 impl BookmarkSource {
     /// A source persisting to `slots`, each on its own device.
+    ///
+    /// The contract for integrators: construct exactly one source per
+    /// slot set per process (the fences and sequence numbers that keep
+    /// the store safe live inside it), and feed that same source to
+    /// both [`seed_gossip`](crate::seed_gossip) and
+    /// [`spawn_gossip`](crate::gossip::spawn_gossip). The caller
+    /// creates the parent directories, writable by this server's user,
+    /// one per boot M.2; the record files are created and owned here.
     pub fn new(log: &Logger, slots: Vec<Utf8PathBuf>) -> Self {
         Self {
             shared: Arc::new(SharedStore {
@@ -100,6 +128,7 @@ impl BookmarkSource {
                 slots,
                 generation: AtomicU64::new(0),
                 state: Mutex::new(StoreState::default()),
+                committed: std::sync::Mutex::new(0),
             }),
         }
     }
@@ -130,27 +159,34 @@ impl BookmarkSource {
         }
     }
 
-    /// A probing handle: reads like a real one, but without incrementing
-    /// the generation.
+    /// A probing handle: reads like the current peer's, but without
+    /// superseding anything.
     fn probe_handle(&self) -> SushBookmark {
         SushBookmark {
             shared: self.shared.clone(),
-            generation: 0,
+            generation: self.shared.generation.load(Ordering::SeqCst),
             shed: false,
         }
     }
 
-    /// Does the storage look reasonable?
+    /// Does the storage work? Reads every slot and proves at least one
+    /// writable by writing.
     pub async fn probe(&self) -> Result<(), BookmarkIoError> {
         if self.shared.slots.is_empty() {
             return Ok(());
         }
         let usable = match self.probe_handle().load().await {
             Ok(_) => {
-                if self.shared.slots.iter().any(|path| {
-                    path.parent()
-                        .is_some_and(|parent| parent.as_std_path().is_dir())
-                }) {
+                let mut writable = false;
+                for path in &self.shared.slots {
+                    let probe = path.with_extension("probe");
+                    if tokio::fs::write(&probe, b"").await.is_ok() {
+                        let _ = tokio::fs::remove_file(&probe).await;
+                        writable = true;
+                        break;
+                    }
+                }
+                if writable {
                     Ok(())
                 } else {
                     Err(BookmarkIoError::NoSlot)
@@ -179,12 +215,45 @@ impl SushBookmark {
         self.generation < self.shared.generation.load(Ordering::SeqCst)
     }
 
-    /// Split an envelope into its sequence number and record.
+    /// Split a checksummed envelope into its sequence number and record.
     fn parse(bytes: &[u8]) -> Option<(u64, Vec<u8>)> {
         let payload = bytes.strip_prefix(MAGIC)?;
-        let (seq, record) = payload.split_first_chunk::<8>()?;
-        Some((u64::from_be_bytes(*seq), record.to_vec()))
+        let (seq, rest) = payload.split_first_chunk::<SEQ_LEN>()?;
+        let (sum, record) = rest.split_first_chunk::<DIGEST_LEN>()?;
+        let seq = u64::from_be_bytes(*seq);
+        (digest(seq, record) == *sum).then(|| (seq, record.to_vec()))
     }
+
+    /// Build the checksummed envelope around `record`.
+    fn envelope(seq: u64, record: &[u8]) -> Vec<u8> {
+        let mut bytes = Vec::with_capacity(MAGIC.len() + SEQ_LEN + DIGEST_LEN + record.len());
+        bytes.extend_from_slice(MAGIC);
+        bytes.extend_from_slice(&seq.to_be_bytes());
+        bytes.extend_from_slice(&digest(seq, record));
+        bytes.extend_from_slice(record);
+        bytes
+    }
+}
+
+/// Rename `envelope` into place iff `seq` is newer than everything
+/// committed by this process. Runs on the blocking pool; the lock is
+/// the commit point, so a straggling write detached from a dropped
+/// store future cannot land on top of the newer record that beat it.
+fn commit(shared: &SharedStore, path: &Utf8Path, seq: u64, envelope: &[u8]) -> io::Result<()> {
+    let mut committed = shared.committed.lock().unwrap();
+    if seq <= *committed {
+        return Err(io::Error::other("superseded by a newer record"));
+    }
+    AtomicFile::new(path, OverwriteBehavior::AllowOverwrite)
+        .write(|file| {
+            file.set_permissions(Permissions::from_mode(0o600))?;
+            file.write_all(envelope)
+        })
+        .map_err(|error| match error {
+            atomicwrites::Error::Internal(error) | atomicwrites::Error::User(error) => error,
+        })?;
+    *committed = seq;
+    Ok(())
 }
 
 impl BookmarkError for SushBookmark {
@@ -197,6 +266,9 @@ impl Bookmark for SushBookmark {
     async fn load(&self) -> Result<Option<Self::Reader>, Self::Error> {
         if self.shed || self.shared.slots.is_empty() {
             return Ok(None);
+        }
+        if self.obe() {
+            return Err(BookmarkIoError::Fenced);
         }
         let mut state = self.shared.state.lock().await;
         let mut newest: Option<(u64, usize, Vec<u8>)> = None;
@@ -229,8 +301,13 @@ impl Bookmark for SushBookmark {
         }
         match newest {
             Some((seq, home, record)) => {
-                state.home = Some(home);
-                state.seq = seq;
+                // Never regress: a reserved sequence number outranks a
+                // re-read of the disk, or a cancelled write's straggler
+                // could collide with a fresh reservation.
+                if seq >= state.seq {
+                    state.home = Some(home);
+                    state.seq = seq;
+                }
                 Ok(Some(Cursor::new(record)))
             }
             // A present-but-unreadable record is an error:
@@ -275,27 +352,15 @@ impl Bookmark for SushBookmark {
         // Reserve the sequence number first: a cancelled write may
         // still land and must be outnumbered.
         state.seq += 1;
-        let mut envelope = Vec::with_capacity(MAGIC.len() + 8 + record.len());
-        envelope.extend_from_slice(MAGIC);
-        envelope.extend_from_slice(&state.seq.to_be_bytes());
-        envelope.extend_from_slice(&record);
+        let seq = state.seq;
+        let envelope = Self::envelope(seq, &record);
 
+        let shared = self.shared.clone();
         let target = path.clone();
-        let written = spawn_blocking(move || {
-            AtomicFile::new(target, OverwriteBehavior::AllowOverwrite)
-                .write(|file| {
-                    file.set_permissions(Permissions::from_mode(0o600))?;
-                    file.write_all(&envelope)
-                })
-                .map_err(|error| match error {
-                    atomicwrites::Error::Internal(error) | atomicwrites::Error::User(error) => {
-                        error
-                    }
-                })
-        })
-        .await
-        .map_err(|join| io::Error::other(join.to_string()))
-        .and_then(|result| result);
+        let written = spawn_blocking(move || commit(&shared, &target, seq, &envelope))
+            .await
+            .map_err(|join| io::Error::other(join.to_string()))
+            .and_then(|result| result);
 
         match written {
             Ok(()) => {
@@ -337,10 +402,7 @@ mod test {
     }
 
     fn envelope(seq: u64, record: &[u8]) -> Vec<u8> {
-        let mut bytes = MAGIC.to_vec();
-        bytes.extend_from_slice(&seq.to_be_bytes());
-        bytes.extend_from_slice(record);
-        bytes
+        SushBookmark::envelope(seq, record)
     }
 
     async fn read_back(handle: &SushBookmark) -> Option<Vec<u8>> {
@@ -423,6 +485,65 @@ mod test {
             source.next_handle().load().await,
             Err(BookmarkIoError::Corrupt { .. })
         ));
+    }
+
+    /// A damaged sequence number fails the digest rather than silently
+    /// reordering the slots.
+    #[tokio::test]
+    async fn a_flipped_sequence_number_is_corruption() {
+        let dir = TempDir::with_prefix("sush-bookmark-").unwrap();
+        let slots = slots(&dir);
+        let mut bytes = envelope(3, b"good");
+        bytes[MAGIC.len()] ^= 0x80;
+        write(&slots[0], bytes).unwrap();
+
+        let source = BookmarkSource::new(&test_log(), slots.clone());
+        assert!(matches!(
+            source.next_handle().load().await,
+            Err(BookmarkIoError::Corrupt { .. })
+        ));
+    }
+
+    /// A straggling write from a dropped store future cannot land on
+    /// top of a newer committed record.
+    #[tokio::test]
+    async fn stragglers_cannot_clobber_newer_commits() {
+        let dir = TempDir::with_prefix("sush-bookmark-").unwrap();
+        let slots = slots(&dir);
+        let source = BookmarkSource::new(&test_log(), slots.clone());
+
+        let newer = envelope(7, b"newer");
+        let straggler = envelope(6, b"stale");
+        commit(&source.shared, &slots[0], 7, &newer).unwrap();
+        assert!(commit(&source.shared, &slots[0], 6, &straggler).is_err());
+        assert_eq!(read(&slots[0]).unwrap(), newer);
+    }
+
+    /// A superseded handle can no longer load: its view of home and
+    /// sequence state belongs to a dead peer.
+    #[tokio::test]
+    async fn stale_generations_cannot_load() {
+        let dir = TempDir::with_prefix("sush-bookmark-").unwrap();
+        let source = BookmarkSource::new(&test_log(), slots(&dir));
+        let old = source.next_handle();
+        old.store(record(b"before")).await.unwrap();
+        let _new = source.next_handle();
+        assert!(matches!(old.load().await, Err(BookmarkIoError::Fenced)));
+    }
+
+    /// Probing proves writability by writing, not by guessing from
+    /// directory metadata.
+    #[tokio::test]
+    async fn probe_rejects_unwritable_storage() {
+        let source = BookmarkSource::new(
+            &test_log(),
+            vec![Utf8PathBuf::from("/nonexistent/sush/bookmark")],
+        );
+        assert!(matches!(source.probe().await, Err(BookmarkIoError::NoSlot)));
+
+        let dir = TempDir::with_prefix("sush-bookmark-").unwrap();
+        let source = BookmarkSource::new(&test_log(), slots(&dir));
+        source.probe().await.unwrap();
     }
 
     /// A slotless source and a shed handle persist nothing and never

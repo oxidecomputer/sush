@@ -417,6 +417,13 @@ where
                     Stopped::Failed
                 };
             }
+            // A bookmark failure stops every future session too (the
+            // persist gate runs before any wire traffic), so unlike
+            // routine link churn it must be loud.
+            Err(Error::Bookmark(error)) => {
+                warn!(log, "bookmark failure stops gossip"; "error" => %error);
+                return Stopped::Failed;
+            }
             Err(err) => {
                 debug!(log, "session failed"; "error" => %err);
                 return Stopped::Failed;
