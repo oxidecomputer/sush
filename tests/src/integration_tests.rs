@@ -16,10 +16,15 @@ use dropshot::{ConfigDropshot, ServerBuilder};
 use function_name::named;
 use futures::{SinkExt as _, StreamExt as _};
 use tokio::io::{AsyncRead, AsyncWrite};
+use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::watch;
 use tokio::test;
 use tokio::time::{sleep, timeout};
 use tokio_tungstenite::WebSocketStream;
+use tokio_tungstenite::accept_hdr_async;
+use tokio_tungstenite::tungstenite::handshake::server::{
+    Request as WsRequest, Response as WsResponse,
+};
 use tokio_tungstenite::tungstenite::protocol::Role;
 use tokio_util::sync::CancellationToken;
 
@@ -39,6 +44,7 @@ use x509_cert::time::Validity;
 use sush_api::JobWait;
 use sush_api::sush_api_mod::api_description;
 use sush_client::tls::client as tls_client;
+use sush_client::tunnel::{Tunnel, pipe};
 use sush_client::{AuthzSigner, Client, Error as ClientError};
 use sush_common::hash::hash;
 use sush_common::interactive::{InteractiveJobControl, InteractiveJobMessage};
@@ -1156,4 +1162,106 @@ async fn streaming_job_linger() {
     assert_eq!(result, Ok(0));
     assert_eq!(stdout_len, streamed.len() as u64);
     assert_eq!(stdout_hash, hash(&streamed).into());
+}
+
+/// A client tunneling through a stub Nexus authenticates and works,
+/// with the platform TLS crossing the websocket untouched.
+// The large Err is tungstenite's callback signature, not ours.
+#[allow(clippy::result_large_err)]
+#[named]
+#[test]
+async fn client_tunnels_through_nexus() {
+    // The rack side: a sush server behind the platform-TLS proxy.
+    let log = test_logger(function_name!());
+    let (mgr, mut root, _dir, _shutdown) = manager_and_test_root(log.clone()).await;
+    let api = api_description::<ApiServer>().unwrap();
+    let server = ServerBuilder::new(api, Arc::new(mgr), log.clone())
+        .config(ConfigDropshot {
+            bind_address: local_addr(),
+            ..Default::default()
+        })
+        .start()
+        .expect("failed to start server");
+    let (_pki_dir, pki) = test_pki("sush-tunnel-");
+    let resolve = ResolveSetting::Local {
+        priv_key: private_key_path(pki.clone(), &sprockets_auth_prefix(1)),
+        cert_chain: certlist_path(pki.clone(), &sprockets_auth_prefix(1)),
+    };
+    let tls = platform_tls(&log, resolve).expect("can't build TLS config");
+    let (_tx_targets, rx_targets) = watch::channel(Targets {
+        sleds: BTreeMap::from([(test_baseboard_id(), server.local_addr())]),
+        cubbies: Cubbies::new(),
+    });
+    let shutdown_proxy = CancellationToken::new();
+    let proxy = ProxyServer::start(
+        &log,
+        local_addr(),
+        Some(tls),
+        rx_targets,
+        None,
+        shutdown_proxy.clone(),
+    )
+    .await
+    .expect("can't start TLS proxy server");
+    let proxy_addr = proxy.local_addr();
+
+    // A stub Nexus: admit the expected bearer and rack, then pipe
+    // each websocket to the proxy, as the real one does.
+    const RACK_ID: &str = "9ec7a284-b040-4bec-a2f7-cf06e1f10f76";
+    const TOKEN: &str = "sesame";
+    let stub = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let stub_addr = stub.local_addr().unwrap();
+    tokio::spawn(async move {
+        loop {
+            let (conn, _peer) = stub.accept().await.unwrap();
+            tokio::spawn(async move {
+                let admit = |request: &WsRequest, response: WsResponse| {
+                    assert_eq!(
+                        request.uri().path(),
+                        format!("/v1/system/hardware/racks/{RACK_ID}/support-shell/tunnel"),
+                    );
+                    assert_eq!(
+                        request.headers()["authorization"],
+                        format!("Bearer {TOKEN}")
+                    );
+                    Ok(response)
+                };
+                let ws = accept_hdr_async(conn, admit).await.expect("stub upgrade");
+                let far = TcpStream::connect(proxy_addr)
+                    .await
+                    .expect("stub can't reach the proxy");
+                pipe(far, ws).await;
+            });
+        }
+    });
+
+    // The tunnel probes the path, then stands in for the proxy.
+    let tunnel = Tunnel::start(&format!("http://{stub_addr}"), RACK_ID, TOKEN, &[])
+        .await
+        .expect("can't start tunnel");
+
+    // The usual client, aimed through the tunnel, authenticates and works.
+    let pem = read(cert_path(pki.clone(), &root_prefix())).unwrap();
+    let roots = vec![Certificate::from_pem(&pem).unwrap()];
+    let signer = AuthzSigner::default();
+    let client = Client::new_with_client(
+        &tunnel.url,
+        tls_client(roots, None).unwrap(),
+        signer.clone(),
+    );
+    let ClientError::ErrorResponse(unauthz) = client.iam().body(None).send().await.unwrap_err()
+    else {
+        panic!("expected error response")
+    };
+    assert_eq!(unauthz.status(), 401, "expected 401 Unauthorized");
+    let (identity, credentials) = authz(&client, unauthz, &mut root).await;
+    signer.set(Some(credentials));
+    let iam = client
+        .iam()
+        .body(None)
+        .send()
+        .await
+        .expect("can't authenticate")
+        .into_inner();
+    assert_eq!(iam, identity, "who am I?");
 }
