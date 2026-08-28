@@ -60,8 +60,8 @@ signature = "2"
 sled-hardware-types = { git = "https://github.com/oxidecomputer/omicron", tag = "rel/v21/rc1" }
 slog = "2"
 slog-term = "2"
-sprockets-tls = { git = "https://github.com/oxidecomputer/sprockets.git", rev = "b8782742d1bd91546887fbc1757a7d024a5469ef", default-features = false }
-sprockets-tls-test-utils = { git = "https://github.com/oxidecomputer/sprockets.git", rev = "b8782742d1bd91546887fbc1757a7d024a5469ef" }
+sprockets-tls = { git = "https://github.com/oxidecomputer/sprockets.git", rev = "98615b86d51f74ce220198eb16c57932fd24e7cb", default-features = false }
+sprockets-tls-test-utils = { git = "https://github.com/oxidecomputer/sprockets.git", rev = "98615b86d51f74ce220198eb16c57932fd24e7cb" }
 ssh-key = { version = "0.6", features = ["ed25519", "p256", "serde"] }
 tempfile = "3"
 thiserror = "1"
