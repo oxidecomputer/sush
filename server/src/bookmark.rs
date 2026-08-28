@@ -41,7 +41,7 @@ use tokio::task::spawn_blocking;
 
 /// The envelope magic. The payload includes its own magic.
 /// A change to our envelope means a new magic.
-const MAGIC: &[u8; 8] = b"SUSHBKMK";
+const MAGIC: &[u8; 12] = b"SUSHBOOKMARK";
 
 /// Envelope layout: magic, big-endian sequence number, digest of the
 /// sequence number and record together, record. The digest keeps a
