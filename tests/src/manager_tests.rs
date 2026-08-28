@@ -34,7 +34,8 @@ use sush_common::jobs::{
 };
 use sush_common::keys::{EphemeralKey, KeyError, KeyId, KeyType, Signer as _, pem_cert_chain};
 use sush_common::targets::{Cubbies, Target};
-use sush_server::gossip::isolated;
+use sush_server::bookmark::BookmarkSource;
+use sush_server::gossip::{Universe, isolated};
 use sush_server::io::BATCH_OUTPUT_BUFFER_SIZE;
 use sush_server::messages::v0::{CertRequest, IdentityRequest, Message, Request, SessionRequest};
 use sush_server::output::{JobOutputDir, OutputDirs};
@@ -578,7 +579,7 @@ async fn cubby_targets() {
         JobOutputDir::fixed(dir.path()),
         test_baseboard_id(),
         cubbies_rx,
-        isolated(seed_gossip()),
+        isolated(seed_gossip(&BookmarkSource::null()).await),
         &[root.cert().to_owned()],
         CancellationToken::new(),
     )
@@ -683,7 +684,7 @@ async fn root_certs_from_files() {
         JobOutputDir::fixed(dir.path()),
         test_baseboard_id(),
         no_cubbies(),
-        isolated(seed_gossip()),
+        isolated(seed_gossip(&BookmarkSource::null()).await),
         &[path],
         CancellationToken::new(),
     )
@@ -733,7 +734,7 @@ async fn bad_root_cert_files() {
                 JobOutputDir::fixed(dir.path()),
                 test_baseboard_id(),
                 no_cubbies(),
-                isolated(seed_gossip()),
+                isolated(seed_gossip(&BookmarkSource::null()).await),
                 &[path],
                 CancellationToken::new(),
             )
@@ -763,7 +764,7 @@ async fn job_output_dir_moves() {
         JobOutputDir::new(rx_dirs),
         test_baseboard_id(),
         no_cubbies(),
-        isolated(seed_gossip()),
+        isolated(seed_gossip(&BookmarkSource::null()).await),
         &[root.cert().to_owned()],
         CancellationToken::new(),
     )
@@ -855,7 +856,9 @@ async fn universe_swap() {
     let log = test_logger(function_name!());
     let dir = TempDir::with_prefix("sush-").unwrap();
     let mut root = ephemeral_test_root();
-    let (universe, universe_rx) = watch::channel(seed_gossip());
+    let (universe, universe_rx) = watch::channel(Universe::genesis(
+        seed_gossip(&BookmarkSource::null()).await,
+    ));
     let mgr = JobManager::with_root_certs(
         log,
         PathIsolation::InsecureDisable,
@@ -900,7 +903,11 @@ async fn universe_swap() {
     assert!(mgr.job_status(&authn, &job_id).await.is_ok());
 
     // Migrate. The session and the job's history are gone.
-    universe.send(seed_gossip()).unwrap();
+    universe
+        .send(Universe::genesis(
+            seed_gossip(&BookmarkSource::null()).await,
+        ))
+        .unwrap();
     timeout(Duration::from_secs(30), async {
         while mgr.session(&authn).is_some() {
             sleep(Duration::from_millis(50)).await;
@@ -998,7 +1005,7 @@ async fn cert_chain() {
         part_number: "test part".to_string(),
         serial_number: "0000".to_string(),
     };
-    let gossip = isolated(seed_gossip());
+    let gossip = isolated(seed_gossip(&BookmarkSource::null()).await);
     let shutdown = CancellationToken::new();
     let mgr = JobManager::with_root_certs(
         log,
@@ -1771,7 +1778,7 @@ async fn hostile_imports_cannot_displace() {
         part_number: "test part".to_string(),
         serial_number: "0000".to_string(),
     };
-    let seed = seed_gossip();
+    let seed = seed_gossip(&BookmarkSource::null()).await;
     let peer = seed.clone();
     let shutdown = CancellationToken::new();
     let mgr = JobManager::with_root_certs(
@@ -1916,7 +1923,7 @@ async fn homonym_issuer_resolves_to_true_parent() {
         part_number: "test part".to_string(),
         serial_number: "0000".to_string(),
     };
-    let seed = seed_gossip();
+    let seed = seed_gossip(&BookmarkSource::null()).await;
     let peer = seed.clone();
     let shutdown = CancellationToken::new();
     let mgr = JobManager::with_root_certs(

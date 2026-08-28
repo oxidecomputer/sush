@@ -16,7 +16,8 @@ use slog::Logger;
 use tokio::sync::watch;
 use tokio_util::sync::CancellationToken;
 
-use sush_server::gossip::spawn_gossip;
+use sush_server::bookmark::{BookmarkSource, SushBookmark};
+use sush_server::gossip::{Universe, spawn_gossip};
 
 use common::{corpus, eventually, gossip_config, localhost, pki, sprockets_config, test_logger};
 
@@ -24,14 +25,19 @@ struct Node {
     addr: SocketAddrV6,
     initial: Network,
     peers: watch::Sender<BTreeSet<SocketAddrV6>>,
-    universe: watch::Receiver<Rumors<String>>,
+    universe: watch::Receiver<Universe<String>>,
     shutdown: CancellationToken,
 }
 
 impl Node {
     async fn start(log: &Logger, dir: &Utf8PathBuf, identity: usize) -> Node {
         let shutdown = CancellationToken::new();
-        let seed: Rumors<String> = Peer::seed().into_rumors();
+        let bookmarks = BookmarkSource::null();
+        let seed: Rumors<String, SushBookmark> = Peer::seed()
+            .bookmark(bookmarks.next_handle())
+            .await
+            .expect("a pristine seed never touches its bookmark")
+            .into_rumors();
         let initial = seed.network();
         let (peers, peers_rx) = watch::channel(BTreeSet::new());
         let (addr, universe) = spawn_gossip(
@@ -42,6 +48,7 @@ impl Node {
             localhost(),
             peers_rx,
             seed,
+            bookmarks,
             shutdown.clone(),
         )
         .await
@@ -56,11 +63,11 @@ impl Node {
     }
 
     fn network(&self) -> Network {
-        self.universe.borrow().network()
+        self.universe.borrow().rumors.network()
     }
 
-    fn rumors(&self) -> Rumors<String> {
-        self.universe.borrow().clone()
+    fn rumors(&self) -> Rumors<String, SushBookmark> {
+        self.universe.borrow().rumors.clone()
     }
 
     fn contains(&self, message: &str) -> bool {

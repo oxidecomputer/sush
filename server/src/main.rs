@@ -20,6 +20,7 @@ use x509_cert::der::DecodePem as _;
 
 use sush_api::sush_api_mod::api_description;
 use sush_common::targets::Cubbies;
+use sush_server::bookmark::BookmarkSource;
 use sush_server::executor::PathIsolation;
 use sush_server::gossip::isolated;
 use sush_server::manager::JobManager;
@@ -94,7 +95,7 @@ async fn main() -> Result<(), String> {
     };
 
     // TODO: get/seed Rumors network
-    let gossip = isolated(seed_gossip());
+    let gossip = isolated(seed_gossip(&BookmarkSource::null()).await);
 
     #[cfg(feature = "test-support")]
     let roots = overridable_root_certs(&override_root_certs).await?;

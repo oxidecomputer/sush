@@ -12,9 +12,9 @@ use std::num::NonZeroUsize;
 use std::sync::{Arc, Mutex};
 
 use chrono::{DateTime, Utc};
-use futures::{Stream, StreamExt};
+use futures::{FutureExt as _, Stream, StreamExt};
 use lru::LruCache;
-use rumors::{Peer, Rumors, Version};
+use rumors::{CausalMessages, Peer, Rumors, Version};
 use sled_hardware_types::BaseboardId;
 use slog::{Logger, debug, error, info, o, warn};
 use tokio::sync::watch;
@@ -34,7 +34,9 @@ use sush_common::keys::{KeyError, KeyId, Signature, SshPublicKey};
 use sush_common::targets::Cubbies;
 use sush_common::version::{VersionInfo, VersionMap};
 
+use crate::bookmark::{BookmarkSource, SushBookmark};
 use crate::executor::{Executor, PathIsolation};
+use crate::gossip::Universe;
 use crate::history::JobHistory;
 use crate::job::SocketSender;
 use crate::messages::v0::{
@@ -46,8 +48,9 @@ use crate::output::JobOutputDir;
 
 pub type AttachmentPoints = BTreeMap<JobId, watch::Receiver<Option<SocketSender>>>;
 pub type Certificates = BTreeMap<KeyId, CertState>;
-pub type GossipNetwork = Rumors<VersionedMessage>;
-pub type QueuedJobs = BTreeMap<JobId, (SignedJob, JobStartParams)>;
+pub type GossipNetwork = Rumors<VersionedMessage, SushBookmark>;
+pub type GossipUniverse = Universe<VersionedMessage>;
+pub type QueuedJobs = BTreeMap<JobId, QueuedJob>;
 pub type RunningJobs = BTreeMap<(JobId, BaseboardId), DateTime<Utc>>;
 
 /// Maximum certificate chain length.
@@ -81,6 +84,16 @@ pub const MAX_REVOKED_KEYS: NonZeroUsize = NonZeroUsize::new(10_000).unwrap();
 pub struct RegisteredIdentity {
     pub identity: Identity,
     pub verifier: RequestVerifier,
+}
+
+/// A job waiting in the session queue for its turn in the causal chain.
+/// Jobs replayed from history that predates our join keep the chain intact
+/// but never execute here.
+#[derive(Clone, Debug)]
+pub struct QueuedJob {
+    pub job: SignedJob,
+    pub params: JobStartParams,
+    pub replayed: bool,
 }
 
 #[derive(Clone, Debug)]
@@ -193,7 +206,7 @@ impl<'a> SessionGuard<'a> {
         self.inner.skip_job(*job_id)
     }
 
-    pub fn next_queued_job(&mut self) -> Option<(SignedJob, JobStartParams)> {
+    pub fn next_queued_job(&mut self) -> Option<QueuedJob> {
         self.queued_jobs.remove(&self.inner.next_job_id())
     }
 
@@ -208,6 +221,7 @@ impl<'a> SessionGuard<'a> {
         job: SignedJob,
         params: JobStartParams,
         actor: &KeyId,
+        replayed: bool,
     ) {
         let job_id = *job.job_id();
         let targeted = job.payload().runs_on(own_baseboard, cubbies);
@@ -222,9 +236,17 @@ impl<'a> SessionGuard<'a> {
         } else {
             // Insert the job into our queue. Every job joins the
             // queue to keep the causal chain whole, but only jobs
-            // targeting this sled record a local status.
-            self.queued_jobs.insert(job_id, (job, params));
-            if targeted {
+            // targeting this sled that can actually run here record
+            // a local status.
+            self.queued_jobs.insert(
+                job_id,
+                QueuedJob {
+                    job,
+                    params,
+                    replayed,
+                },
+            );
+            if targeted && !replayed {
                 history.set_job_status(
                     &job_id,
                     own_baseboard,
@@ -248,8 +270,12 @@ impl<'a> SessionGuard<'a> {
         own_baseboard: &BaseboardId,
         history: &mut JobHistory,
         running: &RunningJobs,
+        replayed: bool,
     ) {
         self.queued_jobs.remove(job_id);
+        if replayed {
+            return;
+        }
         history.transition_job_status(
             job_id,
             own_baseboard,
@@ -272,8 +298,10 @@ impl<'a> SessionGuard<'a> {
     /// in the hash chain, and there may be an unbounded number of
     /// newly-ready-to-run jobs after it in the queue. Once we reach
     /// a fixed point, we have nothing further to do.
+    #[allow(clippy::too_many_arguments)]
     pub fn execute_ready_jobs(
         &mut self,
+        log: &Logger,
         own_baseboard: &BaseboardId,
         cubbies: &Cubbies,
         certs: &mut Certificates,
@@ -281,19 +309,27 @@ impl<'a> SessionGuard<'a> {
         executor: &mut Executor,
         attachments: &mut AttachmentPoints,
     ) {
-        while let Some((request, params)) = self.next_queued_job() {
+        while let Some(QueuedJob {
+            job: request,
+            params,
+            replayed,
+        }) = self.next_queued_job()
+        {
             let (tx_attachment, rx_attachment) = watch::channel(None);
             let job_id = request.payload().job_id().to_owned();
-            if request.payload().runs_on(own_baseboard, cubbies)
-                && history
+            if request.payload().runs_on(own_baseboard, cubbies) {
+                if replayed {
+                    warn!(log, "not executing replayed job"; "job_id" => %job_id);
+                } else if history
                     .get_job_status(&job_id)
                     .map(|status| {
                         matches!(status.get(own_baseboard), Some(JobStatus::Queued { .. }))
                     })
                     .unwrap_or(true)
-            {
-                executor.job_start(certs, request.clone(), params, tx_attachment);
-                attachments.insert(job_id, rx_attachment);
+                {
+                    executor.job_start(certs, request.clone(), params, tx_attachment);
+                    attachments.insert(job_id, rx_attachment);
+                }
             }
             self.job_started(request);
         }
@@ -325,6 +361,14 @@ pub struct State {
     roots: Box<[KeyId]>,
     /// Baseboards by cubby number, as much of it as is known.
     cubbies: Cubbies,
+    /// The causal frontier we joined this universe at, if we joined
+    /// rather than seeded it.
+    join_frontier: Option<Version>,
+    /// Jobs whose start event on our own baseboard arrived as replayed
+    /// history. A previous life started them, and no executor of ours
+    /// will ever stop them. A terminal event clears its job, so
+    /// mid-replay entries are only suspects.
+    zombies: BTreeSet<JobId>,
     /// Message versions from newer builds, each warned about once.
     unknown_versions: BTreeSet<String>,
     /// Build provenance by sled.
@@ -343,6 +387,7 @@ impl State {
         own_baseboard: BaseboardId,
         root_certs: &[Certificate],
         session_sush_nonce: Arc<Mutex<SessionSushNonce>>,
+        join_frontier: Option<Version>,
     ) -> Result<Self, KeyError> {
         let certs = root_certs
             .iter()
@@ -369,6 +414,8 @@ impl State {
             unknown_versions: Default::default(),
             identities: LruCache::new(MAX_REGISTERED_IDENTITIES),
             revoked_keys: LruCache::new(MAX_REVOKED_KEYS),
+            join_frontier,
+            zombies: Default::default(),
         };
         new.validate_certs(&roots);
         for root in &roots {
@@ -403,6 +450,36 @@ impl State {
 
     pub fn history(&self) -> &JobHistory {
         &self.history
+    }
+
+    /// Jobs running on our own baseboard, according to our history.
+    pub fn own_running_jobs(&self) -> BTreeSet<JobId> {
+        self.running
+            .keys()
+            .filter(|(_, baseboard)| *baseboard == self.own_baseboard)
+            .map(|(job_id, _)| *job_id)
+            .collect()
+    }
+
+    /// Jobs a previous life of this server started and left running.
+    pub fn zombies(&self) -> BTreeSet<JobId> {
+        self.zombies
+            .iter()
+            .filter(|job_id| {
+                self.running
+                    .contains_key(&(**job_id, self.own_baseboard.clone()))
+            })
+            .copied()
+            .collect()
+    }
+
+    /// Whether a message at `version` is live traffic rather than
+    /// replayed history. Only strict causal descendants of the join
+    /// frontier are live.
+    fn is_live(&self, version: &Version) -> bool {
+        self.join_frontier
+            .as_ref()
+            .is_none_or(|frontier| version > frontier)
     }
 
     pub fn get_job_status(&self, job_id: &JobId) -> Option<&JobStatusMap> {
@@ -642,6 +719,7 @@ impl State {
                         }
                     }
                     (actor, SessionRequest::Skip(session_id, job_id)) => {
+                        let replayed = !self.is_live(incoming_version);
                         if let Some(mut session) = self.session.active_session()
                             && session.session_id() == *session_id
                         {
@@ -661,8 +739,10 @@ impl State {
                                     &self.own_baseboard,
                                     &mut self.history,
                                     &self.running,
+                                    replayed,
                                 );
                                 session.execute_ready_jobs(
+                                    log,
                                     &self.own_baseboard,
                                     &self.cubbies,
                                     &mut self.certs,
@@ -714,6 +794,7 @@ impl State {
                         // Refused jobs targeting this sled record an error
                         // status so the submitter learns their fate.
                         let session_id = signed.payload().session_id();
+                        let live = self.is_live(incoming_version);
                         match self.session.active_session() {
                             Some(mut session) if session.session_id() == session_id => {
                                 session.enqueue_job(
@@ -725,8 +806,10 @@ impl State {
                                     signed.clone(),
                                     params.clone(),
                                     actor,
+                                    !live,
                                 );
                                 session.execute_ready_jobs(
+                                    log,
                                     &self.own_baseboard,
                                     &self.cubbies,
                                     &mut self.certs,
@@ -743,7 +826,8 @@ impl State {
                                     "session_id" => %session_id,
                                     "actor" => %actor,
                                 );
-                                if signed.payload().runs_on(&self.own_baseboard, &self.cubbies)
+                                if live
+                                    && signed.payload().runs_on(&self.own_baseboard, &self.cubbies)
                                     && !self.history.contains(&job_id)
                                 {
                                     executor.job_refused(
@@ -758,6 +842,7 @@ impl State {
                     }
                     (actor, JobRequest::Stop(job_id)) => {
                         executor.job_stop(job_id);
+                        let replayed = !self.is_live(incoming_version);
                         if let Some(mut session) = self.session.active_session() {
                             session.cancel_job(
                                 job_id,
@@ -765,6 +850,7 @@ impl State {
                                 &self.own_baseboard,
                                 &mut self.history,
                                 &self.running,
+                                replayed,
                             );
                         }
                     }
@@ -817,6 +903,11 @@ impl State {
                     JobEvent::Start(job_id, when) => {
                         info!(log, "job started"; "job_id" => %job_id, "when" => %when);
                         self.running.insert((*job_id, baseboard_id.clone()), *when);
+                        // A replayed start on our own baseboard is a
+                        // previous life's. Only these can be zombies.
+                        if *baseboard_id == self.own_baseboard && !self.is_live(incoming_version) {
+                            self.zombies.insert(*job_id);
+                        }
                         self.history.set_job_status(
                             job_id,
                             baseboard_id,
@@ -833,6 +924,7 @@ impl State {
                         info!(log, "job stopped"; "job_id" => %job_id, "when" => %when, "result" => ?result);
                         if baseboard_id == &self.own_baseboard {
                             self.attachments.remove(job_id);
+                            self.zombies.remove(job_id);
                         }
                         self.running.remove(&(*job_id, baseboard_id.clone()));
                         self.history.transition_job_status(
@@ -849,6 +941,21 @@ impl State {
                                         output: output.clone(),
                                     })
                                 }
+                                // An interrupted declaration raced this
+                                // genuine stop. The real result wins in
+                                // either arrival order, though the start
+                                // time died with the previous life.
+                                Some(JobStatus::Error {
+                                    error: ProcessError::Interrupted,
+                                    time_error,
+                                    ..
+                                }) => Some(JobStatus::Stopped {
+                                    job_id: *job_id,
+                                    time_started: *time_error,
+                                    time_stopped: *when,
+                                    result: result.clone(),
+                                    output: output.clone(),
+                                }),
                                 _ => None,
                             },
                             self.session.queued_jobs(),
@@ -862,17 +969,27 @@ impl State {
                         error!(log, "job error"; "job_id" => %job_id, "when" => %when, "error" => %error);
                         if baseboard_id == &self.own_baseboard {
                             self.attachments.remove(job_id);
+                            self.zombies.remove(job_id);
                         }
                         self.running.remove(&(*job_id, baseboard_id.clone()));
-                        self.history.set_job_status(
+                        self.history.transition_job_status(
                             job_id,
                             baseboard_id,
-                            JobStatus::Error {
-                                job_id: *job_id,
-                                time_error: *when,
-                                error: error.clone(),
-                            },
                             Some(incoming_version.rank()),
+                            // An error never displaces a terminal
+                            // status, so a stop that raced an
+                            // interrupted declaration keeps the real
+                            // result.
+                            |old_status| match old_status {
+                                None
+                                | Some(JobStatus::Queued { .. })
+                                | Some(JobStatus::Started { .. }) => Some(JobStatus::Error {
+                                    job_id: *job_id,
+                                    time_error: *when,
+                                    error: error.clone(),
+                                }),
+                                _ => None,
+                            },
                             self.session.queued_jobs(),
                             &self.running,
                         );
@@ -904,14 +1021,121 @@ impl State {
     }
 }
 
+/// Apply one gossip message to the state, reporting update errors back
+/// onto the network.
+///
+/// We unconditionally mark the watch sender as modified even though it
+/// might not be, because *most* of the messages cause *some* modification
+/// of the state, and we would rather be safe against future code changes
+/// than manually tracking precisely which messages *don't* modify state.
+/// The cost is a few spurious wakeups.
+fn apply_message(
+    log: &Logger,
+    tx_state: &watch::Sender<State>,
+    executor: &mut Executor,
+    rumors: Option<&GossipNetwork>,
+    own_baseboard: &BaseboardId,
+    version: &Version,
+    message: &Arc<VersionedMessage>,
+) {
+    tx_state.send_modify(|state| {
+        if let Err(error) = state.update(log, executor, version, message) {
+            error!(log, "state update failed"; "error" => ?error);
+            // Re-gossiping a replayed message's error would grow the
+            // set a little more on every rejoin by every sled.
+            if state.is_live(version)
+                && let Some(rumors) = rumors
+            {
+                debug!(log, "sending error to gossip network"; "error" => ?error);
+                rumors.send(Message::Event(own_baseboard.clone(), Event::Error(error)).into());
+            }
+        }
+    });
+}
+
+/// Apply every message already delivered locally, without waiting for
+/// more. Afterwards the local set is quiescent.
+fn drain_ready(
+    log: &Logger,
+    causal_messages: &mut CausalMessages<VersionedMessage>,
+    tx_state: &watch::Sender<State>,
+    executor: &mut Executor,
+    rumors: Option<&GossipNetwork>,
+    own_baseboard: &BaseboardId,
+) {
+    while let Some(Some((version, message))) = causal_messages.next().now_or_never() {
+        apply_message(
+            log,
+            tx_state,
+            executor,
+            rumors,
+            own_baseboard,
+            &version,
+            &message,
+        );
+    }
+}
+
+/// Declare interrupted every job a previous life left running,
+/// excluding `survivors` (jobs this incarnation carried across a
+/// universe swap) and jobs already reaped. Zombies come only from
+/// replayed start events, so a job this incarnation started is never
+/// a candidate. Reap only at local quiescence (after
+/// [`drain_ready`]), when a zombie whose terminal event is already
+/// here has been cleared.
+fn reap_zombies(
+    log: &Logger,
+    tx_state: &watch::Sender<State>,
+    rumors: Option<&GossipNetwork>,
+    own_baseboard: &BaseboardId,
+    survivors: &BTreeSet<JobId>,
+    reaped: &mut BTreeSet<JobId>,
+) {
+    let mut zombies = tx_state.borrow().zombies();
+    zombies.retain(|job_id| !survivors.contains(job_id) && !reaped.contains(job_id));
+    for job_id in zombies {
+        reaped.insert(job_id);
+        if let Some(rumors) = rumors {
+            rumors.send(
+                Message::Event(
+                    own_baseboard.clone(),
+                    Event::Job(JobEvent::Error(
+                        job_id,
+                        Utc::now(),
+                        ProcessError::Interrupted,
+                    )),
+                )
+                .into(),
+            );
+        }
+        warn!(log, "interrupted job from a previous life"; "job_id" => %job_id);
+    }
+}
+
 /// Create a fresh gossip network with this server as its only peer.
 ///
 /// A peer that seeds its own network has no one to gossip with, so jobs run
 /// only on the server that accepted them, and no server learns about any other
 /// server's sessions. This stands in for joining the rack's network over
 /// sprockets on the bootstrap network.
-pub fn seed_gossip() -> GossipNetwork {
-    Peer::seed().into_rumors()
+///
+/// A pristine seed's bookmark touches no storage, and identities
+/// recorded there are reclaimed only after a migration returns us to
+/// their universe. Bad storage would abort every session at the
+/// persist gate, before the seed could even learn to migrate. Probe
+/// first and shed on failure.
+pub async fn seed_gossip(bookmarks: &BookmarkSource) -> GossipNetwork {
+    let handle = match bookmarks.probe().await {
+        Ok(()) => bookmarks.next_handle(),
+        Err(_) => bookmarks.shed_handle(),
+    };
+    match Peer::seed().bookmark(handle).await {
+        Ok(peer) => peer.into_rumors(),
+        Err(unbookmarked) => match unbookmarked.peer.bookmark(bookmarks.shed_handle()).await {
+            Ok(peer) => peer.into_rumors(),
+            Err(_) => unreachable!("a shed bookmark never touches storage"),
+        },
+    }
 }
 
 #[derive(Debug)]
@@ -938,7 +1162,7 @@ impl StateManager {
         own_baseboard: BaseboardId,
         mut requests: R,
         mut cubbies: watch::Receiver<Cubbies>,
-        universe: watch::Receiver<GossipNetwork>,
+        mut universe: watch::Receiver<GossipUniverse>,
         roots: &[Certificate],
         session_sush_nonce: Arc<Mutex<SessionSushNonce>>,
         shutdown: CancellationToken,
@@ -946,21 +1170,30 @@ impl StateManager {
     where
         R: Stream<Item = Request> + Send + Unpin + 'static,
     {
-        // We report our current state through a watch channel.
-        let mut initial_state =
-            State::new(own_baseboard.clone(), roots, session_sush_nonce.clone())?;
-        initial_state.cubbies = cubbies.borrow_and_update().clone();
-        let (tx_state, rx_state) = watch::channel(initial_state);
-        let roots = roots.to_vec();
-
         // We process messages in causal order, so that we can rely on
         // things like "the session stop happens after its corresponding
         // session start". This costs a little extra in-memory bookkeeping
         // and computation, but makes it much easier to ensure that our
         // state machine is correct, because it now only has to be correct
         // in the face of arbitrary *causal* reorderings.
-        let initial = universe.borrow().clone();
+        // `borrow_and_update` marks the value seen, so a migration
+        // that landed before we subscribed does not replay as a swap.
+        let Universe {
+            rumors: initial,
+            frontier,
+        } = universe.borrow_and_update().clone();
         let mut causal_messages = initial.causal_messages();
+
+        // We report our current state through a watch channel.
+        let mut initial_state = State::new(
+            own_baseboard.clone(),
+            roots,
+            session_sush_nonce.clone(),
+            frontier.clone(),
+        )?;
+        initial_state.cubbies = cubbies.borrow_and_update().clone();
+        let (tx_state, rx_state) = watch::channel(initial_state);
+        let roots = roots.to_vec();
 
         // The executor needs to have access to send messages back.
         let (mut executor, mut events) = Executor::new(
@@ -980,6 +1213,15 @@ impl StateManager {
             rx_state,
             spawn(async move {
                 info!(log, "managing state");
+
+                // Replay bookkeeping. `frontier` classifies incoming
+                // messages (at or concurrent with it means replayed
+                // history); `survivors` are jobs this incarnation itself
+                // runs across a universe swap; `reaped` are zombies
+                // already declared interrupted.
+                let mut frontier = frontier;
+                let mut survivors: BTreeSet<JobId> = BTreeSet::new();
+                let mut reaped: BTreeSet<JobId> = BTreeSet::new();
 
                 // Announce our build.
                 if let Some((rumors, _)) = &gossip {
@@ -1051,21 +1293,36 @@ impl StateManager {
                                 break;
                             }
                             Some((version, message)) => {
-                                // We unconditionally mark the watch sender as modified
-                                // even though it might not be, because *most* of the
-                                // messages cause *some* modification of the state, and we
-                                // would rather be safe against future code changes than
-                                // manually tracking precisely which messages *don't* modify
-                                // state. The cost is a few spurious wakeups.
-                                tx_state.send_modify(|state| {
-                                    if let Err(error) = state.update(&log, &mut executor, &version, &message) {
-                                        error!(log, "state update failed"; "error" => ?error);
-                                        if let Some((rumors, _)) = &gossip {
-                                            debug!(log, "sending error to gossip network"; "error" => ?error);
-                                            rumors.send(Message::Event(own_baseboard.clone(), Event::Error(error)).into());
-                                        }
-                                    }
-                                });
+                                // Past the join frontier means the message is live.
+                                let live = frontier.as_ref().is_none_or(|f| version > f);
+                                apply_message(
+                                    &log,
+                                    &tx_state,
+                                    &mut executor,
+                                    gossip.as_ref().map(|(rumors, _)| rumors),
+                                    &own_baseboard,
+                                    &version,
+                                    &message,
+                                );
+                                // Replayed traffic can reveal zombies.
+                                if !live {
+                                    drain_ready(
+                                        &log,
+                                        &mut causal_messages,
+                                        &tx_state,
+                                        &mut executor,
+                                        gossip.as_ref().map(|(rumors, _)| rumors),
+                                        &own_baseboard,
+                                    );
+                                    reap_zombies(
+                                        &log,
+                                        &tx_state,
+                                        gossip.as_ref().map(|(rumors, _)| rumors),
+                                        &own_baseboard,
+                                        &survivors,
+                                        &mut reaped,
+                                    );
+                                }
                             },
                         },
 
@@ -1095,25 +1352,50 @@ impl StateManager {
                         let (rumors, universe) =
                             gossip.as_mut().expect("gossip present when it changes");
                         let fresh = universe.borrow_and_update().clone();
-                        info!(log, "gossip universe changed, resetting state"; "network" => %fresh.network());
-                        causal_messages = fresh.causal_messages();
+                        info!(log, "gossip universe changed, resetting state"; "network" => %fresh.rumors.network());
+                        causal_messages = fresh.rumors.causal_messages();
+                        // A reaped zombie may still show as running (its
+                        // error event races the swap); it is no survivor.
+                        survivors = tx_state.borrow().own_running_jobs();
+                        survivors.retain(|job_id| !reaped.contains(job_id));
+                        reaped = BTreeSet::new();
+                        frontier = fresh.frontier.clone();
                         // TODO: re-inject local job state (policy pending).
                         tx_state.send_modify(|state| {
                             *state = State::new(
                                 own_baseboard.clone(),
                                 &roots,
                                 state.session_sush_nonce.clone(),
+                                fresh.frontier.clone(),
                             )
                             .expect("roots validated at startup");
                             state.cubbies = cubbies.borrow().clone();
                         });
-                        *rumors = fresh;
+                        *rumors = fresh.rumors;
                         rumors.send(
                             Message::Event(
                                 own_baseboard.clone(),
                                 Event::Version(VersionInfo::current()),
                             )
                             .into(),
+                        );
+                        // The set received at join is already local:
+                        // drain it, then reap.
+                        drain_ready(
+                            &log,
+                            &mut causal_messages,
+                            &tx_state,
+                            &mut executor,
+                            Some(&*rumors),
+                            &own_baseboard,
+                        );
+                        reap_zombies(
+                            &log,
+                            &tx_state,
+                            Some(&*rumors),
+                            &own_baseboard,
+                            &survivors,
+                            &mut reaped,
                         );
                     }
                 }

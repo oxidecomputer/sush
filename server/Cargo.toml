@@ -16,6 +16,7 @@ embedded = []
 test-support = []
 
 [dependencies]
+atomicwrites.workspace = true
 bytes.workspace = true
 camino.workspace = true
 bytesize.workspace = true

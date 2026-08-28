@@ -872,8 +872,27 @@ async fn authenticate<E>(
     if let Some(via) = via {
         request = request.via(via.to_string());
     }
-    let identity = request.send().await?.into_inner();
+    let identity = match request.send().await {
+        Ok(identity) => identity.into_inner(),
+        Err(error) if error.status() == Some(StatusCode::UNAUTHORIZED) => {
+            let server = client.version().send().await.ok().map(|v| v.into_inner());
+            return Err(login_refused(server, error.into()));
+        }
+        Err(error) => return Err(error.into()),
+    };
     Ok((identity, Authz::new(credentials, key)))
+}
+
+/// A refused login usually indicates build skew rather than a bad key.
+/// Blame the builds when they differ, otherwise return the server error.
+fn login_refused(server: Option<VersionInfo>, error: CommandError) -> CommandError {
+    let client = VersionInfo::current();
+    match server {
+        Some(server) if server.commit != client.commit => {
+            CommandError::AuthnBuildMismatch { client, server }
+        }
+        _ => error,
+    }
 }
 
 /// Make a request as someone who is logged in, logging in if needed.
@@ -2357,6 +2376,15 @@ pub enum CommandError {
     AmbiguousSerial(String),
     #[error("❌ Authentication error")]
     Authn(#[from] AuthnError),
+    #[error(
+        "❌ Authentication failed, client and server are different builds\n   \
+            Client: {client}\n   \
+            Server: {server}"
+    )]
+    AuthnBuildMismatch {
+        client: VersionInfo,
+        server: VersionInfo,
+    },
     #[error("❌ Canceled")]
     Canceled,
     #[error("❌ Certificate for `{0}` is outside its validity window")]
@@ -2552,5 +2580,31 @@ impl From<ClientError<Upgraded>> for CommandError {
             Some(status) => Self::Client(status.to_string()),
             None => Self::Client(error.to_string()),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn login_refused_blames_build_skew() {
+        let refused = || CommandError::Client(String::from("Authentication required, try `iam`"));
+        let skewed = VersionInfo {
+            version: String::from("0.1.0"),
+            commit: String::from("not-this-build"),
+        };
+        assert!(matches!(
+            login_refused(Some(skewed), refused()),
+            CommandError::AuthnBuildMismatch { .. }
+        ));
+        assert!(matches!(
+            login_refused(Some(VersionInfo::current()), refused()),
+            CommandError::Client(_)
+        ));
+        assert!(matches!(
+            login_refused(None, refused()),
+            CommandError::Client(_)
+        ));
     }
 }

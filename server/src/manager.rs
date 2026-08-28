@@ -43,7 +43,7 @@ use crate::executor::PathIsolation;
 use crate::job::SocketSender;
 use crate::messages::v0::{CertRequest, IdentityRequest, JobRequest, Request, SessionRequest};
 use crate::output::{JobOutputDir, JobOutputFileStream};
-use crate::state::{GossipNetwork, MAX_CERTS, State, StateManager};
+use crate::state::{GossipUniverse, MAX_CERTS, State, StateManager};
 
 /// Maximum number of cached identities.
 const MAX_CACHED_IDENTITIES: NonZeroUsize = NonZeroUsize::new(1_000).unwrap();
@@ -103,7 +103,7 @@ impl JobManager {
         output_dir: JobOutputDir,
         own_baseboard: BaseboardId,
         cubbies: watch::Receiver<Cubbies>,
-        universe: watch::Receiver<GossipNetwork>,
+        universe: watch::Receiver<GossipUniverse>,
         roots: &[impl AsRef<Path>],
         shutdown: CancellationToken,
     ) -> Result<Self, JobError> {
@@ -128,7 +128,7 @@ impl JobManager {
         output_dir: JobOutputDir,
         own_baseboard: BaseboardId,
         cubbies: watch::Receiver<Cubbies>,
-        universe: watch::Receiver<GossipNetwork>,
+        universe: watch::Receiver<GossipUniverse>,
         roots: &[Certificate],
         shutdown: CancellationToken,
     ) -> Result<Self, JobError> {
