@@ -22,7 +22,7 @@ use sush_common::jobs::{
     JobId, JobOutputState, JobStatus, ProcessError, Session, SessionId, SessionSignerNonce,
 };
 use sush_common::keys::pem_cert_chain;
-use sush_common::targets::Cubbies;
+use sush_common::targets::{Cubbies, SledHealth};
 use sush_common::version::VersionInfo;
 use sush_server::bookmark::BookmarkSource;
 use sush_server::executor::PathIsolation;
@@ -33,8 +33,8 @@ use sush_server::state::GossipUniverse;
 use sush_server::{JobManager, seed_gossip};
 
 use common::{
-    corpus, eventually, fake_identity, gossip_config, localhost, pki, sign_job, sprockets_config,
-    test_logger,
+    baseboard, corpus, eventually, fake_identity, gossip_config, localhost, pki, sign_job,
+    sprockets_config, test_logger,
 };
 
 struct Sled {
@@ -74,7 +74,7 @@ impl Sled {
         shutdown: &CancellationToken,
     ) -> Sled {
         let (peers, peers_rx) = watch::channel(BTreeSet::new());
-        let (addr, universe, _linked) = spawn_gossip(
+        let (addr, universe, linked) = spawn_gossip(
             log,
             gossip_config(),
             sprockets_config(dir, identity),
@@ -88,10 +88,9 @@ impl Sled {
         .await
         .unwrap();
         let output = TempDir::with_prefix("sush-out-").unwrap();
-        let baseboard = BaseboardId {
-            part_number: "sled".to_string(),
-            serial_number: identity.to_string(),
-        };
+        // The manager's baseboard must be the one sprockets attests,
+        // as it is on a sled, or the health join can never match.
+        let baseboard = baseboard(identity);
         let (_cubbies, cubbies) = watch::channel(Cubbies::new());
         let mgr = JobManager::new(
             log.clone(),
@@ -100,6 +99,7 @@ impl Sled {
             baseboard.clone(),
             cubbies,
             universe.clone(),
+            linked,
             std::slice::from_ref(root_pem),
             shutdown.clone(),
         )
@@ -140,14 +140,15 @@ async fn jobs_gossip_between_sleds() {
     })
     .await;
 
-    // Each sled learns the other's build.
-    eventually("versions gossip", 60, async || {
+    // Each sled learns the other's build, and sees it linked.
+    eventually("versions gossip", 120, async || {
         [&a, &b].iter().all(|sled| {
             let versions = sled.mgr.versions();
             [&a.baseboard, &b.baseboard].iter().all(|baseboard| {
                 versions.iter().any(|row| {
                     row.baseboard == **baseboard
                         && row.version.as_ref() == Some(&VersionInfo::current())
+                        && row.health == Some(SledHealth::Linked)
                 })
             })
         })
@@ -362,10 +363,7 @@ async fn interrupted_jobs_get_stopped() {
     let job_id: JobId = "abandon-abandon-abandon-abandon-abandon-abandon-abandon-ability"
         .parse()
         .unwrap();
-    let ghost = BaseboardId {
-        part_number: "sled".to_string(),
-        serial_number: "2".to_string(),
-    };
+    let ghost = baseboard(2);
     a.universe.borrow().rumors.clone().send(
         Message::Event(
             ghost.clone(),

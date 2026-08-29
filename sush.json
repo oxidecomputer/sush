@@ -1717,8 +1717,34 @@
           "signature"
         ]
       },
+      "SledHealth": {
+        "description": "One sled's gossip link health, as the answering sled sees it. A silent death can lag `Linked` at TCP's pace.",
+        "oneOf": [
+          {
+            "description": "Attested, holding a live gossip link.",
+            "type": "string",
+            "enum": [
+              "linked"
+            ]
+          },
+          {
+            "description": "Known by version or cubby, but no live link.",
+            "type": "string",
+            "enum": [
+              "unlinked"
+            ]
+          },
+          {
+            "description": "A state from a build newer than this one.",
+            "type": "string",
+            "enum": [
+              "unknown"
+            ]
+          }
+        ]
+      },
       "SledVersion": {
-        "description": "One sled's location and build.",
+        "description": "One sled's location, build, and health.",
         "type": "object",
         "properties": {
           "baseboard": {
@@ -1729,6 +1755,15 @@
             "type": "integer",
             "format": "uint8",
             "minimum": 0
+          },
+          "health": {
+            "nullable": true,
+            "default": null,
+            "allOf": [
+              {
+                "$ref": "#/components/schemas/SledHealth"
+              }
+            ]
           },
           "version": {
             "nullable": true,

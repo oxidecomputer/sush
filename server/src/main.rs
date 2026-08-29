@@ -22,7 +22,7 @@ use sush_api::sush_api_mod::api_description;
 use sush_common::targets::Cubbies;
 use sush_server::bookmark::BookmarkSource;
 use sush_server::executor::PathIsolation;
-use sush_server::gossip::isolated;
+use sush_server::gossip::{isolated, lonely};
 use sush_server::manager::JobManager;
 use sush_server::output::JobOutputDir;
 use sush_server::server::ApiServer;
@@ -111,6 +111,7 @@ async fn main() -> Result<(), String> {
         baseboard,
         cubbies,
         gossip,
+        lonely(),
         &roots,
         shutdown.clone(),
     )

@@ -1140,6 +1140,7 @@ mod rack {
                 version: "0.1.0".to_string(),
                 commit: "f078e863b17359031de072222bb631270f2d5157".to_string(),
             }),
+            health: None,
         }
     }
 

@@ -98,6 +98,12 @@ pub fn isolated<T>(seed: Rumors<T, SushBookmark>) -> watch::Receiver<Universe<T>
     rx
 }
 
+/// A linked set that is forever empty, to accompany [`isolated`].
+pub fn lonely() -> LinkedBaseboards {
+    let (_tx, rx) = watch::channel(BTreeSet::new());
+    rx
+}
+
 /// Whether the peer's universe dominates ours, by rumors' documented rule.
 fn remote_dominates(
     local_events: &Ticks,
