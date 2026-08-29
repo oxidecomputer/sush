@@ -74,7 +74,7 @@ impl Sled {
         shutdown: &CancellationToken,
     ) -> Sled {
         let (peers, peers_rx) = watch::channel(BTreeSet::new());
-        let (addr, universe) = spawn_gossip(
+        let (addr, universe, _linked) = spawn_gossip(
             log,
             gossip_config(),
             sprockets_config(dir, identity),

@@ -32,6 +32,7 @@ use futures::StreamExt as _;
 use rumors::{Error, Joined, Network, Peer, Rumors, Ticks, Version};
 use serde::Serialize;
 use serde::de::DeserializeOwned;
+use sled_hardware_types::BaseboardId;
 use slog::{Logger, debug, info, o, warn};
 use sprockets_tls::keys::SprocketsConfig;
 use tokio::sync::watch;
@@ -43,9 +44,12 @@ use tokio_util::sync::CancellationToken;
 use rumors::link::routed::Endpoint;
 
 use crate::bookmark::{BookmarkSource, SushBookmark};
-use crate::link::{CorpusSource, SprocketsDial, SprocketsLink, Transport};
+use crate::link::{AttestedBaseboards, CorpusSource, SprocketsDial, SprocketsLink, Transport};
 
-/// Manager timing. The defaults suit a rack; tests shrink them.
+/// The attested baseboards of our live gossip peers.
+pub type LinkedBaseboards = watch::Receiver<BTreeSet<BaseboardId>>;
+
+/// Manager timing. The defaults suit a rack, tests shrink them.
 #[derive(Clone, Debug)]
 pub struct GossipConfig {
     /// How often absent links are re-established.
@@ -110,9 +114,10 @@ fn remote_dominates(
 }
 
 /// Bind a sprockets transport on `listen_addr` and run a gossip manager
-/// over it until `shutdown`. Returns the address the listener bound and
-/// the channel following the current universe. A caller that cannot bind
-/// may fall back to [`isolated`].
+/// over it until `shutdown`. Returns the address the listener bound, the
+/// channel following the current universe, and the channel following the
+/// baseboards we hold live links to. A caller that cannot bind may fall
+/// back to [`isolated`].
 #[allow(clippy::too_many_arguments)]
 pub async fn spawn_gossip<T>(
     log: &Logger,
@@ -124,7 +129,7 @@ pub async fn spawn_gossip<T>(
     seed: Rumors<T, SushBookmark>,
     bookmarks: BookmarkSource,
     shutdown: CancellationToken,
-) -> io::Result<(SocketAddrV6, watch::Receiver<Universe<T>>)>
+) -> io::Result<(SocketAddrV6, watch::Receiver<Universe<T>>, LinkedBaseboards)>
 where
     T: DeserializeOwned + Serialize + Send + Sync + 'static,
 {
@@ -138,14 +143,15 @@ where
     )
     .await?;
     let bound = transport.bound();
-    let universe = spawn_gossip_manager(log, config, transport, peers, seed, bookmarks, shutdown);
-    Ok((bound, universe))
+    let (universe, linked) =
+        spawn_gossip_manager(log, config, transport, peers, seed, bookmarks, shutdown);
+    Ok((bound, universe, linked))
 }
 
 /// Run a gossip manager until `shutdown`. Establishes and serves links for
 /// the addresses on `peers`, drives gossip on every link, and resolves
-/// universe collisions. The returned channel follows the current universe,
-/// starting at `seed`.
+/// universe collisions. The returned channels follow the current universe,
+/// starting at `seed`, and the baseboards we hold live links to.
 #[allow(clippy::too_many_arguments)]
 pub fn spawn_gossip_manager<T>(
     log: &Logger,
@@ -155,20 +161,23 @@ pub fn spawn_gossip_manager<T>(
     seed: Rumors<T, SushBookmark>,
     bookmarks: BookmarkSource,
     shutdown: CancellationToken,
-) -> watch::Receiver<Universe<T>>
+) -> (watch::Receiver<Universe<T>>, LinkedBaseboards)
 where
     T: DeserializeOwned + Serialize + Send + Sync + 'static,
 {
     let (publish, subscribe) = watch::channel(Universe::genesis(seed.clone()));
+    let (linked, subscribe_linked) = watch::channel(BTreeSet::new());
     let manager = Manager {
         log: log.new(o!("component" => "gossip manager")),
         config,
         endpoint: transport.endpoint(),
+        attested: transport.baseboards().watch(),
         transport,
         peers,
         rumors: seed,
         bookmarks,
         publish,
+        linked,
         drivers: JoinSet::new(),
         live: HashMap::new(),
         dials: JoinSet::new(),
@@ -177,7 +186,7 @@ where
         shutdown,
     };
     spawn(manager.run());
-    subscribe
+    (subscribe, subscribe_linked)
 }
 
 /// A link establishment that finished, and the peer it was aimed at.
@@ -200,6 +209,8 @@ struct Manager<T> {
     rumors: Rumors<T, SushBookmark>,
     bookmarks: BookmarkSource,
     publish: watch::Sender<Universe<T>>,
+    attested: watch::Receiver<AttestedBaseboards>,
+    linked: watch::Sender<BTreeSet<BaseboardId>>,
     drivers: JoinSet<(SocketAddr, Stopped)>,
     live: HashMap<SocketAddr, AbortHandle>,
     dials: JoinSet<Established>,
@@ -224,6 +235,8 @@ where
                     self.prune();
                     self.link_absent();
                 }
+                // A late attestation names a link that is already live.
+                Ok(()) = self.attested.changed() => {}
                 Some((peer, link)) = self.transport.accept() => {
                     self.on_link(peer, link).await;
                 }
@@ -247,6 +260,25 @@ where
                     }
                 }
             }
+            self.publish_linked();
+        }
+    }
+
+    /// Publish the attested baseboards of the peers with live links.
+    fn publish_linked(&self) {
+        let attested = self.attested.borrow();
+        let linked: BTreeSet<BaseboardId> = self
+            .live
+            .keys()
+            .filter_map(|addr| attested.resolve(addr))
+            .collect();
+        if *self.linked.borrow() != linked {
+            debug!(
+                self.log, "linked baseboards changed";
+                "linked" => ?linked,
+                "live" => ?self.live.keys().collect::<Vec<_>>(),
+            );
+            self.linked.send_replace(linked);
         }
     }
 
@@ -301,7 +333,7 @@ where
         self.live.retain(cull);
         self.dialing.retain(cull);
         self.joins.retain(|peer| want.contains(peer));
-        self.transport.retain_pools(&self.peers.borrow());
+        self.transport.retain_peers(&self.peers.borrow());
     }
 
     /// Gossip on a fresh link, or use it to join a universe that beat ours.

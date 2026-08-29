@@ -16,16 +16,20 @@ use slog::Logger;
 use tokio::sync::watch;
 use tokio_util::sync::CancellationToken;
 
+use sush_common::jobs::BaseboardId;
 use sush_server::bookmark::{BookmarkSource, SushBookmark};
-use sush_server::gossip::{Universe, spawn_gossip};
+use sush_server::gossip::{LinkedBaseboards, Universe, spawn_gossip};
 
-use common::{corpus, eventually, gossip_config, localhost, pki, sprockets_config, test_logger};
+use common::{
+    baseboard, corpus, eventually, gossip_config, localhost, pki, sprockets_config, test_logger,
+};
 
 struct Node {
     addr: SocketAddrV6,
     initial: Network,
     peers: watch::Sender<BTreeSet<SocketAddrV6>>,
     universe: watch::Receiver<Universe<String>>,
+    linked: LinkedBaseboards,
     shutdown: CancellationToken,
 }
 
@@ -40,7 +44,7 @@ impl Node {
             .into_rumors();
         let initial = seed.network();
         let (peers, peers_rx) = watch::channel(BTreeSet::new());
-        let (addr, universe) = spawn_gossip(
+        let (addr, universe, linked) = spawn_gossip(
             log,
             gossip_config(),
             sprockets_config(dir, identity),
@@ -58,6 +62,7 @@ impl Node {
             initial,
             peers,
             universe,
+            linked,
             shutdown,
         }
     }
@@ -75,6 +80,10 @@ impl Node {
             .snapshot()
             .iter()
             .any(|(_, m)| m.as_str() == message)
+    }
+
+    fn linked(&self) -> BTreeSet<BaseboardId> {
+        self.linked.borrow().clone()
     }
 }
 
@@ -178,4 +187,24 @@ async fn node_replacement_reconverges() {
         nodes.iter().all(|n| n.contains("after the funeral"))
     })
     .await;
+}
+
+#[tokio::test]
+async fn linked_follows_live_links() {
+    let (_tmp, dir) = pki("sush-gossip-", 2);
+    let log = test_logger("linked_follows_live_links");
+    let a = Node::start(&log, &dir, 1).await;
+    let b = Node::start(&log, &dir, 2).await;
+    assert!(a.linked().is_empty());
+    mesh(&[&a, &b]);
+
+    // Both sides resolving proves the dialed and the accepted paths.
+    eventually("mutual attested links", 120, async || {
+        a.linked() == BTreeSet::from([baseboard(2)]) && b.linked() == BTreeSet::from([baseboard(1)])
+    })
+    .await;
+
+    b.shutdown.cancel();
+    drop(b);
+    eventually("dead peer unlinked", 120, async || a.linked().is_empty()).await;
 }
