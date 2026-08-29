@@ -29,7 +29,8 @@ use schemars::{JsonSchema, SchemaGenerator};
 use serde::{Deserialize, Serialize};
 use signature::Verifier;
 use ssh_key::{
-    Algorithm as SshAlgorithm, EcdsaCurve, Error as SshKeyError, Mpint, Signature as SshSignature,
+    Algorithm as SshAlgorithm, EcdsaCurve, Error as SshKeyError, HashAlg, Mpint,
+    Signature as SshSignature,
 };
 use thiserror::Error;
 use x509_cert::der::Encode as _;
@@ -128,6 +129,11 @@ impl SshPublicKey {
     pub fn is_sk_algorithm(&self) -> bool {
         use SshAlgorithm::*;
         matches!(self.algorithm(), SkEcdsaSha2NistP256 | SkEd25519)
+    }
+
+    /// The OpenSSH `SHA256:...` fingerprint.
+    pub fn fingerprint(&self) -> String {
+        self.0.fingerprint(HashAlg::Sha256).to_string()
     }
 
     pub fn verify(&self, message: &[u8], signature: &Signature) -> Result<(), KeyError> {

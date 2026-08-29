@@ -4,7 +4,8 @@
 
 //! Use Permission Slip to sign Support Shell job requests.
 
-use permslip_client_lib::login::{IdentityProvider, TokenProvider};
+use http::HeaderValue;
+use permslip_client_lib::login::TokenProvider;
 use permslip_client_lib::types::{CreateSushSessionBody, CreatedSushSession, Error as ApiError};
 use permslip_client_lib::{Client, ClientRequestBuilder, Error as ClientError};
 use sled_hardware_types::BaseboardId;
@@ -20,12 +21,32 @@ pub struct PermslipSigner {
     key_name: String,
 }
 
+/// Get a bearer token by the sshauth challenge, signed with the agent
+/// key named by `fingerprint`.
+pub async fn fresh_token(
+    url: &str,
+    agent_sock: String,
+    fingerprint: String,
+) -> Result<String, PermslipError> {
+    let tokens = TokenProvider::SshAuth {
+        fingerprint: Some(fingerprint),
+        server_url: url.to_owned(),
+        agent_sock,
+    };
+    let token = tokens.token().await.map_err(PermslipError::token)?;
+    let value = token.into_header_value().map_err(PermslipError::token)?;
+    value
+        .to_str()
+        .map(str::to_owned)
+        .map_err(PermslipError::token)
+}
+
 impl PermslipSigner {
-    pub async fn new<N: AsRef<str>>(key_name: N, url: &str) -> Result<Self, PermslipError> {
-        let tokens = TokenProvider::IdP(IdentityProvider::Google);
-        let mut builder = ClientRequestBuilder::new();
-        let token = tokens.token().await.map_err(PermslipError::token)?;
-        builder = builder.token(token.into_header_value().map_err(PermslipError::token)?);
+    /// A signer authenticated with `token`.
+    pub fn new<N: AsRef<str>>(key_name: N, url: &str, token: &str) -> Result<Self, PermslipError> {
+        let mut token = HeaderValue::from_str(token).map_err(PermslipError::token)?;
+        token.set_sensitive(true);
+        let builder = ClientRequestBuilder::new().token(token);
         Ok(Self {
             client: Client::new_with_client(
                 url,

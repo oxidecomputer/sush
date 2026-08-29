@@ -17,7 +17,7 @@ use anstream::print;
 use anstyle::{AnsiColor, Style};
 use atomicwrites::{AtomicFile, OverwriteBehavior};
 use bytesize::ByteSize;
-use chrono::TimeDelta;
+use chrono::{DateTime, TimeDelta, Utc};
 use humantime::format_duration;
 use indicatif::{MultiProgress, ProgressBar, ProgressStyle};
 use rustix::io::ioctl_fionread;
@@ -43,14 +43,32 @@ use crate::context::{CommandContext, OutputFormat, StatusDisplayStyle};
 use crate::types::SessionStartNonce;
 
 pub(crate) const PREFIX: &str = "sush";
-const SESSION_FILE: &str = "session.json";
+const SESSION_FILE_NAME: &str = "session.json";
 const SESSION_FILE_VERSION: u32 = 1;
+const TOKEN_FILE_NAME: &str = "permslip-token.json";
+const TOKEN_FILE_VERSION: u32 = 1;
+
+/// How long a permslip token is trusted for reuse. Staying well
+/// under the server's 15 minute TTL spares a command from expiring
+/// mid-flight.
+const TOKEN_REUSE: TimeDelta = TimeDelta::minutes(10);
 
 /// The persisted session, versioned for future migrations.
 #[derive(Deserialize, Serialize)]
 struct SavedSession {
     version: u32,
     session: Session,
+}
+
+/// A persisted permslip token, versioned for future migrations. The
+/// url and fingerprint pin it to one signing server and one identity.
+#[derive(Deserialize, Serialize)]
+struct SavedToken {
+    version: u32,
+    url: String,
+    fingerprint: String,
+    token: String,
+    created: DateTime<Utc>,
 }
 
 #[derive(Clone, Debug, Default)]
@@ -61,6 +79,7 @@ pub struct Cli {
     watch: Arc<Mutex<Option<Watch>>>,
     session: Arc<Mutex<Option<Session>>>,
     session_file: Option<PathBuf>,
+    token_file: Option<PathBuf>,
     credentials: AuthzSigner,
 }
 
@@ -69,7 +88,7 @@ impl Cli {
     /// Without persistence, every one-shot command would need a fresh
     /// `session attach`.
     pub fn load_session(&mut self) {
-        let path = match BaseDirectories::with_prefix(PREFIX).place_state_file(SESSION_FILE) {
+        let path = match BaseDirectories::with_prefix(PREFIX).place_state_file(SESSION_FILE_NAME) {
             Ok(path) => path,
             Err(error) => {
                 eprintln!("⚠️ The session will not persist: {error}");
@@ -91,6 +110,10 @@ impl Cli {
             Err(error) => eprintln!("⚠️ Ignoring the saved session: {error}"),
         }
         self.session_file = Some(path);
+        match BaseDirectories::with_prefix(PREFIX).place_state_file(TOKEN_FILE_NAME) {
+            Ok(path) => self.token_file = Some(path),
+            Err(error) => eprintln!("⚠️ Signing tokens will not persist: {error}"),
+        }
     }
 
     /// Adopt `session` unless one with the same ID is already
@@ -119,18 +142,7 @@ impl Cli {
                 session: session.clone(),
             })
             .map_err(io::Error::other)
-            .and_then(|json| {
-                AtomicFile::new(path, OverwriteBehavior::AllowOverwrite)
-                    .write(|file| {
-                        file.set_permissions(Permissions::from_mode(0o600))?;
-                        file.write_all(&json)
-                    })
-                    .map_err(|error| match error {
-                        atomicwrites::Error::Internal(error) | atomicwrites::Error::User(error) => {
-                            error
-                        }
-                    })
-            }),
+            .and_then(|json| write_private(path, &json)),
             None => match fs::remove_file(path) {
                 Err(error) if error.kind() != ErrorKind::NotFound => Err(error),
                 _ => Ok(()),
@@ -140,6 +152,18 @@ impl Cli {
             eprintln!("⚠️ The session was not saved: {error}");
         }
     }
+}
+
+/// Atomically write a file only the user may read.
+fn write_private(path: &Path, bytes: &[u8]) -> io::Result<()> {
+    AtomicFile::new(path, OverwriteBehavior::AllowOverwrite)
+        .write(|file| {
+            file.set_permissions(Permissions::from_mode(0o600))?;
+            file.write_all(bytes)
+        })
+        .map_err(|error| match error {
+            atomicwrites::Error::Internal(error) | atomicwrites::Error::User(error) => error,
+        })
 }
 
 fn byte_size(len: u64) -> bytesize::Display {
@@ -245,6 +269,43 @@ impl CommandContext for Cli {
 
     fn authz_signer(&self) -> AuthzSigner {
         self.credentials.clone()
+    }
+
+    fn permslip_token(&self, url: &str, fingerprint: &str) -> Option<String> {
+        let json = fs::read(self.token_file.as_ref()?).ok()?;
+        match serde_json::from_slice::<SavedToken>(&json) {
+            Ok(SavedToken {
+                version: TOKEN_FILE_VERSION,
+                url: saved_url,
+                fingerprint: saved_fingerprint,
+                token,
+                created,
+            }) if saved_url == url
+                && saved_fingerprint == fingerprint
+                && Utc::now() - created < TOKEN_REUSE =>
+            {
+                Some(token)
+            }
+            _ => None,
+        }
+    }
+
+    fn save_permslip_token(&self, url: &str, fingerprint: &str, token: &str) {
+        let Some(path) = &self.token_file else {
+            return;
+        };
+        let result = serde_json::to_vec_pretty(&SavedToken {
+            version: TOKEN_FILE_VERSION,
+            url: url.to_owned(),
+            fingerprint: fingerprint.to_owned(),
+            token: token.to_owned(),
+            created: Utc::now(),
+        })
+        .map_err(io::Error::other)
+        .and_then(|json| write_private(path, &json));
+        if let Err(error) = result {
+            eprintln!("⚠️ The token was not saved: {error}");
+        }
     }
 
     fn session_id(&self) -> Option<SessionId> {
@@ -866,7 +927,7 @@ impl CommandContext for Cli {
                     time_authenticated,
                     time_revoked,
                 } = identity;
-                let fingerprint = public_key.fingerprint(Default::default()).to_string();
+                let fingerprint = public_key.fingerprint();
                 let algorithm = public_key.algorithm();
                 let comment = public_key.comment();
                 println!(
@@ -895,7 +956,7 @@ impl CommandContext for Cli {
         } else {
             for key in keys {
                 let key_id = key.key_id()?;
-                let fingerprint = key.fingerprint(Default::default()).to_string();
+                let fingerprint = key.fingerprint();
                 let algorithm = key.algorithm();
                 let comment = key.comment();
                 match self.get_output_format() {

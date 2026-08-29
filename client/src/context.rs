@@ -114,6 +114,13 @@ pub trait CommandContext: Clone + Send + Sync {
     fn set_credentials(&mut self, credentials: Option<Authz>) {
         self.authz_signer().set(credentials)
     }
+    /// The cached permslip token for `url` and the key `fingerprint`
+    /// names, if it is still fresh. The default caches nothing.
+    fn permslip_token(&self, _url: &str, _fingerprint: &str) -> Option<String> {
+        None
+    }
+    /// Remember a permslip token for reuse.
+    fn save_permslip_token(&self, _url: &str, _fingerprint: &str, _token: &str) {}
     fn session_id(&self) -> Option<SessionId>;
     fn next_job_id(&self) -> Result<JobId, CommandError>;
     fn session_start_params(&self, baseboard_id: BaseboardId, nonce: SessionStartNonce);
