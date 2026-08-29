@@ -1151,22 +1151,25 @@ async fn session(
             },
             Some(client),
         ) => {
-            let (session_id, nonce) = if let (Some(session_id), Some(nonce)) = (session_id, nonce) {
-                (session_id, nonce)
-            } else {
-                let (baseboard_id, nonce) = with_login(ctx, client, async || {
-                    Ok((
-                        client.target().send().await?.into_inner(),
-                        client.session_start_nonce().send().await?.into_inner(),
-                    ))
-                })
-                .await?;
-                let (session_id, nonce) =
-                    session_create(permslip, permslip_url, &baseboard_id, nonce.nonce).await?;
-                ctx.session_created(Session::new(session_id), nonce);
-                (session_id, nonce)
-            };
-            session_start(ctx, client, session_id, nonce, wait).await
+            // Creation already announces the session; don't echo it
+            // when the start succeeds.
+            let (session_id, nonce, show) =
+                if let (Some(session_id), Some(nonce)) = (session_id, nonce) {
+                    (session_id, nonce, true)
+                } else {
+                    let (baseboard_id, nonce) = with_login(ctx, client, async || {
+                        Ok((
+                            client.target().send().await?.into_inner(),
+                            client.session_start_nonce().send().await?.into_inner(),
+                        ))
+                    })
+                    .await?;
+                    let (session_id, nonce) =
+                        session_create(permslip, permslip_url, &baseboard_id, nonce.nonce).await?;
+                    ctx.session_created(Session::new(session_id), nonce);
+                    (session_id, nonce, false)
+                };
+            session_start(ctx, client, session_id, nonce, wait, show).await
         }
 
         #[cfg(feature = "permslip")]
@@ -1199,7 +1202,7 @@ async fn session(
             } else {
                 return Err(CommandError::SigningUnavailable);
             };
-            session_start(ctx, client, session_id, nonce, wait).await
+            session_start(ctx, client, session_id, nonce, wait, true).await
         }
 
         (SessionCommand::Allow { key_id, write }, Some(client)) => {
@@ -1758,6 +1761,7 @@ async fn session_start(
     session_id: SessionId,
     signer_nonce: SessionSignerNonce,
     wait: bool,
+    show: bool,
 ) -> Result<(), CommandError> {
     let session = Session::new(session_id);
     with_login(ctx, client, async || {
@@ -1771,7 +1775,9 @@ async fn session_start(
     })
     .await?
     .into_inner();
-    ctx.session_started(session, true);
+    if show {
+        ctx.session_started(session, true);
+    }
     Ok(())
 }
 
