@@ -14,6 +14,7 @@
 
 use std::fs::read;
 use std::io;
+use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
@@ -72,9 +73,9 @@ pub enum TunnelError {
 struct Target {
     host: String,
     port: u16,
+    resolve: Option<SocketAddr>,
     uri: Uri,
     token: String,
-    /// None speaks plain websockets, for tests and dev Nexus.
     tls: Option<TlsConnector>,
 }
 
@@ -100,8 +101,9 @@ impl Tunnel {
         rack_id: &str,
         token: &str,
         roots: &[PathBuf],
+        resolve: Option<SocketAddr>,
     ) -> Result<Tunnel, TunnelError> {
-        let target = Arc::new(target(nexus, rack_id, token, roots)?);
+        let target = Arc::new(target(nexus, rack_id, token, roots, resolve)?);
 
         // A dead path should fail the command now, not as a
         // connection reset from the listener later.
@@ -142,6 +144,7 @@ fn target(
     rack_id: &str,
     token: &str,
     roots: &[PathBuf],
+    resolve: Option<SocketAddr>,
 ) -> Result<Target, TunnelError> {
     let invalid = |reason| TunnelError::NexusUrl {
         url: nexus.to_string(),
@@ -211,6 +214,7 @@ fn target(
     Ok(Target {
         host,
         port,
+        resolve,
         uri,
         token: token.to_string(),
         tls,
@@ -255,7 +259,12 @@ fn describe(error: WsError) -> String {
 
 /// Connect TCP toward Nexus, impatiently.
 async fn dial(target: &Target) -> Result<TcpStream, String> {
-    let connect = TcpStream::connect((target.host.as_str(), target.port));
+    let connect = async {
+        match target.resolve {
+            Some(addr) => TcpStream::connect(addr).await,
+            None => TcpStream::connect((target.host.as_str(), target.port)).await,
+        }
+    };
     match timeout(CONNECT_TIMEOUT, connect).await {
         Ok(Ok(tcp)) => {
             let _ = tcp.set_nodelay(true);

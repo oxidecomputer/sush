@@ -1236,7 +1236,7 @@ async fn client_tunnels_through_nexus() {
     });
 
     // The tunnel probes the path, then stands in for the proxy.
-    let tunnel = Tunnel::start(&format!("http://{stub_addr}"), RACK_ID, TOKEN, &[])
+    let tunnel = Tunnel::start(&format!("http://{stub_addr}"), RACK_ID, TOKEN, &[], None)
         .await
         .expect("can't start tunnel");
 
@@ -1264,4 +1264,32 @@ async fn client_tunnels_through_nexus() {
         .expect("can't authenticate")
         .into_inner();
     assert_eq!(iam, identity, "who am I?");
+
+    // A tunnel whose Nexus URL names an unresolvable host still works
+    // when --nexus-resolve supplies the address.
+    let resolved = Tunnel::start("http://nexus.invalid", RACK_ID, TOKEN, &[], Some(stub_addr))
+        .await
+        .expect("can't start resolved tunnel");
+    let signer = AuthzSigner::default();
+    let pem = read(cert_path(pki.clone(), &root_prefix())).unwrap();
+    let roots = vec![Certificate::from_pem(&pem).unwrap()];
+    let client = Client::new_with_client(
+        &resolved.url,
+        tls_client(roots, None).unwrap(),
+        signer.clone(),
+    );
+    let ClientError::ErrorResponse(unauthz) = client.iam().body(None).send().await.unwrap_err()
+    else {
+        panic!("expected error response")
+    };
+    let (identity, credentials) = authz(&client, unauthz, &mut root).await;
+    signer.set(Some(credentials));
+    let iam = client
+        .iam()
+        .body(None)
+        .send()
+        .await
+        .expect("can't authenticate via the resolved tunnel")
+        .into_inner();
+    assert_eq!(iam, identity, "who am I, resolved?");
 }

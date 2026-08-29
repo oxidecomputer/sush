@@ -10,6 +10,7 @@ use std::fs::{File, OpenOptions, read};
 #[cfg(feature = "permslip")]
 use std::io::ErrorKind;
 use std::io::{Read as _, Seek as _, SeekFrom, Write as _, stdin};
+use std::net::SocketAddr;
 use std::num::{NonZeroU8, NonZeroU64};
 use std::path::{Path, PathBuf};
 use std::pin::Pin;
@@ -84,6 +85,7 @@ pub const SUSH_MAX_FSIZE: &str = "SUSH_MAX_FSIZE";
 pub const SUSH_PERMSLIP_KEY: &str = "SUSH_PERMSLIP_KEY";
 pub const SUSH_OUTPUT_FORMAT: &str = "SUSH_OUTPUT_FORMAT";
 pub const SUSH_NEXUS: &str = "SUSH_NEXUS";
+pub const SUSH_NEXUS_RESOLVE: &str = "SUSH_NEXUS_RESOLVE";
 pub const SUSH_NEXUS_ROOT: &str = "SUSH_NEXUS_ROOT";
 pub const SUSH_NEXUS_TOKEN: &str = "SUSH_NEXUS_TOKEN";
 pub const SUSH_PROXY_ROOT: &str = "SUSH_PROXY_ROOT";
@@ -179,6 +181,13 @@ pub struct GlobalArgs {
     #[arg(long = "nexus-root", env = SUSH_NEXUS_ROOT, value_name = "PEM")]
     #[clap(global = true)]
     pub nexus_roots: Vec<PathBuf>,
+
+    /// Dial Nexus at this address instead of resolving its URL's
+    /// host, which still names the server for TLS (like curl
+    /// --resolve, for racks whose DNS is not yet populated)
+    #[arg(long, env = SUSH_NEXUS_RESOLVE, value_name = "IP:PORT")]
+    #[clap(global = true)]
+    pub nexus_resolve: Option<SocketAddr>,
 
     /// ID of the rack to tunnel to (try `oxide system hardware rack list`)
     #[arg(long, env = SUSH_RACK, value_name = "UUID")]
@@ -787,7 +796,9 @@ impl ClientCommand {
                     .nexus_token
                     .as_ref()
                     .ok_or(CommandError::MissingNexusToken)?;
-                let tunnel = Tunnel::start(nexus, rack, token, &args.nexus_roots).await?;
+                let tunnel =
+                    Tunnel::start(nexus, rack, token, &args.nexus_roots, args.nexus_resolve)
+                        .await?;
                 args.url = Some(tunnel.url.clone());
                 // The repl re-enters run per command; commands must
                 // reuse this tunnel, not build their own.

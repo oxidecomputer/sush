@@ -175,6 +175,7 @@ impl CommandContext for Repl {
             nexus: _,
             nexus_token: _,
             nexus_roots: _,
+            nexus_resolve: _,
             rack: _,
         } = args;
         if json {
