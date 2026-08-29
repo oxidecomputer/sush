@@ -4839,6 +4839,8 @@ dependencies = [
 name = "sush-client"
 version = "0.1.0"
 dependencies = [
+ "anstream",
+ "anstyle",
  "async-recursion",
  "atomicwrites",
  "base64 0.22.1",

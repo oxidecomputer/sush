@@ -6,6 +6,8 @@ resolver = "2"
 version = "0.1.0"
 
 [workspace.dependencies]
+anstream = "1"
+anstyle = "1"
 async-recursion = "1"
 attest-mock = { git = "https://github.com/oxidecomputer/dice-util", rev = "10952e8d9599b735b85d480af3560a11700e5b64" }
 atomicwrites = "0.4"
