@@ -3122,7 +3122,7 @@ checksum = "9b4f627cb1b25917193a259e49bdad08f671f8d9708acfd5fe0a8c1455d87220"
 [[package]]
 name = "permission-slip-client"
 version = "1.1.0"
-source = "git+https://github.com/oxidecomputer/permission-slip?rev=07b5953145cd55bcf14b2461c40639eaced3bd77#07b5953145cd55bcf14b2461c40639eaced3bd77"
+source = "git+https://github.com/oxidecomputer/permission-slip?rev=c9d302ef44576e075e35f4f28f8e7ac8345bcd4b#c9d302ef44576e075e35f4f28f8e7ac8345bcd4b"
 dependencies = [
  "anyhow",
  "base64 0.22.1",
@@ -3158,7 +3158,7 @@ dependencies = [
 [[package]]
 name = "permission-slip-common"
 version = "0.1.0"
-source = "git+https://github.com/oxidecomputer/permission-slip?rev=07b5953145cd55bcf14b2461c40639eaced3bd77#07b5953145cd55bcf14b2461c40639eaced3bd77"
+source = "git+https://github.com/oxidecomputer/permission-slip?rev=c9d302ef44576e075e35f4f28f8e7ac8345bcd4b#c9d302ef44576e075e35f4f28f8e7ac8345bcd4b"
 dependencies = [
  "aws-types",
  "blake3",
@@ -4701,7 +4701,7 @@ dependencies = [
 [[package]]
 name = "sshauth"
 version = "0.1.2"
-source = "git+https://github.com/oxidecomputer/sshauth#6233c1b25d9e3b03d51ab95b19ed7903bfadfd8f"
+source = "git+https://github.com/oxidecomputer/sshauth?rev=afd9b4e549d0e9229c2910c94aa7bca76623dfdb#afd9b4e549d0e9229c2910c94aa7bca76623dfdb"
 dependencies = [
  "anyhow",
  "base64 0.22.1",
