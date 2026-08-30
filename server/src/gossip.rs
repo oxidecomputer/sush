@@ -246,32 +246,52 @@ where
                 Some((peer, link)) = self.transport.accept() => {
                     self.on_link(peer, link).await;
                 }
-                Some(done) = self.dials.join_next() => {
-                    if let Ok((peer, result)) = done {
-                        self.dialing.remove(&peer);
-                        match result {
-                            Ok(link) => self.on_link(peer, link).await,
-                            Err(err) => {
-                                debug!(self.log, "link failed"; "peer" => %peer, "error" => err);
+                Some(done) = self.dials.join_next_with_id() => {
+                    match done {
+                        // A dial may finish after its peer was pruned. Only
+                        // the dial still on the books may act on its result.
+                        Ok((id, (peer, result))) => {
+                            if self.dialing.get(&peer).is_some_and(|dial| dial.id() == id) {
+                                self.dialing.remove(&peer);
+                                match result {
+                                    Ok(link) => self.on_link(peer, link).await,
+                                    Err(err) => {
+                                        debug!(
+                                            self.log, "link failed";
+                                            "peer" => %peer, "error" => err,
+                                        );
+                                    }
+                                }
                             }
                         }
+                        Err(err) => self.dialing.retain(|_, dial| dial.id() != err.id()),
                     }
                 }
                 Some(done) = self.drivers.join_next_with_id() => {
-                    if let Ok((id, (peer, stopped))) = done {
-                        debug!(
-                            self.log, "link driver stopped";
-                            "peer" => %peer,
-                            "dominated" => matches!(stopped, Stopped::Dominated),
-                        );
-                        // A driver may die after a fresh link to its peer
-                        // has replaced it. Only the living driver's death
-                        // may take the peer out of the live set.
-                        if self.live.get(&peer).is_some_and(|live| live.id() == id) {
-                            self.live.remove(&peer);
-                            if matches!(stopped, Stopped::Dominated) {
-                                self.joins.insert(peer);
+                    match done {
+                        Ok((id, (peer, stopped))) => {
+                            debug!(
+                                self.log, "link driver stopped";
+                                "peer" => %peer,
+                                "dominated" => matches!(stopped, Stopped::Dominated),
+                            );
+                            // A driver may die after a fresh link to its peer
+                            // has replaced it. Only the living driver's death
+                            // may take the peer out of the live set.
+                            if self.live.get(&peer).is_some_and(|live| live.id() == id) {
+                                self.live.remove(&peer);
+                                if matches!(stopped, Stopped::Dominated) {
+                                    self.joins.insert(peer);
+                                }
                             }
+                        }
+                        // A panicked driver reports nothing, and its peer
+                        // would never be re-linked.
+                        Err(err) => {
+                            if err.is_panic() {
+                                warn!(self.log, "link driver panicked"; "error" => %err);
+                            }
+                            self.live.retain(|_, live| live.id() != err.id());
                         }
                     }
                 }
