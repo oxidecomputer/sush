@@ -19,6 +19,7 @@ pub mod interactive;
 pub mod permslip;
 pub mod repl;
 pub mod tls;
+pub mod tunnel;
 
 /// Authorization state shared between the command context and the
 /// client's pre-send hook, which signs every request with the current

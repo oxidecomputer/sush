@@ -4880,6 +4880,7 @@ dependencies = [
  "thiserror 1.0.69",
  "tokio",
  "tokio-fd",
+ "tokio-rustls",
  "tokio-tungstenite",
  "x509-cert",
  "xdg 3.0.0",

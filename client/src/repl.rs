@@ -172,6 +172,11 @@ impl CommandContext for Repl {
             ssh_auth_sock,
             ssh_key_id,
             proxy_roots: _,
+            nexus: _,
+            nexus_token: _,
+            nexus_roots: _,
+            nexus_resolve: _,
+            rack: _,
         } = args;
         if json {
             output = Some(OutputFormat::Json);

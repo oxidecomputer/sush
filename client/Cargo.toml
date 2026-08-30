@@ -57,6 +57,7 @@ sush-common = { path = "../common" }
 thiserror.workspace = true
 tokio.workspace = true
 tokio-fd.workspace = true
+tokio-rustls.workspace = true
 tokio-tungstenite.workspace = true
 x509-cert.workspace = true
 xdg.workspace = true

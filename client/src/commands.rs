@@ -10,6 +10,7 @@ use std::fs::{File, OpenOptions, read};
 #[cfg(feature = "permslip")]
 use std::io::ErrorKind;
 use std::io::{Read as _, Seek as _, SeekFrom, Write as _, stdin};
+use std::net::SocketAddr;
 use std::num::{NonZeroU8, NonZeroU64};
 use std::path::{Path, PathBuf};
 use std::pin::Pin;
@@ -66,6 +67,7 @@ use crate::interactive::interactive_job;
 use crate::permslip::{PermslipError, PermslipSigner};
 use crate::repl::Repl;
 use crate::tls;
+use crate::tunnel::{Tunnel, TunnelError};
 use crate::types::{Error as ApiError, SessionStartBody};
 use crate::{Client, Error as ClientError};
 
@@ -82,7 +84,12 @@ pub const SUSH_MAX_FSIZE: &str = "SUSH_MAX_FSIZE";
 #[cfg(feature = "permslip")]
 pub const SUSH_PERMSLIP_KEY: &str = "SUSH_PERMSLIP_KEY";
 pub const SUSH_OUTPUT_FORMAT: &str = "SUSH_OUTPUT_FORMAT";
+pub const SUSH_NEXUS: &str = "SUSH_NEXUS";
+pub const SUSH_NEXUS_RESOLVE: &str = "SUSH_NEXUS_RESOLVE";
+pub const SUSH_NEXUS_ROOT: &str = "SUSH_NEXUS_ROOT";
+pub const SUSH_NEXUS_TOKEN: &str = "SUSH_NEXUS_TOKEN";
 pub const SUSH_PROXY_ROOT: &str = "SUSH_PROXY_ROOT";
+pub const SUSH_RACK: &str = "SUSH_RACK";
 pub const SUSH_URL: &str = "SUSH_URL";
 
 /// Default chunk size for parallel downloads of large output.
@@ -157,6 +164,35 @@ pub struct GlobalArgs {
     #[arg(short, long, env = SUSH_URL)]
     #[clap(global = true)]
     pub url: Option<String>,
+
+    /// Nexus URL to tunnel through instead of a tech port URL
+    // Not env OXIDE_HOST: clap applies conflict rules to env-sourced
+    // values, so the oxide CLI's variable would poison --url.
+    #[arg(long, env = SUSH_NEXUS, conflicts_with_all = ["url", "offline"])]
+    #[clap(global = true)]
+    pub nexus: Option<String>,
+
+    /// Token authenticating the tunnel to Nexus
+    #[arg(long, env = SUSH_NEXUS_TOKEN, hide_env_values = true)]
+    #[clap(global = true)]
+    pub nexus_token: Option<String>,
+
+    /// PEM roots that Nexus's TLS certificate must chain to
+    #[arg(long = "nexus-root", env = SUSH_NEXUS_ROOT, value_name = "PEM")]
+    #[clap(global = true)]
+    pub nexus_roots: Vec<PathBuf>,
+
+    /// Dial Nexus at this address instead of resolving its URL's
+    /// host, which still names the server for TLS (like curl
+    /// --resolve, for racks whose DNS is not yet populated)
+    #[arg(long, env = SUSH_NEXUS_RESOLVE, value_name = "IP:PORT")]
+    #[clap(global = true)]
+    pub nexus_resolve: Option<SocketAddr>,
+
+    /// ID of the rack to tunnel to (try `oxide system hardware rack list`)
+    #[arg(long, env = SUSH_RACK, value_name = "UUID")]
+    #[clap(global = true)]
+    pub rack: Option<String>,
 
     /// PEM roots that a proxy's TLS certificate must chain to,
     /// replacing the baked-in platform identity roots.
@@ -747,10 +783,30 @@ impl ClientCommand {
     }
 
     async fn run(self, ctx: &mut impl CommandContext) -> Result<(), CommandError> {
-        let args = ctx.get_globals().to_owned();
+        let mut args = ctx.get_globals().to_owned();
         if let Some(output) = args.output_format() {
             ctx.set_output_format(output);
         }
+
+        // The tunnel stands in for the proxy until the command ends.
+        let _tunnel = match args.nexus.as_ref() {
+            Some(nexus) => {
+                let rack = args.rack.as_ref().ok_or(CommandError::MissingRack)?;
+                let token = args
+                    .nexus_token
+                    .as_ref()
+                    .ok_or(CommandError::MissingNexusToken)?;
+                let tunnel =
+                    Tunnel::start(nexus, rack, token, &args.nexus_roots, args.nexus_resolve)
+                        .await?;
+                args.url = Some(tunnel.url.clone());
+                // The repl re-enters run per command; commands must
+                // reuse this tunnel, not build their own.
+                args.nexus = None;
+                Some(tunnel)
+            }
+            None => None,
+        };
 
         let client = match args.url.as_ref() {
             Some(url) => {
@@ -1095,22 +1151,25 @@ async fn session(
             },
             Some(client),
         ) => {
-            let (session_id, nonce) = if let (Some(session_id), Some(nonce)) = (session_id, nonce) {
-                (session_id, nonce)
-            } else {
-                let (baseboard_id, nonce) = with_login(ctx, client, async || {
-                    Ok((
-                        client.target().send().await?.into_inner(),
-                        client.session_start_nonce().send().await?.into_inner(),
-                    ))
-                })
-                .await?;
-                let (session_id, nonce) =
-                    session_create(permslip, permslip_url, &baseboard_id, nonce.nonce).await?;
-                ctx.session_created(Session::new(session_id), nonce);
-                (session_id, nonce)
-            };
-            session_start(ctx, client, session_id, nonce, wait).await
+            // Creation already announces the session; don't echo it
+            // when the start succeeds.
+            let (session_id, nonce, show) =
+                if let (Some(session_id), Some(nonce)) = (session_id, nonce) {
+                    (session_id, nonce, true)
+                } else {
+                    let (baseboard_id, nonce) = with_login(ctx, client, async || {
+                        Ok((
+                            client.target().send().await?.into_inner(),
+                            client.session_start_nonce().send().await?.into_inner(),
+                        ))
+                    })
+                    .await?;
+                    let (session_id, nonce) =
+                        session_create(permslip, permslip_url, &baseboard_id, nonce.nonce).await?;
+                    ctx.session_created(Session::new(session_id), nonce);
+                    (session_id, nonce, false)
+                };
+            session_start(ctx, client, session_id, nonce, wait, show).await
         }
 
         #[cfg(feature = "permslip")]
@@ -1143,7 +1202,7 @@ async fn session(
             } else {
                 return Err(CommandError::SigningUnavailable);
             };
-            session_start(ctx, client, session_id, nonce, wait).await
+            session_start(ctx, client, session_id, nonce, wait, true).await
         }
 
         (SessionCommand::Allow { key_id, write }, Some(client)) => {
@@ -1702,6 +1761,7 @@ async fn session_start(
     session_id: SessionId,
     signer_nonce: SessionSignerNonce,
     wait: bool,
+    show: bool,
 ) -> Result<(), CommandError> {
     let session = Session::new(session_id);
     with_login(ctx, client, async || {
@@ -1715,7 +1775,9 @@ async fn session_start(
     })
     .await?
     .into_inner();
-    ctx.session_started(session, true);
+    if show {
+        ctx.session_started(session, true);
+    }
     Ok(())
 }
 
@@ -2448,6 +2510,10 @@ pub enum CommandError {
     #[cfg(feature = "permslip")]
     #[error("❌ Missing permslip URL, try `--permslip-url` or setting `PERMSLIP_URL`")]
     MissingPermslipUrl,
+    #[error("❌ Missing rack ID, try `--rack` (IDs from `oxide system hardware rack list`)")]
+    MissingRack,
+    #[error("❌ Missing Nexus token, try `--nexus-token` or setting `SUSH_NEXUS_TOKEN`")]
+    MissingNexusToken,
     #[error("❌ Missing session, try `session start`")]
     MissingSession,
     #[error("❌ Missing SSH agent socket, try `--ssh-auth-sock`")]
@@ -2501,6 +2567,8 @@ pub enum CommandError {
     TimedOut,
     #[error("❌ Too much output to display on terminal, try `--file`")]
     TooMuchOutput,
+    #[error("❌ Tunnel error: {0}")]
+    Tunnel(#[from] TunnelError),
     #[error("❌ No sled with serial `{serial}` has a status for job `{job_id}`")]
     UnknownSerial { serial: String, job_id: JobId },
     #[error("❌ Serial `{0}` matches no sled in the rack inventory")]
