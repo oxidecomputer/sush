@@ -6,9 +6,9 @@
 
 use std::collections::BTreeMap;
 use std::fmt;
-use std::fs::{self, Permissions};
+use std::fs;
 use std::io::{self, BufRead as _, ErrorKind, Read as _, Write as _, stderr, stdin, stdout};
-use std::os::unix::fs::PermissionsExt as _;
+use std::os::unix::fs::OpenOptionsExt as _;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, SystemTime};
@@ -154,13 +154,13 @@ impl Cli {
     }
 }
 
-/// Atomically write a file only the user may read.
+/// Atomically write a file only the user may read, born that way
+/// rather than chmodded after opening.
 fn write_private(path: &Path, bytes: &[u8]) -> io::Result<()> {
+    let mut options = fs::OpenOptions::new();
+    options.write(true).create(true).truncate(true).mode(0o600);
     AtomicFile::new(path, OverwriteBehavior::AllowOverwrite)
-        .write(|file| {
-            file.set_permissions(Permissions::from_mode(0o600))?;
-            file.write_all(bytes)
-        })
+        .write_with_options(|file| file.write_all(bytes), options)
         .map_err(|error| match error {
             atomicwrites::Error::Internal(error) | atomicwrites::Error::User(error) => error,
         })
@@ -282,7 +282,7 @@ impl CommandContext for Cli {
                 created,
             }) if saved_url == url
                 && saved_fingerprint == fingerprint
-                && Utc::now() - created < TOKEN_REUSE =>
+                && (TimeDelta::zero()..TOKEN_REUSE).contains(&(Utc::now() - created)) =>
             {
                 Some(token)
             }
