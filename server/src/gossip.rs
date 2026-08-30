@@ -257,11 +257,21 @@ where
                         }
                     }
                 }
-                Some(done) = self.drivers.join_next() => {
-                    if let Ok((peer, stopped)) = done {
-                        self.live.remove(&peer);
-                        if matches!(stopped, Stopped::Dominated) {
-                            self.joins.insert(peer);
+                Some(done) = self.drivers.join_next_with_id() => {
+                    if let Ok((id, (peer, stopped))) = done {
+                        debug!(
+                            self.log, "link driver stopped";
+                            "peer" => %peer,
+                            "dominated" => matches!(stopped, Stopped::Dominated),
+                        );
+                        // A driver may die after a fresh link to its peer
+                        // has replaced it. Only the living driver's death
+                        // may take the peer out of the live set.
+                        if self.live.get(&peer).is_some_and(|live| live.id() == id) {
+                            self.live.remove(&peer);
+                            if matches!(stopped, Stopped::Dominated) {
+                                self.joins.insert(peer);
+                            }
                         }
                     }
                 }
@@ -354,6 +364,7 @@ where
     /// Spawn a session driver owning `link`: push our changes, and serve
     /// whatever the peer initiates, until the link fails.
     fn drive(&mut self, peer: SocketAddr, link: SprocketsLink) {
+        debug!(self.log, "driving link"; "peer" => %peer);
         let rumors = self.rumors.clone();
         let log = self.log.clone();
         let handle = self
