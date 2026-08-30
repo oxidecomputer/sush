@@ -35,7 +35,7 @@ use sush_common::jobs::{
 use sush_common::keys::{EphemeralKey, KeyError, KeyId, KeyType, Signer as _, pem_cert_chain};
 use sush_common::targets::{Cubbies, Target};
 use sush_server::bookmark::BookmarkSource;
-use sush_server::gossip::{Universe, isolated};
+use sush_server::gossip::{Universe, isolated, lonely};
 use sush_server::io::BATCH_OUTPUT_BUFFER_SIZE;
 use sush_server::messages::v0::{CertRequest, IdentityRequest, Message, Request, SessionRequest};
 use sush_server::output::{JobOutputDir, OutputDirs};
@@ -580,6 +580,7 @@ async fn cubby_targets() {
         test_baseboard_id(),
         cubbies_rx,
         isolated(seed_gossip(&BookmarkSource::null()).await),
+        lonely(),
         &[root.cert().to_owned()],
         CancellationToken::new(),
     )
@@ -685,6 +686,7 @@ async fn root_certs_from_files() {
         test_baseboard_id(),
         no_cubbies(),
         isolated(seed_gossip(&BookmarkSource::null()).await),
+        lonely(),
         &[path],
         CancellationToken::new(),
     )
@@ -735,6 +737,7 @@ async fn bad_root_cert_files() {
                 test_baseboard_id(),
                 no_cubbies(),
                 isolated(seed_gossip(&BookmarkSource::null()).await),
+                lonely(),
                 &[path],
                 CancellationToken::new(),
             )
@@ -765,6 +768,7 @@ async fn job_output_dir_moves() {
         test_baseboard_id(),
         no_cubbies(),
         isolated(seed_gossip(&BookmarkSource::null()).await),
+        lonely(),
         &[root.cert().to_owned()],
         CancellationToken::new(),
     )
@@ -866,6 +870,7 @@ async fn universe_swap() {
         test_baseboard_id(),
         no_cubbies(),
         universe_rx,
+        lonely(),
         &[root.cert().to_owned()],
         CancellationToken::new(),
     )
@@ -1014,6 +1019,7 @@ async fn cert_chain() {
         baseboard,
         no_cubbies(),
         gossip,
+        lonely(),
         &roots,
         shutdown,
     )
@@ -1788,6 +1794,7 @@ async fn hostile_imports_cannot_displace() {
         baseboard,
         no_cubbies(),
         isolated(seed),
+        lonely(),
         from_ref(&root_cert),
         shutdown,
     )
@@ -1933,6 +1940,7 @@ async fn homonym_issuer_resolves_to_true_parent() {
         baseboard,
         no_cubbies(),
         isolated(seed),
+        lonely(),
         from_ref(&root_cert),
         shutdown,
     )

@@ -35,11 +35,12 @@ use sush_common::jobs::{
 };
 use sush_common::jobs::{JobOutputStream, SessionSushNonce};
 use sush_common::keys::{KeyError, KeyId, SshPublicKey};
-use sush_common::targets::{Cubbies, SledVersion};
+use sush_common::targets::{Cubbies, SledHealth, SledVersion};
 use sush_common::version::LONG_VERSION;
 
 use crate::error::JobError;
 use crate::executor::PathIsolation;
+use crate::gossip::LinkedBaseboards;
 use crate::job::SocketSender;
 use crate::messages::v0::{CertRequest, IdentityRequest, JobRequest, Request, SessionRequest};
 use crate::output::{JobOutputDir, JobOutputFileStream};
@@ -88,6 +89,7 @@ pub struct JobManager {
     session_sush_nonce: Arc<SyncMutex<SessionSushNonce>>,
     output_dir: JobOutputDir,
     own_baseboard: BaseboardId,
+    linked: LinkedBaseboards,
     state: watch::Receiver<State>, // from the state manager
     tx_req: mpsc::Sender<Request>, // to the state manager
     join_state: Option<JoinHandle<()>>,
@@ -104,6 +106,7 @@ impl JobManager {
         own_baseboard: BaseboardId,
         cubbies: watch::Receiver<Cubbies>,
         universe: watch::Receiver<GossipUniverse>,
+        linked: LinkedBaseboards,
         roots: &[impl AsRef<Path>],
         shutdown: CancellationToken,
     ) -> Result<Self, JobError> {
@@ -115,6 +118,7 @@ impl JobManager {
             own_baseboard,
             cubbies,
             universe,
+            linked,
             &roots,
             shutdown,
         )
@@ -129,6 +133,7 @@ impl JobManager {
         own_baseboard: BaseboardId,
         cubbies: watch::Receiver<Cubbies>,
         universe: watch::Receiver<GossipUniverse>,
+        linked: LinkedBaseboards,
         roots: &[Certificate],
         shutdown: CancellationToken,
     ) -> Result<Self, JobError> {
@@ -154,6 +159,7 @@ impl JobManager {
             identities: Arc::new(Mutex::new(LruCache::new(MAX_CACHED_IDENTITIES))),
             session_sush_nonce,
             own_baseboard,
+            linked,
             output_dir,
             state: rx_state,
             tx_req,
@@ -168,6 +174,7 @@ impl JobManager {
     /// Every sled known by cubby or by build, sorted by cubby first.
     pub fn versions(&self) -> Vec<SledVersion> {
         let state = self.state.borrow();
+        let linked = self.linked.borrow();
         let mut sleds: BTreeSet<&BaseboardId> = state.versions().keys().collect();
         sleds.extend(state.cubbies().values());
         let mut rows: Vec<SledVersion> = sleds
@@ -179,6 +186,13 @@ impl JobManager {
                     .find_map(|(cubby, b)| (b == baseboard).then_some(*cubby)),
                 baseboard: baseboard.clone(),
                 version: state.versions().get(baseboard).cloned(),
+                health: Some(
+                    if *baseboard == self.own_baseboard || linked.contains(baseboard) {
+                        SledHealth::Linked
+                    } else {
+                        SledHealth::Unlinked
+                    },
+                ),
             })
             .collect();
         rows.sort_by_key(|row| (row.cubby.is_none(), row.cubby));

@@ -31,7 +31,7 @@ use sush_common::keys::{EphemeralKey, KeyType, Signer};
 use sush_common::targets::{Cubbies, Target};
 use sush_server::bookmark::BookmarkSource;
 use sush_server::executor::PathIsolation;
-use sush_server::gossip::isolated;
+use sush_server::gossip::{isolated, lonely};
 use sush_server::output::{JobOutputDir, JobOutputFileStream};
 use sush_server::state::GossipNetwork;
 use sush_server::{JobError, JobManager, seed_gossip};
@@ -240,6 +240,7 @@ pub async fn manager_test_root_and_peer(
         test_baseboard_id(),
         no_cubbies(),
         gossip,
+        lonely(),
         &[root.cert().to_owned()],
         shutdown.clone(),
     )

@@ -22,12 +22,12 @@ use sprockets_tls::keys::{
     AttestConfig, MeasurementConnectionPolicy, ResolveSetting, SprocketsConfig,
 };
 use sprockets_tls_test_utils::{
-    OutputFileExistsBehavior, alias_prefix, cert_path, certlist_path, generate_config,
+    OutputFileExistsBehavior, alias_prefix, cert_path, certlist_path, generate_config, platform_id,
     private_key_path, root_prefix, sprockets_auth_prefix,
 };
 use sush_common::authn::{Challenge, ChallengeResponse, Identity, Nonce, RequestKey};
 use sush_common::codephrases::Codephrase;
-use sush_common::jobs::{JobId, JobMode, JobStartRequest, SessionId, SignedJob};
+use sush_common::jobs::{BaseboardId, JobId, JobMode, JobStartRequest, SessionId, SignedJob};
 use sush_common::keys::{EphemeralKey, KeyType, Signer as _};
 use sush_common::targets::Target;
 use sush_server::gossip::GossipConfig;
@@ -97,6 +97,16 @@ pub fn write_keys_and_measurements(dir: Utf8PathBuf, num_nodes: usize) {
 pub fn corpus(dir: &Utf8PathBuf) -> CorpusSource {
     let corpus = vec![dir.join("corim.cbor")];
     Arc::new(move || corpus.clone())
+}
+
+/// The baseboard the test PKI attests for `node`.
+pub fn baseboard(node: usize) -> BaseboardId {
+    let id = platform_id(node);
+    let mut fields = id.split(':');
+    BaseboardId {
+        part_number: fields.nth(1).unwrap().to_string(),
+        serial_number: fields.nth(1).unwrap().to_string(),
+    }
 }
 
 /// Dial ceiling for localhost handshakes.

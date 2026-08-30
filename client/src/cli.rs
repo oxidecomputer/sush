@@ -13,6 +13,8 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, SystemTime};
 
+use anstream::print;
+use anstyle::{AnsiColor, Style};
 use atomicwrites::{AtomicFile, OverwriteBehavior};
 use bytesize::ByteSize;
 use chrono::TimeDelta;
@@ -32,7 +34,7 @@ use sush_common::jobs::{
     SessionSignerNonce, SignedJob, job_status_to_json_map,
 };
 use sush_common::keys::{KeyId, Signature, SshPublicKey};
-use sush_common::targets::{MAX_CUBBY, SledId, SledVersion};
+use sush_common::targets::{MAX_CUBBY, SledHealth, SledId, SledVersion};
 use sush_common::version::VersionInfo;
 
 use crate::AuthzSigner;
@@ -1065,7 +1067,8 @@ mod test {
 /// Cell text width for one sled in the rack drawing.
 const CELL: usize = 28;
 
-/// One sled cell: serial on the left, build on the right.
+/// One sled cell: serial on the left, build on the right, colored by
+/// health.
 fn rack_cell(sled: Option<&SledVersion>) -> String {
     match sled {
         Some(sled) => {
@@ -1080,9 +1083,26 @@ fn rack_cell(sled: Option<&SledVersion>) -> String {
                 }
                 None => String::new(),
             };
-            format!(" {:<12.12}{:>14.14} ", sled.baseboard.serial_number, build)
+            let style = health_style(sled);
+            format!(
+                "{style} {:<12.12}{:>14.14} {style:#}",
+                sled.baseboard.serial_number, build
+            )
         }
         None => " ".repeat(CELL),
+    }
+}
+
+/// Green gossips with the answering sled, yellow was once known but is
+/// out of contact, and red is in the cubby map with no other sign of
+/// life. Sleds without health (an old server, a newer state than this
+/// build knows) stay unstyled, which renders as nothing.
+fn health_style(sled: &SledVersion) -> Style {
+    match sled.health {
+        Some(SledHealth::Linked) => AnsiColor::Green.on_default(),
+        Some(SledHealth::Unlinked) if sled.version.is_some() => AnsiColor::Yellow.on_default(),
+        Some(SledHealth::Unlinked) => AnsiColor::Red.on_default(),
+        Some(SledHealth::Unknown) | None => Style::new(),
     }
 }
 
@@ -1140,11 +1160,10 @@ mod rack {
                 version: "0.1.0".to_string(),
                 commit: "f078e863b17359031de072222bb631270f2d5157".to_string(),
             }),
+            health: None,
         }
     }
 
-    /// Compare the rack drawing against the snapshot in
-    /// `tests/output/`, or rewrite it under `EXPECTORATE=overwrite`.
     #[test]
     fn rack_drawing() {
         let mut sleds = vec![
@@ -1162,10 +1181,30 @@ mod rack {
         if let Some(version) = &mut sleds[1].version {
             version.commit.push_str("-dirty");
         }
-        let drawing = draw_rack(&sleds);
-        let path = "tests/output/rack.txt";
+        check(&draw_rack(&sleds), "tests/output/rack.txt");
+    }
+
+    /// A healthy sled, a silent one, and one that is only a cubby
+    /// number, pinning the color codes.
+    #[test]
+    fn rack_drawing_health() {
+        let mut sleds = vec![
+            sled(14, "BRM42220030"),
+            sled(15, "BRM42220036"),
+            sled(16, "2CN2M459"),
+        ];
+        sleds[0].health = Some(SledHealth::Linked);
+        sleds[1].health = Some(SledHealth::Unlinked);
+        sleds[2].health = Some(SledHealth::Unlinked);
+        sleds[2].version = None;
+        check(&draw_rack(&sleds), "tests/output/rack-health.txt");
+    }
+
+    /// Compare against the snapshot at `path`, or rewrite it under
+    /// `EXPECTORATE=overwrite`.
+    fn check(drawing: &str, path: &str) {
         if env::var("EXPECTORATE").as_deref() == Ok("overwrite") {
-            write(path, &drawing).unwrap();
+            write(path, drawing).unwrap();
         } else {
             let expected = read_to_string(path).expect("missing snapshot");
             assert_eq!(drawing, expected, "rack drawing changed:\n{drawing}");

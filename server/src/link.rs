@@ -19,9 +19,9 @@
 //! are reused: a connection dropped mid-stream is discarded at the
 //! pool's door.
 
-use std::collections::{BTreeSet, HashMap};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::io;
-use std::net::{SocketAddr, SocketAddrV6};
+use std::net::{Ipv6Addr, SocketAddr, SocketAddrV6};
 use std::pin::Pin;
 use std::sync::{Arc, Mutex};
 use std::task::{Context, Poll};
@@ -36,13 +36,14 @@ use qorb::pool::Pool;
 use qorb::resolvers::fixed::FixedResolver;
 use rumors::link::STREAM_COUNT;
 use rumors::link::routed::{Config, Dial, Endpoint, Incoming, Listen, RoutedLink};
-use slog::{Logger, o, warn};
+use sled_hardware_types::BaseboardId;
+use slog::{Logger, debug, o, warn};
 use sprockets_tls::keys::SprocketsConfig;
 use sprockets_tls::{Client, Server};
 use tokio::io::{AsyncRead, AsyncReadExt as _, AsyncWrite, AsyncWriteExt as _, ReadBuf};
 use tokio::net::TcpStream;
 use tokio::runtime::Handle;
-use tokio::sync::mpsc;
+use tokio::sync::{mpsc, watch};
 use tokio::time::{sleep, timeout};
 use tokio::{select, spawn};
 use tokio_util::sync::CancellationToken;
@@ -188,12 +189,116 @@ impl Drop for SprocketsConn {
     }
 }
 
+/// The baseboards peers have attested at handshake, kept on a watch
+/// channel so consumers follow the table as it changes.
+#[derive(Clone)]
+pub struct Baseboards {
+    known: watch::Sender<AttestedBaseboards>,
+}
+
+/// The attestation tables: a dialed connection names its peer's listen
+/// address exactly; an accepted one names only its source IP. The
+/// bootstrap network keeps IPs one-to-one with sleds, but localhost
+/// tests stack peers on one IP, so an ambiguous IP resolves to no one.
+/// [`Baseboards::retain`] bounds both tables to the peer set.
+#[derive(Default)]
+pub struct AttestedBaseboards {
+    dialed: BTreeMap<SocketAddrV6, BaseboardId>,
+    accepted: BTreeMap<Ipv6Addr, BTreeSet<BaseboardId>>,
+}
+
+impl AttestedBaseboards {
+    /// The baseboard attested at `addr`: seen on a dialed connection,
+    /// or the only baseboard to have connected from the same IP.
+    pub fn resolve(&self, addr: &SocketAddr) -> Option<BaseboardId> {
+        let SocketAddr::V6(addr) = addr else {
+            return None;
+        };
+        if let Some(id) = self.dialed.get(addr) {
+            return Some(id.clone());
+        }
+        match self.accepted.get(addr.ip()) {
+            Some(ids) if ids.len() == 1 => ids.first().cloned(),
+            _ => None,
+        }
+    }
+}
+
+impl Baseboards {
+    fn new() -> Self {
+        Baseboards {
+            known: watch::Sender::new(AttestedBaseboards::default()),
+        }
+    }
+
+    /// Record the peer attested on a connection dialed to `addr`.
+    fn dialed(&self, log: &Logger, addr: SocketAddrV6, platform_id: &str) {
+        let Some(id) = baseboard(log, platform_id) else {
+            return;
+        };
+        self.known.send_if_modified(|known| {
+            let grew = known.dialed.get(&addr) != Some(&id);
+            if grew {
+                debug!(log, "attested by dial"; "addr" => %addr, "baseboard" => %id);
+                known.dialed.insert(addr, id);
+            }
+            grew
+        });
+    }
+
+    /// Record the peer attested on a connection accepted from `ip`.
+    fn accepted(&self, log: &Logger, ip: Ipv6Addr, platform_id: &str) {
+        let Some(id) = baseboard(log, platform_id) else {
+            return;
+        };
+        self.known.send_if_modified(|known| {
+            if known.accepted.entry(ip).or_default().insert(id.clone()) {
+                debug!(log, "attested by accept"; "ip" => %ip, "baseboard" => %id);
+                true
+            } else {
+                false
+            }
+        });
+    }
+
+    /// A receiver following the attestation tables.
+    pub fn watch(&self) -> watch::Receiver<AttestedBaseboards> {
+        self.known.subscribe()
+    }
+
+    /// Forget the baseboards of peers outside `peers`.
+    fn retain(&self, peers: &BTreeSet<SocketAddrV6>) {
+        let ips: BTreeSet<&Ipv6Addr> = peers.iter().map(|addr| addr.ip()).collect();
+        self.known.send_if_modified(|known| {
+            let before = (known.dialed.len(), known.accepted.len());
+            known.dialed.retain(|addr, _| peers.contains(addr));
+            known.accepted.retain(|ip, _| ips.contains(ip));
+            (known.dialed.len(), known.accepted.len()) != before
+        });
+    }
+}
+
+/// The baseboard a platform id names (`prefix:part:revision:serial`).
+fn baseboard(log: &Logger, platform_id: &str) -> Option<BaseboardId> {
+    let mut fields = platform_id.split(':');
+    match (fields.nth(1), fields.nth(1)) {
+        (Some(part_number), Some(serial_number)) => Some(BaseboardId {
+            part_number: part_number.to_string(),
+            serial_number: serial_number.to_string(),
+        }),
+        _ => {
+            warn!(log, "unparseable platform id"; "platform_id" => platform_id);
+            None
+        }
+    }
+}
+
 /// Establishes a peer pool's connections, one attested handshake each.
 struct PoolConnector {
     log: Logger,
     config: SprocketsConfig,
     corpus: CorpusSource,
-    /// Ceiling on one handshake.
+    baseboards: Baseboards,
     timeout: Duration,
 }
 
@@ -230,6 +335,8 @@ impl backend::Connector for PoolConnector {
             }
         });
         let stream = dial.await.map_err(io::Error::other)??;
+        self.baseboards
+            .dialed(&self.log, addr, stream.peer_platform_id().as_str());
         Ok(PooledConn {
             stream: Some(stream),
             dirty: false,
@@ -259,8 +366,8 @@ pub struct SprocketsDial {
     log: Logger,
     config: SprocketsConfig,
     corpus: CorpusSource,
+    baseboards: Baseboards,
     timeout: Duration,
-    /// One pool per peer, created at first dial and dropped at prune.
     pools: Arc<Mutex<HashMap<SocketAddrV6, Arc<Pool<PooledConn>>>>>,
 }
 
@@ -272,12 +379,14 @@ impl SprocketsDial {
         log: &Logger,
         config: SprocketsConfig,
         corpus: CorpusSource,
+        baseboards: Baseboards,
         timeout: Duration,
     ) -> Self {
         SprocketsDial {
             log: log.new(o!("component" => "sprockets dial")),
             config,
             corpus,
+            baseboards,
             timeout,
             pools: Arc::default(),
         }
@@ -298,6 +407,7 @@ impl SprocketsDial {
             log: self.log.clone(),
             config: self.config.clone(),
             corpus: self.corpus.clone(),
+            baseboards: self.baseboards.clone(),
             timeout: self.timeout,
         });
         let resolver = Box::new(FixedResolver::new([SocketAddr::V6(addr)]));
@@ -308,9 +418,6 @@ impl SprocketsDial {
             set_config: SetConfig {
                 max_count: MAX_SLOTS,
                 min_connection_backoff: MIN_CONNECTION_BACKOFF,
-                // No liveness probing: a pooled connection that died
-                // idle is discovered by the stream that draws it, and
-                // the failed session re-links.
                 health_interval: HEALTH_INTERVAL,
                 ..SetConfig::default()
             },
@@ -318,7 +425,6 @@ impl SprocketsDial {
         };
         match Pool::new(format!("gossip {addr}"), resolver, connector, policy) {
             Ok(pool) => pool,
-            // Registration is telemetry-only; the pool works either way.
             Err(err) => err.into_inner(),
         }
     }
@@ -369,6 +475,7 @@ pub struct Transport {
     endpoint: Endpoint<SprocketsDial>,
     incoming: Incoming<SprocketsDial>,
     dial: SprocketsDial,
+    baseboards: Baseboards,
     bound: SocketAddrV6,
 }
 
@@ -383,15 +490,17 @@ impl Transport {
         dial_timeout: Duration,
         shutdown: CancellationToken,
     ) -> io::Result<Self> {
+        let baseboards = Baseboards::new();
         let (listen, bound) = SprocketsListen::bind(
             log,
             config.clone(),
             corpus.clone(),
+            baseboards.clone(),
             listen_addr,
             shutdown.clone(),
         )
         .await?;
-        let dial = SprocketsDial::new(log, config, corpus, dial_timeout);
+        let dial = SprocketsDial::new(log, config, corpus, baseboards.clone(), dial_timeout);
         let router_config = Config {
             pending_headers: PENDING_HEADERS,
             ..Config::default()
@@ -412,6 +521,7 @@ impl Transport {
             endpoint,
             incoming,
             dial,
+            baseboards,
             bound,
         })
     }
@@ -426,9 +536,16 @@ impl Transport {
         self.endpoint.clone()
     }
 
-    /// Drop the connection pools of peers outside `peers`.
-    pub fn retain_pools(&self, peers: &BTreeSet<SocketAddrV6>) {
-        self.dial.retain(peers)
+    /// The baseboards peers have attested to this transport.
+    pub fn baseboards(&self) -> &Baseboards {
+        &self.baseboards
+    }
+
+    /// Drop the connection pools and recorded baseboards of peers
+    /// outside `peers`.
+    pub fn retain_peers(&self, peers: &BTreeSet<SocketAddrV6>) {
+        self.dial.retain(peers);
+        self.baseboards.retain(peers);
     }
 
     /// Receive the next link a peer established toward us, with the name it
@@ -457,6 +574,7 @@ impl SprocketsListen {
         log: &Logger,
         config: SprocketsConfig,
         corpus: CorpusSource,
+        baseboards: Baseboards,
         listen_addr: SocketAddrV6,
         shutdown: CancellationToken,
     ) -> io::Result<(Self, SocketAddrV6)> {
@@ -471,7 +589,7 @@ impl SprocketsListen {
             }
         };
         let (tx, connections) = mpsc::channel(HANDSHAKE_QUEUE_DEPTH);
-        spawn(pump(server, corpus, tx, log, shutdown));
+        spawn(pump(server, corpus, baseboards, tx, log, shutdown));
         Ok((SprocketsListen { connections }, bound))
     }
 }
@@ -491,6 +609,7 @@ impl Listen for SprocketsListen {
 async fn pump(
     server: Server,
     corpus: CorpusSource,
+    baseboards: Baseboards,
     connections: mpsc::Sender<SprocketsConn>,
     log: Logger,
     shutdown: CancellationToken,
@@ -501,11 +620,16 @@ async fn pump(
             accepted = server.accept((corpus)()) => match accepted {
                 Ok(acceptor) => {
                     let connections = connections.clone();
+                    let baseboards = baseboards.clone();
                     let log = log.clone();
                     spawn(async move {
                         match acceptor.handshake().await {
                             // A closed queue means the endpoint is gone.
-                            Ok((stream, _)) => {
+                            Ok((stream, peer)) => {
+                                if let SocketAddr::V6(peer) = peer {
+                                    let id = stream.peer_platform_id().as_str();
+                                    baseboards.accepted(&log, *peer.ip(), id);
+                                }
                                 let conn = SprocketsConn(Conn::Direct(Some(stream)));
                                 let _ = connections.send(conn).await;
                             }
