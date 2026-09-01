@@ -33,7 +33,7 @@ pub async fn fresh_token(
         server_url: url.to_owned(),
         agent_sock,
     };
-    let token = tokens.token().await.map_err(PermslipError::token)?;
+    let token = tokens.token().await.map_err(PermslipError::token_flow)?;
     let value = token.into_header_value().map_err(PermslipError::token)?;
     value
         .to_str()
@@ -120,6 +120,14 @@ pub enum PermslipError {
 impl PermslipError {
     fn token<E: ToString>(error: E) -> Self {
         Self::Token(error.to_string())
+    }
+
+    /// Recover the API error from the permslip token flow.
+    fn token_flow(error: anyhow::Error) -> Self {
+        match error.downcast::<ClientError<ApiError>>() {
+            Ok(client) => client.into(),
+            Err(error) => Self::token(error),
+        }
     }
 }
 
