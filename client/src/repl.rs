@@ -228,6 +228,14 @@ impl CommandContext for Repl {
         self.cli.authz_signer()
     }
 
+    fn permslip_token(&self, url: &str, fingerprint: &str) -> Option<String> {
+        self.cli.permslip_token(url, fingerprint)
+    }
+
+    fn save_permslip_token(&self, url: &str, fingerprint: &str, token: &str) {
+        self.cli.save_permslip_token(url, fingerprint, token)
+    }
+
     fn session_id(&self) -> Option<SessionId> {
         self.cli.session_id()
     }

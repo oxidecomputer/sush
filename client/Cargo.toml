@@ -14,11 +14,12 @@ path = "src/main.rs"
 [features]
 # Sign job requests through Permission Slip. Off by default because the
 # permission-slip repositories are private; Oxide builds turn it on.
-permslip = ["dep:permission-slip-client", "dep:permission-slip-common"]
+permslip = ["dep:anyhow", "dep:permission-slip-client", "dep:permission-slip-common"]
 
 [dependencies]
 anstream.workspace = true
 anstyle.workspace = true
+anyhow = { workspace = true, optional = true }
 async-recursion.workspace = true
 atomicwrites.workspace = true
 base64.workspace = true

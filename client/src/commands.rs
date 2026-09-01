@@ -64,7 +64,7 @@ use crate::context::{Authz, CommandContext, OutputFormat, StatusDisplayStyle};
 use crate::identity::{IdentityError, SshAgentConnection};
 use crate::interactive::interactive_job;
 #[cfg(feature = "permslip")]
-use crate::permslip::{PermslipError, PermslipSigner};
+use crate::permslip::{PermslipError, PermslipSigner, fresh_token};
 use crate::repl::Repl;
 use crate::tls;
 use crate::tunnel::{Tunnel, TunnelError};
@@ -1153,22 +1153,23 @@ async fn session(
         ) => {
             // Creation already announces the session; don't echo it
             // when the start succeeds.
-            let (session_id, nonce, show) =
-                if let (Some(session_id), Some(nonce)) = (session_id, nonce) {
-                    (session_id, nonce, true)
-                } else {
-                    let (baseboard_id, nonce) = with_login(ctx, client, async || {
-                        Ok((
-                            client.target().send().await?.into_inner(),
-                            client.session_start_nonce().send().await?.into_inner(),
-                        ))
-                    })
-                    .await?;
-                    let (session_id, nonce) =
-                        session_create(permslip, permslip_url, &baseboard_id, nonce.nonce).await?;
-                    ctx.session_created(Session::new(session_id), nonce);
-                    (session_id, nonce, false)
-                };
+            let (session_id, nonce, show) = if let (Some(session_id), Some(nonce)) =
+                (session_id, nonce)
+            {
+                (session_id, nonce, true)
+            } else {
+                let (baseboard_id, nonce) = with_login(ctx, client, async || {
+                    Ok((
+                        client.target().send().await?.into_inner(),
+                        client.session_start_nonce().send().await?.into_inner(),
+                    ))
+                })
+                .await?;
+                let (session_id, nonce) =
+                    session_create(ctx, permslip, permslip_url, &baseboard_id, nonce.nonce).await?;
+                ctx.session_created(Session::new(session_id), nonce);
+                (session_id, nonce, false)
+            };
             session_start(ctx, client, session_id, nonce, wait, show).await
         }
 
@@ -1183,7 +1184,7 @@ async fn session(
             _,
         ) => {
             let (session_id, nonce) =
-                session_create(permslip, permslip_url, &baseboard_id, nonce).await?;
+                session_create(ctx, permslip, permslip_url, &baseboard_id, nonce).await?;
             ctx.session_created(Session::new(session_id), nonce);
             Ok(())
         }
@@ -1357,7 +1358,7 @@ async fn job(
             } else {
                 JobMode::Batch
             };
-            let signer = PermslipSigner::new(key_name, permslip_url).await?;
+            let signer = permslip_signer(ctx, key_name, permslip_url).await?;
             let mut interval = interval(SIGNING_UPDATE_INTERVAL);
             interval.set_missed_tick_behavior(MissedTickBehavior::Skip);
             let sign = signer.sign_job_request(JobStartRequest::new(
@@ -1732,9 +1733,40 @@ fn parse_baseboard_id(value: &str) -> Result<BaseboardId, String> {
     value.parse::<BaseboardId>().map_err(|e| e.to_string())
 }
 
+/// A permslip signer authenticated as the agent key `-s`/`SUSH_KEY_ID`
+/// names, or the agent's first. We choose the key rather than letting
+/// permslip choose, so that one identity serves both the rack and the
+/// signing service.
+#[cfg(feature = "permslip")]
+async fn permslip_signer(
+    ctx: &mut impl CommandContext,
+    key_name: &str,
+    permslip_url: &str,
+) -> Result<PermslipSigner, CommandError> {
+    let globals = ctx.get_globals();
+    let Some(sock) = globals.ssh_auth_sock.clone() else {
+        return Err(CommandError::MissingSshAuthSock);
+    };
+    let key_id = globals.ssh_key_id.clone();
+    let mut agent = SshAgentConnection::connect(&sock).await?;
+    let key = agent.identity(key_id.as_ref()).await?;
+    let fingerprint = key.fingerprint();
+    let token = match ctx.permslip_token(permslip_url, &fingerprint) {
+        Some(token) => token,
+        None => {
+            ctx.please_touch(&key)?;
+            let token = fresh_token(permslip_url, sock, fingerprint.clone()).await?;
+            ctx.save_permslip_token(permslip_url, &fingerprint, &token);
+            token
+        }
+    };
+    Ok(PermslipSigner::new(key_name, permslip_url, &token)?)
+}
+
 /// Ask the online signing service to create a session.
 #[cfg(feature = "permslip")]
 async fn session_create(
+    ctx: &mut impl CommandContext,
     permslip: Option<String>,
     permslip_url: Option<String>,
     baseboard_id: &BaseboardId,
@@ -1747,7 +1779,7 @@ async fn session_create(
         return Err(CommandError::MissingKeyName);
     };
     let invalid = |e: InvalidCodephrase| CommandError::UnsupportedPermslipResponse(e.to_string());
-    let signer = PermslipSigner::new(permslip_key, &permslip_url).await?;
+    let signer = permslip_signer(ctx, &permslip_key, &permslip_url).await?;
     let created = signer.create_session(baseboard_id, nonce).await?;
     Ok((
         created.session_id.to_string().parse().map_err(invalid)?,

@@ -7,6 +7,7 @@ version = "0.1.0"
 
 [workspace.dependencies]
 anstream = "1"
+anyhow = "1"
 anstyle = "1"
 async-recursion = "1"
 attest-mock = { git = "https://github.com/oxidecomputer/dice-util", rev = "10952e8d9599b735b85d480af3560a11700e5b64" }
@@ -38,8 +39,8 @@ memmap2 = "0.9"
 p256 = { version = "0.13", features = ["ecdsa", "pkcs8"] }
 pem-rfc7468 = { version = "0.7", features = ["std"] }
 percent-encoding = "2"
-permission-slip-client = { git = "https://github.com/oxidecomputer/permission-slip", rev = "2a8adcadde01518f1d39993a1cc45ec3b78b3204" }
-permission-slip-common = { git = "https://github.com/oxidecomputer/permission-slip", rev = "2a8adcadde01518f1d39993a1cc45ec3b78b3204" }
+permission-slip-client = { git = "https://github.com/oxidecomputer/permission-slip", rev = "c9d302ef44576e075e35f4f28f8e7ac8345bcd4b" }
+permission-slip-common = { git = "https://github.com/oxidecomputer/permission-slip", rev = "c9d302ef44576e075e35f4f28f8e7ac8345bcd4b" }
 progenitor = "0.14"
 progenitor-client = "0.14"
 pwd = "1"
