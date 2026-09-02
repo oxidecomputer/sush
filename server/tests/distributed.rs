@@ -24,9 +24,10 @@ use sush_common::jobs::{
 use sush_common::keys::pem_cert_chain;
 use sush_common::targets::{Cubbies, SledHealth};
 use sush_common::version::VersionInfo;
-use sush_server::bookmark::BookmarkSource;
+use sush_server::bookmark::{BOOKMARK, BookmarkSource};
 use sush_server::executor::PathIsolation;
 use sush_server::gossip::spawn_gossip;
+use sush_server::locker::Locker;
 use sush_server::messages::v0::{Event, JobEvent, Message};
 use sush_server::output::JobOutputDir;
 use sush_server::state::GossipUniverse;
@@ -560,24 +561,25 @@ async fn bookmarks_survive_restart() {
 
     // Sled 2 keeps its identity in a bookmark; joining records it.
     let bookmark_dir = TempDir::with_prefix("sush-bookmark-").unwrap();
-    let slot = Utf8PathBuf::from_path_buf(bookmark_dir.path().join("bookmark")).unwrap();
+    let slot = Utf8PathBuf::from_path_buf(bookmark_dir.path().to_path_buf()).unwrap();
+    let record = slot.join(BOOKMARK.file);
     let b_shutdown = CancellationToken::new();
     let b = Sled::start_with_bookmarks(
         &log,
         &dir,
         2,
         &root_pem,
-        BookmarkSource::new(&log, vec![slot.clone()]),
+        BookmarkSource::new(&log, &Locker::new(&log, vec![slot.clone()])),
         &b_shutdown,
     )
     .await;
     a.peers.send(BTreeSet::from([b.addr])).unwrap();
     b.peers.send(BTreeSet::from([a.addr])).unwrap();
     eventually("the joining sled records its identity", 120, async || {
-        slot.as_std_path().exists()
+        record.as_std_path().exists()
     })
     .await;
-    let before = std::fs::read(&slot).unwrap();
+    let before = std::fs::read(&record).unwrap();
 
     // The next incarnation reads the record back, rejoins, and
     // advances it, reclaiming the previous life's identity.
@@ -593,7 +595,7 @@ async fn bookmarks_survive_restart() {
         &dir,
         2,
         &root_pem,
-        BookmarkSource::new(&log, vec![slot.clone()]),
+        BookmarkSource::new(&log, &Locker::new(&log, vec![slot.clone()])),
         &shutdown,
     )
     .await;
@@ -606,7 +608,7 @@ async fn bookmarks_survive_restart() {
     eventually(
         "the record advances past the previous life",
         120,
-        async || std::fs::read(&slot).unwrap() != before,
+        async || std::fs::read(&record).unwrap() != before,
     )
     .await;
 
@@ -649,7 +651,10 @@ async fn gossip_survives_bookmark_failure() {
         &dir,
         2,
         &root_pem,
-        BookmarkSource::new(&log, vec![Utf8PathBuf::from("/nonexistent/sush/bookmark")]),
+        BookmarkSource::new(
+            &log,
+            &Locker::new(&log, vec![Utf8PathBuf::from("/nonexistent/sush")]),
+        ),
         &shutdown,
     )
     .await;

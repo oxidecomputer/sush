@@ -18,6 +18,7 @@ pub mod history;
 pub mod io;
 pub mod job;
 pub mod link;
+pub mod locker;
 pub mod manager;
 pub mod messages;
 pub mod mux;
