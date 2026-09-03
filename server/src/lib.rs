@@ -11,6 +11,7 @@ extern crate function_name;
 compile_error!("`test-support` must not be enabled for an embedded server");
 
 pub mod bookmark;
+pub mod boundary;
 pub mod error;
 pub mod executor;
 pub mod gossip;
@@ -18,6 +19,7 @@ pub mod history;
 pub mod io;
 pub mod job;
 pub mod link;
+pub mod locker;
 pub mod manager;
 pub mod messages;
 pub mod mux;

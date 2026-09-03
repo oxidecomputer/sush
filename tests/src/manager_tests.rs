@@ -34,17 +34,17 @@ use sush_common::jobs::{
 };
 use sush_common::keys::{EphemeralKey, KeyError, KeyId, KeyType, Signer as _, pem_cert_chain};
 use sush_common::targets::{Cubbies, Target};
-use sush_server::bookmark::BookmarkSource;
 use sush_server::gossip::{Universe, isolated, lonely};
 use sush_server::io::BATCH_OUTPUT_BUFFER_SIZE;
+use sush_server::locker::Locker;
 use sush_server::messages::v0::{CertRequest, IdentityRequest, Message, Request, SessionRequest};
 use sush_server::output::{JobOutputDir, OutputDirs};
-use sush_server::{JobError, JobManager, seed_gossip};
+use sush_server::{JobError, JobManager};
 
 use crate::test_utils::{
     IntoBytes as _, SignJobRequest as _, ephemeral_test_root, ephemeral_test_subject,
     fake_identity, manager_and_test_root, manager_login, manager_test_root_and_peer, no_cubbies,
-    test_baseboard_id, test_logger,
+    null_gossip, test_baseboard_id, test_logger,
 };
 use sush_server::executor::PathIsolation;
 
@@ -579,8 +579,9 @@ async fn cubby_targets() {
         JobOutputDir::fixed(dir.path()),
         test_baseboard_id(),
         cubbies_rx,
-        isolated(seed_gossip(&BookmarkSource::null()).await),
+        isolated(null_gossip().await),
         lonely(),
+        &Locker::null(),
         &[root.cert().to_owned()],
         CancellationToken::new(),
     )
@@ -685,8 +686,9 @@ async fn root_certs_from_files() {
         JobOutputDir::fixed(dir.path()),
         test_baseboard_id(),
         no_cubbies(),
-        isolated(seed_gossip(&BookmarkSource::null()).await),
+        isolated(null_gossip().await),
         lonely(),
+        &Locker::null(),
         &[path],
         CancellationToken::new(),
     )
@@ -736,8 +738,9 @@ async fn bad_root_cert_files() {
                 JobOutputDir::fixed(dir.path()),
                 test_baseboard_id(),
                 no_cubbies(),
-                isolated(seed_gossip(&BookmarkSource::null()).await),
+                isolated(null_gossip().await),
                 lonely(),
+                &Locker::null(),
                 &[path],
                 CancellationToken::new(),
             )
@@ -767,8 +770,9 @@ async fn job_output_dir_moves() {
         JobOutputDir::new(rx_dirs),
         test_baseboard_id(),
         no_cubbies(),
-        isolated(seed_gossip(&BookmarkSource::null()).await),
+        isolated(null_gossip().await),
         lonely(),
+        &Locker::null(),
         &[root.cert().to_owned()],
         CancellationToken::new(),
     )
@@ -856,13 +860,12 @@ async fn job_output_dir_moves() {
 #[tokio::test]
 async fn universe_swap() {
     // A universe migration resets the state machine. Sessions and history
-    // die with the old universe, and the manager keeps serving.
+    // die with the old universe, the boundary carries the last committed
+    // job across, and the manager keeps serving.
     let log = test_logger(function_name!());
     let dir = TempDir::with_prefix("sush-").unwrap();
     let mut root = ephemeral_test_root();
-    let (universe, universe_rx) = watch::channel(Universe::genesis(
-        seed_gossip(&BookmarkSource::null()).await,
-    ));
+    let (universe, universe_rx) = watch::channel(Universe::genesis(null_gossip().await));
     let mgr = JobManager::with_root_certs(
         log,
         PathIsolation::InsecureDisable,
@@ -871,6 +874,7 @@ async fn universe_swap() {
         no_cubbies(),
         universe_rx,
         lonely(),
+        &Locker::null(),
         &[root.cert().to_owned()],
         CancellationToken::new(),
     )
@@ -909,9 +913,7 @@ async fn universe_swap() {
 
     // Migrate. The session and the job's history are gone.
     universe
-        .send(Universe::genesis(
-            seed_gossip(&BookmarkSource::null()).await,
-        ))
+        .send(Universe::genesis(null_gossip().await))
         .unwrap();
     timeout(Duration::from_secs(30), async {
         while mgr.session(&authn).is_some() {
@@ -920,6 +922,30 @@ async fn universe_swap() {
     })
     .await
     .expect("state reset");
+    // The new universe cannot name the job, so the boundary
+    // adjudicates its recorded ending on this sled's sole authority.
+    timeout(Duration::from_secs(30), async {
+        loop {
+            if let Ok(map) = mgr.job_status(&authn, &job_id).await
+                && matches!(
+                    map.get(mgr.own_baseboard()),
+                    Some(JobStatus::Stopped { result: Ok(0), .. })
+                )
+            {
+                break;
+            }
+            sleep(Duration::from_millis(50)).await;
+        }
+    })
+    .await
+    .expect("boundary adjudication");
+
+    // A further swap does not re-adjudicate the same boundary: one
+    // ruling per boundary.
+    universe
+        .send(Universe::genesis(null_gossip().await))
+        .unwrap();
+    sleep(Duration::from_millis(200)).await;
     assert!(matches!(
         mgr.job_status(&authn, &job_id).await,
         Err(JobError::JobNotFound(_))
@@ -1010,7 +1036,7 @@ async fn cert_chain() {
         part_number: "test part".to_string(),
         serial_number: "0000".to_string(),
     };
-    let gossip = isolated(seed_gossip(&BookmarkSource::null()).await);
+    let gossip = isolated(null_gossip().await);
     let shutdown = CancellationToken::new();
     let mgr = JobManager::with_root_certs(
         log,
@@ -1020,6 +1046,7 @@ async fn cert_chain() {
         no_cubbies(),
         gossip,
         lonely(),
+        &Locker::null(),
         &roots,
         shutdown,
     )
@@ -1784,7 +1811,7 @@ async fn hostile_imports_cannot_displace() {
         part_number: "test part".to_string(),
         serial_number: "0000".to_string(),
     };
-    let seed = seed_gossip(&BookmarkSource::null()).await;
+    let seed = null_gossip().await;
     let peer = seed.clone();
     let shutdown = CancellationToken::new();
     let mgr = JobManager::with_root_certs(
@@ -1795,6 +1822,7 @@ async fn hostile_imports_cannot_displace() {
         no_cubbies(),
         isolated(seed),
         lonely(),
+        &Locker::null(),
         from_ref(&root_cert),
         shutdown,
     )
@@ -1930,7 +1958,7 @@ async fn homonym_issuer_resolves_to_true_parent() {
         part_number: "test part".to_string(),
         serial_number: "0000".to_string(),
     };
-    let seed = seed_gossip(&BookmarkSource::null()).await;
+    let seed = null_gossip().await;
     let peer = seed.clone();
     let shutdown = CancellationToken::new();
     let mgr = JobManager::with_root_certs(
@@ -1941,6 +1969,7 @@ async fn homonym_issuer_resolves_to_true_parent() {
         no_cubbies(),
         isolated(seed),
         lonely(),
+        &Locker::null(),
         from_ref(&root_cert),
         shutdown,
     )

@@ -11,14 +11,16 @@ use std::collections::BTreeSet;
 use std::net::SocketAddrV6;
 
 use camino::Utf8PathBuf;
-use rumors::{Network, Peer, Rumors};
+use function_name::named;
+use rumors::{Network, Rumors};
 use slog::Logger;
 use tokio::sync::watch;
 use tokio_util::sync::CancellationToken;
 
 use sush_common::jobs::BaseboardId;
-use sush_server::bookmark::{BookmarkSource, SushBookmark};
-use sush_server::gossip::{LinkedBaseboards, Universe, spawn_gossip};
+use sush_server::bookmark::SushBookmark;
+use sush_server::gossip::{LinkedBaseboards, Seed, Universe, spawn_gossip};
+use sush_server::locker::Locker;
 
 use common::{
     baseboard, corpus, eventually, gossip_config, localhost, pki, sprockets_config, test_logger,
@@ -36,13 +38,8 @@ struct Node {
 impl Node {
     async fn start(log: &Logger, dir: &Utf8PathBuf, identity: usize) -> Node {
         let shutdown = CancellationToken::new();
-        let bookmarks = BookmarkSource::null();
-        let seed: Rumors<String, SushBookmark> = Peer::seed()
-            .bookmark(bookmarks.next_handle())
-            .await
-            .expect("a pristine seed never touches its bookmark")
-            .into_rumors();
-        let initial = seed.network();
+        let seed: Seed<String> = Seed::grow(log, &Locker::null()).await;
+        let initial = seed.rumors().network();
         let (peers, peers_rx) = watch::channel(BTreeSet::new());
         let (addr, universe, linked) = spawn_gossip(
             log,
@@ -52,7 +49,6 @@ impl Node {
             localhost(),
             peers_rx,
             seed,
-            bookmarks,
             shutdown.clone(),
         )
         .await
@@ -109,10 +105,11 @@ fn converged(nodes: &[&Node]) -> Option<Network> {
     nodes.iter().all(|n| n.network() == first).then_some(first)
 }
 
+#[named]
 #[tokio::test]
 async fn cold_start_converges() {
     let (_tmp, dir) = pki("sush-gossip-", 3);
-    let log = test_logger("cold_start_converges");
+    let log = test_logger(function_name!());
     let a = Node::start(&log, &dir, 1).await;
     let b = Node::start(&log, &dir, 2).await;
     let c = Node::start(&log, &dir, 3).await;
@@ -132,10 +129,11 @@ async fn cold_start_converges() {
     .await;
 }
 
+#[named]
 #[tokio::test]
 async fn staggered_start_converges() {
     let (_tmp, dir) = pki("sush-gossip-", 3);
-    let log = test_logger("staggered_start_converges");
+    let log = test_logger(function_name!());
     let a = Node::start(&log, &dir, 1).await;
     let b = Node::start(&log, &dir, 2).await;
     mesh(&[&a, &b]);
@@ -160,10 +158,11 @@ async fn staggered_start_converges() {
     .await;
 }
 
+#[named]
 #[tokio::test]
 async fn node_replacement_reconverges() {
     let (_tmp, dir) = pki("sush-gossip-", 4);
-    let log = test_logger("node_replacement_reconverges");
+    let log = test_logger(function_name!());
     let a = Node::start(&log, &dir, 1).await;
     let b = Node::start(&log, &dir, 2).await;
     let c = Node::start(&log, &dir, 3).await;
@@ -189,10 +188,11 @@ async fn node_replacement_reconverges() {
     .await;
 }
 
+#[named]
 #[tokio::test]
 async fn linked_follows_live_links() {
     let (_tmp, dir) = pki("sush-gossip-", 2);
-    let log = test_logger("linked_follows_live_links");
+    let log = test_logger(function_name!());
     let a = Node::start(&log, &dir, 1).await;
     let b = Node::start(&log, &dir, 2).await;
     assert!(a.linked().is_empty());

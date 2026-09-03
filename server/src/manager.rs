@@ -38,10 +38,12 @@ use sush_common::keys::{KeyError, KeyId, SshPublicKey};
 use sush_common::targets::{Cubbies, SledHealth, SledVersion};
 use sush_common::version::LONG_VERSION;
 
+use crate::boundary::BoundaryStore;
 use crate::error::JobError;
 use crate::executor::PathIsolation;
 use crate::gossip::LinkedBaseboards;
 use crate::job::SocketSender;
+use crate::locker::Locker;
 use crate::messages::v0::{CertRequest, IdentityRequest, JobRequest, Request, SessionRequest};
 use crate::output::{JobOutputDir, JobOutputFileStream};
 use crate::state::{GossipUniverse, MAX_CERTS, State, StateManager};
@@ -107,6 +109,7 @@ impl JobManager {
         cubbies: watch::Receiver<Cubbies>,
         universe: watch::Receiver<GossipUniverse>,
         linked: LinkedBaseboards,
+        locker: &Locker,
         roots: &[impl AsRef<Path>],
         shutdown: CancellationToken,
     ) -> Result<Self, JobError> {
@@ -119,6 +122,7 @@ impl JobManager {
             cubbies,
             universe,
             linked,
+            locker,
             &roots,
             shutdown,
         )
@@ -134,6 +138,7 @@ impl JobManager {
         cubbies: watch::Receiver<Cubbies>,
         universe: watch::Receiver<GossipUniverse>,
         linked: LinkedBaseboards,
+        locker: &Locker,
         roots: &[Certificate],
         shutdown: CancellationToken,
     ) -> Result<Self, JobError> {
@@ -141,6 +146,8 @@ impl JobManager {
         let (tx_req, rx_req) = mpsc::channel(16);
         let requests = ReceiverStream::new(rx_req);
         let session_sush_nonce = Arc::new(SyncMutex::new(SessionSushNonce::random()));
+        let boundary = Arc::new(BoundaryStore::new(&log, locker));
+        boundary.load().await;
         let (rx_state, join_state) = StateManager::run(
             log.new(o!("component" => "state manager")),
             path_isolation,
@@ -151,6 +158,7 @@ impl JobManager {
             universe,
             roots,
             session_sush_nonce.clone(),
+            boundary,
             shutdown,
         )?;
         Ok(Self {
