@@ -14,7 +14,7 @@ use std::sync::{Arc, Mutex};
 use chrono::{DateTime, Utc};
 use futures::{FutureExt as _, Stream, StreamExt};
 use lru::LruCache;
-use rumors::{CausalMessages, Peer, Rumors, Version};
+use rumors::{CausalMessages, Network, Rumors, Version};
 use sled_hardware_types::BaseboardId;
 use slog::{Logger, debug, error, info, o, warn};
 use tokio::sync::watch;
@@ -34,11 +34,13 @@ use sush_common::keys::{KeyError, KeyId, Signature, SshPublicKey};
 use sush_common::targets::Cubbies;
 use sush_common::version::{VersionInfo, VersionMap};
 
-use crate::bookmark::{BookmarkSource, SushBookmark};
+use crate::bookmark::SushBookmark;
+use crate::boundary::{Boundary, BoundaryStore, JobOutcome};
 use crate::executor::{Executor, PathIsolation};
-use crate::gossip::Universe;
+use crate::gossip::{Seed, Universe};
 use crate::history::JobHistory;
 use crate::job::SocketSender;
+use crate::locker::Locker;
 use crate::messages::v0::{
     CertRequest, Error, Event, IdentityRequest, JobEvent, JobRequest, Message, Request,
     SessionRequest,
@@ -49,6 +51,7 @@ use crate::output::JobOutputDir;
 pub type AttachmentPoints = BTreeMap<JobId, watch::Receiver<Option<SocketSender>>>;
 pub type Certificates = BTreeMap<KeyId, CertState>;
 pub type GossipNetwork = Rumors<VersionedMessage, SushBookmark>;
+pub type GossipSeed = Seed<VersionedMessage>;
 pub type GossipUniverse = Universe<VersionedMessage>;
 pub type QueuedJobs = BTreeMap<JobId, QueuedJob>;
 pub type RunningJobs = BTreeMap<(JobId, BaseboardId), DateTime<Utc>>;
@@ -308,6 +311,8 @@ impl<'a> SessionGuard<'a> {
         history: &mut JobHistory,
         executor: &mut Executor,
         attachments: &mut AttachmentPoints,
+        past: &Past,
+        rumors: Option<&GossipNetwork>,
     ) {
         while let Some(QueuedJob {
             job: request,
@@ -320,6 +325,31 @@ impl<'a> SessionGuard<'a> {
             if request.payload().runs_on(own_baseboard, cubbies) {
                 if replayed {
                     warn!(log, "not executing replayed job"; "job_id" => %job_id);
+                } else if past.boundary.untrusted() {
+                    warn!(
+                        log, "refusing job, the execution boundary is untrusted";
+                        "job_id" => %job_id,
+                    );
+                    executor.job_refused(
+                        job_id,
+                        ProcessError::Io {
+                            what: "consulting the execution boundary".to_string(),
+                            error: "the store is untrusted; this sled needs service".to_string(),
+                        },
+                    );
+                } else if past.lost_session == Some(self.session_id()) {
+                    warn!(
+                        log, "refusing job for session with lost history";
+                        "job_id" => %job_id,
+                    );
+                    executor.job_refused(
+                        job_id,
+                        ProcessError::Io {
+                            what: "consulting the execution boundary".to_string(),
+                            error: "a restart lost part of this session's history on this sled; start a new session"
+                                .to_string(),
+                        },
+                    );
                 } else if history
                     .get_job_status(&job_id)
                     .map(|status| {
@@ -327,12 +357,69 @@ impl<'a> SessionGuard<'a> {
                     })
                     .unwrap_or(true)
                 {
-                    executor.job_start(certs, request.clone(), params, tx_attachment);
-                    attachments.insert(job_id, rx_attachment);
+                    let Some(rumors) = rumors else {
+                        warn!(log, "not starting a job while draining"; "job_id" => %job_id);
+                        self.job_started(request);
+                        continue;
+                    };
+                    let boundary = Boundary {
+                        network: rumors.network(),
+                        session: self.session_id(),
+                        job: job_id,
+                        frontier: rumors.snapshot().latest().clone(),
+                        outcome: JobOutcome::Committed,
+                    };
+                    if executor.job_start(certs, request.clone(), params, tx_attachment, boundary) {
+                        attachments.insert(job_id, rx_attachment);
+                    }
                 }
             }
             self.job_started(request);
         }
+    }
+}
+
+/// This incarnation's relationship to its own past: where it entered
+/// the universe, what a previous life committed to, and what it left
+/// running.
+#[derive(Debug)]
+pub struct Past {
+    /// The causal frontier we joined this universe at, if we joined
+    /// rather than seeded it.
+    join_frontier: Option<Version>,
+    /// The last job this sled committed to executing, durable across
+    /// restarts.
+    boundary: Arc<BoundaryStore>,
+    /// The session a previous life of this sled lost history of. Its
+    /// jobs must not execute here; see [`Boundary::covered_by`].
+    lost_session: Option<SessionId>,
+    /// Jobs whose replayed start events say a previous life ran them.
+    /// The end of such a job may replay later and remove it from the
+    /// set, so the survivors are known only when replay finishes.
+    zombies: BTreeSet<JobId>,
+}
+
+impl Past {
+    pub fn new(
+        join_frontier: Option<Version>,
+        boundary: Arc<BoundaryStore>,
+        lost_session: Option<SessionId>,
+    ) -> Self {
+        Self {
+            join_frontier,
+            boundary,
+            lost_session,
+            zombies: BTreeSet::new(),
+        }
+    }
+
+    /// Whether a message at `version` is live traffic rather than
+    /// replayed history. Only strict causal descendants of the join
+    /// frontier are live.
+    fn is_live(&self, version: &Version) -> bool {
+        self.join_frontier
+            .as_ref()
+            .is_none_or(|frontier| version > frontier)
     }
 }
 
@@ -361,14 +448,8 @@ pub struct State {
     roots: Box<[KeyId]>,
     /// Baseboards by cubby number, as much of it as is known.
     cubbies: Cubbies,
-    /// The causal frontier we joined this universe at, if we joined
-    /// rather than seeded it.
-    join_frontier: Option<Version>,
-    /// Jobs whose start event on our own baseboard arrived as replayed
-    /// history. A previous life started them, and no executor of ours
-    /// will ever stop them. A terminal event clears its job, so
-    /// mid-replay entries are only suspects.
-    zombies: BTreeSet<JobId>,
+    /// This incarnation's relationship to its own past.
+    past: Past,
     /// Message versions from newer builds, each warned about once.
     unknown_versions: BTreeSet<String>,
     /// Build provenance by sled.
@@ -387,7 +468,7 @@ impl State {
         own_baseboard: BaseboardId,
         root_certs: &[Certificate],
         session_sush_nonce: Arc<Mutex<SessionSushNonce>>,
-        join_frontier: Option<Version>,
+        past: Past,
     ) -> Result<Self, KeyError> {
         let certs = root_certs
             .iter()
@@ -414,8 +495,7 @@ impl State {
             unknown_versions: Default::default(),
             identities: LruCache::new(MAX_REGISTERED_IDENTITIES),
             revoked_keys: LruCache::new(MAX_REVOKED_KEYS),
-            join_frontier,
-            zombies: Default::default(),
+            past,
         };
         new.validate_certs(&roots);
         for root in &roots {
@@ -463,7 +543,8 @@ impl State {
 
     /// Jobs a previous life of this server started and left running.
     pub fn zombies(&self) -> BTreeSet<JobId> {
-        self.zombies
+        self.past
+            .zombies
             .iter()
             .filter(|job_id| {
                 self.running
@@ -473,13 +554,29 @@ impl State {
             .collect()
     }
 
-    /// Whether a message at `version` is live traffic rather than
-    /// replayed history. Only strict causal descendants of the join
-    /// frontier are live.
     fn is_live(&self, version: &Version) -> bool {
-        self.join_frontier
-            .as_ref()
-            .is_none_or(|frontier| version > frontier)
+        self.past.is_live(version)
+    }
+
+    /// The boundary record carries the boundary job's ending, so the
+    /// next life can tell the truth instead of guessing. The write is
+    /// spawned because the state machine is synchronous, and losing
+    /// the race to a crash only falls back to interrupted.
+    fn record_boundary_outcome(&self, job_id: &JobId) {
+        let Some(status) = self
+            .history
+            .get_job_status(job_id)
+            .and_then(|map| map.get(&self.own_baseboard))
+            .cloned()
+        else {
+            return;
+        };
+        if !status.is_terminal() {
+            return;
+        }
+        let store = self.past.boundary.clone();
+        let job_id = *job_id;
+        spawn(async move { store.record_outcome(&job_id, &status).await });
     }
 
     pub fn get_job_status(&self, job_id: &JobId) -> Option<&JobStatusMap> {
@@ -546,6 +643,7 @@ impl State {
         &mut self,
         log: &Logger,
         executor: &mut Executor,
+        rumors: Option<&GossipNetwork>,
         incoming_version: &Version,
         message: &Arc<VersionedMessage>,
     ) -> Result<(), Error> {
@@ -749,6 +847,8 @@ impl State {
                                     &mut self.history,
                                     executor,
                                     &mut self.attachments,
+                                    &self.past,
+                                    rumors,
                                 );
                             } else {
                                 info!(
@@ -816,6 +916,8 @@ impl State {
                                     &mut self.history,
                                     executor,
                                     &mut self.attachments,
+                                    &self.past,
+                                    rumors,
                                 );
                             }
                             _ => {
@@ -901,12 +1003,26 @@ impl State {
                 // Track the active set of known-running jobs anywhere in the rack.
                 Event::Job(job_event) => match job_event {
                     JobEvent::Start(job_id, when) => {
+                        // A start never displaces a terminal status.
+                        // After an identity change, an adjudicated
+                        // Interrupted and a late replayed start are
+                        // concurrent, and the verdict must win in
+                        // both arrival orders.
+                        if self
+                            .history
+                            .get_job_status(job_id)
+                            .and_then(|status| status.get(baseboard_id))
+                            .is_some_and(|status| status.is_terminal())
+                        {
+                            info!(log, "ignoring a start for a settled job"; "job_id" => %job_id);
+                            return Ok(());
+                        }
                         info!(log, "job started"; "job_id" => %job_id, "when" => %when);
                         self.running.insert((*job_id, baseboard_id.clone()), *when);
                         // A replayed start on our own baseboard is a
                         // previous life's. Only these can be zombies.
                         if *baseboard_id == self.own_baseboard && !self.is_live(incoming_version) {
-                            self.zombies.insert(*job_id);
+                            self.past.zombies.insert(*job_id);
                         }
                         self.history.set_job_status(
                             job_id,
@@ -924,7 +1040,7 @@ impl State {
                         info!(log, "job stopped"; "job_id" => %job_id, "when" => %when, "result" => ?result);
                         if baseboard_id == &self.own_baseboard {
                             self.attachments.remove(job_id);
-                            self.zombies.remove(job_id);
+                            self.past.zombies.remove(job_id);
                         }
                         self.running.remove(&(*job_id, baseboard_id.clone()));
                         self.history.transition_job_status(
@@ -963,13 +1079,14 @@ impl State {
                         );
                         if *baseboard_id == self.own_baseboard {
                             executor.job_stopped(job_id);
+                            self.record_boundary_outcome(job_id);
                         }
                     }
                     JobEvent::Error(job_id, when, error) => {
                         error!(log, "job error"; "job_id" => %job_id, "when" => %when, "error" => %error);
                         if baseboard_id == &self.own_baseboard {
                             self.attachments.remove(job_id);
-                            self.zombies.remove(job_id);
+                            self.past.zombies.remove(job_id);
                         }
                         self.running.remove(&(*job_id, baseboard_id.clone()));
                         self.history.transition_job_status(
@@ -995,6 +1112,7 @@ impl State {
                         );
                         if *baseboard_id == self.own_baseboard {
                             executor.job_stopped(job_id);
+                            self.record_boundary_outcome(job_id);
                         }
                     }
                 },
@@ -1039,7 +1157,7 @@ fn apply_message(
     message: &Arc<VersionedMessage>,
 ) {
     tx_state.send_modify(|state| {
-        if let Err(error) = state.update(log, executor, version, message) {
+        if let Err(error) = state.update(log, executor, rumors, version, message) {
             error!(log, "state update failed"; "error" => ?error);
             // Re-gossiping a replayed message's error would grow the
             // set a little more on every rejoin by every sled.
@@ -1112,30 +1230,88 @@ fn reap_zombies(
     }
 }
 
-/// Create a fresh gossip network with this server as its only peer.
+/// Adjudicate the boundary job if replay gave it no status on our
+/// baseboard: announce its recorded ending, or interrupted when none
+/// was recorded. No status means its fate never left this sled, and
+/// no other sled can ever report it. A replayed start makes it a
+/// zombie instead, and a replayed end settles it. Adjudicate only
+/// after replay drains, like [`reap_zombies`], and once per universe.
+/// Sleds that witnessed a real terminal event keep it; the ruling
+/// convinces only sleds that knew nothing, so verdicts can differ
+/// across sleds.
+fn adjudicate_boundary(
+    log: &Logger,
+    tx_state: &watch::Sender<State>,
+    rumors: Option<&GossipNetwork>,
+    own_baseboard: &BaseboardId,
+    snapshot: Option<&Boundary>,
+    survivors: &BTreeSet<JobId>,
+    adjudicated: &mut Option<JobId>,
+) {
+    let Some(boundary) = snapshot else {
+        return;
+    };
+    // One ruling per boundary: a sled that swaps universes again
+    // without running a job must not re-adjudicate the same job.
+    if *adjudicated == Some(boundary.job) {
+        return;
+    }
+    // A survivor's events land in the new universe when it finishes,
+    // so it needs no verdict now and may need one at a later swap.
+    if survivors.contains(&boundary.job) {
+        return;
+    }
+    *adjudicated = Some(boundary.job);
+    let witnessed = {
+        let state = tx_state.borrow();
+        state
+            .get_job_status(&boundary.job)
+            .is_some_and(|status| status.get(own_baseboard).is_some())
+    };
+    if witnessed {
+        return;
+    }
+    let job_id = boundary.job;
+    // A stopped ending announces the start and stop pair, so the
+    // ordinary status transitions apply on every sled; a bare stop
+    // with no prior start would be dropped.
+    let events = match &boundary.outcome {
+        JobOutcome::Ended(JobStatus::Stopped {
+            time_started,
+            time_stopped,
+            result,
+            output,
+            ..
+        }) => vec![
+            JobEvent::Start(job_id, *time_started),
+            JobEvent::Stop(job_id, *time_stopped, result.clone(), output.clone()),
+        ],
+        JobOutcome::Ended(JobStatus::Error {
+            time_error, error, ..
+        }) => vec![JobEvent::Error(job_id, *time_error, error.clone())],
+        JobOutcome::Ended(_) | JobOutcome::Committed => vec![JobEvent::Error(
+            job_id,
+            Utc::now(),
+            ProcessError::Interrupted,
+        )],
+    };
+    if let Some(rumors) = rumors {
+        for event in events {
+            rumors.send(Message::Event(own_baseboard.clone(), Event::Job(event)).into());
+        }
+    }
+    warn!(log, "adjudicated an unwitnessed job from a previous life"; "job_id" => %job_id);
+}
+
+/// Grow a fresh gossip seed over sush's message type.
 ///
 /// A peer that seeds its own network has no one to gossip with, so jobs run
 /// only on the server that accepted them, and no server learns about any other
 /// server's sessions. This stands in for joining the rack's network over
-/// sprockets on the bootstrap network.
-///
-/// A pristine seed's bookmark touches no storage, and identities
-/// recorded there are reclaimed only after a migration returns us to
-/// their universe. Bad storage would abort every session at the
-/// persist gate, before the seed could even learn to migrate. Probe
-/// first and shed on failure.
-pub async fn seed_gossip(bookmarks: &BookmarkSource) -> GossipNetwork {
-    let handle = match bookmarks.probe().await {
-        Ok(()) => bookmarks.next_handle(),
-        Err(_) => bookmarks.shed_handle(),
-    };
-    match Peer::seed().bookmark(handle).await {
-        Ok(peer) => peer.into_rumors(),
-        Err(unbookmarked) => match unbookmarked.peer.bookmark(bookmarks.shed_handle()).await {
-            Ok(peer) => peer.into_rumors(),
-            Err(_) => unreachable!("a shed bookmark never touches storage"),
-        },
-    }
+/// sprockets on the bootstrap network. Storage semantics are
+/// [`Seed::grow`]'s.
+pub async fn seed_gossip(log: &Logger, locker: &Locker) -> GossipSeed {
+    Seed::grow(log, locker).await
 }
 
 #[derive(Debug)]
@@ -1165,6 +1341,7 @@ impl StateManager {
         mut universe: watch::Receiver<GossipUniverse>,
         roots: &[Certificate],
         session_sush_nonce: Arc<Mutex<SessionSushNonce>>,
+        store: Arc<BoundaryStore>,
         shutdown: CancellationToken,
     ) -> Result<(watch::Receiver<State>, JoinHandle<()>), KeyError>
     where
@@ -1184,12 +1361,41 @@ impl StateManager {
         } = universe.borrow_and_update().clone();
         let mut causal_messages = initial.causal_messages();
 
+        // The boundary's session counts as lost unless the universe
+        // already knows everything the boundary knew. See
+        // [`Boundary::covered_by`]. Decisions read a snapshot of the
+        // boundary, never the live store: the launcher advances the
+        // store concurrently, and a job committed after the snapshot
+        // is this incarnation's, not the past's.
+        let lost = {
+            let log = log.clone();
+            move |snapshot: Option<&Boundary>, network: Network, frontier: Option<&Version>| {
+                snapshot.and_then(|boundary| {
+                    let covered = boundary.covered_by(network, frontier);
+                    debug!(
+                        log, "boundary coverage";
+                        "covered" => covered,
+                        "recorded_network" => ?boundary.network,
+                        "network" => ?network,
+                        "recorded_frontier" => ?boundary.frontier,
+                        "join_frontier" => ?frontier,
+                    );
+                    (!covered).then_some(boundary.session)
+                })
+            }
+        };
+        let boundary = store.boundary();
+
         // We report our current state through a watch channel.
         let mut initial_state = State::new(
             own_baseboard.clone(),
             roots,
             session_sush_nonce.clone(),
-            frontier.clone(),
+            Past::new(
+                frontier.clone(),
+                store.clone(),
+                lost(boundary.as_ref(), initial.network(), frontier.as_ref()),
+            ),
         )?;
         initial_state.cubbies = cubbies.borrow_and_update().clone();
         let (tx_state, rx_state) = watch::channel(initial_state);
@@ -1200,6 +1406,7 @@ impl StateManager {
             log.new(o!("component" => "executor")),
             path_isolation,
             output_dir,
+            store,
             shutdown.child_token(),
         );
 
@@ -1219,9 +1426,10 @@ impl StateManager {
                 // history); `survivors` are jobs this incarnation itself
                 // runs across a universe swap; `reaped` are zombies
                 // already declared interrupted.
-                let mut frontier = frontier;
+                let mut boundary = boundary;
                 let mut survivors: BTreeSet<JobId> = BTreeSet::new();
                 let mut reaped: BTreeSet<JobId> = BTreeSet::new();
+                let mut adjudicated: Option<JobId> = None;
 
                 // Announce our build.
                 if let Some((rumors, _)) = &gossip {
@@ -1293,8 +1501,7 @@ impl StateManager {
                                 break;
                             }
                             Some((version, message)) => {
-                                // Past the join frontier means the message is live.
-                                let live = frontier.as_ref().is_none_or(|f| version > f);
+                                let live = tx_state.borrow().is_live(&version);
                                 apply_message(
                                     &log,
                                     &tx_state,
@@ -1321,6 +1528,15 @@ impl StateManager {
                                         &own_baseboard,
                                         &survivors,
                                         &mut reaped,
+                                    );
+                                    adjudicate_boundary(
+                                        &log,
+                                        &tx_state,
+                                        gossip.as_ref().map(|(rumors, _)| rumors),
+                                        &own_baseboard,
+                                        boundary.as_ref(),
+                                        &survivors,
+                                        &mut adjudicated,
                                     );
                                 }
                             },
@@ -1356,17 +1572,31 @@ impl StateManager {
                         causal_messages = fresh.rumors.causal_messages();
                         // A reaped zombie may still show as running (its
                         // error event races the swap); it is no survivor.
+                        // A job the executor is still launching is a
+                        // survivor too: its start event may not have
+                        // applied yet, but its events land in the new
+                        // universe like any running job's.
                         survivors = tx_state.borrow().own_running_jobs();
+                        survivors.extend(executor.in_flight());
                         survivors.retain(|job_id| !reaped.contains(job_id));
                         reaped = BTreeSet::new();
-                        frontier = fresh.frontier.clone();
+                        boundary = tx_state.borrow().past.boundary.boundary();
                         // TODO: re-inject local job state (policy pending).
+                        let lost_session = lost(
+                            boundary.as_ref(),
+                            fresh.rumors.network(),
+                            fresh.frontier.as_ref(),
+                        );
                         tx_state.send_modify(|state| {
                             *state = State::new(
                                 own_baseboard.clone(),
                                 &roots,
                                 state.session_sush_nonce.clone(),
-                                fresh.frontier.clone(),
+                                Past::new(
+                                    fresh.frontier.clone(),
+                                    state.past.boundary.clone(),
+                                    lost_session,
+                                ),
                             )
                             .expect("roots validated at startup");
                             state.cubbies = cubbies.borrow().clone();
@@ -1396,6 +1626,15 @@ impl StateManager {
                             &own_baseboard,
                             &survivors,
                             &mut reaped,
+                        );
+                        adjudicate_boundary(
+                            &log,
+                            &tx_state,
+                            Some(&*rumors),
+                            &own_baseboard,
+                            boundary.as_ref(),
+                            &survivors,
+                            &mut adjudicated,
                         );
                     }
                 }

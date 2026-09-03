@@ -7,7 +7,7 @@
 //! Start, stop, and watch job processes. Driven by the session state
 //! machine, but session agnostic.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::io;
 use std::mem::MaybeUninit;
 use std::os::fd::AsRawFd as _;
@@ -35,6 +35,7 @@ use sush_common::jobs::{
     JobId, JobMode, JobOutputStream, JobStartRequest, ProcessError, SignedJob, VerifiedJob,
 };
 
+use crate::boundary::{Boundary, BoundaryStore};
 use crate::io::JobIo;
 use crate::job::{Job, SocketSender};
 use crate::messages::v0::{Event, JobEvent};
@@ -50,13 +51,31 @@ pub const DEFAULT_TERM: &str = "vt100";
 /// experience backpressure; if we do, something is wrong.
 const EVENTS_CHANNEL_CAPACITY: usize = 16;
 
+/// The launcher performs one small fsync per job, so at human job
+/// rates this never fills. A full queue refuses the job.
+const LAUNCH_CHANNEL_CAPACITY: usize = 16;
+
 pub struct Executor {
     log: Logger,
     events: Arc<RwLock<Option<mpsc::Sender<Event>>>>,
     path_isolation: PathIsolation,
     output_dir: JobOutputDir,
+    launch: mpsc::Sender<Launch>,
     shutdown: CancellationToken,
     stop: BTreeMap<JobId, CancellationToken>,
+}
+
+/// One validated job on its way to the launcher.
+struct Launch {
+    log: Logger,
+    boundary: Boundary,
+    events: mpsc::Sender<Event>,
+    output_dir: JobOutputDir,
+    request: VerifiedJob,
+    params: JobStartParams,
+    path_isolation: PathIsolation,
+    tx_attachment: watch::Sender<Option<SocketSender>>,
+    stop: CancellationToken,
 }
 
 /// Executor methods should be infallible; errors are reported via events.
@@ -65,6 +84,7 @@ impl Executor {
         log: Logger,
         path_isolation: PathIsolation,
         output_dir: JobOutputDir,
+        boundary: Arc<BoundaryStore>,
         shutdown: CancellationToken,
     ) -> (Self, impl Stream<Item = Event> + Send + 'static) {
         let (tx_events, rx_events) = mpsc::channel(EVENTS_CHANNEL_CAPACITY);
@@ -80,6 +100,25 @@ impl Executor {
             }
         });
 
+        // The queue keeps boundary writes in release order. If each job
+        // advanced the boundary from its own task, two writes could land
+        // out of order, and the record would name an older job than one
+        // that already spawned.
+        let (launch, mut queued) = mpsc::channel::<Launch>(LAUNCH_CHANNEL_CAPACITY);
+        spawn(async move {
+            while let Some(launch) = queued.recv().await {
+                if let Err(error) = boundary.advance(&launch.boundary).await {
+                    let error = ProcessError::Io {
+                        what: "recording the execution boundary".to_string(),
+                        error: error.to_string(),
+                    };
+                    send_error(&launch.log, &launch.boundary.job, &launch.events, error).await;
+                    continue;
+                }
+                spawn(job_spawn(launch));
+            }
+        });
+
         // Return the executor and event stream.
         (
             Self {
@@ -87,6 +126,7 @@ impl Executor {
                 events,
                 path_isolation,
                 output_dir,
+                launch,
                 shutdown,
                 stop: BTreeMap::new(),
             },
@@ -94,16 +134,19 @@ impl Executor {
         )
     }
 
+    /// Returns whether the job was queued for launch, so the caller
+    /// keeps attachment points only for jobs that can arrive.
     pub fn job_start(
         &mut self,
         certs: &mut Certificates,
         request: SignedJob,
         params: JobStartParams,
         tx_attachment: watch::Sender<Option<SocketSender>>,
-    ) {
+        boundary: Boundary,
+    ) -> bool {
         let Some(events) = self.events.read().unwrap().as_ref().cloned() else {
             // No more events ⇒ shutting down ⇒ no new jobs allowed.
-            return;
+            return false;
         };
 
         // Validate the job request.
@@ -116,7 +159,7 @@ impl Executor {
                 spawn(async move {
                     send_error(&log, &job_id, &events, $err).await;
                 });
-                return;
+                return false;
             }};
         }
         if request.payload().command.starts_with('-') {
@@ -134,16 +177,29 @@ impl Executor {
 
         let stop = self.shutdown.child_token();
         self.stop.insert(job_id, stop.clone());
-        spawn(job_spawn(
-            self.log.new(o!("job_id" => job_id)),
+        let refused = self.launch.try_send(Launch {
+            log: self.log.new(o!("job_id" => job_id)),
+            boundary,
             events,
-            self.output_dir.clone(),
-            verified_request,
+            output_dir: self.output_dir.clone(),
+            request: verified_request,
             params,
-            self.path_isolation,
+            path_isolation: self.path_isolation,
             tx_attachment,
             stop,
-        ));
+        });
+        if let Err(error) = refused {
+            self.stop.remove(&job_id);
+            self.job_refused(
+                job_id,
+                ProcessError::Io {
+                    what: "queueing the job for launch".to_string(),
+                    error: error.to_string(),
+                },
+            );
+            return false;
+        }
+        true
     }
 
     pub fn job_stop(&mut self, job_id: &JobId) {
@@ -154,6 +210,12 @@ impl Executor {
 
     pub fn job_stopped(&mut self, job_id: &JobId) {
         let _ = self.stop.remove(job_id);
+    }
+
+    /// Every job accepted for launch whose stop token is still held:
+    /// queued, spawning, or running.
+    pub fn in_flight(&self) -> BTreeSet<JobId> {
+        self.stop.keys().copied().collect()
     }
 
     /// Announce a job that will never run here.
@@ -173,20 +235,21 @@ impl Executor {
 }
 
 /// Spawn a process for a job and return an attachment point if it is
-/// interactive. Assumes the job request has already been validated,
-/// e.g., as by [`crate::JobManager::job_start`].
-#[allow(clippy::too_many_arguments)]
-async fn job_spawn(
-    log: Logger,
-    events: mpsc::Sender<Event>,
-    output_dir: JobOutputDir,
-    request: VerifiedJob,
-    params: JobStartParams,
-    path_isolation: PathIsolation,
-    tx_attachment: watch::Sender<Option<SocketSender>>,
-    stop: CancellationToken,
-) {
+/// interactive. Assumes [`Executor::job_start`] validated the request
+/// and the launcher committed its boundary.
+async fn job_spawn(launch: Launch) {
     use JobOutputStream::*;
+    let Launch {
+        log,
+        boundary: _,
+        events,
+        output_dir,
+        request,
+        params,
+        path_isolation,
+        tx_attachment,
+        stop,
+    } = launch;
     let JobStartRequest {
         job_id,
         session_id: _,

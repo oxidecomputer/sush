@@ -54,24 +54,21 @@ pub struct BookmarkSource {
 #[derive(Debug)]
 struct Ratchet {
     log: Logger,
-    locker: Locker,
     tenant: Tenant,
     generation: AtomicU64,
 }
 
 impl BookmarkSource {
-    /// A source persisting to `locker`. Construct exactly one source
-    /// per locker per process, and feed that same source to both
-    /// [`seed_gossip`](crate::seed_gossip) and
-    /// [`spawn_gossip`](crate::gossip::spawn_gossip).
-    /// A handle is disabled when its source hands out a newer one.
-    /// No source can disable another source's handles, so a second
-    /// one would let an old peer overwrite its replacement's record.
+    /// A source persisting to `locker`.
+    /// [`Seed::grow`](crate::gossip::Seed::grow) makes the one source
+    /// a locker gets per process. A handle is disabled when its source
+    /// hands out a newer one. No source can disable another source's
+    /// handles, so a second source would let an old peer overwrite its
+    /// replacement's record.
     pub fn new(log: &Logger, locker: &Locker) -> Self {
         Self {
             ratchet: Arc::new(Ratchet {
                 log: log.new(o!("component" => "bookmark")),
-                locker: locker.clone(),
                 tenant: locker.tenant(BOOKMARK),
                 generation: AtomicU64::new(0),
             }),
@@ -101,15 +98,6 @@ impl BookmarkSource {
             generation: 0,
             shed: true,
         }
-    }
-
-    /// Does the storage work?
-    pub async fn probe(&self) -> Result<(), StoreError> {
-        let usable = self.ratchet.locker.probe().await;
-        if let Err(error) = &usable {
-            warn!(self.ratchet.log, "no usable bookmark storage"; "error" => %error);
-        }
-        usable
     }
 }
 
@@ -230,7 +218,7 @@ mod test {
 
     /// A discarded verdict is a fresh start, not an error.
     #[tokio::test]
-    async fn discard_mints_a_fresh_identity() {
+    async fn discard_assumes_fresh_identity() {
         let dir = TempDir::with_prefix("sush-bookmark-").unwrap();
         let slots = slots(&dir);
         for (slot, bytes) in slots.iter().zip([b"one", b"two"]) {
@@ -255,17 +243,6 @@ mod test {
         ));
         assert!(matches!(old.load().await, Err(BookmarkIoError::Superseded)));
         assert_eq!(read_back(&new).await.unwrap(), b"before");
-    }
-
-    /// Probing proves writability by writing, not by guessing from
-    /// directory metadata.
-    #[tokio::test]
-    async fn probe_rejects_unwritable_storage() {
-        let unwritable = source(vec![Utf8PathBuf::from("/nonexistent/sush")]);
-        assert!(unwritable.probe().await.is_err());
-
-        let dir = TempDir::with_prefix("sush-bookmark-").unwrap();
-        source(slots(&dir)).probe().await.unwrap();
     }
 
     /// A null source and a shed handle persist nothing and never fail,

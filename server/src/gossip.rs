@@ -45,6 +45,7 @@ use rumors::link::routed::Endpoint;
 
 use crate::bookmark::{BookmarkSource, SushBookmark};
 use crate::link::{AttestedBaseboards, CorpusSource, SprocketsDial, SprocketsLink, Transport};
+use crate::locker::Locker;
 
 /// The attested baseboards of our live gossip peers.
 pub type LinkedBaseboards = watch::Receiver<BTreeSet<BaseboardId>>;
@@ -90,6 +91,55 @@ impl<T> Universe<T> {
     }
 }
 
+/// A seeded network paired with the source persisting its identity.
+/// [`Seed::grow`] is the only constructor and [`spawn_gossip`] consumes
+/// the pair whole, so a seed can never gossip against a source other
+/// than its own.
+#[derive(Debug)]
+pub struct Seed<T> {
+    rumors: Rumors<T, SushBookmark>,
+    bookmarks: BookmarkSource,
+}
+
+impl<T> Seed<T> {
+    /// Seed a fresh universe with this server as its only peer, over
+    /// `locker`'s storage, making the locker's one [`BookmarkSource`].
+    ///
+    /// A pristine seed's bookmark touches no storage, and identities
+    /// recorded there are reclaimed only after a migration returns us
+    /// to their universe. Bad storage would abort every session at the
+    /// persist gate, before the seed could even learn to migrate. The
+    /// probe runs first, and a failed probe sheds the bookmark.
+    pub async fn grow(log: &Logger, locker: &Locker) -> Self
+    where
+        T: DeserializeOwned + Serialize + Send + Sync + 'static,
+    {
+        let bookmarks = BookmarkSource::new(log, locker);
+        let handle = match locker.probe().await {
+            Ok(()) => bookmarks.next_handle(),
+            Err(_) => bookmarks.shed_handle(),
+        };
+        let rumors = match Peer::seed().bookmark(handle).await {
+            Ok(peer) => peer.into_rumors(),
+            Err(unbookmarked) => match unbookmarked.peer.bookmark(bookmarks.shed_handle()).await {
+                Ok(peer) => peer.into_rumors(),
+                Err(_) => unreachable!("a shed bookmark never touches storage"),
+            },
+        };
+        Self { rumors, bookmarks }
+    }
+
+    pub fn rumors(&self) -> &Rumors<T, SushBookmark> {
+        &self.rumors
+    }
+
+    /// The network alone, for a seed that will never gossip
+    /// (see [`isolated`]).
+    pub fn into_rumors(self) -> Rumors<T, SushBookmark> {
+        self.rumors
+    }
+}
+
 /// A single-peer universe that never changes. The standalone server uses
 /// this, as does a sled that cannot gossip. The receiver outlives its
 /// sender.
@@ -132,8 +182,7 @@ pub async fn spawn_gossip<T>(
     corpus: CorpusSource,
     listen_addr: SocketAddrV6,
     peers: watch::Receiver<BTreeSet<SocketAddrV6>>,
-    seed: Rumors<T, SushBookmark>,
-    bookmarks: BookmarkSource,
+    seed: Seed<T>,
     shutdown: CancellationToken,
 ) -> io::Result<(SocketAddrV6, watch::Receiver<Universe<T>>, LinkedBaseboards)>
 where
@@ -149,8 +198,7 @@ where
     )
     .await?;
     let bound = transport.bound();
-    let (universe, linked) =
-        spawn_gossip_manager(log, config, transport, peers, seed, bookmarks, shutdown);
+    let (universe, linked) = spawn_gossip_manager(log, config, transport, peers, seed, shutdown);
     Ok((bound, universe, linked))
 }
 
@@ -164,13 +212,16 @@ pub fn spawn_gossip_manager<T>(
     config: GossipConfig,
     transport: Transport,
     peers: watch::Receiver<BTreeSet<SocketAddrV6>>,
-    seed: Rumors<T, SushBookmark>,
-    bookmarks: BookmarkSource,
+    seed: Seed<T>,
     shutdown: CancellationToken,
 ) -> (watch::Receiver<Universe<T>>, LinkedBaseboards)
 where
     T: DeserializeOwned + Serialize + Send + Sync + 'static,
 {
+    let Seed {
+        rumors: seed,
+        bookmarks,
+    } = seed;
     let (publish, subscribe) = watch::channel(Universe::genesis(seed.clone()));
     let (linked, subscribe_linked) = watch::channel(BTreeSet::new());
     let manager = Manager {

@@ -7,24 +7,30 @@
 mod common;
 
 use std::collections::BTreeSet;
+use std::fs::{read, read_to_string, write};
 use std::net::SocketAddrV6;
+use std::slice::from_ref;
+use std::time::Duration;
 
 use camino::Utf8PathBuf;
+use function_name::named;
 use sled_hardware_types::BaseboardId;
 use slog::Logger;
 use tempfile::TempDir;
 use tokio::sync::watch;
+use tokio::time::sleep;
 use tokio_util::sync::CancellationToken;
 
 use chrono::Utc;
 use sush_api::{JobStartParams, JobWait};
 use sush_common::jobs::{
-    JobId, JobOutputState, JobStatus, ProcessError, Session, SessionId, SessionSignerNonce,
+    JobId, JobMode, JobOutputState, JobStartRequest, JobStatus, ProcessError, Session, SessionId,
+    SessionSignerNonce, SignedJob,
 };
-use sush_common::keys::pem_cert_chain;
-use sush_common::targets::{Cubbies, SledHealth};
+use sush_common::keys::{EphemeralKey, Signer as _, pem_cert_chain};
+use sush_common::targets::{Cubbies, SledHealth, SledId, Target};
 use sush_common::version::VersionInfo;
-use sush_server::bookmark::{BOOKMARK, BookmarkSource};
+use sush_server::bookmark::BOOKMARK;
 use sush_server::executor::PathIsolation;
 use sush_server::gossip::spawn_gossip;
 use sush_server::locker::Locker;
@@ -55,25 +61,18 @@ impl Sled {
         root_pem: &Utf8PathBuf,
         shutdown: &CancellationToken,
     ) -> Sled {
-        Self::start_with_bookmarks(
-            log,
-            dir,
-            identity,
-            root_pem,
-            BookmarkSource::null(),
-            shutdown,
-        )
-        .await
+        Self::start_with_locker(log, dir, identity, root_pem, Locker::null(), shutdown).await
     }
 
-    async fn start_with_bookmarks(
+    async fn start_with_locker(
         log: &Logger,
         dir: &Utf8PathBuf,
         identity: usize,
         root_pem: &Utf8PathBuf,
-        bookmarks: BookmarkSource,
+        locker: Locker,
         shutdown: &CancellationToken,
     ) -> Sled {
+        let seed = seed_gossip(log, &locker).await;
         let (peers, peers_rx) = watch::channel(BTreeSet::new());
         let (addr, universe, linked) = spawn_gossip(
             log,
@@ -82,8 +81,7 @@ impl Sled {
             corpus(dir),
             localhost(),
             peers_rx,
-            seed_gossip(&bookmarks).await,
-            bookmarks,
+            seed,
             shutdown.clone(),
         )
         .await
@@ -101,7 +99,8 @@ impl Sled {
             cubbies,
             universe.clone(),
             linked,
-            std::slice::from_ref(root_pem),
+            &locker,
+            from_ref(root_pem),
             shutdown.clone(),
         )
         .await
@@ -117,18 +116,19 @@ impl Sled {
     }
 }
 
+#[named]
 #[tokio::test]
 async fn jobs_gossip_between_sleds() {
     let (_tmp, dir) = pki("sush-distributed-", 2);
     let mut root = common::ephemeral_root();
     let root_pem = dir.join("job-root.pem");
-    std::fs::write(
+    write(
         &root_pem,
         pem_cert_chain(vec![root.cert().to_owned()]).unwrap(),
     )
     .unwrap();
 
-    let log = test_logger("jobs_gossip_between_sleds");
+    let log = test_logger(function_name!());
     let shutdown = CancellationToken::new();
     let a = Sled::start(&log, &dir, 1, &root_pem, &shutdown).await;
     let b = Sled::start(&log, &dir, 2, &root_pem, &shutdown).await;
@@ -228,18 +228,19 @@ async fn jobs_gossip_between_sleds() {
     shutdown.cancel();
 }
 
+#[named]
 #[tokio::test]
 async fn rejoining_replays_without_reexecuting() {
     let (_tmp, dir) = pki("sush-replay-", 2);
     let mut root = common::ephemeral_root();
     let root_pem = dir.join("job-root.pem");
-    std::fs::write(
+    write(
         &root_pem,
         pem_cert_chain(vec![root.cert().to_owned()]).unwrap(),
     )
     .unwrap();
 
-    let log = test_logger("rejoining_replays_without_reexecuting");
+    let log = test_logger(function_name!());
     let shutdown = CancellationToken::new();
 
     // Sled A runs a whole job before B exists.
@@ -343,18 +344,19 @@ async fn rejoining_replays_without_reexecuting() {
     shutdown.cancel();
 }
 
+#[named]
 #[tokio::test]
 async fn interrupted_jobs_get_stopped() {
     let (_tmp, dir) = pki("sush-interrupted-", 2);
     let mut root = common::ephemeral_root();
     let root_pem = dir.join("job-root.pem");
-    std::fs::write(
+    write(
         &root_pem,
         pem_cert_chain(vec![root.cert().to_owned()]).unwrap(),
     )
     .unwrap();
 
-    let log = test_logger("interrupted_jobs_get_stopped");
+    let log = test_logger(function_name!());
     let shutdown = CancellationToken::new();
     let a = Sled::start(&log, &dir, 1, &root_pem, &shutdown).await;
     let authn_a = fake_identity(&mut root).await;
@@ -422,18 +424,19 @@ async fn interrupted_jobs_get_stopped() {
     shutdown.cancel();
 }
 
+#[named]
 #[tokio::test]
 async fn stragglers_do_not_interrupt_live_jobs() {
     let (_tmp, dir) = pki("sush-straggler-", 3);
     let mut root = common::ephemeral_root();
     let root_pem = dir.join("job-root.pem");
-    std::fs::write(
+    write(
         &root_pem,
         pem_cert_chain(vec![root.cert().to_owned()]).unwrap(),
     )
     .unwrap();
 
-    let log = test_logger("stragglers_do_not_interrupt_live_jobs");
+    let log = test_logger(function_name!());
     let shutdown = CancellationToken::new();
 
     // A and C converge; C then holds a message A never sees.
@@ -531,18 +534,264 @@ async fn stragglers_do_not_interrupt_live_jobs() {
     shutdown.cancel();
 }
 
+/// Sign a job aimed at one sled, so a retry cannot legitimately run
+/// anywhere else.
+async fn sign_job_for(
+    root: &mut EphemeralKey,
+    job_id: JobId,
+    session_id: SessionId,
+    command: &str,
+    sled: &BaseboardId,
+) -> SignedJob {
+    root.sign(JobStartRequest::new(
+        job_id,
+        session_id,
+        command,
+        JobMode::Batch,
+        Target::Sleds(vec![SledId::Baseboard(sled.clone())]),
+    ))
+    .await
+    .unwrap()
+}
+
+#[named]
 #[tokio::test]
-async fn bookmarks_survive_restart() {
-    let (_tmp, dir) = pki("sush-bookmark-", 2);
+async fn lost_session_is_refused() {
+    let (_tmp, dir) = pki("sush-lost-", 2);
     let mut root = common::ephemeral_root();
     let root_pem = dir.join("job-root.pem");
-    std::fs::write(
+    write(
         &root_pem,
         pem_cert_chain(vec![root.cert().to_owned()]).unwrap(),
     )
     .unwrap();
 
-    let log = test_logger("bookmarks_survive_restart");
+    let log = test_logger(function_name!());
+    let shutdown = CancellationToken::new();
+
+    // Sled A anchors the session and survives throughout.
+    let a = Sled::start(&log, &dir, 1, &root_pem, &shutdown).await;
+    let authn_a = fake_identity(&mut root).await;
+    let signer_nonce = SessionSignerNonce::random();
+    let session_id = SessionId::compute(
+        a.mgr.own_baseboard(),
+        a.mgr.session_sush_nonce(),
+        signer_nonce,
+    );
+    let mut session = Session::new(session_id);
+    a.mgr
+        .session_start(&authn_a, session_id, signer_nonce, true)
+        .await
+        .unwrap();
+
+    // Sled B keeps its boundary in a locker, learns the session, and
+    // is then cut off from gossip while its front door still works.
+    let boundary_dir = TempDir::with_prefix("sush-boundary-").unwrap();
+    let slot = Utf8PathBuf::from_path_buf(boundary_dir.path().to_path_buf()).unwrap();
+    let b_shutdown = CancellationToken::new();
+    let locker = Locker::new(&log, vec![slot.clone()]);
+    let b = Sled::start_with_locker(&log, &dir, 2, &root_pem, locker, &b_shutdown).await;
+    let authn_b = fake_identity(&mut root).await;
+    a.peers.send(BTreeSet::from([b.addr])).unwrap();
+    b.peers.send(BTreeSet::from([a.addr])).unwrap();
+    eventually("the session gossips to B", 120, async || {
+        b.mgr
+            .session(&authn_b)
+            .is_some_and(|s| s.session_id() == session_id)
+    })
+    .await;
+    a.peers.send(BTreeSet::new()).unwrap();
+    b.peers.send(BTreeSet::new()).unwrap();
+    sleep(Duration::from_millis(500)).await;
+
+    // Two jobs run on B through its front door. No one else hears of
+    // them. The first leaves a footprint we can count.
+    let footprint = boundary_dir.path().join("footprint");
+    let j1_id = session.next_job_id();
+    let j1 = sign_job_for(
+        &mut root,
+        j1_id,
+        session_id,
+        &format!("echo run >> {}", footprint.display()),
+        &b.baseboard,
+    )
+    .await;
+    b.mgr
+        .job_start(
+            &authn_b,
+            j1.clone(),
+            JobStartParams {
+                wait: JobWait::Stop,
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+    session.job_started(j1.clone());
+    let j2_id = session.next_job_id();
+    let j2 = sign_job_for(&mut root, j2_id, session_id, "true", &b.baseboard).await;
+    b.mgr
+        .job_start(
+            &authn_b,
+            j2,
+            JobStartParams {
+                wait: JobWait::Stop,
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+    assert_eq!(read_to_string(&footprint).unwrap(), "run\n");
+
+    // B dies with both jobs unwitnessed and rejoins. Its boundary
+    // proves the rack is missing part of the session's history.
+    b_shutdown.cancel();
+    drop(b);
+    sleep(Duration::from_millis(500)).await;
+    let locker = Locker::new(&log, vec![slot]);
+    let b = Sled::start_with_locker(&log, &dir, 2, &root_pem, locker, &shutdown).await;
+    let authn_b = fake_identity(&mut root).await;
+    a.peers.send(BTreeSet::from([b.addr])).unwrap();
+    b.peers.send(BTreeSet::from([a.addr])).unwrap();
+
+    // The recorded job finished before the crash, so B adjudicates
+    // its true ending on its sole authority.
+    eventually("the boundary job is adjudicated", 120, async || {
+        a.mgr.job_status(&authn_a, &j2_id).await.is_ok_and(|map| {
+            map.get(&b.baseboard)
+                .is_some_and(|s| matches!(s, JobStatus::Stopped { result: Ok(0), .. }))
+        })
+    })
+    .await;
+
+    // A retry of the first job's preserved artifact is refused, not
+    // re-executed: the footprint stays single.
+    b.mgr
+        .job_start(&authn_b, j1, JobStartParams::default())
+        .await
+        .unwrap();
+    eventually("the retry is refused", 120, async || {
+        b.mgr.job_status(&authn_b, &j1_id).await.is_ok_and(|map| {
+            map.get(&b.baseboard).is_some_and(|s| {
+                matches!(
+                    s,
+                    JobStatus::Error {
+                        error: ProcessError::Io { .. },
+                        ..
+                    }
+                )
+            })
+        })
+    })
+    .await;
+    assert_eq!(read_to_string(&footprint).unwrap(), "run\n");
+
+    shutdown.cancel();
+}
+
+#[named]
+#[tokio::test]
+async fn witnessed_session_survives_restart() {
+    let (_tmp, dir) = pki("sush-witness-", 2);
+    let mut root = common::ephemeral_root();
+    let root_pem = dir.join("job-root.pem");
+    write(
+        &root_pem,
+        pem_cert_chain(vec![root.cert().to_owned()]).unwrap(),
+    )
+    .unwrap();
+
+    let log = test_logger(function_name!());
+    let shutdown = CancellationToken::new();
+
+    let a = Sled::start(&log, &dir, 1, &root_pem, &shutdown).await;
+    let authn_a = fake_identity(&mut root).await;
+    let signer_nonce = SessionSignerNonce::random();
+    let session_id = SessionId::compute(
+        a.mgr.own_baseboard(),
+        a.mgr.session_sush_nonce(),
+        signer_nonce,
+    );
+    let mut session = Session::new(session_id);
+    a.mgr
+        .session_start(&authn_a, session_id, signer_nonce, true)
+        .await
+        .unwrap();
+
+    let boundary_dir = TempDir::with_prefix("sush-boundary-").unwrap();
+    let slot = Utf8PathBuf::from_path_buf(boundary_dir.path().to_path_buf()).unwrap();
+    let b_shutdown = CancellationToken::new();
+    let locker = Locker::new(&log, vec![slot.clone()]);
+    let b = Sled::start_with_locker(&log, &dir, 2, &root_pem, locker, &b_shutdown).await;
+    a.peers.send(BTreeSet::from([b.addr])).unwrap();
+    b.peers.send(BTreeSet::from([a.addr])).unwrap();
+    eventually("universe convergence", 120, async || {
+        a.universe.borrow().rumors.network() == b.universe.borrow().rumors.network()
+    })
+    .await;
+
+    // A job runs on B and its result is witnessed by A, so B's
+    // boundary frontier is covered when it returns. The job must be
+    // live traffic on B: a replayed job never executes.
+    let j1_id = session.next_job_id();
+    let j1 = sign_job_for(&mut root, j1_id, session_id, "true", &b.baseboard).await;
+    a.mgr
+        .job_start(&authn_a, j1.clone(), JobStartParams::default())
+        .await
+        .unwrap();
+    eventually("B's result reaches A", 120, async || {
+        a.mgr.job_status(&authn_a, &j1_id).await.is_ok_and(|map| {
+            map.get(&b.baseboard)
+                .is_some_and(|s| matches!(s, JobStatus::Stopped { .. }))
+        })
+    })
+    .await;
+
+    // B restarts. The session's history is intact, so the session
+    // keeps working on B.
+    b_shutdown.cancel();
+    drop(b);
+    sleep(Duration::from_millis(500)).await;
+    let locker = Locker::new(&log, vec![slot]);
+    let b = Sled::start_with_locker(&log, &dir, 2, &root_pem, locker, &shutdown).await;
+    a.peers.send(BTreeSet::from([b.addr])).unwrap();
+    b.peers.send(BTreeSet::from([a.addr])).unwrap();
+    eventually("universe reconvergence", 120, async || {
+        a.universe.borrow().rumors.network() == b.universe.borrow().rumors.network()
+    })
+    .await;
+
+    session.job_started(j1);
+    let j2_id = session.next_job_id();
+    let j2 = sign_job_for(&mut root, j2_id, session_id, "true", &b.baseboard).await;
+    a.mgr
+        .job_start(&authn_a, j2, JobStartParams::default())
+        .await
+        .unwrap();
+    eventually("the session's next job runs on B", 120, async || {
+        a.mgr.job_status(&authn_a, &j2_id).await.is_ok_and(|map| {
+            map.get(&b.baseboard)
+                .is_some_and(|s| matches!(s, JobStatus::Stopped { .. }))
+        })
+    })
+    .await;
+
+    shutdown.cancel();
+}
+
+#[named]
+#[tokio::test]
+async fn bookmarks_survive_restart() {
+    let (_tmp, dir) = pki("sush-bookmark-", 2);
+    let mut root = common::ephemeral_root();
+    let root_pem = dir.join("job-root.pem");
+    write(
+        &root_pem,
+        pem_cert_chain(vec![root.cert().to_owned()]).unwrap(),
+    )
+    .unwrap();
+
+    let log = test_logger(function_name!());
     let shutdown = CancellationToken::new();
 
     // Sled A holds session history, so it wins every dominance contest.
@@ -564,12 +813,12 @@ async fn bookmarks_survive_restart() {
     let slot = Utf8PathBuf::from_path_buf(bookmark_dir.path().to_path_buf()).unwrap();
     let record = slot.join(BOOKMARK.file);
     let b_shutdown = CancellationToken::new();
-    let b = Sled::start_with_bookmarks(
+    let b = Sled::start_with_locker(
         &log,
         &dir,
         2,
         &root_pem,
-        BookmarkSource::new(&log, &Locker::new(&log, vec![slot.clone()])),
+        Locker::new(&log, vec![slot.clone()]),
         &b_shutdown,
     )
     .await;
@@ -579,7 +828,7 @@ async fn bookmarks_survive_restart() {
         record.as_std_path().exists()
     })
     .await;
-    let before = std::fs::read(&record).unwrap();
+    let before = read(&record).unwrap();
 
     // The next incarnation reads the record back, rejoins, and
     // advances it, reclaiming the previous life's identity.
@@ -589,13 +838,13 @@ async fn bookmarks_survive_restart() {
     // Let the dead incarnation's tasks quiesce, as a real reboot
     // would. Two live sources over one slot are the store's one
     // forbidden misuse.
-    tokio::time::sleep(std::time::Duration::from_millis(500)).await;
-    let b = Sled::start_with_bookmarks(
+    sleep(Duration::from_millis(500)).await;
+    let b = Sled::start_with_locker(
         &log,
         &dir,
         2,
         &root_pem,
-        BookmarkSource::new(&log, &Locker::new(&log, vec![slot.clone()])),
+        Locker::new(&log, vec![slot.clone()]),
         &shutdown,
     )
     .await;
@@ -608,25 +857,26 @@ async fn bookmarks_survive_restart() {
     eventually(
         "the record advances past the previous life",
         120,
-        async || std::fs::read(&record).unwrap() != before,
+        async || read(&record).unwrap() != before,
     )
     .await;
 
     shutdown.cancel();
 }
 
+#[named]
 #[tokio::test]
 async fn gossip_survives_bookmark_failure() {
     let (_tmp, dir) = pki("sush-nobookmark-", 2);
     let mut root = common::ephemeral_root();
     let root_pem = dir.join("job-root.pem");
-    std::fs::write(
+    write(
         &root_pem,
         pem_cert_chain(vec![root.cert().to_owned()]).unwrap(),
     )
     .unwrap();
 
-    let log = test_logger("gossip_survives_bookmark_failure");
+    let log = test_logger(function_name!());
     let shutdown = CancellationToken::new();
 
     let a = Sled::start(&log, &dir, 1, &root_pem, &shutdown).await;
@@ -646,15 +896,12 @@ async fn gossip_survives_bookmark_failure() {
     // Sled 2's bookmark points into a directory that does not exist.
     // It sheds the bookmark and gossips anyway, stranding identities
     // rather than the rack.
-    let b = Sled::start_with_bookmarks(
+    let b = Sled::start_with_locker(
         &log,
         &dir,
         2,
         &root_pem,
-        BookmarkSource::new(
-            &log,
-            &Locker::new(&log, vec![Utf8PathBuf::from("/nonexistent/sush")]),
-        ),
+        Locker::new(&log, vec![Utf8PathBuf::from("/nonexistent/sush")]),
         &shutdown,
     )
     .await;
@@ -665,7 +912,9 @@ async fn gossip_survives_bookmark_failure() {
     })
     .await;
 
-    // Live jobs still run on the degraded sled.
+    // The degraded sled refuses live jobs rather than run one it
+    // cannot record, and gossips the refusal. The healthy sled still
+    // runs it.
     let job_id = session.next_job_id();
     let job = sign_job(&mut root, job_id, session_id, "true").await;
     a.mgr
@@ -679,9 +928,23 @@ async fn gossip_survives_bookmark_failure() {
         )
         .await
         .unwrap();
-    eventually("the job runs on the degraded sled", 120, async || {
+    eventually("the degraded sled refuses the job", 120, async || {
         a.mgr.job_status(&authn_a, &job_id).await.is_ok_and(|map| {
-            map.get(&b.baseboard)
+            map.get(&b.baseboard).is_some_and(|s| {
+                matches!(
+                    s,
+                    JobStatus::Error {
+                        error: ProcessError::Io { .. },
+                        ..
+                    }
+                )
+            })
+        })
+    })
+    .await;
+    eventually("the healthy sled runs the job", 120, async || {
+        a.mgr.job_status(&authn_a, &job_id).await.is_ok_and(|map| {
+            map.get(&a.baseboard)
                 .is_some_and(|s| matches!(s, JobStatus::Stopped { .. }))
         })
     })

@@ -29,9 +29,9 @@ use sush_common::codephrases::Codephrase;
 use sush_common::jobs::{JobId, JobMode, JobStartRequest, SessionId, VerifiedJob};
 use sush_common::keys::{EphemeralKey, KeyType, Signer};
 use sush_common::targets::{Cubbies, Target};
-use sush_server::bookmark::BookmarkSource;
 use sush_server::executor::PathIsolation;
 use sush_server::gossip::{isolated, lonely};
+use sush_server::locker::Locker;
 use sush_server::output::{JobOutputDir, JobOutputFileStream};
 use sush_server::state::GossipNetwork;
 use sush_server::{JobError, JobManager, seed_gossip};
@@ -228,7 +228,7 @@ pub async fn manager_test_root_and_peer(
     CancellationToken,
 ) {
     let dir = TempDir::with_prefix("sush-").unwrap();
-    let seed = seed_gossip(&BookmarkSource::null()).await;
+    let seed = null_gossip().await;
     let peer = seed.clone();
     let gossip = isolated(seed);
     let shutdown = CancellationToken::new();
@@ -241,6 +241,7 @@ pub async fn manager_test_root_and_peer(
         no_cubbies(),
         gossip,
         lonely(),
+        &Locker::null(),
         &[root.cert().to_owned()],
         shutdown.clone(),
     )
@@ -252,6 +253,12 @@ pub async fn manager_test_root_and_peer(
 /// A cubby map that will never be known.
 pub fn no_cubbies() -> watch::Receiver<Cubbies> {
     watch::channel(Cubbies::new()).1
+}
+
+/// A seed over storage that persists nothing, silently.
+pub async fn null_gossip() -> GossipNetwork {
+    let log = Logger::root(slog::Discard, slog::o!());
+    seed_gossip(&log, &Locker::null()).await.into_rumors()
 }
 
 pub async fn authz<E>(
