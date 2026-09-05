@@ -1523,6 +1523,18 @@
               "Burned"
             ],
             "additionalProperties": false
+          },
+          {
+            "type": "object",
+            "properties": {
+              "Resumed": {
+                "$ref": "#/components/schemas/JobId"
+              }
+            },
+            "required": [
+              "Resumed"
+            ],
+            "additionalProperties": false
           }
         ]
       },

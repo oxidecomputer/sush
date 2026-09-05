@@ -4,22 +4,50 @@
 
 //! The boundary between jobs we executed and jobs we only heard about.
 //!
-//! The gossip frontier answers "what have I heard"; the boundary
-//! answers "where was I when I last committed to running a job." One
-//! record, overwritten in chain order before each spawn, carries the
-//! job, its session, our causal frontier at the moment of commitment,
-//! and the job's ending, once it has one.
+//! One record, rewritten before each spawn, carries what this sled
+//! last committed to: the job, its session, the chain position after
+//! the job, the universe they belong to, and the job's ending once
+//! it has one. A universe is one shared gossip history, identified
+//! by its network; sleds join universes, leave them, and sometimes
+//! return. Alongside the commitment, the record keeps the join
+//! of every session start this sled has executed under in that
+//! universe, and the set of universes it burned by leaving. The
+//! record is this sled's execution watermark: nothing at or below it
+//! may run again.
 //!
-//! After a restart, compare the recorded frontier with the join
-//! frontier. If the join frontier covers it, every request we had
-//! processed was witnessed: replay refuses old jobs, the session
-//! chain never releases a resubmitted one, and zombie reaping reports
-//! what we left running. If not, a suffix of our history died with
-//! us: jobs may have run here that no sled can name, and their signed
-//! artifacts could be resubmitted and run again. The state machine
-//! then refuses jobs of the recorded session until a new session
-//! supersedes it, and adjudicates the recorded job itself: the
-//! recorded ending if the job got one, and interrupted if it did not.
+//! After a restart, replayed gossip rebuilds the sessions. When the
+//! committed session activates, the sled resumes its chain at the
+//! stored successor. The previous life had already moved the chain
+//! past every earlier position, so the session's queue never
+//! releases them here, and the chain continues from the successor
+//! whether its request arrives by replay or by resubmission. A
+//! session that starts strictly above the executed join has never
+//! run here and is served. A session the record cannot order makes
+//! the sled hop: the sled reports the hop to the gossip set as an
+//! error and sets a floor, in memory, at the frontier that includes
+//! the report. A session that does not start above the floor has
+//! its jobs skipped; a session started after the hop is served. The
+//! join folds in every session this sled has executed under in this
+//! universe, so a session it once ran under can never screen as
+//! new: the sled hops, and the session's jobs are skipped rather
+//! than re-run. If replay gives the recorded job no status, the sled
+//! adjudicates it: it announces the recorded ending when the record
+//! holds one, and an interrupted ending when it does not.
+//!
+//! Universes have no order. The record instead keeps a burned set,
+//! holding the network of every universe whose watermark it
+//! overwrote by moving on. A sled that re-enters a burned universe
+//! has flip-flopped, and raises its floor: it reports the flip-flop
+//! to the gossip set and sets the floor, in memory, at the frontier
+//! that includes the report. No older message can contain a version
+//! born at that instant, so a session started before the re-entry
+//! never lies above the floor, and its jobs are skipped. A sled that
+//! enters a universe with history while holding no record for it
+//! raises a floor the same way. The floor is never persisted: the
+//! burn, the missing record, or the unordered session is still there
+//! after a restart, and raises it again. A floor written to disk
+//! could carry a version that died with the life that created it;
+//! no later session could ever dominate such a floor.
 //!
 //! A boundary that cannot be written means the job must not run. A
 //! boundary that cannot be trusted means no job may run at all, since
@@ -29,7 +57,7 @@
 use std::sync::Mutex as SyncMutex;
 use std::sync::atomic::{AtomicBool, Ordering};
 
-use ciborium::{de::from_reader, ser::into_writer};
+use ciborium::{de::from_reader as from_cbor, ser::into_writer as into_cbor};
 use rumors::{Network, Version};
 use serde::{Deserialize, Serialize};
 use slog::{Logger, o, warn};
@@ -37,6 +65,7 @@ use thiserror::Error;
 
 use sush_common::jobs::{JobId, JobStatus, ProcessError, SessionId};
 
+use crate::bloom::Bloom;
 use crate::locker::{Locker, StoreError, Tenant, TenantSpec, Verdict};
 
 pub const BOUNDARY: TenantSpec = TenantSpec {
@@ -44,39 +73,80 @@ pub const BOUNDARY: TenantSpec = TenantSpec {
     magic: b"SUSHBOUNDARY",
 };
 
-/// The execution boundary: the last job this sled committed to
-/// running, everything it had seen when it committed, and how far the
-/// job got.
+/// The execution boundary: what this sled last committed to, in which
+/// universe, and which universes it has left behind ("burned").
+///
+/// Versions do not compare across universes, so `network` scopes every
+/// version in the record. `burned` holds the network of every
+/// universe whose watermark this record overwrote by moving on: a
+/// sled re-entering one raises its floor in memory, and the record on
+/// disk stays the displaced universe's true watermark until a commit
+/// overwrites it.
+///
+/// `executed` is the join of the start versions of every session
+/// this sled has executed under in this universe. A single stored
+/// start would forget the sessions before it, and a third session
+/// could then replay the first session's jobs; the join never
+/// forgets. Session starts are witnessed messages, and only those
+/// keep their meaning across a crash. A start that only this sled
+/// ever saw belongs to a session whose history is lost, and refusal
+/// is the right answer there anyway.
 #[derive(Clone, Debug, Deserialize, Serialize)]
 pub struct Boundary {
     pub network: Network,
+    pub burned: Bloom,
+    #[serde(with = "version_bytes")]
+    pub executed: Version,
+    pub job: Option<Committed>,
+}
+
+/// The last job this sled committed to running, and how far it got.
+/// We also store the chain position *after* `job`, computed from the
+/// request's signed bytes at commit time, to allow session resumption.
+#[derive(Clone, Debug, Deserialize, Serialize)]
+pub struct Committed {
     pub session: SessionId,
     pub job: JobId,
-    #[serde(with = "version_bytes")]
-    pub frontier: Version,
+    pub successor: JobId,
     pub outcome: JobOutcome,
 }
 
-/// How far the boundary job got.
-#[derive(Clone, Debug, Deserialize, Serialize)]
-pub enum JobOutcome {
-    /// Committed to run, with no ending recorded. After a crash,
-    /// interrupted is the truth.
-    Committed,
-    /// The job's terminal status.
-    Ended(JobStatus),
+impl Boundary {
+    /// Whether this record burned `network`: left its universe behind
+    /// and overwrote its watermark.
+    pub fn is_burned(&self, network: Network) -> bool {
+        self.burned.contains(&network_key(network))
+    }
+
+    /// The burned set for the replacement record, committed in
+    /// `network`. A replacement in a different universe burns this
+    /// record's own network.
+    pub fn burned_for(&self, network: Network) -> Bloom {
+        let mut burned = self.burned.clone();
+        if self.network != network {
+            burned.insert(&network_key(self.network));
+        }
+        burned
+    }
+
+    /// The executed-session join for the replacement record,
+    /// committed in `network` and folding in `started`. Joins never
+    /// cross universes, so a replacement elsewhere starts its join
+    /// fresh.
+    pub fn executed_for(&self, network: Network, started: &Version) -> Version {
+        if self.network == network {
+            self.executed.clone() | started.clone()
+        } else {
+            started.clone()
+        }
+    }
 }
 
-impl Boundary {
-    /// Whether the rack already knows everything we knew at
-    /// commitment. Covered means no committed job can be lost.
-    /// Anything else means a suffix of our history died with us.
-    /// The comparison includes third-party traffic we had seen, so a
-    /// join through a lagging peer can look uncovered; the cost is a
-    /// session refused on this sled until a new one supersedes it.
-    pub fn covered_by(&self, network: Network, join_frontier: Option<&Version>) -> bool {
-        self.network == network && join_frontier.is_some_and(|frontier| self.frontier <= *frontier)
-    }
+/// A network's Bloom key is its CBOR bytes.
+fn network_key(network: Network) -> Vec<u8> {
+    let mut bytes = Vec::new();
+    into_cbor(&network, &mut bytes).expect("writing to a Vec cannot fail");
+    bytes
 }
 
 mod version_bytes {
@@ -94,14 +164,23 @@ mod version_bytes {
     }
 }
 
+/// How far the boundary job got.
+#[derive(Clone, Debug, Deserialize, Serialize)]
+pub enum JobOutcome {
+    /// Committed to run, with no ending recorded.
+    Committed,
+    /// The job's terminal status, error endings included.
+    Ended(JobStatus),
+}
+
 fn encode(boundary: &Boundary) -> Vec<u8> {
     let mut bytes = Vec::new();
-    into_writer(boundary, &mut bytes).expect("writing to a Vec cannot fail");
+    into_cbor(boundary, &mut bytes).expect("writing to a Vec cannot fail");
     bytes
 }
 
 fn decode(record: &[u8]) -> Option<Boundary> {
-    from_reader(record).ok()
+    from_cbor(record).ok()
 }
 
 #[derive(Debug, Error)]
@@ -119,8 +198,9 @@ pub struct BoundaryStore {
     tenant: Tenant,
     /// The record, readable synchronously by the state machine.
     boundary: SyncMutex<Option<Boundary>>,
-    /// Untrusted until loaded, and forever if the load discards:
-    /// writing would launder the disagreement into false agreement.
+    /// Untrusted until loaded, and forever if the load discards: a
+    /// write would overwrite the disagreeing slots, and the next load
+    /// would see agreement that never happened.
     untrusted: AtomicBool,
     loaded: AtomicBool,
 }
@@ -167,10 +247,9 @@ impl BoundaryStore {
         self.boundary.lock().unwrap().clone()
     }
 
-    /// Record how the boundary job ended, so the next life can tell
-    /// the truth instead of guessing. A stop displaces an adjudicated
-    /// Interrupted, mirroring the status arms in the state machine;
-    /// nothing else is overwritten, and a record that has moved on to
+    /// Record how the boundary job ended. A stop displaces an adjudicated
+    /// `Interrupted`, mirroring the status arms in the state machine.
+    /// Nothing else is overwritten, and a record that has moved on to
     /// a newer job ignores the old job's ending.
     pub async fn record_outcome(&self, job_id: &JobId, outcome: &JobStatus) {
         debug_assert!(outcome.is_terminal());
@@ -180,11 +259,14 @@ impl BoundaryStore {
         let mut guard = self.tenant.lock().await;
         let updated = {
             let recorded = self.boundary.lock().unwrap();
-            let Some(boundary) = recorded.as_ref().filter(|b| b.job == *job_id) else {
+            let Some(boundary) = recorded.as_ref() else {
+                return;
+            };
+            let Some(committed) = boundary.job.as_ref().filter(|c| c.job == *job_id) else {
                 return;
             };
             let displaces = matches!(
-                (&boundary.outcome, outcome),
+                (&committed.outcome, outcome),
                 (JobOutcome::Committed, _)
                     | (
                         JobOutcome::Ended(JobStatus::Error {
@@ -198,8 +280,13 @@ impl BoundaryStore {
                 return;
             }
             Boundary {
-                outcome: JobOutcome::Ended(outcome.clone()),
-                ..boundary.clone()
+                job: Some(Committed {
+                    outcome: JobOutcome::Ended(outcome.clone()),
+                    ..committed.clone()
+                }),
+                network: boundary.network,
+                burned: boundary.burned.clone(),
+                executed: boundary.executed.clone(),
             }
         };
         if let Err(error) = guard.store(&encode(&updated)).await {
@@ -212,7 +299,7 @@ impl BoundaryStore {
         *self.boundary.lock().unwrap() = Some(updated);
     }
 
-    /// Commit to executing the job at `boundary`. On failure the
+    /// Commit to executing the job in `boundary`. On failure the
     /// caller must not run the job.
     pub async fn advance(&self, boundary: &Boundary) -> Result<(), BoundaryError> {
         if self.untrusted() {
@@ -264,14 +351,34 @@ mod test {
         serde_json::from_str(&format!("[{seed:?}{}]", ", 0".repeat(15))).unwrap()
     }
 
-    fn boundary(seed: u8) -> Boundary {
+    fn boundary() -> Boundary {
         Boundary {
-            network: network(seed),
-            session: SessionId::random(),
-            job: JobId::random(),
-            frontier: "(1, 1, (0, 0, 2))".parse().unwrap(),
-            outcome: JobOutcome::Committed,
+            network: network(1),
+            burned: Bloom::new(),
+            executed: "(1, 1, (0, 0, 2))".parse().unwrap(),
+            job: Some(Committed {
+                session: SessionId::random(),
+                job: JobId::random(),
+                successor: JobId::random(),
+                outcome: JobOutcome::Committed,
+            }),
         }
+    }
+
+    fn job_of(boundary: &Boundary) -> JobId {
+        boundary.job.as_ref().expect("a committed job").job
+    }
+
+    /// The burned set's keys are on-disk format: a change to the
+    /// network's serde shape would silently forget every burn, and a
+    /// forgotten burn admits a flip-flop instead of refusing it. If
+    /// this fails, STOP, and see the warning on [`crate::bloom`].
+    #[test]
+    fn pin_network_keys() {
+        assert_eq!(
+            network_key(network(1)),
+            [0x50, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0]
+        );
     }
 
     #[tokio::test]
@@ -281,7 +388,9 @@ mod test {
         let first = store(slots.clone()).await;
         assert!(first.boundary().is_none());
 
-        let (a, b) = (boundary(1), boundary(2));
+        let (a, mut b) = (boundary(), boundary());
+        b.network = network(2);
+        b.burned = a.burned_for(b.network);
         first.advance(&a).await.unwrap();
         first.advance(&b).await.unwrap();
 
@@ -289,9 +398,13 @@ mod test {
         assert!(!next.untrusted());
         let recorded = next.boundary().unwrap();
         assert_eq!(recorded.network, b.network);
-        assert_eq!(recorded.session, b.session);
-        assert_eq!(recorded.job, b.job);
-        assert_eq!(recorded.frontier, b.frontier);
+        assert_eq!(job_of(&recorded), job_of(&b));
+        assert!(recorded.is_burned(network(1)));
+        assert!(!recorded.is_burned(network(3)));
+        assert_eq!(recorded.executed, b.executed);
+        let (recorded, expected) = (recorded.job.unwrap(), b.job.unwrap());
+        assert_eq!(recorded.session, expected.session);
+        assert_eq!(recorded.successor, expected.successor);
         assert!(matches!(recorded.outcome, JobOutcome::Committed));
     }
 
@@ -303,30 +416,31 @@ mod test {
         let dir = TempDir::with_prefix("sush-boundary-").unwrap();
         let slots = slots(&dir);
         let first = store(slots.clone()).await;
-        let b = boundary(1);
+        let b = boundary();
+        let job = job_of(&b);
         first.advance(&b).await.unwrap();
 
         let interrupted = JobStatus::Error {
-            job_id: b.job,
+            job_id: job,
             time_error: chrono::Utc::now(),
             error: ProcessError::Interrupted,
         };
         let killed = JobStatus::Error {
-            job_id: b.job,
+            job_id: job,
             time_error: chrono::Utc::now(),
             error: ProcessError::Killed(9),
         };
         first.record_outcome(&JobId::random(), &killed).await;
         assert!(matches!(
-            first.boundary().unwrap().outcome,
+            first.boundary().unwrap().job.unwrap().outcome,
             JobOutcome::Committed
         ));
 
-        first.record_outcome(&b.job, &interrupted).await;
-        first.record_outcome(&b.job, &killed).await;
+        first.record_outcome(&job, &interrupted).await;
+        first.record_outcome(&job, &killed).await;
         let next = store(slots).await;
         assert!(matches!(
-            next.boundary().unwrap().outcome,
+            next.boundary().unwrap().job.unwrap().outcome,
             JobOutcome::Ended(JobStatus::Error {
                 error: ProcessError::Interrupted,
                 ..
@@ -335,32 +449,19 @@ mod test {
     }
 
     #[tokio::test]
-    async fn coverage_requires_frontier_and_universe() {
-        let boundary = boundary(1);
-        let covered: Version = "(2, 2, (0, 0, 3))".parse().unwrap();
-        let behind: Version = "(1, 0, (0, 0, 2))".parse().unwrap();
-
-        assert!(boundary.covered_by(network(1), Some(&boundary.frontier)));
-        assert!(boundary.covered_by(network(1), Some(&covered)));
-        assert!(!boundary.covered_by(network(1), Some(&behind)));
-        assert!(!boundary.covered_by(network(2), Some(&covered)));
-        assert!(!boundary.covered_by(network(1), None));
-    }
-
-    #[tokio::test]
     async fn disagreement_is_untrusted_and_pins() {
         let dir = TempDir::with_prefix("sush-boundary-").unwrap();
         let slots = slots(&dir);
-        for (slot, seed) in slots.iter().zip([1, 2]) {
+        for slot in &slots {
             let lone = store(vec![slot.clone()]).await;
-            lone.advance(&boundary(seed)).await.unwrap();
+            lone.advance(&boundary()).await.unwrap();
         }
 
         let untrusted = store(slots.clone()).await;
         assert!(untrusted.untrusted());
         assert!(untrusted.boundary().is_none());
         assert!(matches!(
-            untrusted.advance(&boundary(3)).await,
+            untrusted.advance(&boundary()).await,
             Err(BoundaryError::Untrusted)
         ));
 
@@ -386,7 +487,7 @@ mod test {
         let store = BoundaryStore::new(&test_log(), &Locker::new(&test_log(), slots(&dir)));
         assert!(store.untrusted());
         assert!(matches!(
-            store.advance(&boundary(1)).await,
+            store.advance(&boundary()).await,
             Err(BoundaryError::Untrusted)
         ));
     }

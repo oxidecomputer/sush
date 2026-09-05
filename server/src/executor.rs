@@ -32,7 +32,8 @@ use tokio_util::sync::CancellationToken;
 use sush_api::JobStartParams;
 use sush_common::interactive::WindowSize;
 use sush_common::jobs::{
-    JobId, JobMode, JobOutputStream, JobStartRequest, ProcessError, SignedJob, VerifiedJob,
+    JobId, JobMode, JobOutputStream, JobStartRequest, ProcessError, SignedJob, SkipReason,
+    VerifiedJob,
 };
 
 use crate::boundary::{Boundary, BoundaryStore};
@@ -51,8 +52,10 @@ pub const DEFAULT_TERM: &str = "vt100";
 /// experience backpressure; if we do, something is wrong.
 const EVENTS_CHANNEL_CAPACITY: usize = 16;
 
-/// The launcher performs one small fsync per job, so at human job
-/// rates this never fills. A full queue refuses the job.
+/// Each queued launch waits on one small fsync, so the queue drains in
+/// milliseconds. A burst of concurrent jobs can still fill it, and a
+/// full queue refuses the job with an error event rather than block
+/// the state machine.
 const LAUNCH_CHANNEL_CAPACITY: usize = 16;
 
 pub struct Executor {
@@ -112,7 +115,13 @@ impl Executor {
                         what: "recording the execution boundary".to_string(),
                         error: error.to_string(),
                     };
-                    send_error(&launch.log, &launch.boundary.job, &launch.events, error).await;
+                    send_error(
+                        &launch.log,
+                        launch.request.payload().job_id(),
+                        &launch.events,
+                        error,
+                    )
+                    .await;
                     continue;
                 }
                 spawn(job_spawn(launch));
@@ -226,6 +235,21 @@ impl Executor {
         let log = self.log.clone();
         spawn(async move {
             send_error(&log, &job_id, &events, error).await;
+        });
+    }
+
+    /// Report that this sled will never run `job_id`; see
+    /// [`JobStatus::Skipped`](sush_common::jobs::JobStatus).
+    pub fn job_skipped(&self, job_id: JobId, reason: SkipReason) {
+        let Some(events) = self.events.read().unwrap().as_ref().cloned() else {
+            return;
+        };
+        let log = self.log.clone();
+        spawn(async move {
+            let event = Event::Job(JobEvent::Skipped(job_id, Utc::now(), reason));
+            if let Err(error) = events.send(event).await {
+                warn!(log, "failed to send skip event"; "job_id" => %job_id, "error" => %error);
+            }
         });
     }
 

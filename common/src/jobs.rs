@@ -109,6 +109,7 @@ impl SessionId {
             LastJob::None => hash(&[b"None", self.0.to_be_bytes().as_slice()].concat()),
             LastJob::Some(job) => hash(&[b"Some", job.to_be_signed().as_slice()].concat()),
             LastJob::Burned(job_id) => hash(&[b"Burned", job_id.to_be_bytes().as_slice()].concat()),
+            LastJob::Resumed(next) => return *next,
         })
     }
 }
@@ -153,6 +154,7 @@ pub enum LastJob {
     None,
     Some(SignedJob),
     Burned(JobId),
+    Resumed(JobId),
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, JsonSchema, PartialEq, Serialize)]
@@ -201,11 +203,13 @@ impl Session {
         self.last_job = LastJob::Some(job)
     }
 
-    /// Burn `job_id`, either as the session's next job or by
-    /// rewinding it from the chain head. The rewind unwinds a
-    /// signed-but-unrun job on a signer. On a server it converges a
-    /// skip that raced the start it names, keeping the execution in
-    /// history. Returns whether the chain moved.
+    /// Burn `job_id` when it is the session's next job or the job at
+    /// the chain head. Burning the next job skips it before it runs.
+    /// Burning the head rewrites the chain to continue from the burn:
+    /// a signer unwinds a job it signed that never ran, and a server
+    /// converges with that signer when a skip request arrives after
+    /// the start of the job it names. An execution already in history
+    /// stays there. Returns whether the chain moved.
     pub fn skip_job(&mut self, job_id: JobId) -> bool {
         if job_id == self.next_job_id()
             || matches!(&self.last_job, LastJob::Some(job) if *job.job_id() == job_id)
@@ -219,6 +223,14 @@ impl Session {
 
     pub fn next_job_id(&self) -> JobId {
         self.session_id.next_job_id(&self.last_job)
+    }
+
+    /// Resume the chain at `successor`, the position a boundary
+    /// record stored at its last commitment. Every position before
+    /// `successor` was already handled by the sled that stored the
+    /// record.
+    pub fn resume_at(&mut self, successor: JobId) {
+        self.last_job = LastJob::Resumed(successor);
     }
 }
 

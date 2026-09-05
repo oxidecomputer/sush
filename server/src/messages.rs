@@ -14,7 +14,7 @@ use x509_cert::Certificate;
 use sush_api::JobStartParams;
 use sush_common::authn::SignedLogin;
 use sush_common::jobs::JobOutputState;
-use sush_common::jobs::{Access, JobId, ProcessError, SessionId, SignedJob};
+use sush_common::jobs::{Access, JobId, ProcessError, SessionId, SignedJob, SkipReason};
 use sush_common::keys::{KeyId, SshPublicKey};
 use sush_common::version::VersionInfo;
 
@@ -257,6 +257,7 @@ pub mod v0 {
             JobOutputState,
         ),
         Error(JobId, DateTime<Utc>, ProcessError),
+        Skipped(JobId, DateTime<Utc>, SkipReason),
     }
 
     #[derive(Clone, Debug, Deserialize, Eq, Error, PartialEq, Serialize)]
@@ -272,6 +273,10 @@ pub mod v0 {
             incoming_session: SessionId,
             incoming_version: Version,
         },
+        #[error("Sled re-entered a burned universe")]
+        UniverseFlipFlop,
+        #[error("Sled hopped into a session its record cannot order")]
+        SessionHop,
     }
 }
 
@@ -604,6 +609,49 @@ mod wire_format {
         )
         .into();
         assert_wire_format("concurrent-sessions-error", msg);
+    }
+
+    #[test]
+    fn job_skipped_event() {
+        let msg: VersionedMessage = Message::Event(
+            BaseboardId {
+                part_number: "913-0000019".to_string(),
+                serial_number: "BRM42220030".to_string(),
+            },
+            Event::Job(JobEvent::Skipped(
+                JobId::from_str("zoo-zero").unwrap(),
+                "2026-09-04T20:00:00Z".parse().unwrap(),
+                SkipReason::BelowFloor,
+            )),
+        )
+        .into();
+        assert_wire_format("job-skipped-event", msg);
+    }
+
+    #[test]
+    fn session_hop_error() {
+        let msg: VersionedMessage = Message::Event(
+            BaseboardId {
+                part_number: "913-0000019".to_string(),
+                serial_number: "BRM42220030".to_string(),
+            },
+            Event::Error(Error::SessionHop),
+        )
+        .into();
+        assert_wire_format("session-hop-error", msg);
+    }
+
+    #[test]
+    fn universe_flip_flop_error() {
+        let msg: VersionedMessage = Message::Event(
+            BaseboardId {
+                part_number: "913-0000019".to_string(),
+                serial_number: "BRM42220030".to_string(),
+            },
+            Event::Error(Error::UniverseFlipFlop),
+        )
+        .into();
+        assert_wire_format("universe-flip-flop-error", msg);
     }
 
     #[test]

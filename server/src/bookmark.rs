@@ -13,13 +13,12 @@
 //! The record format and when to load & store are dictated by rumors.
 //! We use a [`Tenant`] of a [`Locker`] to store it on disk(s);
 //! if a load fails or the slots disagree, we assume a new identity
-//! rather than risk resuming with a stale one. Generation numbers
-//! ensure that a straggler from an abandoned universe can't clobber
-//! its successor's record.
+//! rather than risk resuming with a stale one. The record keeps every
+//! universe's identities, so a lost write costs at most a stranded
+//! identity, never a stale one.
 
 use std::io::{self, Cursor};
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU64, Ordering};
 
 use rumors::{Bookmark, BookmarkError, Serialized};
 use slog::{Discard, Logger, o, warn};
@@ -40,38 +39,23 @@ pub enum BookmarkIoError {
     Serialize(#[source] io::Error),
     #[error("storing the bookmark failed: {0}")]
     Store(#[source] StoreError),
-    #[error("the bookmark was handed to a newer peer")]
-    Superseded,
 }
 
-/// This server's bookmark storage. Hands out one handle per peer,
-/// each superseding the last.
+/// This server's bookmark storage. Every handle shares the one record.
 #[derive(Clone, Debug)]
 pub struct BookmarkSource {
-    ratchet: Arc<Ratchet>,
-}
-
-#[derive(Debug)]
-struct Ratchet {
     log: Logger,
-    tenant: Tenant,
-    generation: AtomicU64,
+    tenant: Arc<Tenant>,
 }
 
 impl BookmarkSource {
     /// A source persisting to `locker`.
     /// [`Seed::grow`](crate::gossip::Seed::grow) makes the one source
-    /// a locker gets per process. A handle is disabled when its source
-    /// hands out a newer one. No source can disable another source's
-    /// handles, so a second source would let an old peer overwrite its
-    /// replacement's record.
+    /// a locker gets per process.
     pub fn new(log: &Logger, locker: &Locker) -> Self {
         Self {
-            ratchet: Arc::new(Ratchet {
-                log: log.new(o!("component" => "bookmark")),
-                tenant: locker.tenant(BOOKMARK),
-                generation: AtomicU64::new(0),
-            }),
+            log: log.new(o!("component" => "bookmark")),
+            tenant: Arc::new(locker.tenant(BOOKMARK)),
         }
     }
 
@@ -80,12 +64,15 @@ impl BookmarkSource {
         Self::new(&Logger::root(Discard, o!()), &Locker::null())
     }
 
-    /// A ratcheting handle for the next peer.
-    /// All earlier handles are superseded.
-    pub fn next_handle(&self) -> SushBookmark {
+    /// A persisting handle for a peer. Rumors persists a bookmark only
+    /// when a gossip session starts, and the gossip manager stops
+    /// every session before it hands a new peer its handle, so no two
+    /// peers persist concurrently; see the migration notes in
+    /// [`gossip`](crate::gossip).
+    pub fn handle(&self) -> SushBookmark {
         SushBookmark {
-            ratchet: self.ratchet.clone(),
-            generation: self.ratchet.generation.fetch_add(1, Ordering::SeqCst) + 1,
+            log: self.log.clone(),
+            tenant: self.tenant.clone(),
             shed: false,
         }
     }
@@ -94,8 +81,8 @@ impl BookmarkSource {
     /// gossiping after its real bookmark failed.
     pub fn shed_handle(&self) -> SushBookmark {
         SushBookmark {
-            ratchet: self.ratchet.clone(),
-            generation: 0,
+            log: self.log.clone(),
+            tenant: self.tenant.clone(),
             shed: true,
         }
     }
@@ -104,16 +91,9 @@ impl BookmarkSource {
 /// One peer's handle on the [`BookmarkSource`].
 #[derive(Debug)]
 pub struct SushBookmark {
-    ratchet: Arc<Ratchet>,
-    generation: u64,
+    log: Logger,
+    tenant: Arc<Tenant>,
     shed: bool,
-}
-
-impl SushBookmark {
-    /// Has this bookmark been overtaken by events?
-    fn obe(&self) -> bool {
-        self.generation < self.ratchet.generation.load(Ordering::SeqCst)
-    }
 }
 
 impl BookmarkError for SushBookmark {
@@ -127,15 +107,12 @@ impl Bookmark for SushBookmark {
         if self.shed {
             return Ok(None);
         }
-        let mut guard = self.ratchet.tenant.lock().await;
-        if self.obe() {
-            return Err(BookmarkIoError::Superseded);
-        }
+        let mut guard = self.tenant.lock().await;
         match guard.load().await {
             Verdict::Adopt(record) | Verdict::Restore(record) => Ok(Some(Cursor::new(record))),
             Verdict::Empty => Ok(None),
             Verdict::Discard(reason) => {
-                warn!(self.ratchet.log, "assuming a fresh identity"; "reason" => %reason);
+                warn!(self.log, "assuming a fresh identity"; "reason" => %reason);
                 Ok(None)
             }
         }
@@ -152,10 +129,7 @@ impl Bookmark for SushBookmark {
         write(&mut buf).await.map_err(BookmarkIoError::Serialize)?;
         let record = buf.into_inner();
 
-        let mut guard = self.ratchet.tenant.lock().await;
-        if self.obe() {
-            return Err(BookmarkIoError::Superseded);
-        }
+        let mut guard = self.tenant.lock().await;
         guard.store(&record).await.map_err(BookmarkIoError::Store)
     }
 }
@@ -210,7 +184,7 @@ mod test {
         let dir = TempDir::with_prefix("sush-bookmark-").unwrap();
         let source = source(slots(&dir));
 
-        let handle = source.next_handle();
+        let handle = source.handle();
         assert!(read_back(&handle).await.is_none());
         handle.store(record(b"who we are")).await.unwrap();
         assert_eq!(read_back(&handle).await.unwrap(), b"who we are");
@@ -223,26 +197,19 @@ mod test {
         let slots = slots(&dir);
         for (slot, bytes) in slots.iter().zip([b"one", b"two"]) {
             let lone = source(vec![slot.clone()]);
-            lone.next_handle().store(record(bytes)).await.unwrap();
+            lone.handle().store(record(bytes)).await.unwrap();
         }
-        assert!(read_back(&source(slots).next_handle()).await.is_none());
+        assert!(read_back(&source(slots).handle()).await.is_none());
     }
 
-    /// A new handle disables the old one's loads and stores.
+    /// Handles share the record: one stores, another reads it back.
     #[tokio::test]
-    async fn stale_generations_are_disabled() {
+    async fn handles_share_record() {
         let dir = TempDir::with_prefix("sush-bookmark-").unwrap();
         let source = source(slots(&dir));
 
-        let old = source.next_handle();
-        old.store(record(b"before")).await.unwrap();
-        let new = source.next_handle();
-        assert!(matches!(
-            old.store(record(b"after")).await,
-            Err(BookmarkIoError::Superseded)
-        ));
-        assert!(matches!(old.load().await, Err(BookmarkIoError::Superseded)));
-        assert_eq!(read_back(&new).await.unwrap(), b"before");
+        source.handle().store(record(b"shared")).await.unwrap();
+        assert_eq!(read_back(&source.handle()).await.unwrap(), b"shared");
     }
 
     /// A null source and a shed handle persist nothing and never fail,
@@ -250,16 +217,16 @@ mod test {
     #[tokio::test]
     async fn null_and_shed_touch_nothing() {
         let null = BookmarkSource::null();
-        let handle = null.next_handle();
+        let handle = null.handle();
         handle.store(record(b"lost")).await.unwrap();
         assert!(read_back(&handle).await.is_none());
 
         let dir = TempDir::with_prefix("sush-bookmark-").unwrap();
         let source = source(slots(&dir));
-        source.next_handle().store(record(b"kept")).await.unwrap();
+        source.handle().store(record(b"kept")).await.unwrap();
         let shed = source.shed_handle();
         assert!(read_back(&shed).await.is_none());
         shed.store(record(b"dropped")).await.unwrap();
-        assert_eq!(read_back(&source.next_handle()).await.unwrap(), b"kept");
+        assert_eq!(read_back(&source.handle()).await.unwrap(), b"kept");
     }
 }

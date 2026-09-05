@@ -29,7 +29,7 @@ use std::net::{SocketAddr, SocketAddrV6};
 use std::time::Duration;
 
 use futures::StreamExt as _;
-use rumors::{Error, Joined, Network, Peer, Rumors, Ticks, Version};
+use rumors::{Error, Joined, Network, Peer, Rumors, Ticks};
 use serde::Serialize;
 use serde::de::DeserializeOwned;
 use sled_hardware_types::BaseboardId;
@@ -72,22 +72,16 @@ impl Default for GossipConfig {
     }
 }
 
-/// A gossip universe and where we entered it.
+/// A gossip universe.
 #[derive(Clone, Debug)]
 pub struct Universe<T> {
     /// The gossiped set.
     pub rumors: Rumors<T, SushBookmark>,
-    /// The causal frontier of the set received when we joined,
-    /// or `None` if we seeded the universe ourselves.
-    pub frontier: Option<Version>,
 }
 
 impl<T> Universe<T> {
     pub fn genesis(rumors: Rumors<T, SushBookmark>) -> Self {
-        Self {
-            rumors,
-            frontier: None,
-        }
+        Self { rumors }
     }
 }
 
@@ -105,18 +99,20 @@ impl<T> Seed<T> {
     /// Seed a fresh universe with this server as its only peer, over
     /// `locker`'s storage, making the locker's one [`BookmarkSource`].
     ///
-    /// A pristine seed's bookmark touches no storage, and identities
-    /// recorded there are reclaimed only after a migration returns us
-    /// to their universe. Bad storage would abort every session at the
-    /// persist gate, before the seed could even learn to migrate. The
-    /// probe runs first, and a failed probe sheds the bookmark.
+    /// The probe runs first because broken storage would otherwise
+    /// wedge gossip: rumors stores the bookmark at the start of every
+    /// session, a failed store aborts the session, and a peer that can
+    /// never hold a session can never join another universe. When the
+    /// probe fails we gossip with a shed handle instead, which
+    /// persists nothing; each restart then strands an identity, which
+    /// is harmless.
     pub async fn grow(log: &Logger, locker: &Locker) -> Self
     where
         T: DeserializeOwned + Serialize + Send + Sync + 'static,
     {
         let bookmarks = BookmarkSource::new(log, locker);
         let handle = match locker.probe().await {
-            Ok(()) => bookmarks.next_handle(),
+            Ok(()) => bookmarks.handle(),
             Err(_) => bookmarks.shed_handle(),
         };
         let rumors = match Peer::seed().bookmark(handle).await {
@@ -452,11 +448,17 @@ where
     /// the next link retries; either way all links are rebuilt, since the
     /// old ones belong to the universe we are leaving.
     ///
-    /// The new peer gets a fresh bookmark handle, fencing off all the
-    /// abandoned universe's stores. If the received identity cannot be
-    /// persisted, we keep gossiping with a shed handle rather than take
-    /// the sled out of gossip; a stranded identity is harmless, unlike
-    /// a support shell that cannot reach a degraded rack.
+    /// The new peer gets its own handle on the same bookmark storage.
+    /// That is safe because rumors persists a bookmark only when a
+    /// session starts, and aborting the drivers above ends every
+    /// session before the handle exists: the abandoned peer can never
+    /// store again. A store it already had in flight either loses to
+    /// the locker's sequence guard, or records a session that was
+    /// aborted before it sent anything, so nothing on the wire
+    /// outruns the record. If the received identity cannot be
+    /// persisted, we keep gossiping with a shed handle rather than
+    /// take the sled out of gossip; a stranded identity is harmless,
+    /// unlike a support shell that cannot reach a degraded rack.
     async fn migrate(&mut self, peer: SocketAddr, mut link: SprocketsLink) {
         self.drivers.abort_all();
         self.live.clear();
@@ -464,7 +466,7 @@ where
             self.log, "joining the universe that beat ours";
             "peer" => %peer, "ours" => %self.rumors.network(),
         );
-        let bootstrap = Peer::bootstrap().bookmark(self.bookmarks.next_handle());
+        let bootstrap = Peer::bootstrap().bookmark(self.bookmarks.handle());
         match timeout(self.config.join_timeout, bootstrap.join(&mut link)).await {
             Ok(Joined::Joined { peer }) => self.adopt(peer),
             Ok(Joined::Unbookmarked(unbookmarked)) => {
@@ -493,10 +495,8 @@ where
     /// Follow the joined peer into its universe.
     fn adopt(&mut self, peer: Peer<T, SushBookmark>) {
         self.rumors = peer.into_rumors();
-        let frontier = self.rumors.snapshot().latest().clone();
         let _ = self.publish.send(Universe {
             rumors: self.rumors.clone(),
-            frontier: Some(frontier),
         });
         self.joins.clear();
         info!(self.log, "migrated"; "network" => %self.rumors.network());
