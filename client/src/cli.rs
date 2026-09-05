@@ -203,6 +203,11 @@ fn short_status_row(status: &JobStatus) -> String {
         JobStatus::Error {
             time_error, error, ..
         } => format!("Error at {time_error}: {error}"),
+        JobStatus::Skipped {
+            time_skipped,
+            reason,
+            ..
+        } => format!("Skipped at {time_skipped}: {reason}"),
     }
 }
 
@@ -898,6 +903,19 @@ impl CommandContext for Cli {
                                     Job status:\tError\n   \
                                     Error at:\t{time_error}\n   \
                                     Error:\t{error}"
+                            )
+                        }
+                        JobStatus::Skipped {
+                            job_id,
+                            time_skipped,
+                            reason,
+                        } => {
+                            println!(
+                                "⏩ Job ID:\t{job_id}\n   \
+                                    Target:\t{baseboard_id}\n   \
+                                    Job status:\tSkipped\n   \
+                                    Skipped at:\t{time_skipped}\n   \
+                                    Reason:\t{reason}"
                             )
                         }
                     }

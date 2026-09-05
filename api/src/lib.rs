@@ -388,7 +388,7 @@ impl JobWait {
         match self {
             Self::None => true,
             Self::Start => !matches!(status, Queued { .. }),
-            Self::Stop => matches!(status, Cancelled { .. } | Error { .. } | Stopped { .. }),
+            Self::Stop => status.is_terminal(),
         }
     }
 }

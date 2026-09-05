@@ -1455,6 +1455,36 @@
               "Stopped"
             ],
             "additionalProperties": false
+          },
+          {
+            "description": "The reporting sled decided it will never run this job. A skip is a decision, not a failure: the job may have run on other sleds, and the operator decides whether to resubmit.",
+            "type": "object",
+            "properties": {
+              "Skipped": {
+                "type": "object",
+                "properties": {
+                  "job_id": {
+                    "$ref": "#/components/schemas/JobId"
+                  },
+                  "reason": {
+                    "$ref": "#/components/schemas/SkipReason"
+                  },
+                  "time_skipped": {
+                    "type": "string",
+                    "format": "date-time"
+                  }
+                },
+                "required": [
+                  "job_id",
+                  "reason",
+                  "time_skipped"
+                ]
+              }
+            },
+            "required": [
+              "Skipped"
+            ],
+            "additionalProperties": false
           }
         ]
       },
@@ -1715,6 +1745,25 @@
           "key_id",
           "payload",
           "signature"
+        ]
+      },
+      "SkipReason": {
+        "description": "Why a sled will never run a job.",
+        "oneOf": [
+          {
+            "description": "The job's session sits at or below the sled's execution floor, where the sled cannot tell replay from re-run.",
+            "type": "string",
+            "enum": [
+              "below-floor"
+            ]
+          },
+          {
+            "description": "The job's chain position precedes the sled's recorded commitment: a previous life already handled it.",
+            "type": "string",
+            "enum": [
+              "already-handled"
+            ]
+          }
         ]
       },
       "SledHealth": {

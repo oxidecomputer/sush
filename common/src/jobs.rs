@@ -375,6 +375,35 @@ pub enum JobStatus {
         result: Result<i32, ProcessError>,
         output: JobOutputState,
     },
+    /// The reporting sled decided it will never run this job. A skip
+    /// is a decision, not a failure: the job may have run on other
+    /// sleds, and the operator decides whether to resubmit.
+    Skipped {
+        job_id: JobId,
+        time_skipped: DateTime<Utc>,
+        reason: SkipReason,
+    },
+}
+
+/// Why a sled will never run a job.
+#[derive(Clone, Copy, Debug, Deserialize, Eq, JsonSchema, PartialEq, Serialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum SkipReason {
+    /// The job's session sits at or below the sled's execution floor,
+    /// where the sled cannot tell replay from re-run.
+    BelowFloor,
+    /// The job's chain position precedes the sled's recorded
+    /// commitment: a previous life already handled it.
+    AlreadyHandled,
+}
+
+impl fmt::Display for SkipReason {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(match self {
+            Self::BelowFloor => "the session sits below this sled's execution floor",
+            Self::AlreadyHandled => "a previous life of this sled already handled it",
+        })
+    }
 }
 
 pub type JobStatusMap = BTreeMap<BaseboardId, JobStatus>;
@@ -476,7 +505,10 @@ impl JobStatus {
     pub fn is_terminal(&self) -> bool {
         matches!(
             self,
-            Self::Cancelled { .. } | Self::Error { .. } | Self::Stopped { .. }
+            Self::Cancelled { .. }
+                | Self::Error { .. }
+                | Self::Stopped { .. }
+                | Self::Skipped { .. }
         )
     }
 
@@ -488,12 +520,13 @@ impl JobStatus {
             Self::Error { time_error, .. } => *time_error,
             Self::Started { time_started, .. } => *time_started,
             Self::Stopped { time_stopped, .. } => *time_stopped,
+            Self::Skipped { time_skipped, .. } => *time_skipped,
         }
     }
 
     pub fn time_elapsed(&self) -> TimeDelta {
         match self {
-            Self::Cancelled { .. } | Self::Error { .. } => TimeDelta::zero(),
+            Self::Cancelled { .. } | Self::Error { .. } | Self::Skipped { .. } => TimeDelta::zero(),
             Self::Queued { time_queued, .. } => Utc::now() - time_queued,
             Self::Started { time_started, .. } => Utc::now() - time_started,
             Self::Stopped {
@@ -510,7 +543,8 @@ impl JobStatus {
             | Self::Queued { job_id, .. }
             | Self::Error { job_id, .. }
             | Self::Started { job_id, .. }
-            | Self::Stopped { job_id, .. } => job_id,
+            | Self::Stopped { job_id, .. }
+            | Self::Skipped { job_id, .. } => job_id,
         }
     }
 

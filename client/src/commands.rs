@@ -51,7 +51,7 @@ use sush_common::interactive::{InteractiveJobError, InteractiveJobMessage};
 use sush_common::jobs::JobOutputStream::{self, Stderr, Stdout};
 use sush_common::jobs::{
     Access, JobId, JobLimits, JobMode, JobOutputHash, JobOutputState, JobStatus, JobStatusMap,
-    Session, SessionId, SessionSignerNonce, SignedJob, job_status_try_from_json_map,
+    Session, SessionId, SessionSignerNonce, SignedJob, SkipReason, job_status_try_from_json_map,
 };
 #[cfg(feature = "permslip")]
 use sush_common::jobs::{JobStartRequest, SessionSushNonce};
@@ -2073,6 +2073,9 @@ async fn job_output_from(
         Some(JobStatus::Started { job_id, .. }) => {
             return Err(CommandError::JobStillRunning(job_id.to_owned()));
         }
+        Some(JobStatus::Skipped { job_id, reason, .. }) => {
+            return Err(CommandError::JobSkipped(job_id.to_owned(), *reason));
+        }
         Some(JobStatus::Stopped { output, .. }) => output,
     };
     let len = match stream {
@@ -2526,6 +2529,8 @@ pub enum CommandError {
     JobDidNotRun(JobId),
     #[error("❌ Job `{0}` is not yet running")]
     JobNotYetRunning(JobId),
+    #[error("⏩ Job `{0}` was skipped on this sled: {1}")]
+    JobSkipped(JobId, SkipReason),
     #[error("❌ Job `{0}` is still running")]
     JobStillRunning(JobId),
     #[error("❌ JSON error: {0}")]
