@@ -15,6 +15,7 @@ pub mod bookmark;
 pub mod boundary;
 pub mod error;
 pub mod executor;
+pub mod format;
 pub mod gossip;
 pub mod history;
 pub mod io;

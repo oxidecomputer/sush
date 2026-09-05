@@ -113,6 +113,14 @@ impl<'de> Deserialize<'de> for SshPublicKey {
 }
 
 impl SshPublicKey {
+    pub fn to_openssh(&self) -> Result<String, KeyError> {
+        Ok(self.0.to_openssh()?)
+    }
+
+    pub fn from_openssh(openssh: &str) -> Result<Self, KeyError> {
+        Ok(Self(ssh_key::PublicKey::from_openssh(openssh)?))
+    }
+
     pub fn key_id(&self) -> Result<KeyId, KeyError> {
         KeyId::try_from(&self.0)
     }

@@ -731,6 +731,23 @@ mod test {
     use crate::keys::{EccR, EccS, EncodedSignature};
     use crate::targets::SledId;
 
+    /// A job request is signed, and every sled rebuilds it from the
+    /// wire to check the signature, so two sleds with different
+    /// request shapes disagree about what verifies. This pin freezes
+    /// the shape: any field change fails here. Do not re-pin; add a
+    /// new wire version.
+    #[test]
+    fn pin_job_start_request_schema() {
+        let schema = serde_json::to_string_pretty(&schemars::schema_for!(JobStartRequest)).unwrap();
+        let path = "tests/output/job-start-request-schema.json";
+        if std::env::var("EXPECTORATE").as_deref() == Ok("overwrite") {
+            std::fs::write(path, &schema).unwrap();
+        } else {
+            let expected = std::fs::read_to_string(path).expect("missing snapshot");
+            assert_eq!(schema, expected, "the signed request's shape changed");
+        }
+    }
+
     /// A request's defaulted fields stay out of the signed material,
     /// so a signature made before a field existed still verifies
     /// after it is added. The literal hash pins the scheme for

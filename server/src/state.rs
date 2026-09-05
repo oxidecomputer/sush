@@ -22,7 +22,7 @@ use tokio::task::JoinHandle;
 use tokio::{select, spawn};
 use tokio_util::sync::CancellationToken;
 use x509_cert::Certificate;
-use x509_cert::der::Encode as _;
+use x509_cert::der::{Decode as _, Encode as _};
 
 use sush_api::JobStartParams;
 use sush_common::authn::{Identity, Nonce, RequestVerifier, SignedLogin};
@@ -791,7 +791,10 @@ impl State {
         match message.as_ref() {
             V0(Message::Request(request)) => match request {
                 Request::Cert(attributed) => match attributed.as_parts() {
-                    (actor, CertRequest::Import(cert)) => match self.cert_import(cert) {
+                    (actor, CertRequest::Import(der)) => match Certificate::from_der(der)
+                        .map_err(KeyError::from)
+                        .and_then(|cert| self.cert_import(&cert))
+                    {
                         Ok(key_id) => {
                             info!(log, "imported certificate"; "key_id" => %key_id, "actor" => %actor);
                             self.validate_certs(&self.roots.clone());
@@ -1118,8 +1121,10 @@ impl State {
                     }
                 },
                 Request::Identity(attributed) => match attributed.as_parts() {
-                    (actor, IdentityRequest::Login(public_key, signed)) => {
-                        match verify_login(public_key, signed) {
+                    (actor, IdentityRequest::Login(openssh, signed)) => {
+                        match SshPublicKey::from_openssh(openssh)
+                            .and_then(|public_key| verify_login(&public_key, signed))
+                        {
                             Ok(registered) => {
                                 let identity = &registered.identity;
                                 if self.revoked_keys.peek(&identity.key_id).is_some() {
@@ -1325,7 +1330,7 @@ impl State {
                     }
                 }
             },
-            Unknown(version) => {
+            Unknown { version, .. } => {
                 if self.unknown_versions.insert(version.clone()) {
                     warn!(log, "ignoring messages from a newer peer"; "version" => version);
                 }

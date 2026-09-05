@@ -5,26 +5,33 @@
 //! Messages gossiped via rumors.
 
 use chrono::{DateTime, Utc};
+use ciborium::{Value, de::from_reader as from_cbor, ser::into_writer as into_cbor};
 use rumors::Version;
 use serde::{Deserialize, Serialize};
 use sled_hardware_types::BaseboardId;
 use thiserror::Error;
-use x509_cert::Certificate;
 
 use sush_api::JobStartParams;
 use sush_common::authn::SignedLogin;
 use sush_common::jobs::JobOutputState;
 use sush_common::jobs::{Access, JobId, ProcessError, SessionId, SignedJob, SkipReason};
-use sush_common::keys::{KeyId, SshPublicKey};
+use sush_common::keys::KeyId;
 use sush_common::version::VersionInfo;
+
+use crate::format::{NoFormat, Versioned, Wire};
 
 /// Once a message schema has shipped, it is frozen, since any changes
 /// could break decoding of *existing* messages. Each version gets its
 /// own module; everything defined there and all of their dependencies
 /// (e.g., types shared with the HTTP API, etc.) become part of the frozen
-/// version, whose serde shape on the gossip wire must not change. New
-/// versions must implement `TryInto` to convert old messages into
-/// compatible new ones.
+/// version, whose serde shape on the gossip wire must not change. A
+/// new version must convert [`From`] the old one; the
+/// [`Wire`](crate::format::Wire) chain demands it. New variants must
+/// keep this enum's encoding: a single-entry, text-keyed map. Older
+/// sleds read an unrecognized text key as [`Unknown`](Self::Unknown)
+/// and carry on, but an integer key or an array does not decode at
+/// all, and a message that fails to decode aborts gossip sessions
+/// instead of being ignored.
 ///
 /// Updates go sled by sled, so mixed gossip networks exist for
 /// the whole rollout. A message from a newer peer decodes as
@@ -36,27 +43,31 @@ pub enum VersionedMessage {
     /// The initial message format.
     V0(v0::Message),
 
-    /// A message from a newer version.
-    Unknown(String),
+    Unknown {
+        version: String,
+        message: Vec<u8>,
+    },
 }
 
 impl Serialize for VersionedMessage {
     fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
-        use serde::ser::Error as _;
         match self {
             Self::V0(message) => {
                 serializer.serialize_newtype_variant("VersionedMessage", 0, "V0", message)
             }
-            Self::Unknown(version) => Err(S::Error::custom(format!(
-                "refusing to send a message from a newer version ({version})"
-            ))),
+            // Emit what was received.
+            Self::Unknown { message, .. } => {
+                let value: Value = from_cbor(message.as_slice())
+                    .expect("the bytes were encoded from a value this module decoded");
+                value.serialize(serializer)
+            }
         }
     }
 }
 
 impl<'de> Deserialize<'de> for VersionedMessage {
     fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
-        use serde::de::{Error as _, IgnoredAny, MapAccess, Visitor};
+        use serde::de::{Error as _, MapAccess, Visitor};
 
         struct VersionVisitor;
 
@@ -74,51 +85,26 @@ impl<'de> Deserialize<'de> for VersionedMessage {
                 Ok(match version.as_str() {
                     "V0" => VersionedMessage::V0(map.next_value()?),
                     _ => {
-                        map.next_value::<IgnoredAny>()?;
-                        VersionedMessage::Unknown(version)
+                        let value: Value = map.next_value()?;
+                        let whole = Value::Map(vec![(Value::Text(version.clone()), value)]);
+                        let mut message = Vec::new();
+                        into_cbor(&whole, &mut message).expect("writing to a Vec cannot fail");
+                        VersionedMessage::Unknown { version, message }
                     }
                 })
             }
 
             fn visit_str<E: serde::de::Error>(self, version: &str) -> Result<Self::Value, E> {
-                Ok(VersionedMessage::Unknown(version.to_string()))
+                let mut message = Vec::new();
+                into_cbor(&version, &mut message).expect("writing to a Vec cannot fail");
+                Ok(VersionedMessage::Unknown {
+                    version: version.to_string(),
+                    message,
+                })
             }
         }
 
         deserializer.deserialize_any(VersionVisitor)
-    }
-}
-
-/// DER bytes for certificates, which have no serde support.
-mod cert_der {
-    use serde::de::Visitor;
-    use serde::ser::Error as _;
-    use serde::{Deserializer, Serializer};
-    use x509_cert::Certificate;
-    use x509_cert::der::{Decode as _, Encode as _};
-
-    pub fn serialize<S: Serializer>(cert: &Certificate, serializer: S) -> Result<S::Ok, S::Error> {
-        serializer.serialize_bytes(&cert.to_der().map_err(S::Error::custom)?)
-    }
-
-    pub fn deserialize<'de, D: Deserializer<'de>>(
-        deserializer: D,
-    ) -> Result<Certificate, D::Error> {
-        struct DerVisitor;
-
-        impl<'de> Visitor<'de> for DerVisitor {
-            type Value = Certificate;
-
-            fn expecting(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
-                f.write_str("a DER-encoded certificate")
-            }
-
-            fn visit_bytes<E: serde::de::Error>(self, der: &[u8]) -> Result<Self::Value, E> {
-                Certificate::from_der(der).map_err(E::custom)
-            }
-        }
-
-        deserializer.deserialize_bytes(DerVisitor)
     }
 }
 
@@ -135,6 +121,23 @@ pub mod v0 {
     impl From<Message> for VersionedMessage {
         fn from(message: Message) -> Self {
             Self::V0(message)
+        }
+    }
+
+    /// Version 0 is the initial wire format; see [`crate::format`].
+    /// A later format converts up from this one infallibly, and the
+    /// state machine handles only the latest.
+    impl Versioned for Message {
+        const VERSION: u16 = 0;
+    }
+
+    impl Wire for Message {
+        type Previous = NoFormat;
+    }
+
+    impl From<NoFormat> for Message {
+        fn from(none: NoFormat) -> Self {
+            match none {}
         }
     }
 
@@ -210,7 +213,8 @@ pub mod v0 {
     #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
     #[allow(clippy::large_enum_variant)]
     pub enum CertRequest {
-        Import(#[serde(with = "cert_der")] Certificate),
+        /// The certificate's DER bytes, decoded at use.
+        Import(#[serde(with = "crate::format::cbor_bytes")] Vec<u8>),
         Revoke(KeyId, DateTime<Utc>),
     }
 
@@ -236,7 +240,8 @@ pub mod v0 {
     #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
     #[allow(clippy::large_enum_variant)]
     pub enum IdentityRequest {
-        Login(SshPublicKey, SignedLogin),
+        /// OpenSSH public keys are string encoded and decoded at use.
+        Login(String, SignedLogin),
         Revoke(KeyId, DateTime<Utc>),
     }
 
@@ -302,7 +307,7 @@ mod wire_format {
     #[track_caller]
     fn assert_wire_format(name: &str, message: VersionedMessage) {
         let mut bytes = Vec::new();
-        ciborium::ser::into_writer(&message, &mut bytes).unwrap();
+        into_cbor(&message, &mut bytes).unwrap();
         let path = format!("tests/output/{name}.bin");
         if env::var("EXPECTORATE").as_deref() == Ok("overwrite") {
             write(&path, &bytes).unwrap();
@@ -310,7 +315,7 @@ mod wire_format {
             let expected = read(&path).expect("missing snapshot");
             assert_eq!(bytes, expected, "gossip wire format changed: {bytes:02x?}");
         }
-        let decoded: VersionedMessage = ciborium::de::from_reader(bytes.as_slice()).unwrap();
+        let decoded: VersionedMessage = from_cbor(bytes.as_slice()).unwrap();
         assert_eq!(decoded, message, "wire format should round-trip");
     }
 
@@ -402,7 +407,7 @@ mod wire_format {
     #[test]
     fn identity_login_request() {
         use sush_common::authn::{ChallengeResponse, RequestVerifier};
-        use sush_common::keys::{EncodedSignature, Signed, SshPublicKey};
+        use sush_common::keys::{EncodedSignature, Signed};
 
         // Craft deterministic evidence: nonces, then the ed25519
         // basepoint as the verifier.
@@ -416,7 +421,6 @@ mod wire_format {
         .unwrap();
 
         let openssh = "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAILM+rvN+ot98qgEN796jTiQfZfG1KaT0PtFDJ13gEiGB test@sush";
-        let public_key: SshPublicKey = serde_json::from_value(serde_json::json!(openssh)).unwrap();
 
         let signed = Signed::new(
             response,
@@ -430,7 +434,7 @@ mod wire_format {
         );
         let msg: VersionedMessage = Message::Request(Request::identity(
             KeyId::from_str("zoo-zero").unwrap(),
-            IdentityRequest::Login(public_key, signed),
+            IdentityRequest::Login(openssh.to_string(), signed),
         ))
         .into();
         assert_wire_format("identity-login-request", msg);
@@ -457,8 +461,6 @@ mod wire_format {
     /// still fails.
     #[test]
     fn unknown_version_tolerated() {
-        use ciborium::value::Value;
-
         let v1 = Value::Map(vec![(
             Value::Text("V1".to_string()),
             Value::Map(vec![(
@@ -467,14 +469,17 @@ mod wire_format {
             )]),
         )]);
         let mut bytes = Vec::new();
-        ciborium::ser::into_writer(&v1, &mut bytes).unwrap();
-        let decoded: VersionedMessage = ciborium::de::from_reader(bytes.as_slice()).unwrap();
-        assert_eq!(decoded, VersionedMessage::Unknown("V1".to_string()));
+        into_cbor(&v1, &mut bytes).unwrap();
+        let decoded: VersionedMessage = from_cbor(bytes.as_slice()).unwrap();
+        assert!(matches!(&decoded, VersionedMessage::Unknown { version, .. } if version == "V1"));
 
+        // Rumors panics when a message fails to serialize, so this
+        // must not fail, and it must emit what was received.
         let mut resent = Vec::new();
-        assert!(ciborium::ser::into_writer(&decoded, &mut resent).is_err());
+        into_cbor(&decoded, &mut resent).unwrap();
+        assert_eq!(resent, bytes);
 
-        let corrupt: Result<VersionedMessage, _> = ciborium::de::from_reader([0x01].as_slice());
+        let corrupt: Result<VersionedMessage, _> = from_cbor([0x01].as_slice());
         assert!(corrupt.is_err());
     }
 
@@ -509,12 +514,13 @@ mod wire_format {
 
     #[test]
     fn cert_requests() {
-        use x509_cert::der::DecodePem as _;
+        use x509_cert::Certificate;
+        use x509_cert::der::{DecodePem as _, Encode as _};
 
         let cert = Certificate::from_pem(include_str!("../../client/certs/staging.pem")).unwrap();
         let msg: VersionedMessage = Message::Request(Request::cert(
             KeyId::from_str("zoo-zero").unwrap(),
-            CertRequest::Import(cert),
+            CertRequest::Import(cert.to_der().unwrap()),
         ))
         .into();
         assert_wire_format("cert-import-request", msg);

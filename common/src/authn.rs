@@ -153,7 +153,7 @@ impl RequestKey {
 
 codephrase_newtype! {
     /// The server half of an ephemeral request-signing key.
-    #[derive(Clone, Deserialize, Eq, PartialEq, Serialize)]
+    #[derive(Clone, Deserialize, Eq, JsonSchema, PartialEq, Serialize)]
     pub struct RequestVerifier = Full;
 
 }
@@ -347,7 +347,7 @@ impl SeqWindow {
 /// Response to an authentication challenge, containing the server-chosen
 /// nonce and a fresh client-chosen nonce. This is the structure that is
 /// signed and verified as authentication credentials.
-#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[derive(Clone, Debug, Deserialize, Eq, JsonSchema, PartialEq, Serialize)]
 pub struct ChallengeResponse {
     nonce: Nonce,
     cnonce: Nonce,
@@ -612,6 +612,24 @@ mod test {
     use crate::keys::{EphemeralKey, KeyType, Signer as _};
 
     use super::*;
+
+    /// A login is signed, gossiped, and re-verified by every sled,
+    /// which rebuilds it from the wire to check the signature. Two
+    /// shapes in one rack disagree about which logins verify. This
+    /// pin freezes the shape: any field change fails here. Do not
+    /// re-pin; add a new wire version.
+    #[test]
+    fn pin_challenge_response_schema() {
+        let schema =
+            serde_json::to_string_pretty(&schemars::schema_for!(ChallengeResponse)).unwrap();
+        let path = "tests/output/challenge-response-schema.json";
+        if std::env::var("EXPECTORATE").as_deref() == Ok("overwrite") {
+            std::fs::write(path, &schema).unwrap();
+        } else {
+            let expected = std::fs::read_to_string(path).expect("missing snapshot");
+            assert_eq!(schema, expected, "the signed login's shape changed");
+        }
+    }
 
     /// Values to be signed must match even across versions.
     #[test]

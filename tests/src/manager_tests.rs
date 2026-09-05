@@ -23,6 +23,7 @@ use tokio::fs::{metadata, read, write};
 use tokio::sync::watch;
 use tokio::time::{sleep, timeout};
 use tokio_util::sync::CancellationToken;
+use x509_cert::der::Encode as _;
 use x509_cert::time::Validity;
 
 use sush_api::{JobStartParams, JobStopParams, JobWait};
@@ -1247,7 +1248,7 @@ async fn revocation_tombstones() {
     peer.send(
         Message::Request(Request::cert(
             authn.key_id.clone(),
-            CertRequest::Import(doomed.cert().clone()),
+            CertRequest::Import(doomed.cert().to_der().unwrap()),
         ))
         .into(),
     );
@@ -1445,7 +1446,7 @@ async fn gossiped_identities() {
     peer.send(
         Message::Request(Request::identity(
             root_key_id.clone(),
-            IdentityRequest::Login(root_pk.clone(), signed_by_liar),
+            IdentityRequest::Login(root_pk.to_openssh().unwrap(), signed_by_liar),
         ))
         .into(),
     );
@@ -1460,7 +1461,7 @@ async fn gossiped_identities() {
     peer.send(
         Message::Request(Request::identity(
             root_key_id.clone(),
-            IdentityRequest::Login(root_pk.clone(), signed),
+            IdentityRequest::Login(root_pk.to_openssh().unwrap(), signed),
         ))
         .into(),
     );
@@ -1844,7 +1845,7 @@ async fn hostile_imports_cannot_displace() {
     let import = |key: &EphemeralKey| {
         Message::Request(Request::cert(
             key.key_id().clone(),
-            CertRequest::Import(key.cert().clone()),
+            CertRequest::Import(key.cert().to_der().unwrap()),
         ))
         .into()
     };
@@ -1873,7 +1874,7 @@ async fn hostile_imports_cannot_displace() {
     peer.send(
         Message::Request(Request::cert(
             child.key_id().clone(),
-            CertRequest::Import(conflict),
+            CertRequest::Import(conflict.to_der().unwrap()),
         ))
         .into(),
     );
@@ -1983,7 +1984,7 @@ async fn homonym_issuer_resolves_to_true_parent() {
     peer.send(
         Message::Request(Request::cert(
             homonym.key_id().clone(),
-            CertRequest::Import(homonym.cert().clone()),
+            CertRequest::Import(homonym.cert().to_der().unwrap()),
         ))
         .into(),
     );

@@ -23,7 +23,7 @@ use tokio::time::timeout;
 use tokio_stream::wrappers::ReceiverStream;
 use tokio_util::sync::CancellationToken;
 use x509_cert::Certificate;
-use x509_cert::der::DecodePem as _;
+use x509_cert::der::{DecodePem as _, Encode as _};
 
 use sush_api::{JobStartParams, JobStopParams, JobWait};
 use sush_common::authn::{
@@ -258,7 +258,8 @@ impl JobManager {
             return Err(KeyError::SelfSigned.into());
         }
         let key_id = KeyId::try_from(&cert)?;
-        self.cert_request(authn, CertRequest::Import(cert)).await?;
+        let der = cert.to_der().map_err(KeyError::from)?;
+        self.cert_request(authn, CertRequest::Import(der)).await?;
         if wait {
             self.wait_for(self.wait_for_cert(key_id)).await?;
         }
@@ -421,7 +422,7 @@ impl JobManager {
                 last_used: Instant::now(),
             },
         );
-        let login = IdentityRequest::Login(public_key, response);
+        let login = IdentityRequest::Login(public_key.to_openssh()?, response);
         self.identity_request(key_id, login)
             .await
             .map(|()| identity)

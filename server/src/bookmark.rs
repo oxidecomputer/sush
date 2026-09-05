@@ -25,12 +25,32 @@ use slog::{Discard, Logger, o, warn};
 use thiserror::Error;
 use tokio::io::AsyncWrite;
 
+use crate::format::{self, NoFormat, Record, Versioned};
 use crate::locker::{Locker, StoreError, Tenant, TenantSpec, Verdict};
 
 pub const BOOKMARK: TenantSpec = TenantSpec {
     file: "sush-bookmark",
     magic: b"SUSHBOOKMARK",
 };
+
+/// Wrap the opaque bytes rumors writes.
+#[derive(serde::Deserialize, serde::Serialize)]
+struct BookmarkRecord(#[serde(with = "format::cbor_bytes")] Vec<u8>);
+
+impl Versioned for BookmarkRecord {
+    const VERSION: u16 = 0;
+}
+
+impl Record for BookmarkRecord {
+    type Previous = NoFormat;
+}
+
+impl TryFrom<NoFormat> for BookmarkRecord {
+    type Error = &'static str;
+    fn try_from(none: NoFormat) -> Result<Self, Self::Error> {
+        match none {}
+    }
+}
 
 /// What a bookmark load or store failed at.
 #[derive(Debug, Error)]
@@ -109,7 +129,17 @@ impl Bookmark for SushBookmark {
         }
         let mut guard = self.tenant.lock().await;
         match guard.load().await {
-            Verdict::Adopt(record) | Verdict::Restore(record) => Ok(Some(Cursor::new(record))),
+            Verdict::Adopt(record) | Verdict::Restore(record) => {
+                match format::decode::<BookmarkRecord>(&record) {
+                    Ok(BookmarkRecord(bytes)) => Ok(Some(Cursor::new(bytes))),
+                    // Stranding the old identity is harmless;
+                    // resuming from a misread record is not.
+                    Err(error) => {
+                        warn!(self.log, "assuming a fresh identity"; "reason" => %error);
+                        Ok(None)
+                    }
+                }
+            }
             Verdict::Empty => Ok(None),
             Verdict::Discard(reason) => {
                 warn!(self.log, "assuming a fresh identity"; "reason" => %reason);
@@ -127,10 +157,13 @@ impl Bookmark for SushBookmark {
         }
         let mut buf = Cursor::new(Vec::new());
         write(&mut buf).await.map_err(BookmarkIoError::Serialize)?;
-        let record = buf.into_inner();
+        let record = BookmarkRecord(buf.into_inner());
 
         let mut guard = self.tenant.lock().await;
-        guard.store(&record).await.map_err(BookmarkIoError::Store)
+        guard
+            .store(&format::encode(&record))
+            .await
+            .map_err(BookmarkIoError::Store)
     }
 }
 

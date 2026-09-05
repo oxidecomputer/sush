@@ -57,7 +57,7 @@
 use std::sync::Mutex as SyncMutex;
 use std::sync::atomic::{AtomicBool, Ordering};
 
-use ciborium::{de::from_reader as from_cbor, ser::into_writer as into_cbor};
+use ciborium::ser::into_writer as into_cbor;
 use rumors::{Network, Version};
 use serde::{Deserialize, Serialize};
 use slog::{Logger, o, warn};
@@ -66,6 +66,7 @@ use thiserror::Error;
 use sush_common::jobs::{JobId, JobStatus, ProcessError, SessionId};
 
 use crate::bloom::Bloom;
+use crate::format::{self, NoFormat, Record, Versioned};
 use crate::locker::{Locker, StoreError, Tenant, TenantSpec, Verdict};
 
 pub const BOUNDARY: TenantSpec = TenantSpec {
@@ -173,14 +174,22 @@ pub enum JobOutcome {
     Ended(JobStatus),
 }
 
-fn encode(boundary: &Boundary) -> Vec<u8> {
-    let mut bytes = Vec::new();
-    into_cbor(boundary, &mut bytes).expect("writing to a Vec cannot fail");
-    bytes
+/// Version 0 is the shipped baseline. The pinned record snapshot in
+/// this module's tests freezes its bytes; see [`crate::format`] for
+/// the steps a format change requires.
+impl Versioned for Boundary {
+    const VERSION: u16 = 0;
 }
 
-fn decode(record: &[u8]) -> Option<Boundary> {
-    from_cbor(record).ok()
+impl Record for Boundary {
+    type Previous = NoFormat;
+}
+
+impl TryFrom<NoFormat> for Boundary {
+    type Error = &'static str;
+    fn try_from(none: NoFormat) -> Result<Self, Self::Error> {
+        match none {}
+    }
 }
 
 #[derive(Debug, Error)]
@@ -225,13 +234,19 @@ impl BoundaryStore {
             "the boundary store loads once, at startup",
         );
         let boundary = match self.tenant.load().await {
-            Verdict::Adopt(record) | Verdict::Restore(record) => match decode(&record) {
-                Some(boundary) => Some(boundary),
-                None => {
-                    warn!(self.log, "undecodable boundary record");
-                    return;
+            Verdict::Adopt(record) | Verdict::Restore(record) => {
+                match format::decode::<Boundary>(&record) {
+                    Ok(boundary) => Some(boundary),
+                    // An unreadable record is not an absent one:
+                    // absent would mean a clean slate, forgetting the
+                    // previous life's commitments. The store stays
+                    // untrusted instead, and no job runs.
+                    Err(error) => {
+                        warn!(self.log, "unusable boundary record"; "error" => %error);
+                        return;
+                    }
                 }
-            },
+            }
             Verdict::Empty => None,
             Verdict::Discard(_) => return,
         };
@@ -289,7 +304,7 @@ impl BoundaryStore {
                 executed: boundary.executed.clone(),
             }
         };
-        if let Err(error) = guard.store(&encode(&updated)).await {
+        if let Err(error) = guard.store(&format::encode(&updated)).await {
             warn!(
                 self.log, "failed to record the boundary job's outcome";
                 "job_id" => %job_id, "error" => %error,
@@ -309,7 +324,7 @@ impl BoundaryStore {
             return Err(BoundaryError::Untrusted);
         }
         let mut guard = self.tenant.lock().await;
-        guard.store(&encode(boundary)).await?;
+        guard.store(&format::encode(boundary)).await?;
         *self.boundary.lock().unwrap() = Some(boundary.clone());
         Ok(())
     }
@@ -367,6 +382,62 @@ mod test {
 
     fn job_of(boundary: &Boundary) -> JobId {
         boundary.job.as_ref().expect("a committed job").job
+    }
+
+    /// The record's bytes are on-disk format, frozen at version 0. If
+    /// this fails, STOP: do not re-pin. Copy the old shape into a
+    /// frozen module and add a new version instead; see
+    /// [`crate::format`].
+    #[test]
+    fn pin_record_format_v0() {
+        let record = Boundary {
+            network: network(1),
+            burned: {
+                let mut burned = Bloom::new();
+                burned.insert(&network_key(network(2)));
+                burned
+            },
+            executed: "(1, 1, (0, 0, 2))".parse().unwrap(),
+            job: Some(Committed {
+                session: "abandon-ability".parse().unwrap(),
+                job: "zoo-zero".parse().unwrap(),
+                successor: "able-about".parse().unwrap(),
+                outcome: JobOutcome::Committed,
+            }),
+        };
+        let bytes = format::encode(&record);
+        let path = "tests/output/boundary-record-v0.bin";
+        if std::env::var("EXPECTORATE").as_deref() == Ok("overwrite") {
+            std::fs::write(path, &bytes).unwrap();
+        } else {
+            let expected = std::fs::read(path).expect("missing snapshot");
+            assert_eq!(bytes, expected, "record format changed: {bytes:02x?}");
+        }
+        let decoded: Boundary = format::decode(&bytes).unwrap();
+        assert_eq!(decoded.network, record.network);
+        assert!(decoded.is_burned(network(2)));
+        assert_eq!(decoded.executed, record.executed);
+        assert_eq!(
+            decoded.job.unwrap().successor,
+            record.job.unwrap().successor
+        );
+    }
+
+    /// A record from a newer software version loads as untrusted, and
+    /// the sled reports it instead of guessing at the format.
+    #[tokio::test]
+    async fn future_record_is_untrusted() {
+        let dir = TempDir::with_prefix("sush-boundary-").unwrap();
+        let slots = slots(&dir);
+        #[derive(Serialize)]
+        struct Envelope(u16, #[serde(with = "crate::format::cbor_bytes")] Vec<u8>);
+        let mut bytes = Vec::new();
+        into_cbor(&Envelope(1, b"from the future".to_vec()), &mut bytes).unwrap();
+        let scratch = Locker::new(&test_log(), slots.clone());
+        scratch.tenant(BOUNDARY).store(&bytes).await.unwrap();
+
+        let store = store(slots).await;
+        assert!(store.untrusted());
     }
 
     /// The burned set's keys are on-disk format: a change to the
