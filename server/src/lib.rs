@@ -10,6 +10,7 @@ extern crate function_name;
 #[cfg(all(feature = "embedded", feature = "test-support"))]
 compile_error!("`test-support` must not be enabled for an embedded server");
 
+pub mod bloom;
 pub mod bookmark;
 pub mod boundary;
 pub mod error;
