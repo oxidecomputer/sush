@@ -125,7 +125,7 @@ impl Tunnel {
                         let target = Arc::clone(&target);
                         connections.spawn(async move {
                             if let Err(error) = forward(&target, stream).await {
-                                eprintln!("⚠️ Tunnel connection failed: {error}");
+                                eprintln!("❗ Tunnel connection failed: {error}");
                             }
                         });
                     }

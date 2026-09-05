@@ -91,7 +91,7 @@ impl Cli {
         let path = match BaseDirectories::with_prefix(PREFIX).place_state_file(SESSION_FILE_NAME) {
             Ok(path) => path,
             Err(error) => {
-                eprintln!("⚠️ The session will not persist: {error}");
+                eprintln!("❗ The session will not persist: {error}");
                 return;
             }
         };
@@ -102,17 +102,17 @@ impl Cli {
                     session,
                 }) => *self.session.lock().unwrap() = Some(session),
                 Ok(SavedSession { version, .. }) => {
-                    eprintln!("⚠️ Ignoring a version {version} saved session")
+                    eprintln!("❗ Ignoring a version {version} saved session")
                 }
-                Err(error) => eprintln!("⚠️ Ignoring the saved session: {error}"),
+                Err(error) => eprintln!("❗ Ignoring the saved session: {error}"),
             },
             Err(error) if error.kind() == ErrorKind::NotFound => (),
-            Err(error) => eprintln!("⚠️ Ignoring the saved session: {error}"),
+            Err(error) => eprintln!("❗ Ignoring the saved session: {error}"),
         }
         self.session_file = Some(path);
         match BaseDirectories::with_prefix(PREFIX).place_state_file(TOKEN_FILE_NAME) {
             Ok(path) => self.token_file = Some(path),
-            Err(error) => eprintln!("⚠️ Signing tokens will not persist: {error}"),
+            Err(error) => eprintln!("❗ Signing tokens will not persist: {error}"),
         }
     }
 
@@ -149,7 +149,7 @@ impl Cli {
             },
         };
         if let Err(error) = result {
-            eprintln!("⚠️ The session was not saved: {error}");
+            eprintln!("❗ The session was not saved: {error}");
         }
     }
 }
@@ -309,7 +309,7 @@ impl CommandContext for Cli {
         .map_err(io::Error::other)
         .and_then(|json| write_private(path, &json));
         if let Err(error) = result {
-            eprintln!("⚠️ The token was not saved: {error}");
+            eprintln!("❗ The token was not saved: {error}");
         }
     }
 
