@@ -29,7 +29,7 @@ use crate::format::{self, NoFormat, Record, Versioned};
 use crate::locker::{Locker, StoreError, Tenant, TenantSpec, Verdict};
 
 pub const BOOKMARK: TenantSpec = TenantSpec {
-    file: "sush-bookmark",
+    file: "bookmark",
     magic: b"SUSHBOOKMARK",
 };
 

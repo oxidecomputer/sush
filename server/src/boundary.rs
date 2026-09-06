@@ -70,7 +70,7 @@ use crate::format::{self, NoFormat, Record, Versioned};
 use crate::locker::{Locker, StoreError, Tenant, TenantSpec, Verdict};
 
 pub const BOUNDARY: TenantSpec = TenantSpec {
-    file: "sush-boundary",
+    file: "boundary",
     magic: b"SUSHBOUNDARY",
 };
 
