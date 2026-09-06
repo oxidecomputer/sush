@@ -407,6 +407,7 @@ pub enum SkipReason {
     /// The job's chain position precedes the sled's recorded
     /// commitment: a previous life already handled it.
     AlreadyHandled,
+    SessionEnded,
 }
 
 impl fmt::Display for SkipReason {
@@ -414,6 +415,7 @@ impl fmt::Display for SkipReason {
         f.write_str(match self {
             Self::BelowFloor => "the session sits below this sled's execution floor",
             Self::AlreadyHandled => "a previous life of this sled already handled it",
+            Self::SessionEnded => "the session ended before the job could start",
         })
     }
 }

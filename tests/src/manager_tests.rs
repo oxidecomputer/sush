@@ -31,7 +31,7 @@ use sush_client::context::Authz;
 use sush_common::authn::{Challenge, ChallengeResponse, Credentials, Identity, Nonce, RequestKey};
 use sush_common::jobs::{
     Access, JobId, JobLimits, JobMode, JobOutputState, JobOutputStream::*, JobStartRequest,
-    JobStatus, ProcessError, Session, SessionId, SessionSignerNonce, SignedJob,
+    JobStatus, ProcessError, Session, SessionId, SessionSignerNonce, SignedJob, SkipReason,
 };
 use sush_common::keys::{EphemeralKey, KeyError, KeyId, KeyType, Signer as _, pem_cert_chain};
 use sush_common::targets::{Cubbies, Target};
@@ -425,6 +425,33 @@ async fn job_stop() {
     );
 }
 
+/// Queue a job behind a hole in the job chain: the executor only runs
+/// the job whose id the chain expects next, and it never sees the
+/// hole's, so the queued job cannot start.
+async fn queue_job_behind_hole(
+    mgr: &JobManager,
+    root: &mut EphemeralKey,
+    authn: &Identity,
+    session: &mut Session,
+) -> JobId {
+    let session_id = session.session_id();
+    let hole_id = session.next_job_id();
+    let hole = root
+        .sign_job_request(hole_id, session_id, "true", false)
+        .await;
+    session.job_started(hole.into_signed());
+    let job_id = session.next_job_id();
+    let job = root
+        .sign_job_request(job_id, session_id, "false", false)
+        .await;
+    mgr.job_start(authn, job.clone().into_signed(), JobStartParams::default())
+        .await
+        .expect("should be able to queue the job");
+    session.job_started(job.into_signed());
+    mgr.wait_for_job_status(&job_id).await.unwrap();
+    job_id
+}
+
 #[named]
 #[tokio::test]
 async fn cancel_queued_job() {
@@ -457,28 +484,7 @@ async fn cancel_queued_job() {
     .expect("should be able to start job A");
     session.job_started(job_a.into_signed());
 
-    // Queue job B behind a hole in the job chain, so it cannot start
-    // before we cancel it: the executor only runs the job whose id the
-    // chain expects next, and it never sees this one.
-    let hole_id = session.next_job_id();
-    let hole = root
-        .sign_job_request(hole_id, session_id, "true", false)
-        .await;
-    session.job_started(hole.into_signed());
-    let command_b = "false";
-    let job_id_b = session.next_job_id();
-    let job_b = root
-        .sign_job_request(job_id_b, session_id, command_b, false)
-        .await;
-    mgr.job_start(
-        &authn,
-        job_b.clone().into_signed(),
-        JobStartParams::default(),
-    )
-    .await
-    .expect("should be able to queue job B");
-    session.job_started(job_b.into_signed());
-    mgr.wait_for_job_status(&job_id_b).await.unwrap();
+    let job_id_b = queue_job_behind_hole(&mgr, &mut root, &authn, &mut session).await;
     assert!(matches!(
         &mgr.job_status(&authn, &job_id_b).await.unwrap()[mgr.own_baseboard()],
         JobStatus::Queued { job_id: jid, time_queued, .. } if *jid == job_id_b && *time_queued <= Utc::now()
@@ -511,6 +517,109 @@ async fn cancel_queued_job() {
     )
     .await
     .expect("should be able to stop job A");
+}
+
+async fn wait_for_session_ended_skip(mgr: &JobManager, authn: &Identity, job_id: &JobId) {
+    timeout(Duration::from_secs(30), async {
+        loop {
+            if let Ok(map) = mgr.job_status(authn, job_id).await
+                && matches!(
+                    map.get(mgr.own_baseboard()),
+                    Some(JobStatus::Skipped {
+                        reason: SkipReason::SessionEnded,
+                        ..
+                    })
+                )
+            {
+                break;
+            }
+            sleep(Duration::from_millis(50)).await;
+        }
+    })
+    .await
+    .expect("job skipped for ended session");
+}
+
+#[named]
+#[tokio::test]
+async fn session_stop_skips_queued_jobs() {
+    let log = test_logger(function_name!());
+    let (mgr, mut root, _dir, _shutdown) = manager_and_test_root(log).await;
+    let authn = fake_identity(&mut root).await;
+    let signer_nonce = SessionSignerNonce::random();
+    let session_id =
+        SessionId::compute(mgr.own_baseboard(), mgr.session_sush_nonce(), signer_nonce);
+    let mut session = Session::new(session_id);
+    mgr.session_start(&authn, session_id, signer_nonce, true)
+        .await
+        .unwrap();
+
+    let job_id_a = session.next_job_id();
+    let job_a = root
+        .sign_job_request(job_id_a, session_id, "sleep 10", false)
+        .await;
+    mgr.job_start(
+        &authn,
+        job_a.clone().into_signed(),
+        JobStartParams {
+            wait: JobWait::Start,
+            ..Default::default()
+        },
+    )
+    .await
+    .expect("should be able to start job A");
+    session.job_started(job_a.into_signed());
+
+    let job_id_b = queue_job_behind_hole(&mgr, &mut root, &authn, &mut session).await;
+
+    mgr.session_stop(&authn, session_id)
+        .await
+        .expect("should be able to stop the session");
+    wait_for_session_ended_skip(&mgr, &authn, &job_id_b).await;
+
+    assert!(matches!(
+        &mgr.job_status(&authn, &job_id_a).await.unwrap()[mgr.own_baseboard()],
+        JobStatus::Started { .. }
+    ));
+
+    mgr.job_stop(
+        &authn,
+        &job_id_a,
+        JobStopParams {
+            wait: JobWait::Stop,
+            ..Default::default()
+        },
+    )
+    .await
+    .expect("should be able to stop job A");
+}
+
+#[named]
+#[tokio::test]
+async fn superseding_session_skips_queued_jobs() {
+    let log = test_logger(function_name!());
+    let (mgr, mut root, _dir, _shutdown) = manager_and_test_root(log).await;
+    let authn = fake_identity(&mut root).await;
+    let signer_nonce = SessionSignerNonce::random();
+    let session_id =
+        SessionId::compute(mgr.own_baseboard(), mgr.session_sush_nonce(), signer_nonce);
+    let mut session = Session::new(session_id);
+    mgr.session_start(&authn, session_id, signer_nonce, true)
+        .await
+        .unwrap();
+
+    let job_id = queue_job_behind_hole(&mgr, &mut root, &authn, &mut session).await;
+
+    let new_signer_nonce = SessionSignerNonce::random();
+    let new_session_id = SessionId::compute(
+        mgr.own_baseboard(),
+        mgr.session_sush_nonce(),
+        new_signer_nonce,
+    );
+    mgr.session_start(&authn, new_session_id, new_signer_nonce, true)
+        .await
+        .expect("should be able to start a superseding session");
+    wait_for_session_ended_skip(&mgr, &authn, &job_id).await;
 }
 
 #[named]

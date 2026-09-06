@@ -778,6 +778,19 @@ impl State {
         self.revoked_keys.peek(key_id).is_some()
     }
 
+    fn skip_queued_jobs(&self, executor: &Executor) {
+        for (job_id, queued) in self.session.queued_jobs().into_iter().flatten() {
+            if !queued.replayed
+                && queued
+                    .job
+                    .payload()
+                    .runs_on(&self.own_baseboard, &self.cubbies)
+            {
+                executor.job_skipped(*job_id, SkipReason::SessionEnded);
+            }
+        }
+    }
+
     #[allow(clippy::result_large_err)]
     fn update(
         &mut self,
@@ -837,6 +850,7 @@ impl State {
                                 log, "session started";
                                 "session_id" => %session_id, "actor" => %actor,
                             );
+                            self.skip_queued_jobs(executor);
                             let mut session = Session::started(*session_id, actor.clone());
                             // The committed session resumes at its
                             // stored successor: every earlier chain
@@ -884,9 +898,9 @@ impl State {
                                 incoming_session: *session_id,
                                 incoming_version: incoming_version.clone(),
                             };
-                            self.session = Inactive {
-                                frontier: &*frontier | incoming_version.clone(),
-                            };
+                            let frontier = &*frontier | incoming_version.clone();
+                            self.skip_queued_jobs(executor);
+                            self.session = Inactive { frontier };
                             return Err(error);
                         }
 
@@ -929,6 +943,7 @@ impl State {
                                     log, "session stopped";
                                     "session_id" => %session_id, "actor" => %actor,
                                 );
+                                self.skip_queued_jobs(executor);
                                 self.session = Inactive {
                                     frontier: frontier.clone(),
                                 }
@@ -1054,8 +1069,9 @@ impl State {
                         // session's own start (since each session is
                         // linearized by its accepting server).
                         //
-                        // Refused jobs targeting this sled record an error
-                        // status so the submitter learns their fate.
+                        // Refused jobs targeting this sled record the
+                        // terminal skip status so the submitter learns
+                        // their fate.
                         let session_id = signed.payload().session_id();
                         let live = self.is_live(incoming_version);
                         match self.session.active_session() {
@@ -1086,7 +1102,7 @@ impl State {
                             _ => {
                                 let job_id = *signed.job_id();
                                 warn!(
-                                    log, "refusing job for inactive session";
+                                    log, "skipping job for inactive session";
                                     "job_id" => %job_id,
                                     "session_id" => %session_id,
                                     "actor" => %actor,
@@ -1095,12 +1111,7 @@ impl State {
                                     && signed.payload().runs_on(&self.own_baseboard, &self.cubbies)
                                     && !self.history.contains(&job_id)
                                 {
-                                    executor.job_refused(
-                                        job_id,
-                                        ProcessError::InvalidJob(format!(
-                                            "session `{session_id}` is not active"
-                                        )),
-                                    );
+                                    executor.job_skipped(job_id, SkipReason::SessionEnded);
                                 }
                             }
                         }

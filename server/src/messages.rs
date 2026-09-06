@@ -635,6 +635,23 @@ mod wire_format {
     }
 
     #[test]
+    fn session_ended_skip_event() {
+        let msg: VersionedMessage = Message::Event(
+            BaseboardId {
+                part_number: "913-0000019".to_string(),
+                serial_number: "BRM42220030".to_string(),
+            },
+            Event::Job(JobEvent::Skipped(
+                JobId::from_str("zoo-zero").unwrap(),
+                "2026-09-04T20:00:00Z".parse().unwrap(),
+                SkipReason::SessionEnded,
+            )),
+        )
+        .into();
+        assert_wire_format("session-ended-skip-event", msg);
+    }
+
+    #[test]
     fn session_hop_error() {
         let msg: VersionedMessage = Message::Event(
             BaseboardId {

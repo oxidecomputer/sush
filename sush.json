@@ -1763,6 +1763,12 @@
         "description": "Why a sled will never run a job.",
         "oneOf": [
           {
+            "type": "string",
+            "enum": [
+              "session-ended"
+            ]
+          },
+          {
             "description": "The job's session sits at or below the sled's execution floor, where the sled cannot tell replay from re-run.",
             "type": "string",
             "enum": [
