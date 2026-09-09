@@ -48,7 +48,20 @@ use crate::link::{AttestedBaseboards, CorpusSource, SprocketsDial, SprocketsLink
 use crate::locker::Locker;
 
 /// The attested baseboards of our live gossip peers.
-pub type LinkedBaseboards = watch::Receiver<BTreeSet<BaseboardId>>;
+#[derive(Clone, Debug)]
+pub struct LinkedBaseboards(watch::Receiver<BTreeSet<BaseboardId>>);
+
+impl LinkedBaseboards {
+    /// A set that is forever empty, to accompany [`Universe::isolated`].
+    pub fn lonely() -> Self {
+        let (_tx, rx) = watch::channel(BTreeSet::new());
+        Self(rx)
+    }
+
+    pub fn borrow(&self) -> watch::Ref<'_, BTreeSet<BaseboardId>> {
+        self.0.borrow()
+    }
+}
 
 /// Manager timing. The defaults suit a rack, tests shrink them.
 #[derive(Clone, Debug)]
@@ -82,6 +95,14 @@ pub struct Universe<T> {
 impl<T> Universe<T> {
     pub fn genesis(rumors: Rumors<T, SushBookmark>) -> Self {
         Self { rumors }
+    }
+
+    /// A single-peer universe that never changes. The standalone server
+    /// uses this, as does a sled that cannot gossip. The receiver
+    /// outlives its sender.
+    pub fn isolated(seed: Rumors<T, SushBookmark>) -> watch::Receiver<Self> {
+        let (_tx, rx) = watch::channel(Universe::genesis(seed));
+        rx
     }
 }
 
@@ -130,24 +151,10 @@ impl<T> Seed<T> {
     }
 
     /// The network alone, for a seed that will never gossip
-    /// (see [`isolated`]).
+    /// (see [`Universe::isolated`]).
     pub fn into_rumors(self) -> Rumors<T, SushBookmark> {
         self.rumors
     }
-}
-
-/// A single-peer universe that never changes. The standalone server uses
-/// this, as does a sled that cannot gossip. The receiver outlives its
-/// sender.
-pub fn isolated<T>(seed: Rumors<T, SushBookmark>) -> watch::Receiver<Universe<T>> {
-    let (_tx, rx) = watch::channel(Universe::genesis(seed));
-    rx
-}
-
-/// A linked set that is forever empty, to accompany [`isolated`].
-pub fn lonely() -> LinkedBaseboards {
-    let (_tx, rx) = watch::channel(BTreeSet::new());
-    rx
 }
 
 /// Whether the peer's universe dominates ours, by rumors' documented rule.
@@ -169,7 +176,7 @@ fn remote_dominates(
 /// over it until `shutdown`. Returns the address the listener bound, the
 /// channel following the current universe, and the channel following the
 /// baseboards we hold live links to. A caller that cannot bind may fall
-/// back to [`isolated`].
+/// back to [`Universe::isolated`].
 #[allow(clippy::too_many_arguments)]
 pub async fn spawn_gossip<T>(
     log: &Logger,
@@ -239,7 +246,7 @@ where
         shutdown,
     };
     spawn(manager.run());
-    (subscribe, subscribe_linked)
+    (subscribe, LinkedBaseboards(subscribe_linked))
 }
 
 /// A link establishment that finished, and the peer it was aimed at.

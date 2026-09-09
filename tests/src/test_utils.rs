@@ -30,7 +30,7 @@ use sush_common::jobs::{JobId, JobMode, JobStartRequest, SessionId, VerifiedJob}
 use sush_common::keys::{EphemeralKey, KeyType, Signer};
 use sush_common::targets::{Cubbies, Target};
 use sush_server::executor::PathIsolation;
-use sush_server::gossip::{isolated, lonely};
+use sush_server::gossip::{LinkedBaseboards, Universe};
 use sush_server::locker::Locker;
 use sush_server::output::{JobOutputDir, JobOutputFileStream};
 use sush_server::state::GossipNetwork;
@@ -230,7 +230,7 @@ pub async fn manager_test_root_and_peer(
     let dir = TempDir::with_prefix("sush-").unwrap();
     let seed = null_gossip().await;
     let peer = seed.clone();
-    let gossip = isolated(seed);
+    let gossip = Universe::isolated(seed);
     let shutdown = CancellationToken::new();
     let root = ephemeral_test_root();
     let mgr = JobManager::with_root_certs(
@@ -240,7 +240,7 @@ pub async fn manager_test_root_and_peer(
         test_baseboard_id(),
         no_cubbies(),
         gossip,
-        lonely(),
+        LinkedBaseboards::lonely(),
         &Locker::null(),
         &[root.cert().to_owned()],
         shutdown.clone(),

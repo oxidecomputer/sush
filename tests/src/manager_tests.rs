@@ -35,7 +35,7 @@ use sush_common::jobs::{
 };
 use sush_common::keys::{EphemeralKey, KeyError, KeyId, KeyType, Signer as _, pem_cert_chain};
 use sush_common::targets::{Cubbies, Target};
-use sush_server::gossip::{Universe, isolated, lonely};
+use sush_server::gossip::{LinkedBaseboards, Universe};
 use sush_server::io::BATCH_OUTPUT_BUFFER_SIZE;
 use sush_server::locker::Locker;
 use sush_server::messages::v0::{CertRequest, IdentityRequest, Message, Request, SessionRequest};
@@ -689,8 +689,8 @@ async fn cubby_targets() {
         JobOutputDir::fixed(dir.path()),
         test_baseboard_id(),
         cubbies_rx,
-        isolated(null_gossip().await),
-        lonely(),
+        Universe::isolated(null_gossip().await),
+        LinkedBaseboards::lonely(),
         &Locker::null(),
         &[root.cert().to_owned()],
         CancellationToken::new(),
@@ -796,8 +796,8 @@ async fn root_certs_from_files() {
         JobOutputDir::fixed(dir.path()),
         test_baseboard_id(),
         no_cubbies(),
-        isolated(null_gossip().await),
-        lonely(),
+        Universe::isolated(null_gossip().await),
+        LinkedBaseboards::lonely(),
         &Locker::null(),
         &[path],
         CancellationToken::new(),
@@ -848,8 +848,8 @@ async fn bad_root_cert_files() {
                 JobOutputDir::fixed(dir.path()),
                 test_baseboard_id(),
                 no_cubbies(),
-                isolated(null_gossip().await),
-                lonely(),
+                Universe::isolated(null_gossip().await),
+                LinkedBaseboards::lonely(),
                 &Locker::null(),
                 &[path],
                 CancellationToken::new(),
@@ -880,8 +880,8 @@ async fn job_output_dir_moves() {
         JobOutputDir::new(rx_dirs),
         test_baseboard_id(),
         no_cubbies(),
-        isolated(null_gossip().await),
-        lonely(),
+        Universe::isolated(null_gossip().await),
+        LinkedBaseboards::lonely(),
         &Locker::null(),
         &[root.cert().to_owned()],
         CancellationToken::new(),
@@ -983,7 +983,7 @@ async fn universe_swap() {
         test_baseboard_id(),
         no_cubbies(),
         universe_rx,
-        lonely(),
+        LinkedBaseboards::lonely(),
         &Locker::null(),
         &[root.cert().to_owned()],
         CancellationToken::new(),
@@ -1146,7 +1146,7 @@ async fn cert_chain() {
         part_number: "test part".to_string(),
         serial_number: "0000".to_string(),
     };
-    let gossip = isolated(null_gossip().await);
+    let gossip = Universe::isolated(null_gossip().await);
     let shutdown = CancellationToken::new();
     let mgr = JobManager::with_root_certs(
         log,
@@ -1155,7 +1155,7 @@ async fn cert_chain() {
         baseboard,
         no_cubbies(),
         gossip,
-        lonely(),
+        LinkedBaseboards::lonely(),
         &Locker::null(),
         &roots,
         shutdown,
@@ -1930,8 +1930,8 @@ async fn hostile_imports_cannot_displace() {
         JobOutputDir::fixed(dir.path()),
         baseboard,
         no_cubbies(),
-        isolated(seed),
-        lonely(),
+        Universe::isolated(seed),
+        LinkedBaseboards::lonely(),
         &Locker::null(),
         from_ref(&root_cert),
         shutdown,
@@ -2077,8 +2077,8 @@ async fn homonym_issuer_resolves_to_true_parent() {
         JobOutputDir::fixed(dir.path()),
         baseboard,
         no_cubbies(),
-        isolated(seed),
-        lonely(),
+        Universe::isolated(seed),
+        LinkedBaseboards::lonely(),
         &Locker::null(),
         from_ref(&root_cert),
         shutdown,
