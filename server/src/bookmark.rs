@@ -201,7 +201,7 @@ mod test {
     }
 
     fn source(slots: Vec<Utf8PathBuf>) -> BookmarkSource {
-        BookmarkSource::new(&test_log(), &Locker::new(&test_log(), slots))
+        BookmarkSource::new(&test_log(), &Locker::new(&test_log(), slots).unwrap())
     }
 
     async fn read_back(handle: &SushBookmark) -> Option<Vec<u8>> {

@@ -28,11 +28,16 @@
 //! Discarding is a verdict, not an error, since each tenant decides
 //! what starting over means.
 //!
+//! A locker holds an advisory lock on every slot until it and all
+//! of its tenants drop. Trying to construct a second locker over
+//! any of the same slots, in this process or another, will fail
+//! instead of clobbering records.
+//!
 //! All of this is necessary to ensure the basic constraint that
 //! **we must never adopt stale data**.
 
 use std::collections::BTreeSet;
-use std::fs::Permissions;
+use std::fs::{File, Permissions};
 use std::io::{self, Write as _};
 use std::os::unix::fs::PermissionsExt as _;
 use std::sync::{Arc, Mutex as SyncMutex};
@@ -40,6 +45,7 @@ use std::sync::{Arc, Mutex as SyncMutex};
 use atomicwrites::{AtomicFile, OverwriteBehavior};
 use camino::Utf8PathBuf;
 use futures::TryFutureExt as _;
+use rustix::fs::{FlockOperation, flock};
 use slog::{Logger, o, warn};
 use thiserror::Error;
 use tokio::fs::{read, remove_file, write};
@@ -49,6 +55,7 @@ use tokio::task::spawn_blocking;
 use sush_common::authn::Nonce;
 use sush_common::hash::Hasher;
 
+const LOCK_FILE: &str = "lock";
 const MAGIC_LEN: usize = 12;
 const NONCE_LEN: usize = 32;
 const SEQ_LEN: usize = 8;
@@ -96,6 +103,15 @@ pub enum Discard {
     },
 }
 
+/// Some other locker holds a requested slot.
+#[derive(Debug, Error)]
+#[error("another locker holds `{path}`: {error}")]
+pub struct Locked {
+    path: Utf8PathBuf,
+    #[source]
+    error: io::Error,
+}
+
 #[derive(Debug, Error)]
 pub enum StoreError {
     #[error("storing `{path}` failed: {error}")]
@@ -122,23 +138,48 @@ pub struct Locker {
     /// file would have its own sequence state, silently defeating
     /// the straggler guard.
     claimed: Arc<SyncMutex<BTreeSet<&'static str>>>,
+    /// Advisory locks held by this locker for as long as it lives.
+    /// Every non-broken slot gets a lock.
+    locks: Arc<Vec<File>>,
 }
 
 impl Locker {
     /// A locker spans `slots`. Empty means nothing persists
-    /// (the standalone server, tests).
-    pub fn new(log: &Logger, slots: Vec<Utf8PathBuf>) -> Self {
-        Self {
-            log: log.new(o!("component" => "locker")),
+    /// (the standalone server, tests). Fails when another locker
+    /// holds any of the slots.
+    pub fn new(log: &Logger, slots: Vec<Utf8PathBuf>) -> Result<Self, Locked> {
+        let log = log.new(o!("component" => "locker"));
+        let mut locks = Vec::with_capacity(slots.len());
+        for slot in &slots {
+            let path = slot.join(LOCK_FILE);
+            match File::create(&path) {
+                Ok(file) => match flock(&file, FlockOperation::NonBlockingLockExclusive) {
+                    Ok(()) => locks.push(file),
+                    Err(errno) => {
+                        return Err(Locked {
+                            path,
+                            error: errno.into(),
+                        });
+                    }
+                },
+                Err(error) => {
+                    warn!(log, "cannot create slot lock file"; "path" => %path, "error" => %error);
+                }
+            }
+        }
+        Ok(Self {
+            log,
             slots: Arc::new(slots),
             nonce: Nonce::random(),
-            claimed: Arc::new(SyncMutex::new(BTreeSet::new())),
-        }
+            claimed: Arc::new(SyncMutex::new(BTreeSet::from([LOCK_FILE]))),
+            locks: Arc::new(locks),
+        })
     }
 
     /// A locker that loads and persists nothing.
     pub fn null() -> Self {
         Self::new(&Logger::root(slog::Discard, o!()), Vec::new())
+            .expect("a locker without slots takes no locks")
     }
 
     /// A tenant of this locker, described by a (constant) specification.
@@ -156,6 +197,7 @@ impl Locker {
             nonce: self.nonce.clone(),
             reserved: Mutex::new(0),
             committed: Arc::new(SyncMutex::new(0)),
+            _locks: Arc::clone(&self.locks),
         }
     }
 
@@ -184,6 +226,9 @@ pub struct Tenant {
     reserved: Mutex<u64>,
     /// The newest sequence number written to all slots.
     committed: Arc<SyncMutex<u64>>,
+    /// Holds the slot locks for this tenant's lifetime, so that the
+    /// locker may drop before its tenants without freeing the slots.
+    _locks: Arc<Vec<File>>,
 }
 
 impl Tenant {
@@ -391,7 +436,7 @@ mod test {
     }
 
     fn locker(slots: Vec<Utf8PathBuf>) -> Locker {
-        Locker::new(&test_log(), slots)
+        Locker::new(&test_log(), slots).unwrap()
     }
 
     fn files(slots: &[Utf8PathBuf]) -> Vec<Utf8PathBuf> {
@@ -456,6 +501,7 @@ mod test {
         let b = locker(vec![slots[1].clone()]).tenant(SPEC);
         b.store(b"junk").await.unwrap();
         b.store(b"another").await.unwrap();
+        drop((a, b));
 
         let tenant = locker(slots).tenant(SPEC);
         assert!(matches!(
@@ -475,6 +521,7 @@ mod test {
         let b = locker(vec![slots[1].clone()]).tenant(SPEC);
         b.store(b"junk").await.unwrap();
         b.store(b"same").await.unwrap();
+        drop((a, b));
 
         let tenant = locker(slots.clone()).tenant(SPEC);
         assert!(matches!(
@@ -537,6 +584,7 @@ mod test {
             tenant.load().await,
             Verdict::Adopt(record) if record == b"new"
         ));
+        drop(tenant);
 
         let next = locker(slots.clone()).tenant(SPEC);
         assert!(matches!(
@@ -615,6 +663,18 @@ mod test {
             locker(slots).probe().await,
             Err(StoreError::Io { .. })
         ));
+    }
+
+    /// A slot admits one locker at a time, and a tenant keeps the
+    /// locks alive after its locker drops.
+    #[tokio::test]
+    async fn second_locker_is_locked_out() {
+        let dir = TempDir::with_prefix("sush-locker-").unwrap();
+        let slots = slots(&dir);
+        let tenant = locker(slots.clone()).tenant(SPEC);
+        assert!(Locker::new(&test_log(), slots.clone()).is_err());
+        drop(tenant);
+        assert!(Locker::new(&test_log(), slots).is_ok());
     }
 
     /// A null locker persists nothing and never fails.

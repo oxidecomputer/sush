@@ -357,7 +357,7 @@ mod test {
     }
 
     async fn store(slots: Vec<Utf8PathBuf>) -> BoundaryStore {
-        let store = BoundaryStore::new(&test_log(), &Locker::new(&test_log(), slots));
+        let store = BoundaryStore::new(&test_log(), &Locker::new(&test_log(), slots).unwrap());
         store.load().await;
         store
     }
@@ -433,8 +433,9 @@ mod test {
         struct Envelope(u16, #[serde(with = "crate::format::cbor_bytes")] Vec<u8>);
         let mut bytes = Vec::new();
         into_cbor(&Envelope(1, b"from the future".to_vec()), &mut bytes).unwrap();
-        let scratch = Locker::new(&test_log(), slots.clone());
+        let scratch = Locker::new(&test_log(), slots.clone()).unwrap();
         scratch.tenant(BOUNDARY).store(&bytes).await.unwrap();
+        drop(scratch);
 
         let store = store(slots).await;
         assert!(store.untrusted());
@@ -464,6 +465,7 @@ mod test {
         b.burned = a.burned_for(b.network);
         first.advance(&a).await.unwrap();
         first.advance(&b).await.unwrap();
+        drop(first);
 
         let next = store(slots).await;
         assert!(!next.untrusted());
@@ -509,6 +511,7 @@ mod test {
 
         first.record_outcome(&job, &interrupted).await;
         first.record_outcome(&job, &killed).await;
+        drop(first);
         let next = store(slots).await;
         assert!(matches!(
             next.boundary().unwrap().job.unwrap().outcome,
@@ -535,6 +538,7 @@ mod test {
             untrusted.advance(&boundary()).await,
             Err(BoundaryError::Untrusted)
         ));
+        drop(untrusted);
 
         let reload = store(slots).await;
         assert!(reload.untrusted());
@@ -544,10 +548,11 @@ mod test {
     async fn undecodable_record_is_untrusted() {
         let dir = TempDir::with_prefix("sush-boundary-").unwrap();
         let slots = slots(&dir);
-        let scratch = Locker::new(&test_log(), slots.clone());
+        let scratch = Locker::new(&test_log(), slots.clone()).unwrap();
         scratch.tenant(BOUNDARY).store(b"scribble").await.unwrap();
+        drop(scratch);
 
-        let store = BoundaryStore::new(&test_log(), &Locker::new(&test_log(), slots));
+        let store = BoundaryStore::new(&test_log(), &Locker::new(&test_log(), slots).unwrap());
         store.load().await;
         assert!(store.untrusted());
     }
@@ -555,7 +560,8 @@ mod test {
     #[tokio::test]
     async fn unloaded_is_untrusted() {
         let dir = TempDir::with_prefix("sush-boundary-").unwrap();
-        let store = BoundaryStore::new(&test_log(), &Locker::new(&test_log(), slots(&dir)));
+        let store =
+            BoundaryStore::new(&test_log(), &Locker::new(&test_log(), slots(&dir)).unwrap());
         assert!(store.untrusted());
         assert!(matches!(
             store.advance(&boundary()).await,
