@@ -1348,9 +1348,9 @@ async fn revocation_tombstones() {
         .into()
     };
     for _ in 0..200 {
-        peer.send(revoke(KeyId::random()));
+        peer.send(revoke(KeyId::random())).unwrap();
     }
-    peer.send(revoke(doomed.key_id().clone()));
+    peer.send(revoke(doomed.key_id().clone())).unwrap();
 
     // The revocation outlives the spam and refuses the import. The
     // spam blocks nothing else.
@@ -1360,7 +1360,8 @@ async fn revocation_tombstones() {
             CertRequest::Import(doomed.cert().to_der().unwrap()),
         ))
         .into(),
-    );
+    )
+    .unwrap();
     timeout(Duration::from_secs(30), async {
         loop {
             match mgr.cert_chain(&authn, doomed.key_id()) {
@@ -1558,7 +1559,8 @@ async fn gossiped_identities() {
             IdentityRequest::Login(root_pk.to_openssh().unwrap(), signed_by_liar),
         ))
         .into(),
-    );
+    )
+    .unwrap();
 
     // Real evidence authorizes here without ever logging in here.
     let request_key = RequestKey::new();
@@ -1573,7 +1575,8 @@ async fn gossiped_identities() {
             IdentityRequest::Login(root_pk.to_openssh().unwrap(), signed),
         ))
         .into(),
-    );
+    )
+    .unwrap();
     let authz = Authz::new(credentials, request_key);
     let authn = timeout(Duration::from_secs(30), async {
         loop {
@@ -1696,14 +1699,16 @@ async fn attach_grants() {
             SessionRequest::AllowAttach(session_id, guest.key_id.clone(), Access::ReadWrite),
         ))
         .into(),
-    );
+    )
+    .unwrap();
     peer.send(
         Message::Request(Request::session(
             owner.key_id.clone(),
             SessionRequest::AllowAttach(session_id, third.key_id.clone(), Access::ReadOnly),
         ))
         .into(),
-    );
+    )
+    .unwrap();
     granted(third.clone(), Some(Access::ReadOnly)).await;
     assert!(matches!(
         attach(guest.clone()).await,
@@ -1789,21 +1794,24 @@ async fn skip_and_stop_are_starter_only() {
             SessionRequest::Stop(session_id),
         ))
         .into(),
-    );
+    )
+    .unwrap();
     peer.send(
         Message::Request(Request::session(
             guest.key_id.clone(),
             SessionRequest::Skip(session_id, job_id),
         ))
         .into(),
-    );
+    )
+    .unwrap();
     peer.send(
         Message::Request(Request::session(
             owner.key_id.clone(),
             SessionRequest::Skip(session_id, job_id),
         ))
         .into(),
-    );
+    )
+    .unwrap();
     timeout(Duration::from_secs(30), async {
         loop {
             if let Some(session) = mgr.session(&owner)
@@ -1873,7 +1881,8 @@ async fn skip_racing_start_converges() {
             SessionRequest::Skip(session_id, job_id),
         ))
         .into(),
-    );
+    )
+    .unwrap();
     assert!(mirror.skip_job(job_id));
     timeout(Duration::from_secs(30), async {
         loop {
@@ -1958,7 +1967,7 @@ async fn hostile_imports_cannot_displace() {
         ))
         .into()
     };
-    peer.send(import(&fake_root));
+    peer.send(import(&fake_root)).unwrap();
 
     // A homonym of the root issued by an outsider.
     let mut outsider =
@@ -1975,7 +1984,7 @@ async fn hostile_imports_cannot_displace() {
     )
     .await
     .unwrap();
-    peer.send(import(&fake_delegate));
+    peer.send(import(&fake_delegate)).unwrap();
 
     // A different certificate bearing the child's key.
     let mut conflict = child.cert().clone();
@@ -1986,7 +1995,8 @@ async fn hostile_imports_cannot_displace() {
             CertRequest::Import(conflict.to_der().unwrap()),
         ))
         .into(),
-    );
+    )
+    .unwrap();
 
     // A grandchild sent on the same handle marks the batch processed
     // once it validates.
@@ -2001,7 +2011,7 @@ async fn hostile_imports_cannot_displace() {
     )
     .await
     .unwrap();
-    peer.send(import(&grandchild));
+    peer.send(import(&grandchild)).unwrap();
     timeout(Duration::from_secs(30), async {
         while mgr.cert_chain(&authn, grandchild.key_id()).is_err() {
             sleep(Duration::from_millis(50)).await;
@@ -2096,7 +2106,8 @@ async fn homonym_issuer_resolves_to_true_parent() {
             CertRequest::Import(homonym.cert().to_der().unwrap()),
         ))
         .into(),
-    );
+    )
+    .unwrap();
     timeout(
         Duration::from_secs(1),
         mgr.cert_import(&authn, child.cert().clone(), true),

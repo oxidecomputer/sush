@@ -368,13 +368,18 @@ async fn interrupted_jobs_get_stopped() {
         .parse()
         .unwrap();
     let ghost = baseboard(2);
-    a.universe.borrow().rumors.clone().send(
-        Message::Event(
-            ghost.clone(),
-            Event::Job(JobEvent::Start(job_id, Utc::now())),
+    a.universe
+        .borrow()
+        .rumors
+        .clone()
+        .send(
+            Message::Event(
+                ghost.clone(),
+                Event::Job(JobEvent::Start(job_id, Utc::now())),
+            )
+            .into(),
         )
-        .into(),
-    );
+        .unwrap();
     eventually("A records the orphaned start", 60, async || {
         a.mgr.job_status(&authn_a, &job_id).await.is_ok_and(|map| {
             map.get(&ghost)
@@ -407,13 +412,18 @@ async fn interrupted_jobs_get_stopped() {
     // The job's genuine stop was in flight all along. When it lands,
     // the real result supersedes the interrupted declaration.
     let output = JobOutputState::default();
-    a.universe.borrow().rumors.clone().send(
-        Message::Event(
-            ghost.clone(),
-            Event::Job(JobEvent::Stop(job_id, Utc::now(), Ok(0), output)),
+    a.universe
+        .borrow()
+        .rumors
+        .clone()
+        .send(
+            Message::Event(
+                ghost.clone(),
+                Event::Job(JobEvent::Stop(job_id, Utc::now(), Ok(0), output)),
+            )
+            .into(),
         )
-        .into(),
-    );
+        .unwrap();
     eventually("the late stop supersedes the interrupt", 120, async || {
         a.mgr.job_status(&authn_a, &job_id).await.is_ok_and(|map| {
             map.get(&ghost)
@@ -459,7 +469,8 @@ async fn stragglers_do_not_interrupt_live_jobs() {
         .borrow()
         .rumors
         .clone()
-        .send(Message::Event(marooned.clone(), Event::Version(VersionInfo::current())).into());
+        .send(Message::Event(marooned.clone(), Event::Version(VersionInfo::current())).into())
+        .unwrap();
     // A also advances on its own side of the split, so the marooned
     // message is genuinely concurrent with (not under) B's frontier.
     let split_marker = BaseboardId {
@@ -470,7 +481,8 @@ async fn stragglers_do_not_interrupt_live_jobs() {
         .borrow()
         .rumors
         .clone()
-        .send(Message::Event(split_marker, Event::Version(VersionInfo::current())).into());
+        .send(Message::Event(split_marker, Event::Version(VersionInfo::current())).into())
+        .unwrap();
 
     // B joins through A alone, so C's message is concurrent with B's
     // join frontier, and starts a live job that keeps running.
