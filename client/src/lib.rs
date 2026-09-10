@@ -19,6 +19,7 @@ pub mod interactive;
 pub mod permslip;
 pub mod repl;
 pub mod tls;
+pub mod tunnel;
 
 /// Authorization state shared between the command context and the
 /// client's pre-send hook, which signs every request with the current
@@ -79,8 +80,10 @@ progenitor::generate_api!(
         KeyId = sush_common::keys::KeyId,
         Signature = sush_common::keys::Signature,
         SignedForJobStartRequest = sush_common::jobs::SignedJob,
+        SessionSignerNonce = sush_common::jobs::SessionSignerNonce,
+        SessionSushNonce = sush_common::jobs::SessionSushNonce,
         SledVersion = sush_common::targets::SledVersion,
-        Streaming = sush_common::jobs::Streaming,
+        JobMode = sush_common::jobs::JobMode,
         VersionInfo = sush_common::version::VersionInfo,
     },
     timeout = 600,

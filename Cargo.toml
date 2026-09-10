@@ -6,22 +6,26 @@ resolver = "2"
 version = "0.1.0"
 
 [workspace.dependencies]
+anstream = "1"
+anyhow = "1"
+anstyle = "1"
 async-recursion = "1"
 attest-mock = { git = "https://github.com/oxidecomputer/dice-util", rev = "10952e8d9599b735b85d480af3560a11700e5b64" }
+atomicwrites = "0.4"
 base64 = "0.22"
 camino = "1"
 async-trait = "0.1"
-blake3 = { version = "1", features = ["mmap", "rayon"] }
-borsh = { version = "1", features = ["derive"] }
 bytes = "1"
 bytesize = "2"
 chrono = { version = "0.4", features = ["serde"] }
+ciborium = "0.2"
 clap = { version = "4", features = ["derive", "env", "wrap_help"] }
 crypto-bigint = "0.5"
 dropshot = "0.17"
 ed25519-dalek = { version = "2", features = ["pkcs8", "rand_core"] }
 function_name = "0.3"
 futures = "0.3"
+hex = "0.4"
 http = "1"
 http-body-util = "0.1"
 http-range-header = "0.4"
@@ -35,8 +39,8 @@ memmap2 = "0.9"
 p256 = { version = "0.13", features = ["ecdsa", "pkcs8"] }
 pem-rfc7468 = { version = "0.7", features = ["std"] }
 percent-encoding = "2"
-permission-slip-client = { git = "https://github.com/oxidecomputer/permission-slip" }
-permission-slip-common = { git = "https://github.com/oxidecomputer/permission-slip" }
+permission-slip-client = { git = "https://github.com/oxidecomputer/permission-slip", rev = "c9d302ef44576e075e35f4f28f8e7ac8345bcd4b" }
+permission-slip-common = { git = "https://github.com/oxidecomputer/permission-slip", rev = "c9d302ef44576e075e35f4f28f8e7ac8345bcd4b" }
 progenitor = "0.14"
 progenitor-client = "0.14"
 pwd = "1"
@@ -45,7 +49,7 @@ rand = "0.8"
 rand_core = "0.6"
 reqwest = { version = "0.13", features = ["json", "rustls"] }
 rlimit = "0.10"
-rumors = { git = "https://github.com/oxidecomputer/rumors", rev = "b2675dbef99b784efb817db01920ee59dac708c3" }
+rumors = { git = "https://github.com/oxidecomputer/rumors", rev = "be1d76947f75f27e7f53be438a93d350019dd026" }
 rustix = { version = "1", features = ["fs", "process", "pty", "termios"] }
 rustls = "0.23"
 rustyline = { git = "https://github.com/kkawakam/rustyline", rev = "5ab22f2f8d65e85f0b925360437ece8eeeb6db92", features = ["signal-hook", "termios"] }
@@ -59,8 +63,8 @@ signature = "2"
 sled-hardware-types = { git = "https://github.com/oxidecomputer/omicron", tag = "rel/v21/rc1" }
 slog = "2"
 slog-term = "2"
-sprockets-tls = { git = "https://github.com/oxidecomputer/sprockets.git", rev = "b8782742d1bd91546887fbc1757a7d024a5469ef", default-features = false }
-sprockets-tls-test-utils = { git = "https://github.com/oxidecomputer/sprockets.git", rev = "b8782742d1bd91546887fbc1757a7d024a5469ef" }
+sprockets-tls = { git = "https://github.com/oxidecomputer/sprockets.git", rev = "98615b86d51f74ce220198eb16c57932fd24e7cb", default-features = false }
+sprockets-tls-test-utils = { git = "https://github.com/oxidecomputer/sprockets.git", rev = "98615b86d51f74ce220198eb16c57932fd24e7cb" }
 ssh-key = { version = "0.6", features = ["ed25519", "p256", "serde"] }
 tempfile = "3"
 thiserror = "1"
@@ -70,7 +74,6 @@ tokio-stream = "0.1"
 tokio-fd = "0.3"
 tokio-tungstenite = "0.28"
 tokio-util = "0.7"
-uuid = { version = "1", features = ["borsh"] }
 x509-cert = { version = "0.2", features = ["pem", "std"] }
 xdg = "3"
 
@@ -92,3 +95,8 @@ opt-level = 3
 opt-level = 3
 [profile.dev.package.sha3]
 opt-level = 3
+
+# Unify permission-slip-client's sush-common with this workspace's,
+# so its replaced wire types are our types.
+[patch."https://github.com/oxidecomputer/sush"]
+sush-common = { path = "common" }

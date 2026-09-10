@@ -21,7 +21,8 @@ use x509_cert::der::DecodePem as _;
 use sush_api::sush_api_mod::api_description;
 use sush_common::targets::Cubbies;
 use sush_server::executor::PathIsolation;
-use sush_server::gossip::isolated;
+use sush_server::gossip::{LinkedBaseboards, Universe};
+use sush_server::locker::Locker;
 use sush_server::manager::JobManager;
 use sush_server::output::JobOutputDir;
 use sush_server::server::ApiServer;
@@ -89,12 +90,12 @@ async fn main() -> Result<(), String> {
 
     // TODO: get actual baseboard ID
     let baseboard = BaseboardId {
-        part_number: "a part".to_string(),
-        serial_number: "0001".to_string(),
+        part_number: "000-0000000".to_string(),
+        serial_number: "23333333".to_string(),
     };
 
     // TODO: get/seed Rumors network
-    let gossip = isolated(seed_gossip());
+    let gossip = Universe::isolated(seed_gossip(&log, &Locker::null()).await.into_rumors());
 
     #[cfg(feature = "test-support")]
     let roots = overridable_root_certs(&override_root_certs).await?;
@@ -110,6 +111,8 @@ async fn main() -> Result<(), String> {
         baseboard,
         cubbies,
         gossip,
+        LinkedBaseboards::lonely(),
+        &Locker::null(),
         &roots,
         shutdown.clone(),
     )

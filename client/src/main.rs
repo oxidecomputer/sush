@@ -39,7 +39,9 @@ fn no_expand_tabs() -> Option<Termios> {
 #[tokio::main]
 async fn main() -> ExitCode {
     let saved = no_expand_tabs();
-    let code = match ClientArgs::parse().execute(&mut Cli::default()).await {
+    let mut cli = Cli::default();
+    cli.load_session();
+    let code = match ClientArgs::parse().execute(&mut cli).await {
         Ok(()) => ExitCode::SUCCESS,
         Err(error) => {
             eprintln!("{error}");

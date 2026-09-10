@@ -26,11 +26,12 @@ use sush_client::context::Authz;
 use sush_client::{Client, ResponseValue};
 use sush_common::authn::{Challenge, ChallengeResponse, Credentials, Identity, Nonce, RequestKey};
 use sush_common::codephrases::Codephrase;
-use sush_common::jobs::{JobId, JobStartRequest, Streaming, VerifiedJob};
+use sush_common::jobs::{JobId, JobMode, JobStartRequest, SessionId, VerifiedJob};
 use sush_common::keys::{EphemeralKey, KeyType, Signer};
 use sush_common::targets::{Cubbies, Target};
 use sush_server::executor::PathIsolation;
-use sush_server::gossip::isolated;
+use sush_server::gossip::{LinkedBaseboards, Universe};
+use sush_server::locker::Locker;
 use sush_server::output::{JobOutputDir, JobOutputFileStream};
 use sush_server::state::GossipNetwork;
 use sush_server::{JobError, JobManager, seed_gossip};
@@ -68,43 +69,51 @@ impl IntoBytes for JobOutputFileStream {
 pub trait SignJobRequest {
     async fn sign_job_request<S: AsRef<str>>(
         &mut self,
-        job_id: &JobId,
+        job_id: JobId,
+        session_id: SessionId,
         command: S,
         interactive: bool,
     ) -> VerifiedJob {
-        self.sign_job_request_for(job_id, command, interactive, Target::All)
+        self.sign_job_request_for(job_id, session_id, command, interactive, Target::All)
             .await
     }
 
     async fn sign_job_request_for<S: AsRef<str>>(
         &mut self,
-        job_id: &JobId,
+        job_id: JobId,
+        session_id: SessionId,
         command: S,
         interactive: bool,
         target: Target,
     ) -> VerifiedJob {
-        self.sign_full_job_request(job_id, command, interactive, Streaming::None, target)
+        let mode = if interactive {
+            JobMode::Interactive
+        } else {
+            JobMode::Batch
+        };
+        self.sign_full_job_request(job_id, session_id, command, mode, target)
             .await
     }
 
     /// Sign a batch job request with unrecorded output streaming.
     async fn sign_streaming_job_request<S: AsRef<str>>(
         &mut self,
-        job_id: &JobId,
+        job_id: JobId,
+        session_id: SessionId,
         command: S,
         target: Target,
     ) -> VerifiedJob {
-        self.sign_full_job_request(job_id, command, false, Streaming::Output, target)
+        self.sign_full_job_request(job_id, session_id, command, JobMode::StreamOutput, target)
             .await
     }
 
     /// Sign a job request with every field specified.
     async fn sign_full_job_request<S: AsRef<str>>(
         &mut self,
-        job_id: &JobId,
+        job_id: JobId,
+        session_id: SessionId,
         command: S,
-        interactive: bool,
-        streaming: Streaming,
+        mode: JobMode,
         target: Target,
     ) -> VerifiedJob;
 }
@@ -112,18 +121,14 @@ pub trait SignJobRequest {
 impl SignJobRequest for EphemeralKey {
     async fn sign_full_job_request<S: AsRef<str>>(
         &mut self,
-        job_id: &JobId,
+        job_id: JobId,
+        session_id: SessionId,
         command: S,
-        interactive: bool,
-        streaming: Streaming,
+        mode: JobMode,
         target: Target,
     ) -> VerifiedJob {
         self.sign(JobStartRequest::new(
-            job_id.to_owned(),
-            command,
-            interactive,
-            streaming,
-            target,
+            job_id, session_id, command, mode, target,
         ))
         .await
         .expect("failed to sign job")
@@ -223,9 +228,9 @@ pub async fn manager_test_root_and_peer(
     CancellationToken,
 ) {
     let dir = TempDir::with_prefix("sush-").unwrap();
-    let seed = seed_gossip();
+    let seed = null_gossip().await;
     let peer = seed.clone();
-    let gossip = isolated(seed);
+    let gossip = Universe::isolated(seed);
     let shutdown = CancellationToken::new();
     let root = ephemeral_test_root();
     let mgr = JobManager::with_root_certs(
@@ -235,6 +240,8 @@ pub async fn manager_test_root_and_peer(
         test_baseboard_id(),
         no_cubbies(),
         gossip,
+        LinkedBaseboards::lonely(),
+        &Locker::null(),
         &[root.cert().to_owned()],
         shutdown.clone(),
     )
@@ -246,6 +253,12 @@ pub async fn manager_test_root_and_peer(
 /// A cubby map that will never be known.
 pub fn no_cubbies() -> watch::Receiver<Cubbies> {
     watch::channel(Cubbies::new()).1
+}
+
+/// A seed over storage that persists nothing, silently.
+pub async fn null_gossip() -> GossipNetwork {
+    let log = Logger::root(slog::Discard, slog::o!());
+    seed_gossip(&log, &Locker::null()).await.into_rumors()
 }
 
 pub async fn authz<E>(

@@ -7,7 +7,6 @@
 use std::collections::BTreeMap;
 use std::fmt;
 
-use borsh::{BorshDeserialize, BorshSerialize};
 use dropshot::{
     Body, ClientErrorStatusCode, Header, HttpError, HttpResponseOk, HttpResponseUpdatedNoContent,
     Path as PathParams, Query as QueryParams, RequestContext, TypedBody, WebsocketEndpointResult,
@@ -23,7 +22,7 @@ use sled_hardware_types::BaseboardId;
 use sush_common::authn::Identity;
 use sush_common::jobs::{
     Access, JobId, JobLimits, JobOutputStream, JobStatus, JsonJobStatusMap, Session, SessionId,
-    SignedJob,
+    SessionSignerNonce, SessionSushNonce, SignedJob,
 };
 use sush_common::keys::{KeyId, SshPublicKey};
 use sush_common::targets::SledVersion;
@@ -110,6 +109,16 @@ pub trait SushApi {
         headers: Header<Authorization>,
     ) -> Result<HttpResponseOk<Session>, HttpError>;
 
+    /// Get the sush server nonce needed to start a new session.
+    ///
+    /// The nonce will need to be sent to the signer server, which will give back its own nonce.
+    /// Both nonces combined (along with the baseboard ID) will form the session ID.
+    #[endpoint { method = GET, path = "/session-nonce" }]
+    async fn session_start_nonce(
+        ctx: RequestContext<Self::Context>,
+        headers: Header<Authorization>,
+    ) -> Result<HttpResponseOk<SessionStartNonce>, HttpError>;
+
     /// Start a new support session.
     ///
     /// There may only be one session active on the rack at a time.
@@ -122,6 +131,7 @@ pub trait SushApi {
         headers: Header<Authorization>,
         params: PathParams<SessionIdParam>,
         query: QueryParams<WaitParam>,
+        body: TypedBody<SessionStartBody>,
     ) -> Result<HttpResponseUpdatedNoContent, HttpError>;
 
     /// End a support session.
@@ -267,7 +277,7 @@ pub struct KeyIdParam {
     pub key_id: KeyId,
 }
 
-#[derive(Clone, Debug, Default, Deserialize, JsonSchema, BorshSerialize, BorshDeserialize)]
+#[derive(Clone, Debug, Default, Deserialize, JsonSchema, Serialize)]
 #[serde(default)]
 pub struct WaitParam {
     /// Wait for the subject to appear in the state.
@@ -312,42 +322,42 @@ pub struct JobTargetParams {
     pub target: String,
 }
 
+#[derive(Serialize, JsonSchema)]
+pub struct SessionStartNonce {
+    pub nonce: SessionSushNonce,
+}
+
+#[derive(Deserialize, JsonSchema)]
+pub struct SessionStartBody {
+    pub signer_nonce: SessionSignerNonce,
+}
+
 /// Job parameters _not_ specified in the signed job request.
-#[derive(
-    BorshSerialize, BorshDeserialize, Clone, Debug, Default, Deserialize, Eq, JsonSchema, PartialEq,
-)]
+#[derive(Clone, Debug, Default, Deserialize, Eq, JsonSchema, PartialEq, Serialize)]
 #[serde(default)]
 pub struct JobStartParams {
     #[serde(flatten, deserialize_with = "deserialize_job_limits")]
     pub limits: JobLimits,
 
     /// Terminal type for interactive jobs.
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub term: Option<String>,
 
     /// Terminal window height for interactive jobs.
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub rows: Option<u16>,
 
     /// Terminal window width for interactive jobs.
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub cols: Option<u16>,
 
     /// Wait for the job to start or stop.
+    #[serde(skip_serializing_if = "JobWait::is_none")]
     pub wait: JobWait,
 }
 
 /// Whether and until what state is reached to wait for a job start/stop request.
-#[derive(
-    BorshSerialize,
-    BorshDeserialize,
-    Clone,
-    Copy,
-    Debug,
-    Default,
-    Deserialize,
-    Eq,
-    JsonSchema,
-    PartialEq,
-    Serialize,
-)]
+#[derive(Clone, Copy, Debug, Default, Deserialize, Eq, JsonSchema, PartialEq, Serialize)]
 #[serde(rename_all = "lowercase")]
 pub enum JobWait {
     #[default]
@@ -378,12 +388,12 @@ impl JobWait {
         match self {
             Self::None => true,
             Self::Start => !matches!(status, Queued { .. }),
-            Self::Stop => matches!(status, Cancelled { .. } | Error { .. } | Stopped { .. }),
+            Self::Stop => status.is_terminal(),
         }
     }
 }
 
-#[derive(Clone, Debug, Default, Deserialize, JsonSchema, BorshSerialize, BorshDeserialize)]
+#[derive(Clone, Debug, Default, Deserialize, JsonSchema, Serialize)]
 #[serde(default)]
 pub struct JobStopParams {
     /// Wait for the job process to end.
@@ -422,9 +432,22 @@ where
         where
             A: MapAccess<'de>,
         {
+            /// Limits arrive as strings in query parameters and as
+            /// integers on binary wires.
+            #[derive(Deserialize)]
+            #[serde(untagged)]
+            enum Limit {
+                Number(u64),
+                String(String),
+            }
+
             let mut limits = BTreeMap::<String, u64>::new();
-            while let Some((key, value)) = map.next_entry::<String, String>()? {
-                limits.insert(key, value.parse().map_err(DeserializeError::custom)?);
+            while let Some((key, value)) = map.next_entry::<String, Limit>()? {
+                let value = match value {
+                    Limit::Number(value) => value,
+                    Limit::String(value) => value.parse().map_err(DeserializeError::custom)?,
+                };
+                limits.insert(key, value);
             }
             <JobLimits as Deserialize>::deserialize(limits.into_deserializer())
         }

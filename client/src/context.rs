@@ -15,7 +15,7 @@ use x509_cert::Certificate;
 
 use sush_common::authn::{BoundRequest, Credentials, Identity, RequestKey};
 use sush_common::jobs::{
-    Access, JobId, JobOutputStream, JobStatusMap, Session, SessionId, SignedJob,
+    Access, JobId, JobOutputStream, JobStatusMap, Session, SessionId, SessionSignerNonce, SignedJob,
 };
 use sush_common::keys::{KeyId, SshPublicKey};
 use sush_common::targets::{SledId, SledVersion};
@@ -23,6 +23,7 @@ use sush_common::version::VersionInfo;
 
 use crate::AuthzSigner;
 use crate::commands::{CommandError, GlobalArgs};
+use crate::types::SessionStartNonce;
 
 /// Authorization state: the credentials that authenticated us, and the
 /// ephemeral key that binds each request we make.
@@ -113,10 +114,19 @@ pub trait CommandContext: Clone + Send + Sync {
     fn set_credentials(&mut self, credentials: Option<Authz>) {
         self.authz_signer().set(credentials)
     }
+    /// The cached permslip token for `url` and the key `fingerprint`
+    /// names, if it is still fresh. The default caches nothing.
+    fn permslip_token(&self, _url: &str, _fingerprint: &str) -> Option<String> {
+        None
+    }
+    /// Remember a permslip token for reuse.
+    fn save_permslip_token(&self, _url: &str, _fingerprint: &str, _token: &str) {}
     fn session_id(&self) -> Option<SessionId>;
     fn next_job_id(&self) -> Result<JobId, CommandError>;
-    fn session_started(&mut self, session: Session) -> Result<(), CommandError>;
-    fn session_stopped(&mut self, session_id: &SessionId) -> Result<(), CommandError>;
+    fn session_start_params(&self, baseboard_id: BaseboardId, nonce: SessionStartNonce);
+    fn session_created(&mut self, session: Session, signer_nonce: SessionSignerNonce);
+    fn session_started(&mut self, session: Session, force: bool);
+    fn session_stopped(&mut self, session_id: &SessionId);
     fn attach_allowed(&mut self, key_id: &KeyId, access: Access);
     fn attach_denied(&mut self, key_id: &KeyId);
 
@@ -127,12 +137,13 @@ pub trait CommandContext: Clone + Send + Sync {
         certs: &str,
         roots: &[Certificate],
     ) -> Result<Certificate, CommandError>;
-    fn cert_imported(&mut self, path: &Path, key_id: KeyId) -> Result<(), CommandError>;
+    fn cert_imported(&mut self, path: &Path, key_id: KeyId);
 
     // Job management
     fn really_target(&mut self, sled: &SledId) -> Result<(), CommandError>;
-    fn job_started(&mut self, job: &SignedJob);
+    fn job_started(&mut self, job: &SignedJob, show: bool);
     fn job_stopped(&mut self, id: &JobId);
+    fn job_skipped(&mut self, id: &JobId) -> bool;
     fn job_error(&mut self, error: CommandError) -> CommandError;
     fn job_output(&mut self, id: &JobId, stream: JobOutputStream, output: &[u8], binary: bool);
     fn job_output_target(&mut self, target: &BaseboardId);
@@ -163,5 +174,5 @@ pub trait CommandContext: Clone + Send + Sync {
     fn identities(&mut self, identities: &[SshPublicKey]) -> Result<(), CommandError>;
     fn please_touch(&mut self, identity: &SshPublicKey) -> Result<(), CommandError>;
     fn really_revoke(&mut self, what: &str, key_id: KeyId) -> Result<KeyId, CommandError>;
-    fn revoked(&mut self, what: &str, key_id: KeyId) -> Result<(), CommandError>;
+    fn revoked(&mut self, what: &str, key_id: KeyId);
 }

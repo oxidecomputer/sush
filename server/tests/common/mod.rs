@@ -22,12 +22,12 @@ use sprockets_tls::keys::{
     AttestConfig, MeasurementConnectionPolicy, ResolveSetting, SprocketsConfig,
 };
 use sprockets_tls_test_utils::{
-    OutputFileExistsBehavior, alias_prefix, cert_path, certlist_path, generate_config,
+    OutputFileExistsBehavior, alias_prefix, cert_path, certlist_path, generate_config, platform_id,
     private_key_path, root_prefix, sprockets_auth_prefix,
 };
 use sush_common::authn::{Challenge, ChallengeResponse, Identity, Nonce, RequestKey};
 use sush_common::codephrases::Codephrase;
-use sush_common::jobs::{JobId, JobStartRequest, SignedJob, Streaming};
+use sush_common::jobs::{BaseboardId, JobId, JobMode, JobStartRequest, SessionId, SignedJob};
 use sush_common::keys::{EphemeralKey, KeyType, Signer as _};
 use sush_common::targets::Target;
 use sush_server::gossip::GossipConfig;
@@ -99,6 +99,16 @@ pub fn corpus(dir: &Utf8PathBuf) -> CorpusSource {
     Arc::new(move || corpus.clone())
 }
 
+/// The baseboard the test PKI attests for `node`.
+pub fn baseboard(node: usize) -> BaseboardId {
+    let id = platform_id(node);
+    let mut fields = id.split(':');
+    BaseboardId {
+        part_number: fields.nth(1).unwrap().to_string(),
+        serial_number: fields.nth(1).unwrap().to_string(),
+    }
+}
+
 /// Dial ceiling for localhost handshakes.
 pub fn dial_timeout() -> Duration {
     Duration::from_secs(10)
@@ -149,12 +159,17 @@ pub async fn fake_identity(key: &mut EphemeralKey) -> Identity {
 }
 
 /// Sign a batch job request with `root`.
-pub async fn sign_job(root: &mut EphemeralKey, job_id: &JobId, command: &str) -> SignedJob {
+pub async fn sign_job(
+    root: &mut EphemeralKey,
+    job_id: JobId,
+    session_id: SessionId,
+    command: &str,
+) -> SignedJob {
     root.sign(JobStartRequest::new(
-        job_id.to_owned(),
+        job_id,
+        session_id,
         command,
-        false,
-        Streaming::None,
+        JobMode::Batch,
         Target::All,
     ))
     .await

@@ -7,7 +7,6 @@
 use std::collections::BTreeMap;
 use std::fmt;
 
-use borsh::{BorshDeserialize, BorshSerialize};
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 use sled_hardware_types::BaseboardId;
@@ -25,17 +24,7 @@ pub const LONG_VERSION: &str = concat!(
 );
 
 /// One build's version and commit.
-#[derive(
-    BorshDeserialize,
-    BorshSerialize,
-    Clone,
-    Debug,
-    Deserialize,
-    Eq,
-    JsonSchema,
-    PartialEq,
-    Serialize,
-)]
+#[derive(Clone, Debug, Deserialize, Eq, JsonSchema, PartialEq, Serialize)]
 pub struct VersionInfo {
     /// The package version.
     pub version: String,

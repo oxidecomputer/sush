@@ -10,6 +10,7 @@ use std::fs::{File, OpenOptions, read};
 #[cfg(feature = "permslip")]
 use std::io::ErrorKind;
 use std::io::{Read as _, Seek as _, SeekFrom, Write as _, stdin};
+use std::net::SocketAddr;
 use std::num::{NonZeroU8, NonZeroU64};
 use std::path::{Path, PathBuf};
 use std::pin::Pin;
@@ -17,7 +18,6 @@ use std::str::FromStr;
 use std::time::Duration;
 
 use async_recursion::async_recursion;
-use blake3::{Hasher, hash};
 use bytesize::ByteSize;
 use clap::{Parser, Subcommand};
 use futures::stream;
@@ -29,6 +29,7 @@ use progenitor_client::ResponseValue;
 use reqwest::Upgraded;
 use rustix::termios::tcgetwinsize;
 use sled_hardware_types::BaseboardId;
+use sush_common::hash::{Hasher, hash};
 use thiserror::Error;
 use tokio::signal::ctrl_c;
 use tokio::signal::unix::{SignalKind, signal};
@@ -44,14 +45,16 @@ use sush_api::JobWait;
 use sush_common::authn::{
     AuthnError, Challenge, ChallengeResponse, Credentials, Identity, RequestKey,
 };
+#[cfg(feature = "permslip")]
+use sush_common::codephrases::InvalidCodephrase;
 use sush_common::interactive::{InteractiveJobError, InteractiveJobMessage};
 use sush_common::jobs::JobOutputStream::{self, Stderr, Stdout};
-#[cfg(feature = "permslip")]
-use sush_common::jobs::JobStartRequest;
 use sush_common::jobs::{
-    Access, JobId, JobLimits, JobOutputHash, JobOutputState, JobStatus, JobStatusMap, Session,
-    SessionId, SignedJob, Streaming, job_status_try_from_json_map,
+    Access, JobId, JobLimits, JobMode, JobOutputHash, JobOutputState, JobStatus, JobStatusMap,
+    Session, SessionId, SessionSignerNonce, SignedJob, SkipReason, job_status_try_from_json_map,
 };
+#[cfg(feature = "permslip")]
+use sush_common::jobs::{JobStartRequest, SessionSushNonce};
 use sush_common::keys::{KeyError, KeyId, Signer as _};
 use sush_common::targets::{SledId, Target};
 use sush_common::version::VersionInfo;
@@ -61,10 +64,11 @@ use crate::context::{Authz, CommandContext, OutputFormat, StatusDisplayStyle};
 use crate::identity::{IdentityError, SshAgentConnection};
 use crate::interactive::interactive_job;
 #[cfg(feature = "permslip")]
-use crate::permslip::{PermslipError, PermslipSigner};
+use crate::permslip::{PermslipError, PermslipSigner, fresh_token};
 use crate::repl::Repl;
 use crate::tls;
-use crate::types::Error as ApiError;
+use crate::tunnel::{Tunnel, TunnelError};
+use crate::types::{Error as ApiError, SessionStartBody};
 use crate::{Client, Error as ClientError};
 
 // Names of environment variables for argument defaults
@@ -80,7 +84,12 @@ pub const SUSH_MAX_FSIZE: &str = "SUSH_MAX_FSIZE";
 #[cfg(feature = "permslip")]
 pub const SUSH_PERMSLIP_KEY: &str = "SUSH_PERMSLIP_KEY";
 pub const SUSH_OUTPUT_FORMAT: &str = "SUSH_OUTPUT_FORMAT";
+pub const SUSH_NEXUS: &str = "SUSH_NEXUS";
+pub const SUSH_NEXUS_RESOLVE: &str = "SUSH_NEXUS_RESOLVE";
+pub const SUSH_NEXUS_ROOT: &str = "SUSH_NEXUS_ROOT";
+pub const SUSH_NEXUS_TOKEN: &str = "SUSH_NEXUS_TOKEN";
 pub const SUSH_PROXY_ROOT: &str = "SUSH_PROXY_ROOT";
+pub const SUSH_RACK: &str = "SUSH_RACK";
 pub const SUSH_URL: &str = "SUSH_URL";
 
 /// Default chunk size for parallel downloads of large output.
@@ -136,8 +145,6 @@ pub struct GlobalArgs {
     #[arg(long,
           env = SUSH_OUTPUT_FORMAT,
           default_value = "text",
-          default_value_if("json", "true", "json"),
-          default_value_if("text", "true", "text"),
           value_name = "FORMAT",
           value_enum)]
     #[clap(global = true)]
@@ -157,6 +164,35 @@ pub struct GlobalArgs {
     #[arg(short, long, env = SUSH_URL)]
     #[clap(global = true)]
     pub url: Option<String>,
+
+    /// Nexus URL to tunnel through instead of a tech port URL
+    // Not env OXIDE_HOST: clap applies conflict rules to env-sourced
+    // values, so the oxide CLI's variable would poison --url.
+    #[arg(long, env = SUSH_NEXUS, conflicts_with_all = ["url", "offline"])]
+    #[clap(global = true)]
+    pub nexus: Option<String>,
+
+    /// Token authenticating the tunnel to Nexus
+    #[arg(long, env = SUSH_NEXUS_TOKEN, hide_env_values = true)]
+    #[clap(global = true)]
+    pub nexus_token: Option<String>,
+
+    /// PEM roots that Nexus's TLS certificate must chain to
+    #[arg(long = "nexus-root", env = SUSH_NEXUS_ROOT, value_name = "PEM")]
+    #[clap(global = true)]
+    pub nexus_roots: Vec<PathBuf>,
+
+    /// Dial Nexus at this address instead of resolving its URL's
+    /// host, which still names the server for TLS (like curl
+    /// --resolve, for racks whose DNS is not yet populated)
+    #[arg(long, env = SUSH_NEXUS_RESOLVE, value_name = "IP:PORT")]
+    #[clap(global = true)]
+    pub nexus_resolve: Option<SocketAddr>,
+
+    /// ID of the rack to tunnel to (try `oxide system hardware rack list`)
+    #[arg(long, env = SUSH_RACK, value_name = "UUID")]
+    #[clap(global = true)]
+    pub rack: Option<String>,
 
     /// PEM roots that a proxy's TLS certificate must chain to,
     /// replacing the baked-in platform identity roots.
@@ -178,6 +214,18 @@ pub struct GlobalArgs {
     #[arg(short, long, env = SUSH_KEY_ID)]
     #[clap(global = true)]
     pub ssh_key_id: Option<KeyId>,
+}
+
+impl GlobalArgs {
+    pub fn output_format(&self) -> Option<OutputFormat> {
+        if self.json {
+            Some(OutputFormat::Json)
+        } else if self.text {
+            Some(OutputFormat::Text)
+        } else {
+            self.output
+        }
+    }
 }
 
 #[derive(Debug, Parser)]
@@ -483,7 +531,13 @@ pub enum SessionCommand {
     },
 
     /// Attach to a current support session.
-    Attach { session_id: Option<SessionId> },
+    Attach {
+        session_id: Option<SessionId>,
+
+        /// Reset the chain position of an already-attached session.
+        #[arg(short, long)]
+        force: bool,
+    },
 
     /// Withdraw a key's attach access.
     Deny {
@@ -491,10 +545,47 @@ pub enum SessionCommand {
         key_id: KeyId,
     },
 
+    /// Create a session at the signing service from a rack's start
+    /// parameters.
+    #[cfg(feature = "permslip")]
+    Create {
+        /// The baseboard ID of the sled that generated the nonce.
+        #[arg(value_parser = parse_baseboard_id)]
+        baseboard_id: BaseboardId,
+
+        /// The rack's session nonce.
+        nonce: SessionSushNonce,
+
+        /// Use `permslip` to sign sessions and jobs with this key name.
+        #[arg(short, long, env = SUSH_PERMSLIP_KEY, value_name = "KEY_NAME")]
+        permslip: Option<String>,
+
+        /// The `permslip` server to contact for signing.
+        #[arg(long, env = PERMSLIP_URL, requires = "permslip", value_name = "URL")]
+        permslip_url: Option<String>,
+    },
+
+    /// Get the parameters to send to the signer server to start a session.
+    StartParams,
+
     /// Start a new support session.
     Start {
         /// The session to start.
+        #[arg(requires = "nonce")]
         session_id: Option<SessionId>,
+
+        /// The signer nonce for the session.
+        nonce: Option<SessionSignerNonce>,
+
+        /// Use `permslip` to sign sessions and jobs with this key name.
+        #[cfg(feature = "permslip")]
+        #[arg(short, long, env = SUSH_PERMSLIP_KEY, value_name = "KEY_NAME")]
+        permslip: Option<String>,
+
+        /// The `permslip` server to contact for signing.
+        #[cfg(feature = "permslip")]
+        #[arg(long, env = PERMSLIP_URL, requires = "permslip", value_name = "URL")]
+        permslip_url: Option<String>,
 
         /// Wait for the session to become active.
         #[arg(short, long)]
@@ -510,7 +601,10 @@ pub enum SessionCommand {
 
 impl Default for SessionCommand {
     fn default() -> Self {
-        Self::Attach { session_id: None }
+        Self::Attach {
+            session_id: None,
+            force: false,
+        }
     }
 }
 
@@ -526,6 +620,13 @@ pub enum JobCommand {
     #[clap(alias = "abort")]
     Stop {
         /// The job to abort.
+        #[clap(env = SUSH_JOB_ID)]
+        job_id: JobId,
+    },
+
+    /// Decline a job, burning its ID and advancing the session.
+    Skip {
+        /// The job to skip.
         #[clap(env = SUSH_JOB_ID)]
         job_id: JobId,
     },
@@ -599,9 +700,6 @@ pub struct JobStartArgs {
     /// `bash -c`, so may be an arbitrary bash(1) command or pipeline.
     /// Be sure to quote spaces and characters special to your shell!
     command: Option<String>,
-
-    /// Job ID within the session.
-    job_id: Option<JobId>,
 
     /// Job output is binary, not UTF-8 encoded text.
     #[arg(short, long, default_value_t = false, requires = "wait")]
@@ -685,10 +783,30 @@ impl ClientCommand {
     }
 
     async fn run(self, ctx: &mut impl CommandContext) -> Result<(), CommandError> {
-        let args = ctx.get_globals().to_owned();
-        if let Some(output) = args.output {
+        let mut args = ctx.get_globals().to_owned();
+        if let Some(output) = args.output_format() {
             ctx.set_output_format(output);
         }
+
+        // The tunnel stands in for the proxy until the command ends.
+        let _tunnel = match args.nexus.as_ref() {
+            Some(nexus) => {
+                let rack = args.rack.as_ref().ok_or(CommandError::MissingRack)?;
+                let token = args
+                    .nexus_token
+                    .as_ref()
+                    .ok_or(CommandError::MissingNexusToken)?;
+                let tunnel =
+                    Tunnel::start(nexus, rack, token, &args.nexus_roots, args.nexus_resolve)
+                        .await?;
+                args.url = Some(tunnel.url.clone());
+                // The repl re-enters run per command; commands must
+                // reuse this tunnel, not build their own.
+                args.nexus = None;
+                Some(tunnel)
+            }
+            None => None,
+        };
 
         let client = match args.url.as_ref() {
             Some(url) => {
@@ -810,8 +928,27 @@ async fn authenticate<E>(
     if let Some(via) = via {
         request = request.via(via.to_string());
     }
-    let identity = request.send().await?.into_inner();
+    let identity = match request.send().await {
+        Ok(identity) => identity.into_inner(),
+        Err(error) if error.status() == Some(StatusCode::UNAUTHORIZED) => {
+            let server = client.version().send().await.ok().map(|v| v.into_inner());
+            return Err(login_refused(server, error.into()));
+        }
+        Err(error) => return Err(error.into()),
+    };
     Ok((identity, Authz::new(credentials, key)))
+}
+
+/// A refused login usually indicates build skew rather than a bad key.
+/// Blame the builds when they differ, otherwise return the server error.
+fn login_refused(server: Option<VersionInfo>, error: CommandError) -> CommandError {
+    let client = VersionInfo::current();
+    match server {
+        Some(server) if server.commit != client.commit => {
+            CommandError::AuthnBuildMismatch { client, server }
+        }
+        _ => error,
+    }
 }
 
 /// Make a request as someone who is logged in, logging in if needed.
@@ -901,7 +1038,8 @@ async fn iam(
                 client.iam_revoke().key_id(&key_id).wait(true).send().await
             })
             .await?;
-            ctx.revoked("SSH identity", key_id)
+            ctx.revoked("SSH identity", key_id);
+            Ok(())
         }
     }
 }
@@ -922,7 +1060,8 @@ async fn cert(
             })
             .await?
             .into_inner();
-            ctx.cert_imported(&path, key_id)
+            ctx.cert_imported(&path, key_id);
+            Ok(())
         }
 
         CertCommand::Chain { key_id, root_certs } => {
@@ -946,7 +1085,8 @@ async fn cert(
                 client.cert_revoke().key_id(&key_id).wait(true).send().await
             })
             .await?;
-            ctx.revoked("certificate", key_id)
+            ctx.revoked("certificate", key_id);
+            Ok(())
         }
     }
 }
@@ -957,7 +1097,13 @@ async fn session(
     command: SessionCommand,
 ) -> Result<(), CommandError> {
     match (command, client) {
-        (SessionCommand::Attach { session_id }, Some(client)) => {
+        (
+            SessionCommand::Attach {
+                session_id,
+                force: _,
+            },
+            Some(client),
+        ) => {
             let session = with_login(ctx, client, async || client.session().send().await)
                 .await?
                 .into_inner();
@@ -966,38 +1112,98 @@ async fn session(
             {
                 return Err(CommandError::MissingSession);
             }
-            ctx.session_started(session)?;
+            // The server's session state is authoritative.
+            ctx.session_started(session, true);
             Ok(())
         }
 
         (
             SessionCommand::Attach {
                 session_id: Some(session_id),
+                force,
             },
             None,
         ) => {
-            ctx.session_started(Session::new(session_id))?;
+            ctx.session_started(Session::new(session_id), force);
             Ok(())
         }
 
-        (SessionCommand::Start { session_id, wait }, Some(client)) => {
-            let session = if let Some(session_id) = session_id {
-                Session::new(session_id)
-            } else {
-                Session::new(SessionId::random())
-            };
-            with_login(ctx, client, async || {
-                client
-                    .session_start()
-                    .session_id(session.session_id())
-                    .wait(wait)
-                    .send()
-                    .await
+        (SessionCommand::StartParams, Some(client)) => {
+            let (baseboard_id, nonce) = with_login(ctx, client, async || {
+                Ok((
+                    client.target().send().await?.into_inner(),
+                    client.session_start_nonce().send().await?.into_inner(),
+                ))
             })
-            .await?
-            .into_inner();
-            ctx.session_started(session)?;
+            .await?;
+            ctx.session_start_params(baseboard_id, nonce);
             Ok(())
+        }
+
+        #[cfg(feature = "permslip")]
+        (
+            SessionCommand::Start {
+                session_id,
+                nonce,
+                permslip,
+                permslip_url,
+                wait,
+            },
+            Some(client),
+        ) => {
+            // Creation already announces the session; don't echo it
+            // when the start succeeds.
+            let (session_id, nonce, show) = if let (Some(session_id), Some(nonce)) =
+                (session_id, nonce)
+            {
+                (session_id, nonce, true)
+            } else {
+                let (baseboard_id, nonce) = with_login(ctx, client, async || {
+                    Ok((
+                        client.target().send().await?.into_inner(),
+                        client.session_start_nonce().send().await?.into_inner(),
+                    ))
+                })
+                .await?;
+                let (session_id, nonce) =
+                    session_create(ctx, permslip, permslip_url, &baseboard_id, nonce.nonce).await?;
+                ctx.session_created(Session::new(session_id), nonce);
+                (session_id, nonce, false)
+            };
+            session_start(ctx, client, session_id, nonce, wait, show).await
+        }
+
+        #[cfg(feature = "permslip")]
+        (
+            SessionCommand::Create {
+                baseboard_id,
+                nonce,
+                permslip,
+                permslip_url,
+            },
+            _,
+        ) => {
+            let (session_id, nonce) =
+                session_create(ctx, permslip, permslip_url, &baseboard_id, nonce).await?;
+            ctx.session_created(Session::new(session_id), nonce);
+            Ok(())
+        }
+
+        #[cfg(not(feature = "permslip"))]
+        (
+            SessionCommand::Start {
+                session_id,
+                nonce,
+                wait,
+            },
+            Some(client),
+        ) => {
+            let (session_id, nonce) = if let (Some(session_id), Some(nonce)) = (session_id, nonce) {
+                (session_id, nonce)
+            } else {
+                return Err(CommandError::SigningUnavailable);
+            };
+            session_start(ctx, client, session_id, nonce, wait, true).await
         }
 
         (SessionCommand::Allow { key_id, write }, Some(client)) => {
@@ -1049,7 +1255,7 @@ async fn session(
                 client.session_stop().session_id(*session_id).send().await
             })
             .await?;
-            ctx.session_stopped(session_id)?;
+            ctx.session_stopped(session_id);
             Ok(())
         }
 
@@ -1098,7 +1304,6 @@ async fn job(
                     ref start_args @ JobStartArgs {
                         command: Some(ref command),
                         permslip: Some(ref key_name),
-                        ref job_id,
                         ref permslip_url,
                         ref interactive,
                         ref streaming,
@@ -1108,39 +1313,13 @@ async fn job(
             },
             client,
         ) => {
-            let job_id = if let Some(job_id) = job_id {
-                job_id.to_owned()
-            } else {
-                // Ensure we have a session for the job.
-                if ctx.session_id().is_none()
-                    && let Some(client) = client
-                {
-                    let session =
-                        match with_login(ctx, client, async || client.session().send().await).await
-                        {
-                            Ok(resp) => resp.into_inner(),
-                            Err(CommandError::NotFound(_)) => {
-                                let session = Session::new(SessionId::random());
-                                with_login(ctx, client, async || {
-                                    client
-                                        .session_start()
-                                        .session_id(session.session_id())
-                                        .send()
-                                        .await
-                                })
-                                .await?;
-                                session
-                            }
-                            Err(err) => return Err(err),
-                        };
-                    ctx.session_started(session)?;
-                }
-                ctx.next_job_id()?
+            let Some(session_id) = ctx.session_id() else {
+                return Err(CommandError::MissingSession);
             };
-
             let Some(permslip_url) = permslip_url else {
                 return Err(CommandError::MissingPermslipUrl);
             };
+            let job_id = ctx.next_job_id()?;
             let target = match target {
                 TargetArg::Target(target) => target.clone(),
                 abbreviated => {
@@ -1172,19 +1351,21 @@ async fn job(
             if let Some(client) = client.as_ref() {
                 preflight_target(ctx, client, &target).await?;
             }
-            let streaming = if *streaming {
-                Streaming::Output
+            let mode = if *interactive {
+                JobMode::Interactive
+            } else if *streaming {
+                JobMode::StreamOutput
             } else {
-                Streaming::None
+                JobMode::Batch
             };
-            let mut signer = PermslipSigner::new(key_name, permslip_url).await?;
+            let signer = permslip_signer(ctx, key_name, permslip_url).await?;
             let mut interval = interval(SIGNING_UPDATE_INTERVAL);
             interval.set_missed_tick_behavior(MissedTickBehavior::Skip);
-            let sign = signer.sign(JobStartRequest::new(
+            let sign = signer.sign_job_request(JobStartRequest::new(
                 job_id.to_owned(),
+                session_id,
                 command,
-                *interactive,
-                streaming,
+                mode,
                 target,
             ));
             pin!(sign);
@@ -1208,7 +1389,7 @@ async fn job(
                 job_start(ctx, client, job, start_args.to_owned()).await
             } else {
                 ctx.job_signed(&job, true);
-                ctx.job_started(&job);
+                ctx.job_started(&job, false);
                 Ok(())
             }
         }
@@ -1217,6 +1398,30 @@ async fn job(
             job_stop(ctx, client, &job_id, None).await?;
             ctx.job_stopped(&job_id);
             Ok(())
+        }
+
+        // Offline skips advance only the local session, keeping the
+        // signer's chain in step with a rack that skipped.
+        (JobCommand::Skip { job_id }, client) => {
+            let Some(session_id) = ctx.session_id() else {
+                return Err(CommandError::MissingSession);
+            };
+            if let Some(client) = client {
+                with_login(ctx, client, async || {
+                    client
+                        .session_skip_job()
+                        .session_id(session_id)
+                        .job_id(job_id)
+                        .send()
+                        .await
+                })
+                .await?;
+            }
+            if ctx.job_skipped(&job_id) {
+                Ok(())
+            } else {
+                Err(CommandError::NotNextJob(job_id))
+            }
         }
 
         (JobCommand::Status { job_id, full, wait }, Some(client)) => {
@@ -1305,8 +1510,8 @@ async fn job_start(
         force,
         ..
     } = start_args;
-    let interactive = job.payload().interactive;
-    let streaming = matches!(job.payload().streaming, Streaming::Output);
+    let interactive = job.payload().is_interactive();
+    let streaming = matches!(job.payload().mode, JobMode::StreamOutput);
     let wait = if interactive || streaming {
         JobWait::Start
     } else if wait {
@@ -1344,7 +1549,7 @@ async fn job_start(
     // Start the job.
     if interactive {
         start.await?;
-        ctx.job_started(&job);
+        ctx.job_started(&job, true);
         match job_attach(ctx, client, &job_id, &target).await {
             Ok(()) | Err(CommandError::NotFound(_)) => {
                 job_status(ctx, client, &job_id, StatusDisplayStyle::Short).await?
@@ -1366,7 +1571,7 @@ async fn job_start(
             .open(&path)
             .map_err(|error| CommandError::io(&path, error))?;
         start.await?;
-        ctx.job_started(&job);
+        ctx.job_started(&job, true);
         let hasher = job_stream(ctx, client, &job_id, &target, &path, file).await?;
         let status = job_watch(ctx, client, &job_id, &target.clone().into()).await?;
         ctx.job_status(&job_id, &status, StatusDisplayStyle::Short);
@@ -1414,7 +1619,7 @@ async fn job_start(
                 // Wait for the start request to finish.
                 start_result = &mut start, if !started => {
                     match start_result {
-                        Ok(_) | Err(CommandError::TimedOut) => ctx.job_started(&job),
+                        Ok(_) | Err(CommandError::TimedOut) => ctx.job_started(&job, true),
                         Err(error) => {
                             ctx.job_watch_finished(&job_id);
                             return Err(error);
@@ -1517,7 +1722,93 @@ async fn job_start(
         }
     } else {
         start.await?;
-        ctx.job_started(&job);
+        ctx.job_started(&job, true);
+    }
+    Ok(())
+}
+
+/// Parse a baseboard ID for clap.
+#[cfg(feature = "permslip")]
+fn parse_baseboard_id(value: &str) -> Result<BaseboardId, String> {
+    value.parse::<BaseboardId>().map_err(|e| e.to_string())
+}
+
+/// A permslip signer authenticated as the agent key `-s`/`SUSH_KEY_ID`
+/// names, or the agent's first. We choose the key rather than letting
+/// permslip choose, so that one identity serves both the rack and the
+/// signing service.
+#[cfg(feature = "permslip")]
+async fn permslip_signer(
+    ctx: &mut impl CommandContext,
+    key_name: &str,
+    permslip_url: &str,
+) -> Result<PermslipSigner, CommandError> {
+    let globals = ctx.get_globals();
+    let Some(sock) = globals.ssh_auth_sock.clone() else {
+        return Err(CommandError::MissingSshAuthSock);
+    };
+    let key_id = globals.ssh_key_id.clone();
+    let mut agent = SshAgentConnection::connect(&sock).await?;
+    let key = agent.identity(key_id.as_ref()).await?;
+    let fingerprint = key.fingerprint();
+    let token = match ctx.permslip_token(permslip_url, &fingerprint) {
+        Some(token) => token,
+        None => {
+            ctx.please_touch(&key)?;
+            let token = fresh_token(permslip_url, sock, fingerprint.clone()).await?;
+            ctx.save_permslip_token(permslip_url, &fingerprint, &token);
+            token
+        }
+    };
+    Ok(PermslipSigner::new(key_name, permslip_url, &token)?)
+}
+
+/// Ask the online signing service to create a session.
+#[cfg(feature = "permslip")]
+async fn session_create(
+    ctx: &mut impl CommandContext,
+    permslip: Option<String>,
+    permslip_url: Option<String>,
+    baseboard_id: &BaseboardId,
+    nonce: SessionSushNonce,
+) -> Result<(SessionId, SessionSignerNonce), CommandError> {
+    let Some(permslip_url) = permslip_url else {
+        return Err(CommandError::MissingPermslipUrl);
+    };
+    let Some(permslip_key) = permslip else {
+        return Err(CommandError::MissingKeyName);
+    };
+    let invalid = |e: InvalidCodephrase| CommandError::UnsupportedPermslipResponse(e.to_string());
+    let signer = permslip_signer(ctx, &permslip_key, &permslip_url).await?;
+    let created = signer.create_session(baseboard_id, nonce).await?;
+    Ok((
+        created.session_id.to_string().parse().map_err(invalid)?,
+        created.signer_nonce.to_string().parse().map_err(invalid)?,
+    ))
+}
+
+async fn session_start(
+    ctx: &mut impl CommandContext,
+    client: &Client,
+    session_id: SessionId,
+    signer_nonce: SessionSignerNonce,
+    wait: bool,
+    show: bool,
+) -> Result<(), CommandError> {
+    let session = Session::new(session_id);
+    with_login(ctx, client, async || {
+        client
+            .session_start()
+            .session_id(session.session_id())
+            .wait(wait)
+            .body(SessionStartBody { signer_nonce })
+            .send()
+            .await
+    })
+    .await?
+    .into_inner();
+    if show {
+        ctx.session_started(session, true);
     }
     Ok(())
 }
@@ -1782,6 +2073,9 @@ async fn job_output_from(
         Some(JobStatus::Started { job_id, .. }) => {
             return Err(CommandError::JobStillRunning(job_id.to_owned()));
         }
+        Some(JobStatus::Skipped { job_id, reason, .. }) => {
+            return Err(CommandError::JobSkipped(job_id.to_owned(), *reason));
+        }
         Some(JobStatus::Stopped { output, .. }) => output,
     };
     let len = match stream {
@@ -1844,13 +2138,13 @@ async fn job_output_from(
         if *len < chunk_size.get() {
             check_hash!(hash(&output), None)
         } else {
-            // Multi-threaded BLAKE3 is very, very fast, but still takes
-            // perceptible time on multi-GB outputs. So if there's more
-            // than one chunk, hash in chunks with a progress bar.
+            // Hashing multi-GB outputs takes perceptible time. So if
+            // there's more than one chunk, hash in chunks with a
+            // progress bar.
             ctx.job_output_started(&job_id, stream, "Verifying", *len);
             let mut hasher = Hasher::new();
             for chunk in output.chunks(chunk_size.get() as usize) {
-                hasher.update_rayon(chunk);
+                hasher.update(chunk);
                 ctx.job_output_update(&job_id, stream, chunk.len() as u64);
             }
             check_hash!(hasher.finalize(), Some("✅ Verified"))
@@ -2179,6 +2473,15 @@ pub enum CommandError {
     AmbiguousSerial(String),
     #[error("❌ Authentication error")]
     Authn(#[from] AuthnError),
+    #[error(
+        "❌ Authentication failed, client and server are different builds\n   \
+            Client: {client}\n   \
+            Server: {server}"
+    )]
+    AuthnBuildMismatch {
+        client: VersionInfo,
+        server: VersionInfo,
+    },
     #[error("❌ Canceled")]
     Canceled,
     #[error("❌ Certificate for `{0}` is outside its validity window")]
@@ -2226,6 +2529,8 @@ pub enum CommandError {
     JobDidNotRun(JobId),
     #[error("❌ Job `{0}` is not yet running")]
     JobNotYetRunning(JobId),
+    #[error("⏩ Job `{0}` was skipped on this sled: {1}")]
+    JobSkipped(JobId, SkipReason),
     #[error("❌ Job `{0}` is still running")]
     JobStillRunning(JobId),
     #[error("❌ JSON error: {0}")]
@@ -2242,12 +2547,18 @@ pub enum CommandError {
     #[cfg(feature = "permslip")]
     #[error("❌ Missing permslip URL, try `--permslip-url` or setting `PERMSLIP_URL`")]
     MissingPermslipUrl,
+    #[error("❌ Missing rack ID, try `--rack` (IDs from `oxide system hardware rack list`)")]
+    MissingRack,
+    #[error("❌ Missing Nexus token, try `--nexus-token` or setting `SUSH_NEXUS_TOKEN`")]
+    MissingNexusToken,
     #[error("❌ Missing session, try `session start`")]
     MissingSession,
     #[error("❌ Missing SSH agent socket, try `--ssh-auth-sock`")]
     MissingSshAuthSock,
     #[error("❌ {0}")]
     NotFound(String),
+    #[error("❌ Job `{0}` is not the session's next job")]
+    NotNextJob(JobId),
     #[error("❌ Command not supported in offline mode, try `--url`")]
     Offline,
     #[error(
@@ -2293,6 +2604,8 @@ pub enum CommandError {
     TimedOut,
     #[error("❌ Too much output to display on terminal, try `--file`")]
     TooMuchOutput,
+    #[error("❌ Tunnel error: {0}")]
+    Tunnel(#[from] TunnelError),
     #[error("❌ No sled with serial `{serial}` has a status for job `{job_id}`")]
     UnknownSerial { serial: String, job_id: JobId },
     #[error("❌ Serial `{0}` matches no sled in the rack inventory")]
@@ -2305,6 +2618,9 @@ pub enum CommandError {
     Utf8(#[from] std::string::FromUtf8Error),
     #[error("❌ WebSocket error: {0}")]
     WebSocket(#[from] WebSocketError),
+    #[cfg(feature = "permslip")]
+    #[error("❌ Unsupported permslip response: {0}")]
+    UnsupportedPermslipResponse(String),
 }
 
 impl CommandError {
@@ -2369,5 +2685,31 @@ impl From<ClientError<Upgraded>> for CommandError {
             Some(status) => Self::Client(status.to_string()),
             None => Self::Client(error.to_string()),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn login_refused_blames_build_skew() {
+        let refused = || CommandError::Client(String::from("Authentication required, try `iam`"));
+        let skewed = VersionInfo {
+            version: String::from("0.1.0"),
+            commit: String::from("not-this-build"),
+        };
+        assert!(matches!(
+            login_refused(Some(skewed), refused()),
+            CommandError::AuthnBuildMismatch { .. }
+        ));
+        assert!(matches!(
+            login_refused(Some(VersionInfo::current()), refused()),
+            CommandError::Client(_)
+        ));
+        assert!(matches!(
+            login_refused(None, refused()),
+            CommandError::Client(_)
+        ));
     }
 }

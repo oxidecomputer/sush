@@ -4,35 +4,49 @@
 
 //! Use Permission Slip to sign Support Shell job requests.
 
-use ed25519_dalek::Signature as Ed25519Signature;
-use p256::ecdsa;
-use permission_slip_common::params::{BlobStampParams, SignParams, StampParams};
-use permission_slip_common::{ArtifactKind, HashAlgorithm};
-use permslip_client_lib::login::{IdentityProvider, TokenProvider};
-use permslip_client_lib::types::Error as ApiError;
+use http::HeaderValue;
+use permslip_client_lib::login::TokenProvider;
+use permslip_client_lib::types::{CreateSushSessionBody, CreatedSushSession, Error as ApiError};
 use permslip_client_lib::{Client, ClientRequestBuilder, Error as ClientError};
-use serde_json::{json, to_string as json_to_string};
+use sled_hardware_types::BaseboardId;
 use thiserror::Error;
-use x509_cert::Certificate;
-use x509_cert::der::Decode as _;
-use x509_cert::der::oid::db::rfc5912::ECDSA_WITH_SHA_256;
-use x509_cert::der::oid::db::rfc8410::ID_ED_25519;
-use x509_cert::der::pem::{PemLabel as _, decode_vec as decode_pem};
-use x509_cert::spki::AlgorithmIdentifierOwned;
 
-use sush_common::keys::{KeyError, KeyId, Signature, Signed, Signer, ToBeSigned};
+use sush_common::codephrases::InvalidCodephrase;
+use sush_common::jobs::{JobStartRequest, SessionSushNonce, SignedJob};
+use sush_common::keys::KeyError;
+use sush_common::targets::InvalidTarget;
 
 pub struct PermslipSigner {
     client: Client,
     key_name: String,
 }
 
+/// Get a bearer token by the sshauth challenge, signed with the agent
+/// key named by `fingerprint`.
+pub async fn fresh_token(
+    url: &str,
+    agent_sock: String,
+    fingerprint: String,
+) -> Result<String, PermslipError> {
+    let tokens = TokenProvider::SshAuth {
+        fingerprint: Some(fingerprint),
+        server_url: url.to_owned(),
+        agent_sock,
+    };
+    let token = tokens.token().await.map_err(PermslipError::token_flow)?;
+    let value = token.into_header_value().map_err(PermslipError::token)?;
+    value
+        .to_str()
+        .map(str::to_owned)
+        .map_err(PermslipError::token)
+}
+
 impl PermslipSigner {
-    pub async fn new<N: AsRef<str>>(key_name: N, url: &str) -> Result<Self, PermslipError> {
-        let tokens = TokenProvider::IdP(IdentityProvider::Google);
-        let mut builder = ClientRequestBuilder::new();
-        let token = tokens.token().await.map_err(PermslipError::token)?;
-        builder = builder.token(token.into_header_value().map_err(PermslipError::token)?);
+    /// A signer authenticated with `token`.
+    pub fn new<N: AsRef<str>>(key_name: N, url: &str, token: &str) -> Result<Self, PermslipError> {
+        let mut token = HeaderValue::from_str(token).map_err(PermslipError::token)?;
+        token.set_sensitive(true);
+        let builder = ClientRequestBuilder::new().token(token);
         Ok(Self {
             client: Client::new_with_client(
                 url,
@@ -44,69 +58,36 @@ impl PermslipSigner {
         })
     }
 
-    // TODO: fetch once
-    async fn get_cert(&self) -> Result<Certificate, PermslipError> {
-        let pem = self
+    pub async fn create_session(
+        &self,
+        baseboard: &BaseboardId,
+        sush_nonce: SessionSushNonce,
+    ) -> Result<CreatedSushSession, PermslipError> {
+        Ok(self
             .client
-            .get_cert()
-            .key_name(&self.key_name)
+            .create_sush_session()
+            .body(CreateSushSessionBody {
+                cpn: baseboard.part_number.clone(),
+                serial_number: baseboard.serial_number.clone(),
+                key_name: self.key_name.clone(),
+                sush_nonce,
+            })
             .send()
             .await?
-            .into_inner();
-        if !pem.starts_with("-----BEGIN ") {
-            return Err(PermslipError::InvalidPem);
-        }
-        let (label, der) = decode_pem(pem.as_bytes())?;
-        if label != Certificate::PEM_LABEL {
-            return Err(PermslipError::InvalidPem);
-        }
-        Ok(Certificate::from_der(&der)?)
+            .into_inner())
     }
-}
 
-impl Signer for PermslipSigner {
-    type Error = PermslipError;
-
-    async fn sign<T: ToBeSigned>(&mut self, thing: T) -> Result<Signed<T>, Self::Error> {
-        let cert = self.get_cert().await?;
-        let spki = &cert.tbs_certificate.subject_public_key_info;
-        let message = thing.to_be_signed();
-        let params = StampParams::Blob(BlobStampParams {
-            sign: SignParams {
-                artifact_kind: ArtifactKind::Blob,
-                hash_algorithm: HashAlgorithm::Default,
-                key_name: self.key_name.to_string(),
-                origin_hash: blake3::hash(&message).to_string(),
-                version: None,
-                version_head: None,
-                version_prev: None,
-            },
-        });
-        let signature = self
+    pub async fn sign_job_request(
+        &self,
+        request: JobStartRequest,
+    ) -> Result<SignedJob, PermslipError> {
+        Ok(self
             .client
-            .sign()
-            .params(json_to_string(&json!(params))?)
-            .body(message.clone())
+            .sign_sush_job()
+            .body(request)
             .send()
             .await?
-            .into_inner();
-        let signature = match Signed::<T>::signature_algorithm_from_spki(&spki.algorithm)? {
-            AlgorithmIdentifierOwned {
-                oid: ID_ED_25519,
-                parameters: None,
-            } => Signature::Ed25519(Ed25519Signature::from_slice(&signature)?),
-            AlgorithmIdentifierOwned {
-                oid: ECDSA_WITH_SHA_256,
-                parameters: None,
-            } => Signature::EcdsaSha256(ecdsa::Signature::from_der(&signature)?),
-            _ => return Err(Self::Error::InvalidSignature),
-        };
-        signature.verify_with_spki(&message, spki)?;
-        Ok(Signed::new(
-            thing,
-            KeyId::try_from(&cert)?,
-            signature.encode()?,
-        ))
+            .into_inner())
     }
 }
 
@@ -122,6 +103,10 @@ pub enum PermslipError {
     InvalidPem,
     #[error("invalid signature")]
     InvalidSignature,
+    #[error("invalid codephrase")]
+    InvalidCodephrase(#[from] InvalidCodephrase),
+    #[error("invalid target")]
+    InvalidTarget(#[from] InvalidTarget),
     #[error(transparent)]
     Json(#[from] serde_json::Error),
     #[error("Key error: {0}")]
@@ -135,6 +120,14 @@ pub enum PermslipError {
 impl PermslipError {
     fn token<E: ToString>(error: E) -> Self {
         Self::Token(error.to_string())
+    }
+
+    /// Recover the API error from the permslip token flow.
+    fn token_flow(error: anyhow::Error) -> Self {
+        match error.downcast::<ClientError<ApiError>>() {
+            Ok(client) => client.into(),
+            Err(error) => Self::token(error),
+        }
     }
 }
 

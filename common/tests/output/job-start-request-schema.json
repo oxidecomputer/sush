@@ -1,0 +1,49 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "title": "JobStartRequest",
+  "description": "A request to run the given `command` as `job_id`.",
+  "type": "object",
+  "required": [
+    "command",
+    "job_id",
+    "session_id"
+  ],
+  "properties": {
+    "command": {
+      "type": "string"
+    },
+    "job_id": {
+      "$ref": "#/definitions/JobId"
+    },
+    "mode": {
+      "$ref": "#/definitions/JobMode"
+    },
+    "session_id": {
+      "$ref": "#/definitions/SessionId"
+    },
+    "target": {
+      "description": "The sleds this job runs on.",
+      "type": "string"
+    }
+  },
+  "definitions": {
+    "JobId": {
+      "description": "A globally unique identifier for a job within a session.",
+      "type": "string"
+    },
+    "JobMode": {
+      "description": "How a job runs. The streaming modes allow **unrecorded** I/O.",
+      "type": "string",
+      "enum": [
+        "batch",
+        "interactive",
+        "stream-input",
+        "stream-output"
+      ]
+    },
+    "SessionId": {
+      "description": "A globally unique identifier for a session.",
+      "type": "string"
+    }
+  }
+}

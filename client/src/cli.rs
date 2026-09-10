@@ -6,33 +6,70 @@
 
 use std::collections::BTreeMap;
 use std::fmt;
-use std::io::{self, BufRead as _, Read as _, Write as _, stderr, stdin, stdout};
-use std::path::Path;
+use std::fs;
+use std::io::{self, BufRead as _, ErrorKind, Read as _, Write as _, stderr, stdin, stdout};
+use std::os::unix::fs::OpenOptionsExt as _;
+use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, SystemTime};
 
+use anstream::print;
+use anstyle::{AnsiColor, Style};
+use atomicwrites::{AtomicFile, OverwriteBehavior};
 use bytesize::ByteSize;
-use chrono::TimeDelta;
+use chrono::{DateTime, TimeDelta, Utc};
 use humantime::format_duration;
 use indicatif::{MultiProgress, ProgressBar, ProgressStyle};
 use rustix::io::ioctl_fionread;
+use serde::{Deserialize, Serialize};
 use serde_json::{json, to_string as to_json_string, to_string_pretty as to_json_string_pretty};
 use sled_hardware_types::BaseboardId;
 use x509_cert::Certificate;
 use x509_cert::der::Encode as _;
+use xdg::BaseDirectories;
 
 use sush_common::authn::Identity;
 use sush_common::jobs::{
     Access, JobId, JobOutputState, JobOutputStream, JobStatus, JobStatusMap, Session, SessionId,
-    SignedJob, job_status_to_json_map,
+    SessionSignerNonce, SignedJob, job_status_to_json_map,
 };
 use sush_common::keys::{KeyId, Signature, SshPublicKey};
-use sush_common::targets::{MAX_CUBBY, SledId, SledVersion};
+use sush_common::targets::{MAX_CUBBY, SledHealth, SledId, SledVersion};
 use sush_common::version::VersionInfo;
 
 use crate::AuthzSigner;
 use crate::commands::{CommandError, GlobalArgs};
 use crate::context::{CommandContext, OutputFormat, StatusDisplayStyle};
+use crate::types::SessionStartNonce;
+
+pub(crate) const PREFIX: &str = "sush";
+const SESSION_FILE_NAME: &str = "session.json";
+const SESSION_FILE_VERSION: u32 = 1;
+const TOKEN_FILE_NAME: &str = "permslip-token.json";
+const TOKEN_FILE_VERSION: u32 = 1;
+
+/// How long a permslip token is trusted for reuse. Staying well
+/// under the server's 15 minute TTL spares a command from expiring
+/// mid-flight.
+const TOKEN_REUSE: TimeDelta = TimeDelta::minutes(10);
+
+/// The persisted session, versioned for future migrations.
+#[derive(Deserialize, Serialize)]
+struct SavedSession {
+    version: u32,
+    session: Session,
+}
+
+/// A persisted permslip token, versioned for future migrations. The
+/// url and fingerprint pin it to one signing server and one identity.
+#[derive(Deserialize, Serialize)]
+struct SavedToken {
+    version: u32,
+    url: String,
+    fingerprint: String,
+    token: String,
+    created: DateTime<Utc>,
+}
 
 #[derive(Clone, Debug, Default)]
 pub struct Cli {
@@ -41,7 +78,92 @@ pub struct Cli {
     progress: Arc<Mutex<Option<ProgressBar>>>,
     watch: Arc<Mutex<Option<Watch>>>,
     session: Arc<Mutex<Option<Session>>>,
+    session_file: Option<PathBuf>,
+    token_file: Option<PathBuf>,
     credentials: AuthzSigner,
+}
+
+impl Cli {
+    /// Load the persisted session and persist its changes hereafter.
+    /// Without persistence, every one-shot command would need a fresh
+    /// `session attach`.
+    pub fn load_session(&mut self) {
+        let path = match BaseDirectories::with_prefix(PREFIX).place_state_file(SESSION_FILE_NAME) {
+            Ok(path) => path,
+            Err(error) => {
+                eprintln!("❗ The session will not persist: {error}");
+                return;
+            }
+        };
+        match fs::read(&path) {
+            Ok(json) => match serde_json::from_slice::<SavedSession>(&json) {
+                Ok(SavedSession {
+                    version: SESSION_FILE_VERSION,
+                    session,
+                }) => *self.session.lock().unwrap() = Some(session),
+                Ok(SavedSession { version, .. }) => {
+                    eprintln!("❗ Ignoring a version {version} saved session")
+                }
+                Err(error) => eprintln!("❗ Ignoring the saved session: {error}"),
+            },
+            Err(error) if error.kind() == ErrorKind::NotFound => (),
+            Err(error) => eprintln!("❗ Ignoring the saved session: {error}"),
+        }
+        self.session_file = Some(path);
+        match BaseDirectories::with_prefix(PREFIX).place_state_file(TOKEN_FILE_NAME) {
+            Ok(path) => self.token_file = Some(path),
+            Err(error) => eprintln!("❗ Signing tokens will not persist: {error}"),
+        }
+    }
+
+    /// Adopt `session` unless one with the same ID is already
+    /// attached and `force` is unset.
+    fn adopt_session(&mut self, session: Session, force: bool) -> SessionId {
+        let session_id = session.session_id();
+        let mut session_guard = self.session.lock().unwrap();
+        if force
+            || session_guard
+                .as_ref()
+                .is_none_or(|s| s.session_id() != session_id)
+        {
+            self.save_session(Some(&session));
+            *session_guard = Some(session);
+        }
+        session_id
+    }
+
+    fn save_session(&self, session: Option<&Session>) {
+        let Some(path) = &self.session_file else {
+            return;
+        };
+        let result = match session {
+            Some(session) => serde_json::to_vec_pretty(&SavedSession {
+                version: SESSION_FILE_VERSION,
+                session: session.clone(),
+            })
+            .map_err(io::Error::other)
+            .and_then(|json| write_private(path, &json)),
+            None => match fs::remove_file(path) {
+                Err(error) if error.kind() != ErrorKind::NotFound => Err(error),
+                _ => Ok(()),
+            },
+        };
+        if let Err(error) = result {
+            eprintln!("❗ The session was not saved: {error}");
+        }
+    }
+}
+
+/// Atomically write a file only the user may read, born that way
+/// rather than chmodded after opening.
+fn write_private(path: &Path, bytes: &[u8]) -> io::Result<()> {
+    let mut options = fs::OpenOptions::new();
+    options.write(true).create(true).truncate(true).mode(0o600);
+    AtomicFile::new(path, OverwriteBehavior::AllowOverwrite)
+        .write_with_options(|file| file.write_all(bytes), options)
+        .map_err(|error| match error {
+            atomicwrites::Error::Internal(error) | atomicwrites::Error::User(error) => error,
+        })
 }
 
 fn byte_size(len: u64) -> bytesize::Display {
@@ -81,6 +203,11 @@ fn short_status_row(status: &JobStatus) -> String {
         JobStatus::Error {
             time_error, error, ..
         } => format!("Error at {time_error}: {error}"),
+        JobStatus::Skipped {
+            time_skipped,
+            reason,
+            ..
+        } => format!("Skipped at {time_skipped}: {reason}"),
     }
 }
 
@@ -149,6 +276,43 @@ impl CommandContext for Cli {
         self.credentials.clone()
     }
 
+    fn permslip_token(&self, url: &str, fingerprint: &str) -> Option<String> {
+        let json = fs::read(self.token_file.as_ref()?).ok()?;
+        match serde_json::from_slice::<SavedToken>(&json) {
+            Ok(SavedToken {
+                version: TOKEN_FILE_VERSION,
+                url: saved_url,
+                fingerprint: saved_fingerprint,
+                token,
+                created,
+            }) if saved_url == url
+                && saved_fingerprint == fingerprint
+                && (TimeDelta::zero()..TOKEN_REUSE).contains(&(Utc::now() - created)) =>
+            {
+                Some(token)
+            }
+            _ => None,
+        }
+    }
+
+    fn save_permslip_token(&self, url: &str, fingerprint: &str, token: &str) {
+        let Some(path) = &self.token_file else {
+            return;
+        };
+        let result = serde_json::to_vec_pretty(&SavedToken {
+            version: TOKEN_FILE_VERSION,
+            url: url.to_owned(),
+            fingerprint: fingerprint.to_owned(),
+            token: token.to_owned(),
+            created: Utc::now(),
+        })
+        .map_err(io::Error::other)
+        .and_then(|json| write_private(path, &json));
+        if let Err(error) = result {
+            eprintln!("❗ The token was not saved: {error}");
+        }
+    }
+
     fn session_id(&self) -> Option<SessionId> {
         self.session
             .lock()
@@ -165,28 +329,56 @@ impl CommandContext for Cli {
         }
     }
 
-    fn session_started(&mut self, session: Session) -> Result<(), CommandError> {
-        let session_id = session.session_id().to_owned();
-        *self.session.lock().unwrap() = Some(session);
+    fn session_start_params(&self, baseboard_id: BaseboardId, nonce: SessionStartNonce) {
+        match self.get_output_format() {
+            OutputFormat::Json => println!(
+                "{}",
+                json!({
+                    "baseboard_id": &baseboard_id.to_string(),
+                    "sush_nonce": &nonce.nonce,
+                })
+            ),
+            OutputFormat::Text => {
+                println!("Baseboard ID: {baseboard_id}");
+                println!("Sush nonce:   {}", nonce.nonce);
+            }
+        }
+    }
+
+    fn session_created(&mut self, session: Session, signer_nonce: SessionSignerNonce) {
+        let session_id = self.adopt_session(session, true);
+        match self.get_output_format() {
+            OutputFormat::Json => println!(
+                "{}",
+                json!({"session_created": session_id, "signer_nonce": signer_nonce})
+            ),
+            OutputFormat::Text => {
+                println!("✅ Session is now `{session_id}`");
+                println!("   Signer nonce: {signer_nonce}");
+            }
+        }
+    }
+
+    fn session_started(&mut self, session: Session, force: bool) {
+        let session_id = self.adopt_session(session, force);
         match self.get_output_format() {
             OutputFormat::Json => println!("{}", json!({"session_started": session_id})),
             OutputFormat::Text => println!("✅ Session is now `{session_id}`"),
         }
-        Ok(())
     }
 
-    fn session_stopped(&mut self, session_id: &SessionId) -> Result<(), CommandError> {
+    fn session_stopped(&mut self, session_id: &SessionId) {
         let mut session_guard = self.session.lock().unwrap();
         if let Some(session) = session_guard.as_ref()
             && session.session_id() == *session_id
         {
             let _ = session_guard.take();
+            self.save_session(None);
         }
         match self.get_output_format() {
-            OutputFormat::Json => println!("{}", json!({"session_ended": session_id})),
+            OutputFormat::Json => println!("{}", json!({"session_stopped": session_id})),
             OutputFormat::Text => println!("✅ Stopped session `{session_id}`"),
         }
-        Ok(())
     }
 
     fn attach_allowed(&mut self, key_id: &KeyId, access: Access) {
@@ -268,7 +460,7 @@ impl CommandContext for Cli {
         chain.pop().ok_or(CommandError::EmptyCertChain)
     }
 
-    fn cert_imported(&mut self, path: &Path, key_id: KeyId) -> Result<(), CommandError> {
+    fn cert_imported(&mut self, path: &Path, key_id: KeyId) {
         match self.get_output_format() {
             OutputFormat::Json => println!("{}", json!(key_id)),
             OutputFormat::Text => println!(
@@ -277,20 +469,34 @@ impl CommandContext for Cli {
                 path.display(),
             ),
         }
-        Ok(())
     }
 
     // Job management
 
-    fn job_started(&mut self, job: &SignedJob) {
+    fn job_started(&mut self, job: &SignedJob, show: bool) {
         if let Some(session) = self.session.lock().unwrap().as_mut() {
             session.job_started(job.to_owned());
+            self.save_session(Some(session));
+        }
+        if !show {
+            return;
+        }
+        let job_id = job.job_id();
+        match self.get_output_format() {
+            OutputFormat::Json => println!("{}", json!({"job_started": job_id})),
+            OutputFormat::Text => {
+                if let Some(watch) = self.watch.lock().unwrap().as_ref() {
+                    let _ = watch.multi.println(format!("✅ Started job `{job_id}`"));
+                } else {
+                    println!("✅ Started job `{job_id}`");
+                }
+            }
         }
     }
 
     fn job_stopped(&mut self, job_id: &JobId) {
         match self.get_output_format() {
-            OutputFormat::Json => println!("{}", json!(job_id)),
+            OutputFormat::Json => println!("{}", json!({"job_stopped": job_id})),
             OutputFormat::Text => {
                 if let Some(watch) = self.watch.lock().unwrap().as_ref() {
                     let _ = watch.multi.println(format!("✅ Stopped job `{job_id}`"));
@@ -299,6 +505,22 @@ impl CommandContext for Cli {
                 }
             }
         }
+    }
+
+    fn job_skipped(&mut self, job_id: &JobId) -> bool {
+        let mut session_guard = self.session.lock().unwrap();
+        let skipped = match session_guard.as_mut() {
+            Some(session) => session.skip_job(*job_id),
+            None => false,
+        };
+        if skipped {
+            self.save_session(session_guard.as_ref());
+            match self.get_output_format() {
+                OutputFormat::Json => println!("{}", json!({"job_skipped": job_id})),
+                OutputFormat::Text => println!("✅ Skipped job `{job_id}`"),
+            }
+        }
+        skipped
     }
 
     fn job_error(&mut self, error: CommandError) -> CommandError {
@@ -683,6 +905,19 @@ impl CommandContext for Cli {
                                     Error:\t{error}"
                             )
                         }
+                        JobStatus::Skipped {
+                            job_id,
+                            time_skipped,
+                            reason,
+                        } => {
+                            println!(
+                                "⏩ Job ID:\t{job_id}\n   \
+                                    Target:\t{baseboard_id}\n   \
+                                    Job status:\tSkipped\n   \
+                                    Skipped at:\t{time_skipped}\n   \
+                                    Reason:\t{reason}"
+                            )
+                        }
                     }
                 }
             }
@@ -710,7 +945,7 @@ impl CommandContext for Cli {
                     time_authenticated,
                     time_revoked,
                 } = identity;
-                let fingerprint = public_key.fingerprint(Default::default()).to_string();
+                let fingerprint = public_key.fingerprint();
                 let algorithm = public_key.algorithm();
                 let comment = public_key.comment();
                 println!(
@@ -739,7 +974,7 @@ impl CommandContext for Cli {
         } else {
             for key in keys {
                 let key_id = key.key_id()?;
-                let fingerprint = key.fingerprint(Default::default()).to_string();
+                let fingerprint = key.fingerprint();
                 let algorithm = key.algorithm();
                 let comment = key.comment();
                 match self.get_output_format() {
@@ -795,12 +1030,11 @@ impl CommandContext for Cli {
         }
     }
 
-    fn revoked(&mut self, what: &str, key_id: KeyId) -> Result<(), CommandError> {
+    fn revoked(&mut self, what: &str, key_id: KeyId) {
         match self.get_output_format() {
             OutputFormat::Json => println!("{}", json!({"revoked": key_id})),
             OutputFormat::Text => println!("✅ Revoked {what} `{key_id}`"),
         }
-        Ok(())
     }
 
     fn please_touch(&mut self, identity: &SshPublicKey) -> Result<(), CommandError> {
@@ -912,7 +1146,8 @@ mod test {
 /// Cell text width for one sled in the rack drawing.
 const CELL: usize = 28;
 
-/// One sled cell: serial on the left, build on the right.
+/// One sled cell: serial on the left, build on the right, colored by
+/// health.
 fn rack_cell(sled: Option<&SledVersion>) -> String {
     match sled {
         Some(sled) => {
@@ -927,9 +1162,26 @@ fn rack_cell(sled: Option<&SledVersion>) -> String {
                 }
                 None => String::new(),
             };
-            format!(" {:<12.12}{:>14.14} ", sled.baseboard.serial_number, build)
+            let style = health_style(sled);
+            format!(
+                "{style} {:<12.12}{:>14.14} {style:#}",
+                sled.baseboard.serial_number, build
+            )
         }
         None => " ".repeat(CELL),
+    }
+}
+
+/// Green gossips with the answering sled, yellow was once known but is
+/// out of contact, and red is in the cubby map with no other sign of
+/// life. Sleds without health (an old server, a newer state than this
+/// build knows) stay unstyled, which renders as nothing.
+fn health_style(sled: &SledVersion) -> Style {
+    match sled.health {
+        Some(SledHealth::Linked) => AnsiColor::Green.on_default(),
+        Some(SledHealth::Unlinked) if sled.version.is_some() => AnsiColor::Yellow.on_default(),
+        Some(SledHealth::Unlinked) => AnsiColor::Red.on_default(),
+        Some(SledHealth::Unknown) | None => Style::new(),
     }
 }
 
@@ -987,11 +1239,10 @@ mod rack {
                 version: "0.1.0".to_string(),
                 commit: "f078e863b17359031de072222bb631270f2d5157".to_string(),
             }),
+            health: None,
         }
     }
 
-    /// Compare the rack drawing against the snapshot in
-    /// `tests/output/`, or rewrite it under `EXPECTORATE=overwrite`.
     #[test]
     fn rack_drawing() {
         let mut sleds = vec![
@@ -1009,10 +1260,30 @@ mod rack {
         if let Some(version) = &mut sleds[1].version {
             version.commit.push_str("-dirty");
         }
-        let drawing = draw_rack(&sleds);
-        let path = "tests/output/rack.txt";
+        check(&draw_rack(&sleds), "tests/output/rack.txt");
+    }
+
+    /// A healthy sled, a silent one, and one that is only a cubby
+    /// number, pinning the color codes.
+    #[test]
+    fn rack_drawing_health() {
+        let mut sleds = vec![
+            sled(14, "BRM42220030"),
+            sled(15, "BRM42220036"),
+            sled(16, "2CN2M459"),
+        ];
+        sleds[0].health = Some(SledHealth::Linked);
+        sleds[1].health = Some(SledHealth::Unlinked);
+        sleds[2].health = Some(SledHealth::Unlinked);
+        sleds[2].version = None;
+        check(&draw_rack(&sleds), "tests/output/rack-health.txt");
+    }
+
+    /// Compare against the snapshot at `path`, or rewrite it under
+    /// `EXPECTORATE=overwrite`.
+    fn check(drawing: &str, path: &str) {
         if env::var("EXPECTORATE").as_deref() == Ok("overwrite") {
-            write(path, &drawing).unwrap();
+            write(path, drawing).unwrap();
         } else {
             let expected = read_to_string(path).expect("missing snapshot");
             assert_eq!(drawing, expected, "rack drawing changed:\n{drawing}");

@@ -30,12 +30,28 @@ pub type Cubbies = BTreeMap<u8, BaseboardId>;
 /// The highest cubby number in a rack.
 pub const MAX_CUBBY: u8 = 31;
 
-/// One sled's location and build.
+/// One sled's location, build, and health.
 #[derive(Clone, Debug, Deserialize, Eq, JsonSchema, PartialEq, Serialize)]
 pub struct SledVersion {
     pub cubby: Option<u8>,
     pub baseboard: BaseboardId,
     pub version: Option<VersionInfo>,
+    #[serde(default)]
+    pub health: Option<SledHealth>,
+}
+
+/// One sled's gossip link health, as the answering sled sees it. A
+/// silent death can lag `Linked` at TCP's pace.
+#[derive(Clone, Copy, Debug, Deserialize, Eq, JsonSchema, PartialEq, Serialize)]
+#[serde(rename_all = "lowercase")]
+pub enum SledHealth {
+    /// Attested, holding a live gossip link.
+    Linked,
+    /// Known by version or cubby, but no live link.
+    Unlinked,
+    /// A state from a build newer than this one.
+    #[serde(other)]
+    Unknown,
 }
 
 /// The sleds a request names.
