@@ -6,7 +6,7 @@
 //!
 //! Every peer seeds its own universe at startup, so peers meet across
 //! unrelated universes and their sessions fail with
-//! [`Error::NetworkMismatch`]. That error carries everything both sides need
+//! [`Mismatch::Network`]. That error carries everything both sides need
 //! to agree on which universe survives, without coordination: the greater
 //! minimum event count wins, and the lesser network id breaks ties. rumors
 //! documents the rule under `Peer`, "Bootstrapping without consensus". The
@@ -29,6 +29,7 @@ use std::net::{SocketAddr, SocketAddrV6};
 use std::time::Duration;
 
 use futures::StreamExt as _;
+use rumors::error::Mismatch;
 use rumors::{Error, Joined, Network, Peer, Rumors, Ticks};
 use serde::Serialize;
 use serde::de::DeserializeOwned;
@@ -519,21 +520,26 @@ async fn sessions<T>(
 where
     T: DeserializeOwned + Serialize + Eq + Send + Sync + 'static,
 {
-    let ours = rumors.network();
     let mut driver = rumors.gossip_when(rumors.changes(), &mut link);
     while let Some(session) = driver.next().await {
         match session {
             Ok(_) => {}
-            Err(Error::NetworkMismatch {
+            Err(Error::Mismatch(Mismatch::Network {
+                local_network,
+                local_min_events,
                 remote_network,
                 remote_min_events,
-                local_min_events,
-            }) => {
-                let dominated =
-                    remote_dominates(&local_min_events, &remote_min_events, ours, remote_network);
+                ..
+            })) => {
+                let dominated = remote_dominates(
+                    &local_min_events,
+                    &remote_min_events,
+                    local_network,
+                    remote_network,
+                );
                 debug!(
                     log, "universe mismatch";
-                    "ours" => %ours, "theirs" => %remote_network,
+                    "ours" => %local_network, "theirs" => %remote_network,
                     "our_events" => %local_min_events,
                     "their_events" => %remote_min_events,
                     "we_lose" => dominated,
@@ -544,11 +550,13 @@ where
                     Stopped::Failed
                 };
             }
-            // A bookmark failure also stops every later session at the
-            // persist gate, so it deserves a warning where routine
-            // link churn does not.
+            // Storage failures need attention; reconnecting alone cannot repair them.
             Err(Error::Bookmark(error)) => {
                 warn!(log, "bookmark failure stops gossip"; "error" => %error);
+                return Stopped::Failed;
+            }
+            Err(Error::Protocol(error)) => {
+                warn!(log, "gossip protocol violation"; "diagnostic" => ?error);
                 return Stopped::Failed;
             }
             Err(err) => {
