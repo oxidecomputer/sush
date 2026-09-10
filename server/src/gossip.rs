@@ -68,8 +68,8 @@ impl LinkedBaseboards {
 pub struct GossipConfig {
     /// How often absent links are re-established.
     pub reconnect: Duration,
-    /// Ceiling on establishing one link, and on each data-stream dial
-    /// inside a live one.
+    /// Timeout for establishing a link, dialing a data stream, or initially
+    /// routing an incoming connection. Established gossip may wait indefinitely.
     pub connect_timeout: Duration,
     /// Ceiling on one bootstrap join.
     pub join_timeout: Duration,

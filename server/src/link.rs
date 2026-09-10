@@ -355,7 +355,9 @@ impl Transport {
 /// concurrently, and [`Listen::accept`] is a queue receive, which the
 /// router may cancel freely.
 pub struct SprocketsListen {
+    /// Attested connections waiting for the router.
     connections: mpsc::Receiver<SprocketsConn>,
+    /// Initial routing uses the same timeout as outgoing dials.
     routing_timeout: Duration,
 }
 
