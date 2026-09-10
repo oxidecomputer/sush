@@ -133,15 +133,15 @@ async fn gossip_convergence() {
     });
 
     // Bob joins Alice's universe through the link and hears her message.
-    let bob = timeout(
+    let rumors::Joined::Joined { peer: bob } = timeout(
         Duration::from_secs(60),
         Peer::<String>::bootstrap().join(&mut link_b),
     )
     .await
-    .expect("bootstrap timed out")
-    .expect("bootstrap failed")
-    .expect("mutual bootstrap bail")
-    .into_rumors();
+    .expect("bootstrap timed out") else {
+        panic!("Alice must serve Bob's bootstrap");
+    };
+    let bob = bob.into_rumors();
     assert_eq!(bob.network(), alice.network());
     assert_eq!(bob.snapshot().len(), 1);
 
