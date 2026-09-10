@@ -122,7 +122,7 @@ async fn cold_start_converges() {
     })
     .await;
 
-    a.rumors().send("hello".to_string());
+    a.rumors().send("hello".to_string()).unwrap();
     eventually("message everywhere", 60, async || {
         nodes.iter().all(|n| n.contains("hello"))
     })
@@ -151,7 +151,7 @@ async fn staggered_start_converges() {
     })
     .await;
 
-    c.rumors().send("late but heard".to_string());
+    c.rumors().send("late but heard".to_string()).unwrap();
     eventually("message everywhere", 60, async || {
         nodes.iter().all(|n| n.contains("late but heard"))
     })
@@ -181,7 +181,7 @@ async fn node_replacement_reconverges() {
     mesh(&nodes);
     eventually("re-convergence", 120, async || converged(&nodes).is_some()).await;
 
-    a.rumors().send("after the funeral".to_string());
+    a.rumors().send("after the funeral".to_string()).unwrap();
     eventually("message everywhere", 60, async || {
         nodes.iter().all(|n| n.contains("after the funeral"))
     })

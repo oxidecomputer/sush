@@ -108,7 +108,7 @@ async fn gossip_convergence() {
     // Alice seeds a universe with one message and serves sessions on her
     // end of the link.
     let alice: Rumors<String> = Peer::seed().into_rumors();
-    alice.send("from alice".to_string());
+    alice.send("from alice".to_string()).unwrap();
     let server = spawn({
         let alice = alice.clone();
         async move {
@@ -134,7 +134,7 @@ async fn gossip_convergence() {
     assert_eq!(bob.snapshot().len(), 1);
 
     // Bob's own message reaches Alice within one gossip session.
-    bob.send("from bob".to_string());
+    bob.send("from bob".to_string()).unwrap();
     timeout(Duration::from_secs(60), bob.gossip(&mut link_b))
         .await
         .expect("gossip timed out")

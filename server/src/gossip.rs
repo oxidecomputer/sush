@@ -129,7 +129,7 @@ impl<T> Seed<T> {
     /// is harmless.
     pub async fn grow(log: &Logger, locker: &Locker) -> Self
     where
-        T: DeserializeOwned + Serialize + Send + Sync + 'static,
+        T: DeserializeOwned + Serialize + Eq + Send + Sync + 'static,
     {
         let bookmarks = BookmarkSource::new(log, locker);
         let handle = match locker.probe().await {
@@ -189,7 +189,7 @@ pub async fn spawn_gossip<T>(
     shutdown: CancellationToken,
 ) -> io::Result<(SocketAddrV6, watch::Receiver<Universe<T>>, LinkedBaseboards)>
 where
-    T: DeserializeOwned + Serialize + Send + Sync + 'static,
+    T: DeserializeOwned + Serialize + Eq + Send + Sync + 'static,
 {
     let transport = Transport::new(
         log,
@@ -219,7 +219,7 @@ pub fn spawn_gossip_manager<T>(
     shutdown: CancellationToken,
 ) -> (watch::Receiver<Universe<T>>, LinkedBaseboards)
 where
-    T: DeserializeOwned + Serialize + Send + Sync + 'static,
+    T: DeserializeOwned + Serialize + Eq + Send + Sync + 'static,
 {
     let Seed {
         rumors: seed,
@@ -282,7 +282,7 @@ struct Manager<T> {
 
 impl<T> Manager<T>
 where
-    T: DeserializeOwned + Serialize + Send + Sync + 'static,
+    T: DeserializeOwned + Serialize + Eq + Send + Sync + 'static,
 {
     async fn run(mut self) {
         let mut tick = interval(self.config.reconnect);
@@ -517,7 +517,7 @@ async fn sessions<T>(
     log: &Logger,
 ) -> Stopped
 where
-    T: DeserializeOwned + Serialize + Send + Sync + 'static,
+    T: DeserializeOwned + Serialize + Eq + Send + Sync + 'static,
 {
     let ours = rumors.network();
     let mut driver = rumors.gossip_when(rumors.changes(), &mut link);

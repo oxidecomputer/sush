@@ -339,7 +339,7 @@ impl<'a> SessionGuard<'a> {
                     log, "raising the execution floor above a session the boundary record cannot order";
                     "session_id" => %self.session_id(), "started" => ?self.started,
                 );
-                past.hop(rumors, own_baseboard, Error::SessionHop);
+                past.hop(log, rumors, own_baseboard, Error::SessionHop);
                 continue;
             }
             let QueuedJob {
@@ -524,8 +524,18 @@ impl Past {
 
     /// Report the cause of an [`Admission::Hop`] to the gossip set,
     /// then set the floor at the frontier that includes the report.
-    fn hop(&mut self, rumors: &GossipNetwork, own_baseboard: &BaseboardId, report: Error) {
-        rumors.send(Message::Event(own_baseboard.clone(), Event::Error(report)).into());
+    fn hop(
+        &mut self,
+        log: &Logger,
+        rumors: &GossipNetwork,
+        own_baseboard: &BaseboardId,
+        report: Error,
+    ) {
+        gossip(
+            log,
+            rumors,
+            Message::Event(own_baseboard.clone(), Event::Error(report)).into(),
+        );
         self.floor = Some(rumors.snapshot().latest().clone());
     }
 
@@ -1378,7 +1388,11 @@ fn apply_message(
                 && let Some(rumors) = rumors
             {
                 debug!(log, "sending error to gossip network"; "error" => ?error);
-                rumors.send(Message::Event(own_baseboard.clone(), Event::Error(error)).into());
+                gossip(
+                    log,
+                    rumors,
+                    Message::Event(own_baseboard.clone(), Event::Error(error)).into(),
+                );
             }
         }
     });
@@ -1407,6 +1421,14 @@ fn drain_ready(
     }
 }
 
+/// Send a message into the gossip set. An error means the payload
+/// exceeded the configured depth limit, which tests should catch.
+fn gossip(log: &Logger, rumors: &GossipNetwork, message: VersionedMessage) {
+    if let Err(error) = rumors.send(message) {
+        error!(log, "the gossip set refused a message"; "error" => %error);
+    }
+}
+
 /// Declare interrupted every job a previous life left running,
 /// excluding `survivors` (jobs this incarnation carried across a
 /// universe swap) and jobs already reaped. Zombies come only from
@@ -1427,7 +1449,9 @@ fn reap_zombies(
     for job_id in zombies {
         reaped.insert(job_id);
         if let Some(rumors) = rumors {
-            rumors.send(
+            gossip(
+                log,
+                rumors,
                 Message::Event(
                     own_baseboard.clone(),
                     Event::Job(JobEvent::Error(
@@ -1513,7 +1537,11 @@ fn adjudicate_boundary(
     };
     if let Some(rumors) = rumors {
         for event in events {
-            rumors.send(Message::Event(own_baseboard.clone(), Event::Job(event)).into());
+            gossip(
+                log,
+                rumors,
+                Message::Event(own_baseboard.clone(), Event::Job(event)).into(),
+            );
         }
     }
     warn!(log, "adjudicated an unwitnessed job from a previous life"; "job_id" => %job_id);
@@ -1557,7 +1585,9 @@ fn entry_floor(
                 log, "re-entered a universe this sled's boundary record burned";
                 "committed" => ?boundary.job,
             );
-            rumors.send(
+            gossip(
+                log,
+                rumors,
                 Message::Event(own_baseboard.clone(), Event::Error(Error::UniverseFlipFlop)).into(),
             );
         }
@@ -1662,7 +1692,7 @@ impl StateManager {
         // The watch channel behind `universe` stores its own copy of the
         // network, so holding the receiver would keep the network from
         // draining while we wait for exactly that.
-        let mut gossip = Some((initial, universe));
+        let mut network = Some((initial, universe));
 
         Ok((
             rx_state,
@@ -1674,10 +1704,12 @@ impl StateManager {
                 // raise the floor in case the record burned the
                 // initial universe, and take the birth mark that
                 // splits this life's traffic from replayed history.
-                let boundary = match &gossip {
+                let boundary = match &network {
                     Some((rumors, _)) => {
                         let arrival = rumors.snapshot().latest().clone();
-                        rumors.send(
+                        gossip(
+                            &log,
+                            rumors,
                             Message::Event(
                                 own_baseboard.clone(),
                                 Event::Version(VersionInfo::current()),
@@ -1719,7 +1751,7 @@ impl StateManager {
 
                 // These flip both to `true` once our two input streams (local
                 // requests and local events from the executor) terminate or
-                // we're shutting down. At this point, we must drop `gossip`
+                // we're shutting down. At this point, we must drop `network`
                 // and thereby permit its own `unordered_messages` stream to
                 // eventually be drained; we do this so that we fully update
                 // the local state until nothing more is left to do.
@@ -1729,14 +1761,14 @@ impl StateManager {
                 loop {
                     let message = causal_messages.next();
 
-                    // Once we drain the requests and events, we drop `gossip` so
+                    // Once we drain the requests and events, we drop `network` so
                     // that if there are no outstanding copies elsewhere, we will
                     // drain it and then break.
                     //
                     // If there are still gossip sessions happening, those will
                     // complete and we will process their messages into the state.
                     if requests_empty && events_empty {
-                        gossip = None;
+                        network = None;
                     }
 
                     // Applied after the select, once `message` and the
@@ -1752,18 +1784,22 @@ impl StateManager {
                             // we need to let all spawned tasks by the executor
                             // quiesce, updating the state all the way.
                             None => requests_empty = true,
-                            Some(request) => if let Some((rumors, _)) = &gossip {
+                            Some(request) => if let Some((rumors, _)) = &network {
                                 debug!(log, "forwarding request to gossip network"; "kind" => request.kind());
-                                rumors.send(Message::Request(request).into());
+                                gossip(&log, rumors, Message::Request(request).into());
                             },
                         },
 
                         // Handle events produced by the executor.
                         next = events.next(), if !events_empty => match next {
                             None => events_empty = true,
-                            Some(event) => if let Some((rumors, _)) = &gossip {
+                            Some(event) => if let Some((rumors, _)) = &network {
                                 debug!(log, "forwarding event to gossip network"; "event" => ?event);
-                                rumors.send(Message::Event(own_baseboard.clone(), event).into());
+                                gossip(
+                                    &log,
+                                    rumors,
+                                    Message::Event(own_baseboard.clone(), event).into(),
+                                );
                             },
                         },
 
@@ -1781,7 +1817,7 @@ impl StateManager {
                                     &log,
                                     &tx_state,
                                     &mut executor,
-                                    gossip.as_ref().map(|(rumors, _)| rumors),
+                                    network.as_ref().map(|(rumors, _)| rumors),
                                     &own_baseboard,
                                     &version,
                                     &message,
@@ -1793,13 +1829,13 @@ impl StateManager {
                                         &mut causal_messages,
                                         &tx_state,
                                         &mut executor,
-                                        gossip.as_ref().map(|(rumors, _)| rumors),
+                                        network.as_ref().map(|(rumors, _)| rumors),
                                         &own_baseboard,
                                     );
                                     reap_zombies(
                                         &log,
                                         &tx_state,
-                                        gossip.as_ref().map(|(rumors, _)| rumors),
+                                        network.as_ref().map(|(rumors, _)| rumors),
                                         &own_baseboard,
                                         &survivors,
                                         &mut reaped,
@@ -1807,7 +1843,7 @@ impl StateManager {
                                     adjudicate_boundary(
                                         &log,
                                         &tx_state,
-                                        gossip.as_ref().map(|(rumors, _)| rumors),
+                                        network.as_ref().map(|(rumors, _)| rumors),
                                         &own_baseboard,
                                         boundary.as_ref(),
                                         &survivors,
@@ -1827,7 +1863,7 @@ impl StateManager {
                         // Follow the gossip manager to a new universe,
                         // unless we're already draining.
                         Ok(()) = async {
-                            match gossip.as_mut() {
+                            match network.as_mut() {
                                 Some((_, universe)) => universe.changed().await,
                                 None => std::future::pending().await,
                             }
@@ -1841,7 +1877,7 @@ impl StateManager {
 
                     if swap {
                         let (rumors, universe) =
-                            gossip.as_mut().expect("gossip present when it changes");
+                            network.as_mut().expect("network present when it changes");
                         let fresh = universe.borrow_and_update().clone();
                         info!(log, "gossip universe changed, resetting state"; "network" => %fresh.rumors.network());
                         causal_messages = fresh.rumors.causal_messages();
@@ -1857,7 +1893,9 @@ impl StateManager {
                         reaped = BTreeSet::new();
                         *rumors = fresh.rumors;
                         let arrival = rumors.snapshot().latest().clone();
-                        rumors.send(
+                        gossip(
+                            &log,
+                            rumors,
                             Message::Event(
                                 own_baseboard.clone(),
                                 Event::Version(VersionInfo::current()),
