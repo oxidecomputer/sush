@@ -2,8 +2,7 @@
 // License, v. 2.0. If a copy of the MPL was not distributed with this
 // file, You can obtain one at https://mozilla.org/MPL/2.0/.
 
-//! The sprockets transport against the rumors link contract, and a
-//! two-peer gossip smoke test over it.
+//! Attested transport conformance and two-peer gossip.
 
 mod common;
 
@@ -14,7 +13,7 @@ use futures::StreamExt as _;
 use futures::stream;
 use slog::Logger;
 use tempfile::TempDir;
-use tokio::time::timeout;
+use tokio::time::{sleep, timeout};
 use tokio::{join, spawn};
 use tokio_util::sync::CancellationToken;
 
@@ -24,13 +23,19 @@ use sush_server::link::{SprocketsLink, Transport};
 
 use common::{corpus, dial_timeout, localhost, pki, sprockets_config, test_logger};
 
+/// Two attested endpoints and the PKI used by their handshakes.
 struct TestNet {
+    /// Endpoint for identity 1.
     a: Transport,
+    /// Endpoint for identity 2.
     b: Transport,
+    /// Cancels both endpoints' transport tasks.
     shutdown: CancellationToken,
+    /// Keeps certificate and attestation files alive during the test.
     _dir: TempDir,
 }
 
+/// Bind one identity's authenticated transport for the test network.
 async fn transport(
     log: &Logger,
     dir: &Utf8PathBuf,
@@ -50,6 +55,7 @@ async fn transport(
 }
 
 impl TestNet {
+    /// Create test PKI and start both attested endpoints.
     async fn new(test_name: &'static str) -> TestNet {
         let (tmp, dir) = pki("sush-link-", 2);
         let log = test_logger(test_name);
@@ -77,6 +83,7 @@ impl TestNet {
 }
 
 impl Drop for TestNet {
+    /// Cancel the network's transport tasks.
     fn drop(&mut self) {
         self.shutdown.cancel();
     }
@@ -92,12 +99,11 @@ impl Drop for TestNet {
 #[ignore]
 async fn conformance() {
     let mut net = TestNet::new("conformance").await;
-    timeout(
-        Duration::from_secs(600),
-        check(async || net.link_pair().await),
+    check(
+        async || net.link_pair().await,
+        || sleep(Duration::from_secs(600)),
     )
-    .await
-    .expect("conformance suite timed out");
+    .await;
 }
 
 /// Peers bootstrap and exchange messages over an attested link.
