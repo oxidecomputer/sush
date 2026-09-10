@@ -95,7 +95,11 @@ impl Drop for TestNet {
 //     cargo test --package sush-server --test link -- --include-ignored
 
 /// The attested transport satisfies the Rumors link contract.
-#[tokio::test]
+///
+/// Concurrent handshakes perform synchronous cryptographic work. Use a small
+/// multithreaded runtime, as the server does, so they can progress in parallel
+/// within the production dial deadline.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 #[ignore]
 async fn conformance() {
     let mut net = TestNet::new("conformance").await;
