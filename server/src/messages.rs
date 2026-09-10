@@ -317,6 +317,11 @@ mod wire_format {
         }
         let decoded: VersionedMessage = from_cbor(bytes.as_slice()).unwrap();
         assert_eq!(decoded, message, "wire format should round-trip");
+        // Exercise Rumors' admission checks as well as the wire snapshot.
+        rumors::Peer::<VersionedMessage>::seed()
+            .into_rumors()
+            .send(message)
+            .expect("locally authored Sush messages must encode faithfully");
     }
 
     fn sid(name: &str) -> SessionId {

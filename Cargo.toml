@@ -44,7 +44,6 @@ permission-slip-common = { git = "https://github.com/oxidecomputer/permission-sl
 progenitor = "0.14"
 progenitor-client = "0.14"
 pwd = "1"
-qorb = { version = "0.4", default-features = false }
 rand = "0.8"
 rand_core = "0.6"
 reqwest = { version = "0.13", features = ["json", "rustls"] }
@@ -77,10 +76,8 @@ tokio-util = "0.7"
 x509-cert = { version = "0.2", features = ["pem", "std"] }
 xdg = "3"
 
-# Every sprockets handshake verifies P-384 attestation cert chains, and every
-# gossip link stream is a handshake. The RustCrypto stack is ~100ms per verify
-# unoptimized, which makes the sprockets-backed tests crawl, so optimize the
-# crates that do the math; everything else keeps fast debug builds.
+# Optimize the arithmetic used to verify attestation certificates on fresh
+# connections. Keep the rest of the debug build unoptimized.
 [profile.dev.package.crypto-bigint]
 opt-level = 3
 [profile.dev.package.ecdsa]

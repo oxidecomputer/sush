@@ -82,11 +82,12 @@ impl Drop for TestNet {
     }
 }
 
-// Slow (~35s each): CI always runs these, and local runs should
-// whenever `link.rs` or the gossip configuration changes:
+// These tests perform real attestation. CI runs them; run them locally
+// when changing the transport or gossip configuration:
 //
 //     cargo test --package sush-server --test link -- --include-ignored
 
+/// The attested transport satisfies the Rumors link contract.
 #[tokio::test]
 #[ignore]
 async fn conformance() {
@@ -99,6 +100,7 @@ async fn conformance() {
     .expect("conformance suite timed out");
 }
 
+/// Peers bootstrap and exchange messages over an attested link.
 #[tokio::test]
 #[ignore]
 async fn gossip_convergence() {
