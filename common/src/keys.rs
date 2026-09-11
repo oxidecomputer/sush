@@ -34,10 +34,12 @@ use ssh_key::{
 };
 use thiserror::Error;
 use x509_cert::der::Encode as _;
-use x509_cert::der::asn1::{Any, BitString};
+use x509_cert::der::asn1::{Any, BitString, OctetString};
+use x509_cert::der::oid::ObjectIdentifier;
 use x509_cert::der::oid::db::rfc5912::{ECDSA_WITH_SHA_256, ID_EC_PUBLIC_KEY, SECP_256_R_1};
 use x509_cert::der::oid::db::rfc8410::ID_ED_25519;
 use x509_cert::der::pem::{LineEnding, PemLabel as _, encode_string as pem_encode};
+use x509_cert::ext::Extension;
 use x509_cert::name::Name;
 use x509_cert::serial_number::SerialNumber;
 use x509_cert::spki::{AlgorithmIdentifierOwned, SubjectPublicKeyInfo};
@@ -794,7 +796,23 @@ impl SigningKey {
     }
 }
 
-/// An in-memory-only signing key with certification.
+/// A signature in a trenchcoat; see RFD 620 §4.6.2.1.
+pub const VOUCHER_OID: ObjectIdentifier = ObjectIdentifier::new_unwrap("1.3.6.1.4.1.57551.3.1");
+
+/// Domain separation for [`voucher_digest`]. ASCII, so the preimage
+/// can never collide with a DER certificate, which begins `0x30`.
+const VOUCHER_TAG: &[u8] = b"sush-proxy-voucher-v0:";
+
+/// Produce the SHA-3 digest the RoT signs to make a voucher for a key.
+/// We must use only its public key info, because it is to be embedded
+/// in a self-signed certificate.
+pub fn voucher_digest(spki: &SubjectPublicKeyInfo<Any, BitString>) -> Result<[u8; 32], KeyError> {
+    let mut hasher = Hasher::new();
+    hasher.update(VOUCHER_TAG);
+    hasher.update(&spki.to_der()?);
+    Ok(*hasher.finalize().as_bytes())
+}
+
 pub struct EphemeralKey {
     key: SigningKey,
     key_id: KeyId,
@@ -847,6 +865,40 @@ impl EphemeralKey {
         let cert = Certificate {
             signature_algorithm: tbs_certificate.signature.to_owned(),
             signature: BitString::from_bytes(&signature)?,
+            tbs_certificate,
+        };
+        let key_id = KeyId::try_from(&cert)?;
+        Ok(Self { key, key_id, cert })
+    }
+
+    /// Ephemeral key with a self-signed cert carrying a voucher
+    /// embedded as a critical extension under [`VOUCHER_OID`].
+    pub fn new_vouched<E: fmt::Display>(
+        key_type: KeyType,
+        subject: Name,
+        validity: Validity,
+        vouch: impl FnOnce(&[u8; 32]) -> Result<Vec<u8>, E>,
+    ) -> Result<Self, KeyError> {
+        let key = SigningKey::new(key_type);
+        let voucher = vouch(&voucher_digest(&key.spki())?).map_err(KeyError::signer)?;
+        let signature_algorithm = key.signature_algorithm();
+        let mut tbs_certificate = Self::tbs_certificate(
+            &key,
+            Self::generate_serial_number()?,
+            signature_algorithm.clone(),
+            subject.clone(),
+            subject,
+            validity,
+        );
+        tbs_certificate.extensions = Some(vec![Extension {
+            extn_id: VOUCHER_OID,
+            critical: true,
+            extn_value: OctetString::new(voucher)?,
+        }]);
+        let signature = key.sign(&tbs_certificate.to_der()?).to_bit_string()?;
+        let cert = Certificate {
+            signature_algorithm,
+            signature,
             tbs_certificate,
         };
         let key_id = KeyId::try_from(&cert)?;
@@ -1068,6 +1120,56 @@ mod test {
     use crate::authn::Nonce;
 
     use super::*;
+
+    /// The voucher digest is a convention shared with the
+    /// signatures on deployed proxy certificates. If this
+    /// fails, STOP: existing vouchers would no longer verify.
+    #[test]
+    fn pin_voucher_digest() {
+        let spki = SubjectPublicKeyInfo {
+            algorithm: AlgorithmIdentifierOwned {
+                oid: ID_ED_25519,
+                parameters: None,
+            },
+            subject_public_key: BitString::from_bytes(&[0x42; 32]).unwrap(),
+        };
+        assert_eq!(
+            voucher_digest(&spki).unwrap(),
+            [
+                0x3c, 0x39, 0xf5, 0x94, 0x94, 0xa7, 0x6c, 0xe4, 0x37, 0x01, 0x97, 0xa3, 0xfc, 0xbd,
+                0xf1, 0x28, 0x52, 0x3f, 0x87, 0x0b, 0x07, 0xf2, 0x44, 0x99, 0xcf, 0xf0, 0xdb, 0x14,
+                0x97, 0x03, 0xa6, 0xeb,
+            ],
+        );
+    }
+
+    /// A vouched certificate is self-signed, has the voucher as its
+    /// one critical extension, and verifies against the vouching key.
+    #[test]
+    fn vouched_cert_round_trip() {
+        let authority = ed25519_dalek::SigningKey::generate(&mut OsRng);
+        let key = EphemeralKey::new_vouched(
+            KeyType::Ed25519,
+            "CN=vouched".parse().unwrap(),
+            Validity::from_now(Duration::from_secs(60)).unwrap(),
+            |digest| Ok::<_, KeyError>(authority.sign(digest).to_vec()),
+        )
+        .unwrap();
+        let extensions = key.cert().tbs_certificate.extensions.as_ref().unwrap();
+        let [extension] = extensions.as_slice() else {
+            panic!("expected exactly one extension");
+        };
+        assert_eq!(extension.extn_id, VOUCHER_OID);
+        assert!(extension.critical);
+
+        let digest = voucher_digest(&key.cert().tbs_certificate.subject_public_key_info).unwrap();
+        let signature =
+            ed25519_dalek::Signature::from_slice(extension.extn_value.as_bytes()).unwrap();
+        authority
+            .verifying_key()
+            .verify_strict(&digest, &signature)
+            .unwrap();
+    }
 
     #[test]
     fn test_sk_split() {

@@ -2,12 +2,11 @@
 // License, v. 2.0. If a copy of the MPL was not distributed with this
 // file, You can obtain one at https://mozilla.org/MPL/2.0/.
 
-//! TLS for reaching a proxy, whose certificate chain leads to the
-//! sled's platform identity, verified against the platform PKI roots.
-//!
-//! Verification proves only that the server holds a key some RoT
-//! vouched for. TLS only provides transport privacy for job traffic.
-//! We do not support expiration, revocation, or server-name binding.
+//! TLS for sush client ↔ proxy communication. The proxy serves an
+//! ephemeral certificate that is self-signed but includes an RoT's
+//! _voucher_ for its key (a signature with the Trust Quorum key);
+//! see RFD 620 §4.6.2.1. It serves its platform identity chain
+//! alongside, which is used to validate the voucher.
 
 use std::ffi::CString;
 use std::net::{Ipv6Addr, SocketAddr, SocketAddrV6};
@@ -19,12 +18,12 @@ use rustls::client::danger::{HandshakeSignatureValid, ServerCertVerified, Server
 use rustls::pki_types::{CertificateDer, ServerName, UnixTime};
 use rustls::version::TLS13;
 use rustls::{CertificateError, ClientConfig, DigitallySignedStruct, SignatureScheme};
-use sha3::{Digest as _, Sha3_256};
 use slog::{Discard, Logger, o};
 use sprockets_tls::keys::RotCertVerifier;
+use sush_common::keys::{VOUCHER_OID, voucher_digest};
 use thiserror::Error;
 use x509_cert::Certificate;
-use x509_cert::der::{Decode as _, DecodePem as _, Encode as _};
+use x509_cert::der::{Decode as _, DecodePem as _};
 
 /// The same request timeout as the generated default client.
 const TIMEOUT: Duration = Duration::from_secs(600);
@@ -135,11 +134,10 @@ pub fn client(
     Ok(builder.build()?)
 }
 
-/// Accept a certificate chain that is the platform identity itself,
-/// or an ephemeral leaf the platform identity vouched for once, in
-/// the RoT's signing convention: Ed25519 over the SHA3-256 digest.
-/// Delegation is one level deep by construction; a delegated leaf
-/// cannot vouch for further certificates.
+/// Accept a self-signed cert with an RoT voucher. The voucher only covers
+/// the cert's public key, so it cannot extend to further certificates.
+/// Replaying it is useless without possession of the private key, which
+/// `CertificateVerify` proves on every handshake.
 #[derive(Debug)]
 struct PlatformVerifier {
     inner: RotCertVerifier,
@@ -154,16 +152,13 @@ impl ServerCertVerifier for PlatformVerifier {
         _ocsp_response: &[u8],
         _now: UnixTime,
     ) -> Result<ServerCertVerified, rustls::Error> {
-        if self.inner.verify_cert(end_entity, intermediates).is_ok() {
-            return Ok(ServerCertVerified::assertion());
-        }
         let [platform, rest @ ..] = intermediates else {
             return Err(rustls::Error::InvalidCertificate(
                 CertificateError::UnknownIssuer,
             ));
         };
         self.inner.verify_cert(platform, rest)?;
-        verify_delegated_leaf(end_entity, platform)?;
+        verify_vouched_cert(end_entity, platform)?;
         Ok(ServerCertVerified::assertion())
     }
 
@@ -182,7 +177,20 @@ impl ServerCertVerifier for PlatformVerifier {
         cert: &CertificateDer<'_>,
         dss: &DigitallySignedStruct,
     ) -> Result<HandshakeSignatureValid, rustls::Error> {
-        self.inner.verify_tls13_signature(message, cert, dss)
+        // The sprockets verifier parses the certificate as webpki,
+        // which refuses the voucher's critical extension. But a vouched
+        // key can sign a standard Ed25519 `CertificateVerify`, so check
+        // the signature directly against the public key.
+        if dss.scheme == SignatureScheme::ED25519 {
+            let cert = Certificate::from_der(cert).map_err(|_| bad_encoding())?;
+            let signature = Signature::from_slice(dss.signature()).map_err(|_| bad_signature())?;
+            spki_key(&cert)?
+                .verify_strict(message, &signature)
+                .map_err(|_| bad_signature())?;
+            Ok(HandshakeSignatureValid::assertion())
+        } else {
+            self.inner.verify_tls13_signature(message, cert, dss)
+        }
     }
 
     fn supported_verify_schemes(&self) -> Vec<SignatureScheme> {
@@ -190,27 +198,59 @@ impl ServerCertVerifier for PlatformVerifier {
     }
 }
 
-/// Verify that `platform` signed `leaf`'s TBS certificate.
-fn verify_delegated_leaf(
-    leaf: &CertificateDer<'_>,
+/// Verify the voucher (RFD 620 §4.6.2.1) on a certificate.
+/// The cert must include a [`VOUCHER_OID`] extension containing
+/// a valid signature over its tagged SPKI.
+fn verify_vouched_cert(
+    cert: &CertificateDer<'_>,
     platform: &CertificateDer<'_>,
 ) -> Result<(), rustls::Error> {
-    let encoding = |_| rustls::Error::InvalidCertificate(CertificateError::BadEncoding);
-    let bad = rustls::Error::InvalidCertificate(CertificateError::BadSignature);
-    let leaf = Certificate::from_der(leaf).map_err(encoding)?;
-    let platform = Certificate::from_der(platform).map_err(encoding)?;
-    let tbs = leaf.tbs_certificate.to_der().map_err(encoding)?;
-    let key: [u8; 32] = platform
+    let cert = Certificate::from_der(cert).map_err(|_| bad_encoding())?;
+    let platform = Certificate::from_der(platform).map_err(|_| bad_encoding())?;
+    let mut voucher = None;
+    for extension in cert
+        .tbs_certificate
+        .extensions
+        .as_deref()
+        .unwrap_or_default()
+    {
+        if extension.extn_id == VOUCHER_OID {
+            voucher = Some(extension.extn_value.as_bytes());
+        } else if extension.critical {
+            return Err(rustls::Error::InvalidCertificate(
+                CertificateError::InvalidPurpose,
+            ));
+        }
+    }
+    let Some(voucher) = voucher else {
+        return Err(bad_signature());
+    };
+    let digest = voucher_digest(&cert.tbs_certificate.subject_public_key_info)
+        .map_err(|_| bad_encoding())?;
+    let signature = Signature::from_slice(voucher).map_err(|_| bad_signature())?;
+    spki_key(&platform)?
+        .verify_strict(&digest, &signature)
+        .map_err(|_| bad_signature())
+}
+
+/// The Ed25519 key in a certificate's SPKI.
+fn spki_key(cert: &Certificate) -> Result<VerifyingKey, rustls::Error> {
+    let key: [u8; 32] = cert
         .tbs_certificate
         .subject_public_key_info
         .subject_public_key
         .raw_bytes()
         .try_into()
-        .map_err(|_| bad.clone())?;
-    let key = VerifyingKey::from_bytes(&key).map_err(|_| bad.clone())?;
-    let signature = Signature::from_slice(leaf.signature.raw_bytes()).map_err(|_| bad.clone())?;
-    key.verify_strict(&Sha3_256::digest(&tbs), &signature)
-        .map_err(|_| bad)
+        .map_err(|_| bad_signature())?;
+    VerifyingKey::from_bytes(&key).map_err(|_| bad_signature())
+}
+
+fn bad_encoding() -> rustls::Error {
+    rustls::Error::InvalidCertificate(CertificateError::BadEncoding)
+}
+
+fn bad_signature() -> rustls::Error {
+    rustls::Error::InvalidCertificate(CertificateError::BadSignature)
 }
 
 #[cfg(test)]

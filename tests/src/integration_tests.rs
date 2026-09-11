@@ -30,15 +30,11 @@ use tokio_util::sync::CancellationToken;
 
 use ed25519_dalek::pkcs8::DecodePrivateKey as _;
 use ed25519_dalek::{Signer as _, SigningKey};
-use sha3::{Digest as _, Sha3_256};
-use sprockets_tls::keys::ResolveSetting;
 use sprockets_tls_test_utils::{
     cert_path, certlist_path, private_key_path, root_prefix, sprockets_auth_prefix,
 };
 use x509_cert::Certificate;
 use x509_cert::der::DecodePem as _;
-use x509_cert::der::oid::db::rfc8410::ID_ED_25519;
-use x509_cert::spki::AlgorithmIdentifierOwned;
 use x509_cert::time::Validity;
 
 use sush_api::JobWait;
@@ -67,6 +63,30 @@ const TIMEOUT: Duration = Duration::from_secs(10);
 
 fn local_addr() -> SocketAddr {
     "127.0.0.1:0".parse().unwrap()
+}
+
+/// A fresh proxy key vouched for by the test PKI's platform identity,
+/// written under `pki` as the key and chain PEMs `platform_tls` takes.
+fn vouched_proxy_pems(pki: &camino::Utf8PathBuf) -> (camino::Utf8PathBuf, camino::Utf8PathBuf) {
+    let signer_pem = read_to_string(private_key_path(pki.clone(), &sprockets_auth_prefix(1)))
+        .expect("can't read the platform key");
+    let platform_key =
+        SigningKey::from_pkcs8_pem(&signer_pem).expect("can't parse the platform key");
+    let chain_pem = read_to_string(certlist_path(pki.clone(), &sprockets_auth_prefix(1)))
+        .expect("can't read the platform chain");
+    let vouched = EphemeralKey::new_vouched(
+        KeyType::Ed25519,
+        "CN=sush-proxy".parse().unwrap(),
+        Validity::from_now(Duration::from_secs(600)).unwrap(),
+        |digest| Ok::<_, Infallible>(platform_key.sign(digest).to_vec()),
+    )
+    .expect("can't generate a vouched cert");
+    let key_path = pki.join("sush-proxy-key.pem");
+    let chain_path = pki.join("sush-proxy-chain.pem");
+    write(&key_path, vouched.private_key_pem().unwrap()).unwrap();
+    let cert_pem = pem_cert_chain(vec![vouched.cert().clone()]).unwrap();
+    write(&chain_path, format!("{cert_pem}{chain_pem}")).unwrap();
+    (key_path, chain_path)
 }
 
 #[named]
@@ -331,9 +351,9 @@ async fn client_proxy_server() {
     server.close().await.expect("can't shutdown server");
 }
 
-/// The proxy serves the platform identity, here a local test PKI, and
-/// the client accepts exactly the chains that verify against its
-/// roots.
+/// The proxy serves a self-signed cert vouched for by the platform
+/// identity, here a local test PKI, and the client accepts exactly
+/// the vouchers that verify against its roots.
 #[named]
 #[test]
 async fn client_tls_proxy_server() {
@@ -349,14 +369,11 @@ async fn client_tls_proxy_server() {
         .start()
         .expect("failed to start server");
 
-    // Spin up a TLS proxy with a local platform identity.
-    // The test PKI numbers its nodes from 1.
+    // Spin up a TLS proxy serving a cert vouched for by a local
+    // platform identity. The test PKI numbers its nodes from 1.
     let (_pki_dir, pki) = test_pki("sush-tls-");
-    let resolve = ResolveSetting::Local {
-        priv_key: private_key_path(pki.clone(), &sprockets_auth_prefix(1)),
-        cert_chain: certlist_path(pki.clone(), &sprockets_auth_prefix(1)),
-    };
-    let tls = platform_tls(&log, resolve).expect("can't build TLS config");
+    let (key_path, chain_path) = vouched_proxy_pems(&pki);
+    let tls = platform_tls(&key_path, &chain_path).expect("can't build TLS config");
     let (_tx_targets, rx_targets) = watch::channel(Targets {
         sleds: BTreeMap::from([(test_baseboard_id(), server.local_addr())]),
         cubbies: Cubbies::new(),
@@ -379,7 +396,11 @@ async fn client_tls_proxy_server() {
     let pem = read(cert_path(pki.clone(), &root_prefix())).unwrap();
     let roots = vec![Certificate::from_pem(&pem).unwrap()];
     let signer = AuthzSigner::default();
-    let client = Client::new_with_client(&url, tls_client(roots, None).unwrap(), signer.clone());
+    let client = Client::new_with_client(
+        &url,
+        tls_client(roots.clone(), None).unwrap(),
+        signer.clone(),
+    );
     let ClientError::ErrorResponse(unauthz) = client.iam().body(None).send().await.unwrap_err()
     else {
         panic!("expected error response")
@@ -407,104 +428,32 @@ async fn client_tls_proxy_server() {
     );
     assert!(stranger.iam().body(None).send().await.is_err());
 
-    // A second proxy serves an ephemeral leaf the platform identity
-    // signed once, in the RoT's convention. The same roots accept it.
-    let signer_pem = read_to_string(private_key_path(pki.clone(), &sprockets_auth_prefix(1)))
-        .expect("can't read the platform key");
-    let platform_key =
-        SigningKey::from_pkcs8_pem(&signer_pem).expect("can't parse the platform key");
-    let chain_pem = read_to_string(certlist_path(pki.clone(), &sprockets_auth_prefix(1)))
-        .expect("can't read the platform chain");
-    let platform =
-        Certificate::load_pem_chain(chain_pem.as_bytes()).expect("can't parse the platform chain");
-    let leaf = EphemeralKey::new_delegated(
-        KeyType::Ed25519,
-        "CN=sush-proxy".parse().unwrap(),
-        platform[0].tbs_certificate.subject.clone(),
-        Validity::from_now(Duration::from_secs(600)).unwrap(),
-        AlgorithmIdentifierOwned {
-            oid: ID_ED_25519,
-            parameters: None,
-        },
-        |tbs| Ok::<_, Infallible>(platform_key.sign(&Sha3_256::digest(tbs)).to_vec()),
-    )
-    .expect("can't mint a delegated leaf");
-    let key_path = pki.join("sush-proxy-key.pem");
-    let chain_path = pki.join("sush-proxy-chain.pem");
-    write(&key_path, leaf.private_key_pem().unwrap()).unwrap();
-    let leaf_pem = pem_cert_chain(vec![leaf.cert().clone()]).unwrap();
-    write(&chain_path, format!("{leaf_pem}{chain_pem}")).unwrap();
-
-    let rx_forged = rx_delegated.clone();
-    let delegated = platform_tls(
-        &log,
-        ResolveSetting::Local {
-            priv_key: key_path,
-            cert_chain: chain_path,
-        },
-    )
-    .expect("can't build delegated TLS config");
-    let proxy2 = ProxyServer::start(
-        &log,
-        local_addr(),
-        Some(delegated),
-        rx_delegated,
-        None,
-        shutdown_proxy.clone(),
-    )
-    .await
-    .expect("can't start delegated proxy server");
-    let pem = read(cert_path(pki, &root_prefix())).unwrap();
-    let roots = vec![Certificate::from_pem(&pem).unwrap()];
-    let client2 = Client::new_with_client(
-        &format!("https://{}", proxy2.local_addr()),
-        tls_client(roots.clone(), None).unwrap(),
-        signer.clone(),
-    );
-    let iam = client2
-        .iam()
-        .body(None)
-        .send()
-        .await
-        .expect("can't authenticate via the delegated proxy")
-        .into_inner();
-    assert_eq!(iam, identity, "who am I, again?");
-
-    // A leaf on a valid platform chain, but signed by the wrong key,
-    // refuses the handshake.
+    // A cert served with a valid platform chain, but vouched for by
+    // the wrong key, refuses the handshake.
     let forger_pem = read_to_string(private_key_path(other.clone(), &sprockets_auth_prefix(1)))
         .expect("can't read the forger's key");
     let forger_key = SigningKey::from_pkcs8_pem(&forger_pem).expect("can't parse the forger's key");
-    let forged = EphemeralKey::new_delegated(
+    let chain_pem = read_to_string(certlist_path(pki.clone(), &sprockets_auth_prefix(1)))
+        .expect("can't read the platform chain");
+    let forged = EphemeralKey::new_vouched(
         KeyType::Ed25519,
         "CN=sush-proxy".parse().unwrap(),
-        platform[0].tbs_certificate.subject.clone(),
         Validity::from_now(Duration::from_secs(600)).unwrap(),
-        AlgorithmIdentifierOwned {
-            oid: ID_ED_25519,
-            parameters: None,
-        },
-        |tbs| Ok::<_, Infallible>(forger_key.sign(&Sha3_256::digest(tbs)).to_vec()),
+        |digest| Ok::<_, Infallible>(forger_key.sign(digest).to_vec()),
     )
-    .expect("can't mint a forged leaf");
+    .expect("can't generate a forged cert");
     let forged_key_path = other.join("sush-proxy-key.pem");
     let forged_chain_path = other.join("sush-proxy-chain.pem");
     write(&forged_key_path, forged.private_key_pem().unwrap()).unwrap();
     let forged_pem = pem_cert_chain(vec![forged.cert().clone()]).unwrap();
     write(&forged_chain_path, format!("{forged_pem}{chain_pem}")).unwrap();
-    let forged_tls = platform_tls(
-        &log,
-        ResolveSetting::Local {
-            priv_key: forged_key_path,
-            cert_chain: forged_chain_path,
-        },
-    )
-    .expect("can't build forged TLS config");
+    let forged_tls =
+        platform_tls(&forged_key_path, &forged_chain_path).expect("can't build forged TLS config");
     let proxy3 = ProxyServer::start(
         &log,
         local_addr(),
         Some(forged_tls),
-        rx_forged,
+        rx_delegated,
         None,
         shutdown_proxy.clone(),
     )
@@ -1183,11 +1132,8 @@ async fn client_tunnels_through_nexus() {
         .start()
         .expect("failed to start server");
     let (_pki_dir, pki) = test_pki("sush-tunnel-");
-    let resolve = ResolveSetting::Local {
-        priv_key: private_key_path(pki.clone(), &sprockets_auth_prefix(1)),
-        cert_chain: certlist_path(pki.clone(), &sprockets_auth_prefix(1)),
-    };
-    let tls = platform_tls(&log, resolve).expect("can't build TLS config");
+    let (key_path, chain_path) = vouched_proxy_pems(&pki);
+    let tls = platform_tls(&key_path, &chain_path).expect("can't build TLS config");
     let (_tx_targets, rx_targets) = watch::channel(Targets {
         sleds: BTreeMap::from([(test_baseboard_id(), server.local_addr())]),
         cubbies: Cubbies::new(),

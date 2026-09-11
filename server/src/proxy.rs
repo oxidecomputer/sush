@@ -18,6 +18,7 @@ use std::io;
 use std::net::SocketAddr;
 use std::sync::Arc;
 
+use camino::{Utf8Path, Utf8PathBuf};
 use http::header::CONTENT_TYPE;
 use http::{Method, StatusCode};
 use http_body_util::{Either, Full};
@@ -30,10 +31,13 @@ use hyper::{Request, Response};
 use hyper_util::rt::TokioIo;
 use percent_encoding::percent_decode_str;
 use rustls::ServerConfig;
+use rustls::pki_types::pem::PemObject as _;
+use rustls::pki_types::{CertificateDer, PrivateKeyDer};
+use rustls::server::{ClientHello, ResolvesServerCert};
+use rustls::sign::CertifiedKey;
 use rustls::version::TLS13;
 use sled_hardware_types::BaseboardId;
 use slog::{Logger, debug, error, info, o, warn};
-use sprockets_tls::keys::{CertResolver, ResolveSetting};
 use tokio::io::{AsyncRead, AsyncWrite, copy_bidirectional};
 use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::watch;
@@ -74,16 +78,54 @@ impl Targets {
 /// Backend responses pass through. Proxy errors carry their own body.
 type ProxyBody = Either<Incoming, Full<Bytes>>;
 
-/// The proxy's TLS identity is the sled's platform identity.
-pub fn platform_tls(log: &Logger, resolve: ResolveSetting) -> Result<ServerConfig, rustls::Error> {
-    let log = log.new(o!("component" => "proxy-cert-resolver"));
-    let resolver = Arc::new(CertResolver::new(log, resolve));
-    Ok(
-        ServerConfig::builder_with_provider(Arc::new(sprockets_tls::crypto_provider()))
-            .with_protocol_versions(&[&TLS13])?
-            .with_no_client_auth()
-            .with_cert_resolver(resolver),
-    )
+#[derive(Debug, thiserror::Error)]
+pub enum ProxyTlsError {
+    #[error("reading `{path}` failed: {error}")]
+    Pem {
+        path: Utf8PathBuf,
+        #[source]
+        error: rustls::pki_types::pem::Error,
+    },
+    #[error(transparent)]
+    Rustls(#[from] rustls::Error),
+}
+
+/// Build a standard TLS 1.3 configuration for the proxy. The chain
+/// consists of the proxy's self-signed, RoT-vouched certificate,
+/// followed by the usual platform identity chain; see RFD 620 §4.6.2.1.
+/// Because the voucher is a critical constraint unknown to
+/// `with_single_cert`, we cannot take the usual path, and instead
+/// hand rustls the key and chain directly.
+pub fn platform_tls(
+    priv_key: &Utf8Path,
+    cert_chain: &Utf8Path,
+) -> Result<ServerConfig, ProxyTlsError> {
+    let pem = |path: &Utf8Path, error| ProxyTlsError::Pem {
+        path: path.to_owned(),
+        error,
+    };
+    let certs = CertificateDer::pem_file_iter(cert_chain)
+        .map_err(|e| pem(cert_chain, e))?
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(|e| pem(cert_chain, e))?;
+    let key = PrivateKeyDer::from_pem_file(priv_key).map_err(|e| pem(priv_key, e))?;
+    let provider = Arc::new(rustls::crypto::aws_lc_rs::default_provider());
+    let key = provider.key_provider.load_private_key(key)?;
+    let certified = Arc::new(CertifiedKey::new(certs, key));
+    Ok(ServerConfig::builder_with_provider(provider)
+        .with_protocol_versions(&[&TLS13])?
+        .with_no_client_auth()
+        .with_cert_resolver(Arc::new(VouchedCert(certified))))
+}
+
+/// Serve the one vouched certificate to every client.
+#[derive(Debug)]
+struct VouchedCert(Arc<CertifiedKey>);
+
+impl ResolvesServerCert for VouchedCert {
+    fn resolve(&self, _hello: ClientHello<'_>) -> Option<Arc<CertifiedKey>> {
+        Some(Arc::clone(&self.0))
+    }
 }
 
 pub struct ProxyServer {
