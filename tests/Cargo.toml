@@ -17,6 +17,7 @@ function_name.workspace = true
 futures.workspace = true
 http-range-header.workspace = true
 libc.workspace = true
+pki-playground.workspace = true
 pwd.workspace = true
 rand_core.workspace = true
 rumors.workspace = true

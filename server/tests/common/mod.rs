@@ -12,7 +12,7 @@ use std::net::{Ipv6Addr, SocketAddrV6};
 use std::sync::Arc;
 use std::time::Duration;
 
-use attest_mock::{corim, log};
+use attest_mock::{MockData as _, MockLog, corim, corim::MockCorim, log};
 use camino::Utf8PathBuf;
 use chrono::Utc;
 use rand_core::{OsRng, RngCore as _};
@@ -70,8 +70,8 @@ pub fn write_keys_and_measurements(dir: Utf8PathBuf, num_nodes: usize) {
             digest: digest.into(),
         }],
     };
-    let out = log::mock(attest_log_doc).unwrap();
-    fs::write(dir.join("log.bin"), &out).unwrap();
+    let out = MockLog::from_document(attest_log_doc).unwrap();
+    fs::write(dir.join("log.bin"), out.to_bytes().unwrap()).unwrap();
 
     let corim_doc = corim::Document {
         vendor: "Test Bed".into(),
@@ -90,8 +90,8 @@ pub fn write_keys_and_measurements(dir: Utf8PathBuf, num_nodes: usize) {
             },
         ],
     };
-    let corim = corim::mock(corim_doc).unwrap();
-    fs::write(dir.join("corim.cbor"), &corim).unwrap();
+    let corim = MockCorim::from_document(corim_doc).unwrap();
+    fs::write(dir.join("corim.cbor"), corim.to_bytes().unwrap()).unwrap();
 }
 
 pub fn corpus(dir: &Utf8PathBuf) -> CorpusSource {

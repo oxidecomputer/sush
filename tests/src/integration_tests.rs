@@ -5,8 +5,7 @@
 //! Oxide Support Shell integration tests.
 
 use std::collections::BTreeMap;
-use std::convert::Infallible;
-use std::fs::{read, read_to_string, write};
+use std::fs::read;
 use std::net::SocketAddr;
 use std::sync::Arc;
 use std::time::Duration;
@@ -28,14 +27,9 @@ use tokio_tungstenite::tungstenite::handshake::server::{
 use tokio_tungstenite::tungstenite::protocol::Role;
 use tokio_util::sync::CancellationToken;
 
-use ed25519_dalek::pkcs8::DecodePrivateKey as _;
-use ed25519_dalek::{Signer as _, SigningKey};
-use sprockets_tls_test_utils::{
-    cert_path, certlist_path, private_key_path, root_prefix, sprockets_auth_prefix,
-};
+use sprockets_tls_test_utils::{cert_path, root_prefix};
 use x509_cert::Certificate;
 use x509_cert::der::DecodePem as _;
-use x509_cert::time::Validity;
 
 use sush_api::JobWait;
 use sush_api::sush_api_mod::api_description;
@@ -48,14 +42,13 @@ use sush_common::jobs::{
     Access, JobLimits, JobOutputState, JobOutputStream, JobStatus, Session, SessionId,
     SessionSignerNonce, job_status_try_from_json_map,
 };
-use sush_common::keys::{EphemeralKey, KeyType, pem_cert_chain};
 use sush_common::targets::Cubbies;
 use sush_server::proxy::{Targets, platform_tls};
 use sush_server::{ApiServer, ProxyServer};
 
 use crate::test_utils::{
     SignJobRequest as _, authz, ephemeral_test_root, manager_and_test_root, test_baseboard_id,
-    test_logger, test_pki,
+    test_logger, test_pki, vouched_proxy_pems,
 };
 use sush_client::types::SessionStartBody;
 
@@ -63,30 +56,6 @@ const TIMEOUT: Duration = Duration::from_secs(10);
 
 fn local_addr() -> SocketAddr {
     "127.0.0.1:0".parse().unwrap()
-}
-
-/// A fresh proxy key vouched for by the test PKI's platform identity,
-/// written under `pki` as the key and chain PEMs `platform_tls` takes.
-fn vouched_proxy_pems(pki: &camino::Utf8PathBuf) -> (camino::Utf8PathBuf, camino::Utf8PathBuf) {
-    let signer_pem = read_to_string(private_key_path(pki.clone(), &sprockets_auth_prefix(1)))
-        .expect("can't read the platform key");
-    let platform_key =
-        SigningKey::from_pkcs8_pem(&signer_pem).expect("can't parse the platform key");
-    let chain_pem = read_to_string(certlist_path(pki.clone(), &sprockets_auth_prefix(1)))
-        .expect("can't read the platform chain");
-    let vouched = EphemeralKey::new_vouched(
-        KeyType::Ed25519,
-        "CN=sush-proxy".parse().unwrap(),
-        Validity::from_now(Duration::from_secs(600)).unwrap(),
-        |digest| Ok::<_, Infallible>(platform_key.sign(digest).to_vec()),
-    )
-    .expect("can't generate a vouched cert");
-    let key_path = pki.join("sush-proxy-key.pem");
-    let chain_path = pki.join("sush-proxy-chain.pem");
-    write(&key_path, vouched.private_key_pem().unwrap()).unwrap();
-    let cert_pem = pem_cert_chain(vec![vouched.cert().clone()]).unwrap();
-    write(&chain_path, format!("{cert_pem}{chain_pem}")).unwrap();
-    (key_path, chain_path)
 }
 
 #[named]
@@ -346,125 +315,6 @@ async fn client_proxy_server() {
     if let ClientError::UnexpectedResponse(response) = unavailable {
         assert_eq!(response.status(), 503);
     }
-
-    shutdown_proxy.cancel();
-    server.close().await.expect("can't shutdown server");
-}
-
-/// The proxy serves a self-signed cert vouched for by the platform
-/// identity, here a local test PKI, and the client accepts exactly
-/// the vouchers that verify against its roots.
-#[named]
-#[test]
-async fn client_tls_proxy_server() {
-    // Spin up a full server.
-    let log = test_logger(function_name!());
-    let (mgr, mut root, _dir, _shutdown) = manager_and_test_root(log.clone()).await;
-    let api = api_description::<ApiServer>().unwrap();
-    let server = ServerBuilder::new(api, Arc::new(mgr), log.clone())
-        .config(ConfigDropshot {
-            bind_address: local_addr(),
-            ..Default::default()
-        })
-        .start()
-        .expect("failed to start server");
-
-    // Spin up a TLS proxy serving a cert vouched for by a local
-    // platform identity. The test PKI numbers its nodes from 1.
-    let (_pki_dir, pki) = test_pki("sush-tls-");
-    let (key_path, chain_path) = vouched_proxy_pems(&pki);
-    let tls = platform_tls(&key_path, &chain_path).expect("can't build TLS config");
-    let (_tx_targets, rx_targets) = watch::channel(Targets {
-        sleds: BTreeMap::from([(test_baseboard_id(), server.local_addr())]),
-        cubbies: Cubbies::new(),
-    });
-    let rx_delegated = rx_targets.clone();
-    let shutdown_proxy = CancellationToken::new();
-    let proxy = ProxyServer::start(
-        &log,
-        local_addr(),
-        Some(tls),
-        rx_targets,
-        None,
-        shutdown_proxy.clone(),
-    )
-    .await
-    .expect("can't start TLS proxy server");
-    let url = format!("https://{}", proxy.local_addr());
-
-    // A client rooted in the same PKI authenticates and works.
-    let pem = read(cert_path(pki.clone(), &root_prefix())).unwrap();
-    let roots = vec![Certificate::from_pem(&pem).unwrap()];
-    let signer = AuthzSigner::default();
-    let client = Client::new_with_client(
-        &url,
-        tls_client(roots.clone(), None).unwrap(),
-        signer.clone(),
-    );
-    let ClientError::ErrorResponse(unauthz) = client.iam().body(None).send().await.unwrap_err()
-    else {
-        panic!("expected error response")
-    };
-    assert_eq!(unauthz.status(), 401, "expected 401 Unauthorized");
-    let (identity, credentials) = authz(&client, unauthz, &mut root).await;
-    signer.set(Some(credentials));
-    let iam = client
-        .iam()
-        .body(None)
-        .send()
-        .await
-        .expect("can't authenticate")
-        .into_inner();
-    assert_eq!(iam, identity, "who am I?");
-
-    // A client rooted elsewhere refuses the handshake.
-    let (_other_dir, other) = test_pki("sush-tls-other-");
-    let pem = read(cert_path(other.clone(), &root_prefix())).unwrap();
-    let strangers = vec![Certificate::from_pem(&pem).unwrap()];
-    let stranger = Client::new_with_client(
-        &url,
-        tls_client(strangers, None).unwrap(),
-        AuthzSigner::default(),
-    );
-    assert!(stranger.iam().body(None).send().await.is_err());
-
-    // A cert served with a valid platform chain, but vouched for by
-    // the wrong key, refuses the handshake.
-    let forger_pem = read_to_string(private_key_path(other.clone(), &sprockets_auth_prefix(1)))
-        .expect("can't read the forger's key");
-    let forger_key = SigningKey::from_pkcs8_pem(&forger_pem).expect("can't parse the forger's key");
-    let chain_pem = read_to_string(certlist_path(pki.clone(), &sprockets_auth_prefix(1)))
-        .expect("can't read the platform chain");
-    let forged = EphemeralKey::new_vouched(
-        KeyType::Ed25519,
-        "CN=sush-proxy".parse().unwrap(),
-        Validity::from_now(Duration::from_secs(600)).unwrap(),
-        |digest| Ok::<_, Infallible>(forger_key.sign(digest).to_vec()),
-    )
-    .expect("can't generate a forged cert");
-    let forged_key_path = other.join("sush-proxy-key.pem");
-    let forged_chain_path = other.join("sush-proxy-chain.pem");
-    write(&forged_key_path, forged.private_key_pem().unwrap()).unwrap();
-    let forged_pem = pem_cert_chain(vec![forged.cert().clone()]).unwrap();
-    write(&forged_chain_path, format!("{forged_pem}{chain_pem}")).unwrap();
-    let forged_tls =
-        platform_tls(&forged_key_path, &forged_chain_path).expect("can't build forged TLS config");
-    let proxy3 = ProxyServer::start(
-        &log,
-        local_addr(),
-        Some(forged_tls),
-        rx_delegated,
-        None,
-        shutdown_proxy.clone(),
-    )
-    .await
-    .expect("can't start forged proxy server");
-    let client3 = Client::new_with_client(
-        &format!("https://{}", proxy3.local_addr()),
-        tls_client(roots, None).unwrap(),
-        signer.clone(),
-    );
-    assert!(client3.iam().body(None).send().await.is_err());
 
     shutdown_proxy.cancel();
     server.close().await.expect("can't shutdown server");

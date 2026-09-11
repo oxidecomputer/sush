@@ -10,7 +10,8 @@ anstream = "1"
 anyhow = "1"
 anstyle = "1"
 async-recursion = "1"
-attest-mock = { git = "https://github.com/oxidecomputer/dice-util", rev = "10952e8d9599b735b85d480af3560a11700e5b64" }
+attest-data = { git = "https://github.com/oxidecomputer/dice-util", rev = "4a39ef08d81e5177edee0bddb1146032aa21074d" }
+attest-mock = { git = "https://github.com/oxidecomputer/dice-util", rev = "4a39ef08d81e5177edee0bddb1146032aa21074d" }
 atomicwrites = "0.4"
 base64 = "0.22"
 camino = "1"
@@ -41,6 +42,7 @@ pem-rfc7468 = { version = "0.7", features = ["std"] }
 percent-encoding = "2"
 permission-slip-client = { git = "https://github.com/oxidecomputer/permission-slip", rev = "c9d302ef44576e075e35f4f28f8e7ac8345bcd4b" }
 permission-slip-common = { git = "https://github.com/oxidecomputer/permission-slip", rev = "c9d302ef44576e075e35f4f28f8e7ac8345bcd4b" }
+pki-playground = { git = "https://github.com/oxidecomputer/pki-playground", rev = "7600756029ce046a02c6234aa84ce230cc5eaa04" }
 progenitor = "0.14"
 progenitor-client = "0.14"
 pwd = "1"
