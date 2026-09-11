@@ -48,7 +48,7 @@ rand = "0.8"
 rand_core = "0.6"
 reqwest = { version = "0.13", features = ["json", "rustls"] }
 rlimit = "0.10"
-rumors = { git = "https://github.com/oxidecomputer/rumors", rev = "20d1cd6710760122b7800863f7ffea9cd8d04c9f" }
+rumors = { git = "https://github.com/oxidecomputer/rumors", rev = "84ffc11f04a1848e56300fd461fdb19dc8d3be15" }
 rustix = { version = "1", features = ["fs", "process", "pty", "termios"] }
 rustls = "0.23"
 rustyline = { git = "https://github.com/kkawakam/rustyline", rev = "5ab22f2f8d65e85f0b925360437ece8eeeb6db92", features = ["signal-hook", "termios"] }
