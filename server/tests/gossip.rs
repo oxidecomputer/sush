@@ -208,3 +208,70 @@ async fn linked_follows_live_links() {
     drop(b);
     eventually("dead peer unlinked", 120, async || a.linked().is_empty()).await;
 }
+
+/// Idle links probe every ten seconds without delaying changes or bursting
+/// after a pause; a silent peer then trips the one-second session deadline.
+#[tokio::test(start_paused = true)]
+async fn idle_heartbeats_detect_a_silent_peer() {
+    use std::time::Duration;
+
+    use futures::{FutureExt as _, StreamExt as _};
+    use rumors::{Error, Joined, Led, Peer};
+    use tokio::time::advance;
+
+    let a: Rumors<String, SushBookmark> = Seed::grow(
+        &test_logger("idle_heartbeats_detect_a_silent_peer"),
+        &Locker::null(),
+    )
+    .await
+    .into_rumors();
+    let (mut near, mut far) = rumors::link::memory();
+    let (served, joined) = futures::join!(
+        a.gossip_once(&mut near),
+        Peer::<String>::bootstrap().join(&mut far),
+    );
+    served.unwrap();
+    let Joined::Joined { peer } = joined else {
+        panic!("join succeeds")
+    };
+    let b = peer.into_rumors();
+    let mut sessions = a.gossip(&mut near);
+    let (sent, received) = futures::join!(sessions.next(), b.gossip_once(&mut far));
+    assert_eq!(sent.unwrap().unwrap().led, Led::Local);
+    received.unwrap();
+
+    advance(Duration::from_secs(9)).await;
+    assert!(sessions.next().now_or_never().is_none());
+    a.send("a change before the heartbeat".into()).unwrap();
+    let (sent, received) = futures::join!(sessions.next(), b.gossip_once(&mut far));
+    sent.unwrap().unwrap();
+    received.unwrap();
+    assert_eq!(a.snapshot().hash(), b.snapshot().hash());
+
+    // The heartbeat still fires at ten seconds, even though the set is current.
+    advance(Duration::from_secs(1)).await;
+    assert!(sessions.next().now_or_never().is_none());
+    let (sent, received) = futures::join!(sessions.next(), b.gossip_once(&mut far));
+    assert_eq!(sent.unwrap().unwrap().led, Led::Local);
+    received.unwrap();
+
+    // Several missed intervals produce one probe, followed by a full interval.
+    advance(Duration::from_secs(35)).await;
+    assert!(sessions.next().now_or_never().is_none());
+    let (sent, received) = futures::join!(sessions.next(), b.gossip_once(&mut far));
+    assert_eq!(sent.unwrap().unwrap().led, Led::Local);
+    received.unwrap();
+    assert!(sessions.next().now_or_never().is_none());
+    advance(Duration::from_secs(9)).await;
+    assert!(sessions.next().now_or_never().is_none());
+
+    // Keep the remote link open but stop serving it: no EOF can expose failure.
+    advance(Duration::from_secs(1)).await;
+    assert!(sessions.next().now_or_never().is_none());
+    advance(Duration::from_secs(1)).await;
+    assert!(matches!(
+        sessions.next().await,
+        Some(Err(Error::DeadlineExceeded))
+    ));
+    assert!(sessions.next().await.is_none());
+}

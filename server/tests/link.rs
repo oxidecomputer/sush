@@ -119,13 +119,16 @@ async fn gossip_convergence() {
 
     // Alice seeds a universe with one message and serves sessions on her
     // end of the link.
-    let alice: Rumors<String> = Peer::seed().into_rumors();
+    let alice: Rumors<String> = Peer::seed()
+        .gossip_when(|_| stream::pending::<()>())
+        .session_deadline(|| sleep(Duration::from_secs(1)))
+        .into_rumors();
     alice.send("from alice".to_string()).unwrap();
     let server = spawn({
         let alice = alice.clone();
         async move {
             let mut link_a = link_a;
-            let mut driver = alice.gossip_when(stream::pending::<()>(), &mut link_a);
+            let mut driver = alice.gossip(&mut link_a);
             while let Some(session) = driver.next().await {
                 session.expect("serving gossip session");
             }
@@ -135,7 +138,9 @@ async fn gossip_convergence() {
     // Bob joins Alice's universe through the link and hears her message.
     let rumors::Joined::Joined { peer: bob } = timeout(
         Duration::from_secs(60),
-        Peer::<String>::bootstrap().join(&mut link_b),
+        Peer::<String>::bootstrap()
+            .session_deadline(|| sleep(Duration::from_secs(1)))
+            .join(&mut link_b),
     )
     .await
     .expect("bootstrap timed out") else {
@@ -147,7 +152,7 @@ async fn gossip_convergence() {
 
     // Bob's own message reaches Alice within one gossip session.
     bob.send("from bob".to_string()).unwrap();
-    timeout(Duration::from_secs(60), bob.gossip(&mut link_b))
+    timeout(Duration::from_secs(60), bob.gossip_once(&mut link_b))
         .await
         .expect("gossip timed out")
         .expect("gossip failed");

@@ -28,9 +28,9 @@ use std::io;
 use std::net::{SocketAddr, SocketAddrV6};
 use std::time::Duration;
 
-use futures::StreamExt as _;
+use futures::{Stream, StreamExt as _, stream};
 use rumors::error::Mismatch;
-use rumors::{Error, Joined, Network, Peer, Rumors, Ticks};
+use rumors::{Changes, Error, Gossip, Joined, Network, Peer, Rumors, Ticks};
 use serde::Serialize;
 use serde::de::DeserializeOwned;
 use sled_hardware_types::BaseboardId;
@@ -38,8 +38,9 @@ use slog::{Logger, debug, info, o, warn};
 use sprockets_tls::keys::SprocketsConfig;
 use tokio::sync::watch;
 use tokio::task::{AbortHandle, JoinSet};
-use tokio::time::{MissedTickBehavior, interval, timeout};
+use tokio::time::{Instant, MissedTickBehavior, Sleep, interval, interval_at, sleep, timeout};
 use tokio::{select, spawn};
+use tokio_stream::wrappers::IntervalStream;
 use tokio_util::sync::CancellationToken;
 
 use rumors::link::routed::Endpoint;
@@ -64,15 +65,36 @@ impl LinkedBaseboards {
     }
 }
 
+/// Push changes promptly and probe each connection every ten seconds.
+fn gossip_policy<T: Send + Sync + 'static>(
+    changes: Changes<T>,
+) -> impl Stream<Item = Gossip> + Send {
+    let period = Duration::from_secs(10);
+    // Changes already requests the opening session. Delay the first heartbeat,
+    // and avoid a burst of overdue probes after a scheduling pause.
+    let mut heartbeat = interval_at(Instant::now() + period, period);
+    heartbeat.set_missed_tick_behavior(MissedTickBehavior::Delay);
+    stream::select(
+        changes.map(Gossip::from),
+        IntervalStream::new(heartbeat).map(|_| Gossip::Unconditionally),
+    )
+}
+
+/// Allow one second for each gossip, bootstrap, or retirement exchange.
+fn session_deadline() -> Sleep {
+    sleep(Duration::from_secs(1))
+}
+
 /// Manager timing. The defaults suit a rack, tests shrink them.
 #[derive(Clone, Debug)]
 pub struct GossipConfig {
     /// How often absent links are re-established.
     pub reconnect: Duration,
     /// Timeout for establishing a link, dialing a data stream, or initially
-    /// routing an incoming connection. Established gossip may wait indefinitely.
+    /// routing an incoming connection.
     pub connect_timeout: Duration,
-    /// Ceiling on one bootstrap join.
+    /// Ceiling on joining and attaching its bookmark, including local storage.
+    /// The wire exchange also has its own session deadline.
     pub join_timeout: Duration,
 }
 
@@ -137,7 +159,12 @@ impl<T> Seed<T> {
             Ok(()) => bookmarks.handle(),
             Err(_) => bookmarks.shed_handle(),
         };
-        let rumors = match Peer::seed().bookmark(handle).await {
+        let rumors = match Peer::seed()
+            .gossip_when(gossip_policy)
+            .session_deadline(session_deadline)
+            .bookmark(handle)
+            .await
+        {
             Ok(peer) => peer.into_rumors(),
             Err(unbookmarked) => match unbookmarked.peer.bookmark(bookmarks.shed_handle()).await {
                 Ok(peer) => peer.into_rumors(),
@@ -437,7 +464,7 @@ where
     }
 
     /// Spawn a session driver owning `link`: push our changes, and serve
-    /// whatever the peer initiates, until the link fails.
+    /// whatever the peer initiates, with periodic probes until the link fails.
     fn drive(&mut self, peer: SocketAddr, link: SprocketsLink) {
         debug!(self.log, "driving link"; "peer" => %peer);
         let rumors = self.rumors.clone();
@@ -450,31 +477,24 @@ where
         }
     }
 
-    /// Abandon our universe for the one `peer` belongs to, joining over the
-    /// fresh link to it. Every driver stops first: none may gossip across
-    /// the swap. On failure our universe is intact and the debt stands, so
-    /// the next link retries; either way all links are rebuilt, since the
-    /// old ones belong to the universe we are leaving.
+    /// Stop old sessions, then join the network reached through this fresh link.
+    /// On failure retain our network and retry later; all old links are rebuilt.
     ///
-    /// The new peer gets its own handle on the same bookmark storage.
-    /// That is safe because rumors persists a bookmark only when a
-    /// session starts, and aborting the drivers above ends every
-    /// session before the handle exists: the abandoned peer can never
-    /// store again. A store it already had in flight either loses to
-    /// the locker's sequence guard, or records a session that was
-    /// aborted before it sent anything, so nothing on the wire
-    /// outruns the record. If the received identity cannot be
-    /// persisted, we keep gossiping with a shed handle rather than
-    /// take the sled out of gossip; a stranded identity is harmless,
-    /// unlike a support shell that cannot reach a degraded rack.
+    /// Wait for the driver futures to drop before another peer uses the shared
+    /// bookmark storage. Locker orders any disk writes that outlive cancellation.
+    /// If attaching the bookmark fails, use a shed handle so storage failure
+    /// does not prevent gossip.
     async fn migrate(&mut self, peer: SocketAddr, mut link: SprocketsLink) {
-        self.drivers.abort_all();
+        self.drivers.shutdown().await;
         self.live.clear();
         info!(
             self.log, "joining the universe that beat ours";
             "peer" => %peer, "ours" => %self.rumors.network(),
         );
-        let bootstrap = Peer::bootstrap().bookmark(self.bookmarks.handle());
+        let bootstrap = Peer::bootstrap()
+            .gossip_when(gossip_policy)
+            .session_deadline(session_deadline)
+            .bookmark(self.bookmarks.handle());
         match timeout(self.config.join_timeout, bootstrap.join(&mut link)).await {
             Ok(Joined::Joined { peer }) => self.adopt(peer),
             Ok(Joined::Unbookmarked(unbookmarked)) => {
@@ -520,7 +540,7 @@ async fn sessions<T>(
 where
     T: DeserializeOwned + Serialize + Eq + Send + Sync + 'static,
 {
-    let mut driver = rumors.gossip_when(rumors.changes(), &mut link);
+    let mut driver = rumors.gossip(&mut link);
     while let Some(session) = driver.next().await {
         match session {
             Ok(_) => {}
