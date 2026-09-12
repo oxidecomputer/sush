@@ -1,0 +1,219 @@
+// The sprockets test PKI (tls/test-keys/config.kdl there), reduced
+// to one node, with the DICE measurement extension added to the
+// sprockets-auth cert.
+
+key-pair "test-root-a" {
+    p384
+}
+
+entity "test-root-a" {
+    country-name "US"
+    organization-name "Oxide Computer Company"
+    common-name "test-root-a"
+}
+
+certificate "test-root-a" {
+    issuer-entity "test-root-a"
+    issuer-key "test-root-a"
+
+    subject-entity "test-root-a"
+    subject-key "test-root-a"
+
+    digest-algorithm "sha-384"
+    not-after "9999-12-31T23:59:59Z"
+    serial-number "00"
+
+    extensions {
+        subject-key-identifier critical=false
+
+        basic-constraints critical=true ca=true
+        key-usage critical=true {
+            key-cert-sign
+            crl-sign
+        }
+        certificate-policies critical=true {
+            oana-platform-identity
+            tcg-dice-kp-identity-init
+            tcg-dice-kp-attest-init
+            tcg-dice-kp-eca
+        }
+    }
+}
+
+key-pair "test-signer-a1" {
+    p384
+}
+
+entity "test-signer-a1" {
+    country-name "US"
+    organization-name "Oxide Computer Company"
+    common-name "test-signer-a1"
+}
+
+certificate "test-signer-a1" {
+    issuer-certificate "test-root-a"
+    issuer-key "test-root-a"
+
+    subject-entity "test-signer-a1"
+    subject-key "test-signer-a1"
+
+    digest-algorithm "sha-384"
+    not-after "9999-12-31T23:59:59Z"
+    serial-number "01"
+
+    extensions {
+        subject-key-identifier critical=false
+        authority-key-identifier critical=false {
+            key-id
+        }
+
+        basic-constraints critical=true ca=true
+        key-usage critical=true {
+            key-cert-sign
+            crl-sign
+        }
+        certificate-policies critical=true {
+            oana-platform-identity
+            tcg-dice-kp-identity-init
+            tcg-dice-kp-attest-init
+            tcg-dice-kp-eca
+        }
+    }
+}
+
+key-pair "test-platformid-1" {
+    ed25519
+}
+
+entity "test-platformid-1" {
+    country-name "US"
+    organization-name "Oxide Computer Company"
+    common-name "PDV2:913-0000019:RRR:2FAKE001"
+}
+
+certificate "test-platformid-1" {
+    issuer-certificate "test-signer-a1"
+    issuer-key "test-signer-a1"
+
+    subject-entity "test-platformid-1"
+    subject-key "test-platformid-1"
+
+    digest-algorithm "sha-384"
+    not-after "9999-12-31T23:59:59Z"
+    serial-number "1001"
+
+    extensions {
+        subject-key-identifier critical=false
+        authority-key-identifier critical=false {
+            key-id
+        }
+
+        basic-constraints critical=true ca=true
+        key-usage critical=true {
+            key-cert-sign
+            crl-sign
+        }
+        certificate-policies critical=true {
+            oana-platform-identity
+            tcg-dice-kp-identity-init
+            tcg-dice-kp-attest-init
+            tcg-dice-kp-eca
+        }
+    }
+}
+
+key-pair "test-deviceid-1" {
+    ed25519
+}
+
+entity "test-deviceid-1" {
+    country-name "US"
+    organization-name "Oxide Computer Company"
+    common-name "test-deviceid-1"
+}
+
+certificate "test-deviceid-1" {
+    issuer-certificate "test-platformid-1"
+    issuer-key "test-platformid-1"
+
+    subject-entity "test-deviceid-1"
+    subject-key "test-deviceid-1"
+
+    digest-algorithm "sha-512"
+    not-after "9999-12-31T23:59:59Z"
+    serial-number "2001"
+
+    extensions {
+        subject-key-identifier critical=false
+        authority-key-identifier critical=false {
+            key-id
+        }
+
+        basic-constraints critical=true ca=true
+        key-usage critical=true {
+            key-cert-sign
+            crl-sign
+        }
+        certificate-policies critical=true {
+            oana-platform-identity
+            tcg-dice-kp-identity-init
+            tcg-dice-kp-attest-init
+            tcg-dice-kp-eca
+        }
+    }
+}
+
+key-pair "test-sprockets-auth-1" {
+    ed25519
+}
+
+entity "test-sprockets-auth-1" {
+    country-name "US"
+    organization-name "Oxide Computer Company"
+    common-name "test-sprockets-auth-1"
+}
+
+certificate "test-sprockets-auth-1" {
+    issuer-certificate "test-deviceid-1"
+    issuer-key "test-deviceid-1"
+
+    subject-entity "test-sprockets-auth-1"
+    subject-key "test-sprockets-auth-1"
+
+    digest-algorithm "sha-512"
+    not-after "9999-12-31T23:59:59Z"
+    serial-number "3001"
+
+    extensions {
+        subject-key-identifier critical=false
+        authority-key-identifier critical=false {
+            key-id
+        }
+
+        basic-constraints critical=true ca=false
+        key-usage critical=true {
+            digital-signature
+            non-repudiation
+        }
+        certificate-policies critical=true {
+            oana-platform-identity
+            tcg-dice-kp-identity-init
+            tcg-dice-kp-attest-init
+            tcg-dice-kp-eca
+        }
+        dice-tcb-info critical=true {
+            fwid-list {
+                fwid {
+                    digest-algorithm "sha3-256"
+                    digest "a7ffc6f8bf1ed76651c14756a061d662f580ff4de43b49fa82d80a4b80f8434a"
+                }
+            }
+        }
+    }
+}
+
+certificate-list "test-sprockets-auth-1" \
+    "test-sprockets-auth-1" \
+    "test-deviceid-1" \
+    "test-platformid-1" \
+    "test-signer-a1"

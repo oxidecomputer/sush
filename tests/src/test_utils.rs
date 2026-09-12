@@ -4,18 +4,24 @@
 
 //! Integration test utilities.
 
+use std::convert::Infallible;
+use std::fs::{read_to_string, write};
 use std::sync::OnceLock;
 use std::time::Duration;
 
 use bytes::Bytes;
-use camino::Utf8PathBuf;
+use camino::{Utf8Path, Utf8PathBuf};
 use chrono::Utc;
+use ed25519_dalek::pkcs8::DecodePrivateKey as _;
+use ed25519_dalek::{Signer as _, SigningKey};
 use futures::TryStreamExt as _;
+use pki_playground::OutputFileExistsBehavior;
+use pki_playground::config::load_and_validate;
 use rand_core::{OsRng, RngCore as _};
 use sled_hardware_types::BaseboardId;
 use slog::{Drain as _, Logger, o};
 use slog_term::{FullFormat, PlainSyncDecorator, TestStdoutWriter};
-use sprockets_tls_test_utils::{OutputFileExistsBehavior, generate_config};
+use sprockets_tls_test_utils::{certlist_path, private_key_path, sprockets_auth_prefix};
 use tempfile::TempDir;
 use tokio::sync::watch;
 use tokio_util::sync::CancellationToken;
@@ -27,7 +33,7 @@ use sush_client::{Client, ResponseValue};
 use sush_common::authn::{Challenge, ChallengeResponse, Credentials, Identity, Nonce, RequestKey};
 use sush_common::codephrases::Codephrase;
 use sush_common::jobs::{JobId, JobMode, JobStartRequest, SessionId, VerifiedJob};
-use sush_common::keys::{EphemeralKey, KeyType, Signer};
+use sush_common::keys::{EphemeralKey, KeyType, Signer, pem_cert_chain};
 use sush_common::targets::{Cubbies, Target};
 use sush_server::executor::PathIsolation;
 use sush_server::gossip::{LinkedBaseboards, Universe};
@@ -163,16 +169,56 @@ pub fn test_logger(test_name: &'static str) -> Logger {
 }
 
 /// A one-node local PKI in a fresh temp dir, standing in for the
-/// platform identity a real sled resolves from its RoT.
+/// platform identity a real sled resolves from its RoT. The config
+/// copies the sprockets test PKI and adds the DICE measurement
+/// extension to the sprockets-auth cert: the client refuses vouchers
+/// from certs without one. TODO: use
+/// `sprockets_tls_test_utils::generate_config` again once the
+/// sprockets test PKI carries the extension.
 pub fn test_pki(prefix: &'static str) -> (TempDir, Utf8PathBuf) {
     let tmp = TempDir::with_prefix(prefix).unwrap();
     let dir = Utf8PathBuf::from_path_buf(tmp.path().to_owned()).unwrap();
     let behavior = OutputFileExistsBehavior::Overwrite;
-    let doc = generate_config(1);
+    let config = Utf8Path::new(concat!(env!("CARGO_MANIFEST_DIR"), "/test-keys/config.kdl"));
+    let doc = load_and_validate(config).unwrap();
     doc.write_key_pairs(dir.clone(), behavior).unwrap();
     doc.write_certificates(dir.clone(), behavior).unwrap();
     doc.write_certificate_lists(dir.clone(), behavior).unwrap();
     (tmp, dir)
+}
+
+/// A fresh proxy key vouched for by the test PKI's platform identity,
+/// written under `pki` as the key and chain PEMs `platform_tls` takes.
+pub fn vouched_proxy_pems(pki: &Utf8PathBuf) -> (Utf8PathBuf, Utf8PathBuf) {
+    let signer_pem = read_to_string(private_key_path(pki.clone(), &sprockets_auth_prefix(1)))
+        .expect("can't read the platform key");
+    let chain_pem = read_to_string(certlist_path(pki.clone(), &sprockets_auth_prefix(1)))
+        .expect("can't read the platform chain");
+    crafted_proxy_pems(pki, &signer_pem, &chain_pem)
+}
+
+/// A fresh proxy key vouched for by the `signer_pem` key and served
+/// with `chain_pem`, written under `dir` as the key and chain PEMs
+/// `platform_tls` takes.
+pub fn crafted_proxy_pems(
+    dir: &Utf8PathBuf,
+    signer_pem: &str,
+    chain_pem: &str,
+) -> (Utf8PathBuf, Utf8PathBuf) {
+    let signer = SigningKey::from_pkcs8_pem(signer_pem).expect("can't parse the vouching key");
+    let vouched = EphemeralKey::new_vouched(
+        KeyType::Ed25519,
+        "CN=sush-proxy".parse().unwrap(),
+        Validity::from_now(Duration::from_secs(600)).unwrap(),
+        |digest| Ok::<_, Infallible>(signer.sign(digest).to_vec()),
+    )
+    .expect("can't generate a vouched cert");
+    let key_path = dir.join("sush-proxy-key.pem");
+    let chain_path = dir.join("sush-proxy-chain.pem");
+    write(&key_path, vouched.private_key_pem().unwrap()).unwrap();
+    let cert_pem = pem_cert_chain(vec![vouched.cert().clone()]).unwrap();
+    write(&chain_path, format!("{cert_pem}{chain_pem}")).unwrap();
+    (key_path, chain_path)
 }
 
 pub async fn fake_identity(key: &mut EphemeralKey) -> Identity {
