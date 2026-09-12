@@ -16,7 +16,6 @@ use function_name::named;
 use futures::{SinkExt as _, StreamExt as _};
 use tokio::io::{AsyncRead, AsyncWrite};
 use tokio::net::{TcpListener, TcpStream};
-use tokio::sync::watch;
 use tokio::test;
 use tokio::time::{sleep, timeout};
 use tokio_tungstenite::WebSocketStream;
@@ -173,16 +172,15 @@ async fn client_proxy_server() {
     let server_addr = server.local_addr();
 
     // Spin up a proxy server routing to it.
-    let (tx_targets, rx_targets) = watch::channel(Targets {
-        sleds: BTreeMap::from([(test_baseboard_id(), server_addr)]),
-        cubbies: Cubbies::from([(14, test_baseboard_id())]),
-    });
+    let (tx_targets, tx_cubbies, targets) = Targets::channel();
+    tx_targets.send_replace(BTreeMap::from([(test_baseboard_id(), server_addr)]));
+    tx_cubbies.send_replace(Cubbies::from([(14, test_baseboard_id())]));
     let shutdown_proxy = CancellationToken::new();
     let proxy = ProxyServer::start(
         &log,
         local_addr(),
         None,
-        rx_targets,
+        targets,
         None,
         shutdown_proxy.clone(),
     )
@@ -310,7 +308,7 @@ async fn client_proxy_server() {
     assert_eq!(resolved, test_baseboard_id());
 
     // With no sleds in the table, everything is refused.
-    tx_targets.send(Targets::default()).unwrap();
+    tx_targets.send_replace(BTreeMap::new());
     let unavailable = client.iam().body(None).send().await.unwrap_err();
     if let ClientError::UnexpectedResponse(response) = unavailable {
         assert_eq!(response.status(), 503);
@@ -984,16 +982,14 @@ async fn client_tunnels_through_nexus() {
     let (_pki_dir, pki) = test_pki("sush-tunnel-");
     let (key_path, chain_path) = vouched_proxy_pems(&pki);
     let tls = platform_tls(&key_path, &chain_path).expect("can't build TLS config");
-    let (_tx_targets, rx_targets) = watch::channel(Targets {
-        sleds: BTreeMap::from([(test_baseboard_id(), server.local_addr())]),
-        cubbies: Cubbies::new(),
-    });
+    let (tx_targets, _tx_cubbies, targets) = Targets::channel();
+    tx_targets.send_replace(BTreeMap::from([(test_baseboard_id(), server.local_addr())]));
     let shutdown_proxy = CancellationToken::new();
     let proxy = ProxyServer::start(
         &log,
         local_addr(),
         Some(tls),
-        rx_targets,
+        targets,
         None,
         shutdown_proxy.clone(),
     )

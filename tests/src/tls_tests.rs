@@ -31,7 +31,7 @@ use sush_client::tls::client as tls_client;
 use sush_client::{AuthzSigner, Client, Error as ClientError};
 use sush_common::keys::EphemeralKey;
 use sush_common::targets::Cubbies;
-use sush_server::proxy::{Targets, platform_tls};
+use sush_server::proxy::{Sleds, Targets, platform_tls};
 use sush_server::{ApiServer, JobManager, ProxyServer};
 
 use crate::test_utils::{
@@ -49,7 +49,8 @@ struct ProxiedServer {
     root: EphemeralKey,
     server: HttpServer<Arc<JobManager>>,
     shutdown_proxy: CancellationToken,
-    _tx_targets: watch::Sender<Targets>,
+    _tx_targets: watch::Sender<Sleds>,
+    _tx_cubbies: watch::Sender<Cubbies>,
     _dir: TempDir,
     _shutdown: CancellationToken,
 }
@@ -66,16 +67,14 @@ impl ProxiedServer {
             .start()
             .expect("failed to start server");
         let tls = platform_tls(key_path, chain_path).expect("can't build TLS config");
-        let (_tx_targets, rx_targets) = watch::channel(Targets {
-            sleds: BTreeMap::from([(test_baseboard_id(), server.local_addr())]),
-            cubbies: Cubbies::new(),
-        });
+        let (_tx_targets, _tx_cubbies, targets) = Targets::channel();
+        _tx_targets.send_replace(BTreeMap::from([(test_baseboard_id(), server.local_addr())]));
         let shutdown_proxy = CancellationToken::new();
         let proxy = ProxyServer::start(
             &log,
             local_addr(),
             Some(tls),
-            rx_targets,
+            targets,
             None,
             shutdown_proxy.clone(),
         )
@@ -87,6 +86,7 @@ impl ProxiedServer {
             server,
             shutdown_proxy,
             _tx_targets,
+            _tx_cubbies,
             _dir,
             _shutdown,
         }

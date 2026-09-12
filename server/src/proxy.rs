@@ -48,29 +48,43 @@ use tokio_util::sync::CancellationToken;
 use sush_common::targets::{Cubbies, SledId, Target};
 use sush_common::version::VersionInfo;
 
-/// The sush servers the proxy may route to.
-#[derive(Clone, Debug, Default)]
+/// Server addresses by baseboard.
+pub type Sleds = BTreeMap<BaseboardId, SocketAddr>;
+
+/// The sush servers the proxy may route to. The sled and cubby maps are
+/// discovered independently (by DDM and MGS, resp.), so each arrives on
+/// its own channel.
+#[derive(Clone, Debug)]
 pub struct Targets {
     /// Server addresses by baseboard.
-    pub sleds: BTreeMap<BaseboardId, SocketAddr>,
+    pub sleds: watch::Receiver<Sleds>,
     /// Baseboards by cubby number, as much of it as is known.
-    pub cubbies: Cubbies,
+    pub cubbies: watch::Receiver<Cubbies>,
 }
 
 impl Targets {
+    /// Return a fresh sled map sender, cubby map sender, and receiver
+    /// for both maps.
+    pub fn channel() -> (watch::Sender<Sleds>, watch::Sender<Cubbies>, Targets) {
+        let (sleds_tx, sleds) = watch::channel(Sleds::new());
+        let (cubbies_tx, cubbies) = watch::channel(Cubbies::new());
+        (sleds_tx, cubbies_tx, Targets { sleds, cubbies })
+    }
+
     /// The address of the first sled `target` resolves to. For
     /// routing, a list means the first of these that is reachable.
     fn resolve(&self, target: &Target) -> Option<SocketAddr> {
-        let Target::Sleds(sleds) = target else {
+        let Target::Sleds(ids) = target else {
             return None;
         };
-        sleds
-            .iter()
+        let sleds = self.sleds.borrow();
+        let cubbies = self.cubbies.borrow();
+        ids.iter()
             .filter_map(|sled| match sled {
                 SledId::Baseboard(baseboard) => Some(baseboard),
-                SledId::Cubby(cubby) => self.cubbies.get(cubby),
+                SledId::Cubby(cubby) => cubbies.get(cubby),
             })
-            .find_map(|baseboard| self.sleds.get(baseboard))
+            .find_map(|baseboard| sleds.get(baseboard))
             .copied()
     }
 }
@@ -140,7 +154,7 @@ impl ProxyServer {
         log: &Logger,
         local_addr: SocketAddr,
         tls: Option<ServerConfig>,
-        targets: watch::Receiver<Targets>,
+        targets: Targets,
         home: Option<BaseboardId>,
         shutdown: CancellationToken,
     ) -> io::Result<Self> {
@@ -173,15 +187,14 @@ impl ProxyServer {
 
 /// Pick a sled for each request.
 struct Router {
-    targets: watch::Receiver<Targets>,
+    targets: Targets,
     home: Option<BaseboardId>,
 }
 
 impl Router {
     fn route<B>(&self, request: &Request<B>) -> Result<SocketAddr, Box<Response<ProxyBody>>> {
-        let targets = self.targets.borrow();
         match named_target(request) {
-            Some(Ok(target)) => targets.resolve(&target).ok_or_else(|| {
+            Some(Ok(target)) => self.targets.resolve(&target).ok_or_else(|| {
                 Box::new(error_response(
                     StatusCode::BAD_GATEWAY,
                     format!("no route to target `{target}`"),
@@ -191,21 +204,24 @@ impl Router {
                 StatusCode::BAD_REQUEST,
                 format!("unable to parse target `{bad}`"),
             ))),
-            None => match self.home.as_ref() {
-                Some(home) => targets.sleds.get(home).copied().ok_or_else(|| {
-                    Box::new(error_response(
-                        StatusCode::SERVICE_UNAVAILABLE,
-                        format!("home sled `{home}` unknown to the proxy"),
-                    ))
-                }),
-                None => match targets.sleds.iter().next() {
-                    Some((_, addr)) => Ok(*addr),
-                    None => Err(Box::new(error_response(
-                        StatusCode::SERVICE_UNAVAILABLE,
-                        "no sleds known to the proxy",
-                    ))),
-                },
-            },
+            None => {
+                let sleds = self.targets.sleds.borrow();
+                match self.home.as_ref() {
+                    Some(home) => sleds.get(home).copied().ok_or_else(|| {
+                        Box::new(error_response(
+                            StatusCode::SERVICE_UNAVAILABLE,
+                            format!("home sled `{home}` unknown to the proxy"),
+                        ))
+                    }),
+                    None => match sleds.iter().next() {
+                        Some((_, addr)) => Ok(*addr),
+                        None => Err(Box::new(error_response(
+                            StatusCode::SERVICE_UNAVAILABLE,
+                            "no sleds known to the proxy",
+                        ))),
+                    },
+                }
+            }
         }
     }
 }
@@ -420,29 +436,30 @@ mod test {
             serial_number: serial.to_string(),
         };
         let addr = |port| SocketAddr::from(([127, 0, 0, 1], port));
-        let mut targets = Targets::default();
-        targets.sleds.insert(sled("away"), addr(1));
-        targets.sleds.insert(sled("home"), addr(2));
-        let (tx, rx) = watch::channel(targets);
+        let (tx, _cubbies_tx, targets) = Targets::channel();
+        tx.send_modify(|sleds| {
+            sleds.insert(sled("away"), addr(1));
+            sleds.insert(sled("home"), addr(2));
+        });
         let router = Router {
-            targets: rx.clone(),
+            targets: targets.clone(),
             home: Some(sled("home")),
         };
         let get = request("/versions");
         assert_eq!(router.route(&get).unwrap(), addr(2));
-        tx.send_modify(|t| {
-            t.sleds.remove(&sled("home"));
+        tx.send_modify(|sleds| {
+            sleds.remove(&sled("home"));
         });
         assert_eq!(
             router.route(&get).unwrap_err().status(),
             StatusCode::SERVICE_UNAVAILABLE
         );
-        tx.send_modify(|t| {
-            t.sleds.insert(sled("home"), addr(2));
+        tx.send_modify(|sleds| {
+            sleds.insert(sled("home"), addr(2));
         });
         assert_eq!(router.route(&get).unwrap(), addr(2));
         let homeless = Router {
-            targets: rx,
+            targets,
             home: None,
         };
         assert_eq!(homeless.route(&get).unwrap(), addr(1));
@@ -506,10 +523,12 @@ mod test {
         let brm40: BaseboardId = "913-0000019:BRM42220040".parse().unwrap();
         let addr31: SocketAddr = "[::1]:31000".parse().unwrap();
         let addr40: SocketAddr = "[::1]:40000".parse().unwrap();
-        let targets = Targets {
-            sleds: BTreeMap::from([(brm31.clone(), addr31), (brm40.clone(), addr40)]),
-            cubbies: Cubbies::from([(14, brm31), (16, brm40)]),
-        };
+        let (sleds_tx, cubbies_tx, targets) = Targets::channel();
+        sleds_tx.send_replace(BTreeMap::from([
+            (brm31.clone(), addr31),
+            (brm40.clone(), addr40),
+        ]));
+        cubbies_tx.send_replace(Cubbies::from([(14, brm31), (16, brm40)]));
 
         assert_eq!(
             targets.resolve(&target("913-0000019:BRM42220031")),
@@ -520,6 +539,7 @@ mod test {
         assert_eq!(targets.resolve(&target("3,16,14")), Some(addr40));
         assert_eq!(targets.resolve(&target("3")), None);
         assert_eq!(targets.resolve(&Target::All), None);
-        assert_eq!(Targets::default().resolve(&target("14")), None);
+        let (_sleds_tx, _cubbies_tx, empty) = Targets::channel();
+        assert_eq!(empty.resolve(&target("14")), None);
     }
 }
