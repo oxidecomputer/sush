@@ -84,11 +84,8 @@ impl BookmarkSource {
         Self::new(&Logger::root(Discard, o!()), &Locker::null())
     }
 
-    /// A persisting handle for a peer. Rumors persists a bookmark only
-    /// when a gossip session starts, and the gossip manager stops
-    /// every session before it hands a new peer its handle, so no two
-    /// peers persist concurrently; see the migration notes in
-    /// [`gossip`](crate::gossip).
+    /// A persisting handle for one peer. Before replacing it during migration,
+    /// the gossip manager waits for all sessions using the old handle to stop.
     pub fn handle(&self) -> SushBookmark {
         SushBookmark {
             log: self.log.clone(),
