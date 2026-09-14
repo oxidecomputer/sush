@@ -8,6 +8,8 @@
 //! identity after catching up. The locker stores the record across local disks
 //! and rejects stale or conflicting copies. An unusable record starts fresh
 //! bookkeeping; it must never cause us to reuse an uncertain identity.
+//! The wrapper records the Rumors format version so an incompatible record is
+//! discarded before it can repeatedly abort gossip at session startup.
 
 use std::io::Cursor;
 use std::sync::Arc;
@@ -24,29 +26,66 @@ pub const BOOKMARK: TenantSpec = TenantSpec {
     magic: b"SUSHBOOKMARK",
 };
 
-/// Wrap the opaque bytes rumors writes.
+/// The Rumors format version and its opaque restart bookkeeping.
 #[derive(serde::Deserialize, serde::Serialize)]
-struct BookmarkRecord(#[serde(with = "format::cbor_bytes")] Vec<u8>);
+struct BookmarkRecord(
+    /// Identifies which Rumors codec can read these bytes.
+    u64,
+    /// Complete record supplied by Rumors.
+    #[serde(with = "format::cbor_bytes")]
+    Vec<u8>,
+);
 
-/// Identify the outer Sush record format.
+/// Identify the Sush wrapper format, independently of the enclosed Rumors format.
 impl Versioned for BookmarkRecord {
-    /// Version of this wrapper, independent of Rumors’ opaque payload format.
-    const VERSION: u16 = 0;
+    /// The wrapper stores an explicit Rumors format version.
+    const VERSION: u16 = 1;
 }
 
-/// This wrapper has no older representation to migrate.
+/// Read the versioned wrapper through the locker's format chain.
 impl Record for BookmarkRecord {
-    /// No prior wrapper format exists.
-    type Previous = NoFormat;
+    /// The wrapper without an explicit Rumors version.
+    type Previous = v0::BookmarkRecord;
 }
 
-/// Complete the migration interface for a format with no predecessor.
-impl TryFrom<NoFormat> for BookmarkRecord {
-    /// Required by the migration interface; this conversion cannot fail.
+/// An unlabelled record cannot establish which Rumors codec owns its bytes.
+impl TryFrom<v0::BookmarkRecord> for BookmarkRecord {
+    /// The reason recovery must start fresh.
     type Error = &'static str;
-    /// No value of the source type exists.
-    fn try_from(none: NoFormat) -> Result<Self, Self::Error> {
-        match none {}
+    /// Decline recovery rights whose format is unknown; replicated data is unaffected.
+    fn try_from(_: v0::BookmarkRecord) -> Result<Self, Self::Error> {
+        Err("bookmark has no Rumors format version")
+    }
+}
+
+/// Frozen wrapper format without a Rumors version marker.
+mod v0 {
+    use super::*;
+
+    /// Opaque bookmark bytes in wrapper format zero.
+    #[derive(serde::Deserialize, serde::Serialize)]
+    pub(super) struct BookmarkRecord(#[serde(with = "format::cbor_bytes")] pub(super) Vec<u8>);
+
+    /// Identify this member of the durable format chain.
+    impl Versioned for BookmarkRecord {
+        /// The initial Sush wrapper format.
+        const VERSION: u16 = 0;
+    }
+
+    /// Terminate the wrapper's history at its initial format.
+    impl Record for BookmarkRecord {
+        /// No preceding format exists.
+        type Previous = NoFormat;
+    }
+
+    /// Complete the migration interface for the initial format.
+    impl TryFrom<NoFormat> for BookmarkRecord {
+        /// No source value can exist.
+        type Error = &'static str;
+        /// The source type has no inhabitants.
+        fn try_from(none: NoFormat) -> Result<Self, Self::Error> {
+            match none {}
+        }
     }
 }
 
@@ -124,7 +163,17 @@ impl Bookmark for SushBookmark {
         match guard.load().await {
             Verdict::Adopt(record) | Verdict::Restore(record) => {
                 match format::decode::<BookmarkRecord>(&record) {
-                    Ok(BookmarkRecord(bytes)) => Ok(Some(Cursor::new(bytes))),
+                    Ok(BookmarkRecord(version, bytes))
+                        if version == rumors::BOOKMARK_FORMAT_VERSION =>
+                    {
+                        Ok(Some(Cursor::new(bytes)))
+                    }
+                    Ok(BookmarkRecord(version, _)) => {
+                        warn!(self.log, "starting fresh Rumors bookkeeping";
+                            "stored_format" => version,
+                            "current_format" => rumors::BOOKMARK_FORMAT_VERSION);
+                        Ok(None)
+                    }
                     // Stranding the old identity is harmless;
                     // resuming from a misread record is not.
                     Err(error) => {
@@ -146,7 +195,7 @@ impl Bookmark for SushBookmark {
         if self.shed {
             return Ok(());
         }
-        let record = BookmarkRecord(bytes);
+        let record = BookmarkRecord(rumors::BOOKMARK_FORMAT_VERSION, bytes);
         let mut guard = self.tenant.lock().await;
         guard.store(&format::encode(&record)).await
     }
@@ -202,6 +251,39 @@ mod test {
         assert!(read_back(&handle).await.is_none());
         handle.store(b"who we are".to_vec()).await.unwrap();
         assert_eq!(read_back(&handle).await.unwrap(), b"who we are");
+    }
+
+    /// Unsupported bookmark formats start fresh and allow subsequent persistence.
+    #[tokio::test]
+    async fn incompatible_formats_allow_fresh_checkpoints() {
+        let dir = TempDir::with_prefix("sush-bookmark-").unwrap();
+        let source = source(slots(&dir));
+        let old = format::encode(&v0::BookmarkRecord(b"old".to_vec()));
+        let future = format::encode(&BookmarkRecord(
+            rumors::BOOKMARK_FORMAT_VERSION + 1,
+            b"future".to_vec(),
+        ));
+        for encoded in [old, future] {
+            source.tenant.lock().await.store(&encoded).await.unwrap();
+            let handle = source.handle();
+            assert!(read_back(&handle).await.is_none());
+            handle.store(b"fresh".to_vec()).await.unwrap();
+            assert_eq!(read_back(&source.handle()).await.unwrap(), b"fresh");
+        }
+    }
+
+    /// Pin both Sush wrapper layouts independently of Rumors' opaque payload.
+    #[test]
+    fn wrapper_formats_pin_their_bytes() {
+        assert_eq!(
+            format::encode(&v0::BookmarkRecord(b"old".to_vec())),
+            [0x82, 0x00, 0x44, 0x43, b'o', b'l', b'd']
+        );
+        // Version 6 is an example marker here, not a requirement on the linked codec.
+        assert_eq!(
+            format::encode(&BookmarkRecord(6, b"new".to_vec())),
+            [0x82, 0x01, 0x46, 0x82, 0x06, 0x43, b'n', b'e', b'w']
+        );
     }
 
     /// A discarded verdict is a fresh start, not an error.

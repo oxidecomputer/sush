@@ -457,7 +457,7 @@ checksum = "2af50177e190e07a26ab74f8b1efbfe2ef87da2116221318cb1c2e82baf7de06"
 [[package]]
 name = "before"
 version = "0.1.0"
-source = "git+https://github.com/oxidecomputer/rumors?rev=d73fe2c9720fd64dc8b0d27733ec75b6a7bd7481#d73fe2c9720fd64dc8b0d27733ec75b6a7bd7481"
+source = "git+https://github.com/oxidecomputer/rumors?rev=f4e2b1bb8efc89965a6d94ab84be7c12f8f8485d#f4e2b1bb8efc89965a6d94ab84be7c12f8f8485d"
 dependencies = [
  "bytes",
  "dashu-int",
@@ -1751,6 +1751,12 @@ name = "hashbrown"
 version = "0.12.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "8a9ee70c43aaf417c914396645a0fa852624801b24ebb7ae78fe8272889ac888"
+
+[[package]]
+name = "hashbrown"
+version = "0.13.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "43a3c133739dddd0d2990f9a4bdf8eb4b21ef50e4851ca85ab661199821d510e"
 
 [[package]]
 name = "hashbrown"
@@ -3737,7 +3743,7 @@ dependencies = [
 [[package]]
 name = "rumors"
 version = "0.1.0"
-source = "git+https://github.com/oxidecomputer/rumors?rev=d73fe2c9720fd64dc8b0d27733ec75b6a7bd7481#d73fe2c9720fd64dc8b0d27733ec75b6a7bd7481"
+source = "git+https://github.com/oxidecomputer/rumors?rev=f4e2b1bb8efc89965a6d94ab84be7c12f8f8485d#f4e2b1bb8efc89965a6d94ab84be7c12f8f8485d"
 dependencies = [
  "async-stream",
  "before",
@@ -3748,6 +3754,7 @@ dependencies = [
  "hex",
  "itertools",
  "rand 0.8.7",
+ "schnellru",
  "seq-macro",
  "serde",
  "sha3 0.12.0",
@@ -3999,6 +4006,17 @@ dependencies = [
  "quote",
  "serde_derive_internals",
  "syn 2.0.119",
+]
+
+[[package]]
+name = "schnellru"
+version = "0.2.4"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "356285bbf17bea63d9e52e96bd18f039672ac92b55b8cb997d6162a2a37d1649"
+dependencies = [
+ "ahash",
+ "cfg-if",
+ "hashbrown 0.13.2",
 ]
 
 [[package]]
@@ -4662,7 +4680,7 @@ dependencies = [
 [[package]]
 name = "suanpan"
 version = "0.1.0"
-source = "git+https://github.com/oxidecomputer/rumors?rev=d73fe2c9720fd64dc8b0d27733ec75b6a7bd7481#d73fe2c9720fd64dc8b0d27733ec75b6a7bd7481"
+source = "git+https://github.com/oxidecomputer/rumors?rev=f4e2b1bb8efc89965a6d94ab84be7c12f8f8485d#f4e2b1bb8efc89965a6d94ab84be7c12f8f8485d"
 dependencies = [
  "dashu-int",
 ]
