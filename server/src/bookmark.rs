@@ -2,32 +2,23 @@
 // License, v. 2.0. If a copy of the MPL was not distributed with this
 // file, You can obtain one at https://mozilla.org/MPL/2.0/.
 
-//! Durable gossip peer identity across restarts.
+//! Store Rumors restart bookkeeping in this server's locker.
 //!
-//! A rumors [`Bookmark`] records a peer's identity and how far it has
-//! advanced, so that a restarted sled may reclaim its previous identity
-//! instead of stranding it. The invariant is (as usual) that we must
-//! never adopt stale data, because in this case it could lead to causality
-//! violations (which are bad).
-//!
-//! The record format and when to load & store are dictated by rumors.
-//! We use a [`Tenant`] of a [`Locker`] to store it on disk(s);
-//! if a load fails or the slots disagree, we assume a new identity
-//! rather than risk resuming with a stale one. The record keeps every
-//! universe's identities, so a lost write costs at most a stranded
-//! identity, never a stale one.
+//! Rumors supplies an opaque record that lets it reclaim a departed peer's
+//! identity after catching up. The locker stores the record across local disks
+//! and rejects stale or conflicting copies. An unusable record starts fresh
+//! bookkeeping; it must never cause us to reuse an uncertain identity.
 
-use std::io::{self, Cursor};
+use std::io::Cursor;
 use std::sync::Arc;
 
-use rumors::{Bookmark, BookmarkError, Serialized};
+use rumors::Bookmark;
 use slog::{Discard, Logger, o, warn};
-use thiserror::Error;
-use tokio::io::AsyncWrite;
 
 use crate::format::{self, NoFormat, Record, Versioned};
 use crate::locker::{Locker, StoreError, Tenant, TenantSpec, Verdict};
 
+/// Locker namespace and format marker for Rumors bookmark records.
 pub const BOOKMARK: TenantSpec = TenantSpec {
     file: "bookmark",
     magic: b"SUSHBOOKMARK",
@@ -37,37 +28,38 @@ pub const BOOKMARK: TenantSpec = TenantSpec {
 #[derive(serde::Deserialize, serde::Serialize)]
 struct BookmarkRecord(#[serde(with = "format::cbor_bytes")] Vec<u8>);
 
+/// Identify the outer Sush record format.
 impl Versioned for BookmarkRecord {
+    /// Version of this wrapper, independent of Rumors’ opaque payload format.
     const VERSION: u16 = 0;
 }
 
+/// This wrapper has no older representation to migrate.
 impl Record for BookmarkRecord {
+    /// No prior wrapper format exists.
     type Previous = NoFormat;
 }
 
+/// Complete the migration interface for a format with no predecessor.
 impl TryFrom<NoFormat> for BookmarkRecord {
+    /// Required by the migration interface; this conversion cannot fail.
     type Error = &'static str;
+    /// No value of the source type exists.
     fn try_from(none: NoFormat) -> Result<Self, Self::Error> {
         match none {}
     }
 }
 
-/// What a bookmark load or store failed at.
-#[derive(Debug, Error)]
-pub enum BookmarkIoError {
-    #[error("serializing the bookmark record failed: {0}")]
-    Serialize(#[source] io::Error),
-    #[error("storing the bookmark failed: {0}")]
-    Store(#[source] StoreError),
-}
-
 /// This server's bookmark storage. Every handle shares the one record.
 #[derive(Clone, Debug)]
 pub struct BookmarkSource {
+    /// Logger carrying this bookmark’s component context.
     log: Logger,
+    /// Shared locker record for this server across peer replacements.
     tenant: Arc<Tenant>,
 }
 
+/// Create storage handles for the gossip manager.
 impl BookmarkSource {
     /// A source persisting to `locker`.
     /// [`Seed::grow`](crate::gossip::Seed::grow) makes the one source
@@ -108,18 +100,22 @@ impl BookmarkSource {
 /// One peer's handle on the [`BookmarkSource`].
 #[derive(Debug)]
 pub struct SushBookmark {
+    /// Logger carrying this bookmark’s component context.
     log: Logger,
+    /// Shared locker record for this server across peer replacements.
     tenant: Arc<Tenant>,
+    /// Whether this handle bypasses storage after a persistence failure.
     shed: bool,
 }
 
-impl BookmarkError for SushBookmark {
-    type Error = BookmarkIoError;
-}
-
+/// Read locker records and store the complete bytes supplied by Rumors.
 impl Bookmark for SushBookmark {
+    /// Failure to durably store the locker record.
+    type Error = StoreError;
+    /// An owned snapshot of the stored Rumors record.
     type Reader = Cursor<Vec<u8>>;
 
+    /// Load a usable record, starting fresh if locker recovery rejects it.
     async fn load(&self) -> Result<Option<Self::Reader>, Self::Error> {
         if self.shed {
             return Ok(None);
@@ -145,22 +141,14 @@ impl Bookmark for SushBookmark {
         }
     }
 
-    async fn store<F>(&self, write: F) -> Result<(), Self::Error>
-    where
-        F: for<'a> FnOnce(&'a mut (dyn AsyncWrite + Unpin + Send)) -> Serialized<'a> + Send,
-    {
+    /// Store the encoded Rumors record unless this handle has shed persistence.
+    async fn store(&self, bytes: Vec<u8>) -> Result<(), Self::Error> {
         if self.shed {
             return Ok(());
         }
-        let mut buf = Cursor::new(Vec::new());
-        write(&mut buf).await.map_err(BookmarkIoError::Serialize)?;
-        let record = BookmarkRecord(buf.into_inner());
-
+        let record = BookmarkRecord(bytes);
         let mut guard = self.tenant.lock().await;
-        guard
-            .store(&format::encode(&record))
-            .await
-            .map_err(BookmarkIoError::Store)
+        guard.store(&format::encode(&record)).await
     }
 }
 
@@ -172,14 +160,7 @@ mod test {
 
     use camino::Utf8PathBuf;
     use tempfile::TempDir;
-    use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
-
-    /// A serializer closure writing fixed bytes, shaped like rumors'.
-    fn record(
-        bytes: &'static [u8],
-    ) -> impl for<'a> FnOnce(&'a mut (dyn AsyncWrite + Unpin + Send)) -> Serialized<'a> + Send {
-        move |w| Box::pin(async move { w.write_all(bytes).await })
-    }
+    use tokio::io::AsyncReadExt as _;
 
     /// Two slot directories, like two M.2s.
     fn slots(dir: &TempDir) -> Vec<Utf8PathBuf> {
@@ -193,14 +174,17 @@ mod test {
             .collect()
     }
 
+    /// Silence routine logging in storage tests.
     fn test_log() -> Logger {
         Logger::root(Discard, o!())
     }
 
+    /// Create a bookmark source backed by the requested disk slots.
     fn source(slots: Vec<Utf8PathBuf>) -> BookmarkSource {
         BookmarkSource::new(&test_log(), &Locker::new(&test_log(), slots).unwrap())
     }
 
+    /// Read the exact bytes visible through the public Bookmark interface.
     async fn read_back(handle: &SushBookmark) -> Option<Vec<u8>> {
         let mut reader = handle.load().await.unwrap()?;
         let mut bytes = Vec::new();
@@ -216,7 +200,7 @@ mod test {
 
         let handle = source.handle();
         assert!(read_back(&handle).await.is_none());
-        handle.store(record(b"who we are")).await.unwrap();
+        handle.store(b"who we are".to_vec()).await.unwrap();
         assert_eq!(read_back(&handle).await.unwrap(), b"who we are");
     }
 
@@ -227,7 +211,7 @@ mod test {
         let slots = slots(&dir);
         for (slot, bytes) in slots.iter().zip([b"one", b"two"]) {
             let lone = source(vec![slot.clone()]);
-            lone.handle().store(record(bytes)).await.unwrap();
+            lone.handle().store(bytes.to_vec()).await.unwrap();
         }
         assert!(read_back(&source(slots).handle()).await.is_none());
     }
@@ -238,7 +222,7 @@ mod test {
         let dir = TempDir::with_prefix("sush-bookmark-").unwrap();
         let source = source(slots(&dir));
 
-        source.handle().store(record(b"shared")).await.unwrap();
+        source.handle().store(b"shared".to_vec()).await.unwrap();
         assert_eq!(read_back(&source.handle()).await.unwrap(), b"shared");
     }
 
@@ -248,15 +232,15 @@ mod test {
     async fn null_and_shed_touch_nothing() {
         let null = BookmarkSource::null();
         let handle = null.handle();
-        handle.store(record(b"lost")).await.unwrap();
+        handle.store(b"lost".to_vec()).await.unwrap();
         assert!(read_back(&handle).await.is_none());
 
         let dir = TempDir::with_prefix("sush-bookmark-").unwrap();
         let source = source(slots(&dir));
-        source.handle().store(record(b"kept")).await.unwrap();
+        source.handle().store(b"kept".to_vec()).await.unwrap();
         let shed = source.shed_handle();
         assert!(read_back(&shed).await.is_none());
-        shed.store(record(b"dropped")).await.unwrap();
+        shed.store(b"dropped".to_vec()).await.unwrap();
         assert_eq!(read_back(&source.handle()).await.unwrap(), b"kept");
     }
 }
