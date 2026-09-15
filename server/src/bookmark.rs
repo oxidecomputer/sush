@@ -241,6 +241,23 @@ mod test {
         Some(bytes)
     }
 
+    /// The locker-backed adapter preserves records across replacement and cancellation.
+    #[tokio::test]
+    async fn conforms_to_bookmark_contract() {
+        let mut directories = Vec::new();
+        rumors::conformance::bookmark::check(
+            async || {
+                let dir = TempDir::with_prefix("sush-bookmark-conformance-").unwrap();
+                let handle = source(slots(&dir)).handle();
+                // Keep each fresh fixture's files until its check has finished.
+                directories.push(dir);
+                handle
+            },
+            || tokio::time::sleep(std::time::Duration::from_secs(30)),
+        )
+        .await;
+    }
+
     /// A stored record loads back verbatim.
     #[tokio::test]
     async fn round_trip() {
