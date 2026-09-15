@@ -457,7 +457,7 @@ checksum = "2af50177e190e07a26ab74f8b1efbfe2ef87da2116221318cb1c2e82baf7de06"
 [[package]]
 name = "before"
 version = "0.1.0"
-source = "git+https://github.com/oxidecomputer/rumors?rev=dcd52184b87644bb2267fdb2ab240bed316668d3#dcd52184b87644bb2267fdb2ab240bed316668d3"
+source = "git+https://github.com/oxidecomputer/rumors?rev=b0d0abbb38841a812e740f2cd889df4bb8de5969#b0d0abbb38841a812e740f2cd889df4bb8de5969"
 dependencies = [
  "bytes",
  "dashu-int",
@@ -3743,7 +3743,7 @@ dependencies = [
 [[package]]
 name = "rumors"
 version = "0.1.0"
-source = "git+https://github.com/oxidecomputer/rumors?rev=dcd52184b87644bb2267fdb2ab240bed316668d3#dcd52184b87644bb2267fdb2ab240bed316668d3"
+source = "git+https://github.com/oxidecomputer/rumors?rev=b0d0abbb38841a812e740f2cd889df4bb8de5969#b0d0abbb38841a812e740f2cd889df4bb8de5969"
 dependencies = [
  "async-stream",
  "before",
@@ -4680,7 +4680,7 @@ dependencies = [
 [[package]]
 name = "suanpan"
 version = "0.1.0"
-source = "git+https://github.com/oxidecomputer/rumors?rev=dcd52184b87644bb2267fdb2ab240bed316668d3#dcd52184b87644bb2267fdb2ab240bed316668d3"
+source = "git+https://github.com/oxidecomputer/rumors?rev=b0d0abbb38841a812e740f2cd889df4bb8de5969#b0d0abbb38841a812e740f2cd889df4bb8de5969"
 dependencies = [
  "dashu-int",
 ]
