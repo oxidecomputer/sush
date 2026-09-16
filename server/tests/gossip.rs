@@ -246,7 +246,7 @@ async fn idle_heartbeats_detect_a_silent_peer() {
     let (sent, received) = futures::join!(sessions.next(), b.gossip_once(&mut far));
     sent.unwrap().unwrap();
     received.unwrap();
-    assert_eq!(a.snapshot().hash(), b.snapshot().hash());
+    assert_eq!(a.snapshot(), b.snapshot());
 
     // The heartbeat still fires at ten seconds, even though the set is current.
     advance(Duration::from_secs(1)).await;
