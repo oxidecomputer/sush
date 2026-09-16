@@ -425,7 +425,7 @@ where
             let endpoint = self.endpoint.clone();
             let handle = self.dials.spawn(async move {
                 let result = match timeout(deadline, endpoint.link(peer)).await {
-                    Ok(Ok(link)) => Ok(link),
+                    Ok(Ok((_, link))) => Ok(link),
                     Ok(Err(err)) => Err(err.to_string()),
                     Err(_) => Err("link establishment timed out".to_string()),
                 };

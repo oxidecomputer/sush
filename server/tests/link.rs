@@ -75,7 +75,8 @@ impl TestNet {
         let endpoint = self.a.endpoint();
         let peer = *self.b.endpoint().local_addr();
         let (linked, accepted) = join!(endpoint.link(peer), self.b.accept());
-        let link_a = linked.expect("peer router accepts the link");
+        let (info, link_a) = linked.expect("peer router accepts the link");
+        assert_eq!(info.peer, peer);
         let (from, link_b) = accepted.expect("router is live");
         assert_eq!(from, *endpoint.local_addr());
         (link_a, link_b)
