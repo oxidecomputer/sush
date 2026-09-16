@@ -110,12 +110,13 @@ impl Default for GossipConfig {
 
 /// A gossip universe.
 #[derive(Clone, Debug)]
-pub struct Universe<T> {
+pub struct Universe<T: Send + Sync + 'static> {
     /// The gossiped set.
     pub rumors: Rumors<T, SushBookmark>,
 }
 
-impl<T> Universe<T> {
+impl<T: Send + Sync + 'static> Universe<T> {
+    /// Wrap the initial gossip network for publication.
     pub fn genesis(rumors: Rumors<T, SushBookmark>) -> Self {
         Self { rumors }
     }
@@ -134,12 +135,12 @@ impl<T> Universe<T> {
 /// the pair whole, so a seed can never gossip against a source other
 /// than its own.
 #[derive(Debug)]
-pub struct Seed<T> {
+pub struct Seed<T: Send + Sync + 'static> {
     rumors: Rumors<T, SushBookmark>,
     bookmarks: BookmarkSource,
 }
 
-impl<T> Seed<T> {
+impl<T: Send + Sync + 'static> Seed<T> {
     /// Seed a fresh universe with this server as its only peer, over
     /// `locker`'s storage, making the locker's one [`BookmarkSource`].
     ///
@@ -152,7 +153,7 @@ impl<T> Seed<T> {
     /// is harmless.
     pub async fn grow(log: &Logger, locker: &Locker) -> Self
     where
-        T: DeserializeOwned + Serialize + Eq + Send + Sync + 'static,
+        T: DeserializeOwned + Serialize + Eq,
     {
         let bookmarks = BookmarkSource::new(log, locker);
         let handle = match locker.probe().await {
@@ -174,6 +175,7 @@ impl<T> Seed<T> {
         Self { rumors, bookmarks }
     }
 
+    /// Borrow the seeded network without separating it from its bookmark source.
     pub fn rumors(&self) -> &Rumors<T, SushBookmark> {
         &self.rumors
     }
@@ -288,7 +290,8 @@ enum Stopped {
     Failed,
 }
 
-struct Manager<T> {
+/// Maintains peer links and publishes the current gossip network.
+struct Manager<T: Send + Sync + 'static> {
     log: Logger,
     config: GossipConfig,
     endpoint: Endpoint<SprocketsDial>,
