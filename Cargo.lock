@@ -457,7 +457,7 @@ checksum = "2af50177e190e07a26ab74f8b1efbfe2ef87da2116221318cb1c2e82baf7de06"
 [[package]]
 name = "before"
 version = "0.1.0"
-source = "git+https://github.com/oxidecomputer/rumors?rev=d37ffca701ad2e6a3087e703d0645d89ace1eabb#d37ffca701ad2e6a3087e703d0645d89ace1eabb"
+source = "git+https://github.com/oxidecomputer/rumors?rev=ab57339c2e23fb60435693dd99042e097a42ec25#ab57339c2e23fb60435693dd99042e097a42ec25"
 dependencies = [
  "bytes",
  "dashu-int",
@@ -3743,7 +3743,7 @@ dependencies = [
 [[package]]
 name = "rumors"
 version = "0.1.0"
-source = "git+https://github.com/oxidecomputer/rumors?rev=d37ffca701ad2e6a3087e703d0645d89ace1eabb#d37ffca701ad2e6a3087e703d0645d89ace1eabb"
+source = "git+https://github.com/oxidecomputer/rumors?rev=ab57339c2e23fb60435693dd99042e097a42ec25#ab57339c2e23fb60435693dd99042e097a42ec25"
 dependencies = [
  "async-stream",
  "before",
@@ -3753,7 +3753,7 @@ dependencies = [
  "futures-util",
  "hex",
  "itertools",
- "rand 0.8.7",
+ "rand 0.9.5",
  "schnellru",
  "seq-macro",
  "serde",
@@ -4680,7 +4680,7 @@ dependencies = [
 [[package]]
 name = "suanpan"
 version = "0.1.0"
-source = "git+https://github.com/oxidecomputer/rumors?rev=d37ffca701ad2e6a3087e703d0645d89ace1eabb#d37ffca701ad2e6a3087e703d0645d89ace1eabb"
+source = "git+https://github.com/oxidecomputer/rumors?rev=ab57339c2e23fb60435693dd99042e097a42ec25#ab57339c2e23fb60435693dd99042e097a42ec25"
 dependencies = [
  "dashu-int",
 ]
