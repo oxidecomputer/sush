@@ -3,6 +3,9 @@
 // file, You can obtain one at https://mozilla.org/MPL/2.0/.
 
 //! Attested transport conformance and two-peer gossip.
+//!
+//! A small multithreaded runtime, like the server, lets synchronous
+//! attestation work progress in parallel within the production deadlines.
 
 mod common;
 
@@ -96,10 +99,6 @@ impl Drop for TestNet {
 //     cargo test --package sush-server --test link -- --include-ignored
 
 /// The attested transport satisfies the Rumors link contract.
-///
-/// Concurrent handshakes perform synchronous cryptographic work. Use a small
-/// multithreaded runtime, as the server does, so they can progress in parallel
-/// within the production dial deadline.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 #[ignore]
 async fn conformance() {
@@ -112,7 +111,7 @@ async fn conformance() {
 }
 
 /// Peers bootstrap and exchange messages over an attested link.
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 #[ignore]
 async fn gossip_convergence() {
     let mut net = TestNet::new("gossip_convergence").await;

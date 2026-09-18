@@ -2,7 +2,10 @@
 // License, v. 2.0. If a copy of the MPL was not distributed with this
 // file, You can obtain one at https://mozilla.org/MPL/2.0/.
 
-//! Two job managers on two gossiping sleds. What one accepts, both know.
+//! Job managers on gossiping sleds. What one accepts, the others learn.
+//!
+//! These tests use a small multithreaded runtime, like the server, so
+//! synchronous attestation work can progress in parallel within session deadlines.
 
 mod common;
 
@@ -117,7 +120,7 @@ impl Sled {
 }
 
 #[named]
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn jobs_gossip_between_sleds() {
     let (_tmp, dir) = pki("sush-distributed-", 2);
     let mut root = common::ephemeral_root();
@@ -229,7 +232,7 @@ async fn jobs_gossip_between_sleds() {
 }
 
 #[named]
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn rejoining_replays_without_reexecuting() {
     let (_tmp, dir) = pki("sush-replay-", 2);
     let mut root = common::ephemeral_root();
@@ -346,7 +349,7 @@ async fn rejoining_replays_without_reexecuting() {
 }
 
 #[named]
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn interrupted_jobs_get_stopped() {
     let (_tmp, dir) = pki("sush-interrupted-", 2);
     let mut root = common::ephemeral_root();
@@ -436,7 +439,7 @@ async fn interrupted_jobs_get_stopped() {
 }
 
 #[named]
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn stragglers_do_not_interrupt_live_jobs() {
     let (_tmp, dir) = pki("sush-straggler-", 3);
     let mut root = common::ephemeral_root();
@@ -583,7 +586,7 @@ async fn sign_job_for(
 }
 
 #[named]
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn lost_suffix_never_reruns() {
     let (_tmp, dir) = pki("sush-lost-", 2);
     let mut root = common::ephemeral_root();
@@ -765,7 +768,7 @@ async fn lost_suffix_never_reruns() {
 }
 
 #[named]
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn session_resumes_at_stored_successor() {
     let (_tmp, dir) = pki("sush-resume-", 3);
     let mut root = common::ephemeral_root();
@@ -922,7 +925,7 @@ async fn session_resumes_at_stored_successor() {
 }
 
 #[named]
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn universe_flip_flop_raises_floor() {
     let (_tmp, dir) = pki("sush-flipflop-", 3);
     let mut root = common::ephemeral_root();
@@ -1173,7 +1176,7 @@ async fn universe_flip_flop_raises_floor() {
 }
 
 #[named]
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn witnessed_session_survives_restart() {
     let (_tmp, dir) = pki("sush-witness-", 2);
     let mut root = common::ephemeral_root();
@@ -1264,7 +1267,7 @@ async fn witnessed_session_survives_restart() {
 }
 
 #[named]
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn bookmarks_survive_restart() {
     let (_tmp, dir) = pki("sush-bookmark-", 2);
     let mut root = common::ephemeral_root();
@@ -1349,7 +1352,7 @@ async fn bookmarks_survive_restart() {
 }
 
 #[named]
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn gossip_survives_bookmark_failure() {
     let (_tmp, dir) = pki("sush-nobookmark-", 2);
     let mut root = common::ephemeral_root();

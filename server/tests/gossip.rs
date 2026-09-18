@@ -3,7 +3,9 @@
 // file, You can obtain one at https://mozilla.org/MPL/2.0/.
 
 //! The gossip manager converging localhost meshes, with real attested
-//! handshakes throughout.
+//! handshakes throughout. Network tests use a small multithreaded runtime,
+//! like the server, so synchronous attestation work does not serialize every
+//! handshake onto one runtime thread.
 
 mod common;
 
@@ -106,7 +108,7 @@ fn converged(nodes: &[&Node]) -> Option<Network> {
 }
 
 #[named]
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn cold_start_converges() {
     let (_tmp, dir) = pki("sush-gossip-", 3);
     let log = test_logger(function_name!());
@@ -130,7 +132,7 @@ async fn cold_start_converges() {
 }
 
 #[named]
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn staggered_start_converges() {
     let (_tmp, dir) = pki("sush-gossip-", 3);
     let log = test_logger(function_name!());
@@ -159,7 +161,7 @@ async fn staggered_start_converges() {
 }
 
 #[named]
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn node_replacement_reconverges() {
     let (_tmp, dir) = pki("sush-gossip-", 4);
     let log = test_logger(function_name!());
@@ -189,7 +191,7 @@ async fn node_replacement_reconverges() {
 }
 
 #[named]
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn linked_follows_live_links() {
     let (_tmp, dir) = pki("sush-gossip-", 2);
     let log = test_logger(function_name!());
