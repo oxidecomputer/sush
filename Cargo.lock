@@ -457,7 +457,7 @@ checksum = "2af50177e190e07a26ab74f8b1efbfe2ef87da2116221318cb1c2e82baf7de06"
 [[package]]
 name = "before"
 version = "0.1.0"
-source = "git+https://github.com/oxidecomputer/rumors?rev=5ebb800ee8a243cc694eab48283c826a1a75fff6#5ebb800ee8a243cc694eab48283c826a1a75fff6"
+source = "git+https://github.com/oxidecomputer/rumors?rev=ab94cd77f36d32a08acd912d8cb7dc7f9017fa82#ab94cd77f36d32a08acd912d8cb7dc7f9017fa82"
 dependencies = [
  "bytes",
  "dsi-bitstream",
@@ -3729,7 +3729,7 @@ dependencies = [
 [[package]]
 name = "rumors"
 version = "0.1.0"
-source = "git+https://github.com/oxidecomputer/rumors?rev=5ebb800ee8a243cc694eab48283c826a1a75fff6#5ebb800ee8a243cc694eab48283c826a1a75fff6"
+source = "git+https://github.com/oxidecomputer/rumors?rev=ab94cd77f36d32a08acd912d8cb7dc7f9017fa82#ab94cd77f36d32a08acd912d8cb7dc7f9017fa82"
 dependencies = [
  "async-stream",
  "before",
@@ -4674,7 +4674,7 @@ dependencies = [
 [[package]]
 name = "suanpan"
 version = "0.1.0"
-source = "git+https://github.com/oxidecomputer/rumors?rev=5ebb800ee8a243cc694eab48283c826a1a75fff6#5ebb800ee8a243cc694eab48283c826a1a75fff6"
+source = "git+https://github.com/oxidecomputer/rumors?rev=ab94cd77f36d32a08acd912d8cb7dc7f9017fa82#ab94cd77f36d32a08acd912d8cb7dc7f9017fa82"
 
 [[package]]
 name = "subtle"
