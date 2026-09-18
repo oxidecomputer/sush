@@ -2,8 +2,10 @@
 // License, v. 2.0. If a copy of the MPL was not distributed with this
 // file, You can obtain one at https://mozilla.org/MPL/2.0/.
 
-//! The sprockets transport against the rumors link contract, and a
-//! two-peer gossip smoke test over it.
+//! Attested transport conformance and two-peer gossip.
+//!
+//! A small multithreaded runtime, like the server, lets synchronous
+//! attestation work progress in parallel within the production deadlines.
 
 mod common;
 
@@ -14,7 +16,7 @@ use futures::StreamExt as _;
 use futures::stream;
 use slog::Logger;
 use tempfile::TempDir;
-use tokio::time::timeout;
+use tokio::time::{sleep, timeout};
 use tokio::{join, spawn};
 use tokio_util::sync::CancellationToken;
 
@@ -24,13 +26,19 @@ use sush_server::link::{SprocketsLink, Transport};
 
 use common::{corpus, dial_timeout, localhost, pki, sprockets_config, test_logger};
 
+/// Two attested endpoints and the PKI used by their handshakes.
 struct TestNet {
+    /// Endpoint for identity 1.
     a: Transport,
+    /// Endpoint for identity 2.
     b: Transport,
+    /// Cancels both endpoints' transport tasks.
     shutdown: CancellationToken,
+    /// Keeps certificate and attestation files alive during the test.
     _dir: TempDir,
 }
 
+/// Bind one identity's authenticated transport for the test network.
 async fn transport(
     log: &Logger,
     dir: &Utf8PathBuf,
@@ -50,6 +58,7 @@ async fn transport(
 }
 
 impl TestNet {
+    /// Create test PKI and start both attested endpoints.
     async fn new(test_name: &'static str) -> TestNet {
         let (tmp, dir) = pki("sush-link-", 2);
         let log = test_logger(test_name);
@@ -69,7 +78,8 @@ impl TestNet {
         let endpoint = self.a.endpoint();
         let peer = *self.b.endpoint().local_addr();
         let (linked, accepted) = join!(endpoint.link(peer), self.b.accept());
-        let link_a = linked.expect("peer router accepts the link");
+        let (info, link_a) = linked.expect("peer router accepts the link");
+        assert_eq!(info.peer, peer);
         let (from, link_b) = accepted.expect("router is live");
         assert_eq!(from, *endpoint.local_addr());
         (link_a, link_b)
@@ -77,29 +87,31 @@ impl TestNet {
 }
 
 impl Drop for TestNet {
+    /// Cancel the network's transport tasks.
     fn drop(&mut self) {
         self.shutdown.cancel();
     }
 }
 
-// Slow (~35s each): CI always runs these, and local runs should
-// whenever `link.rs` or the gossip configuration changes:
+// These tests perform real attestation. CI runs them; run them locally
+// when changing the transport or gossip configuration:
 //
 //     cargo test --package sush-server --test link -- --include-ignored
 
-#[tokio::test]
+/// The attested transport satisfies the Rumors link contract.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 #[ignore]
 async fn conformance() {
     let mut net = TestNet::new("conformance").await;
-    timeout(
-        Duration::from_secs(600),
-        check(async || net.link_pair().await),
+    check(
+        async || net.link_pair().await,
+        || sleep(Duration::from_secs(600)),
     )
-    .await
-    .expect("conformance suite timed out");
+    .await;
 }
 
-#[tokio::test]
+/// Peers bootstrap and exchange messages over an attested link.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 #[ignore]
 async fn gossip_convergence() {
     let mut net = TestNet::new("gossip_convergence").await;
@@ -107,13 +119,16 @@ async fn gossip_convergence() {
 
     // Alice seeds a universe with one message and serves sessions on her
     // end of the link.
-    let alice: Rumors<String> = Peer::seed().into_rumors();
+    let alice: Rumors<String> = Peer::seed()
+        .gossip_when(|_| stream::pending::<()>())
+        .session_deadline(|| sleep(Duration::from_secs(1)))
+        .into_rumors();
     alice.send("from alice".to_string()).unwrap();
     let server = spawn({
         let alice = alice.clone();
         async move {
             let mut link_a = link_a;
-            let mut driver = alice.gossip_when(stream::pending::<()>(), &mut link_a);
+            let mut driver = alice.gossip(&mut link_a);
             while let Some(session) = driver.next().await {
                 session.expect("serving gossip session");
             }
@@ -121,21 +136,23 @@ async fn gossip_convergence() {
     });
 
     // Bob joins Alice's universe through the link and hears her message.
-    let bob = timeout(
+    let rumors::Joined::Joined { peer: bob } = timeout(
         Duration::from_secs(60),
-        Peer::<String>::bootstrap().join(&mut link_b),
+        Peer::<String>::bootstrap()
+            .session_deadline(|| sleep(Duration::from_secs(1)))
+            .join(&mut link_b),
     )
     .await
-    .expect("bootstrap timed out")
-    .expect("bootstrap failed")
-    .expect("mutual bootstrap bail")
-    .into_rumors();
+    .expect("bootstrap timed out") else {
+        panic!("Alice must serve Bob's bootstrap");
+    };
+    let bob = bob.into_rumors();
     assert_eq!(bob.network(), alice.network());
     assert_eq!(bob.snapshot().len(), 1);
 
     // Bob's own message reaches Alice within one gossip session.
     bob.send("from bob".to_string()).unwrap();
-    timeout(Duration::from_secs(60), bob.gossip(&mut link_b))
+    timeout(Duration::from_secs(60), bob.gossip_once(&mut link_b))
         .await
         .expect("gossip timed out")
         .expect("gossip failed");

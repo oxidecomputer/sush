@@ -921,8 +921,8 @@ impl State {
                                 log,
                                 "stale session start";
                                 "session_id" => %session_id,
-                                "frontier" => %frontier,
-                                "incoming_version" => %incoming_version,
+                                "frontier" => ?frontier,
+                                "incoming_version" => ?incoming_version,
                             );
                             *frontier |= incoming_version.clone();
                         }
@@ -2152,16 +2152,25 @@ mod test {
         )
     }
 
+    /// Versions before, at, and after one event, plus a concurrent event.
+    fn session_versions() -> [Version; 4] {
+        let mut local = rumors::before::Clock::seed();
+        let before = local.tick().clone();
+        let mut remote = local.fork();
+        let at = local.tick().clone();
+        let after = local.tick().clone();
+        // Both forks share the first event; their later events are independent.
+        let concurrent = remote.tick().clone();
+        [before, at, after, concurrent]
+    }
+
     /// The admission rules: a sled with no record admits, a record
     /// from a foreign universe admits, the committed session admits
     /// outright, a session started strictly above the executed join
     /// admits, and everything else hops.
     #[test]
     fn admission_rules() {
-        let started: Version = "(1, 1, (0, 0, 2))".parse().unwrap();
-        let older: Version = "(1, 0, (0, 0, 2))".parse().unwrap();
-        let newer: Version = "(2, 1, (0, 0, 3))".parse().unwrap();
-        let concurrent: Version = "(1, 2, (0, 0, 1))".parse().unwrap();
+        let [older, started, newer, concurrent] = session_versions();
         let session = SessionId::random();
         let job = JobId::random();
         let committed = Boundary {
@@ -2211,11 +2220,8 @@ mod test {
     /// record.
     #[test]
     fn floors_refuse_below() {
-        let floor: Version = "(1, 1, (0, 0, 2))".parse().unwrap();
-        let at: Version = floor.clone();
-        let below: Version = "(1, 0, (0, 0, 2))".parse().unwrap();
-        let above: Version = "(2, 1, (0, 0, 3))".parse().unwrap();
-        let concurrent: Version = "(1, 2, (0, 0, 1))".parse().unwrap();
+        let [below, floor, above, concurrent] = session_versions();
+        let at = floor.clone();
         let past = past(None, Some(floor.clone()));
 
         for started in [&at, &below, &concurrent] {
