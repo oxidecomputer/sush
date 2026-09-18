@@ -457,12 +457,13 @@ checksum = "2af50177e190e07a26ab74f8b1efbfe2ef87da2116221318cb1c2e82baf7de06"
 [[package]]
 name = "before"
 version = "0.1.0"
-source = "git+https://github.com/oxidecomputer/rumors?rev=30096f0871d9bcc00e024317a9303a3590080d48#30096f0871d9bcc00e024317a9303a3590080d48"
+source = "git+https://github.com/oxidecomputer/rumors?rev=f98d304b554051ae5a233e6402e34b3d9c2aeb25#f98d304b554051ae5a233e6402e34b3d9c2aeb25"
 dependencies = [
  "bytes",
- "dashu-int",
  "dsi-bitstream",
+ "num-bigint",
  "serde",
+ "serde_bytes",
  "serde_json",
  "static_assertions",
  "suanpan",
@@ -1038,25 +1039,6 @@ dependencies = [
  "darling_core",
  "quote",
  "syn 2.0.119",
-]
-
-[[package]]
-name = "dashu-base"
-version = "0.5.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "a64b04cdfc4c8533100fe00304eb9687173bda47b1f1dac8af12ba13712ed49d"
-
-[[package]]
-name = "dashu-int"
-version = "0.5.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "b6ee98721d5d223e5b64b642dd9588b79d9ef415554b13720308b77d628c3be6"
-dependencies = [
- "cfg-if",
- "dashu-base",
- "num-modular",
- "rustversion",
- "static_assertions",
 ]
 
 [[package]]
@@ -2757,6 +2739,16 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "72ef4a56884ca558e5ddb05a1d1e7e1bfd9a68d9ed024c21704cc98872dae1bb"
 
 [[package]]
+name = "num-bigint"
+version = "0.4.8"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "c89e69e7e0f03bea5ef08013795c25018e101932225a656383bd384495ecc367"
+dependencies = [
+ "num-integer",
+ "num-traits",
+]
+
+[[package]]
 name = "num-bigint-dig"
 version = "0.8.6"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2797,12 +2789,6 @@ dependencies = [
  "num-integer",
  "num-traits",
 ]
-
-[[package]]
-name = "num-modular"
-version = "0.6.5"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "bd8e500409e6cd603b03e477c26a6caecdc27ac58979a53e881c75eafc079f44"
 
 [[package]]
 name = "num-primitive"
@@ -3743,14 +3729,13 @@ dependencies = [
 [[package]]
 name = "rumors"
 version = "0.1.0"
-source = "git+https://github.com/oxidecomputer/rumors?rev=30096f0871d9bcc00e024317a9303a3590080d48#30096f0871d9bcc00e024317a9303a3590080d48"
+source = "git+https://github.com/oxidecomputer/rumors?rev=f98d304b554051ae5a233e6402e34b3d9c2aeb25#f98d304b554051ae5a233e6402e34b3d9c2aeb25"
 dependencies = [
  "async-stream",
  "before",
  "bytes",
  "ciborium",
  "futures",
- "futures-util",
  "hex",
  "itertools",
  "rand 0.9.5",
@@ -3762,7 +3747,6 @@ dependencies = [
  "thiserror 2.0.20",
  "tinyvec",
  "tokio",
- "tokio-stream",
 ]
 
 [[package]]
@@ -4115,6 +4099,16 @@ dependencies = [
  "array-init",
  "serde",
  "smallvec 0.6.14",
+]
+
+[[package]]
+name = "serde_bytes"
+version = "0.11.19"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "a5d440709e79d88e51ac01c4b72fc6cb7314017bb7da9eeff678aa94c10e3ea8"
+dependencies = [
+ "serde",
+ "serde_core",
 ]
 
 [[package]]
@@ -4680,10 +4674,7 @@ dependencies = [
 [[package]]
 name = "suanpan"
 version = "0.1.0"
-source = "git+https://github.com/oxidecomputer/rumors?rev=30096f0871d9bcc00e024317a9303a3590080d48#30096f0871d9bcc00e024317a9303a3590080d48"
-dependencies = [
- "dashu-int",
-]
+source = "git+https://github.com/oxidecomputer/rumors?rev=f98d304b554051ae5a233e6402e34b3d9c2aeb25#f98d304b554051ae5a233e6402e34b3d9c2aeb25"
 
 [[package]]
 name = "subtle"

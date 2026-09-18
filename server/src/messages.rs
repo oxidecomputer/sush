@@ -269,8 +269,8 @@ pub mod v0 {
     pub enum Error {
         #[error(
             "Concurrent sessions detected: \
-             ours is {own_session}@{own_version}, \
-             incoming is {incoming_session}@{incoming_version}"
+             ours is {own_session}@{own_version:?}, \
+             incoming is {incoming_session}@{incoming_version:?}"
         )]
         ConcurrentSessions {
             own_session: SessionId,

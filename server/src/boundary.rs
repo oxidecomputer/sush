@@ -366,11 +366,26 @@ mod test {
         serde_json::from_str(&format!("[{seed:?}{}]", ", 0".repeat(15))).unwrap()
     }
 
+    /// A nested history with event counts 2, 1, and 3 in successive regions.
+    ///
+    /// Keep these counts and forks fixed: the boundary format pin contains it.
+    fn executed_version() -> Version {
+        let mut left = rumors::before::Party::seed();
+        let mut version = Version::new();
+        left.tick(&mut version);
+        let mut right = left.fork();
+        left.tick(&mut version);
+        let far_right = right.fork();
+        far_right.ticks(&mut version, 2u64);
+        version
+    }
+
+    /// A committed job and its nonempty execution history.
     fn boundary() -> Boundary {
         Boundary {
             network: network(1),
             burned: Bloom::new(),
-            executed: "(1, 1, (0, 0, 2))".parse().unwrap(),
+            executed: executed_version(),
             job: Some(Committed {
                 session: SessionId::random(),
                 job: JobId::random(),
@@ -397,7 +412,7 @@ mod test {
                 burned.insert(&network_key(network(2)));
                 burned
             },
-            executed: "(1, 1, (0, 0, 2))".parse().unwrap(),
+            executed: executed_version(),
             job: Some(Committed {
                 session: "abandon-ability".parse().unwrap(),
                 job: "zoo-zero".parse().unwrap(),
