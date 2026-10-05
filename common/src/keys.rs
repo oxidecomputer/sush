@@ -796,7 +796,7 @@ impl SigningKey {
     }
 }
 
-/// A signature in a trenchcoat; see RFD 620 §4.6.2.1.
+/// A signature in a trenchcoat; see RFD 620 §4.6.2.1. Allocated in OANA.
 pub const VOUCHER_OID: ObjectIdentifier = ObjectIdentifier::new_unwrap("1.3.6.1.4.1.57551.3.1");
 
 /// Domain separation for [`voucher_digest`]. ASCII, so the preimage
