@@ -215,25 +215,6 @@ dependencies = [
 [[package]]
 name = "attest-data"
 version = "0.5.0"
-source = "git+https://github.com/oxidecomputer/dice-util?rev=10952e8d9599b735b85d480af3560a11700e5b64#10952e8d9599b735b85d480af3560a11700e5b64"
-dependencies = [
- "const-oid 0.9.6",
- "der",
- "getrandom 0.3.4",
- "hex",
- "hubpack",
- "rats-corim",
- "salty",
- "serde",
- "serde_with",
- "sha3 0.10.9",
- "static_assertions",
- "thiserror 2.0.20",
-]
-
-[[package]]
-name = "attest-data"
-version = "0.5.0"
 source = "git+https://github.com/oxidecomputer/dice-util?rev=4a39ef08d81e5177edee0bddb1146032aa21074d#4a39ef08d81e5177edee0bddb1146032aa21074d"
 dependencies = [
  "const-oid 0.9.6",
@@ -253,17 +234,18 @@ dependencies = [
 [[package]]
 name = "attest-mock"
 version = "0.1.0"
-source = "git+https://github.com/oxidecomputer/dice-util?rev=10952e8d9599b735b85d480af3560a11700e5b64#10952e8d9599b735b85d480af3560a11700e5b64"
+source = "git+https://github.com/oxidecomputer/dice-util?rev=4a39ef08d81e5177edee0bddb1146032aa21074d#4a39ef08d81e5177edee0bddb1146032aa21074d"
 dependencies = [
  "anyhow",
- "attest-data 0.5.0 (git+https://github.com/oxidecomputer/dice-util?rev=10952e8d9599b735b85d480af3560a11700e5b64)",
+ "attest-data",
  "clap",
  "hex",
  "hubpack",
- "knuffel",
- "miette 5.10.0",
+ "knus",
  "rats-corim",
- "serde_json",
+ "slog",
+ "slog-error-chain 0.1.0 (git+https://github.com/oxidecomputer/slog-error-chain?rev=15f69041f45774602108e47fb25e705dc23acfb2)",
+ "thiserror 2.0.20",
 ]
 
 [[package]]
@@ -1177,7 +1159,7 @@ source = "git+https://github.com/oxidecomputer/dice-util?rev=4a39ef08d81e5177ede
 dependencies = [
  "anyhow",
  "async-trait",
- "attest-data 0.5.0 (git+https://github.com/oxidecomputer/dice-util?rev=4a39ef08d81e5177edee0bddb1146032aa21074d)",
+ "attest-data",
  "camino",
  "const-oid 0.9.6",
  "ed25519-dalek",
@@ -4542,13 +4524,32 @@ version = "0.1.0"
 source = "git+https://github.com/oxidecomputer/slog-error-chain?branch=main#15f69041f45774602108e47fb25e705dc23acfb2"
 dependencies = [
  "slog",
- "slog-error-chain-derive",
+ "slog-error-chain-derive 0.1.0 (git+https://github.com/oxidecomputer/slog-error-chain?branch=main)",
+]
+
+[[package]]
+name = "slog-error-chain"
+version = "0.1.0"
+source = "git+https://github.com/oxidecomputer/slog-error-chain?rev=15f69041f45774602108e47fb25e705dc23acfb2#15f69041f45774602108e47fb25e705dc23acfb2"
+dependencies = [
+ "slog",
+ "slog-error-chain-derive 0.1.0 (git+https://github.com/oxidecomputer/slog-error-chain?rev=15f69041f45774602108e47fb25e705dc23acfb2)",
 ]
 
 [[package]]
 name = "slog-error-chain-derive"
 version = "0.1.0"
 source = "git+https://github.com/oxidecomputer/slog-error-chain?branch=main#15f69041f45774602108e47fb25e705dc23acfb2"
+dependencies = [
+ "proc-macro2",
+ "quote",
+ "syn 2.0.119",
+]
+
+[[package]]
+name = "slog-error-chain-derive"
+version = "0.1.0"
+source = "git+https://github.com/oxidecomputer/slog-error-chain?rev=15f69041f45774602108e47fb25e705dc23acfb2#15f69041f45774602108e47fb25e705dc23acfb2"
 dependencies = [
  "proc-macro2",
  "quote",
@@ -4643,7 +4644,7 @@ version = "0.1.0"
 source = "git+https://github.com/oxidecomputer/sprockets.git?rev=98615b86d51f74ce220198eb16c57932fd24e7cb#98615b86d51f74ce220198eb16c57932fd24e7cb"
 dependencies = [
  "anyhow",
- "attest-data 0.5.0 (git+https://github.com/oxidecomputer/dice-util?rev=4a39ef08d81e5177edee0bddb1146032aa21074d)",
+ "attest-data",
  "camino",
  "cfg-if",
  "clap",
@@ -4659,7 +4660,7 @@ dependencies = [
  "sha3 0.10.9",
  "slog",
  "slog-async",
- "slog-error-chain",
+ "slog-error-chain 0.1.0 (git+https://github.com/oxidecomputer/slog-error-chain?branch=main)",
  "slog-term",
  "thiserror 1.0.69",
  "tokio",
@@ -4867,6 +4868,7 @@ dependencies = [
  "anyhow",
  "async-recursion",
  "atomicwrites",
+ "attest-data",
  "base64 0.22.1",
  "bytes",
  "bytesize",
@@ -5015,6 +5017,7 @@ dependencies = [
  "futures",
  "http-range-header",
  "libc",
+ "pki-playground 0.2.0 (git+https://github.com/oxidecomputer/pki-playground?rev=7600756029ce046a02c6234aa84ce230cc5eaa04)",
  "pwd",
  "rand_core 0.6.4",
  "rumors",
