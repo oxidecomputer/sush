@@ -174,22 +174,35 @@ pub(crate) mod cbor_bytes {
     use serde::{Deserializer, Serializer};
     use std::fmt;
 
+    /// Encode the buffer as one byte string.
     pub fn serialize<S: Serializer>(bytes: &[u8], serializer: S) -> Result<S::Ok, S::Error> {
         serializer.serialize_bytes(bytes)
     }
 
+    /// Decode an owned buffer without imposing the decoder's scratch-buffer limit.
     pub fn deserialize<'de, D: Deserializer<'de>>(deserializer: D) -> Result<Vec<u8>, D::Error> {
+        /// Accept borrowed or owned byte strings as an owned record.
         struct Bytes;
+        /// Preserve the complete byte string regardless of how the decoder supplies it.
         impl<'de> Visitor<'de> for Bytes {
+            /// The record's opaque bytes.
             type Value = Vec<u8>;
+            /// Describe the required CBOR value on a type mismatch.
             fn expecting(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
                 f.write_str("bytes")
             }
+            /// Copy a decoder's temporary buffer.
             fn visit_bytes<E: serde::de::Error>(self, v: &[u8]) -> Result<Self::Value, E> {
                 Ok(v.to_vec())
             }
+            /// Take the decoder's allocation without another copy.
+            fn visit_byte_buf<E: serde::de::Error>(self, v: Vec<u8>) -> Result<Self::Value, E> {
+                Ok(v)
+            }
         }
-        deserializer.deserialize_bytes(Bytes)
+        // The result is owned. Requesting borrowed bytes would restrict
+        // Ciborium to records that fit in its fixed scratch buffer.
+        deserializer.deserialize_byte_buf(Bytes)
     }
 }
 
@@ -287,6 +300,16 @@ mod test {
         };
         let decoded: TestV1 = decode(&encode(&value)).unwrap();
         assert_eq!(decoded, value);
+    }
+
+    /// Records larger than the decoder's scratch buffer round-trip completely.
+    #[test]
+    fn large_record_round_trip() {
+        let value = TestV1 {
+            count: 7,
+            label: "x".repeat(16 * 1024),
+        };
+        assert_eq!(decode::<TestV1>(&encode(&value)).unwrap(), value);
     }
 
     #[test]

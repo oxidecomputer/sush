@@ -38,7 +38,6 @@ memmap2.workspace = true
 p256.workspace = true
 percent-encoding.workspace = true
 pwd.workspace = true
-qorb.workspace = true
 rumors.workspace = true
 rand_core.workspace = true
 rustix.workspace = true
@@ -64,6 +63,7 @@ tokio-tungstenite.workspace = true
 x509-cert.workspace = true
 
 [dev-dependencies]
+tokio = { workspace = true, features = ["test-util"] }
 attest-mock.workspace = true
 ciborium.workspace = true
 function_name.workspace = true
