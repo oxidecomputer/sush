@@ -8,12 +8,10 @@
 //! messages via the gossip protocol.
 
 use std::collections::{BTreeMap, BTreeSet};
-use std::num::NonZeroUsize;
 use std::sync::{Arc, Mutex};
 
 use chrono::{DateTime, Utc};
 use futures::{FutureExt as _, Stream, StreamExt};
-use lru::LruCache;
 use rumors::{CausalMessages, Network, Rumors, Version};
 use sled_hardware_types::BaseboardId;
 use slog::{Logger, debug, error, info, o, warn};
@@ -24,12 +22,11 @@ use tokio_util::sync::CancellationToken;
 use x509_cert::Certificate;
 
 use sush_api::JobStartParams;
-use sush_common::authn::{Identity, Nonce, RequestVerifier, SignedLogin};
 use sush_common::jobs::{
     Access, JobId, JobStatus, JobStatusMap, LastJob, ProcessError, Session, SessionId,
     SessionSushNonce, SignedJob, SkipReason,
 };
-use sush_common::keys::{KeyError, KeyId, SshPublicKey};
+use sush_common::keys::{KeyError, KeyId};
 use sush_common::targets::Cubbies;
 use sush_common::version::{VersionInfo, VersionMap};
 
@@ -40,11 +37,10 @@ use crate::certs::Certificates;
 use crate::executor::{Executor, PathIsolation};
 use crate::gossip::{Seed, Universe};
 use crate::history::JobHistory;
+use crate::identities::Identities;
 use crate::job::SocketSender;
 use crate::locker::Locker;
-use crate::messages::v0::{
-    Error, Event, IdentityRequest, JobEvent, JobRequest, Message, Request, SessionRequest,
-};
+use crate::messages::v0::{Error, Event, JobEvent, JobRequest, Message, Request, SessionRequest};
 use crate::messages::{VersionedMessage, VersionedMessage::*};
 use crate::output::JobOutputDir;
 
@@ -59,24 +55,6 @@ pub type RunningJobs = BTreeMap<(JobId, BaseboardId), DateTime<Utc>>;
 /// yet next in the causal chain to run). Bounds memory in the presence
 /// of out-of-order, duplicate, or malformed submissions.
 pub const MAX_QUEUED_JOBS: usize = 1_000;
-
-/// Maximum number of registered identities. Evicting a real login
-/// only costs its holder a fresh key touch.
-pub const MAX_REGISTERED_IDENTITIES: NonZeroUsize = NonZeroUsize::new(1_000).unwrap();
-
-/// Maximum number of revoked SSH keys remembered for login refusal.
-/// Any authenticated key may revoke, so a flood of junk revocations
-/// can evict a real one. Entries never expire, so unlike nonces the
-/// eviction is permanent. This is sized so the flood takes thousands
-/// of authenticated, attributed, logged requests.
-pub const MAX_REVOKED_KEYS: NonZeroUsize = NonZeroUsize::new(10_000).unwrap();
-
-/// A rack-wide record of a verified login.
-#[derive(Clone, Debug)]
-pub struct RegisteredIdentity {
-    pub identity: Identity,
-    pub verifier: RequestVerifier,
-}
 
 /// A job waiting in the session queue for its turn in the causal chain.
 /// Jobs replayed from history that predates our join keep the chain intact
@@ -575,6 +553,8 @@ pub struct State {
     attachments: AttachmentPoints,
     /// Job request signing certificates.
     certs: Certificates,
+    /// SSH identities for request attribution.
+    identities: Identities,
     /// The nonce binding new session IDs to this sled, shared with the
     /// manager and rotated whenever a session activates.
     session_sush_nonce: Arc<Mutex<SessionSushNonce>>,
@@ -586,10 +566,6 @@ pub struct State {
     unknown_versions: BTreeSet<String>,
     /// Build provenance by sled.
     versions: VersionMap,
-    /// Verified logins, rack-wide.
-    identities: LruCache<(KeyId, Nonce), RegisteredIdentity>,
-    /// SSH keys refused at login.
-    revoked_keys: LruCache<KeyId, DateTime<Utc>>,
 }
 
 impl State {
@@ -608,10 +584,9 @@ impl State {
             attachments: Default::default(),
             session_sush_nonce,
             certs: Certificates::new(trust_anchors)?,
+            identities: Default::default(),
             cubbies: Default::default(),
             unknown_versions: Default::default(),
-            identities: LruCache::new(MAX_REGISTERED_IDENTITIES),
-            revoked_keys: LruCache::new(MAX_REVOKED_KEYS),
             past,
         })
     }
@@ -642,6 +617,10 @@ impl State {
 
     pub fn certs(&self) -> &Certificates {
         &self.certs
+    }
+
+    pub fn identities(&self) -> &Identities {
+        &self.identities
     }
 
     /// Jobs running on our own baseboard, according to our history.
@@ -695,14 +674,6 @@ impl State {
         self.history.get_job_status(job_id)
     }
 
-    pub fn registered_identity(&self, key: &(KeyId, Nonce)) -> Option<&RegisteredIdentity> {
-        self.identities.peek(key)
-    }
-
-    pub fn is_key_revoked(&self, key_id: &KeyId) -> bool {
-        self.revoked_keys.peek(key_id).is_some()
-    }
-
     fn skip_queued_jobs(&self, executor: &Executor) {
         for (job_id, queued) in self.session.queued_jobs().into_iter().flatten() {
             if !queued.replayed
@@ -732,6 +703,11 @@ impl State {
                     let (actor, request) = attributed.as_parts();
                     let log = log.new(o!("actor" => actor.to_string()));
                     self.certs.apply(&log, request);
+                }
+                Request::Identity(attributed) => {
+                    let (actor, request) = attributed.as_parts();
+                    let log = log.new(o!("actor" => actor.to_string()));
+                    self.identities.apply(&log, request);
                 }
                 Request::Session(attributed) => match attributed.as_parts() {
                     (actor, SessionRequest::Start(session_id)) => match &mut self.session {
@@ -1034,49 +1010,6 @@ impl State {
                                 replayed,
                             );
                         }
-                    }
-                },
-                Request::Identity(attributed) => match attributed.as_parts() {
-                    (actor, IdentityRequest::Login(openssh, signed)) => {
-                        match SshPublicKey::from_openssh(openssh)
-                            .and_then(|public_key| verify_login(&public_key, signed))
-                        {
-                            Ok(registered) => {
-                                let identity = &registered.identity;
-                                if self.revoked_keys.peek(&identity.key_id).is_some() {
-                                    info!(
-                                        log, "refusing login for revoked key";
-                                        "key_id" => %identity.key_id, "actor" => %actor,
-                                    );
-                                } else {
-                                    info!(
-                                        log, "registered identity";
-                                        "key_id" => %identity.key_id, "actor" => %actor,
-                                    );
-                                    let key = (identity.key_id.clone(), identity.nonce.clone());
-                                    self.identities.put(key, registered);
-                                }
-                            }
-                            Err(error) => {
-                                error!(
-                                    log, "ignoring invalid login";
-                                    "error" => %error, "actor" => %actor,
-                                );
-                            }
-                        }
-                    }
-                    (actor, IdentityRequest::Revoke(key_id, when)) => {
-                        let dead: Vec<(KeyId, Nonce)> = self
-                            .identities
-                            .iter()
-                            .filter(|((id, _), _)| id == key_id)
-                            .map(|(key, _)| key.clone())
-                            .collect();
-                        for key in dead {
-                            self.identities.pop(&key);
-                        }
-                        self.revoked_keys.put(key_id.clone(), *when);
-                        info!(log, "revoked identity"; "key_id" => %key_id, "actor" => %actor);
                     }
                 },
             },
@@ -1851,19 +1784,6 @@ impl StateManager {
             }),
         ))
     }
-}
-
-/// Re-verify gossiped login evidence. Identity gossip carries the
-/// signed challenge response, not another sled's conclusion, so a
-/// registered identity never depends on that sled's honesty.
-fn verify_login(
-    public_key: &SshPublicKey,
-    signed: &SignedLogin,
-) -> Result<RegisteredIdentity, KeyError> {
-    let verified = signed.clone().verify_with_ssh_public_key(public_key)?;
-    let verifier = verified.epk().clone();
-    let identity = Identity::new(public_key.clone(), verified, Utc::now())?;
-    Ok(RegisteredIdentity { identity, verifier })
 }
 
 #[cfg(test)]

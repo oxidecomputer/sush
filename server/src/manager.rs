@@ -335,8 +335,12 @@ impl JobManager {
                 // A login elsewhere on the rack reaches us as a
                 // registered identity. Adopt it on first use.
                 if !identities.contains(&cache_key) {
-                    let Some(registered) =
-                        self.state.borrow().registered_identity(&cache_key).cloned()
+                    let Some(registered) = self
+                        .state
+                        .borrow()
+                        .identities()
+                        .registered_identity(&cache_key)
+                        .cloned()
                     else {
                         unauthorized!("unknown identity");
                     };
@@ -380,7 +384,7 @@ impl JobManager {
         }
 
         // Refuse revoked keys.
-        if self.state.borrow().is_key_revoked(&key_id) {
+        if self.state.borrow().identities().revoked(&key_id).is_some() {
             unauthorized!("key is revoked");
         }
 
@@ -472,7 +476,7 @@ impl JobManager {
     }
 
     fn wait_for_key_revocation(&self, key_id: KeyId) -> impl FnMut(&State) -> bool {
-        move |state| state.is_key_revoked(&key_id)
+        move |state| state.identities().revoked(&key_id).is_some()
     }
 
     fn wait_for_session(&self, session_id: SessionId) -> impl FnMut(&State) -> bool {

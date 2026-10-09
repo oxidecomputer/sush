@@ -117,10 +117,9 @@ impl FromStr for Challenge {
     }
 }
 
-/// The client half of an ephemeral request-signing key, minted per
-/// authentication. Its public half rides in the signed challenge
-/// response, and it then signs every request without further use of
-/// the identity key.
+/// The client half of an ephemeral (per login) request-signing key.
+/// Its public half is included in the signed challenge response,
+/// so it signs every request without further use of the identity key.
 #[derive(Clone, Debug)]
 pub struct RequestKey(SigningKey);
 
@@ -155,7 +154,6 @@ codephrase_newtype! {
     /// The server half of an ephemeral request-signing key.
     #[derive(Clone, Deserialize, Eq, JsonSchema, PartialEq, Serialize)]
     pub struct RequestVerifier = Full;
-
 }
 
 impl RequestVerifier {
