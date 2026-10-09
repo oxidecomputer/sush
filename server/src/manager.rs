@@ -183,17 +183,18 @@ impl JobManager {
     pub fn versions(&self) -> Vec<SledVersion> {
         let state = self.state.borrow();
         let linked = self.linked.borrow();
-        let mut sleds: BTreeSet<&BaseboardId> = state.versions().keys().collect();
-        sleds.extend(state.cubbies().values());
+        let mut sleds: BTreeSet<&BaseboardId> = state.rack().versions().keys().collect();
+        sleds.extend(state.rack().cubbies().values());
         let mut rows: Vec<SledVersion> = sleds
             .into_iter()
             .map(|baseboard| SledVersion {
                 cubby: state
+                    .rack()
                     .cubbies()
                     .iter()
                     .find_map(|(cubby, b)| (b == baseboard).then_some(*cubby)),
                 baseboard: baseboard.clone(),
-                version: state.versions().get(baseboard).cloned(),
+                version: state.rack().versions().get(baseboard).cloned(),
                 health: Some(
                     if *baseboard == self.own_baseboard || linked.contains(baseboard) {
                         SledHealth::Linked

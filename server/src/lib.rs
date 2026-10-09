@@ -30,6 +30,7 @@ pub mod mux;
 pub mod output;
 pub mod proxy;
 pub mod pty;
+pub mod rack;
 pub mod server;
 pub mod state;
 

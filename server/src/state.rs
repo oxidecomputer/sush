@@ -28,7 +28,7 @@ use sush_common::jobs::{
 };
 use sush_common::keys::{KeyError, KeyId};
 use sush_common::targets::Cubbies;
-use sush_common::version::{VersionInfo, VersionMap};
+use sush_common::version::VersionInfo;
 
 use crate::bloom::Bloom;
 use crate::bookmark::SushBookmark;
@@ -43,6 +43,7 @@ use crate::locker::Locker;
 use crate::messages::v0::{Error, Event, JobEvent, JobRequest, Message, Request, SessionRequest};
 use crate::messages::{VersionedMessage, VersionedMessage::*};
 use crate::output::JobOutputDir;
+use crate::rack::Rack;
 
 pub type AttachmentPoints = BTreeMap<JobId, watch::Receiver<Option<SocketSender>>>;
 pub type GossipNetwork = Rumors<VersionedMessage, SushBookmark>;
@@ -185,15 +186,15 @@ impl<'a> SessionGuard<'a> {
         log: &Logger,
         history: &mut JobHistory,
         running: &RunningJobs,
-        own_baseboard: &BaseboardId,
-        cubbies: &Cubbies,
+        rack: &Rack,
         job: SignedJob,
         params: JobStartParams,
         actor: &KeyId,
         replayed: bool,
     ) {
         let job_id = *job.job_id();
-        let targeted = job.payload().runs_on(own_baseboard, cubbies);
+        let targeted = rack.runs_here(&job);
+
         // Adjudication can give the boundary job a status before its
         // request replays. The queue releases jobs in order, so
         // dropping that request would wedge the session behind the
@@ -224,7 +225,7 @@ impl<'a> SessionGuard<'a> {
             if targeted && !replayed {
                 history.set_job_status(
                     &job_id,
-                    own_baseboard,
+                    rack.own_baseboard(),
                     JobStatus::Queued {
                         job_id,
                         time_queued: Utc::now(),
@@ -277,8 +278,7 @@ impl<'a> SessionGuard<'a> {
     pub fn execute_ready_jobs(
         &mut self,
         log: &Logger,
-        own_baseboard: &BaseboardId,
-        cubbies: &Cubbies,
+        rack: &Rack,
         certs: &mut Certificates,
         history: &mut JobHistory,
         executor: &mut Executor,
@@ -305,7 +305,7 @@ impl<'a> SessionGuard<'a> {
                     log, "raising the execution floor above a session the boundary record cannot order";
                     "session_id" => %self.session_id(), "started" => ?self.started,
                 );
-                past.hop(log, rumors, own_baseboard, Error::SessionHop);
+                past.hop(log, rumors, rack.own_baseboard(), Error::SessionHop);
                 continue;
             }
             let QueuedJob {
@@ -315,7 +315,7 @@ impl<'a> SessionGuard<'a> {
             } = self.queued_jobs.remove(&next_id).expect("checked above");
             let (tx_attachment, rx_attachment) = watch::channel(None);
             let job_id = request.payload().job_id().to_owned();
-            if request.payload().runs_on(own_baseboard, cubbies) {
+            if rack.runs_here(&request) {
                 if past.boundary.untrusted() {
                     warn!(
                         log, "refusing job, the execution boundary is untrusted";
@@ -343,7 +343,10 @@ impl<'a> SessionGuard<'a> {
                 } else if history
                     .get_job_status(&job_id)
                     .map(|status| {
-                        matches!(status.get(own_baseboard), Some(JobStatus::Queued { .. }))
+                        matches!(
+                            status.get(rack.own_baseboard()),
+                            Some(JobStatus::Queued { .. })
+                        )
                     })
                     .unwrap_or(true)
                 {
@@ -541,8 +544,8 @@ impl Past {
 
 #[derive(Debug)]
 pub struct State {
-    /// The ID of the baseboard (sled) the server is running on.
-    own_baseboard: BaseboardId,
+    /// Information about the rack in which we're running.
+    rack: Rack,
     /// Status of all jobs everywhere (lossy).
     history: JobHistory,
     /// The set of running jobs everywhere, tagged by start wall-clock time.
@@ -558,14 +561,8 @@ pub struct State {
     /// The nonce binding new session IDs to this sled, shared with the
     /// manager and rotated whenever a session activates.
     session_sush_nonce: Arc<Mutex<SessionSushNonce>>,
-    /// Baseboards by cubby number, as much of it as is known.
-    cubbies: Cubbies,
     /// This incarnation's relationship to its own past.
     past: Past,
-    /// Message versions from newer builds, each warned about once.
-    unknown_versions: BTreeSet<String>,
-    /// Build provenance by sled.
-    versions: VersionMap,
 }
 
 impl State {
@@ -576,8 +573,7 @@ impl State {
         past: Past,
     ) -> Result<Self, KeyError> {
         Ok(Self {
-            versions: [(own_baseboard.clone(), VersionInfo::current())].into(),
-            own_baseboard,
+            rack: Rack::new(own_baseboard),
             running: Default::default(),
             history: Default::default(),
             session: Default::default(),
@@ -585,8 +581,6 @@ impl State {
             session_sush_nonce,
             certs: Certificates::new(trust_anchors)?,
             identities: Default::default(),
-            cubbies: Default::default(),
-            unknown_versions: Default::default(),
             past,
         })
     }
@@ -603,12 +597,8 @@ impl State {
         self.session.attach_access(key_id)
     }
 
-    pub fn cubbies(&self) -> &Cubbies {
-        &self.cubbies
-    }
-
-    pub fn versions(&self) -> &VersionMap {
-        &self.versions
+    pub fn rack(&self) -> &Rack {
+        &self.rack
     }
 
     pub fn history(&self) -> &JobHistory {
@@ -627,7 +617,7 @@ impl State {
     pub fn own_running_jobs(&self) -> BTreeSet<JobId> {
         self.running
             .keys()
-            .filter(|(_, baseboard)| *baseboard == self.own_baseboard)
+            .filter(|(_, baseboard)| baseboard == self.rack.own_baseboard())
             .map(|(job_id, _)| *job_id)
             .collect()
     }
@@ -639,7 +629,7 @@ impl State {
             .iter()
             .filter(|job_id| {
                 self.running
-                    .contains_key(&(**job_id, self.own_baseboard.clone()))
+                    .contains_key(&(**job_id, self.rack.own_baseboard().clone()))
             })
             .copied()
             .collect()
@@ -657,7 +647,7 @@ impl State {
         let Some(status) = self
             .history
             .get_job_status(job_id)
-            .and_then(|map| map.get(&self.own_baseboard))
+            .and_then(|map| map.get(self.rack.own_baseboard()))
             .cloned()
         else {
             return;
@@ -676,12 +666,7 @@ impl State {
 
     fn skip_queued_jobs(&self, executor: &Executor) {
         for (job_id, queued) in self.session.queued_jobs().into_iter().flatten() {
-            if !queued.replayed
-                && queued
-                    .job
-                    .payload()
-                    .runs_on(&self.own_baseboard, &self.cubbies)
-            {
+            if !queued.replayed && self.rack.runs_here(&queued.job) {
                 executor.job_skipped(*job_id, SkipReason::SessionEnded);
             }
         }
@@ -893,15 +878,14 @@ impl State {
                                 session.cancel_job(
                                     job_id,
                                     actor,
-                                    &self.own_baseboard,
+                                    self.rack.own_baseboard(),
                                     &mut self.history,
                                     &self.running,
                                     replayed,
                                 );
                                 session.execute_ready_jobs(
                                     log,
-                                    &self.own_baseboard,
-                                    &self.cubbies,
+                                    &self.rack,
                                     &mut self.certs,
                                     &mut self.history,
                                     executor,
@@ -961,8 +945,7 @@ impl State {
                                     log,
                                     &mut self.history,
                                     &self.running,
-                                    &self.own_baseboard,
-                                    &self.cubbies,
+                                    &self.rack,
                                     signed.clone(),
                                     params.clone(),
                                     actor,
@@ -970,8 +953,7 @@ impl State {
                                 );
                                 session.execute_ready_jobs(
                                     log,
-                                    &self.own_baseboard,
-                                    &self.cubbies,
+                                    &self.rack,
                                     &mut self.certs,
                                     &mut self.history,
                                     executor,
@@ -989,7 +971,7 @@ impl State {
                                     "actor" => %actor,
                                 );
                                 if live
-                                    && signed.payload().runs_on(&self.own_baseboard, &self.cubbies)
+                                    && self.rack.runs_here(signed)
                                     && !self.history.contains(&job_id)
                                 {
                                     executor.job_skipped(job_id, SkipReason::SessionEnded);
@@ -1004,7 +986,7 @@ impl State {
                             session.cancel_job(
                                 job_id,
                                 actor,
-                                &self.own_baseboard,
+                                self.rack.own_baseboard(),
                                 &mut self.history,
                                 &self.running,
                                 replayed,
@@ -1043,7 +1025,7 @@ impl State {
                         // mark would misread a previous life's start
                         // as this life's own whenever the join peer
                         // lagged behind that start.
-                        if *baseboard_id == self.own_baseboard
+                        if baseboard_id == self.rack.own_baseboard()
                             && self.past.is_from_previous_life(incoming_version)
                         {
                             self.past.zombies.insert(*job_id);
@@ -1062,7 +1044,7 @@ impl State {
                     }
                     JobEvent::Stop(job_id, when, result, output) => {
                         info!(log, "job stopped"; "job_id" => %job_id, "when" => %when, "result" => ?result);
-                        if baseboard_id == &self.own_baseboard {
+                        if baseboard_id == self.rack.own_baseboard() {
                             self.attachments.remove(job_id);
                             self.past.zombies.remove(job_id);
                         }
@@ -1101,14 +1083,14 @@ impl State {
                             self.session.queued_jobs(),
                             &self.running,
                         );
-                        if *baseboard_id == self.own_baseboard {
+                        if baseboard_id == self.rack.own_baseboard() {
                             executor.job_stopped(job_id);
                             self.record_boundary_outcome(job_id);
                         }
                     }
                     JobEvent::Error(job_id, when, error) => {
                         error!(log, "job error"; "job_id" => %job_id, "when" => %when, "error" => %error);
-                        if baseboard_id == &self.own_baseboard {
+                        if baseboard_id == self.rack.own_baseboard() {
                             self.attachments.remove(job_id);
                             self.past.zombies.remove(job_id);
                         }
@@ -1134,7 +1116,7 @@ impl State {
                             self.session.queued_jobs(),
                             &self.running,
                         );
-                        if *baseboard_id == self.own_baseboard {
+                        if baseboard_id == self.rack.own_baseboard() {
                             executor.job_stopped(job_id);
                             self.record_boundary_outcome(job_id);
                         }
@@ -1171,16 +1153,13 @@ impl State {
                     error!(log, "session error"; "error" => %error);
                 }
                 Event::Version(info) => {
-                    // Our own seed is authoritative, and may be newer
-                    // than a replayed announce from a previous boot.
-                    if *baseboard_id != self.own_baseboard {
+                    if self.rack.known_version(baseboard_id.clone(), info.clone()) {
                         info!(log, "sled version"; "sled" => %baseboard_id, "version" => %info);
-                        self.versions.insert(baseboard_id.clone(), info.clone());
                     }
                 }
             },
             Unknown { version, .. } => {
-                if self.unknown_versions.insert(version.clone()) {
+                if self.rack.unknown_version(version.clone()) {
                     warn!(log, "ignoring messages from a newer peer"; "version" => version);
                 }
             }
@@ -1503,7 +1482,9 @@ impl StateManager {
                 None,
             ),
         )?;
-        initial_state.cubbies = cubbies.borrow_and_update().clone();
+        initial_state
+            .rack
+            .set_cubbies(cubbies.borrow_and_update().clone());
         let (tx_state, rx_state) = watch::channel(initial_state);
         let anchors = anchors.to_vec();
 
@@ -1684,7 +1665,7 @@ impl StateManager {
                         // Follow the rack's cubby map.
                         Ok(()) = cubbies.changed() => {
                             tx_state.send_modify(|state| {
-                                state.cubbies = cubbies.borrow_and_update().clone();
+                                state.rack.set_cubbies(cubbies.borrow_and_update().clone());
                             });
                         },
 
@@ -1750,7 +1731,7 @@ impl StateManager {
                                 ),
                             )
                             .expect("trust anchors validated at startup");
-                            state.cubbies = cubbies.borrow().clone();
+                            state.rack.set_cubbies(cubbies.borrow().clone());
                         });
                         // The set received at join is already local:
                         // drain it, then reap.
