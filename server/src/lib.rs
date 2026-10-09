@@ -13,6 +13,7 @@ compile_error!("`test-support` must not be enabled for an embedded server");
 pub mod bloom;
 pub mod bookmark;
 pub mod boundary;
+pub mod certs;
 pub mod error;
 pub mod executor;
 pub mod format;
@@ -32,7 +33,7 @@ pub mod server;
 pub mod state;
 
 pub use error::JobError;
-pub use manager::{JobManager, read_root_certs};
+pub use manager::{JobManager, read_certs};
 pub use proxy::ProxyServer;
 pub use server::ApiServer;
 pub use state::seed_gossip;

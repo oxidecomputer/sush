@@ -26,12 +26,12 @@ use sush_server::locker::Locker;
 use sush_server::manager::JobManager;
 use sush_server::output::JobOutputDir;
 use sush_server::server::ApiServer;
-use sush_server::{read_root_certs, seed_gossip};
+use sush_server::{read_certs, seed_gossip};
 
 const DEFAULT_ADDRESS: &str = "0.0.0.0:44444";
-const ROOT_CERTS: &[&[u8]] = &[include_bytes!("../certs/sandbox.pem")];
 const ROOT_LOG_NAME: &str = "sush";
 const REQUEST_MAX_BODY_BYTES: usize = 0xFFFF;
+const TRUST_ANCHORS: &[&[u8]] = &[include_bytes!("../certs/sandbox.pem")];
 
 #[derive(Parser)]
 #[clap(name = "Oxide Support Shell Server")]
@@ -55,10 +55,10 @@ struct ServerArgs {
     #[arg(long, default_value_t = false)]
     insecure_disable_path_isolation: bool,
 
-    /// Root certificates to use to verify signatures
+    /// Certificates trusted to verify job signatures
     #[cfg(feature = "test-support")]
-    #[arg(long = "root-cert")]
-    override_root_certs: Vec<PathBuf>,
+    #[arg(long)]
+    trust_anchors: Vec<PathBuf>,
 }
 
 #[tokio::main]
@@ -68,7 +68,7 @@ async fn main() -> Result<(), String> {
         debug,
         directory,
         #[cfg(feature = "test-support")]
-        override_root_certs,
+        trust_anchors,
         insecure_disable_path_isolation,
     } = ServerArgs::parse();
 
@@ -98,13 +98,13 @@ async fn main() -> Result<(), String> {
     let gossip = Universe::isolated(seed_gossip(&log, &Locker::null()).await.into_rumors());
 
     #[cfg(feature = "test-support")]
-    let roots = overridable_root_certs(&override_root_certs).await?;
+    let anchors = overridable_trust_anchors(&trust_anchors).await?;
     #[cfg(not(feature = "test-support"))]
-    let roots = builtin_root_certs()?;
+    let anchors = builtin_trust_anchors()?;
 
     let shutdown = listen_for_shutdown()?;
     let (_cubbies, cubbies) = watch::channel(Cubbies::new());
-    let mut mgr = JobManager::with_root_certs(
+    let mut mgr = JobManager::with_trust_anchors(
         log.clone(),
         path_isolation,
         JobOutputDir::fixed(directory),
@@ -113,7 +113,7 @@ async fn main() -> Result<(), String> {
         gossip,
         LinkedBaseboards::lonely(),
         &Locker::null(),
-        &roots,
+        &anchors,
         shutdown.clone(),
     )
     .await
@@ -143,8 +143,8 @@ async fn main() -> Result<(), String> {
     Ok(())
 }
 
-fn builtin_root_certs() -> Result<Vec<Certificate>, String> {
-    ROOT_CERTS
+fn builtin_trust_anchors() -> Result<Vec<Certificate>, String> {
+    TRUST_ANCHORS
         .iter()
         .map(Certificate::from_pem)
         .collect::<Result<Vec<_>, _>>()
@@ -152,15 +152,11 @@ fn builtin_root_certs() -> Result<Vec<Certificate>, String> {
 }
 
 #[cfg_attr(not(feature = "test-support"), expect(dead_code))]
-async fn overridable_root_certs(
-    override_root_certs: &[PathBuf],
-) -> Result<Vec<Certificate>, String> {
-    if override_root_certs.is_empty() {
-        builtin_root_certs()
+async fn overridable_trust_anchors(certs: &[PathBuf]) -> Result<Vec<Certificate>, String> {
+    if certs.is_empty() {
+        builtin_trust_anchors()
     } else {
-        read_root_certs(override_root_certs)
-            .await
-            .map_err(|e| e.to_string())
+        read_certs(certs).await.map_err(|e| e.to_string())
     }
 }
 

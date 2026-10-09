@@ -37,12 +37,12 @@ use sush_common::jobs::{
 };
 
 use crate::boundary::{Boundary, BoundaryStore};
+use crate::certs::Certificates;
 use crate::io::JobIo;
 use crate::job::{Job, SocketSender};
 use crate::messages::v0::{Event, JobEvent};
 use crate::output::JobOutputDir;
 use crate::pty::open_pty;
-use crate::state::{Certificates, cert_chain};
 
 pub const DEFAULT_PATH: &str = "/usr/sbin:/usr/bin:/sbin:/bin";
 pub const DEFAULT_TERM: &str = "vt100";
@@ -174,7 +174,7 @@ impl Executor {
         if request.payload().command.starts_with('-') {
             fail!(ProcessError::InvalidCommand);
         }
-        let chain = match cert_chain(certs, request.key_id()) {
+        let chain = match certs.chain(request.key_id()) {
             Ok(chain) => chain,
             Err(error) => fail!(ProcessError::InvalidJob(error.to_string())),
         };

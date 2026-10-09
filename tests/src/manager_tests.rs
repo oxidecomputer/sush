@@ -683,7 +683,7 @@ async fn cubby_targets() {
     let dir = TempDir::with_prefix("sush-").unwrap();
     let mut root = ephemeral_test_root();
     let (cubbies, cubbies_rx) = watch::channel(Cubbies::new());
-    let mgr = JobManager::with_root_certs(
+    let mgr = JobManager::with_trust_anchors(
         log,
         PathIsolation::InsecureDisable,
         JobOutputDir::fixed(dir.path()),
@@ -874,7 +874,7 @@ async fn job_output_dir_moves() {
         JobLimits::default().max_fsize,
     ));
     let mut root = ephemeral_test_root();
-    let mgr = JobManager::with_root_certs(
+    let mgr = JobManager::with_trust_anchors(
         log,
         PathIsolation::InsecureDisable,
         JobOutputDir::new(rx_dirs),
@@ -976,7 +976,7 @@ async fn universe_swap() {
     let dir = TempDir::with_prefix("sush-").unwrap();
     let mut root = ephemeral_test_root();
     let (universe, universe_rx) = watch::channel(Universe::genesis(null_gossip().await));
-    let mgr = JobManager::with_root_certs(
+    let mgr = JobManager::with_trust_anchors(
         log,
         PathIsolation::InsecureDisable,
         JobOutputDir::fixed(dir.path()),
@@ -1148,7 +1148,7 @@ async fn cert_chain() {
     };
     let gossip = Universe::isolated(null_gossip().await);
     let shutdown = CancellationToken::new();
-    let mgr = JobManager::with_root_certs(
+    let mgr = JobManager::with_trust_anchors(
         log,
         PathIsolation::InsecureDisable,
         JobOutputDir::fixed(dir.path()),
@@ -1416,7 +1416,7 @@ async fn cert_revoke() {
 
     assert!(matches!(
         mgr.cert_revoke(&authn, root.key_id().clone(), false).await,
-        Err(JobError::RootRevocation(_)),
+        Err(JobError::TrustAnchorRevocation(_)),
     ));
 
     mgr.cert_import(&authn, child.cert().clone(), true)
@@ -1433,19 +1433,10 @@ async fn cert_revoke() {
     mgr.cert_revoke(&authn, unseen.key_id().clone(), true)
         .await
         .unwrap();
-    mgr.cert_import(&authn, unseen.cert().clone(), false)
-        .await
-        .unwrap();
-    timeout(Duration::from_secs(30), async {
-        loop {
-            match mgr.cert_chain(&authn, unseen.key_id()) {
-                Err(JobError::Key(KeyError::Revoked(..))) => break,
-                _ => sleep(Duration::from_millis(50)).await,
-            }
-        }
-    })
-    .await
-    .expect("tombstone never consumed the import");
+    assert!(matches!(
+        mgr.cert_import(&authn, unseen.cert().clone(), false).await,
+        Err(JobError::Key(KeyError::Revoked(..))),
+    ));
 }
 
 /// A job runs only on the sleds its signed target names. Jobs naming
@@ -1933,7 +1924,7 @@ async fn hostile_imports_cannot_displace() {
     let seed = null_gossip().await;
     let peer = seed.clone();
     let shutdown = CancellationToken::new();
-    let mgr = JobManager::with_root_certs(
+    let mgr = JobManager::with_trust_anchors(
         log,
         PathIsolation::InsecureDisable,
         JobOutputDir::fixed(dir.path()),
@@ -2081,7 +2072,7 @@ async fn homonym_issuer_resolves_to_true_parent() {
     let seed = null_gossip().await;
     let peer = seed.clone();
     let shutdown = CancellationToken::new();
-    let mgr = JobManager::with_root_certs(
+    let mgr = JobManager::with_trust_anchors(
         log,
         PathIsolation::InsecureDisable,
         JobOutputDir::fixed(dir.path()),

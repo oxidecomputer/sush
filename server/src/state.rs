@@ -22,7 +22,6 @@ use tokio::task::JoinHandle;
 use tokio::{select, spawn};
 use tokio_util::sync::CancellationToken;
 use x509_cert::Certificate;
-use x509_cert::der::{Decode as _, Encode as _};
 
 use sush_api::JobStartParams;
 use sush_common::authn::{Identity, Nonce, RequestVerifier, SignedLogin};
@@ -30,47 +29,36 @@ use sush_common::jobs::{
     Access, JobId, JobStatus, JobStatusMap, LastJob, ProcessError, Session, SessionId,
     SessionSushNonce, SignedJob, SkipReason,
 };
-use sush_common::keys::{KeyError, KeyId, Signature, SshPublicKey};
+use sush_common::keys::{KeyError, KeyId, SshPublicKey};
 use sush_common::targets::Cubbies;
 use sush_common::version::{VersionInfo, VersionMap};
 
 use crate::bloom::Bloom;
 use crate::bookmark::SushBookmark;
 use crate::boundary::{Boundary, BoundaryStore, Committed, JobOutcome};
+use crate::certs::Certificates;
 use crate::executor::{Executor, PathIsolation};
 use crate::gossip::{Seed, Universe};
 use crate::history::JobHistory;
 use crate::job::SocketSender;
 use crate::locker::Locker;
 use crate::messages::v0::{
-    CertRequest, Error, Event, IdentityRequest, JobEvent, JobRequest, Message, Request,
-    SessionRequest,
+    Error, Event, IdentityRequest, JobEvent, JobRequest, Message, Request, SessionRequest,
 };
 use crate::messages::{VersionedMessage, VersionedMessage::*};
 use crate::output::JobOutputDir;
 
 pub type AttachmentPoints = BTreeMap<JobId, watch::Receiver<Option<SocketSender>>>;
-pub type Certificates = BTreeMap<KeyId, CertState>;
 pub type GossipNetwork = Rumors<VersionedMessage, SushBookmark>;
 pub type GossipSeed = Seed<VersionedMessage>;
 pub type GossipUniverse = Universe<VersionedMessage>;
 pub type QueuedJobs = BTreeMap<JobId, QueuedJob>;
 pub type RunningJobs = BTreeMap<(JobId, BaseboardId), DateTime<Utc>>;
 
-/// Maximum certificate chain length.
-pub const MAX_CERT_CHAIN_LEN: usize = 10;
-
-/// Maximum number of job request signing certificates.
-/// The ideal number of certs is 1, so this need not be large.
-pub const MAX_CERTS: usize = 100;
-
 /// Maximum number of jobs a session may have queued (submitted, but not
 /// yet next in the causal chain to run). Bounds memory in the presence
 /// of out-of-order, duplicate, or malformed submissions.
 pub const MAX_QUEUED_JOBS: usize = 1_000;
-
-/// Maximum number of revocations held for certificates not yet seen.
-pub const MAX_TOMBSTONES: NonZeroUsize = NonZeroUsize::new(100).unwrap();
 
 /// Maximum number of registered identities. Evicting a real login
 /// only costs its holder a fresh key touch.
@@ -590,12 +578,6 @@ pub struct State {
     /// The nonce binding new session IDs to this sled, shared with the
     /// manager and rotated whenever a session activates.
     session_sush_nonce: Arc<Mutex<SessionSushNonce>>,
-    /// Revocations of certificates we have never seen. Bounded and
-    /// apart from `certs`, so revocation spam evicts only itself.
-    tombstones: LruCache<KeyId, DateTime<Utc>>,
-    /// Hard-coded root certificate key IDs. Self-signed certificates
-    /// not in this set will be revoked with prejudice.
-    roots: Box<[KeyId]>,
     /// Baseboards by cubby number, as much of it as is known.
     cubbies: Cubbies,
     /// This incarnation's relationship to its own past.
@@ -611,26 +593,13 @@ pub struct State {
 }
 
 impl State {
-    /// Fails if any root certificate is malformed or does not validate. Roots
-    /// are supplied by whoever configures the server, so they are not
-    /// necessarily trustworthy just because they were handed to us.
     pub fn new(
         own_baseboard: BaseboardId,
-        root_certs: &[Certificate],
+        trust_anchors: &[Certificate],
         session_sush_nonce: Arc<Mutex<SessionSushNonce>>,
         past: Past,
     ) -> Result<Self, KeyError> {
-        let certs = root_certs
-            .iter()
-            .map(|cert| {
-                Ok((
-                    KeyId::try_from(cert)?,
-                    CertState::Unknown(Box::new(cert.clone())),
-                ))
-            })
-            .collect::<Result<BTreeMap<KeyId, CertState>, KeyError>>()?;
-        let roots: Box<[KeyId]> = certs.keys().cloned().collect();
-        let mut new = Self {
+        Ok(Self {
             versions: [(own_baseboard.clone(), VersionInfo::current())].into(),
             own_baseboard,
             running: Default::default(),
@@ -638,24 +607,13 @@ impl State {
             session: Default::default(),
             attachments: Default::default(),
             session_sush_nonce,
-            tombstones: LruCache::new(MAX_TOMBSTONES),
-            certs,
-            roots: roots.clone(),
+            certs: Certificates::new(trust_anchors)?,
             cubbies: Default::default(),
             unknown_versions: Default::default(),
             identities: LruCache::new(MAX_REGISTERED_IDENTITIES),
             revoked_keys: LruCache::new(MAX_REVOKED_KEYS),
             past,
-        };
-        new.validate_certs(&roots);
-        for root in &roots {
-            if !new.certs[root].is_valid() {
-                return Err(KeyError::InvalidCert(format!(
-                    "root certificate `{root}` does not validate"
-                )));
-            }
-        }
-        Ok(new)
+        })
     }
 
     pub fn get_attachment(&self, job_id: &JobId) -> Option<SocketSender> {
@@ -680,6 +638,10 @@ impl State {
 
     pub fn history(&self) -> &JobHistory {
         &self.history
+    }
+
+    pub fn certs(&self) -> &Certificates {
+        &self.certs
     }
 
     /// Jobs running on our own baseboard, according to our history.
@@ -733,53 +695,6 @@ impl State {
         self.history.get_job_status(job_id)
     }
 
-    /// Import the first certificate seen for a key. Re-importing the
-    /// identical certificate is a no-op. Anything else at an occupied
-    /// key ID is refused, so no import can displace an established
-    /// certificate.
-    fn cert_import(&mut self, cert: &Certificate) -> Result<KeyId, KeyError> {
-        if cert.tbs_certificate.subject == cert.tbs_certificate.issuer {
-            return Err(KeyError::SelfSigned);
-        }
-        let key_id = KeyId::try_from(cert)?;
-        // A tombstone becomes a durable revocation once its
-        // certificate shows up. `certs` may briefly exceed `MAX_CERTS`
-        // by the tombstone count.
-        if let Some(when) = self.tombstones.pop(&key_id) {
-            self.certs
-                .insert(key_id.clone(), CertState::Revoked(key_id.clone(), when));
-            return Err(KeyError::Revoked(key_id, when));
-        }
-        match self.certs.get(&key_id) {
-            Some(CertState::Revoked(_, when)) => Err(KeyError::Revoked(key_id, *when)),
-            Some(existing) if existing.cert() == Some(cert) => Ok(key_id),
-            Some(_) => Err(KeyError::CertConflict(key_id)),
-            None if self.certs.len() >= MAX_CERTS => Err(KeyError::TooManyCerts(MAX_CERTS)),
-            None => {
-                self.certs
-                    .insert(key_id.clone(), CertState::Unknown(Box::new(cert.clone())));
-                Ok(key_id)
-            }
-        }
-    }
-
-    pub fn cert_chain(&self, key_id: &KeyId) -> Result<Vec<Certificate>, KeyError> {
-        cert_chain(&self.certs, key_id)
-    }
-
-    pub fn num_certs(&self) -> usize {
-        self.certs.len()
-    }
-
-    pub fn is_root(&self, key_id: &KeyId) -> bool {
-        self.roots.contains(key_id)
-    }
-
-    pub fn is_cert_revoked(&self, key_id: &KeyId) -> bool {
-        matches!(self.certs.get(key_id), Some(CertState::Revoked(..)))
-            || self.tombstones.peek(key_id).is_some()
-    }
-
     pub fn registered_identity(&self, key: &(KeyId, Nonce)) -> Option<&RegisteredIdentity> {
         self.identities.peek(key)
     }
@@ -813,31 +728,11 @@ impl State {
         use SessionState::*;
         match message.as_ref() {
             V0(Message::Request(request)) => match request {
-                Request::Cert(attributed) => match attributed.as_parts() {
-                    (actor, CertRequest::Import(der)) => match Certificate::from_der(der)
-                        .map_err(KeyError::from)
-                        .and_then(|cert| self.cert_import(&cert))
-                    {
-                        Ok(key_id) => {
-                            info!(log, "imported certificate"; "key_id" => %key_id, "actor" => %actor);
-                            self.validate_certs(&self.roots.clone());
-                        }
-                        Err(error) => {
-                            error!(log, "ignoring invalid certificate"; "error" => %error);
-                        }
-                    },
-                    (actor, CertRequest::Revoke(key_id, when)) => {
-                        if self.roots.contains(key_id) {
-                            error!(log, "refusing to revoke root certificate"; "key_id" => %key_id);
-                        } else if let Some(cert) = self.certs.get_mut(key_id) {
-                            *cert = CertState::Revoked(key_id.clone(), *when);
-                            info!(log, "revoked known certificate"; "key_id" => %key_id, "actor" => %actor);
-                        } else {
-                            self.tombstones.put(key_id.clone(), *when);
-                            info!(log, "revoked unknown certificate"; "key_id" => %key_id, "actor" => %actor);
-                        }
-                    }
-                },
+                Request::Cert(attributed) => {
+                    let (actor, request) = attributed.as_parts();
+                    let log = log.new(o!("actor" => actor.to_string()));
+                    self.certs.apply(&log, request);
+                }
                 Request::Session(attributed) => match attributed.as_parts() {
                     (actor, SessionRequest::Start(session_id)) => match &mut self.session {
                         // Re-announcement of active session; absorb and ignore.
@@ -1635,7 +1530,7 @@ impl StateManager {
         mut requests: R,
         mut cubbies: watch::Receiver<Cubbies>,
         mut universe: watch::Receiver<GossipUniverse>,
-        roots: &[Certificate],
+        anchors: &[Certificate],
         session_sush_nonce: Arc<Mutex<SessionSushNonce>>,
         store: Arc<BoundaryStore>,
         shutdown: CancellationToken,
@@ -1665,7 +1560,7 @@ impl StateManager {
         // placeholder birth is replaced before any message applies.
         let mut initial_state = State::new(
             own_baseboard.clone(),
-            roots,
+            anchors,
             session_sush_nonce.clone(),
             Past::new(
                 Version::new(),
@@ -1677,7 +1572,7 @@ impl StateManager {
         )?;
         initial_state.cubbies = cubbies.borrow_and_update().clone();
         let (tx_state, rx_state) = watch::channel(initial_state);
-        let roots = roots.to_vec();
+        let anchors = anchors.to_vec();
 
         // The executor needs to have access to send messages back.
         let (mut executor, mut events) = Executor::new(
@@ -1911,7 +1806,7 @@ impl StateManager {
                         tx_state.send_modify(|state| {
                             *state = State::new(
                                 own_baseboard.clone(),
-                                &roots,
+                                &anchors,
                                 state.session_sush_nonce.clone(),
                                 Past::new(
                                     arrival,
@@ -1921,7 +1816,7 @@ impl StateManager {
                                     floor.clone(),
                                 ),
                             )
-                            .expect("roots validated at startup");
+                            .expect("trust anchors validated at startup");
                             state.cubbies = cubbies.borrow().clone();
                         });
                         // The set received at join is already local:
@@ -1958,138 +1853,6 @@ impl StateManager {
     }
 }
 
-/// Certificate validation state.
-///
-/// Transitions are monotone: state only moves upward in this
-/// lattice, so the resulting map is a function of the set of
-/// messages received, independent of their delivery order.
-///
-/// ```text
-///              Revoked
-///             ▲   ▲   ▲
-///            /    |    \
-///        Valid    |    Invalid
-///            ▲    |    ▲
-///             \   |   /
-///              Unknown ──┐
-///                  ▲     │ (issuer not yet seen)
-///                  └─────┘
-/// ```
-///
-/// Allowed transitions are `Unknown → Valid` on successful chain validation;
-/// `Unknown → Unknown` while no valid issuer verifies the certificate;
-/// `Unknown → Invalid` on an intrinsic failure (bad encoding, or self-signed
-/// without being a root); and any state `→ Revoked`, from which no state
-/// ever returns.
-#[derive(Debug)]
-pub enum CertState {
-    Unknown(Box<Certificate>),
-    /// A validated certificate and the key ID of the issuer that
-    /// verified it, or `None` for a root.
-    Valid(Box<Certificate>, Option<KeyId>),
-    Invalid(KeyError),
-    Revoked(KeyId, DateTime<Utc>),
-}
-
-impl CertState {
-    fn is_unknown(&self) -> bool {
-        matches!(self, Self::Unknown(_))
-    }
-
-    fn is_valid(&self) -> bool {
-        matches!(self, Self::Valid(..))
-    }
-
-    fn cert(&self) -> Option<&Certificate> {
-        match self {
-            Self::Unknown(cert) | Self::Valid(cert, _) => Some(cert),
-            Self::Invalid(_) | Self::Revoked(..) => None,
-        }
-    }
-
-    fn map_valid<R>(&self, f: impl FnOnce(&Certificate) -> &R) -> Option<&R> {
-        if let Self::Valid(cert, _) = self {
-            Some(f(cert))
-        } else {
-            None
-        }
-    }
-
-    fn validate(self, certs: &Certificates, roots: &[KeyId]) -> Self {
-        if let Self::Unknown(cert) = self {
-            macro_rules! with_err {
-                ($expr:expr) => {
-                    match $expr {
-                        Ok(res) => res,
-                        Err(err) => return Self::Invalid(err.into()),
-                    }
-                };
-            }
-
-            // Verify the certificate signature.
-            // TODO: check expiry, basicConstraints, keyUsage.
-            let signature = with_err!(Signature::try_from(cert.as_ref()));
-            let tbs = with_err!(cert.tbs_certificate.to_der());
-            let subject = &cert.tbs_certificate.subject;
-            let issuer = &cert.tbs_certificate.issuer;
-            if subject == issuer {
-                let key_id = with_err!(KeyId::try_from(cert.as_ref()));
-                if !roots.contains(&key_id) {
-                    return Self::Invalid(KeyError::SelfSigned);
-                }
-                with_err!(
-                    signature.verify_with_spki(&tbs, &cert.tbs_certificate.subject_public_key_info)
-                );
-                return Self::Valid(cert, None);
-            }
-            // The issuer name only routes: the parent is whichever valid
-            // certificate of that name verifies the signature, so a
-            // homonym cannot take the true parent's place. Until such a
-            // parent arrives the certificate stays `Unknown`, keeping
-            // the outcome independent of delivery order.
-            for (key_id, candidate) in certs {
-                if let Some(parent) = candidate.map_valid(|cert| cert)
-                    && parent.tbs_certificate.subject == *issuer
-                    && signature
-                        .verify_with_spki(&tbs, &parent.tbs_certificate.subject_public_key_info)
-                        .is_ok()
-                {
-                    return Self::Valid(cert, Some(key_id.clone()));
-                }
-            }
-            Self::Unknown(cert)
-        } else {
-            self
-        }
-    }
-}
-
-impl State {
-    /// Move as many certificates as possible from `Unknown → `Valid`.
-    /// This allows us to eventually validate chains whose elements
-    /// may arrive out of order.
-    fn validate_certs(&mut self, roots: &[KeyId]) {
-        loop {
-            let pending = self
-                .certs
-                .iter()
-                .filter(|(_, c)| c.is_unknown())
-                .map(|(k, _)| k.clone())
-                .collect::<Vec<KeyId>>();
-            let mut progressed = false;
-            for key_id in pending {
-                let state = self.certs.remove(&key_id).unwrap();
-                let validated = state.validate(&self.certs, roots);
-                progressed |= !validated.is_unknown();
-                self.certs.insert(key_id, validated);
-            }
-            if !progressed {
-                break;
-            }
-        }
-    }
-}
-
 /// Re-verify gossiped login evidence. Identity gossip carries the
 /// signed challenge response, not another sled's conclusion, so a
 /// registered identity never depends on that sled's honesty.
@@ -2101,36 +1864,6 @@ fn verify_login(
     let verifier = verified.epk().clone();
     let identity = Identity::new(public_key.clone(), verified, Utc::now())?;
     Ok(RegisteredIdentity { identity, verifier })
-}
-
-/// Return the cert chain for the given key in root-to-leaf order.
-/// Will never return an empty chain.
-pub fn cert_chain(certs: &Certificates, key_id: &KeyId) -> Result<Vec<Certificate>, KeyError> {
-    let mut chain = Vec::new();
-    let mut key_id = key_id.to_owned();
-    loop {
-        if chain.len() >= MAX_CERT_CHAIN_LEN {
-            return Err(KeyError::CertChainTooLong);
-        }
-        let (cert, parent) = match certs.get(&key_id) {
-            None | Some(CertState::Unknown(_)) => return Err(KeyError::MissingCert(key_id)),
-            Some(CertState::Valid(cert, parent)) => (*cert.clone(), parent.clone()),
-            Some(CertState::Invalid(error)) => {
-                return Err(KeyError::InvalidCert(error.to_string()));
-            }
-            Some(CertState::Revoked(key_id, when)) => {
-                return Err(KeyError::Revoked(key_id.clone(), *when));
-            }
-        };
-        chain.push(cert);
-        match parent {
-            None => break,
-            Some(parent) => key_id = parent,
-        }
-    }
-    assert!(!chain.is_empty());
-    chain.reverse();
-    Ok(chain)
 }
 
 #[cfg(test)]
