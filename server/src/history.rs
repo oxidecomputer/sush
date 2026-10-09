@@ -7,12 +7,13 @@
 use std::cmp::Reverse;
 use std::collections::{BTreeMap, BTreeSet};
 
+use chrono::{DateTime, Utc};
 use rumors::before::Rank;
 use sled_hardware_types::BaseboardId;
 
 use sush_common::jobs::{JobId, JobStatus, JobStatusMap};
 
-use crate::state::{QueuedJobs, RunningJobs};
+use crate::state::QueuedJobs;
 
 /// Maximum number of historical job statuses to retain before evicting them.
 /// This is specified as 32 (maximum sleds per rack) times 2,048 (maximum
@@ -31,6 +32,9 @@ pub struct JobHistory {
     /// causal ordering in `causal_jobs`, and indexed first by job ID so that
     /// it's possible to ask "what's the status of this job across the rack?"
     job_status: BTreeMap<JobId, JobStatusMap>,
+
+    /// The set of running jobs everywhere, tagged by start wall-clock time.
+    running: BTreeMap<(JobId, BaseboardId), DateTime<Utc>>,
 }
 
 impl JobHistory {
@@ -52,8 +56,14 @@ impl JobHistory {
         status: JobStatus,
         rank: Option<Rank>,
         queued: Option<&QueuedJobs>,
-        running: &RunningJobs,
     ) {
+        if let JobStatus::Started { time_started, .. } = &status {
+            self.running
+                .insert((job_id.to_owned(), target.to_owned()), *time_started);
+        } else {
+            self.running.remove(&(job_id.to_owned(), target.to_owned()));
+        }
+
         self.job_status
             .entry(job_id.to_owned())
             .or_default()
@@ -64,7 +74,7 @@ impl JobHistory {
                 .insert((rank, job_id.to_owned(), target.to_owned()));
         }
 
-        self.gc(queued, running);
+        self.gc(queued);
     }
 
     /// Set the local (causal) status of a job if it has an entry that
@@ -76,12 +86,15 @@ impl JobHistory {
         rank: Option<Rank>,
         transition: impl FnOnce(Option<&JobStatus>) -> Option<JobStatus>,
         queued: Option<&QueuedJobs>,
-        running: &RunningJobs,
     ) {
         let old = self.get_job_status(job_id).and_then(|map| map.get(target));
         if let Some(new) = transition(old) {
-            self.set_job_status(job_id, target, new, rank, queued, running);
+            self.set_job_status(job_id, target, new, rank, queued);
         }
+    }
+
+    pub fn running_jobs(&self) -> &BTreeMap<(JobId, BaseboardId), DateTime<Utc>> {
+        &self.running
     }
 
     /// Evict causally-oldest job status entries once we exceed
@@ -93,7 +106,7 @@ impl JobHistory {
     /// hasn't happened yet. We only ever evict full job entries,
     /// and only for jobs that aren't currently running anywhere
     /// or queued locally.
-    fn gc(&mut self, queued: Option<&QueuedJobs>, running: &RunningJobs) {
+    fn gc(&mut self, queued: Option<&QueuedJobs>) {
         // Do nothing if we've still got room.
         if self.job_status.len() <= MAX_HISTORY {
             return;
@@ -104,7 +117,7 @@ impl JobHistory {
         if let Some(queued) = queued {
             ineligible.extend(queued.keys().cloned());
         }
-        ineligible.extend(running.iter().map(|((id, _), _)| *id));
+        ineligible.extend(self.running.iter().map(|((id, _), _)| *id));
 
         // Cache causal jobs.
         let causal = self
@@ -157,5 +170,96 @@ impl JobHistory {
                     .filter_map(move |(_, id, _)| seen.insert(id).then_some(id)),
             )
             .filter_map(|id| self.job_status.get(id))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use sush_common::jobs::{ProcessError, SkipReason};
+
+    use super::*;
+
+    fn baseboard(n: u32) -> BaseboardId {
+        BaseboardId {
+            part_number: "913-0000019".into(),
+            serial_number: format!("BRM{n:08}"),
+        }
+    }
+
+    fn started(job_id: JobId) -> JobStatus {
+        JobStatus::Started {
+            job_id,
+            time_started: Utc::now(),
+        }
+    }
+
+    fn error(job_id: JobId) -> JobStatus {
+        JobStatus::Error {
+            job_id,
+            time_error: Utc::now(),
+            error: ProcessError::Interrupted,
+        }
+    }
+
+    fn skipped(job_id: JobId) -> JobStatus {
+        JobStatus::Skipped {
+            job_id,
+            time_skipped: Utc::now(),
+            reason: SkipReason::SessionEnded,
+        }
+    }
+
+    #[test]
+    fn running_index_follows_status() {
+        let mut history = JobHistory::default();
+        let job = JobId::random();
+        for sled in [baseboard(1), baseboard(2)] {
+            history.set_job_status(&job, &sled, started(job), None, None);
+        }
+        assert_eq!(history.running_jobs().len(), 2);
+        history.set_job_status(&job, &baseboard(1), error(job), None, None);
+        history.set_job_status(&job, &baseboard(2), skipped(job), None, None);
+        assert!(history.running_jobs().is_empty());
+        assert!(history.contains(&job));
+    }
+
+    #[test]
+    fn transitions_apply_only_on_match() {
+        let mut history = JobHistory::default();
+        let job = JobId::random();
+        let sled = baseboard(1);
+        let stop_running = |old: Option<&JobStatus>| match old {
+            Some(JobStatus::Started { .. }) => Some(skipped(job)),
+            _ => None,
+        };
+        history.transition_job_status(&job, &sled, None, stop_running, None);
+        assert!(!history.contains(&job));
+        history.set_job_status(&job, &sled, started(job), None, None);
+        history.transition_job_status(&job, &sled, None, stop_running, None);
+        assert!(matches!(
+            history.get_job_status(&job).unwrap().get(&sled),
+            Some(JobStatus::Skipped { .. })
+        ));
+        history.transition_job_status(&job, &sled, None, stop_running, None);
+        assert!(matches!(
+            history.get_job_status(&job).unwrap().get(&sled),
+            Some(JobStatus::Skipped { .. })
+        ));
+        assert!(history.running_jobs().is_empty());
+    }
+
+    #[test]
+    fn eviction_spares_running_jobs() {
+        let mut history = JobHistory::default();
+        let sled = baseboard(1);
+        let runner = JobId::random();
+        history.set_job_status(&runner, &sled, started(runner), None, None);
+        for _ in 0..=MAX_HISTORY {
+            let job = JobId::random();
+            history.set_job_status(&job, &sled, error(job), None, None);
+        }
+        assert!(history.contains(&runner));
+        assert!(history.job_status.len() <= MAX_HISTORY);
+        assert!(history.running_jobs().contains_key(&(runner, sled)));
     }
 }

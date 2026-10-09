@@ -10,7 +10,7 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::sync::{Arc, Mutex};
 
-use chrono::{DateTime, Utc};
+use chrono::Utc;
 use futures::{FutureExt as _, Stream, StreamExt};
 use rumors::{CausalMessages, Network, Rumors, Version};
 use sled_hardware_types::BaseboardId;
@@ -50,7 +50,6 @@ pub type GossipNetwork = Rumors<VersionedMessage, SushBookmark>;
 pub type GossipSeed = Seed<VersionedMessage>;
 pub type GossipUniverse = Universe<VersionedMessage>;
 pub type QueuedJobs = BTreeMap<JobId, QueuedJob>;
-pub type RunningJobs = BTreeMap<(JobId, BaseboardId), DateTime<Utc>>;
 
 /// Maximum number of jobs a session may have queued (submitted, but not
 /// yet next in the causal chain to run). Bounds memory in the presence
@@ -185,7 +184,6 @@ impl<'a> SessionGuard<'a> {
         &mut self,
         log: &Logger,
         history: &mut JobHistory,
-        running: &RunningJobs,
         rack: &Rack,
         job: SignedJob,
         params: JobStartParams,
@@ -233,7 +231,6 @@ impl<'a> SessionGuard<'a> {
                     },
                     None,
                     Some(self.queued_jobs),
-                    running,
                 );
             }
         }
@@ -245,7 +242,6 @@ impl<'a> SessionGuard<'a> {
         actor: &KeyId,
         own_baseboard: &BaseboardId,
         history: &mut JobHistory,
-        running: &RunningJobs,
         replayed: bool,
     ) {
         self.queued_jobs.remove(job_id);
@@ -265,7 +261,6 @@ impl<'a> SessionGuard<'a> {
                 _ => None,
             },
             Some(self.queued_jobs),
-            running,
         );
     }
 
@@ -548,8 +543,6 @@ pub struct State {
     rack: Rack,
     /// Status of all jobs everywhere (lossy).
     history: JobHistory,
-    /// The set of running jobs everywhere, tagged by start wall-clock time.
-    running: RunningJobs,
     /// The current state of the active session, if any.
     session: SessionState,
     /// Attachment points (socket senders) for interactive jobs.
@@ -574,7 +567,6 @@ impl State {
     ) -> Result<Self, KeyError> {
         Ok(Self {
             rack: Rack::new(own_baseboard),
-            running: Default::default(),
             history: Default::default(),
             session: Default::default(),
             attachments: Default::default(),
@@ -615,7 +607,8 @@ impl State {
 
     /// Jobs running on our own baseboard, according to our history.
     pub fn own_running_jobs(&self) -> BTreeSet<JobId> {
-        self.running
+        self.history
+            .running_jobs()
             .keys()
             .filter(|(_, baseboard)| baseboard == self.rack.own_baseboard())
             .map(|(job_id, _)| *job_id)
@@ -628,7 +621,8 @@ impl State {
             .zombies
             .iter()
             .filter(|job_id| {
-                self.running
+                self.history
+                    .running_jobs()
                     .contains_key(&(**job_id, self.rack.own_baseboard().clone()))
             })
             .copied()
@@ -880,7 +874,6 @@ impl State {
                                     actor,
                                     self.rack.own_baseboard(),
                                     &mut self.history,
-                                    &self.running,
                                     replayed,
                                 );
                                 session.execute_ready_jobs(
@@ -944,7 +937,6 @@ impl State {
                                 session.enqueue_job(
                                     log,
                                     &mut self.history,
-                                    &self.running,
                                     &self.rack,
                                     signed.clone(),
                                     params.clone(),
@@ -988,7 +980,6 @@ impl State {
                                 actor,
                                 self.rack.own_baseboard(),
                                 &mut self.history,
-                                &self.running,
                                 replayed,
                             );
                         }
@@ -1014,7 +1005,7 @@ impl State {
                             return Ok(());
                         }
                         info!(log, "job started"; "job_id" => %job_id, "when" => %when);
-                        self.running.insert((*job_id, baseboard_id.clone()), *when);
+
                         // A start on our own baseboard sent by a
                         // previous life names a job whose process
                         // died with that life. No executor here will
@@ -1039,7 +1030,6 @@ impl State {
                             },
                             Some(incoming_version.rank()),
                             self.session.queued_jobs(),
-                            &self.running,
                         );
                     }
                     JobEvent::Stop(job_id, when, result, output) => {
@@ -1048,7 +1038,6 @@ impl State {
                             self.attachments.remove(job_id);
                             self.past.zombies.remove(job_id);
                         }
-                        self.running.remove(&(*job_id, baseboard_id.clone()));
                         self.history.transition_job_status(
                             job_id,
                             baseboard_id,
@@ -1081,7 +1070,6 @@ impl State {
                                 _ => None,
                             },
                             self.session.queued_jobs(),
-                            &self.running,
                         );
                         if baseboard_id == self.rack.own_baseboard() {
                             executor.job_stopped(job_id);
@@ -1094,7 +1082,6 @@ impl State {
                             self.attachments.remove(job_id);
                             self.past.zombies.remove(job_id);
                         }
-                        self.running.remove(&(*job_id, baseboard_id.clone()));
                         self.history.transition_job_status(
                             job_id,
                             baseboard_id,
@@ -1114,7 +1101,6 @@ impl State {
                                 _ => None,
                             },
                             self.session.queued_jobs(),
-                            &self.running,
                         );
                         if baseboard_id == self.rack.own_baseboard() {
                             executor.job_stopped(job_id);
@@ -1126,7 +1112,6 @@ impl State {
                             log, "job skipped";
                             "job_id" => %job_id, "when" => %when, "reason" => %reason,
                         );
-                        self.running.remove(&(*job_id, baseboard_id.clone()));
                         self.history.transition_job_status(
                             job_id,
                             baseboard_id,
@@ -1145,7 +1130,6 @@ impl State {
                                 _ => None,
                             },
                             self.session.queued_jobs(),
-                            &self.running,
                         );
                     }
                 },
