@@ -86,10 +86,13 @@ impl JobHistory {
         rank: Option<Rank>,
         transition: impl FnOnce(Option<&JobStatus>) -> Option<JobStatus>,
         queued: Option<&QueuedJobs>,
-    ) {
+    ) -> Option<JobStatus> {
         let old = self.get_job_status(job_id).and_then(|map| map.get(target));
         if let Some(new) = transition(old) {
-            self.set_job_status(job_id, target, new, rank, queued);
+            self.set_job_status(job_id, target, new.clone(), rank, queued);
+            Some(new)
+        } else {
+            None
         }
     }
 

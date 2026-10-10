@@ -700,6 +700,10 @@ impl<T> Verified<T> {
         self.signed
     }
 
+    pub fn payload(&self) -> &T {
+        self.signed.payload()
+    }
+
     pub fn into_payload(self) -> T {
         self.into_signed().into_payload()
     }

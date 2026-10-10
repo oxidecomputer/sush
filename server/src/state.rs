@@ -24,7 +24,7 @@ use x509_cert::Certificate;
 use sush_api::JobStartParams;
 use sush_common::jobs::{
     Access, JobId, JobStatus, JobStatusMap, LastJob, ProcessError, Session, SessionId,
-    SessionSushNonce, SignedJob, SkipReason,
+    SessionSushNonce, SignedJob, SkipReason, VerifiedJob,
 };
 use sush_common::keys::{KeyError, KeyId};
 use sush_common::targets::Cubbies;
@@ -249,6 +249,28 @@ impl Past {
         }
     }
 
+    /// Construct a boundary for a verified job.
+    fn commit_to(
+        &self,
+        network: Network,
+        started: &Version,
+        session_id: SessionId,
+        job_id: JobId,
+        successor: JobId,
+    ) -> Boundary {
+        Boundary {
+            network,
+            burned: self.burned_for(network),
+            executed: self.executed_for(network, started),
+            job: Some(Committed {
+                session: session_id.to_owned(),
+                job: job_id,
+                successor,
+                outcome: JobOutcome::Committed,
+            }),
+        }
+    }
+
     /// Report the cause of an [`Admission::Hop`] to the gossip set,
     /// then set the floor at the frontier that includes the report.
     fn hop(
@@ -300,6 +322,31 @@ impl Past {
     }
 }
 
+/// A state machine output.
+#[derive(Debug)]
+enum Output {
+    Run(Box<Run>),
+    Ran(JobStatus),
+    Stop(JobId),
+    Gossip(Message),
+    RotateNonce,
+}
+
+impl Output {
+    fn job_event(own_baseboard: &BaseboardId, event: JobEvent) -> Self {
+        Self::Gossip(Message::Event(own_baseboard.to_owned(), Event::Job(event)))
+    }
+}
+
+/// Everything the executor needs to launch a job.
+#[derive(Debug)]
+struct Run {
+    job: VerifiedJob,
+    params: JobStartParams,
+    boundary: Boundary,
+    attachment: watch::Sender<Option<SocketSender>>,
+}
+
 #[derive(Debug)]
 pub struct State {
     /// Information about the rack in which we're running.
@@ -314,9 +361,6 @@ pub struct State {
     certs: Certificates,
     /// SSH identities for request attribution.
     identities: Identities,
-    /// The nonce binding new session IDs to this sled, shared with the
-    /// manager and rotated whenever a session activates.
-    session_sush_nonce: Arc<Mutex<SessionSushNonce>>,
     /// This incarnation's relationship to its own past.
     past: Past,
 }
@@ -325,7 +369,6 @@ impl State {
     pub fn new(
         own_baseboard: BaseboardId,
         trust_anchors: &[Certificate],
-        session_sush_nonce: Arc<Mutex<SessionSushNonce>>,
         past: Past,
     ) -> Result<Self, KeyError> {
         Ok(Self {
@@ -333,7 +376,6 @@ impl State {
             history: Default::default(),
             session: Default::default(),
             attachments: Default::default(),
-            session_sush_nonce,
             certs: Certificates::new(trust_anchors)?,
             identities: Default::default(),
             past,
@@ -396,97 +438,79 @@ impl State {
         self.past.is_live(version)
     }
 
-    /// The boundary record carries the boundary job's ending, so the
-    /// next life can tell the truth instead of guessing. The write is
-    /// spawned because the state machine is synchronous, and losing
-    /// the race to a crash only falls back to interrupted.
-    fn record_boundary_outcome(&self, job_id: &JobId) {
-        let Some(status) = self
-            .history
-            .get_job_status(job_id)
-            .and_then(|map| map.get(self.rack.own_baseboard()))
-            .cloned()
-        else {
-            return;
-        };
-        if !status.is_terminal() {
-            return;
-        }
-        let store = self.past.boundary.clone();
-        let job_id = *job_id;
-        spawn(async move { store.record_outcome(&job_id, &status).await });
-    }
-
     pub fn get_job_status(&self, job_id: &JobId) -> Option<&JobStatusMap> {
         self.history.get_job_status(job_id)
     }
 
-    fn skip_queued_jobs(&self, executor: &Executor) {
+    fn skip_queued_jobs(&self) -> Vec<Output> {
+        let mut outputs = Vec::new();
         for (job_id, queued) in self.session.queued_jobs().into_iter().flatten() {
             if !queued.replayed && self.rack.runs_here(&queued.job) {
-                executor.job_skipped(*job_id, SkipReason::SessionEnded);
+                outputs.push(Output::job_event(
+                    self.rack.own_baseboard(),
+                    JobEvent::Skipped(*job_id, Utc::now(), SkipReason::SessionEnded),
+                ));
             }
         }
+        outputs
     }
 
     fn update(
         &mut self,
         log: &Logger,
-        executor: &mut Executor,
         rumors: Option<&GossipNetwork>,
         incoming_version: &Version,
         message: &Arc<VersionedMessage>,
-    ) -> Result<(), Error> {
+    ) -> Vec<Output> {
         match message.as_ref() {
             V0(Message::Request(request)) => {
                 let actor = request.actor();
                 let log = log.new(o!("actor" => actor.to_string()));
                 match request {
-                    Request::Cert(r) => self.certs.apply(&log, r.request()),
-                    Request::Identity(r) => self.identities.apply(&log, r.request()),
-                    Request::Session(r) => {
-                        self.handle_session_request(
-                            &log,
-                            executor,
-                            rumors,
-                            incoming_version,
-                            actor,
-                            r.request(),
-                        )?;
+                    Request::Cert(r) => {
+                        self.certs.apply(&log, r.request());
+                        Vec::new()
                     }
-                    Request::Job(r) => self.handle_job_request(
+                    Request::Identity(r) => {
+                        self.identities.apply(&log, r.request());
+                        Vec::new()
+                    }
+                    Request::Session(r) => self.handle_session_request(
                         &log,
-                        executor,
                         rumors,
                         incoming_version,
                         actor,
                         r.request(),
                     ),
+                    Request::Job(r) => {
+                        self.handle_job_request(&log, rumors, incoming_version, actor, r.request())
+                    }
                 }
             }
             V0(Message::Event(baseboard_id, event)) => {
-                self.handle_event(log, executor, incoming_version, baseboard_id, event)
+                self.handle_event(log, incoming_version, baseboard_id, event)
             }
             Unknown { version, .. } => {
                 if self.rack.unknown_version(version.clone()) {
                     warn!(log, "ignoring messages from a newer peer"; "version" => version);
                 }
+                Vec::new()
             }
         }
-
-        Ok(())
     }
 
+    #[must_use]
     fn handle_session_request(
         &mut self,
         log: &Logger,
-        executor: &mut Executor,
         rumors: Option<&GossipNetwork>,
         incoming_version: &Version,
         actor: &KeyId,
         request: &SessionRequest,
-    ) -> Result<(), Error> {
+    ) -> Vec<Output> {
         use SessionState::*;
+
+        let mut outputs = Vec::new();
         match request {
             SessionRequest::Start(session_id) => match &mut self.session {
                 // Re-announcement of active session; absorb and ignore.
@@ -509,7 +533,7 @@ impl State {
                         log, "session started";
                         "session_id" => %session_id, "actor" => %actor,
                     );
-                    self.skip_queued_jobs(executor);
+                    outputs.extend(self.skip_queued_jobs());
                     let mut session = Session::started(*session_id, actor.clone());
                     // The committed session resumes at its
                     // stored successor: every earlier chain
@@ -537,7 +561,7 @@ impl State {
                         queued_jobs: QueuedJobs::new(),
                         attach_grants: BTreeMap::new(),
                     };
-                    *self.session_sush_nonce.lock().unwrap() = SessionSushNonce::random();
+                    outputs.push(Output::RotateNonce);
                 }
 
                 // When the incoming session is concurrent, we can't
@@ -558,9 +582,12 @@ impl State {
                         incoming_version: Box::new(incoming_version.clone()),
                     };
                     let frontier = &*frontier | incoming_version.clone();
-                    self.skip_queued_jobs(executor);
                     self.session = Inactive { frontier };
-                    return Err(error);
+                    outputs.extend(self.skip_queued_jobs());
+                    outputs.push(Output::Gossip(Message::Event(
+                        self.rack.own_baseboard().to_owned(),
+                        Event::Error(error),
+                    )));
                 }
 
                 // Stale (≤ frontier) or concurrent while inactive; OBE.
@@ -602,7 +629,7 @@ impl State {
                             log, "session stopped";
                             "session_id" => %session_id, "actor" => %actor,
                         );
-                        self.skip_queued_jobs(executor);
+                        outputs.extend(self.skip_queued_jobs());
                         self.session = Inactive {
                             frontier: frontier.clone(),
                         }
@@ -671,7 +698,7 @@ impl State {
                             "job_id" => %job_id, "actor" => %actor,
                         );
                         self.cancel_job(job_id, actor, replayed);
-                        self.execute_ready_jobs(log, executor, rumors);
+                        outputs.extend(self.release_ready_jobs(log, rumors));
                     } else {
                         info!(
                             log, "ignoring inapplicable job skip";
@@ -687,18 +714,19 @@ impl State {
                 }
             }
         }
-        Ok(())
+        outputs
     }
 
+    #[must_use]
     fn handle_job_request(
         &mut self,
         log: &Logger,
-        executor: &mut Executor,
         rumors: Option<&GossipNetwork>,
         incoming_version: &Version,
         actor: &KeyId,
         request: &JobRequest,
-    ) {
+    ) -> Vec<Output> {
+        let mut outputs = Vec::new();
         match request {
             JobRequest::Start(signed, params) => {
                 // TODO: When we implement
@@ -736,7 +764,7 @@ impl State {
                     .is_some_and(|s| s.session_id() == session_id)
                 {
                     self.enqueue_job(log, signed.clone(), params.clone(), actor, !live);
-                    self.execute_ready_jobs(log, executor, rumors);
+                    outputs.extend(self.release_ready_jobs(log, rumors));
                 } else {
                     let job_id = *signed.job_id();
                     warn!(
@@ -746,174 +774,178 @@ impl State {
                         "actor" => %actor,
                     );
                     if live && self.rack.runs_here(signed) && !self.history.contains(&job_id) {
-                        executor.job_skipped(job_id, SkipReason::SessionEnded);
+                        outputs.push(Output::job_event(
+                            self.rack.own_baseboard(),
+                            JobEvent::Skipped(job_id, Utc::now(), SkipReason::SessionEnded),
+                        ));
                     }
                 }
             }
             JobRequest::Stop(job_id) => {
-                executor.job_stop(job_id);
+                outputs.push(Output::Stop(*job_id));
                 let replayed = !self.is_live(incoming_version);
                 self.cancel_job(job_id, actor, replayed);
             }
         }
+        outputs
     }
 
+    /// Track the active set of known-running jobs anywhere in the rack.
+    #[must_use]
     fn handle_event(
         &mut self,
         log: &Logger,
-        executor: &mut Executor,
         incoming_version: &Version,
         baseboard_id: &BaseboardId,
         event: &Event,
-    ) {
+    ) -> Vec<Output> {
         let log = log.new(o!("sled" => baseboard_id.to_string()));
+        let mut outputs = Vec::new();
         match event {
-            // Track the active set of known-running jobs anywhere in the rack.
-            Event::Job(job_event) => match job_event {
-                JobEvent::Start(job_id, when) => {
-                    // A start never displaces a terminal status.
-                    // After an identity change, an adjudicated
-                    // Interrupted and a late replayed start are
-                    // concurrent, and the verdict must win in
-                    // both arrival orders.
-                    if self
-                        .history
-                        .get_job_status(job_id)
-                        .and_then(|status| status.get(baseboard_id))
-                        .is_some_and(|status| status.is_terminal())
-                    {
-                        info!(log, "ignoring a start for a settled job"; "job_id" => %job_id);
-                        return;
-                    }
-                    info!(log, "job started"; "job_id" => %job_id, "when" => %when);
+            Event::Job(job_event) => {
+                let status = match job_event {
+                    JobEvent::Start(job_id, when) => {
+                        // A start never displaces a terminal status.
+                        // After an identity change, an adjudicated
+                        // Interrupted and a late replayed start are
+                        // concurrent, and the verdict must win in
+                        // both arrival orders.
+                        if self
+                            .history
+                            .get_job_status(job_id)
+                            .and_then(|status| status.get(baseboard_id))
+                            .is_some_and(|status| status.is_terminal())
+                        {
+                            info!(log, "ignoring a start for a settled job"; "job_id" => %job_id);
+                            return outputs;
+                        }
+                        info!(log, "job started"; "job_id" => %job_id, "when" => %when);
 
-                    // A start on our own baseboard sent by a
-                    // previous life names a job whose process
-                    // died with that life. No executor here will
-                    // ever end it, so the job is a zombie: unless
-                    // replay delivers its ending, we report it
-                    // interrupted once replay drains. The birth
-                    // mark splits the lives exactly; the arrival
-                    // mark would misread a previous life's start
-                    // as this life's own whenever the join peer
-                    // lagged behind that start.
-                    if baseboard_id == self.rack.own_baseboard()
-                        && self.past.is_from_previous_life(incoming_version)
-                    {
-                        self.past.zombies.insert(*job_id);
+                        // A start on our own baseboard sent by a
+                        // previous life names a job whose process
+                        // died with that life. No executor here will
+                        // ever end it, so the job is a zombie: unless
+                        // replay delivers its ending, we report it
+                        // interrupted once replay drains. The birth
+                        // mark splits the lives exactly; the arrival
+                        // mark would misread a previous life's start
+                        // as this life's own whenever the join peer
+                        // lagged behind that start.
+                        if baseboard_id == self.rack.own_baseboard()
+                            && self.past.is_from_previous_life(incoming_version)
+                        {
+                            self.past.zombies.insert(*job_id);
+                        }
+                        self.history.set_job_status(
+                            job_id,
+                            baseboard_id,
+                            JobStatus::Started {
+                                job_id: *job_id,
+                                time_started: *when,
+                            },
+                            Some(incoming_version.rank()),
+                            self.session.queued_jobs(),
+                        );
+                        None
                     }
-                    self.history.set_job_status(
-                        job_id,
-                        baseboard_id,
-                        JobStatus::Started {
-                            job_id: *job_id,
-                            time_started: *when,
-                        },
-                        Some(incoming_version.rank()),
-                        self.session.queued_jobs(),
-                    );
-                }
-                JobEvent::Stop(job_id, when, result, output) => {
-                    info!(log, "job stopped"; "job_id" => %job_id, "when" => %when, "result" => ?result);
-                    if baseboard_id == self.rack.own_baseboard() {
-                        self.attachments.remove(job_id);
-                        self.past.zombies.remove(job_id);
-                    }
-                    self.history.transition_job_status(
-                        job_id,
-                        baseboard_id,
-                        Some(incoming_version.rank()),
-                        |old_status| match old_status {
-                            Some(JobStatus::Started { time_started, .. }) => {
-                                Some(JobStatus::Stopped {
+                    JobEvent::Stop(job_id, when, result, output) => {
+                        info!(log, "job stopped"; "job_id" => %job_id, "when" => %when, "result" => ?result);
+                        if baseboard_id == self.rack.own_baseboard() {
+                            self.attachments.remove(job_id);
+                            self.past.zombies.remove(job_id);
+                        }
+                        self.history.transition_job_status(
+                            job_id,
+                            baseboard_id,
+                            Some(incoming_version.rank()),
+                            |old_status| match old_status {
+                                Some(JobStatus::Started { time_started, .. }) => {
+                                    Some(JobStatus::Stopped {
+                                        job_id: *job_id,
+                                        time_started: *time_started,
+                                        time_stopped: *when,
+                                        result: result.clone(),
+                                        output: output.clone(),
+                                    })
+                                }
+                                // An interrupted declaration raced this stop event.
+                                // The real result wins in either arrival order,
+                                // though the start time died with the previous life.
+                                Some(JobStatus::Error {
+                                    error: ProcessError::Interrupted,
+                                    time_error,
+                                    ..
+                                }) => Some(JobStatus::Stopped {
                                     job_id: *job_id,
-                                    time_started: *time_started,
+                                    time_started: *time_error,
                                     time_stopped: *when,
                                     result: result.clone(),
                                     output: output.clone(),
-                                })
-                            }
-                            // An interrupted declaration raced this
-                            // genuine stop. The real result wins in
-                            // either arrival order, though the start
-                            // time died with the previous life.
-                            Some(JobStatus::Error {
-                                error: ProcessError::Interrupted,
-                                time_error,
-                                ..
-                            }) => Some(JobStatus::Stopped {
-                                job_id: *job_id,
-                                time_started: *time_error,
-                                time_stopped: *when,
-                                result: result.clone(),
-                                output: output.clone(),
-                            }),
-                            _ => None,
-                        },
-                        self.session.queued_jobs(),
-                    );
-                    if baseboard_id == self.rack.own_baseboard() {
-                        executor.job_stopped(job_id);
-                        self.record_boundary_outcome(job_id);
+                                }),
+                                _ => None,
+                            },
+                            self.session.queued_jobs(),
+                        )
                     }
-                }
-                JobEvent::Error(job_id, when, error) => {
-                    error!(log, "job error"; "job_id" => %job_id, "when" => %when, "error" => %error);
-                    if baseboard_id == self.rack.own_baseboard() {
-                        self.attachments.remove(job_id);
-                        self.past.zombies.remove(job_id);
+                    JobEvent::Error(job_id, when, error) => {
+                        error!(log, "job error"; "job_id" => %job_id, "when" => %when, "error" => %error);
+                        if baseboard_id == self.rack.own_baseboard() {
+                            self.attachments.remove(job_id);
+                            self.past.zombies.remove(job_id);
+                        }
+                        self.history.transition_job_status(
+                            job_id,
+                            baseboard_id,
+                            Some(incoming_version.rank()),
+                            // An error never displaces a terminal status, so a
+                            // stop that raced an interrupted declaration keeps
+                            // the real result.
+                            |old_status| match old_status {
+                                None
+                                | Some(JobStatus::Queued { .. })
+                                | Some(JobStatus::Started { .. }) => Some(JobStatus::Error {
+                                    job_id: *job_id,
+                                    time_error: *when,
+                                    error: error.clone(),
+                                }),
+                                _ => None,
+                            },
+                            self.session.queued_jobs(),
+                        )
                     }
-                    self.history.transition_job_status(
-                        job_id,
-                        baseboard_id,
-                        Some(incoming_version.rank()),
-                        // An error never displaces a terminal
-                        // status, so a stop that raced an
-                        // interrupted declaration keeps the real
-                        // result.
-                        |old_status| match old_status {
-                            None
-                            | Some(JobStatus::Queued { .. })
-                            | Some(JobStatus::Started { .. }) => Some(JobStatus::Error {
-                                job_id: *job_id,
-                                time_error: *when,
-                                error: error.clone(),
-                            }),
-                            _ => None,
-                        },
-                        self.session.queued_jobs(),
-                    );
-                    if baseboard_id == self.rack.own_baseboard() {
-                        executor.job_stopped(job_id);
-                        self.record_boundary_outcome(job_id);
+                    JobEvent::Skipped(job_id, when, reason) => {
+                        info!(
+                            log, "job skipped";
+                            "job_id" => %job_id, "when" => %when, "reason" => %reason,
+                        );
+                        self.history.transition_job_status(
+                            job_id,
+                            baseboard_id,
+                            Some(incoming_version.rank()),
+                            // A skip is the reporting sled's decision about
+                            // itself, and never displaces a terminal status it
+                            // already reported.
+                            |old_status| match old_status {
+                                None
+                                | Some(JobStatus::Queued { .. })
+                                | Some(JobStatus::Started { .. }) => Some(JobStatus::Skipped {
+                                    job_id: *job_id,
+                                    time_skipped: *when,
+                                    reason: *reason,
+                                }),
+                                _ => None,
+                            },
+                            self.session.queued_jobs(),
+                        )
                     }
+                };
+                if let Some(status) = status
+                    && status.is_terminal()
+                    && baseboard_id == self.rack.own_baseboard()
+                {
+                    outputs.push(Output::Ran(status));
                 }
-                JobEvent::Skipped(job_id, when, reason) => {
-                    info!(
-                        log, "job skipped";
-                        "job_id" => %job_id, "when" => %when, "reason" => %reason,
-                    );
-                    self.history.transition_job_status(
-                        job_id,
-                        baseboard_id,
-                        Some(incoming_version.rank()),
-                        // A skip is the reporting sled's decision
-                        // about itself, and never displaces a
-                        // terminal status it already reported.
-                        |old_status| match old_status {
-                            None
-                            | Some(JobStatus::Queued { .. })
-                            | Some(JobStatus::Started { .. }) => Some(JobStatus::Skipped {
-                                job_id: *job_id,
-                                time_skipped: *when,
-                                reason: *reason,
-                            }),
-                            _ => None,
-                        },
-                        self.session.queued_jobs(),
-                    );
-                }
-            },
+            }
             Event::Error(error) => {
                 error!(log, "session error"; "error" => %error);
             }
@@ -922,7 +954,8 @@ impl State {
                     info!(log, "sled version"; "version" => %info);
                 }
             }
-        }
+        };
+        outputs
     }
 
     fn enqueue_job(
@@ -1011,12 +1044,9 @@ impl State {
     /// in the hash chain, and there may be an unbounded number of
     /// newly-ready-to-run jobs after it in the queue. Once we reach
     /// a fixed point, we have nothing further to do.
-    fn execute_ready_jobs(
-        &mut self,
-        log: &Logger,
-        executor: &mut Executor,
-        rumors: Option<&GossipNetwork>,
-    ) {
+    #[must_use]
+    fn release_ready_jobs(&mut self, log: &Logger, rumors: Option<&GossipNetwork>) -> Vec<Output> {
+        let mut outputs = Vec::new();
         let SessionState::Active {
             session,
             started,
@@ -1024,7 +1054,7 @@ impl State {
             ..
         } = &mut self.session
         else {
-            return;
+            return outputs;
         };
         loop {
             let next_id = session.next_job_id();
@@ -1056,7 +1086,6 @@ impl State {
                 params,
                 replayed,
             } = queued_jobs.remove(&next_id).expect("checked above");
-            let (tx_attachment, rx_attachment) = watch::channel(None);
             let job_id = request.payload().job_id().to_owned();
             if self.rack.runs_here(&request) {
                 if self.past.boundary.untrusted() {
@@ -1064,16 +1093,20 @@ impl State {
                         log, "refusing job, the execution boundary is untrusted";
                         "job_id" => %job_id,
                     );
-                    executor.job_refused(
-                        job_id,
-                        ProcessError::Io {
-                            what: "consulting the execution boundary".to_string(),
-                            error: "the boundary records on this sled's M.2s disagree \
-                                    or are corrupt; an M.2 may have failed and the sled \
-                                    needs service"
-                                .to_string(),
-                        },
-                    );
+                    outputs.push(Output::job_event(
+                        self.rack.own_baseboard(),
+                        JobEvent::Error(
+                            job_id,
+                            Utc::now(),
+                            ProcessError::Io {
+                                what: "consulting the execution boundary".to_string(),
+                                error: "the boundary records on this sled's M.2s disagree \
+                                        or are corrupt; an M.2 may have failed and the sled \
+                                        needs service"
+                                    .to_string(),
+                            },
+                        ),
+                    ));
                 } else if matches!(admission, Admission::Refuse) {
                     // Below the floor the queue skips forward in chain
                     // order. A live job gets the terminal skip status;
@@ -1081,7 +1114,10 @@ impl State {
                     // on every rejoin would grow the message set.
                     if !replayed {
                         warn!(log, "skipping job below the execution floor"; "job_id" => %job_id);
-                        executor.job_skipped(job_id, SkipReason::BelowFloor);
+                        outputs.push(Output::job_event(
+                            self.rack.own_baseboard(),
+                            JobEvent::Skipped(job_id, Utc::now(), SkipReason::BelowFloor),
+                        ));
                     }
                 } else if self
                     .history
@@ -1099,70 +1135,102 @@ impl State {
                         session.job_started(request);
                         continue;
                     };
-                    let successor = session
-                        .session_id()
-                        .next_job_id(&LastJob::Some(request.clone()));
-                    let boundary = Boundary {
-                        network: rumors.network(),
-                        burned: self.past.burned_for(rumors.network()),
-                        executed: self.past.executed_for(rumors.network(), started),
-                        job: Some(Committed {
-                            session: session.session_id(),
-                            job: job_id,
-                            successor,
-                            outcome: JobOutcome::Committed,
-                        }),
-                    };
-                    if executor.job_start(
-                        &mut self.certs,
-                        request.clone(),
-                        params,
-                        tx_attachment,
-                        boundary,
-                    ) {
-                        self.attachments.insert(job_id, rx_attachment);
+                    match self.certs.verify(&request) {
+                        Err(error) => outputs.push(Output::job_event(
+                            self.rack.own_baseboard(),
+                            JobEvent::Error(
+                                job_id,
+                                Utc::now(),
+                                ProcessError::InvalidJob(error.to_string()),
+                            ),
+                        )),
+                        Ok(job) => {
+                            let (attachment, rx_attachment) = watch::channel(None);
+                            self.attachments.insert(job_id, rx_attachment);
+                            outputs.push(Output::Run(Box::new(Run {
+                                job,
+                                params,
+                                attachment,
+                                boundary: self.past.commit_to(
+                                    rumors.network(),
+                                    started,
+                                    session.session_id(),
+                                    job_id,
+                                    session
+                                        .session_id()
+                                        .next_job_id(&LastJob::Some(request.clone())),
+                                ),
+                            })));
+                        }
                     }
                 }
             }
             session.job_started(request);
         }
+        outputs
     }
 }
 
-/// Apply one gossip message to the state, reporting update errors back
-/// onto the network.
+/// Apply one gossip message to the state, then apply its outputs.
 ///
 /// We unconditionally mark the watch sender as modified even though it
 /// might not be, because *most* of the messages cause *some* modification
 /// of the state, and we would rather be safe against future code changes
 /// than manually tracking precisely which messages *don't* modify state.
 /// The cost is a few spurious wakeups.
+#[allow(clippy::too_many_arguments)]
 fn apply_message(
     log: &Logger,
     tx_state: &watch::Sender<State>,
     executor: &mut Executor,
     rumors: Option<&GossipNetwork>,
-    own_baseboard: &BaseboardId,
+    store: &Arc<BoundaryStore>,
+    nonce: &Arc<Mutex<SessionSushNonce>>,
     version: &Version,
     message: &Arc<VersionedMessage>,
 ) {
+    let mut outputs = Vec::new();
     tx_state.send_modify(|state| {
-        if let Err(error) = state.update(log, executor, rumors, version, message) {
-            error!(log, "state update failed"; "error" => ?error);
-            // Re-gossiping a replayed message's error would grow the
-            // set a little more on every rejoin by every sled.
-            if state.is_live(version)
-                && let Some(rumors) = rumors
-            {
-                debug!(log, "sending error to gossip network"; "error" => ?error);
-                gossip(
-                    log,
-                    rumors,
-                    Message::Event(own_baseboard.clone(), Event::Error(error)).into(),
-                );
+        outputs = state.update(log, rumors, version, message);
+    });
+    apply_outputs(log, executor, rumors, store, nonce, outputs);
+}
+
+fn apply_outputs(
+    log: &Logger,
+    executor: &mut Executor,
+    rumors: Option<&GossipNetwork>,
+    store: &Arc<BoundaryStore>,
+    nonce: &Arc<Mutex<SessionSushNonce>>,
+    outputs: Vec<Output>,
+) {
+    for output in outputs {
+        match output {
+            Output::Run(run) => {
+                let Run {
+                    job,
+                    params,
+                    boundary,
+                    attachment,
+                } = *run;
+                executor.job_start(job, params, attachment, boundary);
+            }
+            Output::Stop(job_id) => executor.job_stop(&job_id),
+            Output::Ran(status) => {
+                executor.job_stopped(status.job_id());
+                let store = store.clone();
+                spawn(async move { store.record_outcome(&status).await });
+            }
+            Output::Gossip(message) => {
+                if let Some(rumors) = rumors {
+                    gossip(log, rumors, message.into());
+                }
+            }
+            Output::RotateNonce => {
+                *nonce.lock().unwrap() = SessionSushNonce::random();
             }
         }
-    });
+    }
 }
 
 /// Apply every message already delivered locally, without waiting for
@@ -1173,17 +1241,12 @@ fn drain_ready(
     tx_state: &watch::Sender<State>,
     executor: &mut Executor,
     rumors: Option<&GossipNetwork>,
-    own_baseboard: &BaseboardId,
+    store: &Arc<BoundaryStore>,
+    nonce: &Arc<Mutex<SessionSushNonce>>,
 ) {
     while let Some(Some((version, message))) = causal_messages.next().now_or_never() {
         apply_message(
-            log,
-            tx_state,
-            executor,
-            rumors,
-            own_baseboard,
-            &version,
-            &message,
+            log, tx_state, executor, rumors, store, nonce, &version, &message,
         );
     }
 }
@@ -1433,7 +1496,6 @@ impl StateManager {
         let mut initial_state = State::new(
             own_baseboard.clone(),
             anchors,
-            session_sush_nonce.clone(),
             Past::new(
                 Version::new(),
                 Version::new(),
@@ -1587,7 +1649,8 @@ impl StateManager {
                                     &tx_state,
                                     &mut executor,
                                     network.as_ref().map(|(rumors, _)| rumors),
-                                    &own_baseboard,
+                                    &boundary_store,
+                                    &session_sush_nonce,
                                     &version,
                                     &message,
                                 );
@@ -1599,7 +1662,8 @@ impl StateManager {
                                         &tx_state,
                                         &mut executor,
                                         network.as_ref().map(|(rumors, _)| rumors),
-                                        &own_baseboard,
+                                        &boundary_store,
+                                        &session_sush_nonce,
                                     );
                                     reap_zombies(
                                         &log,
@@ -1681,7 +1745,6 @@ impl StateManager {
                             *state = State::new(
                                 own_baseboard.clone(),
                                 &anchors,
-                                state.session_sush_nonce.clone(),
                                 Past::new(
                                     arrival,
                                     birth,
@@ -1701,7 +1764,8 @@ impl StateManager {
                             &tx_state,
                             &mut executor,
                             Some(&*rumors),
-                            &own_baseboard,
+                            &boundary_store,
+                            &session_sush_nonce,
                         );
                         reap_zombies(
                             &log,

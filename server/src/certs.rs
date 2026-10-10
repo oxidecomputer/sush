@@ -13,6 +13,7 @@ use slog::{Logger, error, info};
 use x509_cert::Certificate;
 use x509_cert::der::{Decode as _, Encode as _};
 
+use sush_common::jobs::{SignedJob, VerifiedJob};
 use sush_common::keys::{KeyError, KeyId, Signature};
 
 use crate::messages::v0::CertRequest;
@@ -271,6 +272,13 @@ impl Certificates {
         assert!(!chain.is_empty());
         chain.reverse();
         Ok(chain)
+    }
+
+    /// Verify a job signature against its signing cert's chain.
+    pub fn verify(&self, job: &SignedJob) -> Result<VerifiedJob, KeyError> {
+        let chain = self.chain(job.key_id())?;
+        let cert = chain.last().expect("cert chain should be non-empty");
+        job.clone().verify_with_cert(cert)
     }
 
     /// Move as many certificates as possible from `Unknown → `Valid`.
