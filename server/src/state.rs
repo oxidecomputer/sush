@@ -94,23 +94,6 @@ impl SessionState {
         }
     }
 
-    fn active_session(&mut self) -> Option<SessionGuard<'_>> {
-        use SessionState::*;
-        match self {
-            Inactive { .. } => None,
-            Active {
-                session,
-                queued_jobs,
-                started,
-                ..
-            } => Some(SessionGuard {
-                inner: session,
-                queued_jobs,
-                started,
-            }),
-        }
-    }
-
     pub fn session(&self) -> Option<&Session> {
         use SessionState::*;
         match self {
@@ -150,226 +133,6 @@ impl Default for SessionState {
     fn default() -> Self {
         Self::Inactive {
             frontier: Version::new(),
-        }
-    }
-}
-
-/// A dynamic guard around an active session and its job queue.
-struct SessionGuard<'a> {
-    inner: &'a mut Session,
-    queued_jobs: &'a mut QueuedJobs,
-    /// The version of the session's start message; identity anchor.
-    started: &'a Version,
-}
-
-impl<'a> SessionGuard<'a> {
-    pub fn session_id(&self) -> SessionId {
-        self.inner.session_id()
-    }
-
-    pub fn started_by(&self) -> Option<&KeyId> {
-        self.inner.started_by()
-    }
-
-    pub fn job_started(&mut self, job: SignedJob) {
-        self.inner.job_started(job)
-    }
-
-    pub fn skip_job(&mut self, job_id: &JobId) -> bool {
-        self.inner.skip_job(*job_id)
-    }
-
-    #[allow(clippy::too_many_arguments)]
-    pub fn enqueue_job(
-        &mut self,
-        log: &Logger,
-        history: &mut JobHistory,
-        rack: &Rack,
-        job: SignedJob,
-        params: JobStartParams,
-        actor: &KeyId,
-        replayed: bool,
-    ) {
-        let job_id = *job.job_id();
-        let targeted = rack.runs_here(&job);
-
-        // Adjudication can give the boundary job a status before its
-        // request replays. The queue releases jobs in order, so
-        // dropping that request would wedge the session behind the
-        // boundary job forever. A replayed request therefore always
-        // joins the queue; only a live duplicate is dropped.
-        if !replayed && history.contains(&job_id) {
-            // Note but otherwise ignore the duplicate job.
-            info!(log, "already started job"; "job_id" => %job_id);
-        } else if !replayed
-            && self.queued_jobs.len() >= MAX_QUEUED_JOBS
-            && !self.queued_jobs.contains_key(&job_id)
-        {
-            // We have no choice; drop the job on the floor.
-            warn!(log, "too many jobs queued"; "job_id" => %job_id, "max" => MAX_QUEUED_JOBS);
-        } else {
-            // Insert the job into our queue. Every job joins the
-            // queue to keep the causal chain whole, but only jobs
-            // targeting this sled that can actually run here record
-            // a local status.
-            self.queued_jobs.insert(
-                job_id,
-                QueuedJob {
-                    job,
-                    params,
-                    replayed,
-                },
-            );
-            if targeted && !replayed {
-                history.set_job_status(
-                    &job_id,
-                    rack.own_baseboard(),
-                    JobStatus::Queued {
-                        job_id,
-                        time_queued: Utc::now(),
-                        actor: actor.clone(),
-                    },
-                    None,
-                    Some(self.queued_jobs),
-                );
-            }
-        }
-    }
-
-    pub fn cancel_job(
-        &mut self,
-        job_id: &JobId,
-        actor: &KeyId,
-        own_baseboard: &BaseboardId,
-        history: &mut JobHistory,
-        replayed: bool,
-    ) {
-        self.queued_jobs.remove(job_id);
-        if replayed {
-            return;
-        }
-        history.transition_job_status(
-            job_id,
-            own_baseboard,
-            None,
-            |old_status| match old_status {
-                None | Some(JobStatus::Queued { .. }) => Some(JobStatus::Cancelled {
-                    job_id: *job_id,
-                    time_cancelled: Utc::now(),
-                    actor: actor.clone(),
-                }),
-                _ => None,
-            },
-            Some(self.queued_jobs),
-        );
-    }
-
-    /// Pull out the next job to execute (if any), repeatedly.
-    /// We loop because adding or skipping a job may have "filled a hole"
-    /// in the hash chain, and there may be an unbounded number of
-    /// newly-ready-to-run jobs after it in the queue. Once we reach
-    /// a fixed point, we have nothing further to do.
-    #[allow(clippy::too_many_arguments)]
-    pub fn execute_ready_jobs(
-        &mut self,
-        log: &Logger,
-        rack: &Rack,
-        certs: &mut Certificates,
-        history: &mut JobHistory,
-        executor: &mut Executor,
-        attachments: &mut AttachmentPoints,
-        past: &mut Past,
-        rumors: Option<&GossipNetwork>,
-    ) {
-        loop {
-            let next_id = self.inner.next_job_id();
-            if !self.queued_jobs.contains_key(&next_id) {
-                break;
-            }
-            // A hop can raise the floor mid-drain, so screen on every pass.
-            let admission = match rumors {
-                None => Admission::Admit,
-                Some(rumors) => past.screen(rumors.network(), self.session_id(), self.started),
-            };
-            // A hop raises the floor and screens again.
-            if matches!(admission, Admission::Hop) {
-                let Some(rumors) = rumors else {
-                    break;
-                };
-                warn!(
-                    log, "raising the execution floor above a session the boundary record cannot order";
-                    "session_id" => %self.session_id(), "started" => ?self.started,
-                );
-                past.hop(log, rumors, rack.own_baseboard(), Error::SessionHop);
-                continue;
-            }
-            let QueuedJob {
-                job: request,
-                params,
-                replayed,
-            } = self.queued_jobs.remove(&next_id).expect("checked above");
-            let (tx_attachment, rx_attachment) = watch::channel(None);
-            let job_id = request.payload().job_id().to_owned();
-            if rack.runs_here(&request) {
-                if past.boundary.untrusted() {
-                    warn!(
-                        log, "refusing job, the execution boundary is untrusted";
-                        "job_id" => %job_id,
-                    );
-                    executor.job_refused(
-                        job_id,
-                        ProcessError::Io {
-                            what: "consulting the execution boundary".to_string(),
-                            error: "the boundary records on this sled's M.2s disagree \
-                                    or are corrupt; an M.2 may have failed and the sled \
-                                    needs service"
-                                .to_string(),
-                        },
-                    );
-                } else if matches!(admission, Admission::Refuse) {
-                    // Below the floor the queue skips forward in chain
-                    // order. A live job gets the terminal skip status;
-                    // a replayed one is history, and re-reporting it
-                    // on every rejoin would grow the message set.
-                    if !replayed {
-                        warn!(log, "skipping job below the execution floor"; "job_id" => %job_id);
-                        executor.job_skipped(job_id, SkipReason::BelowFloor);
-                    }
-                } else if history
-                    .get_job_status(&job_id)
-                    .map(|status| {
-                        matches!(
-                            status.get(rack.own_baseboard()),
-                            Some(JobStatus::Queued { .. })
-                        )
-                    })
-                    .unwrap_or(true)
-                {
-                    let Some(rumors) = rumors else {
-                        warn!(log, "not starting a job while draining"; "job_id" => %job_id);
-                        self.job_started(request);
-                        continue;
-                    };
-                    let successor = self
-                        .session_id()
-                        .next_job_id(&LastJob::Some(request.clone()));
-                    let boundary = Boundary {
-                        network: rumors.network(),
-                        burned: past.burned_for(rumors.network()),
-                        executed: past.executed_for(rumors.network(), self.started),
-                        job: Some(Committed {
-                            session: self.session_id(),
-                            job: job_id,
-                            successor,
-                            outcome: JobOutcome::Committed,
-                        }),
-                    };
-                    if executor.job_start(certs, request.clone(), params, tx_attachment, boundary) {
-                        attachments.insert(job_id, rx_attachment);
-                    }
-                }
-            }
-            self.job_started(request);
         }
     }
 }
@@ -856,36 +619,23 @@ impl State {
                     }
                     (actor, SessionRequest::Skip(session_id, job_id)) => {
                         let replayed = !self.is_live(incoming_version);
-                        if let Some(mut session) = self.session.active_session()
-                            && session.session_id() == *session_id
+                        if let Some(session) = match &mut self.session {
+                            SessionState::Active { session, .. } => Some(session),
+                            _ => None,
+                        } && session.session_id() == *session_id
                         {
                             if session.started_by() != Some(actor) {
                                 warn!(
                                     log, "ignoring job skip from non-starter";
                                     "job_id" => %job_id, "actor" => %actor,
                                 );
-                            } else if session.skip_job(job_id) {
+                            } else if session.skip_job(*job_id) {
                                 info!(
                                     log, "job skipped";
                                     "job_id" => %job_id, "actor" => %actor,
                                 );
-                                session.cancel_job(
-                                    job_id,
-                                    actor,
-                                    self.rack.own_baseboard(),
-                                    &mut self.history,
-                                    replayed,
-                                );
-                                session.execute_ready_jobs(
-                                    log,
-                                    &self.rack,
-                                    &mut self.certs,
-                                    &mut self.history,
-                                    executor,
-                                    &mut self.attachments,
-                                    &mut self.past,
-                                    rumors,
-                                );
+                                self.cancel_job(job_id, actor, replayed);
+                                self.execute_ready_jobs(log, executor, rumors);
                             } else {
                                 info!(
                                     log, "ignoring inapplicable job skip";
@@ -932,57 +682,33 @@ impl State {
                         // their fate.
                         let session_id = signed.payload().session_id();
                         let live = self.is_live(incoming_version);
-                        match self.session.active_session() {
-                            Some(mut session) if session.session_id() == session_id => {
-                                session.enqueue_job(
-                                    log,
-                                    &mut self.history,
-                                    &self.rack,
-                                    signed.clone(),
-                                    params.clone(),
-                                    actor,
-                                    !live,
-                                );
-                                session.execute_ready_jobs(
-                                    log,
-                                    &self.rack,
-                                    &mut self.certs,
-                                    &mut self.history,
-                                    executor,
-                                    &mut self.attachments,
-                                    &mut self.past,
-                                    rumors,
-                                );
-                            }
-                            _ => {
-                                let job_id = *signed.job_id();
-                                warn!(
-                                    log, "skipping job for inactive session";
-                                    "job_id" => %job_id,
-                                    "session_id" => %session_id,
-                                    "actor" => %actor,
-                                );
-                                if live
-                                    && self.rack.runs_here(signed)
-                                    && !self.history.contains(&job_id)
-                                {
-                                    executor.job_skipped(job_id, SkipReason::SessionEnded);
-                                }
+                        if self
+                            .session
+                            .session()
+                            .is_some_and(|s| s.session_id() == session_id)
+                        {
+                            self.enqueue_job(log, signed.clone(), params.clone(), actor, !live);
+                            self.execute_ready_jobs(log, executor, rumors);
+                        } else {
+                            let job_id = *signed.job_id();
+                            warn!(
+                                log, "skipping job for inactive session";
+                                "job_id" => %job_id,
+                                "session_id" => %session_id,
+                                "actor" => %actor,
+                            );
+                            if live
+                                && self.rack.runs_here(signed)
+                                && !self.history.contains(&job_id)
+                            {
+                                executor.job_skipped(job_id, SkipReason::SessionEnded);
                             }
                         }
                     }
                     (actor, JobRequest::Stop(job_id)) => {
                         executor.job_stop(job_id);
                         let replayed = !self.is_live(incoming_version);
-                        if let Some(mut session) = self.session.active_session() {
-                            session.cancel_job(
-                                job_id,
-                                actor,
-                                self.rack.own_baseboard(),
-                                &mut self.history,
-                                replayed,
-                            );
-                        }
+                        self.cancel_job(job_id, actor, replayed);
                     }
                 },
             },
@@ -1150,6 +876,209 @@ impl State {
         }
 
         Ok(())
+    }
+
+    fn enqueue_job(
+        &mut self,
+        log: &Logger,
+        job: SignedJob,
+        params: JobStartParams,
+        actor: &KeyId,
+        replayed: bool,
+    ) {
+        let SessionState::Active { queued_jobs, .. } = &mut self.session else {
+            return;
+        };
+        let job_id = *job.job_id();
+        let targeted = self.rack.runs_here(&job);
+
+        // Adjudication can give the boundary job a status before its
+        // request replays. The queue releases jobs in order, so
+        // dropping that request would wedge the session behind the
+        // boundary job forever. A replayed request therefore always
+        // joins the queue; only a live duplicate is dropped.
+        if !replayed && self.history.contains(&job_id) {
+            // Note but otherwise ignore the duplicate job.
+            info!(log, "already started job"; "job_id" => %job_id);
+        } else if !replayed
+            && queued_jobs.len() >= MAX_QUEUED_JOBS
+            && !queued_jobs.contains_key(&job_id)
+        {
+            // We have no choice; drop the job on the floor.
+            warn!(log, "too many jobs queued"; "job_id" => %job_id, "max" => MAX_QUEUED_JOBS);
+        } else {
+            // Insert the job into our queue. Every job joins the
+            // queue to keep the causal chain whole, but only jobs
+            // targeting this sled that can actually run here record
+            // a local status.
+            queued_jobs.insert(
+                job_id,
+                QueuedJob {
+                    job,
+                    params,
+                    replayed,
+                },
+            );
+            if targeted && !replayed {
+                self.history.set_job_status(
+                    &job_id,
+                    self.rack.own_baseboard(),
+                    JobStatus::Queued {
+                        job_id,
+                        time_queued: Utc::now(),
+                        actor: actor.clone(),
+                    },
+                    None,
+                    Some(queued_jobs),
+                );
+            }
+        }
+    }
+
+    fn cancel_job(&mut self, job_id: &JobId, actor: &KeyId, replayed: bool) {
+        let SessionState::Active { queued_jobs, .. } = &mut self.session else {
+            return;
+        };
+        queued_jobs.remove(job_id);
+        if replayed {
+            return;
+        }
+        self.history.transition_job_status(
+            job_id,
+            self.rack.own_baseboard(),
+            None,
+            |old_status| match old_status {
+                None | Some(JobStatus::Queued { .. }) => Some(JobStatus::Cancelled {
+                    job_id: *job_id,
+                    time_cancelled: Utc::now(),
+                    actor: actor.clone(),
+                }),
+                _ => None,
+            },
+            Some(queued_jobs),
+        );
+    }
+
+    /// Pull out the next job to execute (if any), repeatedly.
+    /// We loop because adding or skipping a job may have "filled a hole"
+    /// in the hash chain, and there may be an unbounded number of
+    /// newly-ready-to-run jobs after it in the queue. Once we reach
+    /// a fixed point, we have nothing further to do.
+    fn execute_ready_jobs(
+        &mut self,
+        log: &Logger,
+        executor: &mut Executor,
+        rumors: Option<&GossipNetwork>,
+    ) {
+        let SessionState::Active {
+            session,
+            started,
+            queued_jobs,
+            ..
+        } = &mut self.session
+        else {
+            return;
+        };
+        loop {
+            let next_id = session.next_job_id();
+            if !queued_jobs.contains_key(&next_id) {
+                break;
+            }
+            // A hop can raise the floor mid-drain, so screen on every pass.
+            let admission = match rumors {
+                None => Admission::Admit,
+                Some(rumors) => self
+                    .past
+                    .screen(rumors.network(), session.session_id(), started),
+            };
+            // A hop raises the floor and screens again.
+            if matches!(admission, Admission::Hop) {
+                let Some(rumors) = rumors else {
+                    break;
+                };
+                warn!(
+                    log, "raising the execution floor above a session the boundary record cannot order";
+                    "session_id" => %session.session_id(), "started" => ?started,
+                );
+                self.past
+                    .hop(log, rumors, self.rack.own_baseboard(), Error::SessionHop);
+                continue;
+            }
+            let QueuedJob {
+                job: request,
+                params,
+                replayed,
+            } = queued_jobs.remove(&next_id).expect("checked above");
+            let (tx_attachment, rx_attachment) = watch::channel(None);
+            let job_id = request.payload().job_id().to_owned();
+            if self.rack.runs_here(&request) {
+                if self.past.boundary.untrusted() {
+                    warn!(
+                        log, "refusing job, the execution boundary is untrusted";
+                        "job_id" => %job_id,
+                    );
+                    executor.job_refused(
+                        job_id,
+                        ProcessError::Io {
+                            what: "consulting the execution boundary".to_string(),
+                            error: "the boundary records on this sled's M.2s disagree \
+                                    or are corrupt; an M.2 may have failed and the sled \
+                                    needs service"
+                                .to_string(),
+                        },
+                    );
+                } else if matches!(admission, Admission::Refuse) {
+                    // Below the floor the queue skips forward in chain
+                    // order. A live job gets the terminal skip status;
+                    // a replayed one is history, and re-reporting it
+                    // on every rejoin would grow the message set.
+                    if !replayed {
+                        warn!(log, "skipping job below the execution floor"; "job_id" => %job_id);
+                        executor.job_skipped(job_id, SkipReason::BelowFloor);
+                    }
+                } else if self
+                    .history
+                    .get_job_status(&job_id)
+                    .map(|status| {
+                        matches!(
+                            status.get(self.rack.own_baseboard()),
+                            Some(JobStatus::Queued { .. })
+                        )
+                    })
+                    .unwrap_or(true)
+                {
+                    let Some(rumors) = rumors else {
+                        warn!(log, "not starting a job while draining"; "job_id" => %job_id);
+                        session.job_started(request);
+                        continue;
+                    };
+                    let successor = session
+                        .session_id()
+                        .next_job_id(&LastJob::Some(request.clone()));
+                    let boundary = Boundary {
+                        network: rumors.network(),
+                        burned: self.past.burned_for(rumors.network()),
+                        executed: self.past.executed_for(rumors.network(), started),
+                        job: Some(Committed {
+                            session: session.session_id(),
+                            job: job_id,
+                            successor,
+                            outcome: JobOutcome::Committed,
+                        }),
+                    };
+                    if executor.job_start(
+                        &mut self.certs,
+                        request.clone(),
+                        params,
+                        tx_attachment,
+                        boundary,
+                    ) {
+                        self.attachments.insert(job_id, rx_attachment);
+                    }
+                }
+            }
+            session.job_started(request);
+        }
     }
 }
 
