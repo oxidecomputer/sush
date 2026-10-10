@@ -157,6 +157,10 @@ pub mod v0 {
         pub fn as_parts(&self) -> (&KeyId, &T) {
             (&self.actor, &self.request)
         }
+
+        pub fn request(&self) -> &T {
+            &self.request
+        }
     }
 
     #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -182,6 +186,15 @@ pub mod v0 {
 
         pub fn identity(actor: KeyId, request: IdentityRequest) -> Self {
             Self::Identity(Box::new(Attributed { actor, request }))
+        }
+
+        pub fn actor(&self) -> &KeyId {
+            match self {
+                Self::Cert(r) => r.as_parts().0,
+                Self::Session(r) => r.as_parts().0,
+                Self::Job(r) => r.as_parts().0,
+                Self::Identity(r) => r.as_parts().0,
+            }
         }
 
         pub fn kind(&self) -> &'static str {
@@ -274,9 +287,9 @@ pub mod v0 {
         )]
         ConcurrentSessions {
             own_session: SessionId,
-            own_version: Version,
+            own_version: Box<Version>,
             incoming_session: SessionId,
-            incoming_version: Version,
+            incoming_version: Box<Version>,
         },
         #[error("Sled re-entered a burned universe")]
         UniverseFlipFlop,
@@ -608,9 +621,9 @@ mod wire_format {
             },
             Event::Error(Error::ConcurrentSessions {
                 own_session: sid("bamboo-bamboo-bamboo-bamboo-bamboo-bamboo-bamboo-banana"),
-                own_version: Version::new(),
+                own_version: Box::new(Version::new()),
                 incoming_session: sid("zoo-zoo-zoo-zoo-zoo-zoo-zoo-zebra"),
-                incoming_version: Version::new(),
+                incoming_version: Box::new(Version::new()),
             }),
         )
         .into();

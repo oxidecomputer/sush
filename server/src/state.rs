@@ -429,7 +429,6 @@ impl State {
         }
     }
 
-    #[allow(clippy::result_large_err)]
     fn update(
         &mut self,
         log: &Logger,
@@ -438,436 +437,36 @@ impl State {
         incoming_version: &Version,
         message: &Arc<VersionedMessage>,
     ) -> Result<(), Error> {
-        use SessionState::*;
         match message.as_ref() {
-            V0(Message::Request(request)) => match request {
-                Request::Cert(attributed) => {
-                    let (actor, request) = attributed.as_parts();
-                    let log = log.new(o!("actor" => actor.to_string()));
-                    self.certs.apply(&log, request);
+            V0(Message::Request(request)) => {
+                let actor = request.actor();
+                let log = log.new(o!("actor" => actor.to_string()));
+                match request {
+                    Request::Cert(r) => self.certs.apply(&log, r.request()),
+                    Request::Identity(r) => self.identities.apply(&log, r.request()),
+                    Request::Session(r) => {
+                        self.handle_session_request(
+                            &log,
+                            executor,
+                            rumors,
+                            incoming_version,
+                            actor,
+                            r.request(),
+                        )?;
+                    }
+                    Request::Job(r) => self.handle_job_request(
+                        &log,
+                        executor,
+                        rumors,
+                        incoming_version,
+                        actor,
+                        r.request(),
+                    ),
                 }
-                Request::Identity(attributed) => {
-                    let (actor, request) = attributed.as_parts();
-                    let log = log.new(o!("actor" => actor.to_string()));
-                    self.identities.apply(&log, request);
-                }
-                Request::Session(attributed) => match attributed.as_parts() {
-                    (actor, SessionRequest::Start(session_id)) => match &mut self.session {
-                        // Re-announcement of active session; absorb and ignore.
-                        Active {
-                            frontier, session, ..
-                        } if session.session_id() == *session_id => {
-                            *frontier |= incoming_version.clone();
-                            info!(log, "duplicate session start"; "session_id" => %session_id);
-                        }
-
-                        // If the incoming new session is in the *strict
-                        // causal future* of everything we have observed,
-                        // adopt it regardless of our current state. Every
-                        // other peer will make the same decision, so it
-                        // will come to dominate the network entirely.
-                        Inactive { frontier } | Active { frontier, .. }
-                            if *incoming_version > *frontier =>
-                        {
-                            info!(
-                                log, "session started";
-                                "session_id" => %session_id, "actor" => %actor,
-                            );
-                            self.skip_queued_jobs(executor);
-                            let mut session = Session::started(*session_id, actor.clone());
-                            // The committed session resumes at its
-                            // stored successor: every earlier chain
-                            // position was already handled by the life
-                            // that stored it, and the chain needs no
-                            // replay to verify the next job.
-                            if let Some(committed) = self
-                                .past
-                                .committed
-                                .as_ref()
-                                .and_then(|boundary| boundary.job.as_ref())
-                                .filter(|committed| committed.session == *session_id)
-                            {
-                                info!(
-                                    log, "resuming the committed session at its successor";
-                                    "session_id" => %session_id,
-                                    "successor" => %committed.successor,
-                                );
-                                session.resume_at(committed.successor);
-                            }
-                            self.session = Active {
-                                frontier: self.session.frontier() | incoming_version.clone(),
-                                started: incoming_version.clone(),
-                                session: Box::new(session),
-                                queued_jobs: QueuedJobs::new(),
-                                attach_grants: BTreeMap::new(),
-                            };
-                            *self.session_sush_nonce.lock().unwrap() = SessionSushNonce::random();
-                        }
-
-                        // When the incoming session is concurrent, we can't
-                        // establish which is older, so we have to kill both
-                        // sessions. Every peer will make this same decision,
-                        // so as a partition resolves, both sessions will be
-                        // killed everywhere.
-                        Active {
-                            frontier,
-                            started,
-                            session,
-                            ..
-                        } if incoming_version.partial_cmp(frontier).is_none() => {
-                            let error = Error::ConcurrentSessions {
-                                own_session: session.session_id(),
-                                own_version: started.clone(),
-                                incoming_session: *session_id,
-                                incoming_version: incoming_version.clone(),
-                            };
-                            let frontier = &*frontier | incoming_version.clone();
-                            self.skip_queued_jobs(executor);
-                            self.session = Inactive { frontier };
-                            return Err(error);
-                        }
-
-                        // Stale (≤ frontier) or concurrent while inactive; OBE.
-                        // Absorb and ignore.
-                        Inactive { frontier, .. } | Active { frontier, .. } => {
-                            info!(
-                                log,
-                                "stale session start";
-                                "session_id" => %session_id,
-                                "frontier" => %frontier,
-                                "incoming_version" => %incoming_version,
-                            );
-                            *frontier |= incoming_version.clone();
-                        }
-                    },
-                    (actor, SessionRequest::Stop(session_id)) => {
-                        // Any session stop request for a session that isn't
-                        // ours is silently ignored. Even in the case of
-                        // arbitrary causal reordering (which we must handle),
-                        // this is safe, because we're guaranteed (1) that a
-                        // stop must come *after* its corresponding start, and
-                        // (2) that all sessions are locally causally ordered
-                        // relative to one another, because we create this
-                        // ordering above when handling session-start. Together,
-                        // this means that we can't fail to react to a stop for
-                        // the active session.
-                        if let Active {
-                            frontier, session, ..
-                        } = &self.session
-                            && session.session_id() == *session_id
-                        {
-                            if session.started_by() != Some(actor) {
-                                warn!(
-                                    log, "ignoring session stop from non-starter";
-                                    "session_id" => %session_id, "actor" => %actor,
-                                );
-                            } else {
-                                info!(
-                                    log, "session stopped";
-                                    "session_id" => %session_id, "actor" => %actor,
-                                );
-                                self.skip_queued_jobs(executor);
-                                self.session = Inactive {
-                                    frontier: frontier.clone(),
-                                }
-                            }
-                        }
-                    }
-                    (actor, SessionRequest::AllowAttach(session_id, key_id, access)) => {
-                        if let Active {
-                            session,
-                            attach_grants,
-                            ..
-                        } = &mut self.session
-                            && session.session_id() == *session_id
-                        {
-                            if session.started_by() == Some(actor) {
-                                attach_grants.insert(key_id.clone(), *access);
-                                info!(
-                                    log, "attach allowed";
-                                    "key_id" => %key_id, "access" => ?access, "actor" => %actor,
-                                );
-                            } else {
-                                warn!(
-                                    log, "ignoring attach grant from non-starter";
-                                    "key_id" => %key_id, "actor" => %actor,
-                                );
-                            }
-                        }
-                    }
-                    (actor, SessionRequest::DenyAttach(session_id, key_id)) => {
-                        if let Active {
-                            session,
-                            attach_grants,
-                            ..
-                        } = &mut self.session
-                            && session.session_id() == *session_id
-                        {
-                            if session.started_by() == Some(actor) {
-                                attach_grants.remove(key_id);
-                                info!(
-                                    log, "attach denied";
-                                    "key_id" => %key_id, "actor" => %actor,
-                                );
-                            } else {
-                                warn!(
-                                    log, "ignoring attach denial from non-starter";
-                                    "key_id" => %key_id, "actor" => %actor,
-                                );
-                            }
-                        }
-                    }
-                    (actor, SessionRequest::Skip(session_id, job_id)) => {
-                        let replayed = !self.is_live(incoming_version);
-                        if let Some(session) = match &mut self.session {
-                            SessionState::Active { session, .. } => Some(session),
-                            _ => None,
-                        } && session.session_id() == *session_id
-                        {
-                            if session.started_by() != Some(actor) {
-                                warn!(
-                                    log, "ignoring job skip from non-starter";
-                                    "job_id" => %job_id, "actor" => %actor,
-                                );
-                            } else if session.skip_job(*job_id) {
-                                info!(
-                                    log, "job skipped";
-                                    "job_id" => %job_id, "actor" => %actor,
-                                );
-                                self.cancel_job(job_id, actor, replayed);
-                                self.execute_ready_jobs(log, executor, rumors);
-                            } else {
-                                info!(
-                                    log, "ignoring inapplicable job skip";
-                                    "job_id" => %job_id, "actor" => %actor,
-                                );
-                            }
-                        } else {
-                            info!(
-                                log,
-                                "skipping job in inactive or invalid session";
-                                "session_id" => %session_id
-                            );
-                        }
-                    }
-                },
-                Request::Job(attributed) => match attributed.as_parts() {
-                    (actor, JobRequest::Start(signed, params)) => {
-                        // TODO: When we implement
-                        // https://github.com/oxidecomputer/sush/issues/23, we
-                        // should check for revocation here before executing the
-                        // job. This enforces revocation globally, instead of
-                        // just when the job is injected first into the system.
-
-                        // The session must be active and must match the
-                        // submitted job.
-                        //
-                        // It is safe to refuse all other jobs. By cases:
-                        //
-                        // - If the job came from a session in the causal
-                        // past of our own, the session has been superseded,
-                        // so we should not run it.
-                        // - If the job came from a session concurrent to
-                        // our own, both sessions should be annihilated, so
-                        // we should not run it.
-                        // - If the job came from a session in the causal
-                        // future of our own, contradiction: we consume
-                        // messages in causal order, so it's not possible to
-                        // receive a job from a session before that
-                        // session's own start (since each session is
-                        // linearized by its accepting server).
-                        //
-                        // Refused jobs targeting this sled record the
-                        // terminal skip status so the submitter learns
-                        // their fate.
-                        let session_id = signed.payload().session_id();
-                        let live = self.is_live(incoming_version);
-                        if self
-                            .session
-                            .session()
-                            .is_some_and(|s| s.session_id() == session_id)
-                        {
-                            self.enqueue_job(log, signed.clone(), params.clone(), actor, !live);
-                            self.execute_ready_jobs(log, executor, rumors);
-                        } else {
-                            let job_id = *signed.job_id();
-                            warn!(
-                                log, "skipping job for inactive session";
-                                "job_id" => %job_id,
-                                "session_id" => %session_id,
-                                "actor" => %actor,
-                            );
-                            if live
-                                && self.rack.runs_here(signed)
-                                && !self.history.contains(&job_id)
-                            {
-                                executor.job_skipped(job_id, SkipReason::SessionEnded);
-                            }
-                        }
-                    }
-                    (actor, JobRequest::Stop(job_id)) => {
-                        executor.job_stop(job_id);
-                        let replayed = !self.is_live(incoming_version);
-                        self.cancel_job(job_id, actor, replayed);
-                    }
-                },
-            },
-            V0(Message::Event(baseboard_id, event)) => match event {
-                // Track the active set of known-running jobs anywhere in the rack.
-                Event::Job(job_event) => match job_event {
-                    JobEvent::Start(job_id, when) => {
-                        // A start never displaces a terminal status.
-                        // After an identity change, an adjudicated
-                        // Interrupted and a late replayed start are
-                        // concurrent, and the verdict must win in
-                        // both arrival orders.
-                        if self
-                            .history
-                            .get_job_status(job_id)
-                            .and_then(|status| status.get(baseboard_id))
-                            .is_some_and(|status| status.is_terminal())
-                        {
-                            info!(log, "ignoring a start for a settled job"; "job_id" => %job_id);
-                            return Ok(());
-                        }
-                        info!(log, "job started"; "job_id" => %job_id, "when" => %when);
-
-                        // A start on our own baseboard sent by a
-                        // previous life names a job whose process
-                        // died with that life. No executor here will
-                        // ever end it, so the job is a zombie: unless
-                        // replay delivers its ending, we report it
-                        // interrupted once replay drains. The birth
-                        // mark splits the lives exactly; the arrival
-                        // mark would misread a previous life's start
-                        // as this life's own whenever the join peer
-                        // lagged behind that start.
-                        if baseboard_id == self.rack.own_baseboard()
-                            && self.past.is_from_previous_life(incoming_version)
-                        {
-                            self.past.zombies.insert(*job_id);
-                        }
-                        self.history.set_job_status(
-                            job_id,
-                            baseboard_id,
-                            JobStatus::Started {
-                                job_id: *job_id,
-                                time_started: *when,
-                            },
-                            Some(incoming_version.rank()),
-                            self.session.queued_jobs(),
-                        );
-                    }
-                    JobEvent::Stop(job_id, when, result, output) => {
-                        info!(log, "job stopped"; "job_id" => %job_id, "when" => %when, "result" => ?result);
-                        if baseboard_id == self.rack.own_baseboard() {
-                            self.attachments.remove(job_id);
-                            self.past.zombies.remove(job_id);
-                        }
-                        self.history.transition_job_status(
-                            job_id,
-                            baseboard_id,
-                            Some(incoming_version.rank()),
-                            |old_status| match old_status {
-                                Some(JobStatus::Started { time_started, .. }) => {
-                                    Some(JobStatus::Stopped {
-                                        job_id: *job_id,
-                                        time_started: *time_started,
-                                        time_stopped: *when,
-                                        result: result.clone(),
-                                        output: output.clone(),
-                                    })
-                                }
-                                // An interrupted declaration raced this
-                                // genuine stop. The real result wins in
-                                // either arrival order, though the start
-                                // time died with the previous life.
-                                Some(JobStatus::Error {
-                                    error: ProcessError::Interrupted,
-                                    time_error,
-                                    ..
-                                }) => Some(JobStatus::Stopped {
-                                    job_id: *job_id,
-                                    time_started: *time_error,
-                                    time_stopped: *when,
-                                    result: result.clone(),
-                                    output: output.clone(),
-                                }),
-                                _ => None,
-                            },
-                            self.session.queued_jobs(),
-                        );
-                        if baseboard_id == self.rack.own_baseboard() {
-                            executor.job_stopped(job_id);
-                            self.record_boundary_outcome(job_id);
-                        }
-                    }
-                    JobEvent::Error(job_id, when, error) => {
-                        error!(log, "job error"; "job_id" => %job_id, "when" => %when, "error" => %error);
-                        if baseboard_id == self.rack.own_baseboard() {
-                            self.attachments.remove(job_id);
-                            self.past.zombies.remove(job_id);
-                        }
-                        self.history.transition_job_status(
-                            job_id,
-                            baseboard_id,
-                            Some(incoming_version.rank()),
-                            // An error never displaces a terminal
-                            // status, so a stop that raced an
-                            // interrupted declaration keeps the real
-                            // result.
-                            |old_status| match old_status {
-                                None
-                                | Some(JobStatus::Queued { .. })
-                                | Some(JobStatus::Started { .. }) => Some(JobStatus::Error {
-                                    job_id: *job_id,
-                                    time_error: *when,
-                                    error: error.clone(),
-                                }),
-                                _ => None,
-                            },
-                            self.session.queued_jobs(),
-                        );
-                        if baseboard_id == self.rack.own_baseboard() {
-                            executor.job_stopped(job_id);
-                            self.record_boundary_outcome(job_id);
-                        }
-                    }
-                    JobEvent::Skipped(job_id, when, reason) => {
-                        info!(
-                            log, "job skipped";
-                            "job_id" => %job_id, "when" => %when, "reason" => %reason,
-                        );
-                        self.history.transition_job_status(
-                            job_id,
-                            baseboard_id,
-                            Some(incoming_version.rank()),
-                            // A skip is the reporting sled's decision
-                            // about itself, and never displaces a
-                            // terminal status it already reported.
-                            |old_status| match old_status {
-                                None
-                                | Some(JobStatus::Queued { .. })
-                                | Some(JobStatus::Started { .. }) => Some(JobStatus::Skipped {
-                                    job_id: *job_id,
-                                    time_skipped: *when,
-                                    reason: *reason,
-                                }),
-                                _ => None,
-                            },
-                            self.session.queued_jobs(),
-                        );
-                    }
-                },
-                Event::Error(error) => {
-                    error!(log, "session error"; "error" => %error);
-                }
-                Event::Version(info) => {
-                    if self.rack.known_version(baseboard_id.clone(), info.clone()) {
-                        info!(log, "sled version"; "sled" => %baseboard_id, "version" => %info);
-                    }
-                }
-            },
+            }
+            V0(Message::Event(baseboard_id, event)) => {
+                self.handle_event(log, executor, incoming_version, baseboard_id, event)
+            }
             Unknown { version, .. } => {
                 if self.rack.unknown_version(version.clone()) {
                     warn!(log, "ignoring messages from a newer peer"; "version" => version);
@@ -876,6 +475,454 @@ impl State {
         }
 
         Ok(())
+    }
+
+    fn handle_session_request(
+        &mut self,
+        log: &Logger,
+        executor: &mut Executor,
+        rumors: Option<&GossipNetwork>,
+        incoming_version: &Version,
+        actor: &KeyId,
+        request: &SessionRequest,
+    ) -> Result<(), Error> {
+        use SessionState::*;
+        match request {
+            SessionRequest::Start(session_id) => match &mut self.session {
+                // Re-announcement of active session; absorb and ignore.
+                Active {
+                    frontier, session, ..
+                } if session.session_id() == *session_id => {
+                    *frontier |= incoming_version.clone();
+                    info!(log, "duplicate session start"; "session_id" => %session_id);
+                }
+
+                // If the incoming new session is in the *strict
+                // causal future* of everything we have observed,
+                // adopt it regardless of our current state. Every
+                // other peer will make the same decision, so it
+                // will come to dominate the network entirely.
+                Inactive { frontier } | Active { frontier, .. }
+                    if *incoming_version > *frontier =>
+                {
+                    info!(
+                        log, "session started";
+                        "session_id" => %session_id, "actor" => %actor,
+                    );
+                    self.skip_queued_jobs(executor);
+                    let mut session = Session::started(*session_id, actor.clone());
+                    // The committed session resumes at its
+                    // stored successor: every earlier chain
+                    // position was already handled by the life
+                    // that stored it, and the chain needs no
+                    // replay to verify the next job.
+                    if let Some(committed) = self
+                        .past
+                        .committed
+                        .as_ref()
+                        .and_then(|boundary| boundary.job.as_ref())
+                        .filter(|committed| committed.session == *session_id)
+                    {
+                        info!(
+                            log, "resuming the committed session at its successor";
+                            "session_id" => %session_id,
+                            "successor" => %committed.successor,
+                        );
+                        session.resume_at(committed.successor);
+                    }
+                    self.session = Active {
+                        frontier: self.session.frontier() | incoming_version.clone(),
+                        started: incoming_version.clone(),
+                        session: Box::new(session),
+                        queued_jobs: QueuedJobs::new(),
+                        attach_grants: BTreeMap::new(),
+                    };
+                    *self.session_sush_nonce.lock().unwrap() = SessionSushNonce::random();
+                }
+
+                // When the incoming session is concurrent, we can't
+                // establish which is older, so we have to kill both
+                // sessions. Every peer will make this same decision,
+                // so as a partition resolves, both sessions will be
+                // killed everywhere.
+                Active {
+                    frontier,
+                    started,
+                    session,
+                    ..
+                } if incoming_version.partial_cmp(frontier).is_none() => {
+                    let error = Error::ConcurrentSessions {
+                        own_session: session.session_id(),
+                        own_version: Box::new(started.clone()),
+                        incoming_session: *session_id,
+                        incoming_version: Box::new(incoming_version.clone()),
+                    };
+                    let frontier = &*frontier | incoming_version.clone();
+                    self.skip_queued_jobs(executor);
+                    self.session = Inactive { frontier };
+                    return Err(error);
+                }
+
+                // Stale (≤ frontier) or concurrent while inactive; OBE.
+                // Absorb and ignore.
+                Inactive { frontier, .. } | Active { frontier, .. } => {
+                    info!(
+                        log,
+                        "stale session start";
+                        "session_id" => %session_id,
+                        "frontier" => %frontier,
+                        "incoming_version" => %incoming_version,
+                    );
+                    *frontier |= incoming_version.clone();
+                }
+            },
+            SessionRequest::Stop(session_id) => {
+                // Any session stop request for a session that isn't
+                // ours is silently ignored. Even in the case of
+                // arbitrary causal reordering (which we must handle),
+                // this is safe, because we're guaranteed (1) that a
+                // stop must come *after* its corresponding start, and
+                // (2) that all sessions are locally causally ordered
+                // relative to one another, because we create this
+                // ordering above when handling session-start. Together,
+                // this means that we can't fail to react to a stop for
+                // the active session.
+                if let Active {
+                    frontier, session, ..
+                } = &self.session
+                    && session.session_id() == *session_id
+                {
+                    if session.started_by() != Some(actor) {
+                        warn!(
+                            log, "ignoring session stop from non-starter";
+                            "session_id" => %session_id, "actor" => %actor,
+                        );
+                    } else {
+                        info!(
+                            log, "session stopped";
+                            "session_id" => %session_id, "actor" => %actor,
+                        );
+                        self.skip_queued_jobs(executor);
+                        self.session = Inactive {
+                            frontier: frontier.clone(),
+                        }
+                    }
+                }
+            }
+            SessionRequest::AllowAttach(session_id, key_id, access) => {
+                if let Active {
+                    session,
+                    attach_grants,
+                    ..
+                } = &mut self.session
+                    && session.session_id() == *session_id
+                {
+                    if session.started_by() == Some(actor) {
+                        attach_grants.insert(key_id.clone(), *access);
+                        info!(
+                            log, "attach allowed";
+                            "key_id" => %key_id, "access" => ?access, "actor" => %actor,
+                        );
+                    } else {
+                        warn!(
+                            log, "ignoring attach grant from non-starter";
+                            "key_id" => %key_id, "actor" => %actor,
+                        );
+                    }
+                }
+            }
+            SessionRequest::DenyAttach(session_id, key_id) => {
+                if let Active {
+                    session,
+                    attach_grants,
+                    ..
+                } = &mut self.session
+                    && session.session_id() == *session_id
+                {
+                    if session.started_by() == Some(actor) {
+                        attach_grants.remove(key_id);
+                        info!(
+                            log, "attach denied";
+                            "key_id" => %key_id, "actor" => %actor,
+                        );
+                    } else {
+                        warn!(
+                            log, "ignoring attach denial from non-starter";
+                            "key_id" => %key_id, "actor" => %actor,
+                        );
+                    }
+                }
+            }
+            SessionRequest::Skip(session_id, job_id) => {
+                let replayed = !self.is_live(incoming_version);
+                if let Some(session) = match &mut self.session {
+                    SessionState::Active { session, .. } => Some(session),
+                    _ => None,
+                } && session.session_id() == *session_id
+                {
+                    if session.started_by() != Some(actor) {
+                        warn!(
+                            log, "ignoring job skip from non-starter";
+                            "job_id" => %job_id, "actor" => %actor,
+                        );
+                    } else if session.skip_job(*job_id) {
+                        info!(
+                            log, "job skipped";
+                            "job_id" => %job_id, "actor" => %actor,
+                        );
+                        self.cancel_job(job_id, actor, replayed);
+                        self.execute_ready_jobs(log, executor, rumors);
+                    } else {
+                        info!(
+                            log, "ignoring inapplicable job skip";
+                            "job_id" => %job_id, "actor" => %actor,
+                        );
+                    }
+                } else {
+                    info!(
+                        log,
+                        "skipping job in inactive or invalid session";
+                        "session_id" => %session_id
+                    );
+                }
+            }
+        }
+        Ok(())
+    }
+
+    fn handle_job_request(
+        &mut self,
+        log: &Logger,
+        executor: &mut Executor,
+        rumors: Option<&GossipNetwork>,
+        incoming_version: &Version,
+        actor: &KeyId,
+        request: &JobRequest,
+    ) {
+        match request {
+            JobRequest::Start(signed, params) => {
+                // TODO: When we implement
+                // https://github.com/oxidecomputer/sush/issues/23, we
+                // should check for revocation here before executing the
+                // job. This enforces revocation globally, instead of
+                // just when the job is injected first into the system.
+
+                // The session must be active and must match the
+                // submitted job.
+                //
+                // It is safe to refuse all other jobs. By cases:
+                //
+                // - If the job came from a session in the causal
+                // past of our own, the session has been superseded,
+                // so we should not run it.
+                // - If the job came from a session concurrent to
+                // our own, both sessions should be annihilated, so
+                // we should not run it.
+                // - If the job came from a session in the causal
+                // future of our own, contradiction: we consume
+                // messages in causal order, so it's not possible to
+                // receive a job from a session before that
+                // session's own start (since each session is
+                // linearized by its accepting server).
+                //
+                // Refused jobs targeting this sled record the
+                // terminal skip status so the submitter learns
+                // their fate.
+                let session_id = signed.payload().session_id();
+                let live = self.is_live(incoming_version);
+                if self
+                    .session
+                    .session()
+                    .is_some_and(|s| s.session_id() == session_id)
+                {
+                    self.enqueue_job(log, signed.clone(), params.clone(), actor, !live);
+                    self.execute_ready_jobs(log, executor, rumors);
+                } else {
+                    let job_id = *signed.job_id();
+                    warn!(
+                        log, "skipping job for inactive session";
+                        "job_id" => %job_id,
+                        "session_id" => %session_id,
+                        "actor" => %actor,
+                    );
+                    if live && self.rack.runs_here(signed) && !self.history.contains(&job_id) {
+                        executor.job_skipped(job_id, SkipReason::SessionEnded);
+                    }
+                }
+            }
+            JobRequest::Stop(job_id) => {
+                executor.job_stop(job_id);
+                let replayed = !self.is_live(incoming_version);
+                self.cancel_job(job_id, actor, replayed);
+            }
+        }
+    }
+
+    fn handle_event(
+        &mut self,
+        log: &Logger,
+        executor: &mut Executor,
+        incoming_version: &Version,
+        baseboard_id: &BaseboardId,
+        event: &Event,
+    ) {
+        let log = log.new(o!("sled" => baseboard_id.to_string()));
+        match event {
+            // Track the active set of known-running jobs anywhere in the rack.
+            Event::Job(job_event) => match job_event {
+                JobEvent::Start(job_id, when) => {
+                    // A start never displaces a terminal status.
+                    // After an identity change, an adjudicated
+                    // Interrupted and a late replayed start are
+                    // concurrent, and the verdict must win in
+                    // both arrival orders.
+                    if self
+                        .history
+                        .get_job_status(job_id)
+                        .and_then(|status| status.get(baseboard_id))
+                        .is_some_and(|status| status.is_terminal())
+                    {
+                        info!(log, "ignoring a start for a settled job"; "job_id" => %job_id);
+                        return;
+                    }
+                    info!(log, "job started"; "job_id" => %job_id, "when" => %when);
+
+                    // A start on our own baseboard sent by a
+                    // previous life names a job whose process
+                    // died with that life. No executor here will
+                    // ever end it, so the job is a zombie: unless
+                    // replay delivers its ending, we report it
+                    // interrupted once replay drains. The birth
+                    // mark splits the lives exactly; the arrival
+                    // mark would misread a previous life's start
+                    // as this life's own whenever the join peer
+                    // lagged behind that start.
+                    if baseboard_id == self.rack.own_baseboard()
+                        && self.past.is_from_previous_life(incoming_version)
+                    {
+                        self.past.zombies.insert(*job_id);
+                    }
+                    self.history.set_job_status(
+                        job_id,
+                        baseboard_id,
+                        JobStatus::Started {
+                            job_id: *job_id,
+                            time_started: *when,
+                        },
+                        Some(incoming_version.rank()),
+                        self.session.queued_jobs(),
+                    );
+                }
+                JobEvent::Stop(job_id, when, result, output) => {
+                    info!(log, "job stopped"; "job_id" => %job_id, "when" => %when, "result" => ?result);
+                    if baseboard_id == self.rack.own_baseboard() {
+                        self.attachments.remove(job_id);
+                        self.past.zombies.remove(job_id);
+                    }
+                    self.history.transition_job_status(
+                        job_id,
+                        baseboard_id,
+                        Some(incoming_version.rank()),
+                        |old_status| match old_status {
+                            Some(JobStatus::Started { time_started, .. }) => {
+                                Some(JobStatus::Stopped {
+                                    job_id: *job_id,
+                                    time_started: *time_started,
+                                    time_stopped: *when,
+                                    result: result.clone(),
+                                    output: output.clone(),
+                                })
+                            }
+                            // An interrupted declaration raced this
+                            // genuine stop. The real result wins in
+                            // either arrival order, though the start
+                            // time died with the previous life.
+                            Some(JobStatus::Error {
+                                error: ProcessError::Interrupted,
+                                time_error,
+                                ..
+                            }) => Some(JobStatus::Stopped {
+                                job_id: *job_id,
+                                time_started: *time_error,
+                                time_stopped: *when,
+                                result: result.clone(),
+                                output: output.clone(),
+                            }),
+                            _ => None,
+                        },
+                        self.session.queued_jobs(),
+                    );
+                    if baseboard_id == self.rack.own_baseboard() {
+                        executor.job_stopped(job_id);
+                        self.record_boundary_outcome(job_id);
+                    }
+                }
+                JobEvent::Error(job_id, when, error) => {
+                    error!(log, "job error"; "job_id" => %job_id, "when" => %when, "error" => %error);
+                    if baseboard_id == self.rack.own_baseboard() {
+                        self.attachments.remove(job_id);
+                        self.past.zombies.remove(job_id);
+                    }
+                    self.history.transition_job_status(
+                        job_id,
+                        baseboard_id,
+                        Some(incoming_version.rank()),
+                        // An error never displaces a terminal
+                        // status, so a stop that raced an
+                        // interrupted declaration keeps the real
+                        // result.
+                        |old_status| match old_status {
+                            None
+                            | Some(JobStatus::Queued { .. })
+                            | Some(JobStatus::Started { .. }) => Some(JobStatus::Error {
+                                job_id: *job_id,
+                                time_error: *when,
+                                error: error.clone(),
+                            }),
+                            _ => None,
+                        },
+                        self.session.queued_jobs(),
+                    );
+                    if baseboard_id == self.rack.own_baseboard() {
+                        executor.job_stopped(job_id);
+                        self.record_boundary_outcome(job_id);
+                    }
+                }
+                JobEvent::Skipped(job_id, when, reason) => {
+                    info!(
+                        log, "job skipped";
+                        "job_id" => %job_id, "when" => %when, "reason" => %reason,
+                    );
+                    self.history.transition_job_status(
+                        job_id,
+                        baseboard_id,
+                        Some(incoming_version.rank()),
+                        // A skip is the reporting sled's decision
+                        // about itself, and never displaces a
+                        // terminal status it already reported.
+                        |old_status| match old_status {
+                            None
+                            | Some(JobStatus::Queued { .. })
+                            | Some(JobStatus::Started { .. }) => Some(JobStatus::Skipped {
+                                job_id: *job_id,
+                                time_skipped: *when,
+                                reason: *reason,
+                            }),
+                            _ => None,
+                        },
+                        self.session.queued_jobs(),
+                    );
+                }
+            },
+            Event::Error(error) => {
+                error!(log, "session error"; "error" => %error);
+            }
+            Event::Version(info) => {
+                if self.rack.known_version(baseboard_id.clone(), info.clone()) {
+                    info!(log, "sled version"; "version" => %info);
+                }
+            }
+        }
     }
 
     fn enqueue_job(
