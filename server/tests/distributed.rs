@@ -15,7 +15,7 @@ use std::time::Duration;
 use camino::Utf8PathBuf;
 use function_name::named;
 use sled_hardware_types::BaseboardId;
-use slog::Logger;
+use slog::{Logger, o};
 use tempfile::TempDir;
 use tokio::sync::watch;
 use tokio::time::sleep;
@@ -72,10 +72,11 @@ impl Sled {
         locker: Locker,
         shutdown: &CancellationToken,
     ) -> Sled {
-        let seed = seed_gossip(log, &locker).await;
+        let log = log.new(o!("sled" => identity));
+        let seed = seed_gossip(&log, &locker).await;
         let (peers, peers_rx) = watch::channel(BTreeSet::new());
         let (addr, universe, linked) = spawn_gossip(
-            log,
+            &log,
             gossip_config(),
             sprockets_config(dir, identity),
             corpus(dir),

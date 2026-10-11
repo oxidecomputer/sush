@@ -156,17 +156,13 @@ enum Admission {
 /// running.
 #[derive(Debug)]
 pub struct Past {
-    /// The frontier just before this life's first send into this
-    /// universe: the general replay line. Messages that do not
-    /// strictly follow it count as replayed.
-    arrival: Version,
-    /// The frontier just past this life's first send. Own-baseboard
-    /// events at or below it belong to a previous life; everything
-    /// this life sends causally follows it. Never persisted: each
-    /// life computes its own, so the split is exact and independent of
-    /// which peer we joined through. It is not the general replay
-    /// line, because a neighbor's fresh traffic reaches us before our
-    /// first send reaches the neighbor.
+    /// The version of this life's first send: our announcement that
+    /// we joined this universe. A message whose causal history
+    /// includes the announcement is live, and so is the announcement
+    /// itself. Every other message, prior to or concurrent with the
+    /// announcement, is replayed. A replayed event from our own
+    /// baseboard came from a previous life. Not persisted; each
+    /// life computes its own.
     birth: Version,
     /// The last job this sled committed to executing, durable across
     /// restarts.
@@ -197,14 +193,12 @@ fn dominates(version: &Version, mark: &Version) -> bool {
 
 impl Past {
     pub fn new(
-        arrival: Version,
         birth: Version,
         boundary: Arc<BoundaryStore>,
         committed: Option<Boundary>,
         floor: Option<Version>,
     ) -> Self {
         Self {
-            arrival,
             birth,
             boundary,
             committed,
@@ -308,17 +302,10 @@ impl Past {
     }
 
     /// Whether a message at `version` is live traffic rather than
-    /// replayed history: only strict causal descendants of the
-    /// arrival are live.
+    /// replayed history; see [`Past::birth`]. Equality admits the
+    /// birth announcement itself.
     fn is_live(&self, version: &Version) -> bool {
-        dominates(version, &self.arrival)
-    }
-
-    /// Whether this sled's own event at `version` came from a
-    /// previous life. The split is exact: nothing a previous life
-    /// sent dominates the birth, and everything this life sends does.
-    fn is_from_previous_life(&self, version: &Version) -> bool {
-        !dominates(version, &self.birth)
+        *version >= self.birth
     }
 }
 
@@ -832,7 +819,7 @@ impl State {
                         // as this life's own whenever the join peer
                         // lagged behind that start.
                         if baseboard_id == self.rack.own_baseboard()
-                            && self.past.is_from_previous_life(incoming_version)
+                            && !self.past.is_live(incoming_version)
                         {
                             self.past.zombies.insert(*job_id);
                         }
@@ -1496,13 +1483,7 @@ impl StateManager {
         let mut initial_state = State::new(
             own_baseboard.clone(),
             anchors,
-            Past::new(
-                Version::new(),
-                Version::new(),
-                store.clone(),
-                boundary.clone(),
-                None,
-            ),
+            Past::new(Version::new(), store.clone(), boundary.clone(), None),
         )?;
         initial_state
             .rack
@@ -1552,7 +1533,6 @@ impl StateManager {
                         let birth = rumors.snapshot().latest().clone();
                         tx_state.send_modify(|state| {
                             state.past = Past::new(
-                                arrival,
                                 birth,
                                 boundary_store.clone(),
                                 boundary.clone(),
@@ -1746,7 +1726,6 @@ impl StateManager {
                                 own_baseboard.clone(),
                                 &anchors,
                                 Past::new(
-                                    arrival,
                                     birth,
                                     boundary_store.clone(),
                                     boundary.clone(),
@@ -1802,7 +1781,6 @@ mod test {
     fn past(committed: Option<Boundary>, floor: Option<Version>) -> Past {
         let log = Logger::root(slog::Discard, o!());
         Past::new(
-            Version::new(),
             Version::new(),
             Arc::new(BoundaryStore::new(&log, &Locker::null())),
             committed,
