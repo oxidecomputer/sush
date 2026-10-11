@@ -69,28 +69,33 @@ pub struct QueuedJob {
 #[derive(Clone, Debug)]
 pub enum SessionState {
     Inactive {
-        /// Last observed session request.
-        frontier: Version,
+        /// Join of all observed session start requests.
+        starts: Version,
     },
     Active {
-        /// Last observed session request.
-        frontier: Version,
+        /// Join of all observed session start requests.
+        starts: Version,
+
+        /// When the active session started.
         started: Version,
+
         /// The active session.
         session: Box<Session>,
+
         /// Jobs waiting to run in this session.
         queued_jobs: QueuedJobs,
+
         /// Keys the starter has granted attach access, and how much.
         attach_grants: BTreeMap<KeyId, Access>,
     },
 }
 
 impl SessionState {
-    fn frontier(&self) -> Version {
+    fn starts(&self) -> Version {
         use SessionState::*;
         match self {
-            Inactive { frontier } => frontier.clone(),
-            Active { frontier, .. } => frontier.clone(),
+            Inactive { starts } => starts.clone(),
+            Active { starts, .. } => starts.clone(),
         }
     }
 
@@ -132,7 +137,7 @@ impl SessionState {
 impl Default for SessionState {
     fn default() -> Self {
         Self::Inactive {
-            frontier: Version::new(),
+            starts: Version::new(),
         }
     }
 }
@@ -248,6 +253,10 @@ pub struct Past {
     /// life computes its own.
     birth: Version,
 
+    /// The most recently seen message version. Initialized to `birth`,
+    /// then joined at every state machine update.
+    frontier: Version,
+
     /// What job, if any, this sled committed to executing. Durable
     /// across restarts.
     committed: Commitment,
@@ -267,10 +276,15 @@ fn dominates(version: &Version, mark: &Version) -> bool {
 impl Past {
     fn new(birth: Version, committed: Commitment) -> Self {
         Self {
+            frontier: birth.clone(),
             birth,
             committed,
             zombies: BTreeSet::new(),
         }
+    }
+
+    fn observe(&mut self, version: &Version) {
+        self.frontier |= version;
     }
 
     /// Decide whether the active session, identified by its id and
@@ -328,23 +342,6 @@ impl Past {
                 outcome: JobOutcome::Committed,
             }),
         }
-    }
-
-    /// Report the cause of an [`Admission::Hop`] to the gossip set,
-    /// then set the floor at the frontier that includes the report.
-    fn hop(
-        &mut self,
-        log: &Logger,
-        rumors: &GossipNetwork,
-        own_baseboard: &BaseboardId,
-        report: Error,
-    ) {
-        gossip(
-            log,
-            rumors,
-            Message::Event(own_baseboard.clone(), Event::Error(report)).into(),
-        );
-        self.committed.raise(rumors.snapshot().latest().clone());
     }
 
     /// The burned set for a record committed in `network`; see
@@ -510,10 +507,11 @@ impl State {
     fn update(
         &mut self,
         log: &Logger,
-        rumors: Option<&GossipNetwork>,
+        network: Option<Network>,
         incoming_version: &Version,
         message: &Arc<VersionedMessage>,
     ) -> Vec<Output> {
+        self.past.observe(incoming_version);
         match message.as_ref() {
             V0(Message::Request(request)) => {
                 let actor = request.actor();
@@ -529,13 +527,13 @@ impl State {
                     }
                     Request::Session(r) => self.handle_session_request(
                         &log,
-                        rumors,
+                        network,
                         incoming_version,
                         actor,
                         r.request(),
                     ),
                     Request::Job(r) => {
-                        self.handle_job_request(&log, rumors, incoming_version, actor, r.request())
+                        self.handle_job_request(&log, network, incoming_version, actor, r.request())
                     }
                 }
             }
@@ -555,7 +553,7 @@ impl State {
     fn handle_session_request(
         &mut self,
         log: &Logger,
-        rumors: Option<&GossipNetwork>,
+        network: Option<Network>,
         incoming_version: &Version,
         actor: &KeyId,
         request: &SessionRequest,
@@ -567,9 +565,9 @@ impl State {
             SessionRequest::Start(session_id) => match &mut self.session {
                 // Re-announcement of active session; absorb and ignore.
                 Active {
-                    frontier, session, ..
+                    starts, session, ..
                 } if session.session_id() == *session_id => {
-                    *frontier |= incoming_version.clone();
+                    *starts |= incoming_version.clone();
                     info!(log, "duplicate session start"; "session_id" => %session_id);
                 }
 
@@ -578,20 +576,9 @@ impl State {
                 // adopt it regardless of our current state. Every
                 // other peer will make the same decision, so it
                 // will come to dominate the network entirely.
-                Inactive { frontier } | Active { frontier, .. }
-                    if *incoming_version > *frontier =>
-                {
-                    info!(
-                        log, "session started";
-                        "session_id" => %session_id, "actor" => %actor,
-                    );
-                    outputs.extend(self.skip_queued_jobs());
+                Inactive { starts } | Active { starts, .. } if *incoming_version > *starts => {
+                    info!(log, "session started"; "session_id" => %session_id, "actor" => %actor);
                     let mut session = Session::started(*session_id, actor.clone());
-                    // The committed session resumes at its
-                    // stored successor: every earlier chain
-                    // position was already handled by the life
-                    // that stored it, and the chain needs no
-                    // replay to verify the next job.
                     if let Commitment::Trusted { boundary, .. } = &self.past.committed
                         && let Some(committed) = boundary
                             .job
@@ -599,20 +586,21 @@ impl State {
                             .filter(|committed| committed.session == *session_id)
                     {
                         info!(
-                            log, "resuming the committed session at its successor";
+                            log, "resuming committed session at its successor";
                             "session_id" => %session_id,
                             "successor" => %committed.successor,
                         );
                         session.resume_at(committed.successor);
                     }
+                    outputs.extend(self.skip_queued_jobs());
+                    outputs.push(Output::RotateNonce);
                     self.session = Active {
-                        frontier: self.session.frontier() | incoming_version.clone(),
+                        starts: self.session.starts() | incoming_version.clone(),
                         started: incoming_version.clone(),
                         session: Box::new(session),
                         queued_jobs: QueuedJobs::new(),
                         attach_grants: BTreeMap::new(),
                     };
-                    outputs.push(Output::RotateNonce);
                 }
 
                 // When the incoming session is concurrent, we can't
@@ -621,37 +609,38 @@ impl State {
                 // so as a partition resolves, both sessions will be
                 // killed everywhere.
                 Active {
-                    frontier,
+                    starts,
                     started,
                     session,
                     ..
-                } if incoming_version.partial_cmp(frontier).is_none() => {
+                } if incoming_version.partial_cmp(starts).is_none() => {
+                    let starts = starts.to_owned();
                     let error = Error::ConcurrentSessions {
                         own_session: session.session_id(),
                         own_version: Box::new(started.clone()),
                         incoming_session: *session_id,
                         incoming_version: Box::new(incoming_version.clone()),
                     };
-                    let frontier = &*frontier | incoming_version.clone();
-                    self.session = Inactive { frontier };
                     outputs.extend(self.skip_queued_jobs());
                     outputs.push(Output::Gossip(Message::Event(
                         self.rack.own_baseboard().to_owned(),
                         Event::Error(error),
                     )));
+                    self.session = Inactive {
+                        starts: starts | incoming_version.clone(),
+                    };
                 }
 
-                // Stale (≤ frontier) or concurrent while inactive; OBE.
+                // Stale or concurrent session while inactive; OBE.
                 // Absorb and ignore.
-                Inactive { frontier, .. } | Active { frontier, .. } => {
+                Inactive { starts, .. } | Active { starts, .. } => {
                     info!(
-                        log,
-                        "stale session start";
+                        log, "stale session start";
                         "session_id" => %session_id,
-                        "frontier" => %frontier,
+                        "starts" => %starts,
                         "incoming_version" => %incoming_version,
                     );
-                    *frontier |= incoming_version.clone();
+                    *starts |= incoming_version.clone();
                 }
             },
             SessionRequest::Stop(session_id) => {
@@ -666,7 +655,7 @@ impl State {
                 // this means that we can't fail to react to a stop for
                 // the active session.
                 if let Active {
-                    frontier, session, ..
+                    starts, session, ..
                 } = &self.session
                     && session.session_id() == *session_id
                 {
@@ -682,8 +671,8 @@ impl State {
                         );
                         outputs.extend(self.skip_queued_jobs());
                         self.session = Inactive {
-                            frontier: frontier.clone(),
-                        }
+                            starts: starts.clone(),
+                        };
                     }
                 }
             }
@@ -749,7 +738,7 @@ impl State {
                             "job_id" => %job_id, "actor" => %actor,
                         );
                         self.cancel_job(job_id, actor, replayed);
-                        outputs.extend(self.release_ready_jobs(log, rumors));
+                        outputs.extend(self.release_ready_jobs(log, network));
                     } else {
                         info!(
                             log, "ignoring inapplicable job skip";
@@ -772,7 +761,7 @@ impl State {
     fn handle_job_request(
         &mut self,
         log: &Logger,
-        rumors: Option<&GossipNetwork>,
+        network: Option<Network>,
         incoming_version: &Version,
         actor: &KeyId,
         request: &JobRequest,
@@ -815,7 +804,7 @@ impl State {
                     .is_some_and(|s| s.session_id() == session_id)
                 {
                     self.enqueue_job(log, signed.clone(), params.clone(), actor, !live);
-                    outputs.extend(self.release_ready_jobs(log, rumors));
+                    outputs.extend(self.release_ready_jobs(log, network));
                 } else {
                     let job_id = *signed.job_id();
                     warn!(
@@ -1096,7 +1085,7 @@ impl State {
     /// newly-ready-to-run jobs after it in the queue. Once we reach
     /// a fixed point, we have nothing further to do.
     #[must_use]
-    fn release_ready_jobs(&mut self, log: &Logger, rumors: Option<&GossipNetwork>) -> Vec<Output> {
+    fn release_ready_jobs(&mut self, log: &Logger, network: Option<Network>) -> Vec<Output> {
         let mut outputs = Vec::new();
         let SessionState::Active {
             session,
@@ -1112,26 +1101,27 @@ impl State {
             if !queued_jobs.contains_key(&next_id) {
                 break;
             }
+
             // A hop can raise the floor mid-drain, so screen on every pass.
-            let admission = match rumors {
+            let admission = match network {
                 None => Admission::Admit,
-                Some(rumors) => self
-                    .past
-                    .screen(rumors.network(), session.session_id(), started),
+                Some(network) => self.past.screen(network, session.session_id(), started),
             };
+
             // A hop raises the floor and screens again.
             if matches!(admission, Admission::Hop) {
-                let Some(rumors) = rumors else {
-                    break;
-                };
                 warn!(
-                    log, "raising the execution floor above a session the boundary record cannot order";
+                    log, "hopping sessions, raising the execution floor";
                     "session_id" => %session.session_id(), "started" => ?started,
                 );
-                self.past
-                    .hop(log, rumors, self.rack.own_baseboard(), Error::SessionHop);
+                self.past.committed.raise(self.past.frontier.clone());
+                outputs.push(Output::Gossip(Message::Event(
+                    self.rack.own_baseboard().to_owned(),
+                    Event::Error(Error::SessionHop),
+                )));
                 continue;
             }
+
             let QueuedJob {
                 job: request,
                 params,
@@ -1141,7 +1131,7 @@ impl State {
             if self.rack.runs_here(&request) {
                 if matches!(admission, Admission::Untrusted) {
                     warn!(
-                        log, "refusing job, the execution boundary is untrusted";
+                        log, "execution boundary is untrusted, refusing job";
                         "job_id" => %job_id,
                     );
                     outputs.push(Output::job_event(
@@ -1181,7 +1171,7 @@ impl State {
                     })
                     .unwrap_or(true)
                 {
-                    let Some(rumors) = rumors else {
+                    let Some(network) = network else {
                         warn!(log, "not starting a job while draining"; "job_id" => %job_id);
                         session.job_started(request);
                         continue;
@@ -1203,7 +1193,7 @@ impl State {
                                 params,
                                 attachment,
                                 boundary: self.past.commit_to(
-                                    rumors.network(),
+                                    network,
                                     started,
                                     session.session_id(),
                                     job_id,
@@ -1241,8 +1231,9 @@ fn apply_message(
     message: &Arc<VersionedMessage>,
 ) {
     let mut outputs = Vec::new();
+    let network = rumors.map(|r| r.network());
     tx_state.send_modify(|state| {
-        outputs = state.update(log, rumors, version, message);
+        outputs = state.update(log, network, version, message);
     });
     apply_outputs(log, executor, rumors, store, nonce, outputs);
 }
@@ -1890,6 +1881,42 @@ mod test {
                 Admission::Admit
             ));
         }
+    }
+
+    /// A hop raises the floor to the frontier, so the hopped session
+    /// screens as a refusal from then on: one hop report per session.
+    /// A session started strictly above the frontier admits again.
+    #[test]
+    fn raised_floor_refuses_hopped_session() {
+        let started: Version = "(1, 1, (0, 0, 2))".parse().unwrap();
+        let executed: Version = "(1, 2, (0, 0, 1))".parse().unwrap();
+        let above: Version = "(2, 2, (0, 0, 3))".parse().unwrap();
+        let session = SessionId::random();
+        let committed = Boundary {
+            network: network(1),
+            burned: Bloom::new(),
+            executed: executed.clone(),
+            job: None,
+        };
+
+        let mut past = past(Some(committed), None);
+        past.observe(&started);
+        past.observe(&executed);
+        assert_eq!(past.frontier, &started | executed.clone());
+        assert!(matches!(
+            past.screen(network(1), session, &started),
+            Admission::Hop
+        ));
+
+        past.committed.raise(past.frontier.clone());
+        assert!(matches!(
+            past.screen(network(1), session, &started),
+            Admission::Refuse
+        ));
+        assert!(matches!(
+            past.screen(network(1), session, &above),
+            Admission::Admit
+        ));
     }
 
     /// An untrusted record admits nothing in any universe, and a
