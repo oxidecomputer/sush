@@ -137,18 +137,101 @@ impl Default for SessionState {
     }
 }
 
+/// Whether we have a job boundary we can rely on, and if so what the
+/// execution floor is.
+///
+/// The floor lives in memory only, since a floor written to disk would
+/// reach the next life, which might join a different universe; and because
+/// versions don't compare across universes, every session would look
+/// concurrent with the floor, leading to a permanent lock-out. Instead,
+/// we raise a fresh floor at each universe entry from messages already
+/// there, so future sessions come to dominate it.
+#[derive(Debug)]
+enum Commitment {
+    /// Tabula rasa. The floor is raised when we join a universe with
+    /// history.
+    Absent { floor: Option<Version> },
+
+    /// We have a valid boundary record. The floor is raised on re-entering
+    /// a universe, or by a session hop.
+    Trusted {
+        boundary: Box<Boundary>,
+        floor: Option<Version>,
+    },
+
+    /// The boundary record is corrupt; no jobs may run here.
+    Untrusted,
+}
+
+impl Commitment {
+    /// Judge the boundary record at entry into a universe. On a flip-flop
+    /// (re-entering a burned universe), the error to report is also returned.
+    fn at_entry(
+        log: &Logger,
+        store: &BoundaryStore,
+        rumors: &GossipNetwork,
+    ) -> (Self, Option<Error>) {
+        if store.untrusted() {
+            return (Self::Untrusted, None);
+        }
+
+        let network = rumors.network();
+        let entry = rumors.snapshot().latest().clone();
+        match store.boundary() {
+            Some(boundary) if boundary.network != network && boundary.is_burned(network) => {
+                warn!(log, "re-entered a burned universe"; "committed" => ?boundary.job);
+                (
+                    Self::Trusted {
+                        boundary: Box::new(boundary),
+                        floor: Some(entry),
+                    },
+                    Some(Error::UniverseFlipFlop),
+                )
+            }
+            Some(boundary) => (
+                Self::Trusted {
+                    boundary: Box::new(boundary),
+                    floor: None,
+                },
+                None,
+            ),
+            None if entry != Version::new() => {
+                warn!(log, "no boundary record, but this universe has history");
+                (Self::Absent { floor: Some(entry) }, None)
+            }
+            None => (Self::Absent { floor: None }, None),
+        }
+    }
+
+    /// Raise the execution floor. An untrusted commitment refuses
+    /// every job already, so it carries no floor to raise.
+    fn raise(&mut self, to: Version) {
+        match self {
+            Self::Absent { floor } | Self::Trusted { floor, .. } => *floor = Some(to),
+            Self::Untrusted => {}
+        }
+    }
+}
+
 /// What [`Past::screen`] decides about a live job of the active
 /// session.
 enum Admission {
     /// Execute normally.
     Admit,
-    /// The session does not start above the floor; skip the job.
+
+    /// The session does not start above the execution floor,
+    /// so skip the job.
     Refuse,
+
     /// The boundary record cannot order this session, so a previous
     /// life of this sled may have run its jobs. The sled reports an
     /// error and raises its floor, as if it had just entered the
-    /// universe at this instant.
+    /// universe.
     Hop,
+
+    /// If we cannot trust our boundary record, we must not admit
+    /// new jobs.
+    Untrusted,
 }
 
 /// This incarnation's relationship to its own past: where it entered
@@ -164,21 +247,11 @@ pub struct Past {
     /// baseboard came from a previous life. Not persisted; each
     /// life computes its own.
     birth: Version,
-    /// The last job this sled committed to executing, durable across
-    /// restarts.
-    boundary: Arc<BoundaryStore>,
-    /// The boundary record as we found it on entering this universe.
-    /// The live store advances with our own jobs; [`Past::screen`]
-    /// compares sessions against the previous life's commitment, so
-    /// it reads this frozen copy.
-    committed: Option<Boundary>,
-    /// The execution floor, raised in memory at entry into a burned
-    /// universe, at record-less entry into a universe with history,
-    /// and on a session hop. Only sessions started strictly above it
-    /// are served; below it this sled cannot tell replay from re-run.
-    /// Never persisted: whatever raised it is still there after a
-    /// restart and raises it again. See [`entry_floor`].
-    floor: Option<Version>,
+
+    /// What job, if any, this sled committed to executing. Durable
+    /// across restarts.
+    committed: Commitment,
+
     /// Jobs whose replayed start events say a previous life ran them.
     /// The end of such a job may replay later and remove it from the
     /// set, so the survivors are known only when replay finishes.
@@ -192,17 +265,10 @@ fn dominates(version: &Version, mark: &Version) -> bool {
 }
 
 impl Past {
-    pub fn new(
-        birth: Version,
-        boundary: Arc<BoundaryStore>,
-        committed: Option<Boundary>,
-        floor: Option<Version>,
-    ) -> Self {
+    fn new(birth: Version, committed: Commitment) -> Self {
         Self {
             birth,
-            boundary,
             committed,
-            floor,
             zombies: BTreeSet::new(),
         }
     }
@@ -210,31 +276,30 @@ impl Past {
     /// Decide whether the active session, identified by its id and
     /// the version of its start message, may run a live job here.
     fn screen(&self, network: Network, session: SessionId, started: &Version) -> Admission {
-        // We must refuse anything below our floor, because we cannot
-        // tell replay from re-run there.
-        if self
-            .floor
-            .as_ref()
-            .is_some_and(|floor| !dominates(started, floor))
-        {
-            return Admission::Refuse;
-        }
+        match &self.committed {
+            // Refuse all jobs if our boundary is untrusted.
+            Commitment::Untrusted => Admission::Untrusted,
 
-        // If we have committed to nothing, anything is safe to admit.
-        let Some(committed) = &self.committed else {
-            return Admission::Admit;
-        };
+            // We must also refuse anything below our floor,
+            // since we cannot tell replay from re-run there.
+            Commitment::Absent { floor: Some(floor) }
+            | Commitment::Trusted {
+                floor: Some(floor), ..
+            } if !dominates(started, floor) => Admission::Refuse,
 
-        // Jobs cannot cross universes, and anything a previous life
-        // ran in this universe is below the floor checked above.
-        if committed.network != network {
-            return Admission::Admit;
-        }
+            // Allow jobs in the absence of any previous commitment.
+            Commitment::Absent { .. } => Admission::Admit,
 
-        match &committed.job {
-            Some(job) if job.session == session => Admission::Admit,
-            _ => {
-                if dominates(started, &committed.executed) {
+            // Jobs cannot cross universes, and anything a previous life
+            // ran in this universe is below the floor checked above.
+            Commitment::Trusted { boundary, .. } => {
+                if boundary.network != network {
+                    Admission::Admit
+                } else if let Some(job) = &boundary.job
+                    && job.session == session
+                {
+                    Admission::Admit
+                } else if dominates(started, &boundary.executed) {
                     Admission::Admit
                 } else {
                     Admission::Hop
@@ -279,26 +344,26 @@ impl Past {
             rumors,
             Message::Event(own_baseboard.clone(), Event::Error(report)).into(),
         );
-        self.floor = Some(rumors.snapshot().latest().clone());
+        self.committed.raise(rumors.snapshot().latest().clone());
     }
 
     /// The burned set for a record committed in `network`; see
     /// [`Boundary::burned_for`].
     fn burned_for(&self, network: Network) -> Bloom {
-        self.committed
-            .as_ref()
-            .map(|boundary| boundary.burned_for(network))
-            .unwrap_or_default()
+        match &self.committed {
+            Commitment::Trusted { boundary, .. } => boundary.burned_for(network),
+            _ => Bloom::default(),
+        }
     }
 
     /// The executed-session join for a record committed in `network`
     /// under a session started at `started`; see
     /// [`Boundary::executed_for`].
     fn executed_for(&self, network: Network, started: &Version) -> Version {
-        self.committed
-            .as_ref()
-            .map(|boundary| boundary.executed_for(network, started))
-            .unwrap_or_else(|| started.clone())
+        match &self.committed {
+            Commitment::Trusted { boundary, .. } => boundary.executed_for(network, started),
+            _ => started.clone(),
+        }
     }
 
     /// Whether a message at `version` is live traffic rather than
@@ -527,12 +592,11 @@ impl State {
                     // position was already handled by the life
                     // that stored it, and the chain needs no
                     // replay to verify the next job.
-                    if let Some(committed) = self
-                        .past
-                        .committed
-                        .as_ref()
-                        .and_then(|boundary| boundary.job.as_ref())
-                        .filter(|committed| committed.session == *session_id)
+                    if let Commitment::Trusted { boundary, .. } = &self.past.committed
+                        && let Some(committed) = boundary
+                            .job
+                            .as_ref()
+                            .filter(|committed| committed.session == *session_id)
                     {
                         info!(
                             log, "resuming the committed session at its successor";
@@ -1075,7 +1139,7 @@ impl State {
             } = queued_jobs.remove(&next_id).expect("checked above");
             let job_id = request.payload().job_id().to_owned();
             if self.rack.runs_here(&request) {
-                if self.past.boundary.untrusted() {
+                if matches!(admission, Admission::Untrusted) {
                     warn!(
                         log, "refusing job, the execution boundary is untrusted";
                         "job_id" => %job_id,
@@ -1364,58 +1428,6 @@ fn adjudicate_boundary(
     warn!(log, "adjudicated an unwitnessed job from a previous life"; "job_id" => %job_id);
 }
 
-/// The execution floor for entering a universe, or `None` when the
-/// record can order everything this sled may meet there. Two kinds
-/// of entry have history the record cannot order. Re-entering a
-/// burned universe is the flip-flop: the record overwrote this
-/// universe's watermark when it left, and the sled reports the
-/// return as an error. Entering a universe that has history while
-/// holding no record leaves the sled unable to tell a first visit
-/// from a return after a clean slate: the universe may hold jobs
-/// this baseboard already ran, and they must not run twice. Both
-/// set the floor at the frontier that includes this life's first
-/// send.
-///
-/// The floor must live in memory only. Its version is created by
-/// sending a message, and if the sled dies before the message
-/// reaches anyone, no other copy of it ever exists. A floor written
-/// to disk would carry that dead version into the next life, where
-/// no future session start could ever dominate it, and every one
-/// would be refused until a cold boot. A floor raised fresh at each
-/// entry is built from a message the living sled is actively
-/// gossiping, so future sessions come to dominate it.
-fn entry_floor(
-    log: &Logger,
-    snapshot: Option<&Boundary>,
-    arrival: &Version,
-    rumors: &GossipNetwork,
-    own_baseboard: &BaseboardId,
-) -> Option<Version> {
-    let network = rumors.network();
-    match snapshot {
-        // A record committed in this universe is its watermark, even
-        // when its burned set names this network: a sled that returns
-        // and commits burns its own network into the replacement
-        // record, and the Bloom set can never drop the stale entry.
-        Some(boundary) if boundary.network != network && boundary.is_burned(network) => {
-            warn!(
-                log, "re-entered a universe this sled's boundary record burned";
-                "committed" => ?boundary.job,
-            );
-            gossip(
-                log,
-                rumors,
-                Message::Event(own_baseboard.clone(), Event::Error(Error::UniverseFlipFlop)).into(),
-            );
-        }
-        None if *arrival != Version::new() => {
-            warn!(log, "no boundary record, and this universe has history");
-        }
-        _ => return None,
-    }
-    Some(rumors.snapshot().latest().clone())
-}
-
 /// Grow a fresh gossip seed over sush's message type.
 ///
 /// A peer that seeds its own network has no one to gossip with, so jobs run
@@ -1483,7 +1495,7 @@ impl StateManager {
         let mut initial_state = State::new(
             own_baseboard.clone(),
             anchors,
-            Past::new(Version::new(), store.clone(), boundary.clone(), None),
+            Past::new(Version::new(), Commitment::Absent { floor: None }),
         )?;
         initial_state
             .rack
@@ -1518,7 +1530,8 @@ impl StateManager {
                 // splits this life's traffic from replayed history.
                 let boundary = match &network {
                     Some((rumors, _)) => {
-                        let arrival = rumors.snapshot().latest().clone();
+                        let (committed, report) =
+                            Commitment::at_entry(&log, &boundary_store, rumors);
                         gossip(
                             &log,
                             rumors,
@@ -1528,16 +1541,16 @@ impl StateManager {
                             )
                             .into(),
                         );
-                        let floor =
-                            entry_floor(&log, boundary.as_ref(), &arrival, rumors, &own_baseboard);
+                        if let Some(report) = report {
+                            gossip(
+                                &log,
+                                rumors,
+                                Message::Event(own_baseboard.clone(), Event::Error(report)).into(),
+                            );
+                        }
                         let birth = rumors.snapshot().latest().clone();
                         tx_state.send_modify(|state| {
-                            state.past = Past::new(
-                                birth,
-                                boundary_store.clone(),
-                                boundary.clone(),
-                                floor.clone(),
-                            );
+                            state.past = Past::new(birth, committed);
                         });
                         boundary
                     }
@@ -1705,7 +1718,8 @@ impl StateManager {
                         survivors.retain(|job_id| !reaped.contains(job_id));
                         reaped = BTreeSet::new();
                         *rumors = fresh.rumors;
-                        let arrival = rumors.snapshot().latest().clone();
+                        let (committed, report) =
+                            Commitment::at_entry(&log, &boundary_store, rumors);
                         gossip(
                             &log,
                             rumors,
@@ -1715,22 +1729,21 @@ impl StateManager {
                             )
                             .into(),
                         );
-                        let boundary_store = tx_state.borrow().past.boundary.clone();
+                        if let Some(report) = report {
+                            gossip(
+                                &log,
+                                rumors,
+                                Message::Event(own_baseboard.clone(), Event::Error(report)).into(),
+                            );
+                        }
                         boundary = boundary_store.boundary();
-                        let floor =
-                            entry_floor(&log, boundary.as_ref(), &arrival, rumors, &own_baseboard);
                         let birth = rumors.snapshot().latest().clone();
                         // TODO: re-inject local job state (policy pending).
                         tx_state.send_modify(|state| {
                             *state = State::new(
                                 own_baseboard.clone(),
                                 &anchors,
-                                Past::new(
-                                    birth,
-                                    boundary_store.clone(),
-                                    boundary.clone(),
-                                    floor.clone(),
-                                ),
+                                Past::new(birth, committed),
                             )
                             .expect("trust anchors validated at startup");
                             state.rack.set_cubbies(cubbies.borrow().clone());
@@ -1779,13 +1792,14 @@ mod test {
     }
 
     fn past(committed: Option<Boundary>, floor: Option<Version>) -> Past {
-        let log = Logger::root(slog::Discard, o!());
-        Past::new(
-            Version::new(),
-            Arc::new(BoundaryStore::new(&log, &Locker::null())),
-            committed,
-            floor,
-        )
+        let committed = match committed {
+            Some(boundary) => Commitment::Trusted {
+                boundary: Box::new(boundary),
+                floor,
+            },
+            None => Commitment::Absent { floor },
+        };
+        Past::new(Version::new(), committed)
     }
 
     /// The admission rules: a sled with no record admits, a record
@@ -1843,8 +1857,8 @@ mod test {
     }
 
     /// A floor refuses every session not started strictly above it,
-    /// in every universe: the floor belongs to this life, not to any
-    /// record.
+    /// in every universe and under either commitment that carries one:
+    /// the floor belongs to this life, not to any record.
     #[test]
     fn floors_refuse_below() {
         let floor: Version = "(1, 1, (0, 0, 2))".parse().unwrap();
@@ -1852,19 +1866,48 @@ mod test {
         let below: Version = "(1, 0, (0, 0, 2))".parse().unwrap();
         let above: Version = "(2, 1, (0, 0, 3))".parse().unwrap();
         let concurrent: Version = "(1, 2, (0, 0, 1))".parse().unwrap();
-        let past = past(None, Some(floor.clone()));
+        let committed = Boundary {
+            network: network(1),
+            burned: Bloom::new(),
+            executed: floor.clone(),
+            job: None,
+        };
 
-        for started in [&at, &below, &concurrent] {
-            for net in [network(1), network(2)] {
-                assert!(matches!(
-                    past.screen(net, SessionId::random(), started),
-                    Admission::Refuse
-                ));
+        for past in [
+            past(None, Some(floor.clone())),
+            past(Some(committed), Some(floor.clone())),
+        ] {
+            for started in [&at, &below, &concurrent] {
+                for net in [network(1), network(2)] {
+                    assert!(matches!(
+                        past.screen(net, SessionId::random(), started),
+                        Admission::Refuse
+                    ));
+                }
             }
+            assert!(matches!(
+                past.screen(network(1), SessionId::random(), &above),
+                Admission::Admit
+            ));
         }
+    }
+
+    /// An untrusted record admits nothing in any universe, and a
+    /// raise leaves it untrusted.
+    #[test]
+    fn untrusted_admits_nothing() {
+        let started: Version = "(2, 1, (0, 0, 3))".parse().unwrap();
+        let mut past = Past::new(Version::new(), Commitment::Untrusted);
+        for net in [network(1), network(2)] {
+            assert!(matches!(
+                past.screen(net, SessionId::random(), &started),
+                Admission::Untrusted
+            ));
+        }
+        past.committed.raise(started.clone());
         assert!(matches!(
-            past.screen(network(1), SessionId::random(), &above),
-            Admission::Admit
+            past.screen(network(1), SessionId::random(), &started),
+            Admission::Untrusted
         ));
     }
 }
