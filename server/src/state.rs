@@ -10,7 +10,7 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::sync::{Arc, Mutex};
 
-use chrono::Utc;
+use chrono::{DateTime, Utc};
 use futures::{FutureExt as _, Stream, StreamExt};
 use rumors::{CausalMessages, Network, Rumors, Version};
 use sled_hardware_types::BaseboardId;
@@ -263,8 +263,51 @@ pub struct Past {
 
     /// Jobs whose replayed start events say a previous life ran them.
     /// The end of such a job may replay later and remove it from the
-    /// set, so the survivors are known only when replay finishes.
+    /// set, so which jobs truly lack an end is known only when replay
+    /// finishes.
     zombies: BTreeSet<JobId>,
+
+    /// Jobs that kept running through a universe swap. The executor
+    /// reports their events into this universe, so they are neither
+    /// zombies nor candidates for adjudication.
+    survivors: BTreeSet<JobId>,
+
+    /// Zombies already declared interrupted. The interrupted event
+    /// applies only after a gossip round trip, so history may still
+    /// show these jobs running; this set keeps [`State::settle`] from
+    /// ruling twice and keeps [`State::remainder`] from counting them
+    /// as survivors.
+    reaped: BTreeSet<JobId>,
+
+    /// The boundary job already ruled on. A sled that swaps universes
+    /// again without running a new job keeps this verdict instead of
+    /// ruling on the same job twice.
+    adjudicated: Option<JobId>,
+}
+
+/// The parts of a [`Past`] that survive a universe swap because the
+/// next life cannot recompute them from replay.
+#[derive(Debug, Default)]
+struct Remainder {
+    /// Jobs still running or launching here at the swap.
+    survivors: BTreeSet<JobId>,
+
+    /// The boundary job already ruled on.
+    adjudicated: Option<JobId>,
+}
+
+impl Remainder {
+    fn into_past(self, birth: Version, committed: Commitment) -> Past {
+        Past {
+            frontier: birth.clone(),
+            birth,
+            committed,
+            zombies: BTreeSet::new(),
+            survivors: self.survivors,
+            reaped: BTreeSet::new(),
+            adjudicated: self.adjudicated,
+        }
+    }
 }
 
 /// Whether `version` strictly dominates `mark`. Equal and concurrent
@@ -275,12 +318,7 @@ fn dominates(version: &Version, mark: &Version) -> bool {
 
 impl Past {
     fn new(birth: Version, committed: Commitment) -> Self {
-        Self {
-            frontier: birth.clone(),
-            birth,
-            committed,
-            zombies: BTreeSet::new(),
-        }
+        Remainder::default().into_past(birth, committed)
     }
 
     fn observe(&mut self, version: &Version) {
@@ -491,22 +529,130 @@ impl State {
         self.history.get_job_status(job_id)
     }
 
-    fn skip_queued_jobs(&self) -> Vec<Output> {
+    fn skip_queued_jobs(&self, now: DateTime<Utc>) -> Vec<Output> {
         let mut outputs = Vec::new();
         for (job_id, queued) in self.session.queued_jobs().into_iter().flatten() {
             if !queued.replayed && self.rack.runs_here(&queued.job) {
                 outputs.push(Output::job_event(
                     self.rack.own_baseboard(),
-                    JobEvent::Skipped(*job_id, Utc::now(), SkipReason::SessionEnded),
+                    JobEvent::Skipped(*job_id, now, SkipReason::SessionEnded),
                 ));
             }
         }
         outputs
     }
 
+    /// Rule on the jobs a previous life left unresolved. Call only
+    /// once ready messages have drained: an undelivered replayed end
+    /// may yet clear a zombie, and an early settle would declare a
+    /// finished job interrupted.
+    fn settle(&mut self, log: &Logger, now: DateTime<Utc>) -> Vec<Output> {
+        let mut outputs = self.reap_zombies(log, now);
+        outputs.extend(self.adjudicate_boundary(log, now));
+        outputs
+    }
+
+    /// Declare interrupted every job a previous life left running,
+    /// excluding survivors and jobs already reaped. Zombies come only
+    /// from replayed start events, so a job this incarnation started
+    /// is never a candidate.
+    fn reap_zombies(&mut self, log: &Logger, now: DateTime<Utc>) -> Vec<Output> {
+        let mut outputs = Vec::new();
+        for job_id in self.zombies() {
+            if self.past.survivors.contains(&job_id) || self.past.reaped.contains(&job_id) {
+                continue;
+            }
+            self.past.reaped.insert(job_id);
+            outputs.push(Output::job_event(
+                self.rack.own_baseboard(),
+                JobEvent::Error(job_id, now, ProcessError::Interrupted),
+            ));
+            warn!(log, "interrupted job from a previous life"; "job_id" => %job_id);
+        }
+        outputs
+    }
+
+    /// Adjudicate the boundary job if replay gave it no status on our
+    /// baseboard: announce its recorded ending, or interrupted when
+    /// none was recorded. No status means its fate never left this
+    /// sled, and no other sled can ever report it. A replayed start
+    /// makes it a zombie instead, and a replayed end settles it.
+    /// Every sled hears the ruling, but a sled that already holds a
+    /// terminal status for the job keeps what it holds, so one sled
+    /// may show the real ending while another shows interrupted.
+    fn adjudicate_boundary(&mut self, log: &Logger, now: DateTime<Utc>) -> Vec<Output> {
+        // An absent or untrusted record commits to no job, so there
+        // is nothing to rule on.
+        let Commitment::Trusted { boundary, .. } = &self.past.committed else {
+            return Vec::new();
+        };
+        let Some(Committed { job, outcome, .. }) = boundary.job.as_ref() else {
+            return Vec::new();
+        };
+        let (job_id, outcome) = (*job, outcome.clone());
+        if self.past.adjudicated == Some(job_id) {
+            return Vec::new();
+        }
+        // A survivor reports its own ending in this universe, so it
+        // needs no verdict now and may need one at a later swap.
+        if self.past.survivors.contains(&job_id) {
+            return Vec::new();
+        }
+        self.past.adjudicated = Some(job_id);
+        let witnessed = self
+            .get_job_status(&job_id)
+            .is_some_and(|status| status.get(self.rack.own_baseboard()).is_some());
+        if witnessed {
+            return Vec::new();
+        }
+        // A stopped ending announces the start and stop pair, so the
+        // ordinary status transitions apply on every sled; a bare stop
+        // with no prior start would be dropped.
+        let events = match outcome {
+            JobOutcome::Ended(JobStatus::Stopped {
+                time_started,
+                time_stopped,
+                result,
+                output,
+                ..
+            }) => vec![
+                JobEvent::Start(job_id, time_started),
+                JobEvent::Stop(job_id, time_stopped, result, output),
+            ],
+            JobOutcome::Ended(JobStatus::Error {
+                time_error, error, ..
+            }) => vec![JobEvent::Error(job_id, time_error, error)],
+            JobOutcome::Ended(_) | JobOutcome::Committed => {
+                vec![JobEvent::Error(job_id, now, ProcessError::Interrupted)]
+            }
+        };
+        warn!(log, "adjudicated an unwitnessed job from a previous life"; "job_id" => %job_id);
+        events
+            .into_iter()
+            .map(|event| Output::job_event(self.rack.own_baseboard(), event))
+            .collect()
+    }
+
+    /// Compute what survives into the next universe. A reaped zombie
+    /// may still show as running while its interrupted event is in
+    /// flight; it is no survivor. A job the executor is still
+    /// launching is a survivor: its start event may not have applied
+    /// yet, but the executor reports its events like any running
+    /// job's.
+    fn remainder(&self, in_flight: BTreeSet<JobId>) -> Remainder {
+        let mut survivors = self.own_running_jobs();
+        survivors.extend(in_flight);
+        survivors.retain(|job_id| !self.past.reaped.contains(job_id));
+        Remainder {
+            survivors,
+            adjudicated: self.past.adjudicated,
+        }
+    }
+
     fn update(
         &mut self,
         log: &Logger,
+        now: DateTime<Utc>,
         network: Option<Network>,
         incoming_version: &Version,
         message: &Arc<VersionedMessage>,
@@ -527,14 +673,20 @@ impl State {
                     }
                     Request::Session(r) => self.handle_session_request(
                         &log,
+                        now,
                         network,
                         incoming_version,
                         actor,
                         r.request(),
                     ),
-                    Request::Job(r) => {
-                        self.handle_job_request(&log, network, incoming_version, actor, r.request())
-                    }
+                    Request::Job(r) => self.handle_job_request(
+                        &log,
+                        now,
+                        network,
+                        incoming_version,
+                        actor,
+                        r.request(),
+                    ),
                 }
             }
             V0(Message::Event(baseboard_id, event)) => {
@@ -553,6 +705,7 @@ impl State {
     fn handle_session_request(
         &mut self,
         log: &Logger,
+        now: DateTime<Utc>,
         network: Option<Network>,
         incoming_version: &Version,
         actor: &KeyId,
@@ -592,7 +745,7 @@ impl State {
                         );
                         session.resume_at(committed.successor);
                     }
-                    outputs.extend(self.skip_queued_jobs());
+                    outputs.extend(self.skip_queued_jobs(now));
                     outputs.push(Output::RotateNonce);
                     self.session = Active {
                         starts: self.session.starts() | incoming_version.clone(),
@@ -621,7 +774,7 @@ impl State {
                         incoming_session: *session_id,
                         incoming_version: Box::new(incoming_version.clone()),
                     };
-                    outputs.extend(self.skip_queued_jobs());
+                    outputs.extend(self.skip_queued_jobs(now));
                     outputs.push(Output::Gossip(Message::Event(
                         self.rack.own_baseboard().to_owned(),
                         Event::Error(error),
@@ -669,7 +822,7 @@ impl State {
                             log, "session stopped";
                             "session_id" => %session_id, "actor" => %actor,
                         );
-                        outputs.extend(self.skip_queued_jobs());
+                        outputs.extend(self.skip_queued_jobs(now));
                         self.session = Inactive {
                             starts: starts.clone(),
                         };
@@ -737,8 +890,8 @@ impl State {
                             log, "job skipped";
                             "job_id" => %job_id, "actor" => %actor,
                         );
-                        self.cancel_job(job_id, actor, replayed);
-                        outputs.extend(self.release_ready_jobs(log, network));
+                        self.cancel_job(now, job_id, actor, replayed);
+                        outputs.extend(self.release_ready_jobs(log, now, network));
                     } else {
                         info!(
                             log, "ignoring inapplicable job skip";
@@ -761,6 +914,7 @@ impl State {
     fn handle_job_request(
         &mut self,
         log: &Logger,
+        now: DateTime<Utc>,
         network: Option<Network>,
         incoming_version: &Version,
         actor: &KeyId,
@@ -803,8 +957,8 @@ impl State {
                     .session()
                     .is_some_and(|s| s.session_id() == session_id)
                 {
-                    self.enqueue_job(log, signed.clone(), params.clone(), actor, !live);
-                    outputs.extend(self.release_ready_jobs(log, network));
+                    self.enqueue_job(log, now, signed.clone(), params.clone(), actor, !live);
+                    outputs.extend(self.release_ready_jobs(log, now, network));
                 } else {
                     let job_id = *signed.job_id();
                     warn!(
@@ -816,7 +970,7 @@ impl State {
                     if live && self.rack.runs_here(signed) && !self.history.contains(&job_id) {
                         outputs.push(Output::job_event(
                             self.rack.own_baseboard(),
-                            JobEvent::Skipped(job_id, Utc::now(), SkipReason::SessionEnded),
+                            JobEvent::Skipped(job_id, now, SkipReason::SessionEnded),
                         ));
                     }
                 }
@@ -824,7 +978,7 @@ impl State {
             JobRequest::Stop(job_id) => {
                 outputs.push(Output::Stop(*job_id));
                 let replayed = !self.is_live(incoming_version);
-                self.cancel_job(job_id, actor, replayed);
+                self.cancel_job(now, job_id, actor, replayed);
             }
         }
         outputs
@@ -1001,6 +1155,7 @@ impl State {
     fn enqueue_job(
         &mut self,
         log: &Logger,
+        now: DateTime<Utc>,
         job: SignedJob,
         params: JobStartParams,
         actor: &KeyId,
@@ -1045,7 +1200,7 @@ impl State {
                     self.rack.own_baseboard(),
                     JobStatus::Queued {
                         job_id,
-                        time_queued: Utc::now(),
+                        time_queued: now,
                         actor: actor.clone(),
                     },
                     None,
@@ -1055,7 +1210,7 @@ impl State {
         }
     }
 
-    fn cancel_job(&mut self, job_id: &JobId, actor: &KeyId, replayed: bool) {
+    fn cancel_job(&mut self, now: DateTime<Utc>, job_id: &JobId, actor: &KeyId, replayed: bool) {
         let SessionState::Active { queued_jobs, .. } = &mut self.session else {
             return;
         };
@@ -1070,7 +1225,7 @@ impl State {
             |old_status| match old_status {
                 None | Some(JobStatus::Queued { .. }) => Some(JobStatus::Cancelled {
                     job_id: *job_id,
-                    time_cancelled: Utc::now(),
+                    time_cancelled: now,
                     actor: actor.clone(),
                 }),
                 _ => None,
@@ -1085,7 +1240,12 @@ impl State {
     /// newly-ready-to-run jobs after it in the queue. Once we reach
     /// a fixed point, we have nothing further to do.
     #[must_use]
-    fn release_ready_jobs(&mut self, log: &Logger, network: Option<Network>) -> Vec<Output> {
+    fn release_ready_jobs(
+        &mut self,
+        log: &Logger,
+        now: DateTime<Utc>,
+        network: Option<Network>,
+    ) -> Vec<Output> {
         let mut outputs = Vec::new();
         let SessionState::Active {
             session,
@@ -1138,7 +1298,7 @@ impl State {
                         self.rack.own_baseboard(),
                         JobEvent::Error(
                             job_id,
-                            Utc::now(),
+                            now,
                             ProcessError::Io {
                                 what: "consulting the execution boundary".to_string(),
                                 error: "the boundary records on this sled's M.2s disagree \
@@ -1157,7 +1317,7 @@ impl State {
                         warn!(log, "skipping job below the execution floor"; "job_id" => %job_id);
                         outputs.push(Output::job_event(
                             self.rack.own_baseboard(),
-                            JobEvent::Skipped(job_id, Utc::now(), SkipReason::BelowFloor),
+                            JobEvent::Skipped(job_id, now, SkipReason::BelowFloor),
                         ));
                     }
                 } else if self
@@ -1181,7 +1341,7 @@ impl State {
                             self.rack.own_baseboard(),
                             JobEvent::Error(
                                 job_id,
-                                Utc::now(),
+                                now,
                                 ProcessError::InvalidJob(error.to_string()),
                             ),
                         )),
@@ -1231,9 +1391,10 @@ fn apply_message(
     message: &Arc<VersionedMessage>,
 ) {
     let mut outputs = Vec::new();
+    let now = Utc::now();
     let network = rumors.map(|r| r.network());
     tx_state.send_modify(|state| {
-        outputs = state.update(log, network, version, message);
+        outputs = state.update(log, now, network, version, message);
     });
     apply_outputs(log, executor, rumors, store, nonce, outputs);
 }
@@ -1293,130 +1454,29 @@ fn drain_ready(
     }
 }
 
+/// Settle the state at local quiescence, then apply the outputs.
+fn settle_and_apply(
+    log: &Logger,
+    tx_state: &watch::Sender<State>,
+    executor: &mut Executor,
+    rumors: Option<&GossipNetwork>,
+    store: &Arc<BoundaryStore>,
+    nonce: &Arc<Mutex<SessionSushNonce>>,
+) {
+    let now = Utc::now();
+    let mut outputs = Vec::new();
+    tx_state.send_modify(|state| {
+        outputs = state.settle(log, now);
+    });
+    apply_outputs(log, executor, rumors, store, nonce, outputs);
+}
+
 /// Send a message into the gossip set. An error means the payload
 /// exceeded the configured depth limit, which tests should catch.
 fn gossip(log: &Logger, rumors: &GossipNetwork, message: VersionedMessage) {
     if let Err(error) = rumors.send(message) {
         error!(log, "the gossip set refused a message"; "error" => %error);
     }
-}
-
-/// Declare interrupted every job a previous life left running,
-/// excluding `survivors` (jobs this incarnation carried across a
-/// universe swap) and jobs already reaped. Zombies come only from
-/// replayed start events, so a job this incarnation started is never
-/// a candidate. Reap only at local quiescence (after
-/// [`drain_ready`]), when a zombie whose terminal event is already
-/// here has been cleared.
-fn reap_zombies(
-    log: &Logger,
-    tx_state: &watch::Sender<State>,
-    rumors: Option<&GossipNetwork>,
-    own_baseboard: &BaseboardId,
-    survivors: &BTreeSet<JobId>,
-    reaped: &mut BTreeSet<JobId>,
-) {
-    let mut zombies = tx_state.borrow().zombies();
-    zombies.retain(|job_id| !survivors.contains(job_id) && !reaped.contains(job_id));
-    for job_id in zombies {
-        reaped.insert(job_id);
-        if let Some(rumors) = rumors {
-            gossip(
-                log,
-                rumors,
-                Message::Event(
-                    own_baseboard.clone(),
-                    Event::Job(JobEvent::Error(
-                        job_id,
-                        Utc::now(),
-                        ProcessError::Interrupted,
-                    )),
-                )
-                .into(),
-            );
-        }
-        warn!(log, "interrupted job from a previous life"; "job_id" => %job_id);
-    }
-}
-
-/// Adjudicate the boundary job if replay gave it no status on our
-/// baseboard: announce its recorded ending, or interrupted when none
-/// was recorded. No status means its fate never left this sled, and
-/// no other sled can ever report it. A replayed start makes it a
-/// zombie instead, and a replayed end settles it. Adjudicate only
-/// after replay drains, like [`reap_zombies`], and once per universe.
-/// The ruling is gossiped to every sled, but a sled that already
-/// holds a terminal status for the job keeps it; only sleds with
-/// none adopt the ruling, so one sled may show the real ending while
-/// another shows interrupted.
-fn adjudicate_boundary(
-    log: &Logger,
-    tx_state: &watch::Sender<State>,
-    rumors: Option<&GossipNetwork>,
-    own_baseboard: &BaseboardId,
-    snapshot: Option<&Boundary>,
-    survivors: &BTreeSet<JobId>,
-    adjudicated: &mut Option<JobId>,
-) {
-    // A floor commits to no job, so there is nothing to rule on.
-    let Some(Committed { job, outcome, .. }) = snapshot.and_then(|boundary| boundary.job.as_ref())
-    else {
-        return;
-    };
-    let job_id = *job;
-    // One ruling per boundary: a sled that swaps universes again
-    // without running a job must not re-adjudicate the same job.
-    if *adjudicated == Some(job_id) {
-        return;
-    }
-    // A survivor's events land in the new universe when it finishes,
-    // so it needs no verdict now and may need one at a later swap.
-    if survivors.contains(&job_id) {
-        return;
-    }
-    *adjudicated = Some(job_id);
-    let witnessed = {
-        let state = tx_state.borrow();
-        state
-            .get_job_status(&job_id)
-            .is_some_and(|status| status.get(own_baseboard).is_some())
-    };
-    if witnessed {
-        return;
-    }
-    // A stopped ending announces the start and stop pair, so the
-    // ordinary status transitions apply on every sled; a bare stop
-    // with no prior start would be dropped.
-    let events = match outcome {
-        JobOutcome::Ended(JobStatus::Stopped {
-            time_started,
-            time_stopped,
-            result,
-            output,
-            ..
-        }) => vec![
-            JobEvent::Start(job_id, *time_started),
-            JobEvent::Stop(job_id, *time_stopped, result.clone(), output.clone()),
-        ],
-        JobOutcome::Ended(JobStatus::Error {
-            time_error, error, ..
-        }) => vec![JobEvent::Error(job_id, *time_error, error.clone())],
-        JobOutcome::Ended(_) | JobOutcome::Committed => vec![JobEvent::Error(
-            job_id,
-            Utc::now(),
-            ProcessError::Interrupted,
-        )],
-    };
-    if let Some(rumors) = rumors {
-        for event in events {
-            gossip(
-                log,
-                rumors,
-                Message::Event(own_baseboard.clone(), Event::Job(event)).into(),
-            );
-        }
-    }
-    warn!(log, "adjudicated an unwitnessed job from a previous life"; "job_id" => %job_id);
 }
 
 /// Grow a fresh gossip seed over sush's message type.
@@ -1556,14 +1616,6 @@ impl StateManager {
                     );
                 }
 
-                // Replay bookkeeping. `survivors` are jobs this
-                // incarnation itself runs across a universe swap;
-                // `reaped` are zombies already declared interrupted.
-                let mut boundary = boundary;
-                let mut survivors: BTreeSet<JobId> = BTreeSet::new();
-                let mut reaped: BTreeSet<JobId> = BTreeSet::new();
-                let mut adjudicated: Option<JobId> = None;
-
                 // These flip both to `true` once our two input streams (local
                 // requests and local events from the executor) terminate or
                 // we're shutting down. At this point, we must drop `network`
@@ -1649,22 +1701,13 @@ impl StateManager {
                                         &boundary_store,
                                         &session_sush_nonce,
                                     );
-                                    reap_zombies(
+                                    settle_and_apply(
                                         &log,
                                         &tx_state,
+                                        &mut executor,
                                         network.as_ref().map(|(rumors, _)| rumors),
-                                        &own_baseboard,
-                                        &survivors,
-                                        &mut reaped,
-                                    );
-                                    adjudicate_boundary(
-                                        &log,
-                                        &tx_state,
-                                        network.as_ref().map(|(rumors, _)| rumors),
-                                        &own_baseboard,
-                                        boundary.as_ref(),
-                                        &survivors,
-                                        &mut adjudicated,
+                                        &boundary_store,
+                                        &session_sush_nonce,
                                     );
                                 }
                             },
@@ -1698,16 +1741,7 @@ impl StateManager {
                         let fresh = universe.borrow_and_update().clone();
                         info!(log, "gossip universe changed, resetting state"; "network" => %fresh.rumors.network());
                         causal_messages = fresh.rumors.causal_messages();
-                        // A reaped zombie may still show as running (its
-                        // error event races the swap); it is no survivor.
-                        // A job the executor is still launching is a
-                        // survivor too: its start event may not have
-                        // applied yet, but its events land in the new
-                        // universe like any running job's.
-                        survivors = tx_state.borrow().own_running_jobs();
-                        survivors.extend(executor.in_flight());
-                        survivors.retain(|job_id| !reaped.contains(job_id));
-                        reaped = BTreeSet::new();
+                        let in_flight = executor.in_flight();
                         *rumors = fresh.rumors;
                         let (committed, report) =
                             Commitment::at_entry(&log, &boundary_store, rumors);
@@ -1727,20 +1761,20 @@ impl StateManager {
                                 Message::Event(own_baseboard.clone(), Event::Error(report)).into(),
                             );
                         }
-                        boundary = boundary_store.boundary();
                         let birth = rumors.snapshot().latest().clone();
                         // TODO: re-inject local job state (policy pending).
                         tx_state.send_modify(|state| {
+                            let remainder = state.remainder(in_flight);
                             *state = State::new(
                                 own_baseboard.clone(),
                                 &anchors,
-                                Past::new(birth, committed),
+                                remainder.into_past(birth, committed),
                             )
                             .expect("trust anchors validated at startup");
                             state.rack.set_cubbies(cubbies.borrow().clone());
                         });
                         // The set received at join is already local:
-                        // drain it, then reap.
+                        // drain it, then settle.
                         drain_ready(
                             &log,
                             &mut causal_messages,
@@ -1750,22 +1784,13 @@ impl StateManager {
                             &boundary_store,
                             &session_sush_nonce,
                         );
-                        reap_zombies(
+                        settle_and_apply(
                             &log,
                             &tx_state,
+                            &mut executor,
                             Some(&*rumors),
-                            &own_baseboard,
-                            &survivors,
-                            &mut reaped,
-                        );
-                        adjudicate_boundary(
-                            &log,
-                            &tx_state,
-                            Some(&*rumors),
-                            &own_baseboard,
-                            boundary.as_ref(),
-                            &survivors,
-                            &mut adjudicated,
+                            &boundary_store,
+                            &session_sush_nonce,
                         );
                     }
                 }
@@ -1780,6 +1805,56 @@ mod test {
 
     fn network(seed: u8) -> Network {
         serde_json::from_str(&format!("[{seed:?}{}]", ", 0".repeat(15))).unwrap()
+    }
+
+    fn state(past: Past) -> State {
+        let baseboard = BaseboardId {
+            part_number: "913-0000019".to_string(),
+            serial_number: "settle-test".to_string(),
+        };
+        State::new(baseboard, &[], past).unwrap()
+    }
+
+    fn discard() -> Logger {
+        Logger::root(slog::Discard, o!())
+    }
+
+    fn start_job(state: &mut State, job_id: JobId, now: DateTime<Utc>) {
+        let baseboard = state.rack.own_baseboard().clone();
+        state.history.set_job_status(
+            &job_id,
+            &baseboard,
+            JobStatus::Started {
+                job_id,
+                time_started: now,
+            },
+            None,
+            None,
+        );
+    }
+
+    fn committed_boundary(job: JobId) -> Boundary {
+        Boundary {
+            network: network(1),
+            burned: Bloom::new(),
+            executed: Version::new(),
+            job: Some(Committed {
+                session: SessionId::random(),
+                job,
+                successor: JobId::random(),
+                outcome: JobOutcome::Committed,
+            }),
+        }
+    }
+
+    fn interrupted(output: &Output, job_id: JobId) -> bool {
+        matches!(
+            output,
+            Output::Gossip(Message::Event(
+                _,
+                Event::Job(JobEvent::Error(id, _, ProcessError::Interrupted)),
+            )) if *id == job_id
+        )
     }
 
     fn past(committed: Option<Boundary>, floor: Option<Version>) -> Past {
@@ -1936,5 +2011,84 @@ mod test {
             past.screen(network(1), SessionId::random(), &started),
             Admission::Untrusted
         ));
+    }
+
+    /// Settle declares a zombie interrupted exactly once. A survivor
+    /// is spared: the executor still runs it and reports its ending
+    /// itself.
+    #[test]
+    fn settle_reaps_zombies_once_and_spares_survivors() {
+        let log = discard();
+        let now = Utc::now();
+        let zombie = JobId::random();
+        let survivor = JobId::random();
+        let mut state = state(past(None, None));
+        for job_id in [zombie, survivor] {
+            state.past.zombies.insert(job_id);
+            start_job(&mut state, job_id, now);
+        }
+        state.past.survivors.insert(survivor);
+
+        let outputs = state.settle(&log, now);
+        assert_eq!(outputs.len(), 1);
+        assert!(interrupted(&outputs[0], zombie));
+        assert!(state.settle(&log, now).is_empty());
+    }
+
+    /// A committed job that replay left without a status is
+    /// adjudicated as interrupted, and only once per boundary.
+    #[test]
+    fn adjudication_rules_once_per_boundary() {
+        let log = discard();
+        let now = Utc::now();
+        let job = JobId::random();
+        let mut state = state(past(Some(committed_boundary(job)), None));
+
+        let outputs = state.settle(&log, now);
+        assert_eq!(outputs.len(), 1);
+        assert!(interrupted(&outputs[0], job));
+        assert!(state.settle(&log, now).is_empty());
+    }
+
+    /// A witnessed boundary job keeps its replayed status: settle
+    /// marks the ruling made and announces nothing. A surviving
+    /// boundary job gets no ruling at all, since it may need one at
+    /// a later swap.
+    #[test]
+    fn adjudication_defers_to_witnesses_and_survivors() {
+        let log = discard();
+        let now = Utc::now();
+        let job = JobId::random();
+        let boundary = committed_boundary(job);
+
+        let mut witnessed = state(past(Some(boundary.clone()), None));
+        start_job(&mut witnessed, job, now);
+        assert!(witnessed.settle(&log, now).is_empty());
+        assert_eq!(witnessed.past.adjudicated, Some(job));
+
+        let mut surviving = state(past(Some(boundary), None));
+        surviving.past.survivors.insert(job);
+        assert!(surviving.settle(&log, now).is_empty());
+        assert_eq!(surviving.past.adjudicated, None);
+    }
+
+    /// The remainder carries exactly what the next life cannot
+    /// recompute from replay: jobs still running or launching, minus
+    /// those already reaped, and the ruling already made.
+    #[test]
+    fn remainder_carries_survivors_and_ruling() {
+        let now = Utc::now();
+        let running = JobId::random();
+        let launching = JobId::random();
+        let reaped = JobId::random();
+        let mut state = state(past(None, None));
+        start_job(&mut state, running, now);
+        start_job(&mut state, reaped, now);
+        state.past.reaped.insert(reaped);
+        state.past.adjudicated = Some(running);
+
+        let remainder = state.remainder(BTreeSet::from([launching]));
+        assert_eq!(remainder.survivors, BTreeSet::from([running, launching]));
+        assert_eq!(remainder.adjudicated, Some(running));
     }
 }
