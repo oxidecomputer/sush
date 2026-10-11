@@ -409,6 +409,19 @@ impl Past {
     }
 }
 
+/// A state machine input. Everything that changes the state arrives
+/// as one of these.
+enum Input {
+    /// The rack's cubby map changed.
+    Cubbies(Cubbies),
+
+    /// The gossip network delivered a message.
+    Gossip(Version, Arc<VersionedMessage>),
+
+    /// All ready messages have been drained.
+    Drained,
+}
+
 /// A state machine output.
 #[derive(Debug)]
 enum Output {
@@ -646,6 +659,26 @@ impl State {
         Remainder {
             survivors,
             adjudicated: self.past.adjudicated,
+        }
+    }
+
+    /// Advance the state machine by one input, returning the outputs
+    /// for the driver to interpret. `network` is `None` while the
+    /// driver drains without a gossip connection.
+    fn step(
+        &mut self,
+        log: &Logger,
+        now: DateTime<Utc>,
+        network: Option<Network>,
+        input: Input,
+    ) -> Vec<Output> {
+        match input {
+            Input::Cubbies(cubbies) => {
+                self.rack.set_cubbies(cubbies);
+                Vec::new()
+            }
+            Input::Gossip(version, message) => self.update(log, now, network, &version, &message),
+            Input::Drained => self.settle(log, now),
         }
     }
 
@@ -1372,29 +1405,27 @@ impl State {
     }
 }
 
-/// Apply one gossip message to the state, then apply its outputs.
+/// Feed one input through the state machine, then apply its outputs.
 ///
 /// We unconditionally mark the watch sender as modified even though it
-/// might not be, because *most* of the messages cause *some* modification
+/// might not be, because *most* of the inputs cause *some* modification
 /// of the state, and we would rather be safe against future code changes
-/// than manually tracking precisely which messages *don't* modify state.
+/// than manually tracking precisely which inputs *don't* modify state.
 /// The cost is a few spurious wakeups.
-#[allow(clippy::too_many_arguments)]
-fn apply_message(
+fn apply(
     log: &Logger,
     tx_state: &watch::Sender<State>,
     executor: &mut Executor,
     rumors: Option<&GossipNetwork>,
     store: &Arc<BoundaryStore>,
     nonce: &Arc<Mutex<SessionSushNonce>>,
-    version: &Version,
-    message: &Arc<VersionedMessage>,
+    input: Input,
 ) {
-    let mut outputs = Vec::new();
     let now = Utc::now();
     let network = rumors.map(|r| r.network());
+    let mut outputs = Vec::new();
     tx_state.send_modify(|state| {
-        outputs = state.update(log, now, network, version, message);
+        outputs = state.step(log, now, network, input);
     });
     apply_outputs(log, executor, rumors, store, nonce, outputs);
 }
@@ -1448,27 +1479,53 @@ fn drain_ready(
     nonce: &Arc<Mutex<SessionSushNonce>>,
 ) {
     while let Some(Some((version, message))) = causal_messages.next().now_or_never() {
-        apply_message(
-            log, tx_state, executor, rumors, store, nonce, &version, &message,
+        apply(
+            log,
+            tx_state,
+            executor,
+            rumors,
+            store,
+            nonce,
+            Input::Gossip(version, message),
         );
     }
 }
 
-/// Settle the state at local quiescence, then apply the outputs.
-fn settle_and_apply(
+/// Enter a universe: judge the boundary record, announce this build,
+/// and mark the birth. The announce is this life's first send and
+/// goes out before the birth snapshot is taken, so the birth is the
+/// announce's own version. A flip-flop report follows the announce.
+fn enter_universe(
     log: &Logger,
-    tx_state: &watch::Sender<State>,
-    executor: &mut Executor,
-    rumors: Option<&GossipNetwork>,
-    store: &Arc<BoundaryStore>,
-    nonce: &Arc<Mutex<SessionSushNonce>>,
-) {
-    let now = Utc::now();
-    let mut outputs = Vec::new();
-    tx_state.send_modify(|state| {
-        outputs = state.settle(log, now);
-    });
-    apply_outputs(log, executor, rumors, store, nonce, outputs);
+    own_baseboard: BaseboardId,
+    anchors: &[Certificate],
+    store: &BoundaryStore,
+    rumors: &GossipNetwork,
+    remainder: Remainder,
+) -> Result<State, KeyError> {
+    let (committed, report) = Commitment::at_entry(log, store, rumors);
+    gossip(
+        log,
+        rumors,
+        Message::Event(
+            own_baseboard.clone(),
+            Event::Version(VersionInfo::current()),
+        )
+        .into(),
+    );
+    if let Some(report) = report {
+        gossip(
+            log,
+            rumors,
+            Message::Event(own_baseboard.clone(), Event::Error(report)).into(),
+        );
+    }
+    let birth = rumors.snapshot().latest().clone();
+    State::new(
+        own_baseboard,
+        anchors,
+        remainder.into_past(birth, committed),
+    )
 }
 
 /// Send a message into the gossip set. An error means the payload
@@ -1574,39 +1631,24 @@ impl StateManager {
             spawn(async move {
                 info!(log, "managing state");
 
-                // Before any message is processed: announce our build
-                // (the send that starts this life's causal presence),
-                // raise the floor in case the record burned the
-                // initial universe, and take the birth mark that
-                // splits this life's traffic from replayed history.
-                let boundary = match &network {
-                    Some((rumors, _)) => {
-                        let (committed, report) =
-                            Commitment::at_entry(&log, &boundary_store, rumors);
-                        gossip(
-                            &log,
-                            rumors,
-                            Message::Event(
-                                own_baseboard.clone(),
-                                Event::Version(VersionInfo::current()),
-                            )
-                            .into(),
-                        );
-                        if let Some(report) = report {
-                            gossip(
-                                &log,
-                                rumors,
-                                Message::Event(own_baseboard.clone(), Event::Error(report)).into(),
-                            );
-                        }
-                        let birth = rumors.snapshot().latest().clone();
-                        tx_state.send_modify(|state| {
-                            state.past = Past::new(birth, committed);
-                        });
-                        boundary
-                    }
-                    None => boundary,
-                };
+                // Enter the initial universe before any message is
+                // processed, so the birth mark splits this life's
+                // traffic from replayed history.
+                if let Some((rumors, _)) = &network {
+                    let entered = enter_universe(
+                        &log,
+                        own_baseboard.clone(),
+                        &anchors,
+                        &boundary_store,
+                        rumors,
+                        Remainder::default(),
+                    )
+                    .expect("trust anchors validated at startup");
+                    tx_state.send_modify(|state| {
+                        *state = entered;
+                        state.rack.set_cubbies(cubbies.borrow_and_update().clone());
+                    });
+                }
                 if let Some(Committed { session, job, .. }) =
                     boundary.as_ref().and_then(|boundary| boundary.job.as_ref())
                 {
@@ -1680,17 +1722,21 @@ impl StateManager {
                             }
                             Some((version, message)) => {
                                 let live = tx_state.borrow().is_live(&version);
-                                apply_message(
+                                apply(
                                     &log,
                                     &tx_state,
                                     &mut executor,
                                     network.as_ref().map(|(rumors, _)| rumors),
                                     &boundary_store,
                                     &session_sush_nonce,
-                                    &version,
-                                    &message,
+                                    Input::Gossip(version, message),
                                 );
-                                // Replayed traffic can reveal zombies.
+                                // Settle only after replayed traffic:
+                                // replay is what reveals zombies, and a
+                                // sled that settles before its universe
+                                // has history adjudicates into a lonely
+                                // universe, whose extra events can win
+                                // the merge and erase rack history.
                                 if !live {
                                     drain_ready(
                                         &log,
@@ -1701,13 +1747,14 @@ impl StateManager {
                                         &boundary_store,
                                         &session_sush_nonce,
                                     );
-                                    settle_and_apply(
+                                    apply(
                                         &log,
                                         &tx_state,
                                         &mut executor,
                                         network.as_ref().map(|(rumors, _)| rumors),
                                         &boundary_store,
                                         &session_sush_nonce,
+                                        Input::Drained,
                                     );
                                 }
                             },
@@ -1715,9 +1762,15 @@ impl StateManager {
 
                         // Follow the rack's cubby map.
                         Ok(()) = cubbies.changed() => {
-                            tx_state.send_modify(|state| {
-                                state.rack.set_cubbies(cubbies.borrow_and_update().clone());
-                            });
+                            apply(
+                                &log,
+                                &tx_state,
+                                &mut executor,
+                                network.as_ref().map(|(rumors, _)| rumors),
+                                &boundary_store,
+                                &session_sush_nonce,
+                                Input::Cubbies(cubbies.borrow_and_update().clone()),
+                            );
                         },
 
                         // Follow the gossip manager to a new universe,
@@ -1741,36 +1794,20 @@ impl StateManager {
                         let fresh = universe.borrow_and_update().clone();
                         info!(log, "gossip universe changed, resetting state"; "network" => %fresh.rumors.network());
                         causal_messages = fresh.rumors.causal_messages();
-                        let in_flight = executor.in_flight();
+                        let remainder = tx_state.borrow().remainder(executor.in_flight());
                         *rumors = fresh.rumors;
-                        let (committed, report) =
-                            Commitment::at_entry(&log, &boundary_store, rumors);
-                        gossip(
-                            &log,
-                            rumors,
-                            Message::Event(
-                                own_baseboard.clone(),
-                                Event::Version(VersionInfo::current()),
-                            )
-                            .into(),
-                        );
-                        if let Some(report) = report {
-                            gossip(
-                                &log,
-                                rumors,
-                                Message::Event(own_baseboard.clone(), Event::Error(report)).into(),
-                            );
-                        }
-                        let birth = rumors.snapshot().latest().clone();
                         // TODO: re-inject local job state (policy pending).
+                        let entered = enter_universe(
+                            &log,
+                            own_baseboard.clone(),
+                            &anchors,
+                            &boundary_store,
+                            rumors,
+                            remainder,
+                        )
+                        .expect("trust anchors validated at startup");
                         tx_state.send_modify(|state| {
-                            let remainder = state.remainder(in_flight);
-                            *state = State::new(
-                                own_baseboard.clone(),
-                                &anchors,
-                                remainder.into_past(birth, committed),
-                            )
-                            .expect("trust anchors validated at startup");
+                            *state = entered;
                             state.rack.set_cubbies(cubbies.borrow().clone());
                         });
                         // The set received at join is already local:
@@ -1784,13 +1821,14 @@ impl StateManager {
                             &boundary_store,
                             &session_sush_nonce,
                         );
-                        settle_and_apply(
+                        apply(
                             &log,
                             &tx_state,
                             &mut executor,
                             Some(&*rumors),
                             &boundary_store,
                             &session_sush_nonce,
+                            Input::Drained,
                         );
                     }
                 }
@@ -1801,18 +1839,55 @@ impl StateManager {
 
 #[cfg(test)]
 mod test {
+    use std::time::Duration;
+
+    use x509_cert::time::Validity;
+
+    use sush_common::jobs::{JobMode, JobOutputState, JobStartRequest};
+    use sush_common::keys::{EphemeralKey, KeyType, Signer as _};
+    use sush_common::targets::Target;
+
     use super::*;
 
     fn network(seed: u8) -> Network {
         serde_json::from_str(&format!("[{seed:?}{}]", ", 0".repeat(15))).unwrap()
     }
 
-    fn state(past: Past) -> State {
-        let baseboard = BaseboardId {
+    fn baseboard() -> BaseboardId {
+        BaseboardId {
             part_number: "913-0000019".to_string(),
-            serial_number: "settle-test".to_string(),
-        };
-        State::new(baseboard, &[], past).unwrap()
+            serial_number: "state-test".to_string(),
+        }
+    }
+
+    fn state(past: Past) -> State {
+        State::new(baseboard(), &[], past).unwrap()
+    }
+
+    fn root() -> EphemeralKey {
+        let subject = "CN=Test Root,O=Oxide Computer Company,C=US";
+        EphemeralKey::new_root(
+            KeyType::P256,
+            subject.parse().unwrap(),
+            Validity::from_now(Duration::from_secs(60)).unwrap(),
+        )
+        .unwrap()
+    }
+
+    async fn signed_job(
+        root: &mut EphemeralKey,
+        job_id: JobId,
+        session_id: SessionId,
+    ) -> SignedJob {
+        root.sign(JobStartRequest::new(
+            job_id,
+            session_id,
+            "true",
+            JobMode::Batch,
+            Target::All,
+        ))
+        .await
+        .unwrap()
     }
 
     fn discard() -> Logger {
@@ -2090,5 +2165,291 @@ mod test {
         let remainder = state.remainder(BTreeSet::from([launching]));
         assert_eq!(remainder.survivors, BTreeSet::from([running, launching]));
         assert_eq!(remainder.adjudicated, Some(running));
+    }
+
+    /// Drive a [`State`] through [`State::step`] alone, over a real
+    /// single-party gossip set: no sockets, no executor, no spawned
+    /// tasks.
+    struct Sim {
+        log: Logger,
+        now: DateTime<Utc>,
+        rumors: GossipNetwork,
+        messages: CausalMessages<VersionedMessage>,
+        state: State,
+    }
+
+    impl Sim {
+        /// Grow a fresh gossip set, send `history` (a previous life's
+        /// traffic), then enter the universe exactly as the driver
+        /// does. With an empty history, every later send is live.
+        async fn new(anchors: &[Certificate], history: Vec<Message>) -> Sim {
+            let log = discard();
+            let rumors: GossipNetwork = Seed::grow(&log, &Locker::null()).await.into_rumors();
+            for message in history {
+                rumors.send(message.into()).unwrap();
+            }
+            let store = BoundaryStore::new(&log, &Locker::null());
+            store.load().await;
+            let state = enter_universe(
+                &log,
+                baseboard(),
+                anchors,
+                &store,
+                &rumors,
+                Remainder::default(),
+            )
+            .unwrap();
+            let messages = rumors.causal_messages();
+            Sim {
+                log,
+                now: Utc::now(),
+                rumors,
+                messages,
+                state,
+            }
+        }
+
+        fn send(&mut self, message: Message) {
+            self.rumors.send(message.into()).unwrap();
+        }
+
+        /// Step every ready message through the state machine,
+        /// collecting the outputs.
+        fn pump(&mut self) -> Vec<Output> {
+            let mut outputs = Vec::new();
+            while let Some(Some((version, message))) = self.messages.next().now_or_never() {
+                outputs.extend(self.state.step(
+                    &self.log,
+                    self.now,
+                    Some(self.rumors.network()),
+                    Input::Gossip(version, message),
+                ));
+            }
+            outputs
+        }
+
+        /// Step every ready message through without a network, as the
+        /// driver does while draining at shutdown.
+        fn pump_draining(&mut self) -> Vec<Output> {
+            let mut outputs = Vec::new();
+            while let Some(Some((version, message))) = self.messages.next().now_or_never() {
+                outputs.extend(self.state.step(
+                    &self.log,
+                    self.now,
+                    None,
+                    Input::Gossip(version, message),
+                ));
+            }
+            outputs
+        }
+
+        fn request(&mut self, request: Request) -> Vec<Output> {
+            self.send(Message::Request(request));
+            self.pump()
+        }
+
+        fn drained(&mut self) -> Vec<Output> {
+            self.state.step(
+                &self.log,
+                self.now,
+                Some(self.rumors.network()),
+                Input::Drained,
+            )
+        }
+    }
+
+    /// A fresh universe with an adopted session, ready for jobs.
+    async fn sim_with_session() -> (EphemeralKey, Sim, SessionId, Session) {
+        let root = root();
+        let anchors = vec![root.cert().clone()];
+        let mut sim = Sim::new(&anchors, Vec::new()).await;
+        let session_id = SessionId::random();
+        sim.request(Request::session(
+            root.key_id().clone(),
+            SessionRequest::Start(session_id),
+        ));
+        (root, sim, session_id, Session::new(session_id))
+    }
+
+    /// The happy path through the step surface alone: a session
+    /// starts, a signed job releases, the job's own events settle its
+    /// status, and the session stops.
+    #[tokio::test]
+    async fn session_lifecycle_through_step() {
+        let mut root = root();
+        let anchors = vec![root.cert().clone()];
+        let actor = root.key_id().clone();
+        let mut sim = Sim::new(&anchors, Vec::new()).await;
+
+        let session_id = SessionId::random();
+        let session = Session::new(session_id);
+        let outputs = sim.request(Request::session(
+            actor.clone(),
+            SessionRequest::Start(session_id),
+        ));
+        assert!(outputs.iter().any(|o| matches!(o, Output::RotateNonce)));
+        assert!(sim.state.session.session().is_some());
+
+        let job_id = session.next_job_id();
+        let signed = signed_job(&mut root, job_id, session_id).await;
+        let outputs = sim.request(Request::job(
+            actor.clone(),
+            JobRequest::Start(signed, JobStartParams::default()),
+        ));
+        assert!(
+            outputs
+                .iter()
+                .any(|o| matches!(o, Output::Run(run) if *run.job.payload().job_id() == job_id))
+        );
+
+        sim.send(Message::Event(
+            baseboard(),
+            Event::Job(JobEvent::Start(job_id, sim.now)),
+        ));
+        sim.pump();
+        let outputs = sim.request(Request::job(actor.clone(), JobRequest::Stop(job_id)));
+        assert!(
+            outputs
+                .iter()
+                .any(|o| matches!(o, Output::Stop(id) if *id == job_id))
+        );
+        sim.send(Message::Event(
+            baseboard(),
+            Event::Job(JobEvent::Stop(
+                job_id,
+                sim.now,
+                Ok(0),
+                JobOutputState::default(),
+            )),
+        ));
+        let outputs = sim.pump();
+        assert!(outputs.iter().any(
+            |o| matches!(o, Output::Ran(JobStatus::Stopped { job_id: id, .. }) if *id == job_id)
+        ));
+
+        sim.request(Request::session(actor, SessionRequest::Stop(session_id)));
+        assert!(sim.state.session.session().is_none());
+    }
+
+    /// A session the boundary record cannot order hops: the floor
+    /// rises, one report goes out, and the session's jobs are skipped
+    /// below the floor rather than run. A later job in the same
+    /// session reports no second hop.
+    #[tokio::test]
+    async fn hop_through_step() {
+        let (mut root, mut sim, session_id, mut session) = sim_with_session().await;
+        let actor = root.key_id().clone();
+
+        // A boundary record whose executed join the session start
+        // does not dominate: the current frontier, which includes
+        // the start itself.
+        sim.state.past.committed = Commitment::Trusted {
+            boundary: Box::new(Boundary {
+                network: sim.rumors.network(),
+                burned: Bloom::new(),
+                executed: sim.rumors.snapshot().latest().clone(),
+                job: None,
+            }),
+            floor: None,
+        };
+
+        let hops = |outputs: &[Output]| {
+            outputs
+                .iter()
+                .filter(|o| {
+                    matches!(
+                        o,
+                        Output::Gossip(Message::Event(_, Event::Error(Error::SessionHop)))
+                    )
+                })
+                .count()
+        };
+        let skipped = |outputs: &[Output], job_id: JobId| {
+            outputs.iter().any(|o| {
+                matches!(
+                    o,
+                    Output::Gossip(Message::Event(
+                        _,
+                        Event::Job(JobEvent::Skipped(id, _, SkipReason::BelowFloor)),
+                    )) if *id == job_id
+                )
+            })
+        };
+
+        let job_id = session.next_job_id();
+        let signed = signed_job(&mut root, job_id, session_id).await;
+        let outputs = sim.request(Request::job(
+            actor.clone(),
+            JobRequest::Start(signed.clone(), JobStartParams::default()),
+        ));
+        assert_eq!(hops(&outputs), 1);
+        assert!(!outputs.iter().any(|o| matches!(o, Output::Run(_))));
+        assert!(skipped(&outputs, job_id));
+
+        session.job_started(signed);
+        let next_id = session.next_job_id();
+        let next = signed_job(&mut root, next_id, session_id).await;
+        let outputs = sim.request(Request::job(
+            actor,
+            JobRequest::Start(next, JobStartParams::default()),
+        ));
+        assert_eq!(hops(&outputs), 0);
+        assert!(skipped(&outputs, next_id));
+    }
+
+    /// Without a network to commit through, a ready job is not
+    /// launched; its chain position still advances so the session is
+    /// not wedged.
+    #[tokio::test]
+    async fn draining_launches_nothing() {
+        let (mut root, mut sim, session_id, mut session) = sim_with_session().await;
+        let actor = root.key_id().clone();
+
+        let job_id = session.next_job_id();
+        let signed = signed_job(&mut root, job_id, session_id).await;
+        sim.send(Message::Request(Request::job(
+            actor,
+            JobRequest::Start(signed.clone(), JobStartParams::default()),
+        )));
+        let outputs = sim.pump_draining();
+        assert!(!outputs.iter().any(|o| matches!(o, Output::Run(_))));
+
+        session.job_started(signed);
+        let state_session = sim.state.session.session().unwrap();
+        assert_eq!(state_session.next_job_id(), session.next_job_id());
+    }
+
+    /// Replayed traffic never releases a job, and the drain after
+    /// replay declares a previous life's running job interrupted
+    /// exactly once.
+    #[tokio::test]
+    async fn replay_reaps_zombies_through_step() {
+        let mut root = root();
+        let anchors = vec![root.cert().clone()];
+        let actor = root.key_id().clone();
+        let session_id = SessionId::random();
+        let session = Session::new(session_id);
+        let job_id = session.next_job_id();
+        let signed = signed_job(&mut root, job_id, session_id).await;
+        let history = vec![
+            Message::Request(Request::session(
+                actor.clone(),
+                SessionRequest::Start(session_id),
+            )),
+            Message::Request(Request::job(
+                actor,
+                JobRequest::Start(signed, JobStartParams::default()),
+            )),
+            Message::Event(baseboard(), Event::Job(JobEvent::Start(job_id, Utc::now()))),
+        ];
+
+        let mut sim = Sim::new(&anchors, history).await;
+        let outputs = sim.pump();
+        assert!(!outputs.iter().any(|o| matches!(o, Output::Run(_))));
+
+        let outputs = sim.drained();
+        assert_eq!(outputs.len(), 1);
+        assert!(interrupted(&outputs[0], job_id));
+        assert!(sim.drained().is_empty());
     }
 }
