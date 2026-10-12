@@ -414,6 +414,14 @@ async fn job(
         let _ = tx_output.try_send(buf);
     }
 
+    // Flush output files.
+    if let Err(error) = stdout_file.flush().await {
+        error!(log, "failed to flush recorded standard output"; "error" => %error);
+    }
+    if let Err(error) = stderr_file.flush().await {
+        error!(log, "failed to flush recorded error output"; "error" => %error);
+    }
+
     // Reap the process. A stopped job that exited the loop alive
     // still gets its SIGKILL upgrade after the grace period.
     let exit_status = select! {
