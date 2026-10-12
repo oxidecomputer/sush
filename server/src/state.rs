@@ -228,10 +228,9 @@ enum Admission {
     /// so skip the job.
     Refuse,
 
-    /// The boundary record cannot order this session, so a previous
-    /// life of this sled may have run its jobs. The sled reports an
-    /// error and raises its floor, as if it had just entered the
-    /// universe.
+    /// We have a boundary record, but it's incommensurate with the
+    /// current session. So "hop" into the new session, and raise the
+    /// execution floor.
     Hop,
 
     /// If we cannot trust our boundary record, we must not admit
@@ -1301,19 +1300,27 @@ impl State {
         else {
             return outputs;
         };
+
+        // If there's no universe, just drain the queue and advance the chain.
+        let Some(network) = network else {
+            let mut n = 0;
+            while let Some(queued) = queued_jobs.remove(&session.next_job_id()) {
+                session.job_started(queued.job);
+                n += 1;
+            }
+            if n > 0 {
+                warn!(log, "skipped queued jobs while draining"; "n" => n);
+            }
+            return outputs;
+        };
+
         loop {
             let next_id = session.next_job_id();
             if !queued_jobs.contains_key(&next_id) {
                 break;
             }
 
-            // A hop can raise the floor mid-drain, so screen on every pass.
-            let admission = match network {
-                None => Admission::Admit,
-                Some(network) => self.past.screen(network, session.session_id(), started),
-            };
-
-            // A hop raises the floor and screens again.
+            let admission = self.past.screen(network, session.session_id(), started);
             if matches!(admission, Admission::Hop) {
                 warn!(
                     log, "hopping sessions, raising the execution floor";
@@ -1376,11 +1383,6 @@ impl State {
                     })
                     .unwrap_or(true)
                 {
-                    let Some(network) = network else {
-                        warn!(log, "not starting a job while draining"; "job_id" => %job_id);
-                        session.job_started(request);
-                        continue;
-                    };
                     let checked = self
                         .certs
                         .verify(&request)
