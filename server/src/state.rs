@@ -279,10 +279,10 @@ pub struct Past {
     /// as survivors.
     reaped: BTreeSet<JobId>,
 
-    /// The boundary job already ruled on. A sled that swaps universes
-    /// again without running a new job keeps this verdict instead of
-    /// ruling on the same job twice.
-    adjudicated: Option<JobId>,
+    /// The universes that have been sent this sled's verdict on its
+    /// boundary job. A ruling is announced at most once per job per
+    /// universe.
+    adjudicated: BTreeMap<Network, JobId>,
 }
 
 /// The parts of a [`Past`] that survive a universe swap because the
@@ -292,8 +292,8 @@ struct Remainder {
     /// Jobs still running or launching here at the swap.
     survivors: BTreeSet<JobId>,
 
-    /// The boundary job already ruled on.
-    adjudicated: Option<JobId>,
+    /// The universes that have been sent a verdict on the boundary job.
+    adjudicated: BTreeMap<Network, JobId>,
 }
 
 impl Remainder {
@@ -559,9 +559,16 @@ impl State {
     /// once ready messages have drained: an undelivered replayed end
     /// may yet clear a zombie, and an early settle would declare a
     /// finished job interrupted.
-    fn settle(&mut self, log: &Logger, now: DateTime<Utc>) -> Vec<Output> {
+    fn settle(
+        &mut self,
+        log: &Logger,
+        now: DateTime<Utc>,
+        network: Option<Network>,
+    ) -> Vec<Output> {
         let mut outputs = self.reap_zombies(log, now);
-        outputs.extend(self.adjudicate_boundary(log, now));
+        if let Some(network) = network {
+            outputs.extend(self.adjudicate_boundary(log, now, network));
+        }
         outputs
     }
 
@@ -593,7 +600,12 @@ impl State {
     /// Every sled hears the ruling, but a sled that already holds a
     /// terminal status for the job keeps what it holds, so one sled
     /// may show the real ending while another shows interrupted.
-    fn adjudicate_boundary(&mut self, log: &Logger, now: DateTime<Utc>) -> Vec<Output> {
+    fn adjudicate_boundary(
+        &mut self,
+        log: &Logger,
+        now: DateTime<Utc>,
+        network: Network,
+    ) -> Vec<Output> {
         // An absent or untrusted record commits to no job, so there
         // is nothing to rule on.
         let Commitment::Trusted { boundary, .. } = &self.past.committed else {
@@ -603,7 +615,7 @@ impl State {
             return Vec::new();
         };
         let (job_id, outcome) = (*job, outcome.clone());
-        if self.past.adjudicated == Some(job_id) {
+        if self.past.adjudicated.get(&network) == Some(&job_id) {
             return Vec::new();
         }
         // A survivor reports its own ending in this universe, so it
@@ -611,7 +623,7 @@ impl State {
         if self.past.survivors.contains(&job_id) {
             return Vec::new();
         }
-        self.past.adjudicated = Some(job_id);
+        self.past.adjudicated.insert(network, job_id);
         let witnessed = self
             .get_job_status(&job_id)
             .is_some_and(|status| status.get(self.rack.own_baseboard()).is_some());
@@ -658,7 +670,7 @@ impl State {
         survivors.retain(|job_id| !self.past.reaped.contains(job_id));
         Remainder {
             survivors,
-            adjudicated: self.past.adjudicated,
+            adjudicated: self.past.adjudicated.clone(),
         }
     }
 
@@ -678,7 +690,7 @@ impl State {
                 Vec::new()
             }
             Input::Gossip(version, message) => self.update(log, now, network, &version, &message),
-            Input::Drained => self.settle(log, now),
+            Input::Drained => self.settle(log, now, network),
         }
     }
 
@@ -2106,25 +2118,28 @@ mod test {
         }
         state.past.survivors.insert(survivor);
 
-        let outputs = state.settle(&log, now);
+        let outputs = state.settle(&log, now, Some(network(1)));
         assert_eq!(outputs.len(), 1);
         assert!(interrupted(&outputs[0], zombie));
-        assert!(state.settle(&log, now).is_empty());
+        assert!(state.settle(&log, now, Some(network(1))).is_empty());
     }
 
     /// A committed job that replay left without a status is
-    /// adjudicated as interrupted, and only once per boundary.
+    /// adjudicated as interrupted, once per universe: a universe that
+    /// never heard the ruling gets its own.
     #[test]
-    fn adjudication_rules_once_per_boundary() {
+    fn adjudication_rules_once_per_universe() {
         let log = discard();
         let now = Utc::now();
         let job = JobId::random();
         let mut state = state(past(Some(committed_boundary(job)), None));
 
-        let outputs = state.settle(&log, now);
-        assert_eq!(outputs.len(), 1);
-        assert!(interrupted(&outputs[0], job));
-        assert!(state.settle(&log, now).is_empty());
+        for net in [network(1), network(2)] {
+            let outputs = state.settle(&log, now, Some(net));
+            assert_eq!(outputs.len(), 1);
+            assert!(interrupted(&outputs[0], job));
+            assert!(state.settle(&log, now, Some(net)).is_empty());
+        }
     }
 
     /// A witnessed boundary job keeps its replayed status: settle
@@ -2140,13 +2155,13 @@ mod test {
 
         let mut witnessed = state(past(Some(boundary.clone()), None));
         start_job(&mut witnessed, job, now);
-        assert!(witnessed.settle(&log, now).is_empty());
-        assert_eq!(witnessed.past.adjudicated, Some(job));
+        assert!(witnessed.settle(&log, now, Some(network(1))).is_empty());
+        assert_eq!(witnessed.past.adjudicated.get(&network(1)), Some(&job));
 
         let mut surviving = state(past(Some(boundary), None));
         surviving.past.survivors.insert(job);
-        assert!(surviving.settle(&log, now).is_empty());
-        assert_eq!(surviving.past.adjudicated, None);
+        assert!(surviving.settle(&log, now, Some(network(1))).is_empty());
+        assert!(surviving.past.adjudicated.is_empty());
     }
 
     /// The remainder carries exactly what the next life cannot
@@ -2162,11 +2177,14 @@ mod test {
         start_job(&mut state, running, now);
         start_job(&mut state, reaped, now);
         state.past.reaped.insert(reaped);
-        state.past.adjudicated = Some(running);
+        state.past.adjudicated.insert(network(1), running);
 
         let remainder = state.remainder(BTreeSet::from([launching]));
         assert_eq!(remainder.survivors, BTreeSet::from([running, launching]));
-        assert_eq!(remainder.adjudicated, Some(running));
+        assert_eq!(
+            remainder.adjudicated,
+            BTreeMap::from([(network(1), running)])
+        );
     }
 
     /// Drive a [`State`] through [`State::step`] alone, over a real
@@ -2175,6 +2193,7 @@ mod test {
     struct Sim {
         log: Logger,
         now: DateTime<Utc>,
+        anchors: Vec<Certificate>,
         rumors: GossipNetwork,
         messages: CausalMessages<VersionedMessage>,
         state: State,
@@ -2205,10 +2224,31 @@ mod test {
             Sim {
                 log,
                 now: Utc::now(),
+                anchors: anchors.to_vec(),
                 rumors,
                 messages,
                 state,
             }
+        }
+
+        /// Swap into a fresh universe, as the driver does on a
+        /// universe change.
+        async fn swap(&mut self) {
+            let rumors: GossipNetwork = Seed::grow(&self.log, &Locker::null()).await.into_rumors();
+            let store = BoundaryStore::new(&self.log, &Locker::null());
+            store.load().await;
+            let remainder = self.state.remainder(BTreeSet::new());
+            self.state = enter_universe(
+                &self.log,
+                baseboard(),
+                &self.anchors,
+                &store,
+                &rumors,
+                remainder,
+            )
+            .unwrap();
+            self.messages = rumors.causal_messages();
+            self.rumors = rumors;
         }
 
         fn send(&mut self, message: Message) {
@@ -2479,6 +2519,37 @@ mod test {
         let outputs = sim.drained();
         assert_eq!(outputs.len(), 1);
         assert!(interrupted(&outputs[0], job_id));
+        assert!(sim.drained().is_empty());
+    }
+
+    /// A swap can land in a universe that never heard the boundary
+    /// verdict; that universe gets its own, exactly once.
+    #[tokio::test]
+    async fn swapped_universe_gets_its_own_ruling() {
+        let root = root();
+        let anchors = vec![root.cert().clone()];
+        let mut sim = Sim::new(&anchors, Vec::new()).await;
+        let job = JobId::random();
+        let commit = |sim: &mut Sim| {
+            sim.state.past.committed = Commitment::Trusted {
+                boundary: Box::new(committed_boundary(job)),
+                floor: None,
+            };
+        };
+
+        commit(&mut sim);
+        let outputs = sim.drained();
+        assert_eq!(outputs.len(), 1);
+        assert!(interrupted(&outputs[0], job));
+        assert!(sim.drained().is_empty());
+
+        // The new universe replaces the commitment from the record on
+        // disk, which the null store cannot supply; restore it by hand.
+        sim.swap().await;
+        commit(&mut sim);
+        let outputs = sim.drained();
+        assert_eq!(outputs.len(), 1);
+        assert!(interrupted(&outputs[0], job));
         assert!(sim.drained().is_empty());
     }
 }

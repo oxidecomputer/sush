@@ -1034,32 +1034,31 @@ async fn universe_swap() {
     .expect("state reset");
     // The new universe cannot name the job, so the boundary
     // adjudicates its recorded ending on this sled's sole authority.
-    timeout(Duration::from_secs(30), async {
-        loop {
-            if let Ok(map) = mgr.job_status(&authn, &job_id).await
-                && matches!(
-                    map.get(mgr.own_baseboard()),
-                    Some(JobStatus::Stopped { result: Ok(0), .. })
-                )
-            {
-                break;
+    async fn adjudicated(mgr: &JobManager, authn: &Identity, job_id: &JobId) {
+        timeout(Duration::from_secs(30), async {
+            loop {
+                if let Ok(map) = mgr.job_status(authn, job_id).await
+                    && matches!(
+                        map.get(mgr.own_baseboard()),
+                        Some(JobStatus::Stopped { result: Ok(0), .. })
+                    )
+                {
+                    break;
+                }
+                sleep(Duration::from_millis(50)).await;
             }
-            sleep(Duration::from_millis(50)).await;
-        }
-    })
-    .await
-    .expect("boundary adjudication");
+        })
+        .await
+        .expect("boundary adjudication");
+    }
+    adjudicated(&mgr, &authn, &job_id).await;
 
-    // A further swap does not re-adjudicate the same boundary: one
-    // ruling per boundary.
+    // A further swap lands in a universe that never heard the
+    // ruling, and that universe gets its own.
     universe
         .send(Universe::genesis(null_gossip().await))
         .unwrap();
-    sleep(Duration::from_millis(200)).await;
-    assert!(matches!(
-        mgr.job_status(&authn, &job_id).await,
-        Err(JobError::JobNotFound(_))
-    ));
+    adjudicated(&mgr, &authn, &job_id).await;
 
     // The manager still works in the new universe.
     run_job(&mgr, &mut root, &authn).await;
