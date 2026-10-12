@@ -141,7 +141,18 @@ impl Executor {
         )
     }
 
-    /// Queue a verified job for launch.
+    /// Whether the executor can launch this command. The rule lives
+    /// here because it comes from how the launch builds its argv.
+    pub fn check_command(request: &JobStartRequest) -> Result<(), ProcessError> {
+        if request.command.starts_with('-') {
+            return Err(ProcessError::InvalidCommand);
+        }
+        Ok(())
+    }
+
+    /// Queue a job for launch. The caller has screened the request:
+    /// the signature is verified and the command passed
+    /// [`Executor::check_command`].
     pub fn job_start(
         &mut self,
         request: VerifiedJob,
@@ -154,16 +165,7 @@ impl Executor {
             return;
         };
 
-        // Validate the job request.
         let job_id = request.payload().job_id().to_owned();
-        if request.payload().command.starts_with('-') {
-            let log = self.log.clone();
-            spawn(async move {
-                send_error(&log, &job_id, &events, ProcessError::InvalidCommand).await;
-            });
-            return;
-        }
-
         let stop = self.shutdown.child_token();
         self.stop.insert(job_id, stop.clone());
         let refused = self.launch.try_send(Launch {

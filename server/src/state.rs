@@ -1369,14 +1369,15 @@ impl State {
                         session.job_started(request);
                         continue;
                     };
-                    match self.certs.verify(&request) {
+                    let checked = self
+                        .certs
+                        .verify(&request)
+                        .map_err(|error| ProcessError::InvalidJob(error.to_string()))
+                        .and_then(|job| Executor::check_command(job.payload()).map(|()| job));
+                    match checked {
                         Err(error) => outputs.push(Output::job_event(
                             self.rack.own_baseboard(),
-                            JobEvent::Error(
-                                job_id,
-                                now,
-                                ProcessError::InvalidJob(error.to_string()),
-                            ),
+                            JobEvent::Error(job_id, now, error),
                         )),
                         Ok(job) => {
                             let (attachment, rx_attachment) = watch::channel(None);
@@ -1878,11 +1879,12 @@ mod test {
         root: &mut EphemeralKey,
         job_id: JobId,
         session_id: SessionId,
+        command: &str,
     ) -> SignedJob {
         root.sign(JobStartRequest::new(
             job_id,
             session_id,
-            "true",
+            command,
             JobMode::Batch,
             Target::All,
         ))
@@ -2291,7 +2293,7 @@ mod test {
         assert!(sim.state.session.session().is_some());
 
         let job_id = session.next_job_id();
-        let signed = signed_job(&mut root, job_id, session_id).await;
+        let signed = signed_job(&mut root, job_id, session_id, "true").await;
         let outputs = sim.request(Request::job(
             actor.clone(),
             JobRequest::Start(signed, JobStartParams::default()),
@@ -2377,7 +2379,7 @@ mod test {
         };
 
         let job_id = session.next_job_id();
-        let signed = signed_job(&mut root, job_id, session_id).await;
+        let signed = signed_job(&mut root, job_id, session_id, "true").await;
         let outputs = sim.request(Request::job(
             actor.clone(),
             JobRequest::Start(signed.clone(), JobStartParams::default()),
@@ -2388,7 +2390,7 @@ mod test {
 
         session.job_started(signed);
         let next_id = session.next_job_id();
-        let next = signed_job(&mut root, next_id, session_id).await;
+        let next = signed_job(&mut root, next_id, session_id, "true").await;
         let outputs = sim.request(Request::job(
             actor,
             JobRequest::Start(next, JobStartParams::default()),
@@ -2406,13 +2408,40 @@ mod test {
         let actor = root.key_id().clone();
 
         let job_id = session.next_job_id();
-        let signed = signed_job(&mut root, job_id, session_id).await;
+        let signed = signed_job(&mut root, job_id, session_id, "true").await;
         sim.send(Message::Request(Request::job(
             actor,
             JobRequest::Start(signed.clone(), JobStartParams::default()),
         )));
         let outputs = sim.pump_draining();
         assert!(!outputs.iter().any(|o| matches!(o, Output::Run(_))));
+
+        session.job_started(signed);
+        let state_session = sim.state.session.session().unwrap();
+        assert_eq!(state_session.next_job_id(), session.next_job_id());
+    }
+
+    /// A command the executor cannot launch is refused at release
+    /// with an invalid command error; the chain still advances.
+    #[tokio::test]
+    async fn invalid_command_is_refused_at_release() {
+        let (mut root, mut sim, session_id, mut session) = sim_with_session().await;
+        let actor = root.key_id().clone();
+
+        let job_id = session.next_job_id();
+        let signed = signed_job(&mut root, job_id, session_id, "-rf").await;
+        let outputs = sim.request(Request::job(
+            actor,
+            JobRequest::Start(signed.clone(), JobStartParams::default()),
+        ));
+        assert!(!outputs.iter().any(|o| matches!(o, Output::Run(_))));
+        assert!(outputs.iter().any(|o| matches!(
+            o,
+            Output::Gossip(Message::Event(
+                _,
+                Event::Job(JobEvent::Error(id, _, ProcessError::InvalidCommand)),
+            )) if *id == job_id
+        )));
 
         session.job_started(signed);
         let state_session = sim.state.session.session().unwrap();
@@ -2430,7 +2459,7 @@ mod test {
         let session_id = SessionId::random();
         let session = Session::new(session_id);
         let job_id = session.next_job_id();
-        let signed = signed_job(&mut root, job_id, session_id).await;
+        let signed = signed_job(&mut root, job_id, session_id, "true").await;
         let history = vec![
             Message::Request(Request::session(
                 actor.clone(),
