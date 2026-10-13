@@ -14,7 +14,7 @@ path = "src/main.rs"
 [features]
 # Sign job requests through Permission Slip. Off by default because the
 # permission-slip repositories are private; Oxide builds turn it on.
-permslip = ["dep:anyhow", "dep:permission-slip-client", "dep:permission-slip-common"]
+permslip = ["dep:anyhow", "dep:permission-slip-client", "dep:webbrowser"]
 
 [dependencies]
 anstream.workspace = true
@@ -39,7 +39,6 @@ memmap2.workspace = true
 p256.workspace = true
 pem-rfc7468.workspace = true
 permission-slip-client = { workspace = true, optional = true }
-permission-slip-common = { workspace = true, optional = true }
 progenitor.workspace = true
 progenitor-client.workspace = true
 rand.workspace = true
@@ -63,6 +62,7 @@ tokio.workspace = true
 tokio-fd.workspace = true
 tokio-rustls.workspace = true
 tokio-tungstenite.workspace = true
+webbrowser = { workspace = true, optional = true }
 x509-cert.workspace = true
 xdg.workspace = true
 

@@ -1006,31 +1006,37 @@ impl CommandContext for Cli {
     }
 
     fn really_target(&mut self, sled: &SledId) -> Result<(), CommandError> {
-        match self.get_output_format() {
-            OutputFormat::Json => Ok(()),
-            OutputFormat::Text => {
-                let prompt =
-                    format!("❓ Sled `{sled}` is not in the rack inventory. Proceed (yes/no)? ");
-                if read_bool(&prompt)? {
-                    Ok(())
-                } else {
-                    Err(CommandError::Canceled)
-                }
-            }
+        if read_bool(&format!(
+            "❓ Sled `{sled}` is not in the rack inventory. Proceed (yes/no)? "
+        ))? {
+            Ok(())
+        } else {
+            Err(CommandError::Canceled)
         }
     }
 
     fn please_touch(&mut self, identity: &SshPublicKey) -> Result<(), CommandError> {
         if identity.is_sk_algorithm() {
-            match self.get_output_format() {
-                OutputFormat::Json => (),
-                OutputFormat::Text => eprintln!(
-                    "👋 Please confirm user presence to sign with key `{}`",
-                    identity.key_id()?
-                ),
-            }
+            eprintln!(
+                "👋 Please confirm user presence to sign with key `{}`",
+                identity.key_id()?
+            );
         }
         Ok(())
+    }
+
+    #[cfg(feature = "permslip")]
+    fn please_authn(&mut self, url: &str) {
+        let message = if webbrowser::open(url).is_ok() {
+            "🔑 Authenticate to the signing service in your browser, or open this URL:"
+        } else {
+            "🔑 Open this URL in your browser to authenticate to the signing service:"
+        };
+        let print = || eprintln!("{message}\n{url}");
+        match self.progress.lock().unwrap().as_ref() {
+            Some(bar) => bar.suspend(print),
+            None => print(),
+        }
     }
 }
 

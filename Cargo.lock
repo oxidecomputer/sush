@@ -2508,7 +2508,7 @@ checksum = "0ceec5bc11778974d1bcb055b18002eba7f4b3518b6a0081b3af5f21666da9ad"
 [[package]]
 name = "lpc55_areas"
 version = "0.2.5"
-source = "git+https://github.com/oxidecomputer/lpc55_support#fc64732faf5511850b35f1734d572b9953d73374"
+source = "git+https://github.com/oxidecomputer/lpc55_support#1710b53108dba117c1585e7b64e3b26cefb83675"
 dependencies = [
  "bitfield",
  "clap",
@@ -2519,7 +2519,7 @@ dependencies = [
 [[package]]
 name = "lpc55_sign"
 version = "0.3.5"
-source = "git+https://github.com/oxidecomputer/lpc55_support#fc64732faf5511850b35f1734d572b9953d73374"
+source = "git+https://github.com/oxidecomputer/lpc55_support#1710b53108dba117c1585e7b64e3b26cefb83675"
 dependencies = [
  "byteorder",
  "const-oid 0.9.6",
@@ -3043,7 +3043,7 @@ checksum = "9b4f627cb1b25917193a259e49bdad08f671f8d9708acfd5fe0a8c1455d87220"
 [[package]]
 name = "permission-slip-client"
 version = "1.1.0"
-source = "git+https://github.com/oxidecomputer/permission-slip?rev=94b68e717f2da426ca1450d5ebc9fc5000596bdc#94b68e717f2da426ca1450d5ebc9fc5000596bdc"
+source = "git+https://github.com/oxidecomputer/permission-slip?rev=e1ac78d5ddf1e02b977d6c5d1c1147cb08dac1ca#e1ac78d5ddf1e02b977d6c5d1c1147cb08dac1ca"
 dependencies = [
  "anyhow",
  "base64 0.22.1",
@@ -3078,7 +3078,7 @@ dependencies = [
 [[package]]
 name = "permission-slip-common"
 version = "0.1.0"
-source = "git+https://github.com/oxidecomputer/permission-slip?rev=94b68e717f2da426ca1450d5ebc9fc5000596bdc#94b68e717f2da426ca1450d5ebc9fc5000596bdc"
+source = "git+https://github.com/oxidecomputer/permission-slip?rev=e1ac78d5ddf1e02b977d6c5d1c1147cb08dac1ca#e1ac78d5ddf1e02b977d6c5d1c1147cb08dac1ca"
 dependencies = [
  "aws-types",
  "blake3",
@@ -4651,7 +4651,7 @@ dependencies = [
 [[package]]
 name = "sshauth"
 version = "0.1.2"
-source = "git+https://github.com/oxidecomputer/sshauth#6233c1b25d9e3b03d51ab95b19ed7903bfadfd8f"
+source = "git+https://github.com/oxidecomputer/sshauth#495ebe3de41c887c86f264fc217875cf676b4844"
 dependencies = [
  "anyhow",
  "base64 0.22.1",
@@ -4808,7 +4808,6 @@ dependencies = [
  "p256",
  "pem-rfc7468",
  "permission-slip-client",
- "permission-slip-common",
  "progenitor",
  "progenitor-client",
  "rand 0.8.7",
@@ -4833,6 +4832,7 @@ dependencies = [
  "tokio-fd",
  "tokio-rustls",
  "tokio-tungstenite",
+ "webbrowser",
  "x509-cert",
  "xdg 3.0.0",
 ]

@@ -4,54 +4,162 @@
 
 //! Use Permission Slip to sign Support Shell job requests.
 
-use http::HeaderValue;
-use permslip_client_lib::login::TokenProvider;
-use permslip_client_lib::types::{CreateSushSessionBody, CreatedSushSession, Error as ApiError};
+use std::time::Duration;
+
+use permslip_client_lib::credential_store::store_credential;
+use permslip_client_lib::login::{BearerToken, TokenProvider};
+use permslip_client_lib::types::{
+    CreateGoogleSessionParams, CreateGoogleSessionResponse, CreateSushSessionBody,
+    CreatedSushSession, Error as ApiError,
+};
 use permslip_client_lib::{Client, ClientRequestBuilder, Error as ClientError};
 use sled_hardware_types::BaseboardId;
 use thiserror::Error;
+use tokio::time::sleep;
 
 use sush_common::codephrases::InvalidCodephrase;
 use sush_common::jobs::{JobStartRequest, SessionSushNonce, SignedJob};
 use sush_common::keys::KeyError;
 use sush_common::targets::InvalidTarget;
 
-pub struct PermslipSigner {
+use crate::context::CommandContext;
+
+pub struct PermslipSigner<C> {
     client: Client,
     key_name: String,
+    url: String,
+    authn: PermslipAuthn,
+    ctx: C,
 }
 
-/// Get the bearer token that `permslip login` saved for `url`.
-pub async fn saved_token(url: &str) -> Result<String, PermslipError> {
-    let token = TokenProvider::SavedCredentials
+/// How to authenticate to the signing service.
+#[derive(Clone)]
+pub enum PermslipAuthn {
+    /// A Google session, for humans.
+    Google,
+
+    /// An sshauth challenge, for machines like manufacturing stations.
+    Ssh {
+        agent_sock: String,
+        fingerprint: Option<String>,
+    },
+}
+
+/// Authenticate to the signing service via Google and save the session
+/// credential where `permslip login` does.
+async fn google_authn<C: CommandContext>(
+    ctx: &mut C,
+    url: &str,
+) -> Result<BearerToken, PermslipError> {
+    let anonymous = Client::new(url);
+    let redirect = anonymous
+        .get_google_auth_redirect()
+        .send()
+        .await?
+        .into_inner();
+    ctx.please_authn(&redirect.redirect_url);
+    loop {
+        let response = anonymous
+            .create_google_session()
+            .body(CreateGoogleSessionParams {
+                exchange_code: redirect.exchange_code.clone(),
+            })
+            .send()
+            .await?
+            .into_inner();
+        match response {
+            CreateGoogleSessionResponse::Created { expires_at, token } => {
+                store_credential(url, &token, expires_at)
+                    .await
+                    .map_err(PermslipError::token)?;
+                return saved_token(url).await;
+            }
+            CreateGoogleSessionResponse::WaitingForOauth {
+                retry_in_milliseconds,
+            } => sleep(Duration::from_millis(retry_in_milliseconds)).await,
+        }
+    }
+}
+
+/// The credential saved for `url`, if it has not expired.
+async fn saved_token(url: &str) -> Result<BearerToken, PermslipError> {
+    TokenProvider::SavedCredentials
         .token(url)
         .await
-        .map_err(PermslipError::token_flow)?;
-    let value = token.into_header_value().map_err(PermslipError::token)?;
-    value
-        .to_str()
-        .map(str::to_owned)
-        .map_err(PermslipError::token)
+        .map_err(PermslipError::token_flow)
 }
 
-impl PermslipSigner {
-    /// A signer authenticated with `token`.
-    pub fn new<N: AsRef<str>>(key_name: N, url: &str, token: &str) -> Result<Self, PermslipError> {
-        let mut token = HeaderValue::from_str(token).map_err(PermslipError::token)?;
-        token.set_sensitive(true);
-        let builder = ClientRequestBuilder::new().token(token);
+/// A client for `url` authenticated by `authn`.
+async fn authn_client<C: CommandContext>(
+    ctx: &mut C,
+    url: &str,
+    authn: &PermslipAuthn,
+    fresh: bool,
+) -> Result<Client, PermslipError> {
+    let token = match authn {
+        PermslipAuthn::Google => match saved_token(url).await {
+            Ok(token) if !fresh => token,
+            _ => google_authn(ctx, url).await?,
+        },
+        PermslipAuthn::Ssh {
+            agent_sock,
+            fingerprint,
+        } => TokenProvider::SshAuth {
+            fingerprint: fingerprint.clone(),
+            agent_sock: agent_sock.clone(),
+        }
+        .token(url)
+        .await
+        .map_err(PermslipError::token_flow)?,
+    };
+    let builder =
+        ClientRequestBuilder::new().token(token.into_header_value().map_err(PermslipError::token)?);
+    Ok(Client::new_with_client(
+        url,
+        builder
+            .build()
+            .map_err(|err| PermslipError::Client(err.to_string()))?,
+    ))
+}
+
+impl<C: CommandContext> PermslipSigner<C> {
+    /// A signer for `key_name`, authenticated to `url` by `authn`.
+    pub async fn connect<N: AsRef<str>>(
+        mut ctx: C,
+        key_name: N,
+        url: &str,
+        authn: PermslipAuthn,
+    ) -> Result<Self, PermslipError> {
         Ok(Self {
-            client: Client::new_with_client(
-                url,
-                builder
-                    .build()
-                    .map_err(|err| PermslipError::Client(err.to_string()))?,
-            ),
+            client: authn_client(&mut ctx, url, &authn, false).await?,
             key_name: key_name.as_ref().to_owned(),
+            url: url.to_owned(),
+            authn,
+            ctx,
         })
     }
 
+    /// Authenticate afresh.
+    async fn renew(&mut self) -> Result<(), PermslipError> {
+        self.client = authn_client(&mut self.ctx, &self.url, &self.authn, true).await?;
+        Ok(())
+    }
+
     pub async fn create_session(
+        &mut self,
+        baseboard: &BaseboardId,
+        sush_nonce: SessionSushNonce,
+    ) -> Result<CreatedSushSession, PermslipError> {
+        match self.try_create_session(baseboard, sush_nonce).await {
+            Err(PermslipError::Unauthorized(_)) => {
+                self.renew().await?;
+                self.try_create_session(baseboard, sush_nonce).await
+            }
+            result => result,
+        }
+    }
+
+    async fn try_create_session(
         &self,
         baseboard: &BaseboardId,
         sush_nonce: SessionSushNonce,
@@ -71,6 +179,19 @@ impl PermslipSigner {
     }
 
     pub async fn sign_job_request(
+        &mut self,
+        request: JobStartRequest,
+    ) -> Result<SignedJob, PermslipError> {
+        match self.try_sign_job_request(request.clone()).await {
+            Err(PermslipError::Unauthorized(_)) => {
+                self.renew().await?;
+                self.try_sign_job_request(request).await
+            }
+            result => result,
+        }
+    }
+
+    async fn try_sign_job_request(
         &self,
         request: JobStartRequest,
     ) -> Result<SignedJob, PermslipError> {
@@ -108,6 +229,8 @@ pub enum PermslipError {
     Pem(#[from] pem_rfc7468::Error),
     #[error("authentication token: {0}")]
     Token(String),
+    #[error("the signing service refused the session: {0}")]
+    Unauthorized(String),
 }
 
 impl PermslipError {
@@ -131,6 +254,9 @@ impl From<ClientError<ApiError>> for PermslipError {
             InvalidRequest(e) => PermslipError::Client(format!("Invalid request: {e}")),
             CommunicationError(e) => PermslipError::Client(format!("Communication error: {e}")),
             InvalidUpgrade(e) => PermslipError::Client(e.to_string()),
+            ErrorResponse(e) if e.status() == http::StatusCode::UNAUTHORIZED => {
+                PermslipError::Unauthorized(e.message.to_owned())
+            }
             ErrorResponse(e) => PermslipError::Client(e.message.to_owned()),
             ResponseBodyError(e) => PermslipError::Client(e.to_string()),
             InvalidResponsePayload(_b, e) => PermslipError::Client(e.to_string()),

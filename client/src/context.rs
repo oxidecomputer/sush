@@ -56,7 +56,9 @@ impl Authz {
     }
 }
 
-/// What kind of output to emit.
+/// What kind of output to emit on standard output. Standard input
+/// and standard error may be used with all formats for interactive
+/// communication with a human user (if there is one).
 #[derive(Clone, Copy, Debug, Default, ValueEnum)]
 pub enum OutputFormat {
     #[default]
@@ -179,4 +181,6 @@ pub trait CommandContext: Clone + Send + Sync {
     fn iam(&mut self, identity: &Identity) -> Result<(), CommandError>;
     fn identities(&mut self, identities: &[SshPublicKey]) -> Result<(), CommandError>;
     fn please_touch(&mut self, identity: &SshPublicKey) -> Result<(), CommandError>;
+    #[cfg(feature = "permslip")]
+    fn please_authn(&mut self, url: &str);
 }
