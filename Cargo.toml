@@ -40,8 +40,7 @@ memmap2 = "0.9"
 p256 = { version = "0.13", features = ["ecdsa", "pkcs8"] }
 pem-rfc7468 = { version = "0.7", features = ["std"] }
 percent-encoding = "2"
-permission-slip-client = { git = "https://github.com/oxidecomputer/permission-slip", rev = "c9d302ef44576e075e35f4f28f8e7ac8345bcd4b" }
-permission-slip-common = { git = "https://github.com/oxidecomputer/permission-slip", rev = "c9d302ef44576e075e35f4f28f8e7ac8345bcd4b" }
+permission-slip-client = { git = "https://github.com/oxidecomputer/permission-slip", rev = "7ab4a237899e112a9a15a4fdbcb10212409db4a9" }
 pki-playground = { git = "https://github.com/oxidecomputer/pki-playground", rev = "7600756029ce046a02c6234aa84ce230cc5eaa04" }
 progenitor = "0.14"
 progenitor-client = "0.14"

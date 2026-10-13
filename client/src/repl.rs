@@ -171,6 +171,8 @@ impl CommandContext for Repl {
             offline,
             ssh_auth_sock,
             ssh_key_id,
+            #[cfg(feature = "permslip")]
+                permslip_ssh: _,
             proxy_roots: _,
             nexus: _,
             nexus_token: _,
@@ -226,14 +228,6 @@ impl CommandContext for Repl {
 
     fn authz_signer(&self) -> AuthzSigner {
         self.cli.authz_signer()
-    }
-
-    fn permslip_token(&self, url: &str, fingerprint: &str) -> Option<String> {
-        self.cli.permslip_token(url, fingerprint)
-    }
-
-    fn save_permslip_token(&self, url: &str, fingerprint: &str, token: &str) {
-        self.cli.save_permslip_token(url, fingerprint, token)
     }
 
     fn session_id(&self) -> Option<SessionId> {
