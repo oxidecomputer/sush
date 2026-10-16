@@ -23,7 +23,7 @@ use tokio::time::timeout;
 use tokio_stream::wrappers::ReceiverStream;
 use tokio_util::sync::CancellationToken;
 use x509_cert::Certificate;
-use x509_cert::der::{DecodePem as _, Encode as _};
+use x509_cert::der::DecodePem as _;
 
 use sush_api::{JobStartParams, JobStopParams, JobWait};
 use sush_common::authn::{
@@ -44,7 +44,7 @@ use crate::executor::PathIsolation;
 use crate::gossip::LinkedBaseboards;
 use crate::job::SocketSender;
 use crate::locker::Locker;
-use crate::messages::v0::{CertRequest, IdentityRequest, JobRequest, Request, SessionRequest};
+use crate::messages::v0::{IdentityRequest, JobRequest, Request, SessionRequest};
 use crate::output::{JobOutputDir, JobOutputFileStream};
 use crate::state::{GossipUniverse, State, StateManager};
 
@@ -208,13 +208,6 @@ impl JobManager {
         rows
     }
 
-    async fn cert_request(&self, authn: &Identity, request: CertRequest) -> Result<(), JobError> {
-        self.tx_req
-            .send(Request::cert(authn.key_id.clone(), request))
-            .await
-            .map_err(|_| JobError::ChannelClosed)
-    }
-
     async fn session_request(
         &self,
         authn: &Identity,
@@ -246,44 +239,12 @@ impl JobManager {
 
     // Certificate management.
 
-    pub async fn cert_import(
-        &self,
-        authn: &Identity,
-        cert: Certificate,
-        wait: bool,
-    ) -> Result<(), JobError> {
-        let key_id = self.state.borrow().certs().check_import(&cert)?;
-        let der = cert.to_der().map_err(KeyError::from)?;
-        self.cert_request(authn, CertRequest::Import(der)).await?;
-        if wait {
-            self.wait_for(self.wait_for_cert(key_id)).await?;
-        }
-        Ok(())
-    }
-
     pub fn cert_chain(
         &self,
         _authn: &Identity,
         key_id: &KeyId,
     ) -> Result<Vec<Certificate>, JobError> {
         Ok(self.state.borrow().certs().chain(key_id)?)
-    }
-
-    pub async fn cert_revoke(
-        &self,
-        authn: &Identity,
-        key_id: KeyId,
-        wait: bool,
-    ) -> Result<(), JobError> {
-        if self.state.borrow().certs().is_anchor(&key_id) {
-            return Err(JobError::TrustAnchorRevocation(key_id));
-        }
-        self.cert_request(authn, CertRequest::Revoke(key_id.clone(), Utc::now()))
-            .await?;
-        if wait {
-            self.wait_for(self.wait_for_revocation(key_id)).await?;
-        }
-        Ok(())
     }
 
     // Identity management.
@@ -466,14 +427,6 @@ impl JobManager {
 
     pub fn take_join_handle(&mut self) -> Option<JoinHandle<()>> {
         self.join_state.take()
-    }
-
-    fn wait_for_cert(&self, key_id: KeyId) -> impl FnMut(&State) -> bool {
-        move |state| state.certs().chain(&key_id).is_ok()
-    }
-
-    fn wait_for_revocation(&self, key_id: KeyId) -> impl FnMut(&State) -> bool {
-        move |state| state.certs().revoked(&key_id).is_some()
     }
 
     fn wait_for_key_revocation(&self, key_id: KeyId) -> impl FnMut(&State) -> bool {
@@ -778,13 +731,15 @@ impl JobManager {
     }
 }
 
-/// Read one PEM-encoded certificate from each of `paths`.
+/// Read one PEM-encoded certificate from each of `paths`. Trust
+/// anchors load in the order given, which [`Certificates::new`]
+/// requires to be root-to-leaf.
 pub async fn read_certs(paths: &[impl AsRef<Path>]) -> Result<Vec<Certificate>, JobError> {
     let mut anchors = Vec::with_capacity(paths.len());
     for path in paths {
         let path = path.as_ref();
         let pem = read(path).await.map_err(JobError::file_io_for(path))?;
-        anchors.push(Certificate::from_pem(&pem)?);
+        anchors.push(Certificate::from_pem(&pem).map_err(KeyError::from)?);
     }
     Ok(anchors)
 }

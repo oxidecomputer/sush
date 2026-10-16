@@ -5,7 +5,6 @@
 //! Command context tracking.
 
 use std::fmt;
-use std::path::Path;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 
@@ -137,7 +136,6 @@ pub trait CommandContext: Clone + Send + Sync {
         certs: &str,
         roots: &[Certificate],
     ) -> Result<Certificate, CommandError>;
-    fn cert_imported(&mut self, path: &Path, key_id: KeyId);
 
     // Job management
     fn really_target(&mut self, sled: &SledId) -> Result<(), CommandError>;

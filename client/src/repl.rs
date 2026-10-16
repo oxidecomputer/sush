@@ -10,7 +10,6 @@ use std::env;
 use std::ffi::OsString;
 use std::fs::{Permissions, set_permissions};
 use std::os::unix::fs::PermissionsExt as _;
-use std::path::Path;
 
 use clap::Parser;
 use rustyline::DefaultEditor;
@@ -277,10 +276,6 @@ impl CommandContext for Repl {
         roots: &[Certificate],
     ) -> Result<Certificate, CommandError> {
         self.cli.cert_chain(key_id, certs, roots)
-    }
-
-    fn cert_imported(&mut self, path: &Path, key_id: KeyId) {
-        self.cli.cert_imported(path, key_id)
     }
 
     // Job management

@@ -35,17 +35,6 @@ pub trait SushApi {
 
     // Certificate management.
 
-    /// Import a certificate, verify its signature, and return a key ID for it.
-    ///
-    /// The body should be a PEM encoded X.509 certificate.
-    #[endpoint { method = PUT, path = "/certs" }]
-    async fn cert_import(
-        ctx: RequestContext<Self::Context>,
-        headers: Header<Authorization>,
-        query: QueryParams<WaitParam>,
-        params: TypedBody<String>,
-    ) -> Result<HttpResponseOk<KeyId>, HttpError>;
-
     /// Get the certificate chain that validates a key.
     ///
     /// Certificates are in root-to-leaf order, PEM encoded and newline separated.
@@ -55,18 +44,6 @@ pub trait SushApi {
         headers: Header<Authorization>,
         params: PathParams<KeyIdParam>,
     ) -> Result<HttpResponseOk<String>, HttpError>;
-
-    /// Revoke a certificate.
-    ///
-    /// Revocation is permanent and propagates across the rack.
-    /// Root certificates cannot be revoked.
-    #[endpoint { method = POST, path = "/certs/{key_id}/revoke" }]
-    async fn cert_revoke(
-        ctx: RequestContext<Self::Context>,
-        headers: Header<Authorization>,
-        params: PathParams<KeyIdParam>,
-        query: QueryParams<WaitParam>,
-    ) -> Result<HttpResponseUpdatedNoContent, HttpError>;
 
     // Identity management.
 

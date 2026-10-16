@@ -460,17 +460,6 @@ impl CommandContext for Cli {
         chain.pop().ok_or(CommandError::EmptyCertChain)
     }
 
-    fn cert_imported(&mut self, path: &Path, key_id: KeyId) {
-        match self.get_output_format() {
-            OutputFormat::Json => println!("{}", json!(key_id)),
-            OutputFormat::Text => println!(
-                "✅ Imported certificate for key ID `{}` from `{}`",
-                key_id,
-                path.display(),
-            ),
-        }
-    }
-
     // Job management
 
     fn job_started(&mut self, job: &SignedJob, show: bool) {

@@ -165,17 +165,12 @@ pub mod v0 {
 
     #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
     pub enum Request {
-        Cert(Box<Attributed<CertRequest>>),
         Session(Box<Attributed<SessionRequest>>),
         Job(Box<Attributed<JobRequest>>),
         Identity(Box<Attributed<IdentityRequest>>),
     }
 
     impl Request {
-        pub fn cert(actor: KeyId, request: CertRequest) -> Self {
-            Self::Cert(Box::new(Attributed { actor, request }))
-        }
-
         pub fn session(actor: KeyId, request: SessionRequest) -> Self {
             Self::Session(Box::new(Attributed { actor, request }))
         }
@@ -190,7 +185,6 @@ pub mod v0 {
 
         pub fn actor(&self) -> &KeyId {
             match self {
-                Self::Cert(r) => r.as_parts().0,
                 Self::Session(r) => r.as_parts().0,
                 Self::Job(r) => r.as_parts().0,
                 Self::Identity(r) => r.as_parts().0,
@@ -199,10 +193,6 @@ pub mod v0 {
 
         pub fn kind(&self) -> &'static str {
             match self {
-                Self::Cert(r) => match r.request {
-                    CertRequest::Import(_) => "cert import",
-                    CertRequest::Revoke(..) => "cert revoke",
-                },
                 Self::Session(r) => match r.request {
                     SessionRequest::Start(_) => "session start",
                     SessionRequest::Stop(_) => "session stop",
@@ -220,15 +210,6 @@ pub mod v0 {
                 },
             }
         }
-    }
-
-    /// Certificates are PEM-encoded X.509
-    #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
-    #[allow(clippy::large_enum_variant)]
-    pub enum CertRequest {
-        /// The certificate's DER bytes, decoded at use.
-        Import(#[serde(with = "crate::format::cbor_bytes")] Vec<u8>),
-        Revoke(KeyId, DateTime<Utc>),
     }
 
     #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -523,30 +504,6 @@ mod wire_format {
         ))
         .into();
         assert_wire_format("job-stop-request", msg);
-    }
-
-    #[test]
-    fn cert_requests() {
-        use x509_cert::Certificate;
-        use x509_cert::der::{DecodePem as _, Encode as _};
-
-        let cert = Certificate::from_pem(include_str!("../../client/certs/staging.pem")).unwrap();
-        let msg: VersionedMessage = Message::Request(Request::cert(
-            KeyId::from_str("zoo-zero").unwrap(),
-            CertRequest::Import(cert.to_der().unwrap()),
-        ))
-        .into();
-        assert_wire_format("cert-import-request", msg);
-
-        let msg: VersionedMessage = Message::Request(Request::cert(
-            KeyId::from_str("zoo-zero").unwrap(),
-            CertRequest::Revoke(
-                KeyId::from_str("zoo-zero").unwrap(),
-                DateTime::from_timestamp(1_756_252_800, 0).unwrap(),
-            ),
-        ))
-        .into();
-        assert_wire_format("cert-revoke-request", msg);
     }
 
     #[test]

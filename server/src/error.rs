@@ -21,8 +21,6 @@ pub enum JobError {
     AttachDenied,
     #[error("Internal communications channel was unexpectedly closed")]
     ChannelClosed,
-    #[error("Certificate decoding error: {0}")]
-    DecodeCert(#[from] x509_cert::der::Error),
     #[error("Duplicate job ID `{0}`")]
     DuplicateJobId(JobId),
     #[error("Execution error: {0}")]
@@ -70,8 +68,6 @@ pub enum JobError {
     PublicKeyMismatch(KeyId),
     #[error("Public key `{0}` not found")]
     PublicKeyNotFound(KeyId),
-    #[error("Cannot revoke trust anchor `{0}`")]
-    TrustAnchorRevocation(KeyId),
     #[error(transparent)]
     Slice(#[from] std::array::TryFromSliceError),
     #[error(transparent)]
@@ -175,15 +171,15 @@ impl From<JobError> for HttpError {
                     .expect("should be able to add WWW-Authenticate header");
                 err
             }
-            AttachDenied | NotSessionStarter | TrustAnchorRevocation(_) => {
+            AttachDenied | NotSessionStarter => {
                 HttpError::for_client_error(None, ClientErrorStatusCode::FORBIDDEN, message)
             }
             IdentityNotFound(_) | JobNotFound(_) | NoSession | OutputFileMissing(_)
             | SessionNotCurrent(_) => {
                 HttpError::for_client_error(None, ClientErrorStatusCode::NOT_FOUND, message)
             }
-            DecodeCert(_) | DuplicateJobId(_) | InteractiveTarget | InvalidCommand | Json(_)
-            | MultipleSessions | InvalidSessionId => {
+            DuplicateJobId(_) | InteractiveTarget | InvalidCommand | Json(_) | MultipleSessions
+            | InvalidSessionId => {
                 HttpError::for_client_error(None, ClientErrorStatusCode::BAD_REQUEST, message)
             }
             NotNextJob(_) => {

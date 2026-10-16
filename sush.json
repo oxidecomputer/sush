@@ -5,60 +5,6 @@
     "version": "0.1.0"
   },
   "paths": {
-    "/certs": {
-      "put": {
-        "summary": "Import a certificate, verify its signature, and return a key ID for it.",
-        "description": "The body should be a PEM encoded X.509 certificate.",
-        "operationId": "cert_import",
-        "parameters": [
-          {
-            "in": "header",
-            "name": "authorization",
-            "description": "Authorization to access some resource, such as a signature.\n\nSee: <https://developer.mozilla.org/en-US/docs/Web/HTTP/Reference/Headers/Authorization>",
-            "schema": {
-              "type": "string"
-            }
-          },
-          {
-            "in": "query",
-            "name": "wait",
-            "description": "Wait for the subject to appear in the state.",
-            "schema": {
-              "type": "boolean"
-            }
-          }
-        ],
-        "requestBody": {
-          "content": {
-            "application/json": {
-              "schema": {
-                "title": "String",
-                "type": "string"
-              }
-            }
-          },
-          "required": true
-        },
-        "responses": {
-          "200": {
-            "description": "successful operation",
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/KeyId"
-                }
-              }
-            }
-          },
-          "4XX": {
-            "$ref": "#/components/responses/Error"
-          },
-          "5XX": {
-            "$ref": "#/components/responses/Error"
-          }
-        }
-      }
-    },
     "/certs/{key_id}": {
       "get": {
         "summary": "Get the certificate chain that validates a key.",
@@ -93,50 +39,6 @@
                 }
               }
             }
-          },
-          "4XX": {
-            "$ref": "#/components/responses/Error"
-          },
-          "5XX": {
-            "$ref": "#/components/responses/Error"
-          }
-        }
-      }
-    },
-    "/certs/{key_id}/revoke": {
-      "post": {
-        "summary": "Revoke a certificate.",
-        "description": "Revocation is permanent and propagates across the rack. Root certificates cannot be revoked.",
-        "operationId": "cert_revoke",
-        "parameters": [
-          {
-            "in": "header",
-            "name": "authorization",
-            "description": "Authorization to access some resource, such as a signature.\n\nSee: <https://developer.mozilla.org/en-US/docs/Web/HTTP/Reference/Headers/Authorization>",
-            "schema": {
-              "type": "string"
-            }
-          },
-          {
-            "in": "path",
-            "name": "key_id",
-            "required": true,
-            "schema": {
-              "$ref": "#/components/schemas/KeyId"
-            }
-          },
-          {
-            "in": "query",
-            "name": "wait",
-            "description": "Wait for the subject to appear in the state.",
-            "schema": {
-              "type": "boolean"
-            }
-          }
-        ],
-        "responses": {
-          "204": {
-            "description": "resource updated"
           },
           "4XX": {
             "$ref": "#/components/responses/Error"

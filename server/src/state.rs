@@ -707,10 +707,6 @@ impl State {
                 let actor = request.actor();
                 let log = log.new(o!("actor" => actor.to_string()));
                 match request {
-                    Request::Cert(r) => {
-                        self.certs.apply(&log, r.request());
-                        Vec::new()
-                    }
                     Request::Identity(r) => {
                         self.identities.apply(&log, r.request());
                         Vec::new()
@@ -967,16 +963,9 @@ impl State {
         let mut outputs = Vec::new();
         match request {
             JobRequest::Start(signed, params) => {
-                // TODO: When we implement
-                // https://github.com/oxidecomputer/sush/issues/23, we
-                // should check for revocation here before executing the
-                // job. This enforces revocation globally, instead of
-                // just when the job is injected first into the system.
-
                 // The session must be active and must match the
-                // submitted job.
-                //
-                // It is safe to refuse all other jobs. By cases:
+                // submitted job. It is safe to refuse all other jobs.
+                // By cases:
                 //
                 // - If the job came from a session in the causal
                 // past of our own, the session has been superseded,
