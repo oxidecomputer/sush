@@ -64,7 +64,7 @@ use crate::context::{Authz, CommandContext, OutputFormat, StatusDisplayStyle};
 use crate::identity::{IdentityError, SshAgentConnection};
 use crate::interactive::interactive_job;
 #[cfg(feature = "permslip")]
-use crate::permslip::{PermslipError, PermslipSigner, fresh_token};
+use crate::permslip::{PermslipAuth, PermslipError, PermslipSigner};
 use crate::repl::Repl;
 use crate::tls;
 use crate::tunnel::{Tunnel, TunnelError};
@@ -83,6 +83,8 @@ pub const SUSH_MAX_MEM: &str = "SUSH_MAX_MEM";
 pub const SUSH_MAX_FSIZE: &str = "SUSH_MAX_FSIZE";
 #[cfg(feature = "permslip")]
 pub const SUSH_PERMSLIP_KEY: &str = "SUSH_PERMSLIP_KEY";
+#[cfg(feature = "permslip")]
+pub const SUSH_PERMSLIP_SSH: &str = "SUSH_PERMSLIP_SSH";
 pub const SUSH_OUTPUT_FORMAT: &str = "SUSH_OUTPUT_FORMAT";
 pub const SUSH_NEXUS: &str = "SUSH_NEXUS";
 pub const SUSH_NEXUS_RESOLVE: &str = "SUSH_NEXUS_RESOLVE";
@@ -204,6 +206,13 @@ pub struct GlobalArgs {
     #[arg(long, default_value_t = false, conflicts_with = "url")]
     #[clap(global = true)]
     pub offline: bool,
+
+    /// Authenticate to the signing service with the SSH agent key
+    /// named by SUSH_KEY_ID instead of a Google session.
+    #[cfg(feature = "permslip")]
+    #[arg(long, env = SUSH_PERMSLIP_SSH, default_value_t = false)]
+    #[clap(global = true)]
+    pub permslip_ssh: bool,
 
     /// Path to the SSH authentication agent Unix-domain socket.
     #[arg(long, env = SSH_AUTH_SOCK)]
@@ -1358,7 +1367,7 @@ async fn job(
             } else {
                 JobMode::Batch
             };
-            let signer = permslip_signer(ctx, key_name, permslip_url).await?;
+            let mut signer = permslip_signer(ctx, key_name, permslip_url).await?;
             let mut interval = interval(SIGNING_UPDATE_INTERVAL);
             interval.set_missed_tick_behavior(MissedTickBehavior::Skip);
             let sign = signer.sign_job_request(JobStartRequest::new(
@@ -1733,10 +1742,7 @@ fn parse_baseboard_id(value: &str) -> Result<BaseboardId, String> {
     value.parse::<BaseboardId>().map_err(|e| e.to_string())
 }
 
-/// A permslip signer authenticated as the agent key `-s`/`SUSH_KEY_ID`
-/// names, or the agent's first. We choose the key rather than letting
-/// permslip choose, so that one identity serves both the rack and the
-/// signing service.
+/// A permslip signer authenticated by a Google session or an SSH key.
 #[cfg(feature = "permslip")]
 async fn permslip_signer(
     ctx: &mut impl CommandContext,
@@ -1744,23 +1750,22 @@ async fn permslip_signer(
     permslip_url: &str,
 ) -> Result<PermslipSigner, CommandError> {
     let globals = ctx.get_globals();
-    let Some(sock) = globals.ssh_auth_sock.clone() else {
-        return Err(CommandError::MissingSshAuthSock);
-    };
-    let key_id = globals.ssh_key_id.clone();
-    let mut agent = SshAgentConnection::connect(&sock).await?;
-    let key = agent.identity(key_id.as_ref()).await?;
-    let fingerprint = key.fingerprint();
-    let token = match ctx.permslip_token(permslip_url, &fingerprint) {
-        Some(token) => token,
-        None => {
-            ctx.please_touch(&key)?;
-            let token = fresh_token(permslip_url, sock, fingerprint.clone()).await?;
-            ctx.save_permslip_token(permslip_url, &fingerprint, &token);
-            token
+    let auth = if globals.permslip_ssh {
+        let Some(sock) = globals.ssh_auth_sock.clone() else {
+            return Err(CommandError::MissingSshAuthSock);
+        };
+        let key_id = globals.ssh_key_id.clone();
+        let mut agent = SshAgentConnection::connect(&sock).await?;
+        let key = agent.identity(key_id.as_ref()).await?;
+        ctx.please_touch(&key)?;
+        PermslipAuth::Ssh {
+            agent_sock: sock,
+            fingerprint: Some(key.fingerprint()),
         }
+    } else {
+        PermslipAuth::Google
     };
-    Ok(PermslipSigner::new(key_name, permslip_url, &token)?)
+    Ok(PermslipSigner::connect(key_name, permslip_url, auth).await?)
 }
 
 /// Ask the online signing service to create a session.
@@ -1779,7 +1784,7 @@ async fn session_create(
         return Err(CommandError::MissingKeyName);
     };
     let invalid = |e: InvalidCodephrase| CommandError::UnsupportedPermslipResponse(e.to_string());
-    let signer = permslip_signer(ctx, &permslip_key, &permslip_url).await?;
+    let mut signer = permslip_signer(ctx, &permslip_key, &permslip_url).await?;
     let created = signer.create_session(baseboard_id, nonce).await?;
     Ok((
         created.session_id.to_string().parse().map_err(invalid)?,
