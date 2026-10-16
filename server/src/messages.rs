@@ -257,6 +257,17 @@ pub mod v0 {
         Skipped(JobId, DateTime<Utc>, SkipReason),
     }
 
+    impl JobEvent {
+        pub fn job_id(&self) -> &JobId {
+            match self {
+                Self::Start(id, ..)
+                | Self::Stop(id, ..)
+                | Self::Error(id, ..)
+                | Self::Skipped(id, ..) => id,
+            }
+        }
+    }
+
     #[derive(Clone, Debug, Deserialize, Eq, Error, PartialEq, Serialize)]
     pub enum Error {
         #[error(

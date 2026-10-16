@@ -18,9 +18,6 @@
 //! and the causal frontier we joined it at) on a watch channel. A
 //! migration replaces the handle entirely; consumers must re-subscribe,
 //! and everything the old universe carried is gone.
-//!
-//! TODO: re-inject local state into the new universe after a migration
-//! (policy pending with the sush team).
 
 use std::cmp::Ordering;
 use std::collections::{BTreeSet, HashMap, HashSet};

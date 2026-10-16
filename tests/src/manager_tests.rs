@@ -965,9 +965,9 @@ async fn job_output_dir_moves() {
 #[named]
 #[tokio::test]
 async fn universe_swap() {
-    // A universe migration resets the state machine. Sessions and history
-    // die with the old universe, the boundary carries the last committed
-    // job across, and the manager keeps serving.
+    // A universe migration resets the state machine. Sessions,
+    // history, and in-flight jobs die with the old universe, nothing
+    // about them reaches the new one, and the manager keeps serving.
     let log = test_logger(function_name!());
     let dir = TempDir::with_prefix("sush-").unwrap();
     let mut root = ephemeral_test_root();
@@ -1013,11 +1013,27 @@ async fn universe_swap() {
         job_id
     }
 
-    // Run a job in the first universe.
+    // Run a job to completion in the first universe, and leave a
+    // second one running at the swap.
     let job_id = run_job(&mgr, &mut root, &authn).await;
     assert!(mgr.job_status(&authn, &job_id).await.is_ok());
+    let session = mgr.session(&authn).expect("live session");
+    let lingering = session.next_job_id();
+    let job = root
+        .sign_job_request(lingering, session.session_id(), "sleep 600", false)
+        .await;
+    mgr.job_start(
+        &authn,
+        job.into_signed(),
+        JobStartParams {
+            wait: JobWait::Start,
+            ..Default::default()
+        },
+    )
+    .await
+    .unwrap();
 
-    // Migrate. The session and the job's history are gone.
+    // Migrate. The session and the jobs die with the old universe.
     universe
         .send(Universe::genesis(null_gossip().await))
         .unwrap();
@@ -1028,36 +1044,19 @@ async fn universe_swap() {
     })
     .await
     .expect("state reset");
-    // The new universe cannot name the job, so the boundary
-    // adjudicates its recorded ending on this sled's sole authority.
-    async fn adjudicated(mgr: &JobManager, authn: &Identity, job_id: &JobId) {
-        timeout(Duration::from_secs(30), async {
-            loop {
-                if let Ok(map) = mgr.job_status(authn, job_id).await
-                    && matches!(
-                        map.get(mgr.own_baseboard()),
-                        Some(JobStatus::Stopped { result: Ok(0), .. })
-                    )
-                {
-                    break;
-                }
-                sleep(Duration::from_millis(50)).await;
-            }
-        })
-        .await
-        .expect("boundary adjudication");
-    }
-    adjudicated(&mgr, &authn, &job_id).await;
 
-    // A further swap lands in a universe that never heard the
-    // ruling, and that universe gets its own.
-    universe
-        .send(Universe::genesis(null_gossip().await))
-        .unwrap();
-    adjudicated(&mgr, &authn, &job_id).await;
-
-    // The manager still works in the new universe.
+    // The manager serves the new universe. Running a fresh job also
+    // orders this check after the swap has fully settled.
     run_job(&mgr, &mut root, &authn).await;
+
+    // Nothing about the old universe's jobs crossed over: not the
+    // completed job's history, and not the killed job's ending.
+    for old in [job_id, lingering] {
+        assert!(matches!(
+            mgr.job_status(&authn, &old).await,
+            Err(JobError::JobNotFound(_)),
+        ));
+    }
 }
 
 #[named]
