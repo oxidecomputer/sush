@@ -70,8 +70,8 @@ pub enum JobError {
     PublicKeyMismatch(KeyId),
     #[error("Public key `{0}` not found")]
     PublicKeyNotFound(KeyId),
-    #[error("Root certificate `{0}` cannot be revoked")]
-    RootRevocation(KeyId),
+    #[error("Cannot revoke trust anchor `{0}`")]
+    TrustAnchorRevocation(KeyId),
     #[error(transparent)]
     Slice(#[from] std::array::TryFromSliceError),
     #[error(transparent)]
@@ -175,7 +175,7 @@ impl From<JobError> for HttpError {
                     .expect("should be able to add WWW-Authenticate header");
                 err
             }
-            AttachDenied | NotSessionStarter | RootRevocation(_) => {
+            AttachDenied | NotSessionStarter | TrustAnchorRevocation(_) => {
                 HttpError::for_client_error(None, ClientErrorStatusCode::FORBIDDEN, message)
             }
             IdentityNotFound(_) | JobNotFound(_) | NoSession | OutputFileMissing(_)

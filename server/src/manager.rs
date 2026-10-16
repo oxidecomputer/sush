@@ -46,7 +46,7 @@ use crate::job::SocketSender;
 use crate::locker::Locker;
 use crate::messages::v0::{CertRequest, IdentityRequest, JobRequest, Request, SessionRequest};
 use crate::output::{JobOutputDir, JobOutputFileStream};
-use crate::state::{GossipUniverse, MAX_CERTS, State, StateManager};
+use crate::state::{GossipUniverse, State, StateManager};
 
 /// Maximum number of cached identities.
 const MAX_CACHED_IDENTITIES: NonZeroUsize = NonZeroUsize::new(1_000).unwrap();
@@ -98,7 +98,7 @@ pub struct JobManager {
 }
 
 impl JobManager {
-    /// Trust the root certificates in `roots`, one PEM-encoded certificate
+    /// Trust the certificates in `anchors`, one PEM-encoded certificate
     /// per file.
     #[allow(clippy::too_many_arguments)]
     pub async fn new(
@@ -110,11 +110,11 @@ impl JobManager {
         universe: watch::Receiver<GossipUniverse>,
         linked: LinkedBaseboards,
         locker: &Locker,
-        roots: &[impl AsRef<Path>],
+        anchors: &[impl AsRef<Path>],
         shutdown: CancellationToken,
     ) -> Result<Self, JobError> {
-        let roots = read_root_certs(roots).await?;
-        Self::with_root_certs(
+        let anchors = read_certs(anchors).await?;
+        Self::with_trust_anchors(
             log,
             path_isolation,
             output_dir,
@@ -123,14 +123,14 @@ impl JobManager {
             universe,
             linked,
             locker,
-            &roots,
+            &anchors,
             shutdown,
         )
         .await
     }
 
     #[allow(clippy::too_many_arguments)]
-    pub async fn with_root_certs(
+    pub async fn with_trust_anchors(
         log: Logger,
         path_isolation: PathIsolation,
         output_dir: JobOutputDir,
@@ -139,7 +139,7 @@ impl JobManager {
         universe: watch::Receiver<GossipUniverse>,
         linked: LinkedBaseboards,
         locker: &Locker,
-        roots: &[Certificate],
+        anchors: &[Certificate],
         shutdown: CancellationToken,
     ) -> Result<Self, JobError> {
         info!(log, "starting sush"; "version" => LONG_VERSION);
@@ -156,7 +156,7 @@ impl JobManager {
             requests,
             cubbies,
             universe,
-            roots,
+            anchors,
             session_sush_nonce.clone(),
             boundary,
             shutdown,
@@ -183,17 +183,18 @@ impl JobManager {
     pub fn versions(&self) -> Vec<SledVersion> {
         let state = self.state.borrow();
         let linked = self.linked.borrow();
-        let mut sleds: BTreeSet<&BaseboardId> = state.versions().keys().collect();
-        sleds.extend(state.cubbies().values());
+        let mut sleds: BTreeSet<&BaseboardId> = state.rack().versions().keys().collect();
+        sleds.extend(state.rack().cubbies().values());
         let mut rows: Vec<SledVersion> = sleds
             .into_iter()
             .map(|baseboard| SledVersion {
                 cubby: state
+                    .rack()
                     .cubbies()
                     .iter()
                     .find_map(|(cubby, b)| (b == baseboard).then_some(*cubby)),
                 baseboard: baseboard.clone(),
-                version: state.versions().get(baseboard).cloned(),
+                version: state.rack().versions().get(baseboard).cloned(),
                 health: Some(
                     if *baseboard == self.own_baseboard || linked.contains(baseboard) {
                         SledHealth::Linked
@@ -251,13 +252,7 @@ impl JobManager {
         cert: Certificate,
         wait: bool,
     ) -> Result<(), JobError> {
-        if self.state.borrow().num_certs() >= MAX_CERTS {
-            return Err(KeyError::TooManyCerts(MAX_CERTS).into());
-        }
-        if cert.tbs_certificate.subject == cert.tbs_certificate.issuer {
-            return Err(KeyError::SelfSigned.into());
-        }
-        let key_id = KeyId::try_from(&cert)?;
+        let key_id = self.state.borrow().certs().check_import(&cert)?;
         let der = cert.to_der().map_err(KeyError::from)?;
         self.cert_request(authn, CertRequest::Import(der)).await?;
         if wait {
@@ -271,7 +266,7 @@ impl JobManager {
         _authn: &Identity,
         key_id: &KeyId,
     ) -> Result<Vec<Certificate>, JobError> {
-        Ok(self.state.borrow().cert_chain(key_id)?)
+        Ok(self.state.borrow().certs().chain(key_id)?)
     }
 
     pub async fn cert_revoke(
@@ -280,8 +275,8 @@ impl JobManager {
         key_id: KeyId,
         wait: bool,
     ) -> Result<(), JobError> {
-        if self.state.borrow().is_root(&key_id) {
-            return Err(JobError::RootRevocation(key_id));
+        if self.state.borrow().certs().is_anchor(&key_id) {
+            return Err(JobError::TrustAnchorRevocation(key_id));
         }
         self.cert_request(authn, CertRequest::Revoke(key_id.clone(), Utc::now()))
             .await?;
@@ -341,8 +336,12 @@ impl JobManager {
                 // A login elsewhere on the rack reaches us as a
                 // registered identity. Adopt it on first use.
                 if !identities.contains(&cache_key) {
-                    let Some(registered) =
-                        self.state.borrow().registered_identity(&cache_key).cloned()
+                    let Some(registered) = self
+                        .state
+                        .borrow()
+                        .identities()
+                        .registered_identity(&cache_key)
+                        .cloned()
                     else {
                         unauthorized!("unknown identity");
                     };
@@ -386,7 +385,7 @@ impl JobManager {
         }
 
         // Refuse revoked keys.
-        if self.state.borrow().is_key_revoked(&key_id) {
+        if self.state.borrow().identities().revoked(&key_id).is_some() {
             unauthorized!("key is revoked");
         }
 
@@ -470,15 +469,15 @@ impl JobManager {
     }
 
     fn wait_for_cert(&self, key_id: KeyId) -> impl FnMut(&State) -> bool {
-        move |state| state.cert_chain(&key_id).is_ok()
+        move |state| state.certs().chain(&key_id).is_ok()
     }
 
     fn wait_for_revocation(&self, key_id: KeyId) -> impl FnMut(&State) -> bool {
-        move |state| state.is_cert_revoked(&key_id)
+        move |state| state.certs().revoked(&key_id).is_some()
     }
 
     fn wait_for_key_revocation(&self, key_id: KeyId) -> impl FnMut(&State) -> bool {
-        move |state| state.is_key_revoked(&key_id)
+        move |state| state.identities().revoked(&key_id).is_some()
     }
 
     fn wait_for_session(&self, session_id: SessionId) -> impl FnMut(&State) -> bool {
@@ -780,14 +779,14 @@ impl JobManager {
 }
 
 /// Read one PEM-encoded certificate from each of `paths`.
-pub async fn read_root_certs(paths: &[impl AsRef<Path>]) -> Result<Vec<Certificate>, JobError> {
-    let mut roots = Vec::with_capacity(paths.len());
+pub async fn read_certs(paths: &[impl AsRef<Path>]) -> Result<Vec<Certificate>, JobError> {
+    let mut anchors = Vec::with_capacity(paths.len());
     for path in paths {
         let path = path.as_ref();
         let pem = read(path).await.map_err(JobError::file_io_for(path))?;
-        roots.push(Certificate::from_pem(&pem)?);
+        anchors.push(Certificate::from_pem(&pem)?);
     }
-    Ok(roots)
+    Ok(anchors)
 }
 
 // See tests in `tests/src/manager_tests.rs`

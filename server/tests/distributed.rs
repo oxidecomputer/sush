@@ -15,7 +15,7 @@ use std::time::Duration;
 use camino::Utf8PathBuf;
 use function_name::named;
 use sled_hardware_types::BaseboardId;
-use slog::Logger;
+use slog::{Logger, o};
 use tempfile::TempDir;
 use tokio::sync::watch;
 use tokio::time::sleep;
@@ -72,10 +72,11 @@ impl Sled {
         locker: Locker,
         shutdown: &CancellationToken,
     ) -> Sled {
-        let seed = seed_gossip(log, &locker).await;
+        let log = log.new(o!("sled" => identity));
+        let seed = seed_gossip(&log, &locker).await;
         let (peers, peers_rx) = watch::channel(BTreeSet::new());
         let (addr, universe, linked) = spawn_gossip(
-            log,
+            &log,
             gossip_config(),
             sprockets_config(dir, identity),
             corpus(dir),
@@ -222,6 +223,98 @@ async fn jobs_gossip_between_sleds() {
         a.mgr
             .session(&authn_a)
             .is_some_and(|s| s.session_id() == successor)
+    })
+    .await;
+
+    shutdown.cancel();
+}
+
+#[named]
+#[tokio::test]
+async fn concurrent_sessions_annihilate() {
+    let (_tmp, dir) = pki("sush-concurrent-", 2);
+    let mut root = common::ephemeral_root();
+    let root_pem = dir.join("job-root.pem");
+    write(
+        &root_pem,
+        pem_cert_chain(vec![root.cert().to_owned()]).unwrap(),
+    )
+    .unwrap();
+
+    let log = test_logger(function_name!());
+    let shutdown = CancellationToken::new();
+    let a = Sled::start(&log, &dir, 1, &root_pem, &shutdown).await;
+    let b = Sled::start(&log, &dir, 2, &root_pem, &shutdown).await;
+    let authn_a = fake_identity(&mut root).await;
+    let authn_b = fake_identity(&mut root).await;
+    a.peers.send(BTreeSet::from([b.addr])).unwrap();
+    b.peers.send(BTreeSet::from([a.addr])).unwrap();
+    eventually("universe convergence", 120, async || {
+        a.universe.borrow().rumors.network() == b.universe.borrow().rumors.network()
+    })
+    .await;
+    sees(&a, &b).await;
+    sees(&b, &a).await;
+
+    // Partitioned, each sled starts its own session. Neither start
+    // can hear the other, so the two versions are concurrent.
+    a.peers.send(BTreeSet::new()).unwrap();
+    b.peers.send(BTreeSet::new()).unwrap();
+    sleep(Duration::from_millis(500)).await;
+    let nonce_a = SessionSignerNonce::random();
+    let session_a = SessionId::compute(a.mgr.own_baseboard(), a.mgr.session_sush_nonce(), nonce_a);
+    let mut session = Session::new(session_a);
+    a.mgr
+        .session_start(&authn_a, session_a, nonce_a, true)
+        .await
+        .unwrap();
+    let nonce_b = SessionSignerNonce::random();
+    let session_b = SessionId::compute(b.mgr.own_baseboard(), b.mgr.session_sush_nonce(), nonce_b);
+    b.mgr
+        .session_start(&authn_b, session_b, nonce_b, true)
+        .await
+        .unwrap();
+
+    // A job on A sits queued behind a hole in the chain, so it can
+    // never run before the sessions annihilate.
+    let hole_id = session.next_job_id();
+    let hole = sign_job_for(&mut root, hole_id, session_a, "true", &a.baseboard).await;
+    session.job_started(hole);
+    let job_id = session.next_job_id();
+    let job = sign_job_for(&mut root, job_id, session_a, "true", &a.baseboard).await;
+    a.mgr
+        .job_start(&authn_a, job, JobStartParams::default())
+        .await
+        .unwrap();
+    eventually("the job queues on A", 60, async || {
+        a.mgr.job_status(&authn_a, &job_id).await.is_ok_and(|map| {
+            map.get(&a.baseboard)
+                .is_some_and(|s| matches!(s, JobStatus::Queued { .. }))
+        })
+    })
+    .await;
+
+    // The partition heals. Each sled hears a session start concurrent
+    // with its own: both sessions are killed everywhere, and the
+    // queued job is skipped rather than left queued forever.
+    a.peers.send(BTreeSet::from([b.addr])).unwrap();
+    b.peers.send(BTreeSet::from([a.addr])).unwrap();
+    eventually("the sessions annihilate", 120, async || {
+        a.mgr.session(&authn_a).is_none() && b.mgr.session(&authn_b).is_none()
+    })
+    .await;
+    eventually("the queued job is skipped", 60, async || {
+        a.mgr.job_status(&authn_a, &job_id).await.is_ok_and(|map| {
+            map.get(&a.baseboard).is_some_and(|s| {
+                matches!(
+                    s,
+                    JobStatus::Skipped {
+                        reason: SkipReason::SessionEnded,
+                        ..
+                    }
+                )
+            })
+        })
     })
     .await;
 

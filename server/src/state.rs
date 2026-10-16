@@ -8,12 +8,10 @@
 //! messages via the gossip protocol.
 
 use std::collections::{BTreeMap, BTreeSet};
-use std::num::NonZeroUsize;
 use std::sync::{Arc, Mutex};
 
 use chrono::{DateTime, Utc};
 use futures::{FutureExt as _, Stream, StreamExt};
-use lru::LruCache;
 use rumors::{CausalMessages, Network, Rumors, Version};
 use sled_hardware_types::BaseboardId;
 use slog::{Logger, debug, error, info, o, warn};
@@ -22,73 +20,41 @@ use tokio::task::JoinHandle;
 use tokio::{select, spawn};
 use tokio_util::sync::CancellationToken;
 use x509_cert::Certificate;
-use x509_cert::der::{Decode as _, Encode as _};
 
 use sush_api::JobStartParams;
-use sush_common::authn::{Identity, Nonce, RequestVerifier, SignedLogin};
 use sush_common::jobs::{
     Access, JobId, JobStatus, JobStatusMap, LastJob, ProcessError, Session, SessionId,
-    SessionSushNonce, SignedJob, SkipReason,
+    SessionSushNonce, SignedJob, SkipReason, VerifiedJob,
 };
-use sush_common::keys::{KeyError, KeyId, Signature, SshPublicKey};
+use sush_common::keys::{KeyError, KeyId};
 use sush_common::targets::Cubbies;
-use sush_common::version::{VersionInfo, VersionMap};
+use sush_common::version::VersionInfo;
 
 use crate::bloom::Bloom;
 use crate::bookmark::SushBookmark;
 use crate::boundary::{Boundary, BoundaryStore, Committed, JobOutcome};
+use crate::certs::Certificates;
 use crate::executor::{Executor, PathIsolation};
 use crate::gossip::{Seed, Universe};
 use crate::history::JobHistory;
+use crate::identities::Identities;
 use crate::job::SocketSender;
 use crate::locker::Locker;
-use crate::messages::v0::{
-    CertRequest, Error, Event, IdentityRequest, JobEvent, JobRequest, Message, Request,
-    SessionRequest,
-};
+use crate::messages::v0::{Error, Event, JobEvent, JobRequest, Message, Request, SessionRequest};
 use crate::messages::{VersionedMessage, VersionedMessage::*};
 use crate::output::JobOutputDir;
+use crate::rack::Rack;
 
 pub type AttachmentPoints = BTreeMap<JobId, watch::Receiver<Option<SocketSender>>>;
-pub type Certificates = BTreeMap<KeyId, CertState>;
 pub type GossipNetwork = Rumors<VersionedMessage, SushBookmark>;
 pub type GossipSeed = Seed<VersionedMessage>;
 pub type GossipUniverse = Universe<VersionedMessage>;
 pub type QueuedJobs = BTreeMap<JobId, QueuedJob>;
-pub type RunningJobs = BTreeMap<(JobId, BaseboardId), DateTime<Utc>>;
-
-/// Maximum certificate chain length.
-pub const MAX_CERT_CHAIN_LEN: usize = 10;
-
-/// Maximum number of job request signing certificates.
-/// The ideal number of certs is 1, so this need not be large.
-pub const MAX_CERTS: usize = 100;
 
 /// Maximum number of jobs a session may have queued (submitted, but not
 /// yet next in the causal chain to run). Bounds memory in the presence
 /// of out-of-order, duplicate, or malformed submissions.
 pub const MAX_QUEUED_JOBS: usize = 1_000;
-
-/// Maximum number of revocations held for certificates not yet seen.
-pub const MAX_TOMBSTONES: NonZeroUsize = NonZeroUsize::new(100).unwrap();
-
-/// Maximum number of registered identities. Evicting a real login
-/// only costs its holder a fresh key touch.
-pub const MAX_REGISTERED_IDENTITIES: NonZeroUsize = NonZeroUsize::new(1_000).unwrap();
-
-/// Maximum number of revoked SSH keys remembered for login refusal.
-/// Any authenticated key may revoke, so a flood of junk revocations
-/// can evict a real one. Entries never expire, so unlike nonces the
-/// eviction is permanent. This is sized so the flood takes thousands
-/// of authenticated, attributed, logged requests.
-pub const MAX_REVOKED_KEYS: NonZeroUsize = NonZeroUsize::new(10_000).unwrap();
-
-/// A rack-wide record of a verified login.
-#[derive(Clone, Debug)]
-pub struct RegisteredIdentity {
-    pub identity: Identity,
-    pub verifier: RequestVerifier,
-}
 
 /// A job waiting in the session queue for its turn in the causal chain.
 /// Jobs replayed from history that predates our join keep the chain intact
@@ -103,45 +69,33 @@ pub struct QueuedJob {
 #[derive(Clone, Debug)]
 pub enum SessionState {
     Inactive {
-        /// Last observed session request.
-        frontier: Version,
+        /// Join of all observed session start requests.
+        starts: Version,
     },
     Active {
-        /// Last observed session request.
-        frontier: Version,
+        /// Join of all observed session start requests.
+        starts: Version,
+
+        /// When the active session started.
         started: Version,
+
         /// The active session.
         session: Box<Session>,
+
         /// Jobs waiting to run in this session.
         queued_jobs: QueuedJobs,
+
         /// Keys the starter has granted attach access, and how much.
         attach_grants: BTreeMap<KeyId, Access>,
     },
 }
 
 impl SessionState {
-    fn frontier(&self) -> Version {
+    fn starts(&self) -> Version {
         use SessionState::*;
         match self {
-            Inactive { frontier } => frontier.clone(),
-            Active { frontier, .. } => frontier.clone(),
-        }
-    }
-
-    fn active_session(&mut self) -> Option<SessionGuard<'_>> {
-        use SessionState::*;
-        match self {
-            Inactive { .. } => None,
-            Active {
-                session,
-                queued_jobs,
-                started,
-                ..
-            } => Some(SessionGuard {
-                inner: session,
-                queued_jobs,
-                started,
-            }),
+            Inactive { starts } => starts.clone(),
+            Active { starts, .. } => starts.clone(),
         }
     }
 
@@ -183,229 +137,83 @@ impl SessionState {
 impl Default for SessionState {
     fn default() -> Self {
         Self::Inactive {
-            frontier: Version::new(),
+            starts: Version::new(),
         }
     }
 }
 
-/// A dynamic guard around an active session and its job queue.
-struct SessionGuard<'a> {
-    inner: &'a mut Session,
-    queued_jobs: &'a mut QueuedJobs,
-    /// The version of the session's start message; identity anchor.
-    started: &'a Version,
+/// Whether we have a job boundary we can rely on, and if so what the
+/// execution floor is.
+///
+/// The floor lives in memory only, since a floor written to disk would
+/// reach the next life, which might join a different universe; and because
+/// versions don't compare across universes, every session would look
+/// concurrent with the floor, leading to a permanent lock-out. Instead,
+/// we raise a fresh floor at each universe entry from messages already
+/// there, so future sessions come to dominate it.
+#[derive(Debug)]
+enum Commitment {
+    /// Tabula rasa. The floor is raised when we join a universe with
+    /// history.
+    Absent { floor: Option<Version> },
+
+    /// We have a valid boundary record. The floor is raised on re-entering
+    /// a universe, or by a session hop.
+    Trusted {
+        boundary: Box<Boundary>,
+        floor: Option<Version>,
+    },
+
+    /// The boundary record is corrupt; no jobs may run here.
+    Untrusted,
 }
 
-impl<'a> SessionGuard<'a> {
-    pub fn session_id(&self) -> SessionId {
-        self.inner.session_id()
-    }
-
-    pub fn started_by(&self) -> Option<&KeyId> {
-        self.inner.started_by()
-    }
-
-    pub fn job_started(&mut self, job: SignedJob) {
-        self.inner.job_started(job)
-    }
-
-    pub fn skip_job(&mut self, job_id: &JobId) -> bool {
-        self.inner.skip_job(*job_id)
-    }
-
-    #[allow(clippy::too_many_arguments)]
-    pub fn enqueue_job(
-        &mut self,
+impl Commitment {
+    /// Judge the boundary record at entry into a universe. On a flip-flop
+    /// (re-entering a burned universe), the error to report is also returned.
+    fn at_entry(
         log: &Logger,
-        history: &mut JobHistory,
-        running: &RunningJobs,
-        own_baseboard: &BaseboardId,
-        cubbies: &Cubbies,
-        job: SignedJob,
-        params: JobStartParams,
-        actor: &KeyId,
-        replayed: bool,
-    ) {
-        let job_id = *job.job_id();
-        let targeted = job.payload().runs_on(own_baseboard, cubbies);
-        // Adjudication can give the boundary job a status before its
-        // request replays. The queue releases jobs in order, so
-        // dropping that request would wedge the session behind the
-        // boundary job forever. A replayed request therefore always
-        // joins the queue; only a live duplicate is dropped.
-        if !replayed && history.contains(&job_id) {
-            // Note but otherwise ignore the duplicate job.
-            info!(log, "already started job"; "job_id" => %job_id);
-        } else if !replayed
-            && self.queued_jobs.len() >= MAX_QUEUED_JOBS
-            && !self.queued_jobs.contains_key(&job_id)
-        {
-            // We have no choice; drop the job on the floor.
-            warn!(log, "too many jobs queued"; "job_id" => %job_id, "max" => MAX_QUEUED_JOBS);
-        } else {
-            // Insert the job into our queue. Every job joins the
-            // queue to keep the causal chain whole, but only jobs
-            // targeting this sled that can actually run here record
-            // a local status.
-            self.queued_jobs.insert(
-                job_id,
-                QueuedJob {
-                    job,
-                    params,
-                    replayed,
-                },
-            );
-            if targeted && !replayed {
-                history.set_job_status(
-                    &job_id,
-                    own_baseboard,
-                    JobStatus::Queued {
-                        job_id,
-                        time_queued: Utc::now(),
-                        actor: actor.clone(),
+        store: &BoundaryStore,
+        rumors: &GossipNetwork,
+    ) -> (Self, Option<Error>) {
+        if store.untrusted() {
+            return (Self::Untrusted, None);
+        }
+
+        let network = rumors.network();
+        let entry = rumors.snapshot().latest().clone();
+        match store.boundary() {
+            Some(boundary) if boundary.network != network && boundary.is_burned(network) => {
+                warn!(log, "re-entered a burned universe"; "committed" => ?boundary.job);
+                (
+                    Self::Trusted {
+                        boundary: Box::new(boundary),
+                        floor: Some(entry),
                     },
-                    None,
-                    Some(self.queued_jobs),
-                    running,
-                );
+                    Some(Error::UniverseFlipFlop),
+                )
             }
+            Some(boundary) => (
+                Self::Trusted {
+                    boundary: Box::new(boundary),
+                    floor: None,
+                },
+                None,
+            ),
+            None if entry != Version::new() => {
+                warn!(log, "no boundary record, but this universe has history");
+                (Self::Absent { floor: Some(entry) }, None)
+            }
+            None => (Self::Absent { floor: None }, None),
         }
     }
 
-    pub fn cancel_job(
-        &mut self,
-        job_id: &JobId,
-        actor: &KeyId,
-        own_baseboard: &BaseboardId,
-        history: &mut JobHistory,
-        running: &RunningJobs,
-        replayed: bool,
-    ) {
-        self.queued_jobs.remove(job_id);
-        if replayed {
-            return;
-        }
-        history.transition_job_status(
-            job_id,
-            own_baseboard,
-            None,
-            |old_status| match old_status {
-                None | Some(JobStatus::Queued { .. }) => Some(JobStatus::Cancelled {
-                    job_id: *job_id,
-                    time_cancelled: Utc::now(),
-                    actor: actor.clone(),
-                }),
-                _ => None,
-            },
-            Some(self.queued_jobs),
-            running,
-        );
-    }
-
-    /// Pull out the next job to execute (if any), repeatedly.
-    /// We loop because adding or skipping a job may have "filled a hole"
-    /// in the hash chain, and there may be an unbounded number of
-    /// newly-ready-to-run jobs after it in the queue. Once we reach
-    /// a fixed point, we have nothing further to do.
-    #[allow(clippy::too_many_arguments)]
-    pub fn execute_ready_jobs(
-        &mut self,
-        log: &Logger,
-        own_baseboard: &BaseboardId,
-        cubbies: &Cubbies,
-        certs: &mut Certificates,
-        history: &mut JobHistory,
-        executor: &mut Executor,
-        attachments: &mut AttachmentPoints,
-        past: &mut Past,
-        rumors: Option<&GossipNetwork>,
-    ) {
-        loop {
-            let next_id = self.inner.next_job_id();
-            if !self.queued_jobs.contains_key(&next_id) {
-                break;
-            }
-            // A hop can raise the floor mid-drain, so screen on every pass.
-            let admission = match rumors {
-                None => Admission::Admit,
-                Some(rumors) => past.screen(rumors.network(), self.session_id(), self.started),
-            };
-            // A hop raises the floor and screens again.
-            if matches!(admission, Admission::Hop) {
-                let Some(rumors) = rumors else {
-                    break;
-                };
-                warn!(
-                    log, "raising the execution floor above a session the boundary record cannot order";
-                    "session_id" => %self.session_id(), "started" => ?self.started,
-                );
-                past.hop(log, rumors, own_baseboard, Error::SessionHop);
-                continue;
-            }
-            let QueuedJob {
-                job: request,
-                params,
-                replayed,
-            } = self.queued_jobs.remove(&next_id).expect("checked above");
-            let (tx_attachment, rx_attachment) = watch::channel(None);
-            let job_id = request.payload().job_id().to_owned();
-            if request.payload().runs_on(own_baseboard, cubbies) {
-                if past.boundary.untrusted() {
-                    warn!(
-                        log, "refusing job, the execution boundary is untrusted";
-                        "job_id" => %job_id,
-                    );
-                    executor.job_refused(
-                        job_id,
-                        ProcessError::Io {
-                            what: "consulting the execution boundary".to_string(),
-                            error: "the boundary records on this sled's M.2s disagree \
-                                    or are corrupt; an M.2 may have failed and the sled \
-                                    needs service"
-                                .to_string(),
-                        },
-                    );
-                } else if matches!(admission, Admission::Refuse) {
-                    // Below the floor the queue skips forward in chain
-                    // order. A live job gets the terminal skip status;
-                    // a replayed one is history, and re-reporting it
-                    // on every rejoin would grow the message set.
-                    if !replayed {
-                        warn!(log, "skipping job below the execution floor"; "job_id" => %job_id);
-                        executor.job_skipped(job_id, SkipReason::BelowFloor);
-                    }
-                } else if history
-                    .get_job_status(&job_id)
-                    .map(|status| {
-                        matches!(status.get(own_baseboard), Some(JobStatus::Queued { .. }))
-                    })
-                    .unwrap_or(true)
-                {
-                    let Some(rumors) = rumors else {
-                        warn!(log, "not starting a job while draining"; "job_id" => %job_id);
-                        self.job_started(request);
-                        continue;
-                    };
-                    let successor = self
-                        .session_id()
-                        .next_job_id(&LastJob::Some(request.clone()));
-                    let boundary = Boundary {
-                        network: rumors.network(),
-                        burned: past.burned_for(rumors.network()),
-                        executed: past.executed_for(rumors.network(), self.started),
-                        job: Some(Committed {
-                            session: self.session_id(),
-                            job: job_id,
-                            successor,
-                            outcome: JobOutcome::Committed,
-                        }),
-                    };
-                    if executor.job_start(certs, request.clone(), params, tx_attachment, boundary) {
-                        attachments.insert(job_id, rx_attachment);
-                    }
-                }
-            }
-            self.job_started(request);
+    /// Raise the execution floor. An untrusted commitment refuses
+    /// every job already, so it carries no floor to raise.
+    fn raise(&mut self, to: Version) {
+        match self {
+            Self::Absent { floor } | Self::Trusted { floor, .. } => *floor = Some(to),
+            Self::Untrusted => {}
         }
     }
 }
@@ -415,13 +223,19 @@ impl<'a> SessionGuard<'a> {
 enum Admission {
     /// Execute normally.
     Admit,
-    /// The session does not start above the floor; skip the job.
+
+    /// The session does not start above the execution floor,
+    /// so skip the job.
     Refuse,
-    /// The boundary record cannot order this session, so a previous
-    /// life of this sled may have run its jobs. The sled reports an
-    /// error and raises its floor, as if it had just entered the
-    /// universe at this instant.
+
+    /// We have a boundary record, but it's incommensurate with the
+    /// current session. So "hop" into the new session, and raise the
+    /// execution floor.
     Hop,
+
+    /// If we cannot trust our boundary record, we must not admit
+    /// new jobs.
+    Untrusted,
 }
 
 /// This incarnation's relationship to its own past: where it entered
@@ -429,37 +243,70 @@ enum Admission {
 /// running.
 #[derive(Debug)]
 pub struct Past {
-    /// The frontier just before this life's first send into this
-    /// universe: the general replay line. Messages that do not
-    /// strictly follow it count as replayed.
-    arrival: Version,
-    /// The frontier just past this life's first send. Own-baseboard
-    /// events at or below it belong to a previous life; everything
-    /// this life sends causally follows it. Never persisted: each
-    /// life computes its own, so the split is exact and independent of
-    /// which peer we joined through. It is not the general replay
-    /// line, because a neighbor's fresh traffic reaches us before our
-    /// first send reaches the neighbor.
+    /// The version of this life's first send: our announcement that
+    /// we joined this universe. A message whose causal history
+    /// includes the announcement is live, and so is the announcement
+    /// itself. Every other message, prior to or concurrent with the
+    /// announcement, is replayed. A replayed event from our own
+    /// baseboard came from a previous life. Not persisted; each
+    /// life computes its own.
     birth: Version,
-    /// The last job this sled committed to executing, durable across
-    /// restarts.
-    boundary: Arc<BoundaryStore>,
-    /// The boundary record as we found it on entering this universe.
-    /// The live store advances with our own jobs; [`Past::screen`]
-    /// compares sessions against the previous life's commitment, so
-    /// it reads this frozen copy.
-    committed: Option<Boundary>,
-    /// The execution floor, raised in memory at entry into a burned
-    /// universe, at record-less entry into a universe with history,
-    /// and on a session hop. Only sessions started strictly above it
-    /// are served; below it this sled cannot tell replay from re-run.
-    /// Never persisted: whatever raised it is still there after a
-    /// restart and raises it again. See [`entry_floor`].
-    floor: Option<Version>,
+
+    /// The most recently seen message version. Initialized to `birth`,
+    /// then joined at every state machine update.
+    frontier: Version,
+
+    /// What job, if any, this sled committed to executing. Durable
+    /// across restarts.
+    committed: Commitment,
+
     /// Jobs whose replayed start events say a previous life ran them.
     /// The end of such a job may replay later and remove it from the
-    /// set, so the survivors are known only when replay finishes.
+    /// set, so which jobs truly lack an end is known only when replay
+    /// finishes.
     zombies: BTreeSet<JobId>,
+
+    /// Jobs that kept running through a universe swap. The executor
+    /// reports their events into this universe, so they are neither
+    /// zombies nor candidates for adjudication.
+    survivors: BTreeSet<JobId>,
+
+    /// Zombies already declared interrupted. The interrupted event
+    /// applies only after a gossip round trip, so history may still
+    /// show these jobs running; this set keeps [`State::settle`] from
+    /// ruling twice and keeps [`State::remainder`] from counting them
+    /// as survivors.
+    reaped: BTreeSet<JobId>,
+
+    /// The universes that have been sent this sled's verdict on its
+    /// boundary job. A ruling is announced at most once per job per
+    /// universe.
+    adjudicated: BTreeMap<Network, JobId>,
+}
+
+/// The parts of a [`Past`] that survive a universe swap because the
+/// next life cannot recompute them from replay.
+#[derive(Debug, Default)]
+struct Remainder {
+    /// Jobs still running or launching here at the swap.
+    survivors: BTreeSet<JobId>,
+
+    /// The universes that have been sent a verdict on the boundary job.
+    adjudicated: BTreeMap<Network, JobId>,
+}
+
+impl Remainder {
+    fn into_past(self, birth: Version, committed: Commitment) -> Past {
+        Past {
+            frontier: birth.clone(),
+            birth,
+            committed,
+            zombies: BTreeSet::new(),
+            survivors: self.survivors,
+            reaped: BTreeSet::new(),
+            adjudicated: self.adjudicated,
+        }
+    }
 }
 
 /// Whether `version` strictly dominates `mark`. Equal and concurrent
@@ -469,51 +316,41 @@ fn dominates(version: &Version, mark: &Version) -> bool {
 }
 
 impl Past {
-    pub fn new(
-        arrival: Version,
-        birth: Version,
-        boundary: Arc<BoundaryStore>,
-        committed: Option<Boundary>,
-        floor: Option<Version>,
-    ) -> Self {
-        Self {
-            arrival,
-            birth,
-            boundary,
-            committed,
-            floor,
-            zombies: BTreeSet::new(),
-        }
+    fn new(birth: Version, committed: Commitment) -> Self {
+        Remainder::default().into_past(birth, committed)
+    }
+
+    fn observe(&mut self, version: &Version) {
+        self.frontier |= version;
     }
 
     /// Decide whether the active session, identified by its id and
     /// the version of its start message, may run a live job here.
     fn screen(&self, network: Network, session: SessionId, started: &Version) -> Admission {
-        // We must refuse anything below our floor, because we cannot
-        // tell replay from re-run there.
-        if self
-            .floor
-            .as_ref()
-            .is_some_and(|floor| !dominates(started, floor))
-        {
-            return Admission::Refuse;
-        }
+        match &self.committed {
+            // Refuse all jobs if our boundary is untrusted.
+            Commitment::Untrusted => Admission::Untrusted,
 
-        // If we have committed to nothing, anything is safe to admit.
-        let Some(committed) = &self.committed else {
-            return Admission::Admit;
-        };
+            // We must also refuse anything below our floor,
+            // since we cannot tell replay from re-run there.
+            Commitment::Absent { floor: Some(floor) }
+            | Commitment::Trusted {
+                floor: Some(floor), ..
+            } if !dominates(started, floor) => Admission::Refuse,
 
-        // Jobs cannot cross universes, and anything a previous life
-        // ran in this universe is below the floor checked above.
-        if committed.network != network {
-            return Admission::Admit;
-        }
+            // Allow jobs in the absence of any previous commitment.
+            Commitment::Absent { .. } => Admission::Admit,
 
-        match &committed.job {
-            Some(job) if job.session == session => Admission::Admit,
-            _ => {
-                if dominates(started, &committed.executed) {
+            // Jobs cannot cross universes, and anything a previous life
+            // ran in this universe is below the floor checked above.
+            Commitment::Trusted { boundary, .. } => {
+                if boundary.network != network {
+                    Admission::Admit
+                } else if let Some(job) = &boundary.job
+                    && job.session == session
+                {
+                    Admission::Admit
+                } else if dominates(started, &boundary.executed) {
                     Admission::Admit
                 } else {
                     Admission::Hop
@@ -522,140 +359,126 @@ impl Past {
         }
     }
 
-    /// Report the cause of an [`Admission::Hop`] to the gossip set,
-    /// then set the floor at the frontier that includes the report.
-    fn hop(
-        &mut self,
-        log: &Logger,
-        rumors: &GossipNetwork,
-        own_baseboard: &BaseboardId,
-        report: Error,
-    ) {
-        gossip(
-            log,
-            rumors,
-            Message::Event(own_baseboard.clone(), Event::Error(report)).into(),
-        );
-        self.floor = Some(rumors.snapshot().latest().clone());
+    /// Construct a boundary for a verified job.
+    fn commit_to(
+        &self,
+        network: Network,
+        started: &Version,
+        session_id: SessionId,
+        job_id: JobId,
+        successor: JobId,
+    ) -> Boundary {
+        Boundary {
+            network,
+            burned: self.burned_for(network),
+            executed: self.executed_for(network, started),
+            job: Some(Committed {
+                session: session_id.to_owned(),
+                job: job_id,
+                successor,
+                outcome: JobOutcome::Committed,
+            }),
+        }
     }
 
     /// The burned set for a record committed in `network`; see
     /// [`Boundary::burned_for`].
     fn burned_for(&self, network: Network) -> Bloom {
-        self.committed
-            .as_ref()
-            .map(|boundary| boundary.burned_for(network))
-            .unwrap_or_default()
+        match &self.committed {
+            Commitment::Trusted { boundary, .. } => boundary.burned_for(network),
+            _ => Bloom::default(),
+        }
     }
 
     /// The executed-session join for a record committed in `network`
     /// under a session started at `started`; see
     /// [`Boundary::executed_for`].
     fn executed_for(&self, network: Network, started: &Version) -> Version {
-        self.committed
-            .as_ref()
-            .map(|boundary| boundary.executed_for(network, started))
-            .unwrap_or_else(|| started.clone())
+        match &self.committed {
+            Commitment::Trusted { boundary, .. } => boundary.executed_for(network, started),
+            _ => started.clone(),
+        }
     }
 
     /// Whether a message at `version` is live traffic rather than
-    /// replayed history: only strict causal descendants of the
-    /// arrival are live.
+    /// replayed history; see [`Past::birth`]. Equality admits the
+    /// birth announcement itself.
     fn is_live(&self, version: &Version) -> bool {
-        dominates(version, &self.arrival)
+        *version >= self.birth
     }
+}
 
-    /// Whether this sled's own event at `version` came from a
-    /// previous life. The split is exact: nothing a previous life
-    /// sent dominates the birth, and everything this life sends does.
-    fn is_from_previous_life(&self, version: &Version) -> bool {
-        !dominates(version, &self.birth)
+/// A state machine input. Everything that changes the state arrives
+/// as one of these.
+enum Input {
+    /// The rack's cubby map changed.
+    Cubbies(Cubbies),
+
+    /// The gossip network delivered a message.
+    Gossip(Version, Arc<VersionedMessage>),
+
+    /// All ready messages have been drained.
+    Drained,
+}
+
+/// A state machine output.
+#[derive(Debug)]
+enum Output {
+    Run(Box<Run>),
+    Ran(JobStatus),
+    Stop(JobId),
+    Gossip(Message),
+    RotateNonce,
+}
+
+impl Output {
+    fn job_event(own_baseboard: &BaseboardId, event: JobEvent) -> Self {
+        Self::Gossip(Message::Event(own_baseboard.to_owned(), Event::Job(event)))
     }
+}
+
+/// Everything the executor needs to launch a job.
+#[derive(Debug)]
+struct Run {
+    job: VerifiedJob,
+    params: JobStartParams,
+    boundary: Boundary,
+    attachment: watch::Sender<Option<SocketSender>>,
 }
 
 #[derive(Debug)]
 pub struct State {
-    /// The ID of the baseboard (sled) the server is running on.
-    own_baseboard: BaseboardId,
+    /// Information about the rack in which we're running.
+    rack: Rack,
     /// Status of all jobs everywhere (lossy).
     history: JobHistory,
-    /// The set of running jobs everywhere, tagged by start wall-clock time.
-    running: RunningJobs,
     /// The current state of the active session, if any.
     session: SessionState,
     /// Attachment points (socket senders) for interactive jobs.
     attachments: AttachmentPoints,
     /// Job request signing certificates.
     certs: Certificates,
-    /// The nonce binding new session IDs to this sled, shared with the
-    /// manager and rotated whenever a session activates.
-    session_sush_nonce: Arc<Mutex<SessionSushNonce>>,
-    /// Revocations of certificates we have never seen. Bounded and
-    /// apart from `certs`, so revocation spam evicts only itself.
-    tombstones: LruCache<KeyId, DateTime<Utc>>,
-    /// Hard-coded root certificate key IDs. Self-signed certificates
-    /// not in this set will be revoked with prejudice.
-    roots: Box<[KeyId]>,
-    /// Baseboards by cubby number, as much of it as is known.
-    cubbies: Cubbies,
+    /// SSH identities for request attribution.
+    identities: Identities,
     /// This incarnation's relationship to its own past.
     past: Past,
-    /// Message versions from newer builds, each warned about once.
-    unknown_versions: BTreeSet<String>,
-    /// Build provenance by sled.
-    versions: VersionMap,
-    /// Verified logins, rack-wide.
-    identities: LruCache<(KeyId, Nonce), RegisteredIdentity>,
-    /// SSH keys refused at login.
-    revoked_keys: LruCache<KeyId, DateTime<Utc>>,
 }
 
 impl State {
-    /// Fails if any root certificate is malformed or does not validate. Roots
-    /// are supplied by whoever configures the server, so they are not
-    /// necessarily trustworthy just because they were handed to us.
     pub fn new(
         own_baseboard: BaseboardId,
-        root_certs: &[Certificate],
-        session_sush_nonce: Arc<Mutex<SessionSushNonce>>,
+        trust_anchors: &[Certificate],
         past: Past,
     ) -> Result<Self, KeyError> {
-        let certs = root_certs
-            .iter()
-            .map(|cert| {
-                Ok((
-                    KeyId::try_from(cert)?,
-                    CertState::Unknown(Box::new(cert.clone())),
-                ))
-            })
-            .collect::<Result<BTreeMap<KeyId, CertState>, KeyError>>()?;
-        let roots: Box<[KeyId]> = certs.keys().cloned().collect();
-        let mut new = Self {
-            versions: [(own_baseboard.clone(), VersionInfo::current())].into(),
-            own_baseboard,
-            running: Default::default(),
+        Ok(Self {
+            rack: Rack::new(own_baseboard),
             history: Default::default(),
             session: Default::default(),
             attachments: Default::default(),
-            session_sush_nonce,
-            tombstones: LruCache::new(MAX_TOMBSTONES),
-            certs,
-            roots: roots.clone(),
-            cubbies: Default::default(),
-            unknown_versions: Default::default(),
-            identities: LruCache::new(MAX_REGISTERED_IDENTITIES),
-            revoked_keys: LruCache::new(MAX_REVOKED_KEYS),
+            certs: Certificates::new(trust_anchors)?,
+            identities: Default::default(),
             past,
-        };
-        new.validate_certs(&roots);
-        for root in &roots {
-            if !new.certs[root].is_valid() {
-                return Err(KeyError::InvalidCert(format!(
-                    "root certificate `{root}` does not validate"
-                )));
-            }
-        }
-        Ok(new)
+        })
     }
 
     pub fn get_attachment(&self, job_id: &JobId) -> Option<SocketSender> {
@@ -670,23 +493,28 @@ impl State {
         self.session.attach_access(key_id)
     }
 
-    pub fn cubbies(&self) -> &Cubbies {
-        &self.cubbies
-    }
-
-    pub fn versions(&self) -> &VersionMap {
-        &self.versions
+    pub fn rack(&self) -> &Rack {
+        &self.rack
     }
 
     pub fn history(&self) -> &JobHistory {
         &self.history
     }
 
+    pub fn certs(&self) -> &Certificates {
+        &self.certs
+    }
+
+    pub fn identities(&self) -> &Identities {
+        &self.identities
+    }
+
     /// Jobs running on our own baseboard, according to our history.
     pub fn own_running_jobs(&self) -> BTreeSet<JobId> {
-        self.running
+        self.history
+            .running_jobs()
             .keys()
-            .filter(|(_, baseboard)| *baseboard == self.own_baseboard)
+            .filter(|(_, baseboard)| baseboard == self.rack.own_baseboard())
             .map(|(job_id, _)| *job_id)
             .collect()
     }
@@ -697,8 +525,9 @@ impl State {
             .zombies
             .iter()
             .filter(|job_id| {
-                self.running
-                    .contains_key(&(**job_id, self.own_baseboard.clone()))
+                self.history
+                    .running_jobs()
+                    .contains_key(&(**job_id, self.rack.own_baseboard().clone()))
             })
             .copied()
             .collect()
@@ -708,486 +537,511 @@ impl State {
         self.past.is_live(version)
     }
 
-    /// The boundary record carries the boundary job's ending, so the
-    /// next life can tell the truth instead of guessing. The write is
-    /// spawned because the state machine is synchronous, and losing
-    /// the race to a crash only falls back to interrupted.
-    fn record_boundary_outcome(&self, job_id: &JobId) {
-        let Some(status) = self
-            .history
-            .get_job_status(job_id)
-            .and_then(|map| map.get(&self.own_baseboard))
-            .cloned()
-        else {
-            return;
-        };
-        if !status.is_terminal() {
-            return;
-        }
-        let store = self.past.boundary.clone();
-        let job_id = *job_id;
-        spawn(async move { store.record_outcome(&job_id, &status).await });
-    }
-
     pub fn get_job_status(&self, job_id: &JobId) -> Option<&JobStatusMap> {
         self.history.get_job_status(job_id)
     }
 
-    /// Import the first certificate seen for a key. Re-importing the
-    /// identical certificate is a no-op. Anything else at an occupied
-    /// key ID is refused, so no import can displace an established
-    /// certificate.
-    fn cert_import(&mut self, cert: &Certificate) -> Result<KeyId, KeyError> {
-        if cert.tbs_certificate.subject == cert.tbs_certificate.issuer {
-            return Err(KeyError::SelfSigned);
-        }
-        let key_id = KeyId::try_from(cert)?;
-        // A tombstone becomes a durable revocation once its
-        // certificate shows up. `certs` may briefly exceed `MAX_CERTS`
-        // by the tombstone count.
-        if let Some(when) = self.tombstones.pop(&key_id) {
-            self.certs
-                .insert(key_id.clone(), CertState::Revoked(key_id.clone(), when));
-            return Err(KeyError::Revoked(key_id, when));
-        }
-        match self.certs.get(&key_id) {
-            Some(CertState::Revoked(_, when)) => Err(KeyError::Revoked(key_id, *when)),
-            Some(existing) if existing.cert() == Some(cert) => Ok(key_id),
-            Some(_) => Err(KeyError::CertConflict(key_id)),
-            None if self.certs.len() >= MAX_CERTS => Err(KeyError::TooManyCerts(MAX_CERTS)),
-            None => {
-                self.certs
-                    .insert(key_id.clone(), CertState::Unknown(Box::new(cert.clone())));
-                Ok(key_id)
-            }
-        }
-    }
-
-    pub fn cert_chain(&self, key_id: &KeyId) -> Result<Vec<Certificate>, KeyError> {
-        cert_chain(&self.certs, key_id)
-    }
-
-    pub fn num_certs(&self) -> usize {
-        self.certs.len()
-    }
-
-    pub fn is_root(&self, key_id: &KeyId) -> bool {
-        self.roots.contains(key_id)
-    }
-
-    pub fn is_cert_revoked(&self, key_id: &KeyId) -> bool {
-        matches!(self.certs.get(key_id), Some(CertState::Revoked(..)))
-            || self.tombstones.peek(key_id).is_some()
-    }
-
-    pub fn registered_identity(&self, key: &(KeyId, Nonce)) -> Option<&RegisteredIdentity> {
-        self.identities.peek(key)
-    }
-
-    pub fn is_key_revoked(&self, key_id: &KeyId) -> bool {
-        self.revoked_keys.peek(key_id).is_some()
-    }
-
-    fn skip_queued_jobs(&self, executor: &Executor) {
+    fn skip_queued_jobs(&self, now: DateTime<Utc>) -> Vec<Output> {
+        let mut outputs = Vec::new();
         for (job_id, queued) in self.session.queued_jobs().into_iter().flatten() {
-            if !queued.replayed
-                && queued
-                    .job
-                    .payload()
-                    .runs_on(&self.own_baseboard, &self.cubbies)
-            {
-                executor.job_skipped(*job_id, SkipReason::SessionEnded);
+            if !queued.replayed && self.rack.runs_here(&queued.job) {
+                outputs.push(Output::job_event(
+                    self.rack.own_baseboard(),
+                    JobEvent::Skipped(*job_id, now, SkipReason::SessionEnded),
+                ));
             }
+        }
+        outputs
+    }
+
+    /// Rule on the jobs a previous life left unresolved. Call only
+    /// once ready messages have drained: an undelivered replayed end
+    /// may yet clear a zombie, and an early settle would declare a
+    /// finished job interrupted.
+    fn settle(
+        &mut self,
+        log: &Logger,
+        now: DateTime<Utc>,
+        network: Option<Network>,
+    ) -> Vec<Output> {
+        let mut outputs = self.reap_zombies(log, now);
+        if let Some(network) = network {
+            outputs.extend(self.adjudicate_boundary(log, now, network));
+        }
+        outputs
+    }
+
+    /// Declare interrupted every job a previous life left running,
+    /// excluding survivors and jobs already reaped. Zombies come only
+    /// from replayed start events, so a job this incarnation started
+    /// is never a candidate.
+    fn reap_zombies(&mut self, log: &Logger, now: DateTime<Utc>) -> Vec<Output> {
+        let mut outputs = Vec::new();
+        for job_id in self.zombies() {
+            if self.past.survivors.contains(&job_id) || self.past.reaped.contains(&job_id) {
+                continue;
+            }
+            self.past.reaped.insert(job_id);
+            outputs.push(Output::job_event(
+                self.rack.own_baseboard(),
+                JobEvent::Error(job_id, now, ProcessError::Interrupted),
+            ));
+            warn!(log, "interrupted job from a previous life"; "job_id" => %job_id);
+        }
+        outputs
+    }
+
+    /// Adjudicate the boundary job if replay gave it no status on our
+    /// baseboard: announce its recorded ending, or interrupted when
+    /// none was recorded. No status means its fate never left this
+    /// sled, and no other sled can ever report it. A replayed start
+    /// makes it a zombie instead, and a replayed end settles it.
+    /// Every sled hears the ruling, but a sled that already holds a
+    /// terminal status for the job keeps what it holds, so one sled
+    /// may show the real ending while another shows interrupted.
+    fn adjudicate_boundary(
+        &mut self,
+        log: &Logger,
+        now: DateTime<Utc>,
+        network: Network,
+    ) -> Vec<Output> {
+        // An absent or untrusted record commits to no job, so there
+        // is nothing to rule on.
+        let Commitment::Trusted { boundary, .. } = &self.past.committed else {
+            return Vec::new();
+        };
+        let Some(Committed { job, outcome, .. }) = boundary.job.as_ref() else {
+            return Vec::new();
+        };
+        let (job_id, outcome) = (*job, outcome.clone());
+        if self.past.adjudicated.get(&network) == Some(&job_id) {
+            return Vec::new();
+        }
+        // A survivor reports its own ending in this universe, so it
+        // needs no verdict now and may need one at a later swap.
+        if self.past.survivors.contains(&job_id) {
+            return Vec::new();
+        }
+        self.past.adjudicated.insert(network, job_id);
+        let witnessed = self
+            .get_job_status(&job_id)
+            .is_some_and(|status| status.get(self.rack.own_baseboard()).is_some());
+        if witnessed {
+            return Vec::new();
+        }
+        // A stopped ending announces the start and stop pair, so the
+        // ordinary status transitions apply on every sled; a bare stop
+        // with no prior start would be dropped.
+        let events = match outcome {
+            JobOutcome::Ended(JobStatus::Stopped {
+                time_started,
+                time_stopped,
+                result,
+                output,
+                ..
+            }) => vec![
+                JobEvent::Start(job_id, time_started),
+                JobEvent::Stop(job_id, time_stopped, result, output),
+            ],
+            JobOutcome::Ended(JobStatus::Error {
+                time_error, error, ..
+            }) => vec![JobEvent::Error(job_id, time_error, error)],
+            JobOutcome::Ended(_) | JobOutcome::Committed => {
+                vec![JobEvent::Error(job_id, now, ProcessError::Interrupted)]
+            }
+        };
+        warn!(log, "adjudicated an unwitnessed job from a previous life"; "job_id" => %job_id);
+        events
+            .into_iter()
+            .map(|event| Output::job_event(self.rack.own_baseboard(), event))
+            .collect()
+    }
+
+    /// Compute what survives into the next universe. A reaped zombie
+    /// may still show as running while its interrupted event is in
+    /// flight; it is no survivor. A job the executor is still
+    /// launching is a survivor: its start event may not have applied
+    /// yet, but the executor reports its events like any running
+    /// job's.
+    fn remainder(&self, in_flight: BTreeSet<JobId>) -> Remainder {
+        let mut survivors = self.own_running_jobs();
+        survivors.extend(in_flight);
+        survivors.retain(|job_id| !self.past.reaped.contains(job_id));
+        Remainder {
+            survivors,
+            adjudicated: self.past.adjudicated.clone(),
         }
     }
 
-    #[allow(clippy::result_large_err)]
+    /// Advance the state machine by one input, returning the outputs
+    /// for the driver to interpret. `network` is `None` while the
+    /// driver drains without a gossip connection.
+    fn step(
+        &mut self,
+        log: &Logger,
+        now: DateTime<Utc>,
+        network: Option<Network>,
+        input: Input,
+    ) -> Vec<Output> {
+        match input {
+            Input::Cubbies(cubbies) => {
+                self.rack.set_cubbies(cubbies);
+                Vec::new()
+            }
+            Input::Gossip(version, message) => self.update(log, now, network, &version, &message),
+            Input::Drained => self.settle(log, now, network),
+        }
+    }
+
     fn update(
         &mut self,
         log: &Logger,
-        executor: &mut Executor,
-        rumors: Option<&GossipNetwork>,
+        now: DateTime<Utc>,
+        network: Option<Network>,
         incoming_version: &Version,
         message: &Arc<VersionedMessage>,
-    ) -> Result<(), Error> {
-        use SessionState::*;
+    ) -> Vec<Output> {
+        self.past.observe(incoming_version);
         match message.as_ref() {
-            V0(Message::Request(request)) => match request {
-                Request::Cert(attributed) => match attributed.as_parts() {
-                    (actor, CertRequest::Import(der)) => match Certificate::from_der(der)
-                        .map_err(KeyError::from)
-                        .and_then(|cert| self.cert_import(&cert))
+            V0(Message::Request(request)) => {
+                let actor = request.actor();
+                let log = log.new(o!("actor" => actor.to_string()));
+                match request {
+                    Request::Cert(r) => {
+                        self.certs.apply(&log, r.request());
+                        Vec::new()
+                    }
+                    Request::Identity(r) => {
+                        self.identities.apply(&log, r.request());
+                        Vec::new()
+                    }
+                    Request::Session(r) => self.handle_session_request(
+                        &log,
+                        now,
+                        network,
+                        incoming_version,
+                        actor,
+                        r.request(),
+                    ),
+                    Request::Job(r) => self.handle_job_request(
+                        &log,
+                        now,
+                        network,
+                        incoming_version,
+                        actor,
+                        r.request(),
+                    ),
+                }
+            }
+            V0(Message::Event(baseboard_id, event)) => {
+                self.handle_event(log, incoming_version, baseboard_id, event)
+            }
+            Unknown { version, .. } => {
+                if self.rack.unknown_version(version.clone()) {
+                    warn!(log, "ignoring messages from a newer peer"; "version" => version);
+                }
+                Vec::new()
+            }
+        }
+    }
+
+    #[must_use]
+    fn handle_session_request(
+        &mut self,
+        log: &Logger,
+        now: DateTime<Utc>,
+        network: Option<Network>,
+        incoming_version: &Version,
+        actor: &KeyId,
+        request: &SessionRequest,
+    ) -> Vec<Output> {
+        use SessionState::*;
+
+        let mut outputs = Vec::new();
+        match request {
+            SessionRequest::Start(session_id) => match &mut self.session {
+                // Re-announcement of active session; absorb and ignore.
+                Active {
+                    starts, session, ..
+                } if session.session_id() == *session_id => {
+                    *starts |= incoming_version.clone();
+                    info!(log, "duplicate session start"; "session_id" => %session_id);
+                }
+
+                // If the incoming new session is in the *strict
+                // causal future* of everything we have observed,
+                // adopt it regardless of our current state. Every
+                // other peer will make the same decision, so it
+                // will come to dominate the network entirely.
+                Inactive { starts } | Active { starts, .. } if *incoming_version > *starts => {
+                    info!(log, "session started"; "session_id" => %session_id, "actor" => %actor);
+                    let mut session = Session::started(*session_id, actor.clone());
+                    if let Commitment::Trusted { boundary, .. } = &self.past.committed
+                        && let Some(committed) = boundary
+                            .job
+                            .as_ref()
+                            .filter(|committed| committed.session == *session_id)
                     {
-                        Ok(key_id) => {
-                            info!(log, "imported certificate"; "key_id" => %key_id, "actor" => %actor);
-                            self.validate_certs(&self.roots.clone());
-                        }
-                        Err(error) => {
-                            error!(log, "ignoring invalid certificate"; "error" => %error);
-                        }
-                    },
-                    (actor, CertRequest::Revoke(key_id, when)) => {
-                        if self.roots.contains(key_id) {
-                            error!(log, "refusing to revoke root certificate"; "key_id" => %key_id);
-                        } else if let Some(cert) = self.certs.get_mut(key_id) {
-                            *cert = CertState::Revoked(key_id.clone(), *when);
-                            info!(log, "revoked known certificate"; "key_id" => %key_id, "actor" => %actor);
-                        } else {
-                            self.tombstones.put(key_id.clone(), *when);
-                            info!(log, "revoked unknown certificate"; "key_id" => %key_id, "actor" => %actor);
-                        }
+                        info!(
+                            log, "resuming committed session at its successor";
+                            "session_id" => %session_id,
+                            "successor" => %committed.successor,
+                        );
+                        session.resume_at(committed.successor);
                     }
-                },
-                Request::Session(attributed) => match attributed.as_parts() {
-                    (actor, SessionRequest::Start(session_id)) => match &mut self.session {
-                        // Re-announcement of active session; absorb and ignore.
-                        Active {
-                            frontier, session, ..
-                        } if session.session_id() == *session_id => {
-                            *frontier |= incoming_version.clone();
-                            info!(log, "duplicate session start"; "session_id" => %session_id);
-                        }
+                    outputs.extend(self.skip_queued_jobs(now));
+                    outputs.push(Output::RotateNonce);
+                    self.session = Active {
+                        starts: self.session.starts() | incoming_version.clone(),
+                        started: incoming_version.clone(),
+                        session: Box::new(session),
+                        queued_jobs: QueuedJobs::new(),
+                        attach_grants: BTreeMap::new(),
+                    };
+                }
 
-                        // If the incoming new session is in the *strict
-                        // causal future* of everything we have observed,
-                        // adopt it regardless of our current state. Every
-                        // other peer will make the same decision, so it
-                        // will come to dominate the network entirely.
-                        Inactive { frontier } | Active { frontier, .. }
-                            if *incoming_version > *frontier =>
-                        {
-                            info!(
-                                log, "session started";
-                                "session_id" => %session_id, "actor" => %actor,
-                            );
-                            self.skip_queued_jobs(executor);
-                            let mut session = Session::started(*session_id, actor.clone());
-                            // The committed session resumes at its
-                            // stored successor: every earlier chain
-                            // position was already handled by the life
-                            // that stored it, and the chain needs no
-                            // replay to verify the next job.
-                            if let Some(committed) = self
-                                .past
-                                .committed
-                                .as_ref()
-                                .and_then(|boundary| boundary.job.as_ref())
-                                .filter(|committed| committed.session == *session_id)
-                            {
-                                info!(
-                                    log, "resuming the committed session at its successor";
-                                    "session_id" => %session_id,
-                                    "successor" => %committed.successor,
-                                );
-                                session.resume_at(committed.successor);
-                            }
-                            self.session = Active {
-                                frontier: self.session.frontier() | incoming_version.clone(),
-                                started: incoming_version.clone(),
-                                session: Box::new(session),
-                                queued_jobs: QueuedJobs::new(),
-                                attach_grants: BTreeMap::new(),
-                            };
-                            *self.session_sush_nonce.lock().unwrap() = SessionSushNonce::random();
-                        }
+                // When the incoming session is concurrent, we can't
+                // establish which is older, so we have to kill both
+                // sessions. Every peer will make this same decision,
+                // so as a partition resolves, both sessions will be
+                // killed everywhere.
+                Active {
+                    starts,
+                    started,
+                    session,
+                    ..
+                } if incoming_version.partial_cmp(starts).is_none() => {
+                    let starts = starts.to_owned();
+                    let error = Error::ConcurrentSessions {
+                        own_session: session.session_id(),
+                        own_version: Box::new(started.clone()),
+                        incoming_session: *session_id,
+                        incoming_version: Box::new(incoming_version.clone()),
+                    };
+                    outputs.extend(self.skip_queued_jobs(now));
+                    outputs.push(Output::Gossip(Message::Event(
+                        self.rack.own_baseboard().to_owned(),
+                        Event::Error(error),
+                    )));
+                    self.session = Inactive {
+                        starts: starts | incoming_version.clone(),
+                    };
+                }
 
-                        // When the incoming session is concurrent, we can't
-                        // establish which is older, so we have to kill both
-                        // sessions. Every peer will make this same decision,
-                        // so as a partition resolves, both sessions will be
-                        // killed everywhere.
-                        Active {
-                            frontier,
-                            started,
-                            session,
-                            ..
-                        } if incoming_version.partial_cmp(frontier).is_none() => {
-                            let error = Error::ConcurrentSessions {
-                                own_session: session.session_id(),
-                                own_version: started.clone(),
-                                incoming_session: *session_id,
-                                incoming_version: incoming_version.clone(),
-                            };
-                            let frontier = &*frontier | incoming_version.clone();
-                            self.skip_queued_jobs(executor);
-                            self.session = Inactive { frontier };
-                            return Err(error);
-                        }
-
-                        // Stale (≤ frontier) or concurrent while inactive; OBE.
-                        // Absorb and ignore.
-                        Inactive { frontier, .. } | Active { frontier, .. } => {
-                            info!(
-                                log,
-                                "stale session start";
-                                "session_id" => %session_id,
-                                "frontier" => %frontier,
-                                "incoming_version" => %incoming_version,
-                            );
-                            *frontier |= incoming_version.clone();
-                        }
-                    },
-                    (actor, SessionRequest::Stop(session_id)) => {
-                        // Any session stop request for a session that isn't
-                        // ours is silently ignored. Even in the case of
-                        // arbitrary causal reordering (which we must handle),
-                        // this is safe, because we're guaranteed (1) that a
-                        // stop must come *after* its corresponding start, and
-                        // (2) that all sessions are locally causally ordered
-                        // relative to one another, because we create this
-                        // ordering above when handling session-start. Together,
-                        // this means that we can't fail to react to a stop for
-                        // the active session.
-                        if let Active {
-                            frontier, session, ..
-                        } = &self.session
-                            && session.session_id() == *session_id
-                        {
-                            if session.started_by() != Some(actor) {
-                                warn!(
-                                    log, "ignoring session stop from non-starter";
-                                    "session_id" => %session_id, "actor" => %actor,
-                                );
-                            } else {
-                                info!(
-                                    log, "session stopped";
-                                    "session_id" => %session_id, "actor" => %actor,
-                                );
-                                self.skip_queued_jobs(executor);
-                                self.session = Inactive {
-                                    frontier: frontier.clone(),
-                                }
-                            }
-                        }
-                    }
-                    (actor, SessionRequest::AllowAttach(session_id, key_id, access)) => {
-                        if let Active {
-                            session,
-                            attach_grants,
-                            ..
-                        } = &mut self.session
-                            && session.session_id() == *session_id
-                        {
-                            if session.started_by() == Some(actor) {
-                                attach_grants.insert(key_id.clone(), *access);
-                                info!(
-                                    log, "attach allowed";
-                                    "key_id" => %key_id, "access" => ?access, "actor" => %actor,
-                                );
-                            } else {
-                                warn!(
-                                    log, "ignoring attach grant from non-starter";
-                                    "key_id" => %key_id, "actor" => %actor,
-                                );
-                            }
-                        }
-                    }
-                    (actor, SessionRequest::DenyAttach(session_id, key_id)) => {
-                        if let Active {
-                            session,
-                            attach_grants,
-                            ..
-                        } = &mut self.session
-                            && session.session_id() == *session_id
-                        {
-                            if session.started_by() == Some(actor) {
-                                attach_grants.remove(key_id);
-                                info!(
-                                    log, "attach denied";
-                                    "key_id" => %key_id, "actor" => %actor,
-                                );
-                            } else {
-                                warn!(
-                                    log, "ignoring attach denial from non-starter";
-                                    "key_id" => %key_id, "actor" => %actor,
-                                );
-                            }
-                        }
-                    }
-                    (actor, SessionRequest::Skip(session_id, job_id)) => {
-                        let replayed = !self.is_live(incoming_version);
-                        if let Some(mut session) = self.session.active_session()
-                            && session.session_id() == *session_id
-                        {
-                            if session.started_by() != Some(actor) {
-                                warn!(
-                                    log, "ignoring job skip from non-starter";
-                                    "job_id" => %job_id, "actor" => %actor,
-                                );
-                            } else if session.skip_job(job_id) {
-                                info!(
-                                    log, "job skipped";
-                                    "job_id" => %job_id, "actor" => %actor,
-                                );
-                                session.cancel_job(
-                                    job_id,
-                                    actor,
-                                    &self.own_baseboard,
-                                    &mut self.history,
-                                    &self.running,
-                                    replayed,
-                                );
-                                session.execute_ready_jobs(
-                                    log,
-                                    &self.own_baseboard,
-                                    &self.cubbies,
-                                    &mut self.certs,
-                                    &mut self.history,
-                                    executor,
-                                    &mut self.attachments,
-                                    &mut self.past,
-                                    rumors,
-                                );
-                            } else {
-                                info!(
-                                    log, "ignoring inapplicable job skip";
-                                    "job_id" => %job_id, "actor" => %actor,
-                                );
-                            }
-                        } else {
-                            info!(
-                                log,
-                                "skipping job in inactive or invalid session";
-                                "session_id" => %session_id
-                            );
-                        }
-                    }
-                },
-                Request::Job(attributed) => match attributed.as_parts() {
-                    (actor, JobRequest::Start(signed, params)) => {
-                        // TODO: When we implement
-                        // https://github.com/oxidecomputer/sush/issues/23, we
-                        // should check for revocation here before executing the
-                        // job. This enforces revocation globally, instead of
-                        // just when the job is injected first into the system.
-
-                        // The session must be active and must match the
-                        // submitted job.
-                        //
-                        // It is safe to refuse all other jobs. By cases:
-                        //
-                        // - If the job came from a session in the causal
-                        // past of our own, the session has been superseded,
-                        // so we should not run it.
-                        // - If the job came from a session concurrent to
-                        // our own, both sessions should be annihilated, so
-                        // we should not run it.
-                        // - If the job came from a session in the causal
-                        // future of our own, contradiction: we consume
-                        // messages in causal order, so it's not possible to
-                        // receive a job from a session before that
-                        // session's own start (since each session is
-                        // linearized by its accepting server).
-                        //
-                        // Refused jobs targeting this sled record the
-                        // terminal skip status so the submitter learns
-                        // their fate.
-                        let session_id = signed.payload().session_id();
-                        let live = self.is_live(incoming_version);
-                        match self.session.active_session() {
-                            Some(mut session) if session.session_id() == session_id => {
-                                session.enqueue_job(
-                                    log,
-                                    &mut self.history,
-                                    &self.running,
-                                    &self.own_baseboard,
-                                    &self.cubbies,
-                                    signed.clone(),
-                                    params.clone(),
-                                    actor,
-                                    !live,
-                                );
-                                session.execute_ready_jobs(
-                                    log,
-                                    &self.own_baseboard,
-                                    &self.cubbies,
-                                    &mut self.certs,
-                                    &mut self.history,
-                                    executor,
-                                    &mut self.attachments,
-                                    &mut self.past,
-                                    rumors,
-                                );
-                            }
-                            _ => {
-                                let job_id = *signed.job_id();
-                                warn!(
-                                    log, "skipping job for inactive session";
-                                    "job_id" => %job_id,
-                                    "session_id" => %session_id,
-                                    "actor" => %actor,
-                                );
-                                if live
-                                    && signed.payload().runs_on(&self.own_baseboard, &self.cubbies)
-                                    && !self.history.contains(&job_id)
-                                {
-                                    executor.job_skipped(job_id, SkipReason::SessionEnded);
-                                }
-                            }
-                        }
-                    }
-                    (actor, JobRequest::Stop(job_id)) => {
-                        executor.job_stop(job_id);
-                        let replayed = !self.is_live(incoming_version);
-                        if let Some(mut session) = self.session.active_session() {
-                            session.cancel_job(
-                                job_id,
-                                actor,
-                                &self.own_baseboard,
-                                &mut self.history,
-                                &self.running,
-                                replayed,
-                            );
-                        }
-                    }
-                },
-                Request::Identity(attributed) => match attributed.as_parts() {
-                    (actor, IdentityRequest::Login(openssh, signed)) => {
-                        match SshPublicKey::from_openssh(openssh)
-                            .and_then(|public_key| verify_login(&public_key, signed))
-                        {
-                            Ok(registered) => {
-                                let identity = &registered.identity;
-                                if self.revoked_keys.peek(&identity.key_id).is_some() {
-                                    info!(
-                                        log, "refusing login for revoked key";
-                                        "key_id" => %identity.key_id, "actor" => %actor,
-                                    );
-                                } else {
-                                    info!(
-                                        log, "registered identity";
-                                        "key_id" => %identity.key_id, "actor" => %actor,
-                                    );
-                                    let key = (identity.key_id.clone(), identity.nonce.clone());
-                                    self.identities.put(key, registered);
-                                }
-                            }
-                            Err(error) => {
-                                error!(
-                                    log, "ignoring invalid login";
-                                    "error" => %error, "actor" => %actor,
-                                );
-                            }
-                        }
-                    }
-                    (actor, IdentityRequest::Revoke(key_id, when)) => {
-                        let dead: Vec<(KeyId, Nonce)> = self
-                            .identities
-                            .iter()
-                            .filter(|((id, _), _)| id == key_id)
-                            .map(|(key, _)| key.clone())
-                            .collect();
-                        for key in dead {
-                            self.identities.pop(&key);
-                        }
-                        self.revoked_keys.put(key_id.clone(), *when);
-                        info!(log, "revoked identity"; "key_id" => %key_id, "actor" => %actor);
-                    }
-                },
+                // Stale or concurrent session while inactive; OBE.
+                // Absorb and ignore.
+                Inactive { starts, .. } | Active { starts, .. } => {
+                    info!(
+                        log, "stale session start";
+                        "session_id" => %session_id,
+                        "starts" => %starts,
+                        "incoming_version" => %incoming_version,
+                    );
+                    *starts |= incoming_version.clone();
+                }
             },
-            V0(Message::Event(baseboard_id, event)) => match event {
-                // Track the active set of known-running jobs anywhere in the rack.
-                Event::Job(job_event) => match job_event {
+            SessionRequest::Stop(session_id) => {
+                // Any session stop request for a session that isn't
+                // ours is silently ignored. Even in the case of
+                // arbitrary causal reordering (which we must handle),
+                // this is safe, because we're guaranteed (1) that a
+                // stop must come *after* its corresponding start, and
+                // (2) that all sessions are locally causally ordered
+                // relative to one another, because we create this
+                // ordering above when handling session-start. Together,
+                // this means that we can't fail to react to a stop for
+                // the active session.
+                if let Active {
+                    starts, session, ..
+                } = &self.session
+                    && session.session_id() == *session_id
+                {
+                    if session.started_by() != Some(actor) {
+                        warn!(
+                            log, "ignoring session stop from non-starter";
+                            "session_id" => %session_id, "actor" => %actor,
+                        );
+                    } else {
+                        info!(
+                            log, "session stopped";
+                            "session_id" => %session_id, "actor" => %actor,
+                        );
+                        outputs.extend(self.skip_queued_jobs(now));
+                        self.session = Inactive {
+                            starts: starts.clone(),
+                        };
+                    }
+                }
+            }
+            SessionRequest::AllowAttach(session_id, key_id, access) => {
+                if let Active {
+                    session,
+                    attach_grants,
+                    ..
+                } = &mut self.session
+                    && session.session_id() == *session_id
+                {
+                    if session.started_by() == Some(actor) {
+                        attach_grants.insert(key_id.clone(), *access);
+                        info!(
+                            log, "attach allowed";
+                            "key_id" => %key_id, "access" => ?access, "actor" => %actor,
+                        );
+                    } else {
+                        warn!(
+                            log, "ignoring attach grant from non-starter";
+                            "key_id" => %key_id, "actor" => %actor,
+                        );
+                    }
+                }
+            }
+            SessionRequest::DenyAttach(session_id, key_id) => {
+                if let Active {
+                    session,
+                    attach_grants,
+                    ..
+                } = &mut self.session
+                    && session.session_id() == *session_id
+                {
+                    if session.started_by() == Some(actor) {
+                        attach_grants.remove(key_id);
+                        info!(
+                            log, "attach denied";
+                            "key_id" => %key_id, "actor" => %actor,
+                        );
+                    } else {
+                        warn!(
+                            log, "ignoring attach denial from non-starter";
+                            "key_id" => %key_id, "actor" => %actor,
+                        );
+                    }
+                }
+            }
+            SessionRequest::Skip(session_id, job_id) => {
+                let replayed = !self.is_live(incoming_version);
+                if let Some(session) = match &mut self.session {
+                    SessionState::Active { session, .. } => Some(session),
+                    _ => None,
+                } && session.session_id() == *session_id
+                {
+                    if session.started_by() != Some(actor) {
+                        warn!(
+                            log, "ignoring job skip from non-starter";
+                            "job_id" => %job_id, "actor" => %actor,
+                        );
+                    } else if session.skip_job(*job_id) {
+                        info!(
+                            log, "job skipped";
+                            "job_id" => %job_id, "actor" => %actor,
+                        );
+                        self.cancel_job(now, job_id, actor, replayed);
+                        outputs.extend(self.release_ready_jobs(log, now, network));
+                    } else {
+                        info!(
+                            log, "ignoring inapplicable job skip";
+                            "job_id" => %job_id, "actor" => %actor,
+                        );
+                    }
+                } else {
+                    info!(
+                        log,
+                        "skipping job in inactive or invalid session";
+                        "session_id" => %session_id
+                    );
+                }
+            }
+        }
+        outputs
+    }
+
+    #[must_use]
+    fn handle_job_request(
+        &mut self,
+        log: &Logger,
+        now: DateTime<Utc>,
+        network: Option<Network>,
+        incoming_version: &Version,
+        actor: &KeyId,
+        request: &JobRequest,
+    ) -> Vec<Output> {
+        let mut outputs = Vec::new();
+        match request {
+            JobRequest::Start(signed, params) => {
+                // TODO: When we implement
+                // https://github.com/oxidecomputer/sush/issues/23, we
+                // should check for revocation here before executing the
+                // job. This enforces revocation globally, instead of
+                // just when the job is injected first into the system.
+
+                // The session must be active and must match the
+                // submitted job.
+                //
+                // It is safe to refuse all other jobs. By cases:
+                //
+                // - If the job came from a session in the causal
+                // past of our own, the session has been superseded,
+                // so we should not run it.
+                // - If the job came from a session concurrent to
+                // our own, both sessions should be annihilated, so
+                // we should not run it.
+                // - If the job came from a session in the causal
+                // future of our own, contradiction: we consume
+                // messages in causal order, so it's not possible to
+                // receive a job from a session before that
+                // session's own start (since each session is
+                // linearized by its accepting server).
+                //
+                // Refused jobs targeting this sled record the
+                // terminal skip status so the submitter learns
+                // their fate.
+                let session_id = signed.payload().session_id();
+                let live = self.is_live(incoming_version);
+                if self
+                    .session
+                    .session()
+                    .is_some_and(|s| s.session_id() == session_id)
+                {
+                    self.enqueue_job(log, now, signed.clone(), params.clone(), actor, !live);
+                    outputs.extend(self.release_ready_jobs(log, now, network));
+                } else {
+                    let job_id = *signed.job_id();
+                    warn!(
+                        log, "skipping job for inactive session";
+                        "job_id" => %job_id,
+                        "session_id" => %session_id,
+                        "actor" => %actor,
+                    );
+                    if live && self.rack.runs_here(signed) && !self.history.contains(&job_id) {
+                        outputs.push(Output::job_event(
+                            self.rack.own_baseboard(),
+                            JobEvent::Skipped(job_id, now, SkipReason::SessionEnded),
+                        ));
+                    }
+                }
+            }
+            JobRequest::Stop(job_id) => {
+                outputs.push(Output::Stop(*job_id));
+                let replayed = !self.is_live(incoming_version);
+                self.cancel_job(now, job_id, actor, replayed);
+            }
+        }
+        outputs
+    }
+
+    /// Track the active set of known-running jobs anywhere in the rack.
+    #[must_use]
+    fn handle_event(
+        &mut self,
+        log: &Logger,
+        incoming_version: &Version,
+        baseboard_id: &BaseboardId,
+        event: &Event,
+    ) -> Vec<Output> {
+        let log = log.new(o!("sled" => baseboard_id.to_string()));
+        let mut outputs = Vec::new();
+        match event {
+            Event::Job(job_event) => {
+                let status = match job_event {
                     JobEvent::Start(job_id, when) => {
                         // A start never displaces a terminal status.
                         // After an identity change, an adjudicated
@@ -1201,10 +1055,10 @@ impl State {
                             .is_some_and(|status| status.is_terminal())
                         {
                             info!(log, "ignoring a start for a settled job"; "job_id" => %job_id);
-                            return Ok(());
+                            return outputs;
                         }
                         info!(log, "job started"; "job_id" => %job_id, "when" => %when);
-                        self.running.insert((*job_id, baseboard_id.clone()), *when);
+
                         // A start on our own baseboard sent by a
                         // previous life names a job whose process
                         // died with that life. No executor here will
@@ -1215,8 +1069,8 @@ impl State {
                         // mark would misread a previous life's start
                         // as this life's own whenever the join peer
                         // lagged behind that start.
-                        if *baseboard_id == self.own_baseboard
-                            && self.past.is_from_previous_life(incoming_version)
+                        if baseboard_id == self.rack.own_baseboard()
+                            && !self.past.is_live(incoming_version)
                         {
                             self.past.zombies.insert(*job_id);
                         }
@@ -1229,16 +1083,15 @@ impl State {
                             },
                             Some(incoming_version.rank()),
                             self.session.queued_jobs(),
-                            &self.running,
                         );
+                        None
                     }
                     JobEvent::Stop(job_id, when, result, output) => {
                         info!(log, "job stopped"; "job_id" => %job_id, "when" => %when, "result" => ?result);
-                        if baseboard_id == &self.own_baseboard {
+                        if baseboard_id == self.rack.own_baseboard() {
                             self.attachments.remove(job_id);
                             self.past.zombies.remove(job_id);
                         }
-                        self.running.remove(&(*job_id, baseboard_id.clone()));
                         self.history.transition_job_status(
                             job_id,
                             baseboard_id,
@@ -1253,10 +1106,9 @@ impl State {
                                         output: output.clone(),
                                     })
                                 }
-                                // An interrupted declaration raced this
-                                // genuine stop. The real result wins in
-                                // either arrival order, though the start
-                                // time died with the previous life.
+                                // An interrupted declaration raced this stop event.
+                                // The real result wins in either arrival order,
+                                // though the start time died with the previous life.
                                 Some(JobStatus::Error {
                                     error: ProcessError::Interrupted,
                                     time_error,
@@ -1271,28 +1123,21 @@ impl State {
                                 _ => None,
                             },
                             self.session.queued_jobs(),
-                            &self.running,
-                        );
-                        if *baseboard_id == self.own_baseboard {
-                            executor.job_stopped(job_id);
-                            self.record_boundary_outcome(job_id);
-                        }
+                        )
                     }
                     JobEvent::Error(job_id, when, error) => {
                         error!(log, "job error"; "job_id" => %job_id, "when" => %when, "error" => %error);
-                        if baseboard_id == &self.own_baseboard {
+                        if baseboard_id == self.rack.own_baseboard() {
                             self.attachments.remove(job_id);
                             self.past.zombies.remove(job_id);
                         }
-                        self.running.remove(&(*job_id, baseboard_id.clone()));
                         self.history.transition_job_status(
                             job_id,
                             baseboard_id,
                             Some(incoming_version.rank()),
-                            // An error never displaces a terminal
-                            // status, so a stop that raced an
-                            // interrupted declaration keeps the real
-                            // result.
+                            // An error never displaces a terminal status, so a
+                            // stop that raced an interrupted declaration keeps
+                            // the real result.
                             |old_status| match old_status {
                                 None
                                 | Some(JobStatus::Queued { .. })
@@ -1304,26 +1149,20 @@ impl State {
                                 _ => None,
                             },
                             self.session.queued_jobs(),
-                            &self.running,
-                        );
-                        if *baseboard_id == self.own_baseboard {
-                            executor.job_stopped(job_id);
-                            self.record_boundary_outcome(job_id);
-                        }
+                        )
                     }
                     JobEvent::Skipped(job_id, when, reason) => {
                         info!(
                             log, "job skipped";
                             "job_id" => %job_id, "when" => %when, "reason" => %reason,
                         );
-                        self.running.remove(&(*job_id, baseboard_id.clone()));
                         self.history.transition_job_status(
                             job_id,
                             baseboard_id,
                             Some(incoming_version.rank()),
-                            // A skip is the reporting sled's decision
-                            // about itself, and never displaces a
-                            // terminal status it already reported.
+                            // A skip is the reporting sled's decision about
+                            // itself, and never displaces a terminal status it
+                            // already reported.
                             |old_status| match old_status {
                                 None
                                 | Some(JobStatus::Queued { .. })
@@ -1335,67 +1174,312 @@ impl State {
                                 _ => None,
                             },
                             self.session.queued_jobs(),
-                            &self.running,
-                        );
+                        )
                     }
-                },
-                Event::Error(error) => {
-                    error!(log, "session error"; "error" => %error);
-                }
-                Event::Version(info) => {
-                    // Our own seed is authoritative, and may be newer
-                    // than a replayed announce from a previous boot.
-                    if *baseboard_id != self.own_baseboard {
-                        info!(log, "sled version"; "sled" => %baseboard_id, "version" => %info);
-                        self.versions.insert(baseboard_id.clone(), info.clone());
-                    }
-                }
-            },
-            Unknown { version, .. } => {
-                if self.unknown_versions.insert(version.clone()) {
-                    warn!(log, "ignoring messages from a newer peer"; "version" => version);
+                };
+                if let Some(status) = status
+                    && status.is_terminal()
+                    && baseboard_id == self.rack.own_baseboard()
+                {
+                    outputs.push(Output::Ran(status));
                 }
             }
-        }
+            Event::Error(error) => {
+                error!(log, "session error"; "error" => %error);
+            }
+            Event::Version(info) => {
+                if self.rack.known_version(baseboard_id.clone(), info.clone()) {
+                    info!(log, "sled version"; "version" => %info);
+                }
+            }
+        };
+        outputs
+    }
 
-        Ok(())
+    fn enqueue_job(
+        &mut self,
+        log: &Logger,
+        now: DateTime<Utc>,
+        job: SignedJob,
+        params: JobStartParams,
+        actor: &KeyId,
+        replayed: bool,
+    ) {
+        let SessionState::Active { queued_jobs, .. } = &mut self.session else {
+            return;
+        };
+        let job_id = *job.job_id();
+        let targeted = self.rack.runs_here(&job);
+
+        // Adjudication can give the boundary job a status before its
+        // request replays. The queue releases jobs in order, so
+        // dropping that request would wedge the session behind the
+        // boundary job forever. A replayed request therefore always
+        // joins the queue; only a live duplicate is dropped.
+        if !replayed && self.history.contains(&job_id) {
+            // Note but otherwise ignore the duplicate job.
+            info!(log, "already started job"; "job_id" => %job_id);
+        } else if !replayed
+            && queued_jobs.len() >= MAX_QUEUED_JOBS
+            && !queued_jobs.contains_key(&job_id)
+        {
+            // We have no choice; drop the job on the floor.
+            warn!(log, "too many jobs queued"; "job_id" => %job_id, "max" => MAX_QUEUED_JOBS);
+        } else {
+            // Insert the job into our queue. Every job joins the
+            // queue to keep the causal chain whole, but only jobs
+            // targeting this sled that can actually run here record
+            // a local status.
+            queued_jobs.insert(
+                job_id,
+                QueuedJob {
+                    job,
+                    params,
+                    replayed,
+                },
+            );
+            if targeted && !replayed {
+                self.history.set_job_status(
+                    &job_id,
+                    self.rack.own_baseboard(),
+                    JobStatus::Queued {
+                        job_id,
+                        time_queued: now,
+                        actor: actor.clone(),
+                    },
+                    None,
+                    Some(queued_jobs),
+                );
+            }
+        }
+    }
+
+    fn cancel_job(&mut self, now: DateTime<Utc>, job_id: &JobId, actor: &KeyId, replayed: bool) {
+        let SessionState::Active { queued_jobs, .. } = &mut self.session else {
+            return;
+        };
+        queued_jobs.remove(job_id);
+        if replayed {
+            return;
+        }
+        self.history.transition_job_status(
+            job_id,
+            self.rack.own_baseboard(),
+            None,
+            |old_status| match old_status {
+                None | Some(JobStatus::Queued { .. }) => Some(JobStatus::Cancelled {
+                    job_id: *job_id,
+                    time_cancelled: now,
+                    actor: actor.clone(),
+                }),
+                _ => None,
+            },
+            Some(queued_jobs),
+        );
+    }
+
+    /// Pull out the next job to execute (if any), repeatedly.
+    /// We loop because adding or skipping a job may have "filled a hole"
+    /// in the hash chain, and there may be an unbounded number of
+    /// newly-ready-to-run jobs after it in the queue. Once we reach
+    /// a fixed point, we have nothing further to do.
+    #[must_use]
+    fn release_ready_jobs(
+        &mut self,
+        log: &Logger,
+        now: DateTime<Utc>,
+        network: Option<Network>,
+    ) -> Vec<Output> {
+        let mut outputs = Vec::new();
+        let SessionState::Active {
+            session,
+            started,
+            queued_jobs,
+            ..
+        } = &mut self.session
+        else {
+            return outputs;
+        };
+
+        // If there's no universe, just drain the queue and advance the chain.
+        let Some(network) = network else {
+            let mut n = 0;
+            while let Some(queued) = queued_jobs.remove(&session.next_job_id()) {
+                session.job_started(queued.job);
+                n += 1;
+            }
+            if n > 0 {
+                warn!(log, "skipped queued jobs while draining"; "n" => n);
+            }
+            return outputs;
+        };
+
+        loop {
+            let next_id = session.next_job_id();
+            if !queued_jobs.contains_key(&next_id) {
+                break;
+            }
+
+            let admission = self.past.screen(network, session.session_id(), started);
+            if matches!(admission, Admission::Hop) {
+                warn!(
+                    log, "hopping sessions, raising the execution floor";
+                    "session_id" => %session.session_id(), "started" => ?started,
+                );
+                self.past.committed.raise(self.past.frontier.clone());
+                outputs.push(Output::Gossip(Message::Event(
+                    self.rack.own_baseboard().to_owned(),
+                    Event::Error(Error::SessionHop),
+                )));
+                continue;
+            }
+
+            let QueuedJob {
+                job: request,
+                params,
+                replayed,
+            } = queued_jobs.remove(&next_id).expect("checked above");
+            let job_id = request.payload().job_id().to_owned();
+            if self.rack.runs_here(&request) {
+                if matches!(admission, Admission::Untrusted) {
+                    warn!(
+                        log, "execution boundary is untrusted, refusing job";
+                        "job_id" => %job_id,
+                    );
+                    outputs.push(Output::job_event(
+                        self.rack.own_baseboard(),
+                        JobEvent::Error(
+                            job_id,
+                            now,
+                            ProcessError::Io {
+                                what: "consulting the execution boundary".to_string(),
+                                error: "the boundary records on this sled's M.2s disagree \
+                                        or are corrupt; an M.2 may have failed and the sled \
+                                        needs service"
+                                    .to_string(),
+                            },
+                        ),
+                    ));
+                } else if matches!(admission, Admission::Refuse) {
+                    // Below the floor the queue skips forward in chain
+                    // order. A live job gets the terminal skip status;
+                    // a replayed one is history, and re-reporting it
+                    // on every rejoin would grow the message set.
+                    if !replayed {
+                        warn!(log, "skipping job below the execution floor"; "job_id" => %job_id);
+                        outputs.push(Output::job_event(
+                            self.rack.own_baseboard(),
+                            JobEvent::Skipped(job_id, now, SkipReason::BelowFloor),
+                        ));
+                    }
+                } else if self
+                    .history
+                    .get_job_status(&job_id)
+                    .map(|status| {
+                        matches!(
+                            status.get(self.rack.own_baseboard()),
+                            Some(JobStatus::Queued { .. })
+                        )
+                    })
+                    .unwrap_or(true)
+                {
+                    let checked = self
+                        .certs
+                        .verify(&request)
+                        .map_err(|error| ProcessError::InvalidJob(error.to_string()))
+                        .and_then(|job| Executor::check_command(job.payload()).map(|()| job));
+                    match checked {
+                        Err(error) => outputs.push(Output::job_event(
+                            self.rack.own_baseboard(),
+                            JobEvent::Error(job_id, now, error),
+                        )),
+                        Ok(job) => {
+                            let (attachment, rx_attachment) = watch::channel(None);
+                            self.attachments.insert(job_id, rx_attachment);
+                            outputs.push(Output::Run(Box::new(Run {
+                                job,
+                                params,
+                                attachment,
+                                boundary: self.past.commit_to(
+                                    network,
+                                    started,
+                                    session.session_id(),
+                                    job_id,
+                                    session
+                                        .session_id()
+                                        .next_job_id(&LastJob::Some(request.clone())),
+                                ),
+                            })));
+                        }
+                    }
+                }
+            }
+            session.job_started(request);
+        }
+        outputs
     }
 }
 
-/// Apply one gossip message to the state, reporting update errors back
-/// onto the network.
+/// Feed one input through the state machine, then apply its outputs.
 ///
 /// We unconditionally mark the watch sender as modified even though it
-/// might not be, because *most* of the messages cause *some* modification
+/// might not be, because *most* of the inputs cause *some* modification
 /// of the state, and we would rather be safe against future code changes
-/// than manually tracking precisely which messages *don't* modify state.
+/// than manually tracking precisely which inputs *don't* modify state.
 /// The cost is a few spurious wakeups.
-fn apply_message(
+fn apply(
     log: &Logger,
     tx_state: &watch::Sender<State>,
     executor: &mut Executor,
     rumors: Option<&GossipNetwork>,
-    own_baseboard: &BaseboardId,
-    version: &Version,
-    message: &Arc<VersionedMessage>,
+    store: &Arc<BoundaryStore>,
+    nonce: &Arc<Mutex<SessionSushNonce>>,
+    input: Input,
 ) {
+    let now = Utc::now();
+    let network = rumors.map(|r| r.network());
+    let mut outputs = Vec::new();
     tx_state.send_modify(|state| {
-        if let Err(error) = state.update(log, executor, rumors, version, message) {
-            error!(log, "state update failed"; "error" => ?error);
-            // Re-gossiping a replayed message's error would grow the
-            // set a little more on every rejoin by every sled.
-            if state.is_live(version)
-                && let Some(rumors) = rumors
-            {
-                debug!(log, "sending error to gossip network"; "error" => ?error);
-                gossip(
-                    log,
-                    rumors,
-                    Message::Event(own_baseboard.clone(), Event::Error(error)).into(),
-                );
+        outputs = state.step(log, now, network, input);
+    });
+    apply_outputs(log, executor, rumors, store, nonce, outputs);
+}
+
+fn apply_outputs(
+    log: &Logger,
+    executor: &mut Executor,
+    rumors: Option<&GossipNetwork>,
+    store: &Arc<BoundaryStore>,
+    nonce: &Arc<Mutex<SessionSushNonce>>,
+    outputs: Vec<Output>,
+) {
+    for output in outputs {
+        match output {
+            Output::Run(run) => {
+                let Run {
+                    job,
+                    params,
+                    boundary,
+                    attachment,
+                } = *run;
+                executor.job_start(job, params, attachment, boundary);
+            }
+            Output::Stop(job_id) => executor.job_stop(&job_id),
+            Output::Ran(status) => {
+                executor.job_stopped(status.job_id());
+                let store = store.clone();
+                spawn(async move { store.record_outcome(&status).await });
+            }
+            Output::Gossip(message) => {
+                if let Some(rumors) = rumors {
+                    gossip(log, rumors, message.into());
+                }
+            }
+            Output::RotateNonce => {
+                *nonce.lock().unwrap() = SessionSushNonce::random();
             }
         }
-    });
+    }
 }
 
 /// Apply every message already delivered locally, without waiting for
@@ -1406,19 +1490,57 @@ fn drain_ready(
     tx_state: &watch::Sender<State>,
     executor: &mut Executor,
     rumors: Option<&GossipNetwork>,
-    own_baseboard: &BaseboardId,
+    store: &Arc<BoundaryStore>,
+    nonce: &Arc<Mutex<SessionSushNonce>>,
 ) {
     while let Some(Some((version, message))) = causal_messages.next().now_or_never() {
-        apply_message(
+        apply(
             log,
             tx_state,
             executor,
             rumors,
-            own_baseboard,
-            &version,
-            &message,
+            store,
+            nonce,
+            Input::Gossip(version, message),
         );
     }
+}
+
+/// Enter a universe: judge the boundary record, announce this build,
+/// and mark the birth. The announce is this life's first send and
+/// goes out before the birth snapshot is taken, so the birth is the
+/// announce's own version. A flip-flop report follows the announce.
+fn enter_universe(
+    log: &Logger,
+    own_baseboard: BaseboardId,
+    anchors: &[Certificate],
+    store: &BoundaryStore,
+    rumors: &GossipNetwork,
+    remainder: Remainder,
+) -> Result<State, KeyError> {
+    let (committed, report) = Commitment::at_entry(log, store, rumors);
+    gossip(
+        log,
+        rumors,
+        Message::Event(
+            own_baseboard.clone(),
+            Event::Version(VersionInfo::current()),
+        )
+        .into(),
+    );
+    if let Some(report) = report {
+        gossip(
+            log,
+            rumors,
+            Message::Event(own_baseboard.clone(), Event::Error(report)).into(),
+        );
+    }
+    let birth = rumors.snapshot().latest().clone();
+    State::new(
+        own_baseboard,
+        anchors,
+        remainder.into_past(birth, committed),
+    )
 }
 
 /// Send a message into the gossip set. An error means the payload
@@ -1427,176 +1549,6 @@ fn gossip(log: &Logger, rumors: &GossipNetwork, message: VersionedMessage) {
     if let Err(error) = rumors.send(message) {
         error!(log, "the gossip set refused a message"; "error" => %error);
     }
-}
-
-/// Declare interrupted every job a previous life left running,
-/// excluding `survivors` (jobs this incarnation carried across a
-/// universe swap) and jobs already reaped. Zombies come only from
-/// replayed start events, so a job this incarnation started is never
-/// a candidate. Reap only at local quiescence (after
-/// [`drain_ready`]), when a zombie whose terminal event is already
-/// here has been cleared.
-fn reap_zombies(
-    log: &Logger,
-    tx_state: &watch::Sender<State>,
-    rumors: Option<&GossipNetwork>,
-    own_baseboard: &BaseboardId,
-    survivors: &BTreeSet<JobId>,
-    reaped: &mut BTreeSet<JobId>,
-) {
-    let mut zombies = tx_state.borrow().zombies();
-    zombies.retain(|job_id| !survivors.contains(job_id) && !reaped.contains(job_id));
-    for job_id in zombies {
-        reaped.insert(job_id);
-        if let Some(rumors) = rumors {
-            gossip(
-                log,
-                rumors,
-                Message::Event(
-                    own_baseboard.clone(),
-                    Event::Job(JobEvent::Error(
-                        job_id,
-                        Utc::now(),
-                        ProcessError::Interrupted,
-                    )),
-                )
-                .into(),
-            );
-        }
-        warn!(log, "interrupted job from a previous life"; "job_id" => %job_id);
-    }
-}
-
-/// Adjudicate the boundary job if replay gave it no status on our
-/// baseboard: announce its recorded ending, or interrupted when none
-/// was recorded. No status means its fate never left this sled, and
-/// no other sled can ever report it. A replayed start makes it a
-/// zombie instead, and a replayed end settles it. Adjudicate only
-/// after replay drains, like [`reap_zombies`], and once per universe.
-/// The ruling is gossiped to every sled, but a sled that already
-/// holds a terminal status for the job keeps it; only sleds with
-/// none adopt the ruling, so one sled may show the real ending while
-/// another shows interrupted.
-fn adjudicate_boundary(
-    log: &Logger,
-    tx_state: &watch::Sender<State>,
-    rumors: Option<&GossipNetwork>,
-    own_baseboard: &BaseboardId,
-    snapshot: Option<&Boundary>,
-    survivors: &BTreeSet<JobId>,
-    adjudicated: &mut Option<JobId>,
-) {
-    // A floor commits to no job, so there is nothing to rule on.
-    let Some(Committed { job, outcome, .. }) = snapshot.and_then(|boundary| boundary.job.as_ref())
-    else {
-        return;
-    };
-    let job_id = *job;
-    // One ruling per boundary: a sled that swaps universes again
-    // without running a job must not re-adjudicate the same job.
-    if *adjudicated == Some(job_id) {
-        return;
-    }
-    // A survivor's events land in the new universe when it finishes,
-    // so it needs no verdict now and may need one at a later swap.
-    if survivors.contains(&job_id) {
-        return;
-    }
-    *adjudicated = Some(job_id);
-    let witnessed = {
-        let state = tx_state.borrow();
-        state
-            .get_job_status(&job_id)
-            .is_some_and(|status| status.get(own_baseboard).is_some())
-    };
-    if witnessed {
-        return;
-    }
-    // A stopped ending announces the start and stop pair, so the
-    // ordinary status transitions apply on every sled; a bare stop
-    // with no prior start would be dropped.
-    let events = match outcome {
-        JobOutcome::Ended(JobStatus::Stopped {
-            time_started,
-            time_stopped,
-            result,
-            output,
-            ..
-        }) => vec![
-            JobEvent::Start(job_id, *time_started),
-            JobEvent::Stop(job_id, *time_stopped, result.clone(), output.clone()),
-        ],
-        JobOutcome::Ended(JobStatus::Error {
-            time_error, error, ..
-        }) => vec![JobEvent::Error(job_id, *time_error, error.clone())],
-        JobOutcome::Ended(_) | JobOutcome::Committed => vec![JobEvent::Error(
-            job_id,
-            Utc::now(),
-            ProcessError::Interrupted,
-        )],
-    };
-    if let Some(rumors) = rumors {
-        for event in events {
-            gossip(
-                log,
-                rumors,
-                Message::Event(own_baseboard.clone(), Event::Job(event)).into(),
-            );
-        }
-    }
-    warn!(log, "adjudicated an unwitnessed job from a previous life"; "job_id" => %job_id);
-}
-
-/// The execution floor for entering a universe, or `None` when the
-/// record can order everything this sled may meet there. Two kinds
-/// of entry have history the record cannot order. Re-entering a
-/// burned universe is the flip-flop: the record overwrote this
-/// universe's watermark when it left, and the sled reports the
-/// return as an error. Entering a universe that has history while
-/// holding no record leaves the sled unable to tell a first visit
-/// from a return after a clean slate: the universe may hold jobs
-/// this baseboard already ran, and they must not run twice. Both
-/// set the floor at the frontier that includes this life's first
-/// send.
-///
-/// The floor must live in memory only. Its version is created by
-/// sending a message, and if the sled dies before the message
-/// reaches anyone, no other copy of it ever exists. A floor written
-/// to disk would carry that dead version into the next life, where
-/// no future session start could ever dominate it, and every one
-/// would be refused until a cold boot. A floor raised fresh at each
-/// entry is built from a message the living sled is actively
-/// gossiping, so future sessions come to dominate it.
-fn entry_floor(
-    log: &Logger,
-    snapshot: Option<&Boundary>,
-    arrival: &Version,
-    rumors: &GossipNetwork,
-    own_baseboard: &BaseboardId,
-) -> Option<Version> {
-    let network = rumors.network();
-    match snapshot {
-        // A record committed in this universe is its watermark, even
-        // when its burned set names this network: a sled that returns
-        // and commits burns its own network into the replacement
-        // record, and the Bloom set can never drop the stale entry.
-        Some(boundary) if boundary.network != network && boundary.is_burned(network) => {
-            warn!(
-                log, "re-entered a universe this sled's boundary record burned";
-                "committed" => ?boundary.job,
-            );
-            gossip(
-                log,
-                rumors,
-                Message::Event(own_baseboard.clone(), Event::Error(Error::UniverseFlipFlop)).into(),
-            );
-        }
-        None if *arrival != Version::new() => {
-            warn!(log, "no boundary record, and this universe has history");
-        }
-        _ => return None,
-    }
-    Some(rumors.snapshot().latest().clone())
 }
 
 /// Grow a fresh gossip seed over sush's message type.
@@ -1635,7 +1587,7 @@ impl StateManager {
         mut requests: R,
         mut cubbies: watch::Receiver<Cubbies>,
         mut universe: watch::Receiver<GossipUniverse>,
-        roots: &[Certificate],
+        anchors: &[Certificate],
         session_sush_nonce: Arc<Mutex<SessionSushNonce>>,
         store: Arc<BoundaryStore>,
         shutdown: CancellationToken,
@@ -1665,19 +1617,14 @@ impl StateManager {
         // placeholder birth is replaced before any message applies.
         let mut initial_state = State::new(
             own_baseboard.clone(),
-            roots,
-            session_sush_nonce.clone(),
-            Past::new(
-                Version::new(),
-                Version::new(),
-                store.clone(),
-                boundary.clone(),
-                None,
-            ),
+            anchors,
+            Past::new(Version::new(), Commitment::Absent { floor: None }),
         )?;
-        initial_state.cubbies = cubbies.borrow_and_update().clone();
+        initial_state
+            .rack
+            .set_cubbies(cubbies.borrow_and_update().clone());
         let (tx_state, rx_state) = watch::channel(initial_state);
-        let roots = roots.to_vec();
+        let anchors = anchors.to_vec();
 
         // The executor needs to have access to send messages back.
         let (mut executor, mut events) = Executor::new(
@@ -1699,39 +1646,24 @@ impl StateManager {
             spawn(async move {
                 info!(log, "managing state");
 
-                // Before any message is processed: announce our build
-                // (the send that starts this life's causal presence),
-                // raise the floor in case the record burned the
-                // initial universe, and take the birth mark that
-                // splits this life's traffic from replayed history.
-                let boundary = match &network {
-                    Some((rumors, _)) => {
-                        let arrival = rumors.snapshot().latest().clone();
-                        gossip(
-                            &log,
-                            rumors,
-                            Message::Event(
-                                own_baseboard.clone(),
-                                Event::Version(VersionInfo::current()),
-                            )
-                            .into(),
-                        );
-                        let floor =
-                            entry_floor(&log, boundary.as_ref(), &arrival, rumors, &own_baseboard);
-                        let birth = rumors.snapshot().latest().clone();
-                        tx_state.send_modify(|state| {
-                            state.past = Past::new(
-                                arrival,
-                                birth,
-                                boundary_store.clone(),
-                                boundary.clone(),
-                                floor.clone(),
-                            );
-                        });
-                        boundary
-                    }
-                    None => boundary,
-                };
+                // Enter the initial universe before any message is
+                // processed, so the birth mark splits this life's
+                // traffic from replayed history.
+                if let Some((rumors, _)) = &network {
+                    let entered = enter_universe(
+                        &log,
+                        own_baseboard.clone(),
+                        &anchors,
+                        &boundary_store,
+                        rumors,
+                        Remainder::default(),
+                    )
+                    .expect("trust anchors validated at startup");
+                    tx_state.send_modify(|state| {
+                        *state = entered;
+                        state.rack.set_cubbies(cubbies.borrow_and_update().clone());
+                    });
+                }
                 if let Some(Committed { session, job, .. }) =
                     boundary.as_ref().and_then(|boundary| boundary.job.as_ref())
                 {
@@ -1740,14 +1672,6 @@ impl StateManager {
                         "session_id" => %session, "job_id" => %job,
                     );
                 }
-
-                // Replay bookkeeping. `survivors` are jobs this
-                // incarnation itself runs across a universe swap;
-                // `reaped` are zombies already declared interrupted.
-                let mut boundary = boundary;
-                let mut survivors: BTreeSet<JobId> = BTreeSet::new();
-                let mut reaped: BTreeSet<JobId> = BTreeSet::new();
-                let mut adjudicated: Option<JobId> = None;
 
                 // These flip both to `true` once our two input streams (local
                 // requests and local events from the executor) terminate or
@@ -1813,16 +1737,21 @@ impl StateManager {
                             }
                             Some((version, message)) => {
                                 let live = tx_state.borrow().is_live(&version);
-                                apply_message(
+                                apply(
                                     &log,
                                     &tx_state,
                                     &mut executor,
                                     network.as_ref().map(|(rumors, _)| rumors),
-                                    &own_baseboard,
-                                    &version,
-                                    &message,
+                                    &boundary_store,
+                                    &session_sush_nonce,
+                                    Input::Gossip(version, message),
                                 );
-                                // Replayed traffic can reveal zombies.
+                                // Settle only after replayed traffic:
+                                // replay is what reveals zombies, and a
+                                // sled that settles before its universe
+                                // has history adjudicates into a lonely
+                                // universe, whose extra events can win
+                                // the merge and erase rack history.
                                 if !live {
                                     drain_ready(
                                         &log,
@@ -1830,24 +1759,17 @@ impl StateManager {
                                         &tx_state,
                                         &mut executor,
                                         network.as_ref().map(|(rumors, _)| rumors),
-                                        &own_baseboard,
+                                        &boundary_store,
+                                        &session_sush_nonce,
                                     );
-                                    reap_zombies(
+                                    apply(
                                         &log,
                                         &tx_state,
+                                        &mut executor,
                                         network.as_ref().map(|(rumors, _)| rumors),
-                                        &own_baseboard,
-                                        &survivors,
-                                        &mut reaped,
-                                    );
-                                    adjudicate_boundary(
-                                        &log,
-                                        &tx_state,
-                                        network.as_ref().map(|(rumors, _)| rumors),
-                                        &own_baseboard,
-                                        boundary.as_ref(),
-                                        &survivors,
-                                        &mut adjudicated,
+                                        &boundary_store,
+                                        &session_sush_nonce,
+                                        Input::Drained,
                                     );
                                 }
                             },
@@ -1855,9 +1777,15 @@ impl StateManager {
 
                         // Follow the rack's cubby map.
                         Ok(()) = cubbies.changed() => {
-                            tx_state.send_modify(|state| {
-                                state.cubbies = cubbies.borrow_and_update().clone();
-                            });
+                            apply(
+                                &log,
+                                &tx_state,
+                                &mut executor,
+                                network.as_ref().map(|(rumors, _)| rumors),
+                                &boundary_store,
+                                &session_sush_nonce,
+                                Input::Cubbies(cubbies.borrow_and_update().clone()),
+                            );
                         },
 
                         // Follow the gossip manager to a new universe,
@@ -1881,75 +1809,41 @@ impl StateManager {
                         let fresh = universe.borrow_and_update().clone();
                         info!(log, "gossip universe changed, resetting state"; "network" => %fresh.rumors.network());
                         causal_messages = fresh.rumors.causal_messages();
-                        // A reaped zombie may still show as running (its
-                        // error event races the swap); it is no survivor.
-                        // A job the executor is still launching is a
-                        // survivor too: its start event may not have
-                        // applied yet, but its events land in the new
-                        // universe like any running job's.
-                        survivors = tx_state.borrow().own_running_jobs();
-                        survivors.extend(executor.in_flight());
-                        survivors.retain(|job_id| !reaped.contains(job_id));
-                        reaped = BTreeSet::new();
+                        let remainder = tx_state.borrow().remainder(executor.in_flight());
                         *rumors = fresh.rumors;
-                        let arrival = rumors.snapshot().latest().clone();
-                        gossip(
-                            &log,
-                            rumors,
-                            Message::Event(
-                                own_baseboard.clone(),
-                                Event::Version(VersionInfo::current()),
-                            )
-                            .into(),
-                        );
-                        let boundary_store = tx_state.borrow().past.boundary.clone();
-                        boundary = boundary_store.boundary();
-                        let floor =
-                            entry_floor(&log, boundary.as_ref(), &arrival, rumors, &own_baseboard);
-                        let birth = rumors.snapshot().latest().clone();
                         // TODO: re-inject local job state (policy pending).
+                        let entered = enter_universe(
+                            &log,
+                            own_baseboard.clone(),
+                            &anchors,
+                            &boundary_store,
+                            rumors,
+                            remainder,
+                        )
+                        .expect("trust anchors validated at startup");
                         tx_state.send_modify(|state| {
-                            *state = State::new(
-                                own_baseboard.clone(),
-                                &roots,
-                                state.session_sush_nonce.clone(),
-                                Past::new(
-                                    arrival,
-                                    birth,
-                                    boundary_store.clone(),
-                                    boundary.clone(),
-                                    floor.clone(),
-                                ),
-                            )
-                            .expect("roots validated at startup");
-                            state.cubbies = cubbies.borrow().clone();
+                            *state = entered;
+                            state.rack.set_cubbies(cubbies.borrow().clone());
                         });
                         // The set received at join is already local:
-                        // drain it, then reap.
+                        // drain it, then settle.
                         drain_ready(
                             &log,
                             &mut causal_messages,
                             &tx_state,
                             &mut executor,
                             Some(&*rumors),
-                            &own_baseboard,
+                            &boundary_store,
+                            &session_sush_nonce,
                         );
-                        reap_zombies(
+                        apply(
                             &log,
                             &tx_state,
+                            &mut executor,
                             Some(&*rumors),
-                            &own_baseboard,
-                            &survivors,
-                            &mut reaped,
-                        );
-                        adjudicate_boundary(
-                            &log,
-                            &tx_state,
-                            Some(&*rumors),
-                            &own_baseboard,
-                            boundary.as_ref(),
-                            &survivors,
-                            &mut adjudicated,
+                            &boundary_store,
+                            &session_sush_nonce,
+                            Input::Drained,
                         );
                     }
                 }
@@ -1958,198 +1852,111 @@ impl StateManager {
     }
 }
 
-/// Certificate validation state.
-///
-/// Transitions are monotone: state only moves upward in this
-/// lattice, so the resulting map is a function of the set of
-/// messages received, independent of their delivery order.
-///
-/// ```text
-///              Revoked
-///             ▲   ▲   ▲
-///            /    |    \
-///        Valid    |    Invalid
-///            ▲    |    ▲
-///             \   |   /
-///              Unknown ──┐
-///                  ▲     │ (issuer not yet seen)
-///                  └─────┘
-/// ```
-///
-/// Allowed transitions are `Unknown → Valid` on successful chain validation;
-/// `Unknown → Unknown` while no valid issuer verifies the certificate;
-/// `Unknown → Invalid` on an intrinsic failure (bad encoding, or self-signed
-/// without being a root); and any state `→ Revoked`, from which no state
-/// ever returns.
-#[derive(Debug)]
-pub enum CertState {
-    Unknown(Box<Certificate>),
-    /// A validated certificate and the key ID of the issuer that
-    /// verified it, or `None` for a root.
-    Valid(Box<Certificate>, Option<KeyId>),
-    Invalid(KeyError),
-    Revoked(KeyId, DateTime<Utc>),
-}
-
-impl CertState {
-    fn is_unknown(&self) -> bool {
-        matches!(self, Self::Unknown(_))
-    }
-
-    fn is_valid(&self) -> bool {
-        matches!(self, Self::Valid(..))
-    }
-
-    fn cert(&self) -> Option<&Certificate> {
-        match self {
-            Self::Unknown(cert) | Self::Valid(cert, _) => Some(cert),
-            Self::Invalid(_) | Self::Revoked(..) => None,
-        }
-    }
-
-    fn map_valid<R>(&self, f: impl FnOnce(&Certificate) -> &R) -> Option<&R> {
-        if let Self::Valid(cert, _) = self {
-            Some(f(cert))
-        } else {
-            None
-        }
-    }
-
-    fn validate(self, certs: &Certificates, roots: &[KeyId]) -> Self {
-        if let Self::Unknown(cert) = self {
-            macro_rules! with_err {
-                ($expr:expr) => {
-                    match $expr {
-                        Ok(res) => res,
-                        Err(err) => return Self::Invalid(err.into()),
-                    }
-                };
-            }
-
-            // Verify the certificate signature.
-            // TODO: check expiry, basicConstraints, keyUsage.
-            let signature = with_err!(Signature::try_from(cert.as_ref()));
-            let tbs = with_err!(cert.tbs_certificate.to_der());
-            let subject = &cert.tbs_certificate.subject;
-            let issuer = &cert.tbs_certificate.issuer;
-            if subject == issuer {
-                let key_id = with_err!(KeyId::try_from(cert.as_ref()));
-                if !roots.contains(&key_id) {
-                    return Self::Invalid(KeyError::SelfSigned);
-                }
-                with_err!(
-                    signature.verify_with_spki(&tbs, &cert.tbs_certificate.subject_public_key_info)
-                );
-                return Self::Valid(cert, None);
-            }
-            // The issuer name only routes: the parent is whichever valid
-            // certificate of that name verifies the signature, so a
-            // homonym cannot take the true parent's place. Until such a
-            // parent arrives the certificate stays `Unknown`, keeping
-            // the outcome independent of delivery order.
-            for (key_id, candidate) in certs {
-                if let Some(parent) = candidate.map_valid(|cert| cert)
-                    && parent.tbs_certificate.subject == *issuer
-                    && signature
-                        .verify_with_spki(&tbs, &parent.tbs_certificate.subject_public_key_info)
-                        .is_ok()
-                {
-                    return Self::Valid(cert, Some(key_id.clone()));
-                }
-            }
-            Self::Unknown(cert)
-        } else {
-            self
-        }
-    }
-}
-
-impl State {
-    /// Move as many certificates as possible from `Unknown → `Valid`.
-    /// This allows us to eventually validate chains whose elements
-    /// may arrive out of order.
-    fn validate_certs(&mut self, roots: &[KeyId]) {
-        loop {
-            let pending = self
-                .certs
-                .iter()
-                .filter(|(_, c)| c.is_unknown())
-                .map(|(k, _)| k.clone())
-                .collect::<Vec<KeyId>>();
-            let mut progressed = false;
-            for key_id in pending {
-                let state = self.certs.remove(&key_id).unwrap();
-                let validated = state.validate(&self.certs, roots);
-                progressed |= !validated.is_unknown();
-                self.certs.insert(key_id, validated);
-            }
-            if !progressed {
-                break;
-            }
-        }
-    }
-}
-
-/// Re-verify gossiped login evidence. Identity gossip carries the
-/// signed challenge response, not another sled's conclusion, so a
-/// registered identity never depends on that sled's honesty.
-fn verify_login(
-    public_key: &SshPublicKey,
-    signed: &SignedLogin,
-) -> Result<RegisteredIdentity, KeyError> {
-    let verified = signed.clone().verify_with_ssh_public_key(public_key)?;
-    let verifier = verified.epk().clone();
-    let identity = Identity::new(public_key.clone(), verified, Utc::now())?;
-    Ok(RegisteredIdentity { identity, verifier })
-}
-
-/// Return the cert chain for the given key in root-to-leaf order.
-/// Will never return an empty chain.
-pub fn cert_chain(certs: &Certificates, key_id: &KeyId) -> Result<Vec<Certificate>, KeyError> {
-    let mut chain = Vec::new();
-    let mut key_id = key_id.to_owned();
-    loop {
-        if chain.len() >= MAX_CERT_CHAIN_LEN {
-            return Err(KeyError::CertChainTooLong);
-        }
-        let (cert, parent) = match certs.get(&key_id) {
-            None | Some(CertState::Unknown(_)) => return Err(KeyError::MissingCert(key_id)),
-            Some(CertState::Valid(cert, parent)) => (*cert.clone(), parent.clone()),
-            Some(CertState::Invalid(error)) => {
-                return Err(KeyError::InvalidCert(error.to_string()));
-            }
-            Some(CertState::Revoked(key_id, when)) => {
-                return Err(KeyError::Revoked(key_id.clone(), *when));
-            }
-        };
-        chain.push(cert);
-        match parent {
-            None => break,
-            Some(parent) => key_id = parent,
-        }
-    }
-    assert!(!chain.is_empty());
-    chain.reverse();
-    Ok(chain)
-}
-
 #[cfg(test)]
 mod test {
+    use std::time::Duration;
+
+    use x509_cert::time::Validity;
+
+    use sush_common::jobs::{JobMode, JobOutputState, JobStartRequest};
+    use sush_common::keys::{EphemeralKey, KeyType, Signer as _};
+    use sush_common::targets::Target;
+
     use super::*;
 
     fn network(seed: u8) -> Network {
         serde_json::from_str(&format!("[{seed:?}{}]", ", 0".repeat(15))).unwrap()
     }
 
-    fn past(committed: Option<Boundary>, floor: Option<Version>) -> Past {
-        let log = Logger::root(slog::Discard, o!());
-        Past::new(
-            Version::new(),
-            Version::new(),
-            Arc::new(BoundaryStore::new(&log, &Locker::null())),
-            committed,
-            floor,
+    fn baseboard() -> BaseboardId {
+        BaseboardId {
+            part_number: "913-0000019".to_string(),
+            serial_number: "state-test".to_string(),
+        }
+    }
+
+    fn state(past: Past) -> State {
+        State::new(baseboard(), &[], past).unwrap()
+    }
+
+    fn root() -> EphemeralKey {
+        let subject = "CN=Test Root,O=Oxide Computer Company,C=US";
+        EphemeralKey::new_root(
+            KeyType::P256,
+            subject.parse().unwrap(),
+            Validity::from_now(Duration::from_secs(60)).unwrap(),
         )
+        .unwrap()
+    }
+
+    async fn signed_job(
+        root: &mut EphemeralKey,
+        job_id: JobId,
+        session_id: SessionId,
+        command: &str,
+    ) -> SignedJob {
+        root.sign(JobStartRequest::new(
+            job_id,
+            session_id,
+            command,
+            JobMode::Batch,
+            Target::All,
+        ))
+        .await
+        .unwrap()
+    }
+
+    fn discard() -> Logger {
+        Logger::root(slog::Discard, o!())
+    }
+
+    fn start_job(state: &mut State, job_id: JobId, now: DateTime<Utc>) {
+        let baseboard = state.rack.own_baseboard().clone();
+        state.history.set_job_status(
+            &job_id,
+            &baseboard,
+            JobStatus::Started {
+                job_id,
+                time_started: now,
+            },
+            None,
+            None,
+        );
+    }
+
+    fn committed_boundary(job: JobId) -> Boundary {
+        Boundary {
+            network: network(1),
+            burned: Bloom::new(),
+            executed: Version::new(),
+            job: Some(Committed {
+                session: SessionId::random(),
+                job,
+                successor: JobId::random(),
+                outcome: JobOutcome::Committed,
+            }),
+        }
+    }
+
+    fn interrupted(output: &Output, job_id: JobId) -> bool {
+        matches!(
+            output,
+            Output::Gossip(Message::Event(
+                _,
+                Event::Job(JobEvent::Error(id, _, ProcessError::Interrupted)),
+            )) if *id == job_id
+        )
+    }
+
+    fn past(committed: Option<Boundary>, floor: Option<Version>) -> Past {
+        let committed = match committed {
+            Some(boundary) => Commitment::Trusted {
+                boundary: Box::new(boundary),
+                floor,
+            },
+            None => Commitment::Absent { floor },
+        };
+        Past::new(Version::new(), committed)
     }
 
     /// The admission rules: a sled with no record admits, a record
@@ -2207,8 +2014,8 @@ mod test {
     }
 
     /// A floor refuses every session not started strictly above it,
-    /// in every universe: the floor belongs to this life, not to any
-    /// record.
+    /// in every universe and under either commitment that carries one:
+    /// the floor belongs to this life, not to any record.
     #[test]
     fn floors_refuse_below() {
         let floor: Version = "(1, 1, (0, 0, 2))".parse().unwrap();
@@ -2216,19 +2023,535 @@ mod test {
         let below: Version = "(1, 0, (0, 0, 2))".parse().unwrap();
         let above: Version = "(2, 1, (0, 0, 3))".parse().unwrap();
         let concurrent: Version = "(1, 2, (0, 0, 1))".parse().unwrap();
-        let past = past(None, Some(floor.clone()));
+        let committed = Boundary {
+            network: network(1),
+            burned: Bloom::new(),
+            executed: floor.clone(),
+            job: None,
+        };
 
-        for started in [&at, &below, &concurrent] {
-            for net in [network(1), network(2)] {
-                assert!(matches!(
-                    past.screen(net, SessionId::random(), started),
-                    Admission::Refuse
-                ));
+        for past in [
+            past(None, Some(floor.clone())),
+            past(Some(committed), Some(floor.clone())),
+        ] {
+            for started in [&at, &below, &concurrent] {
+                for net in [network(1), network(2)] {
+                    assert!(matches!(
+                        past.screen(net, SessionId::random(), started),
+                        Admission::Refuse
+                    ));
+                }
             }
+            assert!(matches!(
+                past.screen(network(1), SessionId::random(), &above),
+                Admission::Admit
+            ));
         }
+    }
+
+    /// A hop raises the floor to the frontier, so the hopped session
+    /// screens as a refusal from then on: one hop report per session.
+    /// A session started strictly above the frontier admits again.
+    #[test]
+    fn raised_floor_refuses_hopped_session() {
+        let started: Version = "(1, 1, (0, 0, 2))".parse().unwrap();
+        let executed: Version = "(1, 2, (0, 0, 1))".parse().unwrap();
+        let above: Version = "(2, 2, (0, 0, 3))".parse().unwrap();
+        let session = SessionId::random();
+        let committed = Boundary {
+            network: network(1),
+            burned: Bloom::new(),
+            executed: executed.clone(),
+            job: None,
+        };
+
+        let mut past = past(Some(committed), None);
+        past.observe(&started);
+        past.observe(&executed);
+        assert_eq!(past.frontier, &started | executed.clone());
         assert!(matches!(
-            past.screen(network(1), SessionId::random(), &above),
+            past.screen(network(1), session, &started),
+            Admission::Hop
+        ));
+
+        past.committed.raise(past.frontier.clone());
+        assert!(matches!(
+            past.screen(network(1), session, &started),
+            Admission::Refuse
+        ));
+        assert!(matches!(
+            past.screen(network(1), session, &above),
             Admission::Admit
         ));
+    }
+
+    /// An untrusted record admits nothing in any universe, and a
+    /// raise leaves it untrusted.
+    #[test]
+    fn untrusted_admits_nothing() {
+        let started: Version = "(2, 1, (0, 0, 3))".parse().unwrap();
+        let mut past = Past::new(Version::new(), Commitment::Untrusted);
+        for net in [network(1), network(2)] {
+            assert!(matches!(
+                past.screen(net, SessionId::random(), &started),
+                Admission::Untrusted
+            ));
+        }
+        past.committed.raise(started.clone());
+        assert!(matches!(
+            past.screen(network(1), SessionId::random(), &started),
+            Admission::Untrusted
+        ));
+    }
+
+    /// Settle declares a zombie interrupted exactly once. A survivor
+    /// is spared: the executor still runs it and reports its ending
+    /// itself.
+    #[test]
+    fn settle_reaps_zombies_once_and_spares_survivors() {
+        let log = discard();
+        let now = Utc::now();
+        let zombie = JobId::random();
+        let survivor = JobId::random();
+        let mut state = state(past(None, None));
+        for job_id in [zombie, survivor] {
+            state.past.zombies.insert(job_id);
+            start_job(&mut state, job_id, now);
+        }
+        state.past.survivors.insert(survivor);
+
+        let outputs = state.settle(&log, now, Some(network(1)));
+        assert_eq!(outputs.len(), 1);
+        assert!(interrupted(&outputs[0], zombie));
+        assert!(state.settle(&log, now, Some(network(1))).is_empty());
+    }
+
+    /// A committed job that replay left without a status is
+    /// adjudicated as interrupted, once per universe: a universe that
+    /// never heard the ruling gets its own.
+    #[test]
+    fn adjudication_rules_once_per_universe() {
+        let log = discard();
+        let now = Utc::now();
+        let job = JobId::random();
+        let mut state = state(past(Some(committed_boundary(job)), None));
+
+        for net in [network(1), network(2)] {
+            let outputs = state.settle(&log, now, Some(net));
+            assert_eq!(outputs.len(), 1);
+            assert!(interrupted(&outputs[0], job));
+            assert!(state.settle(&log, now, Some(net)).is_empty());
+        }
+    }
+
+    /// A witnessed boundary job keeps its replayed status: settle
+    /// marks the ruling made and announces nothing. A surviving
+    /// boundary job gets no ruling at all, since it may need one at
+    /// a later swap.
+    #[test]
+    fn adjudication_defers_to_witnesses_and_survivors() {
+        let log = discard();
+        let now = Utc::now();
+        let job = JobId::random();
+        let boundary = committed_boundary(job);
+
+        let mut witnessed = state(past(Some(boundary.clone()), None));
+        start_job(&mut witnessed, job, now);
+        assert!(witnessed.settle(&log, now, Some(network(1))).is_empty());
+        assert_eq!(witnessed.past.adjudicated.get(&network(1)), Some(&job));
+
+        let mut surviving = state(past(Some(boundary), None));
+        surviving.past.survivors.insert(job);
+        assert!(surviving.settle(&log, now, Some(network(1))).is_empty());
+        assert!(surviving.past.adjudicated.is_empty());
+    }
+
+    /// The remainder carries exactly what the next life cannot
+    /// recompute from replay: jobs still running or launching, minus
+    /// those already reaped, and the ruling already made.
+    #[test]
+    fn remainder_carries_survivors_and_ruling() {
+        let now = Utc::now();
+        let running = JobId::random();
+        let launching = JobId::random();
+        let reaped = JobId::random();
+        let mut state = state(past(None, None));
+        start_job(&mut state, running, now);
+        start_job(&mut state, reaped, now);
+        state.past.reaped.insert(reaped);
+        state.past.adjudicated.insert(network(1), running);
+
+        let remainder = state.remainder(BTreeSet::from([launching]));
+        assert_eq!(remainder.survivors, BTreeSet::from([running, launching]));
+        assert_eq!(
+            remainder.adjudicated,
+            BTreeMap::from([(network(1), running)])
+        );
+    }
+
+    /// Drive a [`State`] through [`State::step`] alone, over a real
+    /// single-party gossip set: no sockets, no executor, no spawned
+    /// tasks.
+    struct Sim {
+        log: Logger,
+        now: DateTime<Utc>,
+        anchors: Vec<Certificate>,
+        rumors: GossipNetwork,
+        messages: CausalMessages<VersionedMessage>,
+        state: State,
+    }
+
+    impl Sim {
+        /// Grow a fresh gossip set, send `history` (a previous life's
+        /// traffic), then enter the universe exactly as the driver
+        /// does. With an empty history, every later send is live.
+        async fn new(anchors: &[Certificate], history: Vec<Message>) -> Sim {
+            let log = discard();
+            let rumors: GossipNetwork = Seed::grow(&log, &Locker::null()).await.into_rumors();
+            for message in history {
+                rumors.send(message.into()).unwrap();
+            }
+            let store = BoundaryStore::new(&log, &Locker::null());
+            store.load().await;
+            let state = enter_universe(
+                &log,
+                baseboard(),
+                anchors,
+                &store,
+                &rumors,
+                Remainder::default(),
+            )
+            .unwrap();
+            let messages = rumors.causal_messages();
+            Sim {
+                log,
+                now: Utc::now(),
+                anchors: anchors.to_vec(),
+                rumors,
+                messages,
+                state,
+            }
+        }
+
+        /// Swap into a fresh universe, as the driver does on a
+        /// universe change.
+        async fn swap(&mut self) {
+            let rumors: GossipNetwork = Seed::grow(&self.log, &Locker::null()).await.into_rumors();
+            let store = BoundaryStore::new(&self.log, &Locker::null());
+            store.load().await;
+            let remainder = self.state.remainder(BTreeSet::new());
+            self.state = enter_universe(
+                &self.log,
+                baseboard(),
+                &self.anchors,
+                &store,
+                &rumors,
+                remainder,
+            )
+            .unwrap();
+            self.messages = rumors.causal_messages();
+            self.rumors = rumors;
+        }
+
+        fn send(&mut self, message: Message) {
+            self.rumors.send(message.into()).unwrap();
+        }
+
+        /// Step every ready message through the state machine,
+        /// collecting the outputs.
+        fn pump(&mut self) -> Vec<Output> {
+            let mut outputs = Vec::new();
+            while let Some(Some((version, message))) = self.messages.next().now_or_never() {
+                outputs.extend(self.state.step(
+                    &self.log,
+                    self.now,
+                    Some(self.rumors.network()),
+                    Input::Gossip(version, message),
+                ));
+            }
+            outputs
+        }
+
+        /// Step every ready message through without a network, as the
+        /// driver does while draining at shutdown.
+        fn pump_draining(&mut self) -> Vec<Output> {
+            let mut outputs = Vec::new();
+            while let Some(Some((version, message))) = self.messages.next().now_or_never() {
+                outputs.extend(self.state.step(
+                    &self.log,
+                    self.now,
+                    None,
+                    Input::Gossip(version, message),
+                ));
+            }
+            outputs
+        }
+
+        fn request(&mut self, request: Request) -> Vec<Output> {
+            self.send(Message::Request(request));
+            self.pump()
+        }
+
+        fn drained(&mut self) -> Vec<Output> {
+            self.state.step(
+                &self.log,
+                self.now,
+                Some(self.rumors.network()),
+                Input::Drained,
+            )
+        }
+    }
+
+    /// A fresh universe with an adopted session, ready for jobs.
+    async fn sim_with_session() -> (EphemeralKey, Sim, SessionId, Session) {
+        let root = root();
+        let anchors = vec![root.cert().clone()];
+        let mut sim = Sim::new(&anchors, Vec::new()).await;
+        let session_id = SessionId::random();
+        sim.request(Request::session(
+            root.key_id().clone(),
+            SessionRequest::Start(session_id),
+        ));
+        (root, sim, session_id, Session::new(session_id))
+    }
+
+    /// The happy path through the step surface alone: a session
+    /// starts, a signed job releases, the job's own events settle its
+    /// status, and the session stops.
+    #[tokio::test]
+    async fn session_lifecycle_through_step() {
+        let mut root = root();
+        let anchors = vec![root.cert().clone()];
+        let actor = root.key_id().clone();
+        let mut sim = Sim::new(&anchors, Vec::new()).await;
+
+        let session_id = SessionId::random();
+        let session = Session::new(session_id);
+        let outputs = sim.request(Request::session(
+            actor.clone(),
+            SessionRequest::Start(session_id),
+        ));
+        assert!(outputs.iter().any(|o| matches!(o, Output::RotateNonce)));
+        assert!(sim.state.session.session().is_some());
+
+        let job_id = session.next_job_id();
+        let signed = signed_job(&mut root, job_id, session_id, "true").await;
+        let outputs = sim.request(Request::job(
+            actor.clone(),
+            JobRequest::Start(signed, JobStartParams::default()),
+        ));
+        assert!(
+            outputs
+                .iter()
+                .any(|o| matches!(o, Output::Run(run) if *run.job.payload().job_id() == job_id))
+        );
+
+        sim.send(Message::Event(
+            baseboard(),
+            Event::Job(JobEvent::Start(job_id, sim.now)),
+        ));
+        sim.pump();
+        let outputs = sim.request(Request::job(actor.clone(), JobRequest::Stop(job_id)));
+        assert!(
+            outputs
+                .iter()
+                .any(|o| matches!(o, Output::Stop(id) if *id == job_id))
+        );
+        sim.send(Message::Event(
+            baseboard(),
+            Event::Job(JobEvent::Stop(
+                job_id,
+                sim.now,
+                Ok(0),
+                JobOutputState::default(),
+            )),
+        ));
+        let outputs = sim.pump();
+        assert!(outputs.iter().any(
+            |o| matches!(o, Output::Ran(JobStatus::Stopped { job_id: id, .. }) if *id == job_id)
+        ));
+
+        sim.request(Request::session(actor, SessionRequest::Stop(session_id)));
+        assert!(sim.state.session.session().is_none());
+    }
+
+    /// A session the boundary record cannot order hops: the floor
+    /// rises, one report goes out, and the session's jobs are skipped
+    /// below the floor rather than run. A later job in the same
+    /// session reports no second hop.
+    #[tokio::test]
+    async fn hop_through_step() {
+        let (mut root, mut sim, session_id, mut session) = sim_with_session().await;
+        let actor = root.key_id().clone();
+
+        // A boundary record whose executed join the session start
+        // does not dominate: the current frontier, which includes
+        // the start itself.
+        sim.state.past.committed = Commitment::Trusted {
+            boundary: Box::new(Boundary {
+                network: sim.rumors.network(),
+                burned: Bloom::new(),
+                executed: sim.rumors.snapshot().latest().clone(),
+                job: None,
+            }),
+            floor: None,
+        };
+
+        let hops = |outputs: &[Output]| {
+            outputs
+                .iter()
+                .filter(|o| {
+                    matches!(
+                        o,
+                        Output::Gossip(Message::Event(_, Event::Error(Error::SessionHop)))
+                    )
+                })
+                .count()
+        };
+        let skipped = |outputs: &[Output], job_id: JobId| {
+            outputs.iter().any(|o| {
+                matches!(
+                    o,
+                    Output::Gossip(Message::Event(
+                        _,
+                        Event::Job(JobEvent::Skipped(id, _, SkipReason::BelowFloor)),
+                    )) if *id == job_id
+                )
+            })
+        };
+
+        let job_id = session.next_job_id();
+        let signed = signed_job(&mut root, job_id, session_id, "true").await;
+        let outputs = sim.request(Request::job(
+            actor.clone(),
+            JobRequest::Start(signed.clone(), JobStartParams::default()),
+        ));
+        assert_eq!(hops(&outputs), 1);
+        assert!(!outputs.iter().any(|o| matches!(o, Output::Run(_))));
+        assert!(skipped(&outputs, job_id));
+
+        session.job_started(signed);
+        let next_id = session.next_job_id();
+        let next = signed_job(&mut root, next_id, session_id, "true").await;
+        let outputs = sim.request(Request::job(
+            actor,
+            JobRequest::Start(next, JobStartParams::default()),
+        ));
+        assert_eq!(hops(&outputs), 0);
+        assert!(skipped(&outputs, next_id));
+    }
+
+    /// Without a network to commit through, a ready job is not
+    /// launched; its chain position still advances so the session is
+    /// not wedged.
+    #[tokio::test]
+    async fn draining_launches_nothing() {
+        let (mut root, mut sim, session_id, mut session) = sim_with_session().await;
+        let actor = root.key_id().clone();
+
+        let job_id = session.next_job_id();
+        let signed = signed_job(&mut root, job_id, session_id, "true").await;
+        sim.send(Message::Request(Request::job(
+            actor,
+            JobRequest::Start(signed.clone(), JobStartParams::default()),
+        )));
+        let outputs = sim.pump_draining();
+        assert!(!outputs.iter().any(|o| matches!(o, Output::Run(_))));
+
+        session.job_started(signed);
+        let state_session = sim.state.session.session().unwrap();
+        assert_eq!(state_session.next_job_id(), session.next_job_id());
+    }
+
+    /// A command the executor cannot launch is refused at release
+    /// with an invalid command error; the chain still advances.
+    #[tokio::test]
+    async fn invalid_command_is_refused_at_release() {
+        let (mut root, mut sim, session_id, mut session) = sim_with_session().await;
+        let actor = root.key_id().clone();
+
+        let job_id = session.next_job_id();
+        let signed = signed_job(&mut root, job_id, session_id, "-rf").await;
+        let outputs = sim.request(Request::job(
+            actor,
+            JobRequest::Start(signed.clone(), JobStartParams::default()),
+        ));
+        assert!(!outputs.iter().any(|o| matches!(o, Output::Run(_))));
+        assert!(outputs.iter().any(|o| matches!(
+            o,
+            Output::Gossip(Message::Event(
+                _,
+                Event::Job(JobEvent::Error(id, _, ProcessError::InvalidCommand)),
+            )) if *id == job_id
+        )));
+
+        session.job_started(signed);
+        let state_session = sim.state.session.session().unwrap();
+        assert_eq!(state_session.next_job_id(), session.next_job_id());
+    }
+
+    /// Replayed traffic never releases a job, and the drain after
+    /// replay declares a previous life's running job interrupted
+    /// exactly once.
+    #[tokio::test]
+    async fn replay_reaps_zombies_through_step() {
+        let mut root = root();
+        let anchors = vec![root.cert().clone()];
+        let actor = root.key_id().clone();
+        let session_id = SessionId::random();
+        let session = Session::new(session_id);
+        let job_id = session.next_job_id();
+        let signed = signed_job(&mut root, job_id, session_id, "true").await;
+        let history = vec![
+            Message::Request(Request::session(
+                actor.clone(),
+                SessionRequest::Start(session_id),
+            )),
+            Message::Request(Request::job(
+                actor,
+                JobRequest::Start(signed, JobStartParams::default()),
+            )),
+            Message::Event(baseboard(), Event::Job(JobEvent::Start(job_id, Utc::now()))),
+        ];
+
+        let mut sim = Sim::new(&anchors, history).await;
+        let outputs = sim.pump();
+        assert!(!outputs.iter().any(|o| matches!(o, Output::Run(_))));
+
+        let outputs = sim.drained();
+        assert_eq!(outputs.len(), 1);
+        assert!(interrupted(&outputs[0], job_id));
+        assert!(sim.drained().is_empty());
+    }
+
+    /// A swap can land in a universe that never heard the boundary
+    /// verdict; that universe gets its own, exactly once.
+    #[tokio::test]
+    async fn swapped_universe_gets_its_own_ruling() {
+        let root = root();
+        let anchors = vec![root.cert().clone()];
+        let mut sim = Sim::new(&anchors, Vec::new()).await;
+        let job = JobId::random();
+        let commit = |sim: &mut Sim| {
+            sim.state.past.committed = Commitment::Trusted {
+                boundary: Box::new(committed_boundary(job)),
+                floor: None,
+            };
+        };
+
+        commit(&mut sim);
+        let outputs = sim.drained();
+        assert_eq!(outputs.len(), 1);
+        assert!(interrupted(&outputs[0], job));
+        assert!(sim.drained().is_empty());
+
+        // The new universe replaces the commitment from the record on
+        // disk, which the null store cannot supply; restore it by hand.
+        sim.swap().await;
+        commit(&mut sim);
+        let outputs = sim.drained();
+        assert_eq!(outputs.len(), 1);
+        assert!(interrupted(&outputs[0], job));
+        assert!(sim.drained().is_empty());
     }
 }

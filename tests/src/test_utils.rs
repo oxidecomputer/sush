@@ -279,7 +279,7 @@ pub async fn manager_test_root_and_peer(
     let gossip = Universe::isolated(seed);
     let shutdown = CancellationToken::new();
     let root = ephemeral_test_root();
-    let mgr = JobManager::with_root_certs(
+    let mgr = JobManager::with_trust_anchors(
         log,
         PathIsolation::InsecureDisable,
         JobOutputDir::fixed(dir.path()),

@@ -266,8 +266,8 @@ impl BoundaryStore {
     /// `Interrupted`, mirroring the status arms in the state machine.
     /// Nothing else is overwritten, and a record that has moved on to
     /// a newer job ignores the old job's ending.
-    pub async fn record_outcome(&self, job_id: &JobId, outcome: &JobStatus) {
-        debug_assert!(outcome.is_terminal());
+    pub async fn record_outcome(&self, status: &JobStatus) {
+        assert!(status.is_terminal());
         if self.untrusted() {
             return;
         }
@@ -277,11 +277,12 @@ impl BoundaryStore {
             let Some(boundary) = recorded.as_ref() else {
                 return;
             };
-            let Some(committed) = boundary.job.as_ref().filter(|c| c.job == *job_id) else {
+            let Some(committed) = boundary.job.as_ref().filter(|c| c.job == *status.job_id())
+            else {
                 return;
             };
             let displaces = matches!(
-                (&committed.outcome, outcome),
+                (&committed.outcome, status),
                 (JobOutcome::Committed, _)
                     | (
                         JobOutcome::Ended(JobStatus::Error {
@@ -296,7 +297,7 @@ impl BoundaryStore {
             }
             Boundary {
                 job: Some(Committed {
-                    outcome: JobOutcome::Ended(outcome.clone()),
+                    outcome: JobOutcome::Ended(status.clone()),
                     ..committed.clone()
                 }),
                 network: boundary.network,
@@ -307,7 +308,7 @@ impl BoundaryStore {
         if let Err(error) = guard.store(&format::encode(&updated)).await {
             warn!(
                 self.log, "failed to record the boundary job's outcome";
-                "job_id" => %job_id, "error" => %error,
+                "job_id" => status.job_id(), "error" => %error,
             );
             return;
         }
@@ -503,14 +504,19 @@ mod test {
             time_error: chrono::Utc::now(),
             error: ProcessError::Killed(9),
         };
-        first.record_outcome(&JobId::random(), &killed).await;
+        let stray = JobStatus::Error {
+            job_id: JobId::random(),
+            time_error: chrono::Utc::now(),
+            error: ProcessError::Killed(9),
+        };
+        first.record_outcome(&stray).await;
         assert!(matches!(
             first.boundary().unwrap().job.unwrap().outcome,
             JobOutcome::Committed
         ));
 
-        first.record_outcome(&job, &interrupted).await;
-        first.record_outcome(&job, &killed).await;
+        first.record_outcome(&interrupted).await;
+        first.record_outcome(&killed).await;
         drop(first);
         let next = store(slots).await;
         assert!(matches!(

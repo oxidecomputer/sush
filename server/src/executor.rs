@@ -32,8 +32,7 @@ use tokio_util::sync::CancellationToken;
 use sush_api::JobStartParams;
 use sush_common::interactive::WindowSize;
 use sush_common::jobs::{
-    JobId, JobMode, JobOutputStream, JobStartRequest, ProcessError, SignedJob, SkipReason,
-    VerifiedJob,
+    JobId, JobMode, JobOutputStream, JobStartRequest, ProcessError, VerifiedJob,
 };
 
 use crate::boundary::{Boundary, BoundaryStore};
@@ -42,7 +41,6 @@ use crate::job::{Job, SocketSender};
 use crate::messages::v0::{Event, JobEvent};
 use crate::output::JobOutputDir;
 use crate::pty::open_pty;
-use crate::state::{Certificates, cert_chain};
 
 pub const DEFAULT_PATH: &str = "/usr/sbin:/usr/bin:/sbin:/bin";
 pub const DEFAULT_TERM: &str = "vt100";
@@ -143,47 +141,31 @@ impl Executor {
         )
     }
 
-    /// Returns whether the job was queued for launch, so the caller
-    /// keeps attachment points only for jobs that can arrive.
+    /// Whether the executor can launch this command. The rule lives
+    /// here because it comes from how the launch builds its argv.
+    pub fn check_command(request: &JobStartRequest) -> Result<(), ProcessError> {
+        if request.command.starts_with('-') {
+            return Err(ProcessError::InvalidCommand);
+        }
+        Ok(())
+    }
+
+    /// Queue a job for launch. The caller has screened the request:
+    /// the signature is verified and the command passed
+    /// [`Executor::check_command`].
     pub fn job_start(
         &mut self,
-        certs: &mut Certificates,
-        request: SignedJob,
+        request: VerifiedJob,
         params: JobStartParams,
         tx_attachment: watch::Sender<Option<SocketSender>>,
         boundary: Boundary,
-    ) -> bool {
+    ) {
         let Some(events) = self.events.read().unwrap().as_ref().cloned() else {
             // No more events ⇒ shutting down ⇒ no new jobs allowed.
-            return false;
+            return;
         };
 
-        // Validate the job request.
         let job_id = request.payload().job_id().to_owned();
-        macro_rules! fail {
-            ($err:expr) => {{
-                let log = self.log.clone();
-                let job_id = job_id.clone();
-                let events = events.clone();
-                spawn(async move {
-                    send_error(&log, &job_id, &events, $err).await;
-                });
-                return false;
-            }};
-        }
-        if request.payload().command.starts_with('-') {
-            fail!(ProcessError::InvalidCommand);
-        }
-        let chain = match cert_chain(certs, request.key_id()) {
-            Ok(chain) => chain,
-            Err(error) => fail!(ProcessError::InvalidJob(error.to_string())),
-        };
-        let leaf = chain.last().expect("cert chain should be non-empty");
-        let verified_request = match request.verify_with_cert(leaf) {
-            Ok(request) => request,
-            Err(error) => fail!(ProcessError::InvalidJob(error.to_string())),
-        };
-
         let stop = self.shutdown.child_token();
         self.stop.insert(job_id, stop.clone());
         let refused = self.launch.try_send(Launch {
@@ -191,7 +173,7 @@ impl Executor {
             boundary,
             events,
             output_dir: self.output_dir.clone(),
-            request: verified_request,
+            request,
             params,
             path_isolation: self.path_isolation,
             tx_attachment,
@@ -206,9 +188,7 @@ impl Executor {
                     error: error.to_string(),
                 },
             );
-            return false;
         }
-        true
     }
 
     pub fn job_stop(&mut self, job_id: &JobId) {
@@ -235,21 +215,6 @@ impl Executor {
         let log = self.log.clone();
         spawn(async move {
             send_error(&log, &job_id, &events, error).await;
-        });
-    }
-
-    /// Report that this sled will never run `job_id`; see
-    /// [`JobStatus::Skipped`](sush_common::jobs::JobStatus).
-    pub fn job_skipped(&self, job_id: JobId, reason: SkipReason) {
-        let Some(events) = self.events.read().unwrap().as_ref().cloned() else {
-            return;
-        };
-        let log = self.log.clone();
-        spawn(async move {
-            let event = Event::Job(JobEvent::Skipped(job_id, Utc::now(), reason));
-            if let Err(error) = events.send(event).await {
-                warn!(log, "failed to send skip event"; "job_id" => %job_id, "error" => %error);
-            }
         });
     }
 
