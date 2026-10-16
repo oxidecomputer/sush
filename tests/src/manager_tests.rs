@@ -40,8 +40,8 @@ use sush_server::{JobError, JobManager};
 
 use crate::test_utils::{
     IntoBytes as _, SignJobRequest as _, ephemeral_test_root, ephemeral_test_subject,
-    fake_identity, manager_and_test_root, manager_login, manager_test_root_and_peer, no_cubbies,
-    null_gossip, test_baseboard_id, test_logger,
+    fake_identity, manager_and_test_root, manager_test_root_and_peer, no_cubbies, null_gossip,
+    test_baseboard_id, test_logger,
 };
 use sush_server::executor::PathIsolation;
 
@@ -1278,31 +1278,6 @@ async fn job_targets() {
     }
 }
 
-/// Identity revocation: live bound credentials die and the key may
-/// not log back in.
-#[named]
-#[tokio::test]
-async fn iam_revoke() {
-    let log = test_logger(function_name!());
-    let (mgr, mut root, _dir, _shutdown) = manager_and_test_root(log).await;
-    let authz = manager_login(&mgr, &mut root).await.unwrap();
-    let key_id = root.ssh_public_key().key_id().unwrap();
-    let header = authz.header("GET", "/sessions");
-    let authn = mgr
-        .iam(Some(header), None, ("GET", "/sessions"))
-        .await
-        .unwrap();
-
-    mgr.iam_revoke(&authn, key_id, true).await.unwrap();
-    let header = authz.header("GET", "/sessions");
-    assert!(
-        mgr.iam(Some(header), None, ("GET", "/sessions"))
-            .await
-            .is_err()
-    );
-    assert!(manager_login(&mgr, &mut root).await.is_err());
-}
-
 /// A login gossips as evidence every sled verifies for itself: real
 /// evidence authorizes bound requests with no local login, and
 /// fabricated evidence registers nothing.
@@ -2081,13 +2056,11 @@ async fn iam() {
         public_key: iam_public_key,
         nonce: iam_nonce,
         time_authenticated: iam_authenticated,
-        time_revoked: iam_revoked,
     } = identity.clone();
     assert_eq!(iam_key_id, key_id);
     assert_eq!(iam_public_key, public_key);
     assert_eq!(iam_nonce, credentials.nonce);
     assert!(iam_authenticated <= Utc::now());
-    assert!(iam_revoked.is_none());
 
     // A bound request authorizes; replaying its header does not, nor
     // does presenting it against a different request line.

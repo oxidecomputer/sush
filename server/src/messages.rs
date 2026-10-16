@@ -206,7 +206,6 @@ pub mod v0 {
                 },
                 Self::Identity(r) => match r.request {
                     IdentityRequest::Login(..) => "identity login",
-                    IdentityRequest::Revoke(..) => "identity revoke",
                 },
             }
         }
@@ -236,7 +235,6 @@ pub mod v0 {
     pub enum IdentityRequest {
         /// OpenSSH public keys are string encoded and decoded at use.
         Login(String, SignedLogin),
-        Revoke(KeyId, DateTime<Utc>),
     }
 
     #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -504,19 +502,6 @@ mod wire_format {
         ))
         .into();
         assert_wire_format("job-stop-request", msg);
-    }
-
-    #[test]
-    fn identity_revoke_request() {
-        let msg: VersionedMessage = Message::Request(Request::identity(
-            KeyId::from_str("zoo-zero").unwrap(),
-            IdentityRequest::Revoke(
-                KeyId::from_str("zoo-zero").unwrap(),
-                DateTime::from_timestamp(1_756_252_800, 0).unwrap(),
-            ),
-        ))
-        .into();
-        assert_wire_format("identity-revoke-request", msg);
     }
 
     #[test]

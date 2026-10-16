@@ -65,18 +65,6 @@ pub trait SushApi {
         headers: Header<Authorization>,
     ) -> Result<HttpResponseOk<Vec<Identity>>, HttpError>;
 
-    /// Revoke an SSH identity.
-    ///
-    /// Expires the key's identities and refuses its future logins,
-    /// across the rack.
-    #[endpoint { method = POST, path = "/iam/{key_id}/revoke" }]
-    async fn iam_revoke(
-        ctx: RequestContext<Self::Context>,
-        headers: Header<Authorization>,
-        params: PathParams<KeyIdParam>,
-        query: QueryParams<WaitParam>,
-    ) -> Result<HttpResponseUpdatedNoContent, HttpError>;
-
     // Session management.
 
     /// Get the current session from this server's point of view.

@@ -507,9 +507,6 @@ pub enum IdentityCommand {
     /// Log in to the server as an SSH identity.
     #[default]
     Login,
-
-    /// Revoke an SSH identity and refuse its future logins.
-    Revoke { key_id: KeyId },
 }
 
 #[derive(Clone, Debug, Subcommand)]
@@ -1024,16 +1021,6 @@ async fn iam(
                 .await?
                 .into_inner();
             ctx.iam(&identity)
-        }
-
-        IdentityCommand::Revoke { key_id } => {
-            let key_id = ctx.really_revoke("SSH identity", key_id)?;
-            with_login(ctx, client, async || {
-                client.iam_revoke().key_id(&key_id).wait(true).send().await
-            })
-            .await?;
-            ctx.revoked("SSH identity", key_id);
-            Ok(())
         }
     }
 }

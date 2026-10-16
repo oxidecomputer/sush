@@ -100,23 +100,6 @@ impl SushApi for ApiServer {
         Ok(HttpResponseOk(mgr.identities(&authn).await?))
     }
 
-    async fn iam_revoke(
-        ctx: RequestContext<Self::Context>,
-        headers: Header<Authorization>,
-        params: PathParams<KeyIdParam>,
-        query: QueryParams<WaitParam>,
-    ) -> Result<HttpResponseUpdatedNoContent, HttpError> {
-        let mgr = ctx.context();
-        let Authorization { authorization } = headers.into_inner();
-        let authn = mgr
-            .iam(authorization, None, request_line(&ctx.request))
-            .await?;
-        let KeyIdParam { key_id } = params.into_inner();
-        let WaitParam { wait } = query.into_inner();
-        mgr.iam_revoke(&authn, key_id, wait).await?;
-        Ok(HttpResponseUpdatedNoContent())
-    }
-
     // Session management.
 
     async fn session(

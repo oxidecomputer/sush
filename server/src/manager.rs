@@ -75,8 +75,7 @@ struct CachedIdentity {
 
 impl CachedIdentity {
     fn is_still_valid(&self) -> bool {
-        self.identity.time_revoked.is_none()
-            && self.authenticated.elapsed() < IDENTITY_MAX_TTL
+        self.authenticated.elapsed() < IDENTITY_MAX_TTL
             && self.last_used.elapsed() < IDENTITY_IDLE_TTL
     }
 }
@@ -345,11 +344,6 @@ impl JobManager {
             unauthorized!("initial credentials presented outside iam");
         }
 
-        // Refuse revoked keys.
-        if self.state.borrow().identities().revoked(&key_id).is_some() {
-            unauthorized!("key is revoked");
-        }
-
         // Claim the nonce.
         let Some(minted) = self.nonces.lock().await.pop(&nonce) else {
             unauthorized!("nonce not found");
@@ -399,38 +393,10 @@ impl JobManager {
             .collect())
     }
 
-    pub async fn iam_revoke(
-        &self,
-        authn: &Identity,
-        key_id: KeyId,
-        wait: bool,
-    ) -> Result<(), JobError> {
-        let now = Utc::now();
-        let mut identities = self.identities.lock().await;
-        for (_, cached) in identities.iter_mut().filter(|((id, _), _)| *id == key_id) {
-            cached.identity.time_revoked = Some(now);
-        }
-        drop(identities);
-        info!(self.log, "revoking identity"; "key_id" => %key_id, "actor" => %authn.key_id);
-        self.identity_request(
-            authn.key_id.clone(),
-            IdentityRequest::Revoke(key_id.clone(), now),
-        )
-        .await?;
-        if wait {
-            self.wait_for(self.wait_for_key_revocation(key_id)).await?;
-        }
-        Ok(())
-    }
-
     // Waiting.
 
     pub fn take_join_handle(&mut self) -> Option<JoinHandle<()>> {
         self.join_state.take()
-    }
-
-    fn wait_for_key_revocation(&self, key_id: KeyId) -> impl FnMut(&State) -> bool {
-        move |state| state.identities().revoked(&key_id).is_some()
     }
 
     fn wait_for_session(&self, session_id: SessionId) -> impl FnMut(&State) -> bool {

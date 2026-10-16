@@ -141,50 +141,6 @@
         }
       }
     },
-    "/iam/{key_id}/revoke": {
-      "post": {
-        "summary": "Revoke an SSH identity.",
-        "description": "Expires the key's identities and refuses its future logins, across the rack.",
-        "operationId": "iam_revoke",
-        "parameters": [
-          {
-            "in": "header",
-            "name": "authorization",
-            "description": "Authorization to access some resource, such as a signature.\n\nSee: <https://developer.mozilla.org/en-US/docs/Web/HTTP/Reference/Headers/Authorization>",
-            "schema": {
-              "type": "string"
-            }
-          },
-          {
-            "in": "path",
-            "name": "key_id",
-            "required": true,
-            "schema": {
-              "$ref": "#/components/schemas/KeyId"
-            }
-          },
-          {
-            "in": "query",
-            "name": "wait",
-            "description": "Wait for the subject to appear in the state.",
-            "schema": {
-              "type": "boolean"
-            }
-          }
-        ],
-        "responses": {
-          "204": {
-            "description": "resource updated"
-          },
-          "4XX": {
-            "$ref": "#/components/responses/Error"
-          },
-          "5XX": {
-            "$ref": "#/components/responses/Error"
-          }
-        }
-      }
-    },
     "/jobs": {
       "get": {
         "summary": "List known jobs sorted by start time, most recent first.",
@@ -1099,11 +1055,6 @@
             "type": "string"
           },
           "time_authenticated": {
-            "type": "string",
-            "format": "date-time"
-          },
-          "time_revoked": {
-            "nullable": true,
             "type": "string",
             "format": "date-time"
           }

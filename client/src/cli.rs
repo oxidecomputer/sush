@@ -932,7 +932,6 @@ impl CommandContext for Cli {
                     public_key,
                     nonce,
                     time_authenticated,
-                    time_revoked,
                 } = identity;
                 let fingerprint = public_key.fingerprint();
                 let algorithm = public_key.algorithm();
@@ -945,9 +944,6 @@ impl CommandContext for Cli {
                         Nonce:\t{nonce}\n   \
                         Authn at:\t{time_authenticated}",
                 );
-                if let Some(time_revoked) = time_revoked {
-                    println!("   Revoked at:\t{time_revoked}");
-                }
             }
         }
         Ok(())
@@ -1002,27 +998,6 @@ impl CommandContext for Cli {
                     Err(CommandError::Canceled)
                 }
             }
-        }
-    }
-
-    fn really_revoke(&mut self, what: &str, key_id: KeyId) -> Result<KeyId, CommandError> {
-        match self.get_output_format() {
-            OutputFormat::Json => Ok(key_id),
-            OutputFormat::Text => {
-                let prompt = format!("❓ Really revoke {what} `{key_id}` (yes/no)? ");
-                if read_bool(&prompt)? {
-                    Ok(key_id)
-                } else {
-                    Err(CommandError::Canceled)
-                }
-            }
-        }
-    }
-
-    fn revoked(&mut self, what: &str, key_id: KeyId) {
-        match self.get_output_format() {
-            OutputFormat::Json => println!("{}", json!({"revoked": key_id})),
-            OutputFormat::Text => println!("✅ Revoked {what} `{key_id}`"),
         }
     }
 

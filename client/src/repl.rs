@@ -397,12 +397,4 @@ impl CommandContext for Repl {
     fn really_target(&mut self, sled: &SledId) -> Result<(), CommandError> {
         self.cli.really_target(sled)
     }
-
-    fn really_revoke(&mut self, what: &str, key_id: KeyId) -> Result<KeyId, CommandError> {
-        self.cli.really_revoke(what, key_id)
-    }
-
-    fn revoked(&mut self, what: &str, key_id: KeyId) {
-        self.cli.revoked(what, key_id)
-    }
 }
