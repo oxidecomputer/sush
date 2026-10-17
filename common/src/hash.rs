@@ -87,6 +87,13 @@ impl Hasher {
         self
     }
 
+    /// Append length-prefixed bytes, so that adjacent updates cannot
+    /// bleed into one another.
+    pub fn update_with_len(&mut self, bytes: &[u8]) -> &mut Self {
+        self.update(&(bytes.len() as u64).to_be_bytes());
+        self.update(bytes)
+    }
+
     pub fn count(&self) -> u64 {
         self.count
     }
