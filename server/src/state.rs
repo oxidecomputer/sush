@@ -1385,11 +1385,10 @@ fn apply(
     tx_state.send_modify(|state| {
         outputs = state.step(log, now, network, input);
     });
-    apply_outputs(log, executor, rumors, store, nonce, outputs);
+    apply_outputs(executor, rumors, store, nonce, outputs);
 }
 
 fn apply_outputs(
-    log: &Logger,
     executor: &mut Executor,
     rumors: Option<&GossipNetwork>,
     store: &Arc<BoundaryStore>,
@@ -1415,7 +1414,7 @@ fn apply_outputs(
             }
             Output::Gossip(message) => {
                 if let Some(rumors) = rumors {
-                    gossip(log, rumors, message.into());
+                    gossip(rumors, message.into());
                 }
             }
             Output::RotateNonce => {
@@ -1450,9 +1449,9 @@ fn drain_ready(
 }
 
 /// Enter a universe: judge the boundary record, announce this build,
-/// and mark the birth. The announce is this life's first send and
-/// goes out before the birth snapshot is taken, so the birth is the
-/// announce's own version. A flip-flop report follows the announce.
+/// and mark the birth. The announce is this life's first send, and a
+/// flip-flop report follows it. The birth is the version of whichever
+/// went out last.
 fn enter_universe(
     log: &Logger,
     own_baseboard: BaseboardId,
@@ -1461,8 +1460,7 @@ fn enter_universe(
     rumors: &GossipNetwork,
 ) -> Result<State, KeyError> {
     let (committed, report) = Commitment::at_entry(log, store, rumors);
-    gossip(
-        log,
+    let mut birth = gossip(
         rumors,
         Message::Event(
             own_baseboard.clone(),
@@ -1471,22 +1469,23 @@ fn enter_universe(
         .into(),
     );
     if let Some(report) = report {
-        gossip(
-            log,
+        birth = gossip(
             rumors,
             Message::Event(own_baseboard.clone(), Event::Error(report)).into(),
         );
     }
-    let birth = rumors.snapshot().latest().clone();
     State::new(own_baseboard, anchors, Past::new(birth, committed))
 }
 
-/// Send a message into the gossip set. An error means the payload
-/// exceeded the configured depth limit, which tests should catch.
-fn gossip(log: &Logger, rumors: &GossipNetwork, message: VersionedMessage) {
-    if let Err(error) = rumors.send(message) {
-        error!(log, "the gossip set refused a message"; "error" => %error);
-    }
+/// Send a message into the gossip set, returning the version it was
+/// assigned. A send fails only on a payload that nests past the depth
+/// limit or fails its own serde round trip. Both are properties of the
+/// message type, which the wire tests pin, so a failure here indicates
+/// incomplete test coverage.
+fn gossip(rumors: &GossipNetwork, message: VersionedMessage) -> Version {
+    rumors
+        .send(message)
+        .expect("sush messages have fixed, shallow encodings")
 }
 
 /// Grow a fresh gossip seed over sush's message type.
@@ -1653,7 +1652,7 @@ impl StateManager {
                             None => requests_empty = true,
                             Some(request) => if let Some((rumors, _)) = &network {
                                 debug!(log, "forwarding request to gossip network"; "kind" => request.kind());
-                                gossip(&log, rumors, Message::Request(request).into());
+                                gossip(rumors, Message::Request(request).into());
                             },
                         },
 
@@ -1672,7 +1671,6 @@ impl StateManager {
                                 } else if let Some((rumors, _)) = &network {
                                     debug!(log, "forwarding event to gossip network"; "event" => ?event);
                                     gossip(
-                                        &log,
                                         rumors,
                                         Message::Event(own_baseboard.clone(), event).into(),
                                     );
@@ -1815,6 +1813,7 @@ impl StateManager {
 mod test {
     use std::time::Duration;
 
+    use rumors::before::Clock;
     use x509_cert::time::Validity;
 
     use sush_common::jobs::{JobMode, JobOutputState, JobStartRequest};
@@ -1918,16 +1917,38 @@ mod test {
         Past::new(Version::new(), committed)
     }
 
+    /// Versions with known causal relations: `older < started <
+    /// newer`, with `concurrent` unordered against all three.
+    struct Versions {
+        older: Version,
+        started: Version,
+        newer: Version,
+        concurrent: Version,
+    }
+
+    fn versions() -> Versions {
+        let mut a = Clock::seed();
+        let mut b = a.fork();
+        Versions {
+            older: a.tick().clone(),
+            started: a.tick().clone(),
+            newer: a.tick().clone(),
+            concurrent: b.tick().clone(),
+        }
+    }
+
     /// The admission rules: a sled with no record admits, a record
     /// from a foreign universe admits, the committed session admits
     /// outright, a session started strictly above the executed join
     /// admits, and everything else hops.
     #[test]
     fn admission_rules() {
-        let started: Version = "(1, 1, (0, 0, 2))".parse().unwrap();
-        let older: Version = "(1, 0, (0, 0, 2))".parse().unwrap();
-        let newer: Version = "(2, 1, (0, 0, 3))".parse().unwrap();
-        let concurrent: Version = "(1, 2, (0, 0, 1))".parse().unwrap();
+        let Versions {
+            older,
+            started,
+            newer,
+            concurrent,
+        } = versions();
         let session = SessionId::random();
         let job = JobId::random();
         let committed = Boundary {
@@ -1977,11 +1998,13 @@ mod test {
     /// the floor belongs to this life, not to any record.
     #[test]
     fn floors_refuse_below() {
-        let floor: Version = "(1, 1, (0, 0, 2))".parse().unwrap();
+        let Versions {
+            older: below,
+            started: floor,
+            newer: above,
+            concurrent,
+        } = versions();
         let at: Version = floor.clone();
-        let below: Version = "(1, 0, (0, 0, 2))".parse().unwrap();
-        let above: Version = "(2, 1, (0, 0, 3))".parse().unwrap();
-        let concurrent: Version = "(1, 2, (0, 0, 1))".parse().unwrap();
         let committed = Boundary {
             network: network(1),
             burned: Bloom::new(),
@@ -2013,9 +2036,11 @@ mod test {
     /// A session started strictly above the frontier admits again.
     #[test]
     fn raised_floor_refuses_hopped_session() {
-        let started: Version = "(1, 1, (0, 0, 2))".parse().unwrap();
-        let executed: Version = "(1, 2, (0, 0, 1))".parse().unwrap();
-        let above: Version = "(2, 2, (0, 0, 3))".parse().unwrap();
+        let mut a = Clock::seed();
+        let mut b = a.fork();
+        let started = a.tick().clone();
+        let executed = b.tick().clone();
+        let above = started.clone() | executed.clone() | a.tick().clone();
         let session = SessionId::random();
         let committed = Boundary {
             network: network(1),
@@ -2048,7 +2073,7 @@ mod test {
     /// raise leaves it untrusted.
     #[test]
     fn untrusted_admits_nothing() {
-        let started: Version = "(2, 1, (0, 0, 3))".parse().unwrap();
+        let Versions { started, .. } = versions();
         let mut past = Past::new(Version::new(), Commitment::Untrusted);
         for net in [network(1), network(2)] {
             assert!(matches!(

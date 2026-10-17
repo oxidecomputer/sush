@@ -38,7 +38,6 @@ memmap2.workspace = true
 p256.workspace = true
 percent-encoding.workspace = true
 pwd.workspace = true
-qorb.workspace = true
 rumors.workspace = true
 rand_core.workspace = true
 rustix.workspace = true

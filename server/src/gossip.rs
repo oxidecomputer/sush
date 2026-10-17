@@ -26,7 +26,8 @@ use std::net::{SocketAddr, SocketAddrV6};
 use std::time::Duration;
 
 use futures::StreamExt as _;
-use rumors::{Error, Joined, Network, Peer, Rumors, Ticks};
+use rumors::error::Mismatch;
+use rumors::{Count, Error, Joined, Network, Peer, Rumors};
 use serde::Serialize;
 use serde::de::DeserializeOwned;
 use sled_hardware_types::BaseboardId;
@@ -84,12 +85,12 @@ impl Default for GossipConfig {
 
 /// A gossip universe.
 #[derive(Clone, Debug)]
-pub struct Universe<T> {
+pub struct Universe<T: Send + Sync + 'static> {
     /// The gossiped set.
     pub rumors: Rumors<T, SushBookmark>,
 }
 
-impl<T> Universe<T> {
+impl<T: Send + Sync + 'static> Universe<T> {
     pub fn genesis(rumors: Rumors<T, SushBookmark>) -> Self {
         Self { rumors }
     }
@@ -108,12 +109,12 @@ impl<T> Universe<T> {
 /// the pair whole, so a seed can never gossip against a source other
 /// than its own.
 #[derive(Debug)]
-pub struct Seed<T> {
+pub struct Seed<T: Send + Sync + 'static> {
     rumors: Rumors<T, SushBookmark>,
     bookmarks: BookmarkSource,
 }
 
-impl<T> Seed<T> {
+impl<T: Send + Sync + 'static> Seed<T> {
     /// Seed a fresh universe with this server as its only peer, over
     /// `locker`'s storage, making the locker's one [`BookmarkSource`].
     ///
@@ -156,8 +157,8 @@ impl<T> Seed<T> {
 
 /// Whether the peer's universe dominates ours, by rumors' documented rule.
 fn remote_dominates(
-    local_events: &Ticks,
-    remote_events: &Ticks,
+    local_events: &Count,
+    remote_events: &Count,
     local_network: Network,
     remote_network: Network,
 ) -> bool {
@@ -257,7 +258,7 @@ enum Stopped {
     Failed,
 }
 
-struct Manager<T> {
+struct Manager<T: Send + Sync + 'static> {
     log: Logger,
     config: GossipConfig,
     endpoint: Endpoint<SprocketsDial>,
@@ -391,7 +392,7 @@ where
             let endpoint = self.endpoint.clone();
             let handle = self.dials.spawn(async move {
                 let result = match timeout(deadline, endpoint.link(peer)).await {
-                    Ok(Ok(link)) => Ok(link),
+                    Ok(Ok((_, link))) => Ok(link),
                     Ok(Err(err)) => Err(err.to_string()),
                     Err(_) => Err("link establishment timed out".to_string()),
                 };
@@ -517,15 +518,16 @@ where
     T: DeserializeOwned + Serialize + Eq + Send + Sync + 'static,
 {
     let ours = rumors.network();
-    let mut driver = rumors.gossip_when(rumors.changes(), &mut link);
+    let mut driver = rumors.gossip(&mut link);
     while let Some(session) = driver.next().await {
         match session {
             Ok(_) => {}
-            Err(Error::NetworkMismatch {
+            Err(Error::Mismatch(Mismatch::Network {
                 remote_network,
                 remote_min_events,
                 local_min_events,
-            }) => {
+                ..
+            })) => {
                 let dominated =
                     remote_dominates(&local_min_events, &remote_min_events, ours, remote_network);
                 debug!(

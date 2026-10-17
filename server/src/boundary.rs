@@ -338,6 +338,7 @@ mod test {
     use std::fs::create_dir;
 
     use camino::Utf8PathBuf;
+    use rumors::before::Clock;
     use slog::Discard;
     use tempfile::TempDir;
 
@@ -367,11 +368,19 @@ mod test {
         serde_json::from_str(&format!("[{seed:?}{}]", ", 0".repeat(15))).unwrap()
     }
 
+    /// A deterministic nonempty version: the seed party with two
+    /// events.
+    fn executed() -> Version {
+        let mut clock = Clock::seed();
+        clock.tick();
+        clock.tick().clone()
+    }
+
     fn boundary() -> Boundary {
         Boundary {
             network: network(1),
             burned: Bloom::new(),
-            executed: "(1, 1, (0, 0, 2))".parse().unwrap(),
+            executed: executed(),
             job: Some(Committed {
                 session: SessionId::random(),
                 job: JobId::random(),
@@ -398,7 +407,7 @@ mod test {
                 burned.insert(&network_key(network(2)));
                 burned
             },
-            executed: "(1, 1, (0, 0, 2))".parse().unwrap(),
+            executed: executed(),
             job: Some(Committed {
                 session: "abandon-ability".parse().unwrap(),
                 job: "zoo-zero".parse().unwrap(),

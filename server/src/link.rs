@@ -12,35 +12,27 @@
 //! which is what rumors asks of a transport it trusts.
 //!
 //! A fresh connection costs a full attested handshake, most of a second
-//! with the RoT in the loop, and the RoT serializes them. The dialer
-//! therefore pools. rumors hands a completed stream's connection back
-//! through [`Dial::recycle`], a qorb pool per peer holds it, and the next
-//! stream to that peer draws it instead of dialing. Only clean returns
-//! are reused: a connection dropped mid-stream is discarded at the
-//! pool's door.
+//! with the RoT in the loop, and the RoT serializes them. rumors itself
+//! holds a completed stream's connection idle and reuses it for the next
+//! stream on that link. [`Dial::dial`] therefore pays that handshake
+//! only when a link needs a connection it does not already hold.
 
-use std::collections::{BTreeMap, BTreeSet, HashMap};
+use std::collections::{BTreeMap, BTreeSet};
 use std::io;
 use std::net::{Ipv6Addr, SocketAddr, SocketAddrV6};
 use std::pin::Pin;
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 use std::task::{Context, Poll};
 use std::time::Duration;
 
-use async_trait::async_trait;
 use camino::Utf8PathBuf;
-use qorb::backend::{self, Backend};
-use qorb::claim;
-use qorb::policy::{Policy, SetConfig};
-use qorb::pool::Pool;
-use qorb::resolvers::fixed::FixedResolver;
 use rumors::link::STREAM_COUNT;
 use rumors::link::routed::{Config, Dial, Endpoint, Incoming, Listen, RoutedLink};
 use sled_hardware_types::BaseboardId;
 use slog::{Logger, debug, o, warn};
 use sprockets_tls::keys::SprocketsConfig;
 use sprockets_tls::{Client, Server};
-use tokio::io::{AsyncRead, AsyncReadExt as _, AsyncWrite, AsyncWriteExt as _, ReadBuf};
+use tokio::io::{AsyncRead, AsyncWrite, AsyncWriteExt as _, ReadBuf};
 use tokio::net::TcpStream;
 use tokio::runtime::Handle;
 use tokio::sync::{mpsc, watch};
@@ -57,88 +49,20 @@ pub type CorpusSource = Arc<dyn Fn() -> Vec<Utf8PathBuf> + Send + Sync>;
 /// Completed handshakes the listener holds while the router catches up.
 const HANDSHAKE_QUEUE_DEPTH: usize = 64;
 
-/// Inbound connections the router holds mid-header. Recycled idle
-/// connections park here between streams, so the bound admits a whole
-/// rack's stream complements at once.
+/// Inbound connections that the router holds mid-header. Enough
+/// for a whole rack opening full stream complements at once; idle
+/// connections parked between streams do not count against this.
 const PENDING_HEADERS: usize = STREAM_COUNT * 32;
 
 /// How long to wait after a failed accept before accepting again.
 const ACCEPT_RETRY: Duration = Duration::from_millis(100);
 
-/// Connections per peer. The link contract's worst case is one control
-/// stream plus a full complement for each of a pair's two links, and
-/// claims parked on the ready byte can briefly overlap the next
-/// session's opens. Slots are created on demand, so the cap is free
-/// when idle.
-const MAX_SLOTS: usize = 3 * STREAM_COUNT + 1;
-
-/// Idle connections kept warm per peer. Taking one stream leaves a
-/// spare, so qorb fires no refill and reuses the recycled connection
-/// rather than culling it.
-const SPARES_WANTED: usize = 2;
-
-/// Floor between one slot's reconnect attempts after a failure,
-/// matched to the RoT's roughly one-per-second handshake rate.
-const MIN_CONNECTION_BACKOFF: Duration = Duration::from_secs(1);
-
-/// How often qorb re-checks an idle connection. The check is a no-op
-/// (no ping), so the tick only bounces slot state. It must be finite:
-/// qorb arms the timer by adding this to the current instant, and
-/// `Duration::MAX`, which its docs suggest for disabling checks,
-/// overflows the addition and kills the slot task.
-const HEALTH_INTERVAL: Duration = Duration::from_secs(24 * 60 * 60);
-
-/// One attested connection as a peer's pool holds it.
-struct PooledConn {
-    stream: Option<sprockets_tls::Stream<TcpStream>>,
-    /// qorb returns a dropped claim to the pool no matter how its
-    /// stream ended, so this bit tells a clean return from an abort:
-    /// set as the connection is claimed, cleared only by
-    /// [`Dial::recycle`], and checked at the pool's door, where a dirty
-    /// connection is discarded.
-    dirty: bool,
-}
-
-impl Drop for PooledConn {
-    fn drop(&mut self) {
-        let Some(mut stream) = self.stream.take() else {
-            return;
-        };
-        // A dropped TLS connection sends a bare FIN, which rustls
-        // reports to the peer as an unexpected end of file, so the drop
-        // hands the connection to a task that shuts it down properly.
-        // Outside a runtime there is no one left to read the closing
-        // alert either, so let the connection drop abruptly.
-        if let Ok(handle) = Handle::try_current() {
-            handle.spawn(async move {
-                let _ = stream.shutdown().await;
-            });
-        }
-    }
-}
-
-/// One sprockets connection, carrying one link stream at a time.
-///
-/// A dialed connection is a claim on its peer's pool: dropping it
-/// returns it, and the pool reuses it only if [`Dial::recycle`] marked
-/// it clean first. An accepted connection belongs to the router, and
-/// dropping it closes it.
-pub struct SprocketsConn(Conn);
-
-enum Conn {
-    /// Accepted by the listener.
-    Direct(Option<sprockets_tls::Stream<TcpStream>>),
-    /// Claimed from a peer's pool.
-    Pooled(claim::Handle<PooledConn>),
-}
+/// One sprockets connection, closed on drop.
+pub struct SprocketsConn(Option<sprockets_tls::Stream<TcpStream>>);
 
 impl SprocketsConn {
     fn stream(&mut self) -> Pin<&mut sprockets_tls::Stream<TcpStream>> {
-        let stream = match &mut self.0 {
-            Conn::Direct(stream) => stream.as_mut(),
-            Conn::Pooled(handle) => handle.stream.as_mut(),
-        };
-        Pin::new(stream.expect("stream present until drop"))
+        Pin::new(self.0.as_mut().expect("stream present until drop"))
     }
 }
 
@@ -172,15 +96,14 @@ impl AsyncWrite for SprocketsConn {
 
 impl Drop for SprocketsConn {
     fn drop(&mut self) {
-        // A pooled connection's drop is its return to the pool, which
-        // discards it (shutting it down) unless it was recycled clean.
-        let Conn::Direct(stream) = &mut self.0 else {
+        let Some(mut stream) = self.0.take() else {
             return;
         };
-        let Some(mut stream) = stream.take() else {
-            return;
-        };
-        // As for `PooledConn`: shut down properly inside a runtime.
+        // A dropped TLS connection sends a bare FIN, which rustls
+        // reports to the peer as an unexpected end of file, so the drop
+        // hands the connection to a task that shuts it down properly.
+        // Outside a runtime there is no one left to read the closing
+        // alert either, so let the connection drop abruptly.
         if let Ok(handle) = Handle::try_current() {
             handle.spawn(async move {
                 let _ = stream.shutdown().await;
@@ -293,74 +216,7 @@ fn baseboard(log: &Logger, platform_id: &str) -> Option<BaseboardId> {
     }
 }
 
-/// Establishes a peer pool's connections, one attested handshake each.
-struct PoolConnector {
-    log: Logger,
-    config: SprocketsConfig,
-    corpus: CorpusSource,
-    baseboards: Baseboards,
-    timeout: Duration,
-}
-
-#[async_trait]
-impl backend::Connector for PoolConnector {
-    type Connection = PooledConn;
-
-    async fn connect(&self, backend: &Backend) -> Result<PooledConn, backend::Error> {
-        // The resolver only ever names IPv6 backends; see `Dial::dial`.
-        let SocketAddr::V6(addr) = backend.address else {
-            return Err(backend::Error::from(io::Error::other(format!(
-                "sush gossip needs IPv6: {}",
-                backend.address
-            ))));
-        };
-        let config = self.config.clone();
-        let corpus = self.corpus.clone();
-        let log = self.log.clone();
-        // Sprockets connects are not cancel safe, and qorb may cancel
-        // this future, so the handshake runs in its own task and this
-        // future only awaits the result. The deadline lives inside the
-        // task, so an abandoned handshake still terminates at it
-        // instead of holding the RoT unbounded. The corpus source is
-        // consulted inside the task: if it panics, this connect fails,
-        // not the pool.
-        let deadline = self.timeout;
-        let dial = spawn(async move {
-            match timeout(deadline, Client::connect(config, addr, (corpus)(), log)).await {
-                Ok(connected) => connected.map_err(io::Error::other),
-                Err(_) => Err(io::Error::new(
-                    io::ErrorKind::TimedOut,
-                    format!("dialing {addr} timed out"),
-                )),
-            }
-        });
-        let stream = dial.await.map_err(io::Error::other)??;
-        self.baseboards
-            .dialed(&self.log, addr, stream.peer_platform_id().as_str());
-        Ok(PooledConn {
-            stream: Some(stream),
-            dirty: false,
-        })
-    }
-
-    async fn on_acquire(&self, conn: &mut PooledConn) -> Result<(), backend::Error> {
-        // Pessimistic: only a clean recycle clears it.
-        conn.dirty = true;
-        Ok(())
-    }
-
-    async fn on_recycle(&self, conn: &mut PooledConn) -> Result<(), backend::Error> {
-        if conn.dirty {
-            return Err(backend::Error::from(io::Error::new(
-                io::ErrorKind::ConnectionAborted,
-                "connection was dropped mid-stream",
-            )));
-        }
-        Ok(())
-    }
-}
-
-/// Dials attested sprockets connections, pooled per peer.
+/// Dials attested sprockets connections, one handshake each.
 #[derive(Clone)]
 pub struct SprocketsDial {
     log: Logger,
@@ -368,13 +224,11 @@ pub struct SprocketsDial {
     corpus: CorpusSource,
     baseboards: Baseboards,
     timeout: Duration,
-    pools: Arc<Mutex<HashMap<SocketAddrV6, Arc<Pool<PooledConn>>>>>,
 }
 
 impl SprocketsDial {
     /// Dial with `config`, appraising peers against the corpus of the
-    /// moment, and giving up on any one handshake or claim after
-    /// `timeout`.
+    /// moment, and giving up on any one handshake after `timeout`.
     pub fn new(
         log: &Logger,
         config: SprocketsConfig,
@@ -388,54 +242,7 @@ impl SprocketsDial {
             corpus,
             baseboards,
             timeout,
-            pools: Arc::default(),
         }
-    }
-
-    /// The pool dialing `addr`, created on first use.
-    fn pool(&self, addr: SocketAddrV6) -> Arc<Pool<PooledConn>> {
-        self.pools
-            .lock()
-            .expect("pool table lock")
-            .entry(addr)
-            .or_insert_with(|| Arc::new(self.build(addr)))
-            .clone()
-    }
-
-    fn build(&self, addr: SocketAddrV6) -> Pool<PooledConn> {
-        let connector = Arc::new(PoolConnector {
-            log: self.log.clone(),
-            config: self.config.clone(),
-            corpus: self.corpus.clone(),
-            baseboards: self.baseboards.clone(),
-            timeout: self.timeout,
-        });
-        let resolver = Box::new(FixedResolver::new([SocketAddr::V6(addr)]));
-        let policy = Policy {
-            spares_wanted: SPARES_WANTED,
-            max_slots: MAX_SLOTS,
-            claim_timeout: self.timeout,
-            set_config: SetConfig {
-                max_count: MAX_SLOTS,
-                min_connection_backoff: MIN_CONNECTION_BACKOFF,
-                health_interval: HEALTH_INTERVAL,
-                ..SetConfig::default()
-            },
-            ..Policy::default()
-        };
-        match Pool::new(format!("gossip {addr}"), resolver, connector, policy) {
-            Ok(pool) => pool,
-            Err(err) => err.into_inner(),
-        }
-    }
-
-    /// Drop the pools of peers outside `peers`, closing their idle
-    /// connections.
-    fn retain(&self, peers: &BTreeSet<SocketAddrV6>) {
-        self.pools
-            .lock()
-            .expect("pool table lock")
-            .retain(|addr, _| peers.contains(addr));
     }
 }
 
@@ -447,25 +254,30 @@ impl Dial for SprocketsDial {
         let SocketAddr::V6(addr) = *addr else {
             return Err(io::Error::other(format!("sush gossip needs IPv6: {addr}")));
         };
-        let handle =
-            self.pool(addr).claim().await.map_err(|err| {
-                io::Error::other(format!("claiming a connection to {addr}: {err}"))
-            })?;
-        Ok(SprocketsConn(Conn::Pooled(handle)))
-    }
-
-    fn recycle(&self, _peer: &SocketAddr, mut conn: SprocketsConn) {
-        // Reusable only once the peer's router says it is ready: read
-        // that byte off the session's task, then let the drop return
-        // the claim clean.
-        spawn(async move {
-            let mut ready = [0u8; 1];
-            if conn.read_exact(&mut ready).await.is_ok()
-                && let Conn::Pooled(handle) = &mut conn.0
-            {
-                handle.dirty = false;
+        let config = self.config.clone();
+        let corpus = self.corpus.clone();
+        let log = self.log.clone();
+        // Sprockets connects are not cancel safe, and the router may
+        // cancel this future, so the handshake runs in its own task and
+        // this future only awaits the result. The deadline lives inside
+        // the task, so an abandoned handshake still terminates at it
+        // instead of holding the RoT unbounded. The corpus source is
+        // consulted inside the task, so a panic there fails this dial
+        // instead of unwinding the caller.
+        let deadline = self.timeout;
+        let dial = spawn(async move {
+            match timeout(deadline, Client::connect(config, addr, (corpus)(), log)).await {
+                Ok(connected) => connected.map_err(io::Error::other),
+                Err(_) => Err(io::Error::new(
+                    io::ErrorKind::TimedOut,
+                    format!("dialing {addr} timed out"),
+                )),
             }
         });
+        let stream = dial.await.map_err(io::Error::other)??;
+        self.baseboards
+            .dialed(&self.log, addr, stream.peer_platform_id().as_str());
+        Ok(SprocketsConn(Some(stream)))
     }
 }
 
@@ -474,7 +286,6 @@ impl Dial for SprocketsDial {
 pub struct Transport {
     endpoint: Endpoint<SprocketsDial>,
     incoming: Incoming<SprocketsDial>,
-    dial: SprocketsDial,
     baseboards: Baseboards,
     bound: SocketAddrV6,
 }
@@ -497,6 +308,7 @@ impl Transport {
             corpus.clone(),
             baseboards.clone(),
             listen_addr,
+            dial_timeout,
             shutdown.clone(),
         )
         .await?;
@@ -506,7 +318,7 @@ impl Transport {
             ..Config::default()
         };
         let (endpoint, incoming, router) =
-            Endpoint::new(listen, SocketAddr::V6(bound), dial.clone(), router_config)
+            Endpoint::new(listen, SocketAddr::V6(bound), dial, router_config)
                 .map_err(io::Error::other)?;
         let log = log.new(o!("component" => "link router"));
         spawn(async move {
@@ -520,7 +332,6 @@ impl Transport {
         Ok(Transport {
             endpoint,
             incoming,
-            dial,
             baseboards,
             bound,
         })
@@ -541,10 +352,9 @@ impl Transport {
         &self.baseboards
     }
 
-    /// Drop the connection pools and recorded baseboards of peers
-    /// outside `peers`.
+    /// Drop the recorded baseboards of peers outside `peers`. Their
+    /// idle connections live in rumors' links and close with them.
     pub fn retain_peers(&self, peers: &BTreeSet<SocketAddrV6>) {
-        self.dial.retain(peers);
         self.baseboards.retain(peers);
     }
 
@@ -565,6 +375,9 @@ impl Transport {
 /// router may cancel freely.
 pub struct SprocketsListen {
     connections: mpsc::Receiver<SprocketsConn>,
+    /// How long an accepted connection may take to route its first
+    /// stream before the router drops it and frees its slot.
+    routing_deadline: Duration,
 }
 
 impl SprocketsListen {
@@ -576,6 +389,7 @@ impl SprocketsListen {
         corpus: CorpusSource,
         baseboards: Baseboards,
         listen_addr: SocketAddrV6,
+        routing_deadline: Duration,
         shutdown: CancellationToken,
     ) -> io::Result<(Self, SocketAddrV6)> {
         let log = log.new(o!("component" => "sprockets listen"));
@@ -590,7 +404,13 @@ impl SprocketsListen {
         };
         let (tx, connections) = mpsc::channel(HANDSHAKE_QUEUE_DEPTH);
         spawn(pump(server, corpus, baseboards, tx, log, shutdown));
-        Ok((SprocketsListen { connections }, bound))
+        Ok((
+            SprocketsListen {
+                connections,
+                routing_deadline,
+            },
+            bound,
+        ))
     }
 }
 
@@ -602,6 +422,12 @@ impl Listen for SprocketsListen {
             .recv()
             .await
             .ok_or_else(|| io::Error::new(io::ErrorKind::BrokenPipe, "sprockets listener stopped"))
+    }
+
+    // Left at the never-expiring default, a stalled peer could hold a
+    // routing slot forever.
+    fn routing_deadline(&self) -> impl Future<Output = ()> + Send + 'static {
+        sleep(self.routing_deadline)
     }
 }
 
@@ -630,7 +456,7 @@ async fn pump(
                                     let id = stream.peer_platform_id().as_str();
                                     baseboards.accepted(&log, *peer.ip(), id);
                                 }
-                                let conn = SprocketsConn(Conn::Direct(Some(stream)));
+                                let conn = SprocketsConn(Some(stream));
                                 let _ = connections.send(conn).await;
                             }
                             Err(err) => {
