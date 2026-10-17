@@ -290,13 +290,18 @@ pub mod v0 {
 
 #[cfg(test)]
 mod wire_format {
+    use std::collections::BTreeSet;
     use std::env;
-    use std::fs::{read, write};
+    use std::fs::{read, read_dir, write};
+
+    use sush_api::JobWait;
+    use sush_common::authn::{ChallengeResponse, Nonce, RequestVerifier};
+    use sush_common::hash::hash;
+    use sush_common::jobs::{JobMode, JobStartRequest};
+    use sush_common::keys::{EncodedSignature, Signed};
 
     use super::v0::*;
     use super::*;
-    use std::str::FromStr as _;
-    use sush_common::authn::Nonce;
 
     /// Serialize a message as rumors does (CBOR) and compare against
     /// the snapshot in `tests/output/`, or rewrite it under
@@ -326,137 +331,243 @@ mod wire_format {
         name.parse().unwrap()
     }
 
-    #[test]
-    fn session_start_request() {
-        let msg: VersionedMessage = Message::Request(Request::session(
-            KeyId::from_str("zoo-zero").unwrap(),
-            SessionRequest::Start(sid("abandon-ability")),
-        ))
-        .into();
-        assert_wire_format("session-start-request", msg);
+    fn key(name: &str) -> KeyId {
+        name.parse().unwrap()
     }
 
-    #[test]
-    fn session_stop_request() {
-        let msg: VersionedMessage = Message::Request(Request::session(
-            KeyId::from_str("zoo-zero").unwrap(),
-            SessionRequest::Stop(sid("abandon-ability")),
-        ))
-        .into();
-        assert_wire_format("session-stop-request", msg);
-    }
-
-    #[test]
-    fn session_allow_attach_request() {
-        let msg: VersionedMessage = Message::Request(Request::session(
-            KeyId::from_str("zoo-zero").unwrap(),
-            SessionRequest::AllowAttach(
-                sid("abandon-ability"),
-                KeyId::from_str("able-about").unwrap(),
-                Access::ReadWrite,
-            ),
-        ))
-        .into();
-        assert_wire_format("session-allow-attach-request", msg);
-    }
-
-    #[test]
-    fn session_deny_attach_request() {
-        let msg: VersionedMessage = Message::Request(Request::session(
-            KeyId::from_str("zoo-zero").unwrap(),
-            SessionRequest::DenyAttach(
-                sid("abandon-ability"),
-                KeyId::from_str("able-about").unwrap(),
-            ),
-        ))
-        .into();
-        assert_wire_format("session-deny-attach-request", msg);
-    }
-
-    #[test]
-    fn job_start_request() {
-        use sush_common::jobs::{JobMode, JobStartRequest};
-        use sush_common::keys::{EncodedSignature, Signed};
-
-        let request = JobStartRequest::new(
-            "abandon-abandon-abandon-abandon-abandon-abandon-abandon-ability"
-                .parse()
-                .unwrap(),
-            "bamboo-bamboo-bamboo-bamboo-bamboo-bamboo-bamboo-banana"
-                .parse()
-                .unwrap(),
-            "echo hello",
-            JobMode::Batch,
-            "14,16".parse().unwrap(),
-        );
-        let signed = Signed::new(
-            request,
-            KeyId::from_str("zoo-zero").unwrap(),
-            EncodedSignature {
-                r: "abandon".parse().unwrap(),
-                s: "zoo".parse().unwrap(),
-                flags: 0,
-                counter: 0,
+    /// Maps every message to the snapshot pinning its variant. No
+    /// wildcard arms over this module's enums or [`SkipReason`]:
+    /// adding a variant fails compilation here until it is named,
+    /// built in [`samples`], and its snapshot pinned. Payload enums
+    /// with many variants ([`ProcessError`]) are sampled
+    /// representatively instead.
+    fn snapshot_name(message: &Message) -> &'static str {
+        match message {
+            Message::Request(Request::Session(r)) => match r.request {
+                SessionRequest::Start(_) => "session-start-request",
+                SessionRequest::Stop(_) => "session-stop-request",
+                SessionRequest::Skip(..) => "session-skip-request",
+                SessionRequest::AllowAttach(..) => "session-allow-attach-request",
+                SessionRequest::DenyAttach(..) => "session-deny-attach-request",
             },
-        );
-        let msg: VersionedMessage = Message::Request(Request::job(
-            KeyId::from_str("zoo-zero").unwrap(),
-            JobRequest::Start(signed, JobStartParams::default()),
-        ))
-        .into();
-        assert_wire_format("job-start-request", msg);
+            Message::Request(Request::Job(r)) => match &r.request {
+                JobRequest::Start(_, params) if params.term.is_some() => {
+                    "job-start-interactive-request"
+                }
+                JobRequest::Start(..) => "job-start-request",
+                JobRequest::Stop(_) => "job-stop-request",
+            },
+            Message::Request(Request::Identity(r)) => match r.request {
+                IdentityRequest::Login(..) => "identity-login-request",
+            },
+            Message::Event(_, event) => match event {
+                Event::Version(_) => "version-event",
+                Event::Job(JobEvent::Start(..)) => "job-start-event",
+                Event::Job(JobEvent::Stop(..)) => "job-stop-event",
+                Event::Job(JobEvent::Error(_, _, ProcessError::Interrupted)) => {
+                    "job-interrupted-event"
+                }
+                Event::Job(JobEvent::Error(..)) => "job-error-event",
+                Event::Job(JobEvent::Skipped(_, _, reason)) => match reason {
+                    SkipReason::BelowFloor => "job-skipped-event",
+                    SkipReason::AlreadyHandled => "already-handled-skip-event",
+                    SkipReason::SessionEnded => "session-ended-skip-event",
+                },
+                Event::Error(Error::ConcurrentSessions { .. }) => "concurrent-sessions-error",
+                Event::Error(Error::SessionHop) => "session-hop-error",
+                Event::Error(Error::UniverseFlipFlop) => "universe-flip-flop-error",
+            },
+        }
     }
 
-    #[test]
-    fn identity_login_request() {
-        use sush_common::authn::{ChallengeResponse, RequestVerifier};
-        use sush_common::keys::{EncodedSignature, Signed};
+    /// One sample per leaf of [`snapshot_name`]'s match, the inputs
+    /// to [`wire_formats`].
+    fn samples() -> Vec<Message> {
+        let actor = || key("zoo-zero");
+        let session = sid("abandon-ability");
+        let attach = key("able-about");
+        let long_job: JobId = "abandon-abandon-abandon-abandon-abandon-abandon-abandon-ability"
+            .parse()
+            .unwrap();
+        let long_session = sid("bamboo-bamboo-bamboo-bamboo-bamboo-bamboo-bamboo-banana");
+        let when = DateTime::from_timestamp(1_756_252_800, 0).unwrap();
+        let skip_when = "2026-09-04T20:00:00Z".parse().unwrap();
+        let skip_job: JobId = "zoo-zero".parse().unwrap();
+        let baseboard = BaseboardId {
+            part_number: "913-0000019".to_string(),
+            serial_number: "BRM42220030".to_string(),
+        };
+        let signature = |flags, counter| EncodedSignature {
+            r: "abandon".parse().unwrap(),
+            s: "zoo".parse().unwrap(),
+            flags,
+            counter,
+        };
 
-        // Craft deterministic evidence: nonces, then the ed25519
+        let batch = Signed::new(
+            JobStartRequest::new(
+                long_job,
+                long_session,
+                "echo hello",
+                JobMode::Batch,
+                "14,16".parse().unwrap(),
+            ),
+            actor(),
+            signature(0, 0),
+        );
+        let interactive = Signed::new(
+            JobStartRequest::new(
+                long_job,
+                long_session,
+                "bash",
+                JobMode::Interactive,
+                "14".parse().unwrap(),
+            ),
+            actor(),
+            signature(1, 38),
+        );
+        let interactive_params = JobStartParams {
+            term: Some("vt100".to_string()),
+            rows: Some(24),
+            cols: Some(80),
+            wait: JobWait::Start,
+            ..Default::default()
+        };
+
+        // Deterministic login evidence: nonces, then the ed25519
         // basepoint as the verifier.
         let mut epk = [0x66; 32];
         epk[0] = 0x58;
         let response: ChallengeResponse = serde_json::from_value(serde_json::json!({
-            "nonce": Nonce::from_str("abandon").unwrap(),
-            "cnonce": Nonce::from_str("ability").unwrap(),
+            "nonce": "abandon".parse::<Nonce>().unwrap(),
+            "cnonce": "ability".parse::<Nonce>().unwrap(),
             "epk": RequestVerifier::from_be_bytes(epk),
         }))
         .unwrap();
-
         let openssh = "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAILM+rvN+ot98qgEN796jTiQfZfG1KaT0PtFDJ13gEiGB test@sush";
+        let login = Signed::new(response, actor(), signature(0, 0));
 
-        let signed = Signed::new(
-            response,
-            KeyId::from_str("zoo-zero").unwrap(),
-            EncodedSignature {
-                r: "abandon".parse().unwrap(),
-                s: "zoo".parse().unwrap(),
-                flags: 0,
-                counter: 0,
-            },
-        );
-        let msg: VersionedMessage = Message::Request(Request::identity(
-            KeyId::from_str("zoo-zero").unwrap(),
-            IdentityRequest::Login(openssh.to_string(), signed),
-        ))
-        .into();
-        assert_wire_format("identity-login-request", msg);
+        let output = JobOutputState {
+            stdout_len: 22,
+            stderr_len: 0,
+            stdout_hash: hash(b"all pools are healthy\n").into(),
+            stderr_hash: hash(b"").into(),
+        };
+
+        vec![
+            Message::Request(Request::session(actor(), SessionRequest::Start(session))),
+            Message::Request(Request::session(actor(), SessionRequest::Stop(session))),
+            Message::Request(Request::session(
+                actor(),
+                SessionRequest::Skip(long_session, long_job),
+            )),
+            Message::Request(Request::session(
+                actor(),
+                SessionRequest::AllowAttach(session, attach.clone(), Access::ReadWrite),
+            )),
+            Message::Request(Request::session(
+                actor(),
+                SessionRequest::DenyAttach(session, attach),
+            )),
+            Message::Request(Request::job(
+                actor(),
+                JobRequest::Start(batch, JobStartParams::default()),
+            )),
+            Message::Request(Request::job(
+                actor(),
+                JobRequest::Start(interactive, interactive_params),
+            )),
+            Message::Request(Request::job(actor(), JobRequest::Stop(long_job))),
+            Message::Request(Request::identity(
+                actor(),
+                IdentityRequest::Login(openssh.to_string(), login),
+            )),
+            Message::Event(
+                baseboard.clone(),
+                Event::Version(VersionInfo {
+                    version: "0.1.0".to_string(),
+                    commit: "f078e863b17359031de072222bb631270f2d5157".to_string(),
+                }),
+            ),
+            Message::Event(
+                baseboard.clone(),
+                Event::Job(JobEvent::Start(long_job, when)),
+            ),
+            Message::Event(
+                baseboard.clone(),
+                Event::Job(JobEvent::Stop(long_job, when, Ok(0), output)),
+            ),
+            Message::Event(
+                baseboard.clone(),
+                Event::Job(JobEvent::Error(
+                    long_job,
+                    when,
+                    ProcessError::InvalidJob("interactive jobs cannot stream".to_string()),
+                )),
+            ),
+            Message::Event(
+                baseboard.clone(),
+                Event::Job(JobEvent::Error(long_job, when, ProcessError::Interrupted)),
+            ),
+            Message::Event(
+                baseboard.clone(),
+                Event::Job(JobEvent::Skipped(
+                    skip_job,
+                    skip_when,
+                    SkipReason::BelowFloor,
+                )),
+            ),
+            Message::Event(
+                baseboard.clone(),
+                Event::Job(JobEvent::Skipped(
+                    skip_job,
+                    skip_when,
+                    SkipReason::AlreadyHandled,
+                )),
+            ),
+            Message::Event(
+                baseboard.clone(),
+                Event::Job(JobEvent::Skipped(
+                    skip_job,
+                    skip_when,
+                    SkipReason::SessionEnded,
+                )),
+            ),
+            Message::Event(
+                baseboard.clone(),
+                Event::Error(Error::ConcurrentSessions {
+                    own_session: long_session,
+                    own_version: Box::new(Version::new()),
+                    incoming_session: sid("zoo-zoo-zoo-zoo-zoo-zoo-zoo-zebra"),
+                    incoming_version: Box::new(Version::new()),
+                }),
+            ),
+            Message::Event(baseboard.clone(), Event::Error(Error::SessionHop)),
+            Message::Event(baseboard, Event::Error(Error::UniverseFlipFlop)),
+        ]
     }
 
+    /// Every sample round-trips against its pinned snapshot, and the
+    /// snapshot directory holds exactly the pinned set, so a deleted
+    /// variant cannot leave a stale snapshot behind.
     #[test]
-    fn version_event() {
-        let msg: VersionedMessage = Message::Event(
-            BaseboardId {
-                part_number: "913-0000019".to_string(),
-                serial_number: "BRM42220030".to_string(),
-            },
-            Event::Version(VersionInfo {
-                version: "0.1.0".to_string(),
-                commit: "f078e863b17359031de072222bb631270f2d5157".to_string(),
-            }),
-        )
-        .into();
-        assert_wire_format("version-event", msg);
+    fn wire_formats() {
+        // The boundary module pins its record format in the same
+        // directory.
+        let mut expected = BTreeSet::from(["boundary-record-v0.bin".to_string()]);
+        for message in samples() {
+            let name = snapshot_name(&message);
+            assert!(
+                expected.insert(format!("{name}.bin")),
+                "two samples hit the same arm: {name}"
+            );
+            assert_wire_format(name, message.into());
+        }
+        let present: BTreeSet<String> = read_dir("tests/output")
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name().into_string().unwrap())
+            .collect();
+        assert_eq!(present, expected, "tests/output and the samples disagree");
     }
 
     /// A message from a newer build decodes as `Unknown` instead of
@@ -484,202 +595,5 @@ mod wire_format {
 
         let corrupt: Result<VersionedMessage, _> = from_cbor([0x01].as_slice());
         assert!(corrupt.is_err());
-    }
-
-    #[test]
-    fn session_skip_request() {
-        let msg: VersionedMessage = Message::Request(Request::session(
-            KeyId::from_str("zoo-zero").unwrap(),
-            SessionRequest::Skip(
-                sid("bamboo-bamboo-bamboo-bamboo-bamboo-bamboo-bamboo-banana"),
-                "abandon-abandon-abandon-abandon-abandon-abandon-abandon-ability"
-                    .parse()
-                    .unwrap(),
-            ),
-        ))
-        .into();
-        assert_wire_format("session-skip-request", msg);
-    }
-
-    #[test]
-    fn job_stop_request() {
-        let msg: VersionedMessage = Message::Request(Request::job(
-            KeyId::from_str("zoo-zero").unwrap(),
-            JobRequest::Stop(
-                "abandon-abandon-abandon-abandon-abandon-abandon-abandon-ability"
-                    .parse()
-                    .unwrap(),
-            ),
-        ))
-        .into();
-        assert_wire_format("job-stop-request", msg);
-    }
-
-    #[test]
-    fn job_events() {
-        use sush_common::hash::hash;
-        use sush_common::jobs::JobOutputState;
-
-        let baseboard = BaseboardId {
-            part_number: "913-0000019".to_string(),
-            serial_number: "BRM42220030".to_string(),
-        };
-        let job_id = "abandon-abandon-abandon-abandon-abandon-abandon-abandon-ability"
-            .parse()
-            .unwrap();
-        let when = DateTime::from_timestamp(1_756_252_800, 0).unwrap();
-
-        let msg: VersionedMessage =
-            Message::Event(baseboard.clone(), Event::Job(JobEvent::Start(job_id, when))).into();
-        assert_wire_format("job-start-event", msg);
-
-        let output = JobOutputState {
-            stdout_len: 22,
-            stderr_len: 0,
-            stdout_hash: hash(b"all pools are healthy\n").into(),
-            stderr_hash: hash(b"").into(),
-        };
-        let msg: VersionedMessage = Message::Event(
-            baseboard.clone(),
-            Event::Job(JobEvent::Stop(job_id, when, Ok(0), output)),
-        )
-        .into();
-        assert_wire_format("job-stop-event", msg);
-
-        let msg: VersionedMessage = Message::Event(
-            baseboard.clone(),
-            Event::Job(JobEvent::Error(
-                job_id,
-                when,
-                ProcessError::InvalidJob("interactive jobs cannot stream".to_string()),
-            )),
-        )
-        .into();
-        assert_wire_format("job-error-event", msg);
-
-        let msg: VersionedMessage = Message::Event(
-            baseboard,
-            Event::Job(JobEvent::Error(job_id, when, ProcessError::Interrupted)),
-        )
-        .into();
-        assert_wire_format("job-interrupted-event", msg);
-    }
-
-    #[test]
-    fn concurrent_sessions_error() {
-        let msg: VersionedMessage = Message::Event(
-            BaseboardId {
-                part_number: "913-0000019".to_string(),
-                serial_number: "BRM42220030".to_string(),
-            },
-            Event::Error(Error::ConcurrentSessions {
-                own_session: sid("bamboo-bamboo-bamboo-bamboo-bamboo-bamboo-bamboo-banana"),
-                own_version: Box::new(Version::new()),
-                incoming_session: sid("zoo-zoo-zoo-zoo-zoo-zoo-zoo-zebra"),
-                incoming_version: Box::new(Version::new()),
-            }),
-        )
-        .into();
-        assert_wire_format("concurrent-sessions-error", msg);
-    }
-
-    #[test]
-    fn job_skipped_event() {
-        let msg: VersionedMessage = Message::Event(
-            BaseboardId {
-                part_number: "913-0000019".to_string(),
-                serial_number: "BRM42220030".to_string(),
-            },
-            Event::Job(JobEvent::Skipped(
-                JobId::from_str("zoo-zero").unwrap(),
-                "2026-09-04T20:00:00Z".parse().unwrap(),
-                SkipReason::BelowFloor,
-            )),
-        )
-        .into();
-        assert_wire_format("job-skipped-event", msg);
-    }
-
-    #[test]
-    fn session_ended_skip_event() {
-        let msg: VersionedMessage = Message::Event(
-            BaseboardId {
-                part_number: "913-0000019".to_string(),
-                serial_number: "BRM42220030".to_string(),
-            },
-            Event::Job(JobEvent::Skipped(
-                JobId::from_str("zoo-zero").unwrap(),
-                "2026-09-04T20:00:00Z".parse().unwrap(),
-                SkipReason::SessionEnded,
-            )),
-        )
-        .into();
-        assert_wire_format("session-ended-skip-event", msg);
-    }
-
-    #[test]
-    fn session_hop_error() {
-        let msg: VersionedMessage = Message::Event(
-            BaseboardId {
-                part_number: "913-0000019".to_string(),
-                serial_number: "BRM42220030".to_string(),
-            },
-            Event::Error(Error::SessionHop),
-        )
-        .into();
-        assert_wire_format("session-hop-error", msg);
-    }
-
-    #[test]
-    fn universe_flip_flop_error() {
-        let msg: VersionedMessage = Message::Event(
-            BaseboardId {
-                part_number: "913-0000019".to_string(),
-                serial_number: "BRM42220030".to_string(),
-            },
-            Event::Error(Error::UniverseFlipFlop),
-        )
-        .into();
-        assert_wire_format("universe-flip-flop-error", msg);
-    }
-
-    #[test]
-    fn job_start_interactive_request() {
-        use sush_api::JobWait;
-        use sush_common::jobs::{JobMode, JobStartRequest};
-        use sush_common::keys::{EncodedSignature, Signed};
-
-        let request = JobStartRequest::new(
-            "abandon-abandon-abandon-abandon-abandon-abandon-abandon-ability"
-                .parse()
-                .unwrap(),
-            sid("bamboo-bamboo-bamboo-bamboo-bamboo-bamboo-bamboo-banana"),
-            "bash",
-            JobMode::Interactive,
-            "14".parse().unwrap(),
-        );
-        let signed = Signed::new(
-            request,
-            KeyId::from_str("zoo-zero").unwrap(),
-            EncodedSignature {
-                r: "abandon".parse().unwrap(),
-                s: "zoo".parse().unwrap(),
-                flags: 1,
-                counter: 38,
-            },
-        );
-        let params = JobStartParams {
-            term: Some("vt100".to_string()),
-            rows: Some(24),
-            cols: Some(80),
-            wait: JobWait::Start,
-            ..Default::default()
-        };
-        let msg: VersionedMessage = Message::Request(Request::job(
-            KeyId::from_str("zoo-zero").unwrap(),
-            JobRequest::Start(signed, params),
-        ))
-        .into();
-        assert_wire_format("job-start-interactive-request", msg);
     }
 }
