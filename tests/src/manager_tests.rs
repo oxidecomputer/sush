@@ -8,7 +8,6 @@ use std::mem::MaybeUninit;
 use std::os::unix::fs::PermissionsExt as _;
 use std::path::Path;
 use std::ptr::null_mut;
-use std::slice::from_ref;
 use std::time::Duration;
 
 use chrono::Utc;
@@ -16,14 +15,11 @@ use function_name::named;
 use http_range_header::{EndPosition, StartPosition, SyntacticallyCorrectRange as Range};
 use libc::{SIGTERM, SIGXCPU};
 use pwd::Passwd;
-use sled_hardware_types::BaseboardId;
-use slog::{Discard, Logger, o};
 use tempfile::TempDir;
 use tokio::fs::{metadata, read, write};
 use tokio::sync::watch;
 use tokio::time::{sleep, timeout};
 use tokio_util::sync::CancellationToken;
-use x509_cert::der::Encode as _;
 use x509_cert::time::Validity;
 
 use sush_api::{JobStartParams, JobStopParams, JobWait};
@@ -33,19 +29,19 @@ use sush_common::jobs::{
     Access, JobId, JobLimits, JobMode, JobOutputState, JobOutputStream::*, JobStartRequest,
     JobStatus, ProcessError, Session, SessionId, SessionSignerNonce, SignedJob, SkipReason,
 };
-use sush_common::keys::{EphemeralKey, KeyError, KeyId, KeyType, Signer as _, pem_cert_chain};
+use sush_common::keys::{EphemeralKey, KeyError, KeyType, Signer as _, pem_cert_chain};
 use sush_common::targets::{Cubbies, Target};
 use sush_server::gossip::{LinkedBaseboards, Universe};
 use sush_server::io::BATCH_OUTPUT_BUFFER_SIZE;
 use sush_server::locker::Locker;
-use sush_server::messages::v0::{CertRequest, IdentityRequest, Message, Request, SessionRequest};
+use sush_server::messages::v0::{IdentityRequest, Message, Request, SessionRequest};
 use sush_server::output::{JobOutputDir, OutputDirs};
 use sush_server::{JobError, JobManager};
 
 use crate::test_utils::{
     IntoBytes as _, SignJobRequest as _, ephemeral_test_root, ephemeral_test_subject,
-    fake_identity, manager_and_test_root, manager_login, manager_test_root_and_peer, no_cubbies,
-    null_gossip, test_baseboard_id, test_logger,
+    fake_identity, manager_and_test_root, manager_test_root_and_peer, no_cubbies, null_gossip,
+    test_baseboard_id, test_logger,
 };
 use sush_server::executor::PathIsolation;
 
@@ -969,9 +965,9 @@ async fn job_output_dir_moves() {
 #[named]
 #[tokio::test]
 async fn universe_swap() {
-    // A universe migration resets the state machine. Sessions and history
-    // die with the old universe, the boundary carries the last committed
-    // job across, and the manager keeps serving.
+    // A universe migration resets the state machine. Sessions,
+    // history, and in-flight jobs die with the old universe, nothing
+    // about them reaches the new one, and the manager keeps serving.
     let log = test_logger(function_name!());
     let dir = TempDir::with_prefix("sush-").unwrap();
     let mut root = ephemeral_test_root();
@@ -1017,11 +1013,27 @@ async fn universe_swap() {
         job_id
     }
 
-    // Run a job in the first universe.
+    // Run a job to completion in the first universe, and leave a
+    // second one running at the swap.
     let job_id = run_job(&mgr, &mut root, &authn).await;
     assert!(mgr.job_status(&authn, &job_id).await.is_ok());
+    let session = mgr.session(&authn).expect("live session");
+    let lingering = session.next_job_id();
+    let job = root
+        .sign_job_request(lingering, session.session_id(), "sleep 600", false)
+        .await;
+    mgr.job_start(
+        &authn,
+        job.into_signed(),
+        JobStartParams {
+            wait: JobWait::Start,
+            ..Default::default()
+        },
+    )
+    .await
+    .unwrap();
 
-    // Migrate. The session and the job's history are gone.
+    // Migrate. The session and the jobs die with the old universe.
     universe
         .send(Universe::genesis(null_gossip().await))
         .unwrap();
@@ -1032,36 +1044,19 @@ async fn universe_swap() {
     })
     .await
     .expect("state reset");
-    // The new universe cannot name the job, so the boundary
-    // adjudicates its recorded ending on this sled's sole authority.
-    async fn adjudicated(mgr: &JobManager, authn: &Identity, job_id: &JobId) {
-        timeout(Duration::from_secs(30), async {
-            loop {
-                if let Ok(map) = mgr.job_status(authn, job_id).await
-                    && matches!(
-                        map.get(mgr.own_baseboard()),
-                        Some(JobStatus::Stopped { result: Ok(0), .. })
-                    )
-                {
-                    break;
-                }
-                sleep(Duration::from_millis(50)).await;
-            }
-        })
-        .await
-        .expect("boundary adjudication");
-    }
-    adjudicated(&mgr, &authn, &job_id).await;
 
-    // A further swap lands in a universe that never heard the
-    // ruling, and that universe gets its own.
-    universe
-        .send(Universe::genesis(null_gossip().await))
-        .unwrap();
-    adjudicated(&mgr, &authn, &job_id).await;
-
-    // The manager still works in the new universe.
+    // The manager serves the new universe. Running a fresh job also
+    // orders this check after the swap has fully settled.
     run_job(&mgr, &mut root, &authn).await;
+
+    // Nothing about the old universe's jobs crossed over: not the
+    // completed job's history, and not the killed job's ending.
+    for old in [job_id, lingering] {
+        assert!(matches!(
+            mgr.job_status(&authn, &old).await,
+            Err(JobError::JobNotFound(_)),
+        ));
+    }
 }
 
 #[named]
@@ -1111,108 +1106,28 @@ async fn shutdown() {
     );
 }
 
+/// A root anchor's chain is the anchor itself, and a key outside the
+/// baked anchor set has no chain.
 #[named]
 #[tokio::test]
 async fn cert_chain() {
-    // Build a two-level chain.
-    let validity = Validity::from_now(Duration::from_secs(60)).unwrap();
-    let mut root =
-        EphemeralKey::new_root(KeyType::P256, ephemeral_test_subject(), validity).unwrap();
-    let root_key_id = root.key_id().to_owned();
-    let root_cert = root.cert().to_owned();
-    let roots = vec![root_cert.clone()];
-    let issuer = root.subject();
-    let signature_algorithm = root.signature_algorithm();
-    let subject = ephemeral_test_subject();
-    let mut child = EphemeralKey::new_child(
-        KeyType::Ed25519,
-        subject,
-        issuer,
-        validity,
-        &mut root,
-        signature_algorithm,
-    )
-    .await
-    .unwrap();
-    assert_ne!(child.key_id(), &root_key_id);
-    let child_key_id = child.key_id().to_owned();
-
-    // Set up the manager.
+    let log = test_logger(function_name!());
+    let (mgr, mut root, _dir, _shutdown) = manager_and_test_root(log).await;
     let authn = fake_identity(&mut root).await;
-    let dir = TempDir::with_prefix("sush-").unwrap();
-    let log = Logger::root(Discard, o!("test" => function_name!()));
-    let baseboard = BaseboardId {
-        part_number: "test part".to_string(),
-        serial_number: "0000".to_string(),
-    };
-    let gossip = Universe::isolated(null_gossip().await);
-    let shutdown = CancellationToken::new();
-    let mgr = JobManager::with_trust_anchors(
-        log,
-        PathIsolation::InsecureDisable,
-        JobOutputDir::fixed(dir.path()),
-        baseboard,
-        no_cubbies(),
-        gossip,
-        LinkedBaseboards::lonely(),
-        &Locker::null(),
-        &roots,
-        shutdown,
-    )
-    .await
-    .unwrap();
-
-    // Test failure modes.
-    assert!(
-        matches!(
-            mgr.cert_import(&authn, root_cert.clone(), false)
-                .await
-                .unwrap_err(),
-            JobError::Key(KeyError::SelfSigned),
-        ),
-        "should not import root cert"
-    );
     assert_eq!(
-        mgr.cert_chain(&authn, &root_key_id).unwrap(),
-        vec![root_cert.clone()]
+        mgr.cert_chain(&authn, root.key_id()).unwrap(),
+        vec![root.cert().clone()]
     );
-    timeout(
-        Duration::from_secs(1),
-        mgr.cert_import(&authn, child.cert().clone(), true),
+    let other = EphemeralKey::new_root(
+        KeyType::P256,
+        ephemeral_test_subject(),
+        Validity::from_now(Duration::from_secs(60)).unwrap(),
     )
-    .await
-    .expect("timed out importing child")
-    .expect("could not import child");
-    assert_eq!(
-        mgr.cert_chain(&authn, &child_key_id).unwrap(),
-        vec![root_cert.clone(), child.cert().clone()]
-    );
-
-    // Start a job signed with the child.
-    let signer_nonce = SessionSignerNonce::random();
-    let session_id =
-        SessionId::compute(mgr.own_baseboard(), mgr.session_sush_nonce(), signer_nonce);
-    let mut session = Session::new(session_id);
-    mgr.session_start(&authn, session_id, signer_nonce, true)
-        .await
-        .unwrap();
-    let job_id = session.next_job_id();
-    let job = child
-        .sign_job_request(job_id, session_id, "true", false)
-        .await;
-    mgr.job_start(
-        &authn,
-        job.clone().into_signed(),
-        JobStartParams {
-            wait: JobWait::Stop,
-            ..Default::default()
-        },
-    )
-    .await
     .unwrap();
-    session.job_started(job.clone().into_signed());
-    let status = mgr.job_status(&authn, &job_id).await.unwrap()[mgr.own_baseboard()].clone();
-    check_status_stopped(status, &job_id, Ok(0), Some(0), Some(0));
+    assert!(matches!(
+        mgr.cert_chain(&authn, other.key_id()),
+        Err(JobError::Key(KeyError::MissingCert(_))),
+    ));
 }
 
 /// Requests record the verified key that made them: the session names
@@ -1305,139 +1220,6 @@ async fn attribution() {
     .unwrap();
 }
 
-/// A revocation that precedes its certificate still lands, and
-/// revocation spam for made-up key IDs cannot block imports.
-#[named]
-#[tokio::test]
-async fn revocation_tombstones() {
-    let log = test_logger(function_name!());
-    let (mgr, mut root, peer, _dir, _shutdown) = manager_test_root_and_peer(log).await;
-    let authn = fake_identity(&mut root).await;
-    let validity = Validity::from_now(Duration::from_secs(60)).unwrap();
-    let issuer = root.subject();
-    let algorithm = root.signature_algorithm();
-    let doomed = EphemeralKey::new_child(
-        KeyType::P256,
-        ephemeral_test_subject(),
-        issuer.clone(),
-        validity,
-        &mut root,
-        algorithm.clone(),
-    )
-    .await
-    .unwrap();
-    let spared = EphemeralKey::new_child(
-        KeyType::P256,
-        ephemeral_test_subject(),
-        issuer,
-        validity,
-        &mut root,
-        algorithm,
-    )
-    .await
-    .unwrap();
-
-    // Spam revocations for keys that will never exist, then revoke the
-    // doomed child before anyone has seen its certificate.
-    let revoke = |key_id: KeyId| {
-        Message::Request(Request::cert(
-            authn.key_id.clone(),
-            CertRequest::Revoke(key_id, Utc::now()),
-        ))
-        .into()
-    };
-    for _ in 0..200 {
-        peer.send(revoke(KeyId::random())).unwrap();
-    }
-    peer.send(revoke(doomed.key_id().clone())).unwrap();
-
-    // The revocation outlives the spam and refuses the import. The
-    // spam blocks nothing else.
-    peer.send(
-        Message::Request(Request::cert(
-            authn.key_id.clone(),
-            CertRequest::Import(doomed.cert().to_der().unwrap()),
-        ))
-        .into(),
-    )
-    .unwrap();
-    timeout(Duration::from_secs(30), async {
-        loop {
-            match mgr.cert_chain(&authn, doomed.key_id()) {
-                Err(JobError::Key(KeyError::Revoked(..))) => break,
-                _ => sleep(Duration::from_millis(50)).await,
-            }
-        }
-    })
-    .await
-    .expect("revocation never landed");
-    timeout(
-        Duration::from_secs(30),
-        mgr.cert_import(&authn, spared.cert().clone(), true),
-    )
-    .await
-    .expect("timed out importing spared child")
-    .expect("could not import spared child");
-}
-
-/// Certificate revocation through the API: roots are refused, known
-/// certificates stop validating, and unseen certificates are
-/// tombstoned so their eventual import is refused.
-#[named]
-#[tokio::test]
-async fn cert_revoke() {
-    let log = test_logger(function_name!());
-    let (mgr, mut root, _dir, _shutdown) = manager_and_test_root(log).await;
-    let authn = fake_identity(&mut root).await;
-    let validity = Validity::from_now(Duration::from_secs(60)).unwrap();
-    let issuer = root.subject();
-    let algorithm = root.signature_algorithm();
-    let child = EphemeralKey::new_child(
-        KeyType::P256,
-        ephemeral_test_subject(),
-        issuer.clone(),
-        validity,
-        &mut root,
-        algorithm.clone(),
-    )
-    .await
-    .unwrap();
-    let unseen = EphemeralKey::new_child(
-        KeyType::P256,
-        ephemeral_test_subject(),
-        issuer,
-        validity,
-        &mut root,
-        algorithm,
-    )
-    .await
-    .unwrap();
-
-    assert!(matches!(
-        mgr.cert_revoke(&authn, root.key_id().clone(), false).await,
-        Err(JobError::TrustAnchorRevocation(_)),
-    ));
-
-    mgr.cert_import(&authn, child.cert().clone(), true)
-        .await
-        .unwrap();
-    mgr.cert_revoke(&authn, child.key_id().clone(), true)
-        .await
-        .unwrap();
-    assert!(matches!(
-        mgr.cert_chain(&authn, child.key_id()),
-        Err(JobError::Key(KeyError::Revoked(..))),
-    ));
-
-    mgr.cert_revoke(&authn, unseen.key_id().clone(), true)
-        .await
-        .unwrap();
-    assert!(matches!(
-        mgr.cert_import(&authn, unseen.cert().clone(), false).await,
-        Err(JobError::Key(KeyError::Revoked(..))),
-    ));
-}
-
 /// A job runs only on the sleds its signed target names. Jobs naming
 /// another baseboard, or a cubby while no mapping is known, are
 /// processed but never run here, and the causal chain moves on.
@@ -1493,31 +1275,6 @@ async fn job_targets() {
             Err(JobError::JobNotFound(_)),
         ));
     }
-}
-
-/// Identity revocation: live bound credentials die and the key may
-/// not log back in.
-#[named]
-#[tokio::test]
-async fn iam_revoke() {
-    let log = test_logger(function_name!());
-    let (mgr, mut root, _dir, _shutdown) = manager_and_test_root(log).await;
-    let authz = manager_login(&mgr, &mut root).await.unwrap();
-    let key_id = root.ssh_public_key().key_id().unwrap();
-    let header = authz.header("GET", "/sessions");
-    let authn = mgr
-        .iam(Some(header), None, ("GET", "/sessions"))
-        .await
-        .unwrap();
-
-    mgr.iam_revoke(&authn, key_id, true).await.unwrap();
-    let header = authz.header("GET", "/sessions");
-    assert!(
-        mgr.iam(Some(header), None, ("GET", "/sessions"))
-            .await
-            .is_err()
-    );
-    assert!(manager_login(&mgr, &mut root).await.is_err());
 }
 
 /// A login gossips as evidence every sled verifies for itself: real
@@ -1889,248 +1646,6 @@ async fn skip_racing_start_converges() {
 
     let status = mgr.job_status(&owner, &job_id).await.unwrap()[mgr.own_baseboard()].clone();
     check_status_stopped(status, &job_id, Ok(0), Some(0), Some(0));
-}
-
-/// Hostile certificate imports over gossip cannot displace the trust
-/// anchor or any established certificate.
-#[named]
-#[tokio::test]
-async fn hostile_imports_cannot_displace() {
-    let validity = Validity::from_now(Duration::from_secs(60)).unwrap();
-    let mut root =
-        EphemeralKey::new_root(KeyType::P256, ephemeral_test_subject(), validity).unwrap();
-    let root_cert = root.cert().to_owned();
-    let root_key_id = root.key_id().to_owned();
-    let issuer = root.subject();
-    let algorithm = root.signature_algorithm();
-    let mut child = EphemeralKey::new_child(
-        KeyType::P256,
-        ephemeral_test_subject(),
-        issuer,
-        validity,
-        &mut root,
-        algorithm.clone(),
-    )
-    .await
-    .unwrap();
-
-    let dir = TempDir::with_prefix("sush-").unwrap();
-    let log = Logger::root(Discard, o!("test" => function_name!()));
-    let baseboard = BaseboardId {
-        part_number: "test part".to_string(),
-        serial_number: "0000".to_string(),
-    };
-    let seed = null_gossip().await;
-    let peer = seed.clone();
-    let shutdown = CancellationToken::new();
-    let mgr = JobManager::with_trust_anchors(
-        log,
-        PathIsolation::InsecureDisable,
-        JobOutputDir::fixed(dir.path()),
-        baseboard,
-        no_cubbies(),
-        Universe::isolated(seed),
-        LinkedBaseboards::lonely(),
-        &Locker::null(),
-        from_ref(&root_cert),
-        shutdown,
-    )
-    .await
-    .unwrap();
-    let authn = fake_identity(&mut root).await;
-    timeout(
-        Duration::from_secs(1),
-        mgr.cert_import(&authn, child.cert().clone(), true),
-    )
-    .await
-    .expect("timed out importing child")
-    .expect("could not import child");
-
-    // A self-signed homonym of the root: same subject, different key,
-    // and therefore a different key ID.
-    let fake_root = EphemeralKey::new_root(KeyType::P256, root.subject(), validity).unwrap();
-    assert_ne!(fake_root.key_id(), &root_key_id);
-    let import = |key: &EphemeralKey| {
-        Message::Request(Request::cert(
-            key.key_id().clone(),
-            CertRequest::Import(key.cert().to_der().unwrap()),
-        ))
-        .into()
-    };
-    peer.send(import(&fake_root)).unwrap();
-
-    // A homonym of the root issued by an outsider.
-    let mut outsider =
-        EphemeralKey::new_root(KeyType::P256, ephemeral_test_subject(), validity).unwrap();
-    let outsider_issuer = outsider.subject();
-    let outsider_algorithm = outsider.signature_algorithm();
-    let fake_delegate = EphemeralKey::new_child(
-        KeyType::P256,
-        root.subject(),
-        outsider_issuer,
-        validity,
-        &mut outsider,
-        outsider_algorithm,
-    )
-    .await
-    .unwrap();
-    peer.send(import(&fake_delegate)).unwrap();
-
-    // A different certificate bearing the child's key.
-    let mut conflict = child.cert().clone();
-    conflict.tbs_certificate.validity = Validity::from_now(Duration::from_secs(120)).unwrap();
-    peer.send(
-        Message::Request(Request::cert(
-            child.key_id().clone(),
-            CertRequest::Import(conflict.to_der().unwrap()),
-        ))
-        .into(),
-    )
-    .unwrap();
-
-    // A grandchild sent on the same handle marks the batch processed
-    // once it validates.
-    let child_issuer = child.subject();
-    let grandchild = EphemeralKey::new_child(
-        KeyType::P256,
-        ephemeral_test_subject(),
-        child_issuer,
-        validity,
-        &mut child,
-        algorithm,
-    )
-    .await
-    .unwrap();
-    peer.send(import(&grandchild)).unwrap();
-    timeout(Duration::from_secs(30), async {
-        while mgr.cert_chain(&authn, grandchild.key_id()).is_err() {
-            sleep(Duration::from_millis(50)).await;
-        }
-    })
-    .await
-    .expect("grandchild never validated");
-
-    // The anchor and the established chain are intact, and neither
-    // homonym ever became usable.
-    assert_eq!(
-        mgr.cert_chain(&authn, &root_key_id).unwrap(),
-        vec![root_cert.clone()]
-    );
-    assert_eq!(
-        mgr.cert_chain(&authn, child.key_id()).unwrap(),
-        vec![root_cert, child.cert().clone()]
-    );
-    assert!(mgr.cert_chain(&authn, fake_root.key_id()).is_err());
-    assert!(mgr.cert_chain(&authn, fake_delegate.key_id()).is_err());
-}
-
-/// A certificate whose subject name matches another's cannot take its
-/// place as an issuer: chains resolve through the key that verifies.
-#[named]
-#[tokio::test]
-async fn homonym_issuer_resolves_to_true_parent() {
-    let validity = Validity::from_now(Duration::from_secs(60)).unwrap();
-    let mut root =
-        EphemeralKey::new_root(KeyType::P256, ephemeral_test_subject(), validity).unwrap();
-    let root_cert = root.cert().to_owned();
-    let issuer = root.subject();
-    let algorithm = root.signature_algorithm();
-    let shared_subject = ephemeral_test_subject();
-    let mut child = EphemeralKey::new_child(
-        KeyType::P256,
-        shared_subject.clone(),
-        issuer,
-        validity,
-        &mut root,
-        algorithm.clone(),
-    )
-    .await
-    .unwrap();
-    let mut outsider =
-        EphemeralKey::new_root(KeyType::P256, ephemeral_test_subject(), validity).unwrap();
-    let outsider_issuer = outsider.subject();
-    let outsider_algorithm = outsider.signature_algorithm();
-    let homonym = EphemeralKey::new_child(
-        KeyType::P256,
-        shared_subject,
-        outsider_issuer,
-        validity,
-        &mut outsider,
-        outsider_algorithm,
-    )
-    .await
-    .unwrap();
-    assert_ne!(homonym.key_id(), child.key_id());
-
-    let dir = TempDir::with_prefix("sush-").unwrap();
-    let log = Logger::root(Discard, o!("test" => function_name!()));
-    let baseboard = BaseboardId {
-        part_number: "test part".to_string(),
-        serial_number: "0000".to_string(),
-    };
-    let seed = null_gossip().await;
-    let peer = seed.clone();
-    let shutdown = CancellationToken::new();
-    let mgr = JobManager::with_trust_anchors(
-        log,
-        PathIsolation::InsecureDisable,
-        JobOutputDir::fixed(dir.path()),
-        baseboard,
-        no_cubbies(),
-        Universe::isolated(seed),
-        LinkedBaseboards::lonely(),
-        &Locker::null(),
-        from_ref(&root_cert),
-        shutdown,
-    )
-    .await
-    .unwrap();
-    let authn = fake_identity(&mut root).await;
-
-    // The homonym arrives before the certificate it mimics, then the
-    // real intermediate and a grandchild that names their shared
-    // subject as its issuer.
-    peer.send(
-        Message::Request(Request::cert(
-            homonym.key_id().clone(),
-            CertRequest::Import(homonym.cert().to_der().unwrap()),
-        ))
-        .into(),
-    )
-    .unwrap();
-    timeout(
-        Duration::from_secs(1),
-        mgr.cert_import(&authn, child.cert().clone(), true),
-    )
-    .await
-    .expect("timed out importing child")
-    .expect("could not import child");
-    let child_issuer = child.subject();
-    let grandchild = EphemeralKey::new_child(
-        KeyType::P256,
-        ephemeral_test_subject(),
-        child_issuer,
-        validity,
-        &mut child,
-        algorithm,
-    )
-    .await
-    .unwrap();
-    timeout(
-        Duration::from_secs(1),
-        mgr.cert_import(&authn, grandchild.cert().clone(), true),
-    )
-    .await
-    .expect("timed out importing grandchild")
-    .expect("could not import grandchild");
-
-    // The chain runs through the key that verifies, and the homonym
-    // never becomes usable, its issuer being a stranger.
-    assert_eq!(
-        mgr.cert_chain(&authn, grandchild.key_id()).unwrap(),
-        vec![root_cert, child.cert().clone(), grandchild.cert().clone()]
-    );
-    assert!(mgr.cert_chain(&authn, homonym.key_id()).is_err());
 }
 
 #[named]
@@ -2540,13 +2055,11 @@ async fn iam() {
         public_key: iam_public_key,
         nonce: iam_nonce,
         time_authenticated: iam_authenticated,
-        time_revoked: iam_revoked,
     } = identity.clone();
     assert_eq!(iam_key_id, key_id);
     assert_eq!(iam_public_key, public_key);
     assert_eq!(iam_nonce, credentials.nonce);
     assert!(iam_authenticated <= Utc::now());
-    assert!(iam_revoked.is_none());
 
     // A bound request authorizes; replaying its header does not, nor
     // does presenting it against a different request line.

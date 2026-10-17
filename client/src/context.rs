@@ -5,7 +5,6 @@
 //! Command context tracking.
 
 use std::fmt;
-use std::path::Path;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 
@@ -137,7 +136,6 @@ pub trait CommandContext: Clone + Send + Sync {
         certs: &str,
         roots: &[Certificate],
     ) -> Result<Certificate, CommandError>;
-    fn cert_imported(&mut self, path: &Path, key_id: KeyId);
 
     // Job management
     fn really_target(&mut self, sled: &SledId) -> Result<(), CommandError>;
@@ -173,6 +171,4 @@ pub trait CommandContext: Clone + Send + Sync {
     fn iam(&mut self, identity: &Identity) -> Result<(), CommandError>;
     fn identities(&mut self, identities: &[SshPublicKey]) -> Result<(), CommandError>;
     fn please_touch(&mut self, identity: &SshPublicKey) -> Result<(), CommandError>;
-    fn really_revoke(&mut self, what: &str, key_id: KeyId) -> Result<KeyId, CommandError>;
-    fn revoked(&mut self, what: &str, key_id: KeyId);
 }

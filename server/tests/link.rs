@@ -19,7 +19,7 @@ use tokio::{join, spawn};
 use tokio_util::sync::CancellationToken;
 
 use rumors::conformance::link::check;
-use rumors::{Peer, Rumors};
+use rumors::{Gossip, Joined, Peer, Rumors};
 use sush_server::link::{SprocketsLink, Transport};
 
 use common::{corpus, dial_timeout, localhost, pki, sprockets_config, test_logger};
@@ -69,7 +69,7 @@ impl TestNet {
         let endpoint = self.a.endpoint();
         let peer = *self.b.endpoint().local_addr();
         let (linked, accepted) = join!(endpoint.link(peer), self.b.accept());
-        let link_a = linked.expect("peer router accepts the link");
+        let (_, link_a) = linked.expect("peer router accepts the link");
         let (from, link_b) = accepted.expect("router is live");
         assert_eq!(from, *endpoint.local_addr());
         (link_a, link_b)
@@ -82,38 +82,40 @@ impl Drop for TestNet {
     }
 }
 
-// Slow (~35s each): CI always runs these, and local runs should
-// whenever `link.rs` or the gossip configuration changes:
+// Slow: the conformance suite runs for minutes in a debug build.
+// CI always runs these. Run them locally whenever `link.rs` or the
+// gossip configuration changes:
 //
 //     cargo test --package sush-server --test link -- --include-ignored
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread")]
 #[ignore]
 async fn conformance() {
     let mut net = TestNet::new("conformance").await;
-    timeout(
-        Duration::from_secs(600),
-        check(async || net.link_pair().await),
+    check(
+        async || net.link_pair().await,
+        || tokio::time::sleep(Duration::from_secs(120)),
     )
-    .await
-    .expect("conformance suite timed out");
+    .await;
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread")]
 #[ignore]
 async fn gossip_convergence() {
     let mut net = TestNet::new("gossip_convergence").await;
     let (link_a, mut link_b) = net.link_pair().await;
 
     // Alice seeds a universe with one message and serves sessions on her
-    // end of the link.
-    let alice: Rumors<String> = Peer::seed().into_rumors();
+    // end of the link, never initiating one herself.
+    let alice: Rumors<String> = Peer::seed()
+        .gossip_when(|_| stream::pending::<Gossip>())
+        .into_rumors();
     alice.send("from alice".to_string()).unwrap();
     let server = spawn({
         let alice = alice.clone();
         async move {
             let mut link_a = link_a;
-            let mut driver = alice.gossip_when(stream::pending::<()>(), &mut link_a);
+            let mut driver = alice.gossip(&mut link_a);
             while let Some(session) = driver.next().await {
                 session.expect("serving gossip session");
             }
@@ -121,21 +123,22 @@ async fn gossip_convergence() {
     });
 
     // Bob joins Alice's universe through the link and hears her message.
-    let bob = timeout(
+    let joined = timeout(
         Duration::from_secs(60),
         Peer::<String>::bootstrap().join(&mut link_b),
     )
     .await
-    .expect("bootstrap timed out")
-    .expect("bootstrap failed")
-    .expect("mutual bootstrap bail")
-    .into_rumors();
+    .expect("bootstrap timed out");
+    let Joined::Joined { peer } = joined else {
+        panic!("bootstrap failed: {joined:?}");
+    };
+    let bob = peer.into_rumors();
     assert_eq!(bob.network(), alice.network());
     assert_eq!(bob.snapshot().len(), 1);
 
     // Bob's own message reaches Alice within one gossip session.
     bob.send("from bob".to_string()).unwrap();
-    timeout(Duration::from_secs(60), bob.gossip(&mut link_b))
+    timeout(Duration::from_secs(60), bob.gossip_once(&mut link_b))
         .await
         .expect("gossip timed out")
         .expect("gossip failed");

@@ -6,7 +6,7 @@
 
 use std::num::NonZeroUsize;
 
-use chrono::{DateTime, Utc};
+use chrono::Utc;
 use lru::LruCache;
 use slog::{Logger, error, info};
 
@@ -17,13 +17,6 @@ use crate::messages::v0::IdentityRequest;
 
 /// Maximum number of registered identities.
 const MAX_REGISTERED_IDENTITIES: NonZeroUsize = NonZeroUsize::new(1_000).unwrap();
-
-/// Maximum number of revoked SSH keys remembered for login refusal.
-/// Any authenticated key may revoke any other, so a flood of junk
-/// revocations can evict a real one. Entries never expire, so unlike
-/// nonces the eviction is permanent. This is sized so a flood takes
-/// thousands of authenticated, attributed, logged requests.
-const MAX_REVOKED_KEYS: NonZeroUsize = NonZeroUsize::new(10_000).unwrap();
 
 /// A rack-wide record of a verified login.
 #[derive(Clone, Debug)]
@@ -36,25 +29,17 @@ pub struct RegisteredIdentity {
 pub struct Identities {
     /// Verified logins, rack-wide.
     identities: LruCache<(KeyId, Nonce), RegisteredIdentity>,
-
-    /// SSH keys refused at login.
-    revoked_keys: LruCache<KeyId, DateTime<Utc>>,
 }
 
 impl Identities {
     pub fn new() -> Self {
         Self {
             identities: LruCache::new(MAX_REGISTERED_IDENTITIES),
-            revoked_keys: LruCache::new(MAX_REVOKED_KEYS),
         }
     }
 
     pub fn registered_identity(&self, key: &(KeyId, Nonce)) -> Option<&RegisteredIdentity> {
         self.identities.peek(key)
-    }
-
-    pub fn revoked(&self, key_id: &KeyId) -> Option<DateTime<Utc>> {
-        self.revoked_keys.peek(key_id).cloned()
     }
 
     pub fn apply(&mut self, log: &Logger, request: &IdentityRequest) {
@@ -65,31 +50,14 @@ impl Identities {
                 {
                     Ok(registered) => {
                         let identity = &registered.identity;
-                        if self.revoked_keys.peek(&identity.key_id).is_some() {
-                            info!(log, "refusing login for revoked key"; "key_id" => %identity.key_id);
-                        } else {
-                            info!(log, "registered identity"; "key_id" => %identity.key_id);
-                            let key = (identity.key_id.clone(), identity.nonce.clone());
-                            self.identities.put(key, registered);
-                        }
+                        info!(log, "registered identity"; "key_id" => %identity.key_id);
+                        let key = (identity.key_id.clone(), identity.nonce.clone());
+                        self.identities.put(key, registered);
                     }
                     Err(error) => {
                         error!(log, "ignoring invalid login"; "error" => %error);
                     }
                 }
-            }
-            IdentityRequest::Revoke(key_id, when) => {
-                let dead: Vec<(KeyId, Nonce)> = self
-                    .identities
-                    .iter()
-                    .filter(|((id, _), _)| id == key_id)
-                    .map(|(key, _)| key.clone())
-                    .collect();
-                for key in dead {
-                    self.identities.pop(&key);
-                }
-                self.revoked_keys.put(key_id.clone(), *when);
-                info!(log, "revoked identity"; "key_id" => %key_id);
             }
         }
     }
@@ -161,47 +129,12 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn revoked_key_refused_at_login() {
-        let mut key = key("Operator");
-        let mut identities = Identities::new();
-        identities.apply(&log(), &IdentityRequest::Revoke(key_id(&key), Utc::now()));
-        let (nonce, request) = login(&mut key).await;
-        identities.apply(&log(), &request);
-        assert!(
-            identities
-                .registered_identity(&(key_id(&key), nonce))
-                .is_none()
-        );
-        assert!(identities.revoked(&key_id(&key)).is_some());
-    }
-
-    #[tokio::test]
-    async fn revocation_evicts_registrations() {
-        let mut key = key("Operator");
-        let mut identities = Identities::new();
-        let (first, request) = login(&mut key).await;
-        identities.apply(&log(), &request);
-        let (second, request) = login(&mut key).await;
-        identities.apply(&log(), &request);
-        identities.apply(&log(), &IdentityRequest::Revoke(key_id(&key), Utc::now()));
-        for nonce in [first, second] {
-            assert!(
-                identities
-                    .registered_identity(&(key_id(&key), nonce))
-                    .is_none()
-            );
-        }
-    }
-
-    #[tokio::test]
     async fn hostile_logins_ignored() {
         let mut signer = key("Signer");
         let bystander = key("Bystander");
         let mut identities = Identities::new();
         let (nonce, request) = login(&mut signer).await;
-        let IdentityRequest::Login(_, signed) = &request else {
-            unreachable!()
-        };
+        let IdentityRequest::Login(_, signed) = &request;
         let forged = IdentityRequest::Login(
             bystander.ssh_public_key().to_openssh().unwrap(),
             signed.clone(),

@@ -9,7 +9,7 @@
 use std::fs::{File, OpenOptions, read};
 #[cfg(feature = "permslip")]
 use std::io::ErrorKind;
-use std::io::{Read as _, Seek as _, SeekFrom, Write as _, stdin};
+use std::io::{Seek as _, SeekFrom, Write as _, stdin};
 use std::net::SocketAddr;
 use std::num::{NonZeroU8, NonZeroU64};
 use std::path::{Path, PathBuf};
@@ -484,9 +484,6 @@ pub enum ClientCommand {
 
 #[derive(Clone, Debug, Subcommand)]
 pub enum CertCommand {
-    /// Import a PEM encoded X.509 certificate and return its key ID.
-    Import { path: PathBuf },
-
     /// Get the certificate chain that validates a key, in root-to-leaf order.
     Chain {
         key_id: KeyId,
@@ -496,9 +493,6 @@ pub enum CertCommand {
         #[arg(long = "root-cert")]
         root_certs: Vec<PathBuf>,
     },
-
-    /// Permanently revoke a certificate across the rack.
-    Revoke { key_id: KeyId },
 }
 
 #[derive(Clone, Debug, Default, Subcommand)]
@@ -513,9 +507,6 @@ pub enum IdentityCommand {
     /// Log in to the server as an SSH identity.
     #[default]
     Login,
-
-    /// Revoke an SSH identity and refuse its future logins.
-    Revoke { key_id: KeyId },
 }
 
 #[derive(Clone, Debug, Subcommand)]
@@ -1031,16 +1022,6 @@ async fn iam(
                 .into_inner();
             ctx.iam(&identity)
         }
-
-        IdentityCommand::Revoke { key_id } => {
-            let key_id = ctx.really_revoke("SSH identity", key_id)?;
-            with_login(ctx, client, async || {
-                client.iam_revoke().key_id(&key_id).wait(true).send().await
-            })
-            .await?;
-            ctx.revoked("SSH identity", key_id);
-            Ok(())
-        }
     }
 }
 
@@ -1050,20 +1031,6 @@ async fn cert(
     command: CertCommand,
 ) -> Result<(), CommandError> {
     match command {
-        CertCommand::Import { path } => {
-            let io_error = |error| CommandError::io(&path, error);
-            let mut file = File::open(&path).map_err(io_error)?;
-            let mut cert = Vec::new();
-            file.read_to_end(&mut cert).map_err(io_error)?;
-            let key_id = with_login(ctx, client, async || {
-                client.cert_import().body(cert.clone()).send().await
-            })
-            .await?
-            .into_inner();
-            ctx.cert_imported(&path, key_id);
-            Ok(())
-        }
-
         CertCommand::Chain { key_id, root_certs } => {
             let mut roots = Vec::new();
             for path in &root_certs {
@@ -1076,16 +1043,6 @@ async fn cert(
             .await?
             .into_inner();
             ctx.cert_chain(key_id, &certs, &roots)?;
-            Ok(())
-        }
-
-        CertCommand::Revoke { key_id } => {
-            let key_id = ctx.really_revoke("certificate", key_id)?;
-            with_login(ctx, client, async || {
-                client.cert_revoke().key_id(&key_id).wait(true).send().await
-            })
-            .await?;
-            ctx.revoked("certificate", key_id);
             Ok(())
         }
     }
