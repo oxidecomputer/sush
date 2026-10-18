@@ -32,7 +32,8 @@ use sush_common::authn::{
 };
 use sush_common::jobs::{
     Access, JobId, JobOutputStream, JobStatusMap, Session, SessionClientNonce, SessionId,
-    SessionSeq, SessionServerNonce, SessionSignerNonce, SessionSushNonce, SignedJob,
+    SessionPreimage, SessionSeq, SessionServerNonce, SessionSignerNonce, SessionSushNonce,
+    SignedJob,
 };
 use sush_common::keys::{KeyError, KeyId, SshPublicKey};
 use sush_common::targets::{Cubbies, SledHealth, SledVersion};
@@ -476,15 +477,21 @@ impl JobManager {
     ) -> Result<(), JobError> {
         // Verify that the session ID provided by the client is meant
         // for this instance of Sush: it must hash over our baseboard
-        // and current server nonce.
+        // and current server nonce. The preimage then travels instead
+        // of the id, so every peer derives for itself both the id and
+        // the sequence number the id commits to.
         let server_nonce = *self.session_server_nonce.lock().unwrap();
-        let sush_nonce = SessionSushNonce::compute(client_nonce, server_nonce);
-        let computed = SessionId::compute(self.own_baseboard(), sush_nonce, signer_nonce, seq);
-        if computed != session_id {
+        let preimage = SessionPreimage {
+            baseboard: self.own_baseboard().clone(),
+            sush_nonce: SessionSushNonce::compute(client_nonce, server_nonce),
+            signer_nonce,
+            seq,
+        };
+        if preimage.session_id() != session_id {
             return Err(JobError::InvalidSessionId);
         }
 
-        self.session_request(authn, SessionRequest::Start(session_id, seq))
+        self.session_request(authn, SessionRequest::Start(preimage))
             .await?;
         if wait {
             self.wait_for(self.wait_for_session(session_id)).await?;

@@ -61,7 +61,8 @@ impl From<&JobId> for JobId {
 }
 
 codephrase_newtype! {
-    /// A globally unique identifier for a session.
+    /// A globally unique identifier for a session. Constructed only
+    /// from a `SessionPreimage`.
     #[derive(
         Copy,
         Clone,
@@ -77,27 +78,46 @@ codephrase_newtype! {
     pub struct SessionId = Truncated;
 }
 
-impl SessionId {
-    pub fn compute(
-        baseboard: &BaseboardId,
-        sush: SessionSushNonce,
-        signer: SessionSignerNonce,
-        seq: SessionSeq,
-    ) -> Self {
+/// The material a session ID hashes over, and the only source
+/// of one. The `SessionRequest::Start` message gossips this
+/// preimage to prevent a malicious or corrupted server from
+/// poisoning the session.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub struct SessionPreimage {
+    pub baseboard: BaseboardId,
+    pub sush_nonce: SessionSushNonce,
+    pub signer_nonce: SessionSignerNonce,
+    pub seq: SessionSeq,
+}
+
+impl SessionPreimage {
+    pub fn session_id(&self) -> SessionId {
+        let Self {
+            baseboard:
+                BaseboardId {
+                    part_number,
+                    serial_number,
+                },
+            sush_nonce,
+            signer_nonce,
+            seq,
+        } = self;
         let mut hasher = Hasher::new();
         hasher.update_with_len(b"SUSH_SESSION_ID_V2");
         hasher.update_with_len(b"baseboard_id");
-        hasher.update_with_len(baseboard.part_number.as_bytes());
-        hasher.update_with_len(baseboard.serial_number.as_bytes());
+        hasher.update_with_len(part_number.as_bytes());
+        hasher.update_with_len(serial_number.as_bytes());
         hasher.update_with_len(b"sush_nonce");
-        hasher.update_with_len(&sush.to_be_bytes());
+        hasher.update_with_len(&sush_nonce.to_be_bytes());
         hasher.update_with_len(b"signer_nonce");
-        hasher.update_with_len(&signer.to_be_bytes());
+        hasher.update_with_len(&signer_nonce.to_be_bytes());
         hasher.update_with_len(b"seq");
         hasher.update_with_len(&seq.to_be_bytes());
-        Self::from_hash(hasher.finalize())
+        SessionId::from_hash(hasher.finalize())
     }
+}
 
+impl SessionId {
     pub fn first_job_id(&self) -> JobId {
         JobId::from_hash(hash(&self.0.to_be_bytes()))
     }
@@ -149,9 +169,8 @@ codephrase_newtype! {
 }
 
 codephrase_newtype! {
-    /// The nonce the client submits to the signer, derived by
-    /// [`SessionSushNonce::compute`] from the client and server
-    /// nonces.
+    /// The nonce the client submits to the signer,
+    /// derived from the client and server nonces.
     #[derive(
         Copy,
         Clone,
@@ -207,8 +226,9 @@ codephrase_newtype! {
     /// The session's place in the signer-assigned order of sessions.
     /// Taken as whole seconds since the Unix epoch according to the
     /// *signer's* wall clock; the server's clock can't be trusted, so
-    /// it never interprets a seq as a time, only as an order. Sessions
-    /// authorized in the same second share a seq and tie-break by id.
+    /// the server never interprets a sequence number as a time, only
+    /// as an order. Sessions authorized in the same second share a
+    /// sequence number and tie-break by id.
     /// Spoken as three codephrase words: 2048³ = 2³³ values, which
     /// reaches the year 2242.
     #[derive(
@@ -859,8 +879,9 @@ mod test {
         );
     }
 
-    /// On the binary wire a seq is codephrase bytes, like the ids and
-    /// nonces; as text it is words. Wide values refuse to decode.
+    /// On the binary wire a sequence number is codephrase bytes, like
+    /// the ids and nonces; as text it is words. A value too wide for
+    /// three words fails to decode.
     #[test]
     fn seq_serde_forms() {
         let seq = SessionSeq::from_unix_seconds(1_760_000_000).unwrap();

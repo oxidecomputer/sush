@@ -27,7 +27,8 @@ use sush_client::context::Authz;
 use sush_common::authn::{Challenge, ChallengeResponse, Credentials, Identity, Nonce, RequestKey};
 use sush_common::jobs::{
     Access, JobId, JobLimits, JobMode, JobOutputState, JobOutputStream::*, JobStartRequest,
-    JobStatus, ProcessError, Session, SessionId, SessionSignerNonce, SignedJob, SkipReason,
+    JobStatus, ProcessError, Session, SessionId, SessionPreimage, SessionSeq, SessionSignerNonce,
+    SignedJob, SkipReason,
 };
 use sush_common::keys::{EphemeralKey, KeyError, KeyType, Signer as _, pem_cert_chain};
 use sush_common::targets::{Cubbies, Target};
@@ -311,7 +312,7 @@ async fn job_session_enforced() {
 /// leaves it alone, and so does activation.
 #[named]
 #[tokio::test]
-async fn session_nonce_rotates() {
+async fn fetch_rotates_server_nonce() {
     let log = test_logger(function_name!());
     let (mgr, mut root, _dir, _shutdown) = manager_and_test_root(log).await;
     let authn = fake_identity(&mut root).await;
@@ -344,21 +345,20 @@ async fn session_nonce_rotates() {
     .await
     .unwrap();
 
-    // Activation leaves it alone too: a second grant over the same
+    // Activation leaves it alone too: a later grant over the same
     // sush nonce verifies and supersedes.
-    let second_signer_nonce = SessionSignerNonce::random();
-    let second = SessionId::compute(
-        mgr.own_baseboard(),
-        ceremony.sush_nonce,
-        second_signer_nonce,
-        ceremony.seq,
-    );
+    let second = SessionPreimage {
+        baseboard: mgr.own_baseboard().clone(),
+        sush_nonce: ceremony.sush_nonce,
+        signer_nonce: SessionSignerNonce::random(),
+        seq: SessionSeq::from_unix_seconds(2).unwrap(),
+    };
     mgr.session_start(
         &authn,
-        second,
+        second.session_id(),
         ceremony.client_nonce,
-        second_signer_nonce,
-        ceremony.seq,
+        second.signer_nonce,
+        second.seq,
         true,
     )
     .await
@@ -366,20 +366,19 @@ async fn session_nonce_rotates() {
 
     // A fetch rotates: everything built over the old nonce is stale.
     mgr.fresh_server_nonce();
-    let stale_signer_nonce = SessionSignerNonce::random();
-    let stale = SessionId::compute(
-        mgr.own_baseboard(),
-        ceremony.sush_nonce,
-        stale_signer_nonce,
-        ceremony.seq,
-    );
+    let stale = SessionPreimage {
+        baseboard: mgr.own_baseboard().clone(),
+        sush_nonce: ceremony.sush_nonce,
+        signer_nonce: SessionSignerNonce::random(),
+        seq: ceremony.seq,
+    };
     assert!(matches!(
         mgr.session_start(
             &authn,
-            stale,
+            stale.session_id(),
             ceremony.client_nonce,
-            stale_signer_nonce,
-            ceremony.seq,
+            stale.signer_nonce,
+            stale.seq,
             true,
         )
         .await,

@@ -33,8 +33,8 @@ use sush_client::{Client, ResponseValue};
 use sush_common::authn::{Challenge, ChallengeResponse, Credentials, Identity, Nonce, RequestKey};
 use sush_common::codephrases::Codephrase;
 use sush_common::jobs::{
-    JobId, JobMode, JobStartRequest, SessionClientNonce, SessionId, SessionSeq, SessionSignerNonce,
-    SessionSushNonce, VerifiedJob,
+    JobId, JobMode, JobStartRequest, SessionClientNonce, SessionId, SessionPreimage, SessionSeq,
+    SessionSignerNonce, SessionSushNonce, VerifiedJob,
 };
 use sush_common::keys::{EphemeralKey, KeyType, Signer, pem_cert_chain};
 use sush_common::targets::{Cubbies, Target};
@@ -258,16 +258,19 @@ pub struct SessionCeremony {
 /// against `mgr` go stale.
 pub fn session_ceremony(mgr: &JobManager, seq: u64) -> SessionCeremony {
     let client_nonce = SessionClientNonce::random();
-    let signer_nonce = SessionSignerNonce::random();
     let sush_nonce = SessionSushNonce::compute(client_nonce, mgr.fresh_server_nonce());
-    let seq = SessionSeq::from_unix_seconds(seq).unwrap();
-    let session_id = SessionId::compute(mgr.own_baseboard(), sush_nonce, signer_nonce, seq);
+    let preimage = SessionPreimage {
+        baseboard: mgr.own_baseboard().clone(),
+        sush_nonce,
+        signer_nonce: SessionSignerNonce::random(),
+        seq: SessionSeq::from_unix_seconds(seq).unwrap(),
+    };
     SessionCeremony {
-        session_id,
+        session_id: preimage.session_id(),
         client_nonce,
         sush_nonce,
-        signer_nonce,
-        seq,
+        signer_nonce: preimage.signer_nonce,
+        seq: preimage.seq,
     }
 }
 
@@ -279,17 +282,19 @@ pub async fn http_session_ceremony(
     seq: u64,
 ) -> (SessionId, sush_client::types::SessionStartBody) {
     let client_nonce = SessionClientNonce::random();
-    let signer_nonce = SessionSignerNonce::random();
     let server_nonce = client.server_nonce().send().await.unwrap().into_inner();
-    let sush_nonce = SessionSushNonce::compute(client_nonce, server_nonce);
-    let seq = SessionSeq::from_unix_seconds(seq).unwrap();
-    let session_id = SessionId::compute(&test_baseboard_id(), sush_nonce, signer_nonce, seq);
+    let preimage = SessionPreimage {
+        baseboard: test_baseboard_id(),
+        sush_nonce: SessionSushNonce::compute(client_nonce, server_nonce),
+        signer_nonce: SessionSignerNonce::random(),
+        seq: SessionSeq::from_unix_seconds(seq).unwrap(),
+    };
     (
-        session_id,
+        preimage.session_id(),
         sush_client::types::SessionStartBody {
             client_nonce,
-            signer_nonce,
-            seq,
+            signer_nonce: preimage.signer_nonce,
+            seq: preimage.seq,
         },
     )
 }

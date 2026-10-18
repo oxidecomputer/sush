@@ -5,49 +5,30 @@
 //! The boundary between jobs we executed and jobs we only heard about.
 //!
 //! One record, rewritten before each spawn, carries what this sled
-//! last committed to: the job, its session, the chain position after
-//! the job, the universe they belong to, and the job's ending once
-//! it has one. A universe is one shared gossip history, identified
-//! by its network; sleds join universes, leave them, and sometimes
-//! return. Alongside the commitment, the record keeps the join
-//! of every session start this sled has executed under in that
-//! universe, and the set of universes it burned by leaving. The
-//! record is this sled's execution watermark: nothing at or below it
-//! may run again.
+//! last committed to: the job, its session and that session's
+//! sequence number, the chain position after the job, the universe
+//! they belong to, and the job's ending once it has one. The record
+//! is this sled's execution floor: the signer assigns every session
+//! a sequence number from its wall clock, so sequence numbers order
+//! sessions totally, across restarts and across universes, and no
+//! session at or below the committed sequence number may run jobs
+//! here again.
 //!
 //! After a restart, replayed gossip rebuilds the sessions. When the
 //! committed session activates, the sled resumes its chain at the
 //! stored successor. The previous life had already moved the chain
 //! past every earlier position, so the session's queue never
-//! releases them here, and the chain continues from the successor
-//! whether its request arrives by replay or by resubmission. A
-//! session that starts strictly above the executed join has never
-//! run here and is served. A session the record cannot order makes
-//! the sled hop: the sled reports the hop to the gossip set as an
-//! error and sets a floor, in memory, at the frontier that includes
-//! the report. A session that does not start above the floor has
-//! its jobs skipped; a session started after the hop is served. The
-//! join folds in every session this sled has executed under in this
-//! universe, so a session it once ran under can never screen as
-//! new: the sled hops, and the session's jobs are skipped rather
-//! than re-run. If replay gives the recorded job no status, the sled
-//! adjudicates it: it announces the recorded ending when the record
-//! holds one, and an interrupted ending when it does not.
+//! releases those jobs here, and the chain continues from the
+//! successor whether its request arrives by replay or by
+//! resubmission. A session whose sequence number exceeds the
+//! committed one has never run jobs here and is served; any other
+//! session's jobs are skipped. If replay gives the recorded job no
+//! status, the sled adjudicates it: it announces the recorded ending
+//! when the record holds one, and an interrupted ending when it does
+//! not.
 //!
-//! Universes have no order. The record instead keeps a burned set,
-//! holding the network of every universe whose watermark it
-//! overwrote by moving on. A sled that re-enters a burned universe
-//! has flip-flopped, and raises its floor: it reports the flip-flop
-//! to the gossip set and sets the floor, in memory, at the frontier
-//! that includes the report. No older message can contain a version
-//! born at that instant, so a session started before the re-entry
-//! never lies above the floor, and its jobs are skipped. A sled that
-//! enters a universe with history while holding no record for it
-//! raises a floor the same way. The floor is never persisted: the
-//! burn, the missing record, or the unordered session is still there
-//! after a restart, and raises it again. A floor written to disk
-//! could carry a version that died with the life that created it;
-//! no later session could ever dominate such a floor.
+//! A sled with no record cannot tell replay from re-run, so it
+//! serves only sessions that start as live traffic.
 //!
 //! A boundary that cannot be written means the job must not run. A
 //! boundary that cannot be trusted means no job may run at all, since
@@ -57,16 +38,14 @@
 use std::sync::Mutex as SyncMutex;
 use std::sync::atomic::{AtomicBool, Ordering};
 
-use ciborium::ser::into_writer as into_cbor;
-use rumors::{Network, Version};
+use rumors::Network;
 use serde::{Deserialize, Serialize};
 use slog::{Logger, o, warn};
 use thiserror::Error;
 
-use sush_common::jobs::{JobId, JobStatus, ProcessError, SessionId};
+use sush_common::jobs::{JobId, JobStatus, ProcessError, SessionId, SessionSeq};
 
-use crate::bloom::Bloom;
-use crate::format::{self, NoFormat, Record, Versioned};
+use crate::format::{self, Record, Versioned};
 use crate::locker::{Locker, StoreError, Tenant, TenantSpec, Verdict};
 
 pub const BOUNDARY: TenantSpec = TenantSpec {
@@ -74,95 +53,35 @@ pub const BOUNDARY: TenantSpec = TenantSpec {
     magic: b"SUSHBOUNDARY",
 };
 
-/// The execution boundary: what this sled last committed to, in which
-/// universe, and which universes it has left behind ("burned").
-///
-/// Versions do not compare across universes, so `network` scopes every
-/// version in the record. `burned` holds the network of every
-/// universe whose watermark this record overwrote by moving on: a
-/// sled re-entering one raises its floor in memory, and the record on
-/// disk stays the displaced universe's true watermark until a commit
-/// overwrites it.
-///
-/// `executed` is the join of the start versions of every session
-/// this sled has executed under in this universe. A single stored
-/// start would forget the sessions before it, and a third session
-/// could then replay the first session's jobs; the join never
-/// forgets. Session starts are witnessed messages, and only those
-/// keep their meaning across a crash. A start that only this sled
-/// ever saw belongs to a session whose history is lost, and refusal
-/// is the right answer there anyway.
+/// The execution boundary: what this sled last committed to, and in
+/// which universe. The committed job's sequence number is the sled's
+/// global execution floor: the signer orders sessions totally and
+/// across universes, so every session a previous life could have run
+/// jobs under sits at or below this one stored number.
 #[derive(Clone, Debug, Deserialize, Serialize)]
 pub struct Boundary {
     pub network: Network,
-    pub burned: Bloom,
-    #[serde(with = "version_bytes")]
-    pub executed: Version,
     pub job: Option<Committed>,
 }
 
 /// The last job this sled committed to running, and how far it got.
 /// We also store the chain position *after* `job`, computed from the
 /// request's signed bytes at commit time, to allow session resumption.
+///
+/// The sequence number itself travels unsigned, in the gossiped
+/// session preimage, yet a forged one cannot reach this record: the
+/// sled writes the record only when it commits to a signed job, the
+/// job's signed bytes name the session id, and the id hashes over
+/// the preimage, sequence number included. A preimage with a
+/// different sequence number hashes to a different session id, and
+/// no signed job names that id.
 #[derive(Clone, Debug, Deserialize, Serialize)]
 pub struct Committed {
     pub session: SessionId,
+    pub seq: SessionSeq,
     pub job: JobId,
     pub successor: JobId,
     pub outcome: JobOutcome,
-}
-
-impl Boundary {
-    /// Whether this record burned `network`: left its universe behind
-    /// and overwrote its watermark.
-    pub fn is_burned(&self, network: Network) -> bool {
-        self.burned.contains(&network_key(network))
-    }
-
-    /// The burned set for the replacement record, committed in
-    /// `network`. A replacement in a different universe burns this
-    /// record's own network.
-    pub fn burned_for(&self, network: Network) -> Bloom {
-        let mut burned = self.burned.clone();
-        if self.network != network {
-            burned.insert(&network_key(self.network));
-        }
-        burned
-    }
-
-    /// The executed-session join for the replacement record,
-    /// committed in `network` and folding in `started`. Joins never
-    /// cross universes, so a replacement elsewhere starts its join
-    /// fresh.
-    pub fn executed_for(&self, network: Network, started: &Version) -> Version {
-        if self.network == network {
-            self.executed.clone() | started.clone()
-        } else {
-            started.clone()
-        }
-    }
-}
-
-/// A network's Bloom key is its CBOR bytes.
-fn network_key(network: Network) -> Vec<u8> {
-    let mut bytes = Vec::new();
-    into_cbor(&network, &mut bytes).expect("writing to a Vec cannot fail");
-    bytes
-}
-
-mod version_bytes {
-    use rumors::Version;
-    use serde::de::Error as _;
-    use serde::{Deserialize, Deserializer, Serializer};
-
-    pub fn serialize<S: Serializer>(version: &Version, serializer: S) -> Result<S::Ok, S::Error> {
-        serializer.serialize_bytes(&version.encode())
-    }
-
-    pub fn deserialize<'de, D: Deserializer<'de>>(deserializer: D) -> Result<Version, D::Error> {
-        let bytes = <Vec<u8>>::deserialize(deserializer)?;
-        Version::decode(bytes.as_slice()).map_err(D::Error::custom)
-    }
 }
 
 /// How far the boundary job got.
@@ -174,21 +93,118 @@ pub enum JobOutcome {
     Ended(JobStatus),
 }
 
-/// Version 0 is the shipped baseline. The pinned record snapshot in
-/// this module's tests freezes its bytes; see [`crate::format`] for
-/// the steps a format change requires.
+/// Version 1 replaced the executed-session join and the burned set
+/// with the committed sequence number. The pinned record snapshots in this
+/// module's tests freeze both versions' bytes; see [`crate::format`]
+/// for the steps a format change requires.
 impl Versioned for Boundary {
-    const VERSION: u16 = 0;
+    const VERSION: u16 = 1;
 }
 
 impl Record for Boundary {
-    type Previous = NoFormat;
+    type Previous = v0::Boundary;
 }
 
-impl TryFrom<NoFormat> for Boundary {
+impl TryFrom<v0::Boundary> for Boundary {
     type Error = &'static str;
-    fn try_from(none: NoFormat) -> Result<Self, Self::Error> {
-        match none {}
+
+    /// A v0 record kept a per-universe join of session-start versions
+    /// instead of a sequence number, and the join yields no sequence
+    /// number, so the committed job converts with a floor of zero:
+    /// the session still resumes, and the floor refuses nothing. The
+    /// zero floor readmits nothing a previous life ran, because every
+    /// v0 record predates sequence numbers and only sessions that
+    /// carry one can start now.
+    fn try_from(old: v0::Boundary) -> Result<Self, Self::Error> {
+        Ok(Self {
+            network: old.network,
+            job: old.job.map(|job| Committed {
+                session: job.session,
+                seq: SessionSeq::from_unix_seconds(0).expect("zero is encodable"),
+                job: job.job,
+                successor: job.successor,
+                outcome: job.outcome,
+            }),
+        })
+    }
+}
+
+/// The version 0 record shapes, kept only to decode records written
+/// before sessions carried sequence numbers.
+pub mod v0 {
+    use super::{JobId, JobOutcome, Network, SessionId};
+    use crate::format::{NoFormat, Record, Versioned};
+    use serde::{Deserialize, Deserializer, Serialize, Serializer};
+    use sush_common::wire::ExactBytes;
+
+    #[derive(Deserialize, Serialize)]
+    pub struct Boundary {
+        pub network: Network,
+        pub burned: Burned,
+        #[serde(with = "version_bytes")]
+        pub executed: rumors::Version,
+        pub job: Option<Committed>,
+    }
+
+    /// The v0 burned set: the Bloom filter's 1024 bytes, decoded but
+    /// never read.
+    pub struct Burned(Box<[u8; 1024]>);
+
+    impl Serialize for Burned {
+        fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+            serializer.serialize_bytes(&self.0[..])
+        }
+    }
+
+    impl<'de> Deserialize<'de> for Burned {
+        fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+            Ok(Self(Box::new(
+                deserializer.deserialize_bytes(ExactBytes::<1024>)?,
+            )))
+        }
+    }
+
+    #[derive(Deserialize, Serialize)]
+    pub struct Committed {
+        pub session: SessionId,
+        pub job: JobId,
+        pub successor: JobId,
+        pub outcome: JobOutcome,
+    }
+
+    impl Versioned for Boundary {
+        const VERSION: u16 = 0;
+    }
+
+    impl Record for Boundary {
+        type Previous = NoFormat;
+    }
+
+    impl TryFrom<NoFormat> for Boundary {
+        type Error = &'static str;
+        fn try_from(none: NoFormat) -> Result<Self, Self::Error> {
+            match none {}
+        }
+    }
+
+    mod version_bytes {
+        use rumors::Version;
+        use serde::de::Error as _;
+        use serde::{Deserialize, Deserializer, Serializer};
+
+        pub fn serialize<S: Serializer>(
+            version: &Version,
+            serializer: S,
+        ) -> Result<S::Ok, S::Error> {
+            serializer.serialize_bytes(&version.encode())
+        }
+
+        pub fn deserialize<'de, D: Deserializer<'de>>(
+            deserializer: D,
+        ) -> Result<Version, D::Error> {
+            let bytes = <Vec<u8>>::deserialize(deserializer)?;
+            Version::decode(bytes.as_slice()).map_err(D::Error::custom)
+        }
     }
 }
 
@@ -301,8 +317,6 @@ impl BoundaryStore {
                     ..committed.clone()
                 }),
                 network: boundary.network,
-                burned: boundary.burned.clone(),
-                executed: boundary.executed.clone(),
             }
         };
         if let Err(error) = guard.store(&format::encode(&updated)).await {
@@ -338,7 +352,7 @@ mod test {
     use std::fs::create_dir;
 
     use camino::Utf8PathBuf;
-    use rumors::before::Clock;
+    use ciborium::ser::into_writer as into_cbor;
     use slog::Discard;
     use tempfile::TempDir;
 
@@ -368,21 +382,16 @@ mod test {
         serde_json::from_str(&format!("[{seed:?}{}]", ", 0".repeat(15))).unwrap()
     }
 
-    /// A deterministic nonempty version: the seed party with two
-    /// events.
-    fn executed() -> Version {
-        let mut clock = Clock::seed();
-        clock.tick();
-        clock.tick().clone()
+    fn seq(seconds: u64) -> SessionSeq {
+        SessionSeq::from_unix_seconds(seconds).unwrap()
     }
 
     fn boundary() -> Boundary {
         Boundary {
             network: network(1),
-            burned: Bloom::new(),
-            executed: executed(),
             job: Some(Committed {
                 session: SessionId::random(),
+                seq: seq(1_760_000_000),
                 job: JobId::random(),
                 successor: JobId::random(),
                 outcome: JobOutcome::Committed,
@@ -394,29 +403,39 @@ mod test {
         boundary.job.as_ref().expect("a committed job").job
     }
 
-    /// The record's bytes are on-disk format, frozen at version 0. If
+    /// The frozen v0 snapshot decodes and converts: the commitment
+    /// survives with a floor of zero. Nothing can regenerate the
+    /// snapshot; the code that wrote it is gone, and git keeps the
+    /// bytes.
+    #[test]
+    fn v0_record_converts() {
+        let bytes = std::fs::read("tests/output/boundary-record-v0.bin").expect("missing snapshot");
+        let decoded: Boundary = format::decode(&bytes).unwrap();
+        assert_eq!(decoded.network, network(1));
+        let job = decoded.job.unwrap();
+        assert_eq!(job.session, "abandon-ability".parse().unwrap());
+        assert_eq!(job.successor, "able-about".parse().unwrap());
+        assert_eq!(job.seq, seq(0));
+    }
+
+    /// The record's bytes are on-disk format, frozen at version 1. If
     /// this fails, STOP: do not re-pin. Copy the old shape into a
     /// frozen module and add a new version instead; see
     /// [`crate::format`].
     #[test]
-    fn pin_record_format_v0() {
+    fn pin_record_format_v1() {
         let record = Boundary {
             network: network(1),
-            burned: {
-                let mut burned = Bloom::new();
-                burned.insert(&network_key(network(2)));
-                burned
-            },
-            executed: executed(),
             job: Some(Committed {
                 session: "abandon-ability".parse().unwrap(),
+                seq: seq(1_760_000_000),
                 job: "zoo-zero".parse().unwrap(),
                 successor: "able-about".parse().unwrap(),
                 outcome: JobOutcome::Committed,
             }),
         };
         let bytes = format::encode(&record);
-        let path = "tests/output/boundary-record-v0.bin";
+        let path = "tests/output/boundary-record-v1.bin";
         if std::env::var("EXPECTORATE").as_deref() == Ok("overwrite") {
             std::fs::write(path, &bytes).unwrap();
         } else {
@@ -425,12 +444,10 @@ mod test {
         }
         let decoded: Boundary = format::decode(&bytes).unwrap();
         assert_eq!(decoded.network, record.network);
-        assert!(decoded.is_burned(network(2)));
-        assert_eq!(decoded.executed, record.executed);
-        assert_eq!(
-            decoded.job.unwrap().successor,
-            record.job.unwrap().successor
-        );
+        let (decoded, expected) = (decoded.job.unwrap(), record.job.unwrap());
+        assert_eq!(decoded.session, expected.session);
+        assert_eq!(decoded.seq, expected.seq);
+        assert_eq!(decoded.successor, expected.successor);
     }
 
     /// A record from a newer software version loads as untrusted, and
@@ -442,25 +459,13 @@ mod test {
         #[derive(Serialize)]
         struct Envelope(u16, #[serde(with = "crate::format::cbor_bytes")] Vec<u8>);
         let mut bytes = Vec::new();
-        into_cbor(&Envelope(1, b"from the future".to_vec()), &mut bytes).unwrap();
+        into_cbor(&Envelope(2, b"from the future".to_vec()), &mut bytes).unwrap();
         let scratch = Locker::new(&test_log(), slots.clone()).unwrap();
         scratch.tenant(BOUNDARY).store(&bytes).await.unwrap();
         drop(scratch);
 
         let store = store(slots).await;
         assert!(store.untrusted());
-    }
-
-    /// The burned set's keys are on-disk format: a change to the
-    /// network's serde shape would silently forget every burn, and a
-    /// forgotten burn admits a flip-flop instead of refusing it. If
-    /// this fails, STOP, and see the warning on [`crate::bloom`].
-    #[test]
-    fn pin_network_keys() {
-        assert_eq!(
-            network_key(network(1)),
-            [0x50, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0]
-        );
     }
 
     #[tokio::test]
@@ -472,7 +477,6 @@ mod test {
 
         let (a, mut b) = (boundary(), boundary());
         b.network = network(2);
-        b.burned = a.burned_for(b.network);
         first.advance(&a).await.unwrap();
         first.advance(&b).await.unwrap();
         drop(first);
@@ -482,11 +486,9 @@ mod test {
         let recorded = next.boundary().unwrap();
         assert_eq!(recorded.network, b.network);
         assert_eq!(job_of(&recorded), job_of(&b));
-        assert!(recorded.is_burned(network(1)));
-        assert!(!recorded.is_burned(network(3)));
-        assert_eq!(recorded.executed, b.executed);
         let (recorded, expected) = (recorded.job.unwrap(), b.job.unwrap());
         assert_eq!(recorded.session, expected.session);
+        assert_eq!(recorded.seq, expected.seq);
         assert_eq!(recorded.successor, expected.successor);
         assert!(matches!(recorded.outcome, JobOutcome::Committed));
     }

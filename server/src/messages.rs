@@ -6,16 +6,14 @@
 
 use chrono::{DateTime, Utc};
 use ciborium::{Value, de::from_reader as from_cbor, ser::into_writer as into_cbor};
-use rumors::Version;
 use serde::{Deserialize, Serialize};
 use sled_hardware_types::BaseboardId;
-use thiserror::Error;
 
 use sush_api::JobStartParams;
 use sush_common::authn::SignedLogin;
 use sush_common::jobs::JobOutputState;
 use sush_common::jobs::{
-    Access, JobId, ProcessError, SessionId, SessionSeq, SignedJob, SkipReason,
+    Access, JobId, ProcessError, SessionId, SessionPreimage, SignedJob, SkipReason,
 };
 use sush_common::keys::KeyId;
 use sush_common::version::VersionInfo;
@@ -215,7 +213,7 @@ pub mod v0 {
 
     #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
     pub enum SessionRequest {
-        Start(SessionId, SessionSeq),
+        Start(SessionPreimage),
         Stop(SessionId),
         Skip(SessionId, JobId),
         AllowAttach(SessionId, KeyId, Access),
@@ -242,7 +240,6 @@ pub mod v0 {
     #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
     pub enum Event {
         Job(JobEvent),
-        Error(Error),
         Version(VersionInfo),
     }
 
@@ -269,25 +266,6 @@ pub mod v0 {
             }
         }
     }
-
-    #[derive(Clone, Debug, Deserialize, Eq, Error, PartialEq, Serialize)]
-    pub enum Error {
-        #[error(
-            "Concurrent sessions detected: \
-             ours is {own_session}@{own_version}, \
-             incoming is {incoming_session}@{incoming_version}"
-        )]
-        ConcurrentSessions {
-            own_session: SessionId,
-            own_version: Box<Version>,
-            incoming_session: SessionId,
-            incoming_version: Box<Version>,
-        },
-        #[error("Sled re-entered a burned universe")]
-        UniverseFlipFlop,
-        #[error("Sled hopped into a session its record cannot order")]
-        SessionHop,
-    }
 }
 
 #[cfg(test)]
@@ -299,7 +277,9 @@ mod wire_format {
     use sush_api::JobWait;
     use sush_common::authn::{ChallengeResponse, Nonce, RequestVerifier};
     use sush_common::hash::hash;
-    use sush_common::jobs::{JobMode, JobStartRequest};
+    use sush_common::jobs::{
+        JobMode, JobStartRequest, SessionSeq, SessionSignerNonce, SessionSushNonce,
+    };
     use sush_common::keys::{EncodedSignature, Signed};
 
     use super::v0::*;
@@ -375,9 +355,6 @@ mod wire_format {
                     SkipReason::AlreadyHandled => "already-handled-skip-event",
                     SkipReason::SessionEnded => "session-ended-skip-event",
                 },
-                Event::Error(Error::ConcurrentSessions { .. }) => "concurrent-sessions-error",
-                Event::Error(Error::SessionHop) => "session-hop-error",
-                Event::Error(Error::UniverseFlipFlop) => "universe-flip-flop-error",
             },
         }
     }
@@ -459,10 +436,12 @@ mod wire_format {
         vec![
             Message::Request(Request::session(
                 actor(),
-                SessionRequest::Start(
-                    session,
-                    SessionSeq::from_unix_seconds(1_760_000_000).unwrap(),
-                ),
+                SessionRequest::Start(SessionPreimage {
+                    baseboard: baseboard.clone(),
+                    sush_nonce: SessionSushNonce::from_be_bytes([0x11; 32]),
+                    signer_nonce: SessionSignerNonce::from_be_bytes([0x22; 32]),
+                    seq: SessionSeq::from_unix_seconds(1_760_000_000).unwrap(),
+                }),
             )),
             Message::Request(Request::session(actor(), SessionRequest::Stop(session))),
             Message::Request(Request::session(
@@ -534,24 +513,13 @@ mod wire_format {
                 )),
             ),
             Message::Event(
-                baseboard.clone(),
+                baseboard,
                 Event::Job(JobEvent::Skipped(
                     skip_job,
                     skip_when,
                     SkipReason::SessionEnded,
                 )),
             ),
-            Message::Event(
-                baseboard.clone(),
-                Event::Error(Error::ConcurrentSessions {
-                    own_session: long_session,
-                    own_version: Box::new(Version::new()),
-                    incoming_session: sid("zoo-zoo-zoo-zoo-zoo-zoo-zoo-zebra"),
-                    incoming_version: Box::new(Version::new()),
-                }),
-            ),
-            Message::Event(baseboard.clone(), Event::Error(Error::SessionHop)),
-            Message::Event(baseboard, Event::Error(Error::UniverseFlipFlop)),
         ]
     }
 
@@ -560,9 +528,12 @@ mod wire_format {
     /// variant cannot leave a stale snapshot behind.
     #[test]
     fn wire_formats() {
-        // The boundary module pins its record format in the same
+        // The boundary module pins its record formats in the same
         // directory.
-        let mut expected = BTreeSet::from(["boundary-record-v0.bin".to_string()]);
+        let mut expected = BTreeSet::from([
+            "boundary-record-v0.bin".to_string(),
+            "boundary-record-v1.bin".to_string(),
+        ]);
         for message in samples() {
             let name = snapshot_name(&message);
             assert!(

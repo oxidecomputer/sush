@@ -25,8 +25,8 @@ use chrono::Utc;
 use sush_api::{JobStartParams, JobWait};
 use sush_common::jobs::{
     JobId, JobMode, JobOutputState, JobStartRequest, JobStatus, ProcessError, Session,
-    SessionClientNonce, SessionId, SessionSeq, SessionSignerNonce, SessionSushNonce, SignedJob,
-    SkipReason,
+    SessionClientNonce, SessionId, SessionPreimage, SessionSeq, SessionSignerNonce,
+    SessionSushNonce, SignedJob, SkipReason,
 };
 use sush_common::keys::{EphemeralKey, Signer as _, pem_cert_chain};
 use sush_common::targets::{Cubbies, SledHealth, SledId, Target};
@@ -232,7 +232,7 @@ async fn jobs_gossip_between_sleds() {
 
 #[named]
 #[tokio::test]
-async fn concurrent_sessions_annihilate() {
+async fn partitioned_sessions_converge_on_higher_seq() {
     let (_tmp, dir) = pki("sush-concurrent-", 2);
     let mut root = common::ephemeral_root();
     let root_pem = dir.join("job-root.pem");
@@ -258,7 +258,8 @@ async fn concurrent_sessions_annihilate() {
     sees(&b, &a).await;
 
     // Partitioned, each sled starts its own session. Neither start
-    // can hear the other, so the two versions are concurrent.
+    // can hear the other, but the signer-assigned order still ranks
+    // them.
     a.peers.send(BTreeSet::new()).unwrap();
     b.peers.send(BTreeSet::new()).unwrap();
     sleep(Duration::from_millis(500)).await;
@@ -291,7 +292,7 @@ async fn concurrent_sessions_annihilate() {
         .unwrap();
 
     // A job on A sits queued behind a hole in the chain, so it can
-    // never run before the sessions annihilate.
+    // never run before B's session supersedes A's.
     let hole_id = session.next_job_id();
     let hole = sign_job_for(&mut root, hole_id, session_a, "true", &a.baseboard).await;
     session.job_started(hole);
@@ -309,14 +310,23 @@ async fn concurrent_sessions_annihilate() {
     })
     .await;
 
-    // The partition heals. Each sled hears a session start concurrent
-    // with its own: both sessions are killed everywhere, and the
-    // queued job is skipped rather than left queued forever.
+    // The partition heals. B's session carries the higher sequence
+    // number, so every sled converges on it, and A's queued job is
+    // skipped rather than left queued forever.
     a.peers.send(BTreeSet::from([b.addr])).unwrap();
     b.peers.send(BTreeSet::from([a.addr])).unwrap();
-    eventually("the sessions annihilate", 120, async || {
-        a.mgr.session(&authn_a).is_none() && b.mgr.session(&authn_b).is_none()
-    })
+    eventually(
+        "the higher sequence number wins everywhere",
+        120,
+        async || {
+            a.mgr
+                .session(&authn_a)
+                .is_some_and(|s| s.session_id() == session_b)
+                && b.mgr
+                    .session(&authn_b)
+                    .is_some_and(|s| s.session_id() == session_b)
+        },
+    )
     .await;
     eventually("the queued job is skipped", 60, async || {
         a.mgr.job_status(&authn_a, &job_id).await.is_ok_and(|map| {
@@ -409,7 +419,7 @@ async fn rejoining_replays_without_reexecuting() {
         client_nonce,
         signer_nonce: successor_nonce,
         seq,
-    } = ceremony(&a.mgr, 1);
+    } = ceremony(&a.mgr, 2);
     let fresh = Session::new(successor);
     a.mgr
         .session_start(
@@ -680,15 +690,17 @@ struct Ceremony {
 /// nonce, so earlier ceremonies against that sled go stale.
 fn ceremony(mgr: &JobManager, seq: u64) -> Ceremony {
     let client_nonce = SessionClientNonce::random();
-    let signer_nonce = SessionSignerNonce::random();
-    let sush_nonce = SessionSushNonce::compute(client_nonce, mgr.fresh_server_nonce());
-    let seq = SessionSeq::from_unix_seconds(seq).unwrap();
-    let session_id = SessionId::compute(mgr.own_baseboard(), sush_nonce, signer_nonce, seq);
+    let preimage = SessionPreimage {
+        baseboard: mgr.own_baseboard().clone(),
+        sush_nonce: SessionSushNonce::compute(client_nonce, mgr.fresh_server_nonce()),
+        signer_nonce: SessionSignerNonce::random(),
+        seq: SessionSeq::from_unix_seconds(seq).unwrap(),
+    };
     Ceremony {
-        session_id,
+        session_id: preimage.session_id(),
         client_nonce,
-        signer_nonce,
-        seq,
+        signer_nonce: preimage.signer_nonce,
+        seq: preimage.seq,
     }
 }
 
@@ -869,7 +881,7 @@ async fn lost_suffix_never_reruns() {
         client_nonce,
         signer_nonce,
         seq,
-    } = ceremony(&a.mgr, 1);
+    } = ceremony(&a.mgr, 2);
     let session2 = Session::new(session2_id);
     a.mgr
         .session_start(&authn_a, session2_id, client_nonce, signer_nonce, seq, true)
@@ -1064,7 +1076,7 @@ async fn session_resumes_at_stored_successor() {
 
 #[named]
 #[tokio::test]
-async fn universe_flip_flop_raises_floor() {
+async fn seq_floor_crosses_universes() {
     let (_tmp, dir) = pki("sush-flipflop-", 3);
     let mut root = common::ephemeral_root();
     let root_pem = dir.join("job-root.pem");
@@ -1087,7 +1099,7 @@ async fn universe_flip_flop_raises_floor() {
         client_nonce,
         signer_nonce,
         seq,
-    } = ceremony(&d.mgr, 1);
+    } = ceremony(&d.mgr, 2);
     let mut session2 = Session::new(session2_id);
     d.mgr
         .session_start(&authn_d, session2_id, client_nonce, signer_nonce, seq, true)
@@ -1191,9 +1203,10 @@ async fn universe_flip_flop_raises_floor() {
     })
     .await;
 
-    // X dies again and flip-flops back to A's universe. Its record
-    // burned that universe, so X raises its floor: session one's next
-    // job is refused, and nothing re-runs.
+    // X dies again and returns to A's universe. Its record holds
+    // session two's sequence number, which session one does not
+    // exceed, even from another universe: session one's next job is
+    // refused, and nothing re-runs.
     x_shutdown.cancel();
     drop(x);
     d.peers.send(BTreeSet::new()).unwrap();
@@ -1231,14 +1244,14 @@ async fn universe_flip_flop_raises_floor() {
     })
     .await;
 
-    // A witnessed the refusal, so a session started now begins above
-    // X's floor, and serves X again.
+    // A session with a sequence number above the committed one serves
+    // X again.
     let Ceremony {
         session_id: session3_id,
         client_nonce,
         signer_nonce,
         seq,
-    } = ceremony(&a.mgr, 1);
+    } = ceremony(&a.mgr, 3);
     let session3 = Session::new(session3_id);
     a.mgr
         .session_start(&authn_a, session3_id, client_nonce, signer_nonce, seq, true)

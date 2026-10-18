@@ -1785,8 +1785,8 @@ async fn session_create(
     let signer = permslip_signer(ctx, &permslip_key, &permslip_url).await?;
     let _created = signer.create_session(baseboard_id, nonce).await?;
     // The signing service cannot order sessions yet: its response
-    // carries no seq until the permission-slip side of protocol v2
-    // lands.
+    // carries no sequence number until the permission-slip side of
+    // protocol v2 lands.
     Err(CommandError::UnsupportedPermslipResponse(
         "the signing service returned no session sequence number".to_string(),
     ))

@@ -42,7 +42,7 @@
       ]
     },
     "SessionId": {
-      "description": "A globally unique identifier for a session.",
+      "description": "A globally unique identifier for a session. Constructed only from a `SessionPreimage`.",
       "type": "string"
     }
   }
