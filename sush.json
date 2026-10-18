@@ -1563,11 +1563,11 @@
         "type": "string"
       },
       "SessionId": {
-        "description": "A globally unique identifier for a session.",
+        "description": "A globally unique identifier for a session. Constructed only from a `SessionPreimage`.",
         "type": "string"
       },
       "SessionSeq": {
-        "description": "The session's place in the signer-assigned order of sessions. Taken as whole seconds since the Unix epoch according to the *signer's* wall clock; the server's clock can't be trusted, so it never interprets a seq as a time, only as an order. Sessions authorized in the same second share a seq and tie-break by id. Spoken as three codephrase words: 2048³ = 2³³ values, which reaches the year 2242.",
+        "description": "The session's place in the signer-assigned order of sessions. Taken as whole seconds since the Unix epoch according to the *signer's* wall clock; the server's clock can't be trusted, so the server never interprets a sequence number as a time, only as an order. Sessions authorized in the same second share a sequence number and tie-break by id. Spoken as three codephrase words: 2048³ = 2³³ values, which reaches the year 2242.",
         "type": "string"
       },
       "SessionServerNonce": {
