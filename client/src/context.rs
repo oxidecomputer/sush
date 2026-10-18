@@ -14,7 +14,8 @@ use x509_cert::Certificate;
 
 use sush_common::authn::{BoundRequest, Credentials, Identity, RequestKey};
 use sush_common::jobs::{
-    Access, JobId, JobOutputStream, JobStatusMap, Session, SessionId, SessionSignerNonce, SignedJob,
+    Access, JobId, JobOutputStream, JobStatusMap, Session, SessionClientNonce, SessionId,
+    SessionSeq, SessionSignerNonce, SessionSushNonce, SignedJob,
 };
 use sush_common::keys::{KeyId, SshPublicKey};
 use sush_common::targets::{SledId, SledVersion};
@@ -22,7 +23,6 @@ use sush_common::version::VersionInfo;
 
 use crate::AuthzSigner;
 use crate::commands::{CommandError, GlobalArgs};
-use crate::types::SessionStartNonce;
 
 /// Authorization state: the credentials that authenticated us, and the
 /// ephemeral key that binds each request we make.
@@ -113,17 +113,28 @@ pub trait CommandContext: Clone + Send + Sync {
     fn set_credentials(&mut self, credentials: Option<Authz>) {
         self.authz_signer().set(credentials)
     }
-    /// The cached permslip token for `url` and the key `fingerprint`
-    /// names, if it is still fresh. The default caches nothing.
     fn permslip_token(&self, _url: &str, _fingerprint: &str) -> Option<String> {
         None
     }
-    /// Remember a permslip token for reuse.
     fn save_permslip_token(&self, _url: &str, _fingerprint: &str, _token: &str) {}
+    fn pending_client_nonce(&self) -> Option<SessionClientNonce> {
+        None
+    }
+    fn save_client_nonce(&self, _client_nonce: SessionClientNonce) {}
     fn session_id(&self) -> Option<SessionId>;
     fn next_job_id(&self) -> Result<JobId, CommandError>;
-    fn session_start_params(&self, baseboard_id: BaseboardId, nonce: SessionStartNonce);
-    fn session_created(&mut self, session: Session, signer_nonce: SessionSignerNonce);
+    fn session_start_params(
+        &self,
+        baseboard_id: BaseboardId,
+        client_nonce: SessionClientNonce,
+        sush_nonce: SessionSushNonce,
+    );
+    fn session_created(
+        &mut self,
+        session: Session,
+        signer_nonce: SessionSignerNonce,
+        seq: SessionSeq,
+    );
     fn session_started(&mut self, session: Session, force: bool);
     fn session_stopped(&mut self, session_id: &SessionId);
     fn attach_allowed(&mut self, key_id: &KeyId, access: Access);

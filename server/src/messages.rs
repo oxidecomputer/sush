@@ -14,7 +14,9 @@ use thiserror::Error;
 use sush_api::JobStartParams;
 use sush_common::authn::SignedLogin;
 use sush_common::jobs::JobOutputState;
-use sush_common::jobs::{Access, JobId, ProcessError, SessionId, SignedJob, SkipReason};
+use sush_common::jobs::{
+    Access, JobId, ProcessError, SessionId, SessionSeq, SignedJob, SkipReason,
+};
 use sush_common::keys::KeyId;
 use sush_common::version::VersionInfo;
 
@@ -194,7 +196,7 @@ pub mod v0 {
         pub fn kind(&self) -> &'static str {
             match self {
                 Self::Session(r) => match r.request {
-                    SessionRequest::Start(_) => "session start",
+                    SessionRequest::Start(..) => "session start",
                     SessionRequest::Stop(_) => "session stop",
                     SessionRequest::Skip(..) => "session skip",
                     SessionRequest::AllowAttach(..) => "session allow",
@@ -213,7 +215,7 @@ pub mod v0 {
 
     #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
     pub enum SessionRequest {
-        Start(SessionId),
+        Start(SessionId, SessionSeq),
         Stop(SessionId),
         Skip(SessionId, JobId),
         AllowAttach(SessionId, KeyId, Access),
@@ -344,7 +346,7 @@ mod wire_format {
     fn snapshot_name(message: &Message) -> &'static str {
         match message {
             Message::Request(Request::Session(r)) => match r.request {
-                SessionRequest::Start(_) => "session-start-request",
+                SessionRequest::Start(..) => "session-start-request",
                 SessionRequest::Stop(_) => "session-stop-request",
                 SessionRequest::Skip(..) => "session-skip-request",
                 SessionRequest::AllowAttach(..) => "session-allow-attach-request",
@@ -455,7 +457,13 @@ mod wire_format {
         };
 
         vec![
-            Message::Request(Request::session(actor(), SessionRequest::Start(session))),
+            Message::Request(Request::session(
+                actor(),
+                SessionRequest::Start(
+                    session,
+                    SessionSeq::from_unix_seconds(1_760_000_000).unwrap(),
+                ),
+            )),
             Message::Request(Request::session(actor(), SessionRequest::Stop(session))),
             Message::Request(Request::session(
                 actor(),

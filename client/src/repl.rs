@@ -21,7 +21,8 @@ use xdg::BaseDirectories;
 
 use sush_common::authn::Identity;
 use sush_common::jobs::{
-    Access, JobId, JobOutputStream, JobStatusMap, Session, SessionId, SessionSignerNonce, SignedJob,
+    Access, JobId, JobOutputStream, JobStatusMap, Session, SessionClientNonce, SessionId,
+    SessionSeq, SessionSignerNonce, SessionSushNonce, SignedJob,
 };
 use sush_common::keys::{KeyId, SshPublicKey};
 use sush_common::targets::{SledId, SledVersion};
@@ -33,7 +34,6 @@ use crate::commands::{
     SUSH_OUTPUT_FORMAT, SUSH_URL,
 };
 use crate::context::{CommandContext, OutputFormat, StatusDisplayStyle};
-use crate::types::SessionStartNonce;
 use crate::{AuthzSigner, Client};
 
 const HISTORY_FILE: &str = "history.txt";
@@ -243,12 +243,31 @@ impl CommandContext for Repl {
         self.cli.next_job_id()
     }
 
-    fn session_start_params(&self, baseboard_id: BaseboardId, nonce: SessionStartNonce) {
-        self.cli.session_start_params(baseboard_id, nonce)
+    fn pending_client_nonce(&self) -> Option<SessionClientNonce> {
+        self.cli.pending_client_nonce()
     }
 
-    fn session_created(&mut self, session: Session, signer_nonce: SessionSignerNonce) {
-        self.cli.session_created(session, signer_nonce)
+    fn save_client_nonce(&self, client_nonce: SessionClientNonce) {
+        self.cli.save_client_nonce(client_nonce)
+    }
+
+    fn session_start_params(
+        &self,
+        baseboard_id: BaseboardId,
+        client_nonce: SessionClientNonce,
+        sush_nonce: SessionSushNonce,
+    ) {
+        self.cli
+            .session_start_params(baseboard_id, client_nonce, sush_nonce)
+    }
+
+    fn session_created(
+        &mut self,
+        session: Session,
+        signer_nonce: SessionSignerNonce,
+        seq: SessionSeq,
+    ) {
+        self.cli.session_created(session, signer_nonce, seq)
     }
 
     fn session_started(&mut self, session: Session, force: bool) {

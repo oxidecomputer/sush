@@ -45,16 +45,15 @@ use sush_api::JobWait;
 use sush_common::authn::{
     AuthnError, Challenge, ChallengeResponse, Credentials, Identity, RequestKey,
 };
-#[cfg(feature = "permslip")]
-use sush_common::codephrases::InvalidCodephrase;
 use sush_common::interactive::{InteractiveJobError, InteractiveJobMessage};
 use sush_common::jobs::JobOutputStream::{self, Stderr, Stdout};
+#[cfg(feature = "permslip")]
+use sush_common::jobs::JobStartRequest;
 use sush_common::jobs::{
     Access, JobId, JobLimits, JobMode, JobOutputHash, JobOutputState, JobStatus, JobStatusMap,
-    Session, SessionId, SessionSignerNonce, SignedJob, SkipReason, job_status_try_from_json_map,
+    Session, SessionClientNonce, SessionId, SessionSeq, SessionSignerNonce, SessionSushNonce,
+    SignedJob, SkipReason, job_status_try_from_json_map,
 };
-#[cfg(feature = "permslip")]
-use sush_common::jobs::{JobStartRequest, SessionSushNonce};
 use sush_common::keys::{KeyError, KeyId, Signer as _};
 use sush_common::targets::{SledId, Target};
 use sush_common::version::VersionInfo;
@@ -536,15 +535,14 @@ pub enum SessionCommand {
         key_id: KeyId,
     },
 
-    /// Create a session at the signing service from a rack's start
-    /// parameters.
+    /// Create a session with the signing service from `session start-params`.
     #[cfg(feature = "permslip")]
     Create {
         /// The baseboard ID of the sled that generated the nonce.
         #[arg(value_parser = parse_baseboard_id)]
         baseboard_id: BaseboardId,
 
-        /// The rack's session nonce.
+        /// The sush nonce from `session start-params`.
         nonce: SessionSushNonce,
 
         /// Use `permslip` to sign sessions and jobs with this key name.
@@ -566,7 +564,14 @@ pub enum SessionCommand {
         session_id: Option<SessionId>,
 
         /// The signer nonce for the session.
+        #[arg(requires = "seq")]
         nonce: Option<SessionSignerNonce>,
+
+        /// The session sequence number assigned by the signer.
+        seq: Option<SessionSeq>,
+
+        /// Override the client nonce generated and stashed by `session start-params`.
+        client_nonce: Option<SessionClientNonce>,
 
         /// Use `permslip` to sign sessions and jobs with this key name.
         #[cfg(feature = "permslip")]
@@ -1089,11 +1094,14 @@ async fn session(
             let (baseboard_id, nonce) = with_login(ctx, client, async || {
                 Ok((
                     client.target().send().await?.into_inner(),
-                    client.session_start_nonce().send().await?.into_inner(),
+                    client.server_nonce().send().await?.into_inner(),
                 ))
             })
             .await?;
-            ctx.session_start_params(baseboard_id, nonce);
+            let client_nonce = SessionClientNonce::random();
+            let sush_nonce = SessionSushNonce::compute(client_nonce, nonce);
+            ctx.save_client_nonce(client_nonce);
+            ctx.session_start_params(baseboard_id, client_nonce, sush_nonce);
             Ok(())
         }
 
@@ -1102,6 +1110,8 @@ async fn session(
             SessionCommand::Start {
                 session_id,
                 nonce,
+                seq,
+                client_nonce,
                 permslip,
                 permslip_url,
                 wait,
@@ -1110,24 +1120,46 @@ async fn session(
         ) => {
             // Creation already announces the session; don't echo it
             // when the start succeeds.
-            let (session_id, nonce, show) = if let (Some(session_id), Some(nonce)) =
-                (session_id, nonce)
-            {
-                (session_id, nonce, true)
-            } else {
-                let (baseboard_id, nonce) = with_login(ctx, client, async || {
-                    Ok((
-                        client.target().send().await?.into_inner(),
-                        client.session_start_nonce().send().await?.into_inner(),
-                    ))
-                })
-                .await?;
-                let (session_id, nonce) =
-                    session_create(ctx, permslip, permslip_url, &baseboard_id, nonce.nonce).await?;
-                ctx.session_created(Session::new(session_id), nonce);
-                (session_id, nonce, false)
-            };
-            session_start(ctx, client, session_id, nonce, wait, show).await
+            let (session_id, body, show) =
+                if let (Some(session_id), Some(signer_nonce), Some(seq)) = (session_id, nonce, seq)
+                {
+                    let client_nonce = client_nonce
+                        .or_else(|| ctx.pending_client_nonce())
+                        .ok_or(CommandError::MissingClientNonce)?;
+                    (
+                        session_id,
+                        SessionStartBody {
+                            client_nonce,
+                            signer_nonce,
+                            seq,
+                        },
+                        true,
+                    )
+                } else {
+                    let (baseboard_id, nonce) = with_login(ctx, client, async || {
+                        Ok((
+                            client.target().send().await?.into_inner(),
+                            client.server_nonce().send().await?.into_inner(),
+                        ))
+                    })
+                    .await?;
+                    let client_nonce = SessionClientNonce::random();
+                    let sush_nonce = SessionSushNonce::compute(client_nonce, nonce);
+                    let (session_id, signer_nonce, seq) =
+                        session_create(ctx, permslip, permslip_url, &baseboard_id, sush_nonce)
+                            .await?;
+                    ctx.session_created(Session::new(session_id), signer_nonce, seq);
+                    (
+                        session_id,
+                        SessionStartBody {
+                            client_nonce,
+                            signer_nonce,
+                            seq,
+                        },
+                        false,
+                    )
+                };
+            session_start(ctx, client, session_id, body, wait, show).await
         }
 
         #[cfg(feature = "permslip")]
@@ -1140,9 +1172,9 @@ async fn session(
             },
             _,
         ) => {
-            let (session_id, nonce) =
+            let (session_id, nonce, seq) =
                 session_create(ctx, permslip, permslip_url, &baseboard_id, nonce).await?;
-            ctx.session_created(Session::new(session_id), nonce);
+            ctx.session_created(Session::new(session_id), nonce, seq);
             Ok(())
         }
 
@@ -1151,16 +1183,31 @@ async fn session(
             SessionCommand::Start {
                 session_id,
                 nonce,
+                seq,
+                client_nonce,
                 wait,
             },
             Some(client),
         ) => {
-            let (session_id, nonce) = if let (Some(session_id), Some(nonce)) = (session_id, nonce) {
-                (session_id, nonce)
-            } else {
+            let (Some(session_id), Some(signer_nonce), Some(seq)) = (session_id, nonce, seq) else {
                 return Err(CommandError::SigningUnavailable);
             };
-            session_start(ctx, client, session_id, nonce, wait, true).await
+            let client_nonce = client_nonce
+                .or_else(|| ctx.pending_client_nonce())
+                .ok_or(CommandError::MissingClientNonce)?;
+            session_start(
+                ctx,
+                client,
+                session_id,
+                SessionStartBody {
+                    client_nonce,
+                    signer_nonce,
+                    seq,
+                },
+                wait,
+                true,
+            )
+            .await
         }
 
         (SessionCommand::Allow { key_id, write }, Some(client)) => {
@@ -1728,19 +1775,20 @@ async fn session_create(
     permslip_url: Option<String>,
     baseboard_id: &BaseboardId,
     nonce: SessionSushNonce,
-) -> Result<(SessionId, SessionSignerNonce), CommandError> {
+) -> Result<(SessionId, SessionSignerNonce, SessionSeq), CommandError> {
     let Some(permslip_url) = permslip_url else {
         return Err(CommandError::MissingPermslipUrl);
     };
     let Some(permslip_key) = permslip else {
         return Err(CommandError::MissingKeyName);
     };
-    let invalid = |e: InvalidCodephrase| CommandError::UnsupportedPermslipResponse(e.to_string());
     let signer = permslip_signer(ctx, &permslip_key, &permslip_url).await?;
-    let created = signer.create_session(baseboard_id, nonce).await?;
-    Ok((
-        created.session_id.to_string().parse().map_err(invalid)?,
-        created.signer_nonce.to_string().parse().map_err(invalid)?,
+    let _created = signer.create_session(baseboard_id, nonce).await?;
+    // The signing service cannot order sessions yet: its response
+    // carries no seq until the permission-slip side of protocol v2
+    // lands.
+    Err(CommandError::UnsupportedPermslipResponse(
+        "the signing service returned no session sequence number".to_string(),
     ))
 }
 
@@ -1748,7 +1796,7 @@ async fn session_start(
     ctx: &mut impl CommandContext,
     client: &Client,
     session_id: SessionId,
-    signer_nonce: SessionSignerNonce,
+    body: SessionStartBody,
     wait: bool,
     show: bool,
 ) -> Result<(), CommandError> {
@@ -1758,7 +1806,7 @@ async fn session_start(
             .session_start()
             .session_id(session.session_id())
             .wait(wait)
-            .body(SessionStartBody { signer_nonce })
+            .body(body.clone())
             .send()
             .await
     })
@@ -2496,6 +2544,8 @@ pub enum CommandError {
     Key(#[from] KeyError),
     #[error("❌ Length mismatch: expected {expected} bytes, received {received}")]
     LengthMismatch { expected: u64, received: u64 },
+    #[error("❌ Missing client nonce: run `session start-params` first, or pass one")]
+    MissingClientNonce,
     #[error("❌ Missing job command, try `--help`")]
     MissingCommand,
     #[cfg(feature = "permslip")]

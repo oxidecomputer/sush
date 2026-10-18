@@ -8,7 +8,7 @@
 //! messages via the gossip protocol.
 
 use std::collections::{BTreeMap, BTreeSet};
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 
 use chrono::{DateTime, Utc};
 use futures::{FutureExt as _, Stream, StreamExt};
@@ -23,8 +23,8 @@ use x509_cert::Certificate;
 
 use sush_api::JobStartParams;
 use sush_common::jobs::{
-    Access, JobId, JobStatus, JobStatusMap, LastJob, ProcessError, Session, SessionId,
-    SessionSushNonce, SignedJob, SkipReason, VerifiedJob,
+    Access, JobId, JobStatus, JobStatusMap, LastJob, ProcessError, Session, SessionId, SignedJob,
+    SkipReason, VerifiedJob,
 };
 use sush_common::keys::{KeyError, KeyId};
 use sush_common::targets::Cubbies;
@@ -403,7 +403,6 @@ enum Output {
     Ran(JobStatus),
     Stop(JobId),
     Gossip(Message),
-    RotateNonce,
 }
 
 impl Output {
@@ -713,7 +712,7 @@ impl State {
 
         let mut outputs = Vec::new();
         match request {
-            SessionRequest::Start(session_id) => match &mut self.session {
+            SessionRequest::Start(session_id, _seq) => match &mut self.session {
                 // Re-announcement of active session; absorb and ignore.
                 Active {
                     starts, session, ..
@@ -744,7 +743,6 @@ impl State {
                         session.resume_at(committed.successor);
                     }
                     outputs.extend(self.skip_queued_jobs(now));
-                    outputs.push(Output::RotateNonce);
                     self.session = Active {
                         starts: self.session.starts() | incoming_version.clone(),
                         started: incoming_version.clone(),
@@ -1376,7 +1374,6 @@ fn apply(
     executor: &mut Executor,
     rumors: Option<&GossipNetwork>,
     store: &Arc<BoundaryStore>,
-    nonce: &Arc<Mutex<SessionSushNonce>>,
     input: Input,
 ) {
     let now = Utc::now();
@@ -1385,14 +1382,13 @@ fn apply(
     tx_state.send_modify(|state| {
         outputs = state.step(log, now, network, input);
     });
-    apply_outputs(executor, rumors, store, nonce, outputs);
+    apply_outputs(executor, rumors, store, outputs);
 }
 
 fn apply_outputs(
     executor: &mut Executor,
     rumors: Option<&GossipNetwork>,
     store: &Arc<BoundaryStore>,
-    nonce: &Arc<Mutex<SessionSushNonce>>,
     outputs: Vec<Output>,
 ) {
     for output in outputs {
@@ -1417,9 +1413,6 @@ fn apply_outputs(
                     gossip(rumors, message.into());
                 }
             }
-            Output::RotateNonce => {
-                *nonce.lock().unwrap() = SessionSushNonce::random();
-            }
         }
     }
 }
@@ -1433,7 +1426,6 @@ fn drain_ready(
     executor: &mut Executor,
     rumors: Option<&GossipNetwork>,
     store: &Arc<BoundaryStore>,
-    nonce: &Arc<Mutex<SessionSushNonce>>,
 ) {
     while let Some(Some((version, message))) = causal_messages.next().now_or_never() {
         apply(
@@ -1442,7 +1434,6 @@ fn drain_ready(
             executor,
             rumors,
             store,
-            nonce,
             Input::Gossip(version, message),
         );
     }
@@ -1525,7 +1516,6 @@ impl StateManager {
         mut cubbies: watch::Receiver<Cubbies>,
         mut universe: watch::Receiver<GossipUniverse>,
         anchors: &[Certificate],
-        session_sush_nonce: Arc<Mutex<SessionSushNonce>>,
         store: Arc<BoundaryStore>,
         shutdown: CancellationToken,
     ) -> Result<(watch::Receiver<State>, JoinHandle<()>), KeyError>
@@ -1694,7 +1684,6 @@ impl StateManager {
                                     &mut executor,
                                     network.as_ref().map(|(rumors, _)| rumors),
                                     &boundary_store,
-                                    &session_sush_nonce,
                                     Input::Gossip(version, message),
                                 );
                                 // Settle only after replayed traffic:
@@ -1711,7 +1700,6 @@ impl StateManager {
                                         &mut executor,
                                         network.as_ref().map(|(rumors, _)| rumors),
                                         &boundary_store,
-                                        &session_sush_nonce,
                                     );
                                     apply(
                                         &log,
@@ -1719,7 +1707,6 @@ impl StateManager {
                                         &mut executor,
                                         network.as_ref().map(|(rumors, _)| rumors),
                                         &boundary_store,
-                                        &session_sush_nonce,
                                         Input::Drained,
                                     );
                                 }
@@ -1734,7 +1721,6 @@ impl StateManager {
                                 &mut executor,
                                 network.as_ref().map(|(rumors, _)| rumors),
                                 &boundary_store,
-                                &session_sush_nonce,
                                 Input::Cubbies(cubbies.borrow_and_update().clone()),
                             );
                         },
@@ -1791,7 +1777,6 @@ impl StateManager {
                             &mut executor,
                             Some(&*rumors),
                             &boundary_store,
-                            &session_sush_nonce,
                         );
                         apply(
                             &log,
@@ -1799,7 +1784,6 @@ impl StateManager {
                             &mut executor,
                             Some(&*rumors),
                             &boundary_store,
-                            &session_sush_nonce,
                             Input::Drained,
                         );
                     }
@@ -1816,7 +1800,7 @@ mod test {
     use rumors::before::Clock;
     use x509_cert::time::Validity;
 
-    use sush_common::jobs::{JobMode, JobOutputState, JobStartRequest};
+    use sush_common::jobs::{JobMode, JobOutputState, JobStartRequest, SessionSeq};
     use sush_common::keys::{EphemeralKey, KeyType, Signer as _};
     use sush_common::targets::Target;
 
@@ -1924,6 +1908,10 @@ mod test {
         started: Version,
         newer: Version,
         concurrent: Version,
+    }
+
+    fn seq(seconds: u64) -> SessionSeq {
+        SessionSeq::from_unix_seconds(seconds).unwrap()
     }
 
     fn versions() -> Versions {
@@ -2241,7 +2229,7 @@ mod test {
         let session_id = SessionId::random();
         sim.request(Request::session(
             root.key_id().clone(),
-            SessionRequest::Start(session_id),
+            SessionRequest::Start(session_id, seq(1)),
         ));
         (root, sim, session_id, Session::new(session_id))
     }
@@ -2258,11 +2246,10 @@ mod test {
 
         let session_id = SessionId::random();
         let session = Session::new(session_id);
-        let outputs = sim.request(Request::session(
+        sim.request(Request::session(
             actor.clone(),
-            SessionRequest::Start(session_id),
+            SessionRequest::Start(session_id, seq(1)),
         ));
-        assert!(outputs.iter().any(|o| matches!(o, Output::RotateNonce)));
         assert!(sim.state.session.session().is_some());
 
         let job_id = session.next_job_id();
@@ -2436,7 +2423,7 @@ mod test {
         let history = vec![
             Message::Request(Request::session(
                 actor.clone(),
-                SessionRequest::Start(session_id),
+                SessionRequest::Start(session_id, seq(1)),
             )),
             Message::Request(Request::job(
                 actor,

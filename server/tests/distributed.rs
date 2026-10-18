@@ -24,8 +24,9 @@ use tokio_util::sync::CancellationToken;
 use chrono::Utc;
 use sush_api::{JobStartParams, JobWait};
 use sush_common::jobs::{
-    JobId, JobMode, JobOutputState, JobStartRequest, JobStatus, ProcessError, Session, SessionId,
-    SessionSignerNonce, SignedJob, SkipReason,
+    JobId, JobMode, JobOutputState, JobStartRequest, JobStatus, ProcessError, Session,
+    SessionClientNonce, SessionId, SessionSeq, SessionSignerNonce, SessionSushNonce, SignedJob,
+    SkipReason,
 };
 use sush_common::keys::{EphemeralKey, Signer as _, pem_cert_chain};
 use sush_common::targets::{Cubbies, SledHealth, SledId, Target};
@@ -160,15 +161,15 @@ async fn jobs_gossip_between_sleds() {
     // A session started on sled A becomes B's active session too.
     let authn_a = fake_identity(&mut root).await;
     let authn_b = fake_identity(&mut root).await;
-    let signer_nonce = SessionSignerNonce::random();
-    let session_id = SessionId::compute(
-        a.mgr.own_baseboard(),
-        a.mgr.session_sush_nonce(),
+    let Ceremony {
+        session_id,
+        client_nonce,
         signer_nonce,
-    );
+        seq,
+    } = ceremony(&a.mgr, 1);
     let session = Session::new(session_id);
     a.mgr
-        .session_start(&authn_a, session_id, signer_nonce, true)
+        .session_start(&authn_a, session_id, client_nonce, signer_nonce, seq, true)
         .await
         .unwrap();
     eventually("session gossips to B", 60, async || {
@@ -209,14 +210,14 @@ async fn jobs_gossip_between_sleds() {
     .await;
 
     // A session started on B supersedes A's everywhere.
-    let successor_nonce = SessionSignerNonce::random();
-    let successor = SessionId::compute(
-        b.mgr.own_baseboard(),
-        b.mgr.session_sush_nonce(),
-        successor_nonce,
-    );
+    let Ceremony {
+        session_id: successor,
+        client_nonce,
+        signer_nonce,
+        seq,
+    } = ceremony(&b.mgr, 2);
     b.mgr
-        .session_start(&authn_b, successor, successor_nonce, true)
+        .session_start(&authn_b, successor, client_nonce, signer_nonce, seq, true)
         .await
         .unwrap();
     eventually("supersession gossips to A", 60, async || {
@@ -261,17 +262,31 @@ async fn concurrent_sessions_annihilate() {
     a.peers.send(BTreeSet::new()).unwrap();
     b.peers.send(BTreeSet::new()).unwrap();
     sleep(Duration::from_millis(500)).await;
-    let nonce_a = SessionSignerNonce::random();
-    let session_a = SessionId::compute(a.mgr.own_baseboard(), a.mgr.session_sush_nonce(), nonce_a);
+    let a_ceremony = ceremony(&a.mgr, 1);
+    let session_a = a_ceremony.session_id;
     let mut session = Session::new(session_a);
     a.mgr
-        .session_start(&authn_a, session_a, nonce_a, true)
+        .session_start(
+            &authn_a,
+            session_a,
+            a_ceremony.client_nonce,
+            a_ceremony.signer_nonce,
+            a_ceremony.seq,
+            true,
+        )
         .await
         .unwrap();
-    let nonce_b = SessionSignerNonce::random();
-    let session_b = SessionId::compute(b.mgr.own_baseboard(), b.mgr.session_sush_nonce(), nonce_b);
+    let b_ceremony = ceremony(&b.mgr, 2);
+    let session_b = b_ceremony.session_id;
     b.mgr
-        .session_start(&authn_b, session_b, nonce_b, true)
+        .session_start(
+            &authn_b,
+            session_b,
+            b_ceremony.client_nonce,
+            b_ceremony.signer_nonce,
+            b_ceremony.seq,
+            true,
+        )
         .await
         .unwrap();
 
@@ -339,15 +354,15 @@ async fn rejoining_replays_without_reexecuting() {
     // Sled A runs a whole job before B exists.
     let a = Sled::start(&log, &dir, 1, &root_pem, &shutdown).await;
     let authn_a = fake_identity(&mut root).await;
-    let signer_nonce = SessionSignerNonce::random();
-    let session_id = SessionId::compute(
-        a.mgr.own_baseboard(),
-        a.mgr.session_sush_nonce(),
+    let Ceremony {
+        session_id,
+        client_nonce,
         signer_nonce,
-    );
+        seq,
+    } = ceremony(&a.mgr, 1);
     let session = Session::new(session_id);
     a.mgr
-        .session_start(&authn_a, session_id, signer_nonce, true)
+        .session_start(&authn_a, session_id, client_nonce, signer_nonce, seq, true)
         .await
         .unwrap();
     let job_id = session.next_job_id();
@@ -389,15 +404,22 @@ async fn rejoining_replays_without_reexecuting() {
     // Live traffic still executes everywhere: a fresh session's job runs
     // on both sleds.
     sees(&a, &b).await;
-    let successor_nonce = SessionSignerNonce::random();
-    let successor = SessionId::compute(
-        a.mgr.own_baseboard(),
-        a.mgr.session_sush_nonce(),
-        successor_nonce,
-    );
+    let Ceremony {
+        session_id: successor,
+        client_nonce,
+        signer_nonce: successor_nonce,
+        seq,
+    } = ceremony(&a.mgr, 1);
     let fresh = Session::new(successor);
     a.mgr
-        .session_start(&authn_a, successor, successor_nonce, true)
+        .session_start(
+            &authn_a,
+            successor,
+            client_nonce,
+            successor_nonce,
+            seq,
+            true,
+        )
         .await
         .unwrap();
     let live_job = fresh.next_job_id();
@@ -588,15 +610,15 @@ async fn stragglers_do_not_interrupt_live_jobs() {
     .await;
     sees(&a, &b).await;
     let authn_a = fake_identity(&mut root).await;
-    let signer_nonce = SessionSignerNonce::random();
-    let session_id = SessionId::compute(
-        a.mgr.own_baseboard(),
-        a.mgr.session_sush_nonce(),
+    let Ceremony {
+        session_id,
+        client_nonce,
         signer_nonce,
-    );
+        seq,
+    } = ceremony(&a.mgr, 1);
     let session = Session::new(session_id);
     a.mgr
-        .session_start(&authn_a, session_id, signer_nonce, true)
+        .session_start(&authn_a, session_id, client_nonce, signer_nonce, seq, true)
         .await
         .unwrap();
     let job_id = session.next_job_id();
@@ -644,6 +666,32 @@ async fn stragglers_do_not_interrupt_live_jobs() {
 /// Wait until `anchor` has applied `joiner`'s build announcement. A
 /// session started on `anchor` afterward causally follows everything
 /// `joiner` held at entry, so it clears the joiner's entry floor.
+/// Everything one sled hears at session start: a client nonce, a
+/// signer nonce, the signer's clock reading, and the session id over
+/// them all.
+struct Ceremony {
+    session_id: SessionId,
+    client_nonce: SessionClientNonce,
+    signer_nonce: SessionSignerNonce,
+    seq: SessionSeq,
+}
+
+/// Build a [`Ceremony`] against one sled. Fetches a fresh server
+/// nonce, so earlier ceremonies against that sled go stale.
+fn ceremony(mgr: &JobManager, seq: u64) -> Ceremony {
+    let client_nonce = SessionClientNonce::random();
+    let signer_nonce = SessionSignerNonce::random();
+    let sush_nonce = SessionSushNonce::compute(client_nonce, mgr.fresh_server_nonce());
+    let seq = SessionSeq::from_unix_seconds(seq).unwrap();
+    let session_id = SessionId::compute(mgr.own_baseboard(), sush_nonce, signer_nonce, seq);
+    Ceremony {
+        session_id,
+        client_nonce,
+        signer_nonce,
+        seq,
+    }
+}
+
 async fn sees(anchor: &Sled, joiner: &Sled) {
     eventually("the anchor sees the joiner", 60, async || {
         anchor
@@ -709,15 +757,15 @@ async fn lost_suffix_never_reruns() {
     })
     .await;
     sees(&a, &b).await;
-    let signer_nonce = SessionSignerNonce::random();
-    let session_id = SessionId::compute(
-        a.mgr.own_baseboard(),
-        a.mgr.session_sush_nonce(),
+    let Ceremony {
+        session_id,
+        client_nonce,
         signer_nonce,
-    );
+        seq,
+    } = ceremony(&a.mgr, 1);
     let mut session = Session::new(session_id);
     a.mgr
-        .session_start(&authn_a, session_id, signer_nonce, true)
+        .session_start(&authn_a, session_id, client_nonce, signer_nonce, seq, true)
         .await
         .unwrap();
     eventually("the session gossips to B", 120, async || {
@@ -816,15 +864,15 @@ async fn lost_suffix_never_reruns() {
     assert_eq!(read_to_string(&footprint).unwrap(), "run\n");
 
     // A new session serves immediately.
-    let signer_nonce = SessionSignerNonce::random();
-    let session2_id = SessionId::compute(
-        a.mgr.own_baseboard(),
-        a.mgr.session_sush_nonce(),
+    let Ceremony {
+        session_id: session2_id,
+        client_nonce,
         signer_nonce,
-    );
+        seq,
+    } = ceremony(&a.mgr, 1);
     let session2 = Session::new(session2_id);
     a.mgr
-        .session_start(&authn_a, session2_id, signer_nonce, true)
+        .session_start(&authn_a, session2_id, client_nonce, signer_nonce, seq, true)
         .await
         .unwrap();
     eventually("the new session gossips to B", 120, async || {
@@ -895,15 +943,15 @@ async fn session_resumes_at_stored_successor() {
     .await;
     sees(&a, &b).await;
     sees(&a, &c).await;
-    let signer_nonce = SessionSignerNonce::random();
-    let session_id = SessionId::compute(
-        a.mgr.own_baseboard(),
-        a.mgr.session_sush_nonce(),
+    let Ceremony {
+        session_id,
+        client_nonce,
         signer_nonce,
-    );
+        seq,
+    } = ceremony(&a.mgr, 1);
     let mut session = Session::new(session_id);
     a.mgr
-        .session_start(&authn_a, session_id, signer_nonce, true)
+        .session_start(&authn_a, session_id, client_nonce, signer_nonce, seq, true)
         .await
         .unwrap();
     eventually("the session gossips to B and C", 120, async || {
@@ -1034,15 +1082,15 @@ async fn universe_flip_flop_raises_floor() {
     let authn_a = fake_identity(&mut root).await;
     let d = Sled::start(&log, &dir, 3, &root_pem, &shutdown).await;
     let authn_d = fake_identity(&mut root).await;
-    let signer_nonce = SessionSignerNonce::random();
-    let session2_id = SessionId::compute(
-        d.mgr.own_baseboard(),
-        d.mgr.session_sush_nonce(),
+    let Ceremony {
+        session_id: session2_id,
+        client_nonce,
         signer_nonce,
-    );
+        seq,
+    } = ceremony(&d.mgr, 1);
     let mut session2 = Session::new(session2_id);
     d.mgr
-        .session_start(&authn_d, session2_id, signer_nonce, true)
+        .session_start(&authn_d, session2_id, client_nonce, signer_nonce, seq, true)
         .await
         .unwrap();
 
@@ -1060,15 +1108,15 @@ async fn universe_flip_flop_raises_floor() {
     })
     .await;
     sees(&a, &x).await;
-    let signer_nonce = SessionSignerNonce::random();
-    let session1_id = SessionId::compute(
-        a.mgr.own_baseboard(),
-        a.mgr.session_sush_nonce(),
+    let Ceremony {
+        session_id: session1_id,
+        client_nonce,
         signer_nonce,
-    );
+        seq,
+    } = ceremony(&a.mgr, 1);
     let mut session1 = Session::new(session1_id);
     a.mgr
-        .session_start(&authn_a, session1_id, signer_nonce, true)
+        .session_start(&authn_a, session1_id, client_nonce, signer_nonce, seq, true)
         .await
         .unwrap();
     eventually("session one gossips to X", 120, async || {
@@ -1185,15 +1233,15 @@ async fn universe_flip_flop_raises_floor() {
 
     // A witnessed the refusal, so a session started now begins above
     // X's floor, and serves X again.
-    let signer_nonce = SessionSignerNonce::random();
-    let session3_id = SessionId::compute(
-        a.mgr.own_baseboard(),
-        a.mgr.session_sush_nonce(),
+    let Ceremony {
+        session_id: session3_id,
+        client_nonce,
         signer_nonce,
-    );
+        seq,
+    } = ceremony(&a.mgr, 1);
     let session3 = Session::new(session3_id);
     a.mgr
-        .session_start(&authn_a, session3_id, signer_nonce, true)
+        .session_start(&authn_a, session3_id, client_nonce, signer_nonce, seq, true)
         .await
         .unwrap();
     eventually("session three gossips to X", 120, async || {
@@ -1295,15 +1343,15 @@ async fn witnessed_session_survives_restart() {
     })
     .await;
     sees(&a, &b).await;
-    let signer_nonce = SessionSignerNonce::random();
-    let session_id = SessionId::compute(
-        a.mgr.own_baseboard(),
-        a.mgr.session_sush_nonce(),
+    let Ceremony {
+        session_id,
+        client_nonce,
         signer_nonce,
-    );
+        seq,
+    } = ceremony(&a.mgr, 1);
     let mut session = Session::new(session_id);
     a.mgr
-        .session_start(&authn_a, session_id, signer_nonce, true)
+        .session_start(&authn_a, session_id, client_nonce, signer_nonce, seq, true)
         .await
         .unwrap();
 
@@ -1374,14 +1422,14 @@ async fn bookmarks_survive_restart() {
     // Sled A holds session history, so it wins every dominance contest.
     let a = Sled::start(&log, &dir, 1, &root_pem, &shutdown).await;
     let authn_a = fake_identity(&mut root).await;
-    let signer_nonce = SessionSignerNonce::random();
-    let session_id = SessionId::compute(
-        a.mgr.own_baseboard(),
-        a.mgr.session_sush_nonce(),
+    let Ceremony {
+        session_id,
+        client_nonce,
         signer_nonce,
-    );
+        seq,
+    } = ceremony(&a.mgr, 1);
     a.mgr
-        .session_start(&authn_a, session_id, signer_nonce, true)
+        .session_start(&authn_a, session_id, client_nonce, signer_nonce, seq, true)
         .await
         .unwrap();
 
@@ -1478,15 +1526,15 @@ async fn gossip_survives_bookmark_failure() {
     })
     .await;
     sees(&a, &b).await;
-    let signer_nonce = SessionSignerNonce::random();
-    let session_id = SessionId::compute(
-        a.mgr.own_baseboard(),
-        a.mgr.session_sush_nonce(),
+    let Ceremony {
+        session_id,
+        client_nonce,
         signer_nonce,
-    );
+        seq,
+    } = ceremony(&a.mgr, 1);
     let session = Session::new(session_id);
     a.mgr
-        .session_start(&authn_a, session_id, signer_nonce, true)
+        .session_start(&authn_a, session_id, client_nonce, signer_nonce, seq, true)
         .await
         .unwrap();
 
