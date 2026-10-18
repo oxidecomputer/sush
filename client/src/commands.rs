@@ -7,7 +7,6 @@
 //! May be executed via either the main CLI or the interactive REPL.
 
 use std::fs::{File, OpenOptions, read};
-#[cfg(feature = "permslip")]
 use std::io::ErrorKind;
 use std::io::{Seek as _, SeekFrom, Write as _, stdin};
 use std::net::SocketAddr;
@@ -47,12 +46,10 @@ use sush_common::authn::{
 };
 use sush_common::interactive::{InteractiveJobError, InteractiveJobMessage};
 use sush_common::jobs::JobOutputStream::{self, Stderr, Stdout};
-#[cfg(feature = "permslip")]
-use sush_common::jobs::JobStartRequest;
 use sush_common::jobs::{
-    Access, JobId, JobLimits, JobMode, JobOutputHash, JobOutputState, JobStatus, JobStatusMap,
-    Session, SessionClientNonce, SessionId, SessionSeq, SessionSignerNonce, SessionSushNonce,
-    SignedJob, SkipReason, job_status_try_from_json_map,
+    Access, JobId, JobLimits, JobMode, JobOutputHash, JobOutputState, JobStartRequest, JobStatus,
+    JobStatusMap, Session, SessionClientNonce, SessionId, SessionSeq, SessionSignerNonce,
+    SessionSushNonce, SignedJob, SkipReason, job_status_try_from_json_map,
 };
 use sush_common::keys::{KeyError, KeyId, Signer as _};
 use sush_common::targets::{SledId, Target};
@@ -63,7 +60,7 @@ use crate::context::{Authz, CommandContext, OutputFormat, StatusDisplayStyle};
 use crate::identity::{IdentityError, SshAgentConnection};
 use crate::interactive::interactive_job;
 #[cfg(feature = "permslip")]
-use crate::permslip::{PermslipError, PermslipSigner, fresh_token};
+use crate::permslip::{PermslipError, PermslipSigner, saved_token};
 use crate::repl::Repl;
 use crate::tls;
 use crate::tunnel::{Tunnel, TunnelError};
@@ -742,10 +739,11 @@ pub struct JobStartArgs {
 }
 
 impl JobStartArgs {
-    /// The signing key name in a build that can sign.
-    fn key_name(&self) -> Option<&str> {
+    /// The signing service URL in a build that can sign. Its absence
+    /// means an out-of-band request to the signer (support).
+    fn signer_url(&self) -> Option<&str> {
         #[cfg(feature = "permslip")]
-        return self.permslip.as_deref();
+        return self.permslip_url.as_deref();
         #[cfg(not(feature = "permslip"))]
         None
     }
@@ -1090,20 +1088,7 @@ async fn session(
             Ok(())
         }
 
-        (SessionCommand::StartParams, Some(client)) => {
-            let (baseboard_id, nonce) = with_login(ctx, client, async || {
-                Ok((
-                    client.target().send().await?.into_inner(),
-                    client.server_nonce().send().await?.into_inner(),
-                ))
-            })
-            .await?;
-            let client_nonce = SessionClientNonce::random();
-            let sush_nonce = SessionSushNonce::compute(client_nonce, nonce);
-            ctx.save_client_nonce(client_nonce);
-            ctx.session_start_params(baseboard_id, client_nonce, sush_nonce);
-            Ok(())
-        }
+        (SessionCommand::StartParams, Some(client)) => session_start_params(ctx, client).await,
 
         #[cfg(feature = "permslip")]
         (
@@ -1136,6 +1121,12 @@ async fn session(
                         true,
                     )
                 } else {
+                    let Some(permslip_url) = permslip_url else {
+                        return session_start_params(ctx, client).await;
+                    };
+                    let Some(permslip_key) = permslip else {
+                        return Err(CommandError::MissingKeyName);
+                    };
                     let (baseboard_id, nonce) = with_login(ctx, client, async || {
                         Ok((
                             client.target().send().await?.into_inner(),
@@ -1146,7 +1137,7 @@ async fn session(
                     let client_nonce = SessionClientNonce::random();
                     let sush_nonce = SessionSushNonce::compute(client_nonce, nonce);
                     let (session_id, signer_nonce, seq) =
-                        session_create(ctx, permslip, permslip_url, &baseboard_id, sush_nonce)
+                        session_create(permslip_key, permslip_url, &baseboard_id, sush_nonce)
                             .await?;
                     ctx.session_created(Session::new(session_id), signer_nonce, seq);
                     (
@@ -1172,8 +1163,14 @@ async fn session(
             },
             _,
         ) => {
+            let Some(permslip_url) = permslip_url else {
+                return Err(CommandError::MissingPermslipUrl);
+            };
+            let Some(permslip_key) = permslip else {
+                return Err(CommandError::MissingKeyName);
+            };
             let (session_id, nonce, seq) =
-                session_create(ctx, permslip, permslip_url, &baseboard_id, nonce).await?;
+                session_create(permslip_key, permslip_url, &baseboard_id, nonce).await?;
             ctx.session_created(Session::new(session_id), nonce, seq);
             Ok(())
         }
@@ -1189,8 +1186,10 @@ async fn session(
             },
             Some(client),
         ) => {
+            // A build that cannot sign is always in the relay flow: a
+            // bare start means the start parameters.
             let (Some(session_id), Some(signer_nonce), Some(seq)) = (session_id, nonce, seq) else {
-                return Err(CommandError::SigningUnavailable);
+                return session_start_params(ctx, client).await;
             };
             let client_nonce = client_nonce
                 .or_else(|| ctx.pending_client_nonce())
@@ -1273,8 +1272,10 @@ async fn job(
     command: JobCommand,
 ) -> Result<(), CommandError> {
     match (command, client) {
+        // Without a signing service, a bare job start takes a job the
+        // signer already signed.
         (JobCommand::Start { start_args }, Some(client))
-            if start_args.command.is_none() && start_args.key_name().is_none() =>
+            if start_args.command.is_none() && start_args.signer_url().is_none() =>
         {
             let job = ctx.read_signed_job()?;
             job_start(ctx, client, job, start_args).await?;
@@ -1289,6 +1290,42 @@ async fn job(
             Some(_),
         ) => Err(CommandError::MissingCommand),
 
+        // Without a signing service, a command's job start prints the
+        // request parameters for the user to relay to support.
+        #[cfg(feature = "permslip")]
+        (
+            JobCommand::Start {
+                start_args:
+                    ref start_args @ JobStartArgs {
+                        command: Some(_),
+                        permslip_url: None,
+                        ..
+                    },
+            },
+            client,
+        ) => {
+            let request = job_start_request(ctx, client.as_ref(), start_args).await?;
+            ctx.job_start_params(&request);
+            Ok(())
+        }
+
+        // A build that cannot sign prints the request parameters for
+        // the user to relay to support.
+        #[cfg(not(feature = "permslip"))]
+        (
+            JobCommand::Start {
+                start_args:
+                    ref start_args @ JobStartArgs {
+                        command: Some(_), ..
+                    },
+            },
+            client,
+        ) => {
+            let request = job_start_request(ctx, client.as_ref(), start_args).await?;
+            ctx.job_start_params(&request);
+            Ok(())
+        }
+
         #[cfg(feature = "permslip")]
         (
             JobCommand::Start {
@@ -1298,80 +1335,24 @@ async fn job(
             Some(_),
         ) => Err(CommandError::MissingKeyName),
 
-        #[cfg(not(feature = "permslip"))]
-        (JobCommand::Start { .. }, Some(_)) => Err(CommandError::SigningUnavailable),
-
         #[cfg(feature = "permslip")]
         (
             JobCommand::Start {
                 start_args:
                     ref start_args @ JobStartArgs {
-                        command: Some(ref command),
                         permslip: Some(ref key_name),
-                        ref permslip_url,
-                        ref interactive,
-                        ref streaming,
-                        ref target,
+                        permslip_url: Some(ref permslip_url),
                         ..
                     },
             },
             client,
         ) => {
-            let Some(session_id) = ctx.session_id() else {
-                return Err(CommandError::MissingSession);
-            };
-            let Some(permslip_url) = permslip_url else {
-                return Err(CommandError::MissingPermslipUrl);
-            };
-            let job_id = ctx.next_job_id()?;
-            let target = match target {
-                TargetArg::Target(target) => target.clone(),
-                abbreviated => {
-                    let Some(client) = client.as_ref() else {
-                        return Err(CommandError::Offline);
-                    };
-                    resolve_target_arg(client, abbreviated).await?
-                }
-            };
-            // Sign an interactive or streaming job for the sled its
-            // attachment will land on.
-            let target = if (*interactive || *streaming) && target.single_baseboard().is_none() {
-                let Some(client) = client.as_ref() else {
-                    return Err(CommandError::InteractiveTarget);
-                };
-                Target::from(resolve_target(client, &target).await?)
-            } else {
-                target
-            };
-            // Catch output file problems before the signing ceremony.
-            if *streaming {
-                let Some(path) = &start_args.file else {
-                    return Err(CommandError::StreamingNeedsFile);
-                };
-                if !start_args.force && path.exists() {
-                    return Err(CommandError::io(path, ErrorKind::AlreadyExists.into()));
-                }
-            }
-            if let Some(client) = client.as_ref() {
-                preflight_target(ctx, client, &target).await?;
-            }
-            let mode = if *interactive {
-                JobMode::Interactive
-            } else if *streaming {
-                JobMode::StreamOutput
-            } else {
-                JobMode::Batch
-            };
-            let signer = permslip_signer(ctx, key_name, permslip_url).await?;
+            let request = job_start_request(ctx, client.as_ref(), start_args).await?;
+            let job_id = request.job_id;
+            let signer = permslip_signer(key_name, permslip_url).await?;
             let mut interval = interval(SIGNING_UPDATE_INTERVAL);
             interval.set_missed_tick_behavior(MissedTickBehavior::Skip);
-            let sign = signer.sign_job_request(JobStartRequest::new(
-                job_id.to_owned(),
-                session_id,
-                command,
-                mode,
-                target,
-            ));
+            let sign = signer.sign_job_request(request);
             pin!(sign);
             ctx.job_signing_started(&job_id);
             let mut sigint = signal(SignalKind::interrupt())?;
@@ -1737,59 +1718,108 @@ fn parse_baseboard_id(value: &str) -> Result<BaseboardId, String> {
     value.parse::<BaseboardId>().map_err(|e| e.to_string())
 }
 
-/// A permslip signer authenticated as the agent key `-s`/`SUSH_KEY_ID`
-/// names, or the agent's first. We choose the key rather than letting
-/// permslip choose, so that one identity serves both the rack and the
-/// signing service.
+/// A permslip signer authenticated by the credential that
+/// `permslip login` saved.
 #[cfg(feature = "permslip")]
 async fn permslip_signer(
-    ctx: &mut impl CommandContext,
     key_name: &str,
     permslip_url: &str,
 ) -> Result<PermslipSigner, CommandError> {
-    let globals = ctx.get_globals();
-    let Some(sock) = globals.ssh_auth_sock.clone() else {
-        return Err(CommandError::MissingSshAuthSock);
+    let token = saved_token(permslip_url).await?;
+    Ok(PermslipSigner::new(key_name, permslip_url, &token)?)
+}
+
+/// Fetch the ceremony inputs from the rack and print the parameters
+/// to relay to the signer, stashing the client nonce for the
+/// eventual start.
+async fn session_start_params(
+    ctx: &mut impl CommandContext,
+    client: &Client,
+) -> Result<(), CommandError> {
+    let (baseboard_id, nonce) = with_login(ctx, client, async || {
+        Ok((
+            client.target().send().await?.into_inner(),
+            client.server_nonce().send().await?.into_inner(),
+        ))
+    })
+    .await?;
+    let client_nonce = SessionClientNonce::random();
+    let sush_nonce = SessionSushNonce::compute(client_nonce, nonce);
+    ctx.save_client_nonce(client_nonce);
+    ctx.session_start_params(baseboard_id, client_nonce, sush_nonce);
+    Ok(())
+}
+
+/// Assemble the request a job start submits for signing: the
+/// session's next job id, the resolved target, and the mode the
+/// flags name.
+async fn job_start_request(
+    ctx: &mut impl CommandContext,
+    client: Option<&Client>,
+    start_args: &JobStartArgs,
+) -> Result<JobStartRequest, CommandError> {
+    let Some(command) = &start_args.command else {
+        return Err(CommandError::MissingCommand);
     };
-    let key_id = globals.ssh_key_id.clone();
-    let mut agent = SshAgentConnection::connect(&sock).await?;
-    let key = agent.identity(key_id.as_ref()).await?;
-    let fingerprint = key.fingerprint();
-    let token = match ctx.permslip_token(permslip_url, &fingerprint) {
-        Some(token) => token,
-        None => {
-            ctx.please_touch(&key)?;
-            let token = fresh_token(permslip_url, sock, fingerprint.clone()).await?;
-            ctx.save_permslip_token(permslip_url, &fingerprint, &token);
-            token
+    let Some(session_id) = ctx.session_id() else {
+        return Err(CommandError::MissingSession);
+    };
+    let job_id = ctx.next_job_id()?;
+    let (interactive, streaming) = (start_args.interactive, start_args.streaming);
+    let target = match &start_args.target {
+        TargetArg::Target(target) => target.clone(),
+        abbreviated => {
+            let Some(client) = client else {
+                return Err(CommandError::Offline);
+            };
+            resolve_target_arg(client, abbreviated).await?
         }
     };
-    Ok(PermslipSigner::new(key_name, permslip_url, &token)?)
+    // An interactive or streaming job binds to the single sled its
+    // attachment will land on.
+    let target = if (interactive || streaming) && target.single_baseboard().is_none() {
+        let Some(client) = client else {
+            return Err(CommandError::InteractiveTarget);
+        };
+        Target::from(resolve_target(client, &target).await?)
+    } else {
+        target
+    };
+    // Catch output file problems before anything is signed.
+    if streaming {
+        let Some(path) = &start_args.file else {
+            return Err(CommandError::StreamingNeedsFile);
+        };
+        if !start_args.force && path.exists() {
+            return Err(CommandError::io(path, ErrorKind::AlreadyExists.into()));
+        }
+    }
+    if let Some(client) = client {
+        preflight_target(ctx, client, &target).await?;
+    }
+    let mode = if interactive {
+        JobMode::Interactive
+    } else if streaming {
+        JobMode::StreamOutput
+    } else {
+        JobMode::Batch
+    };
+    Ok(JobStartRequest::new(
+        job_id, session_id, command, mode, target,
+    ))
 }
 
 /// Ask the online signing service to create a session.
 #[cfg(feature = "permslip")]
 async fn session_create(
-    ctx: &mut impl CommandContext,
-    permslip: Option<String>,
-    permslip_url: Option<String>,
+    permslip_key: String,
+    permslip_url: String,
     baseboard_id: &BaseboardId,
     nonce: SessionSushNonce,
 ) -> Result<(SessionId, SessionSignerNonce, SessionSeq), CommandError> {
-    let Some(permslip_url) = permslip_url else {
-        return Err(CommandError::MissingPermslipUrl);
-    };
-    let Some(permslip_key) = permslip else {
-        return Err(CommandError::MissingKeyName);
-    };
-    let signer = permslip_signer(ctx, &permslip_key, &permslip_url).await?;
-    let _created = signer.create_session(baseboard_id, nonce).await?;
-    // The signing service cannot order sessions yet: its response
-    // carries no sequence number until the permission-slip side of
-    // protocol v2 lands.
-    Err(CommandError::UnsupportedPermslipResponse(
-        "the signing service returned no session sequence number".to_string(),
-    ))
+    let signer = permslip_signer(&permslip_key, &permslip_url).await?;
+    let created = signer.create_session(baseboard_id, nonce).await?;
+    Ok((created.session_id, created.signer_nonce, created.seq))
 }
 
 async fn session_start(
@@ -2393,7 +2423,6 @@ impl FromStr for TargetArg {
 }
 
 /// Confirm before signing a job for a sled that doesn't appear in inventory.
-#[cfg(feature = "permslip")]
 async fn preflight_target(
     ctx: &mut impl CommandContext,
     client: &Client,
@@ -2596,9 +2625,6 @@ pub enum CommandError {
     Reqwest(#[from] reqwest::Error),
     #[error("❌ SSH signature error on key ID `{0}`")]
     Signature(KeyId),
-    #[cfg(not(feature = "permslip"))]
-    #[error("❌ Signing unavailable: built without the `permslip` feature")]
-    SigningUnavailable,
     #[error("❌ Streaming jobs need `--file`")]
     StreamingNeedsFile,
     #[error("❌ Job `{0}` did not exit cleanly, streamed output is unverified")]
@@ -2625,9 +2651,6 @@ pub enum CommandError {
     Utf8(#[from] std::string::FromUtf8Error),
     #[error("❌ WebSocket error: {0}")]
     WebSocket(#[from] WebSocketError),
-    #[cfg(feature = "permslip")]
-    #[error("❌ Unsupported permslip response: {0}")]
-    UnsupportedPermslipResponse(String),
 }
 
 impl CommandError {

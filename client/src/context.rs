@@ -14,8 +14,8 @@ use x509_cert::Certificate;
 
 use sush_common::authn::{BoundRequest, Credentials, Identity, RequestKey};
 use sush_common::jobs::{
-    Access, JobId, JobOutputStream, JobStatusMap, Session, SessionClientNonce, SessionId,
-    SessionSeq, SessionSignerNonce, SessionSushNonce, SignedJob,
+    Access, JobId, JobOutputStream, JobStartRequest, JobStatusMap, Session, SessionClientNonce,
+    SessionId, SessionSeq, SessionSignerNonce, SessionSushNonce, SignedJob,
 };
 use sush_common::keys::{KeyId, SshPublicKey};
 use sush_common::targets::{SledId, SledVersion};
@@ -113,10 +113,6 @@ pub trait CommandContext: Clone + Send + Sync {
     fn set_credentials(&mut self, credentials: Option<Authz>) {
         self.authz_signer().set(credentials)
     }
-    fn permslip_token(&self, _url: &str, _fingerprint: &str) -> Option<String> {
-        None
-    }
-    fn save_permslip_token(&self, _url: &str, _fingerprint: &str, _token: &str) {}
     fn pending_client_nonce(&self) -> Option<SessionClientNonce> {
         None
     }
@@ -129,6 +125,7 @@ pub trait CommandContext: Clone + Send + Sync {
         client_nonce: SessionClientNonce,
         sush_nonce: SessionSushNonce,
     );
+    fn job_start_params(&self, request: &JobStartRequest);
     fn session_created(
         &mut self,
         session: Session,

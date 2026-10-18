@@ -17,7 +17,7 @@ use anstream::print;
 use anstyle::{AnsiColor, Style};
 use atomicwrites::{AtomicFile, OverwriteBehavior};
 use bytesize::ByteSize;
-use chrono::{DateTime, TimeDelta, Utc};
+use chrono::TimeDelta;
 use humantime::format_duration;
 use indicatif::{MultiProgress, ProgressBar, ProgressStyle};
 use rustix::io::ioctl_fionread;
@@ -30,9 +30,9 @@ use xdg::BaseDirectories;
 
 use sush_common::authn::Identity;
 use sush_common::jobs::{
-    Access, JobId, JobOutputState, JobOutputStream, JobStatus, JobStatusMap, Session,
-    SessionClientNonce, SessionId, SessionSeq, SessionSignerNonce, SessionSushNonce, SignedJob,
-    job_status_to_json_map,
+    Access, JobId, JobOutputState, JobOutputStream, JobStartRequest, JobStatus, JobStatusMap,
+    Session, SessionClientNonce, SessionId, SessionSeq, SessionSignerNonce, SessionSushNonce,
+    SignedJob, job_status_to_json_map,
 };
 use sush_common::keys::{KeyId, Signature, SshPublicKey};
 use sush_common::targets::{MAX_CUBBY, SledHealth, SledId, SledVersion};
@@ -45,32 +45,14 @@ use crate::context::{CommandContext, OutputFormat, StatusDisplayStyle};
 pub(crate) const PREFIX: &str = "sush";
 const SESSION_FILE_NAME: &str = "session.json";
 const SESSION_FILE_VERSION: u32 = 1;
-const TOKEN_FILE_NAME: &str = "permslip-token.json";
-const TOKEN_FILE_VERSION: u32 = 1;
 const CLIENT_NONCE_FILE_NAME: &str = "client-nonce.json";
 const CLIENT_NONCE_FILE_VERSION: u32 = 1;
-
-/// How long a permslip token is trusted for reuse. Staying well
-/// under the server's 15 minute TTL spares a command from expiring
-/// mid-flight.
-const TOKEN_REUSE: TimeDelta = TimeDelta::minutes(10);
 
 /// The persisted session, versioned for future migrations.
 #[derive(Deserialize, Serialize)]
 struct SavedSession {
     version: u32,
     session: Session,
-}
-
-/// A persisted permslip token, versioned for future migrations. The
-/// url and fingerprint pin it to one signing server and one identity.
-#[derive(Deserialize, Serialize)]
-struct SavedToken {
-    version: u32,
-    url: String,
-    fingerprint: String,
-    token: String,
-    created: DateTime<Utc>,
 }
 
 /// The persisted client nonce of the pending session ceremony,
@@ -91,7 +73,6 @@ pub struct Cli {
     watch: Arc<Mutex<Option<Watch>>>,
     session: Arc<Mutex<Option<Session>>>,
     session_file: Option<PathBuf>,
-    token_file: Option<PathBuf>,
     client_nonce_file: Option<PathBuf>,
     credentials: AuthzSigner,
 }
@@ -123,10 +104,6 @@ impl Cli {
             Err(error) => eprintln!("❗ Ignoring the saved session: {error}"),
         }
         self.session_file = Some(path);
-        match BaseDirectories::with_prefix(PREFIX).place_state_file(TOKEN_FILE_NAME) {
-            Ok(path) => self.token_file = Some(path),
-            Err(error) => eprintln!("❗ Signing tokens will not persist: {error}"),
-        }
         match BaseDirectories::with_prefix(PREFIX).place_state_file(CLIENT_NONCE_FILE_NAME) {
             Ok(path) => self.client_nonce_file = Some(path),
             Err(error) => eprintln!("❗ The client nonce will not persist: {error}"),
@@ -293,43 +270,6 @@ impl CommandContext for Cli {
         self.credentials.clone()
     }
 
-    fn permslip_token(&self, url: &str, fingerprint: &str) -> Option<String> {
-        let json = fs::read(self.token_file.as_ref()?).ok()?;
-        match serde_json::from_slice::<SavedToken>(&json) {
-            Ok(SavedToken {
-                version: TOKEN_FILE_VERSION,
-                url: saved_url,
-                fingerprint: saved_fingerprint,
-                token,
-                created,
-            }) if saved_url == url
-                && saved_fingerprint == fingerprint
-                && (TimeDelta::zero()..TOKEN_REUSE).contains(&(Utc::now() - created)) =>
-            {
-                Some(token)
-            }
-            _ => None,
-        }
-    }
-
-    fn save_permslip_token(&self, url: &str, fingerprint: &str, token: &str) {
-        let Some(path) = &self.token_file else {
-            return;
-        };
-        let result = serde_json::to_vec_pretty(&SavedToken {
-            version: TOKEN_FILE_VERSION,
-            url: url.to_owned(),
-            fingerprint: fingerprint.to_owned(),
-            token: token.to_owned(),
-            created: Utc::now(),
-        })
-        .map_err(io::Error::other)
-        .and_then(|json| write_private(path, &json));
-        if let Err(error) = result {
-            eprintln!("❗ The token was not saved: {error}");
-        }
-    }
-
     fn pending_client_nonce(&self) -> Option<SessionClientNonce> {
         let json = fs::read(self.client_nonce_file.as_ref()?).ok()?;
         match serde_json::from_slice::<SavedClientNonce>(&json) {
@@ -391,6 +331,29 @@ impl CommandContext for Cli {
                 println!("✅ Please relay these parameters to support:");
                 println!("   Baseboard ID: {baseboard_id}");
                 println!("   Sush nonce:   {sush_nonce}");
+            }
+        }
+    }
+
+    fn job_start_params(&self, request: &JobStartRequest) {
+        match self.get_output_format() {
+            OutputFormat::Json => println!(
+                "{}",
+                json!({
+                    "job_id": &request.job_id,
+                    "session_id": &request.session_id,
+                    "command": &request.command,
+                    "mode": &request.mode,
+                    "target": &request.target.to_string(),
+                })
+            ),
+            OutputFormat::Text => {
+                println!("✅ Please request a job with these parameters from support:");
+                println!("   Job ID:     {}", request.job_id);
+                println!("   Session ID: {}", request.session_id);
+                println!("   Command:    {}", request.command);
+                println!("   Mode:       {}", request.mode.as_str());
+                println!("   Target:     {}", request.target);
             }
         }
     }

@@ -21,8 +21,8 @@ use xdg::BaseDirectories;
 
 use sush_common::authn::Identity;
 use sush_common::jobs::{
-    Access, JobId, JobOutputStream, JobStatusMap, Session, SessionClientNonce, SessionId,
-    SessionSeq, SessionSignerNonce, SessionSushNonce, SignedJob,
+    Access, JobId, JobOutputStream, JobStartRequest, JobStatusMap, Session, SessionClientNonce,
+    SessionId, SessionSeq, SessionSignerNonce, SessionSushNonce, SignedJob,
 };
 use sush_common::keys::{KeyId, SshPublicKey};
 use sush_common::targets::{SledId, SledVersion};
@@ -227,14 +227,6 @@ impl CommandContext for Repl {
         self.cli.authz_signer()
     }
 
-    fn permslip_token(&self, url: &str, fingerprint: &str) -> Option<String> {
-        self.cli.permslip_token(url, fingerprint)
-    }
-
-    fn save_permslip_token(&self, url: &str, fingerprint: &str, token: &str) {
-        self.cli.save_permslip_token(url, fingerprint, token)
-    }
-
     fn session_id(&self) -> Option<SessionId> {
         self.cli.session_id()
     }
@@ -259,6 +251,10 @@ impl CommandContext for Repl {
     ) {
         self.cli
             .session_start_params(baseboard_id, client_nonce, sush_nonce)
+    }
+
+    fn job_start_params(&self, request: &JobStartRequest) {
+        self.cli.job_start_params(request)
     }
 
     fn session_created(
