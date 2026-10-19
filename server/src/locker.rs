@@ -29,9 +29,15 @@
 //! what starting over means.
 //!
 //! A locker holds an advisory lock on every slot until it and all
-//! of its tenants drop. Trying to construct a second locker over
-//! any of the same slots, in this process or another, will fail
-//! instead of clobbering records.
+//! of its tenants drop. A locker in another process trying to claim
+//! any of the same slots fails instead of clobbering records.
+//!
+//! The locks are fcntl record locks. A flock would be inherited by
+//! a child forked to run a job and held until it execs; an fcntl
+//! lock belongs to the process, and no child holds one. The kernel
+//! grants a process locks it already holds, so a single process
+//! must only ever construct one locker over a slot; nothing
+//! enforces this.
 //!
 //! All of this is necessary to ensure the basic constraint that
 //! **we must never adopt stale data**.
@@ -45,7 +51,7 @@ use std::sync::{Arc, Mutex as SyncMutex};
 use atomicwrites::{AtomicFile, OverwriteBehavior};
 use camino::Utf8PathBuf;
 use futures::TryFutureExt as _;
-use rustix::fs::{FlockOperation, flock};
+use rustix::fs::{FlockOperation, fcntl_lock};
 use slog::{Logger, o, warn};
 use thiserror::Error;
 use tokio::fs::{read, remove_file, write};
@@ -112,6 +118,26 @@ pub struct Locked {
     error: io::Error,
 }
 
+/// Take the slot lock at `path`, or `Ok(None)` when the lock file
+/// cannot be created. The kernel holds the lock until the file
+/// closes.
+fn claim(log: &Logger, path: Utf8PathBuf) -> Result<Option<File>, Locked> {
+    let file = match File::create(&path) {
+        Ok(file) => file,
+        Err(error) => {
+            warn!(log, "cannot create slot lock file"; "path" => %path, "error" => %error);
+            return Ok(None);
+        }
+    };
+    match fcntl_lock(&file, FlockOperation::NonBlockingLockExclusive) {
+        Ok(()) => Ok(Some(file)),
+        Err(errno) => Err(Locked {
+            path,
+            error: errno.into(),
+        }),
+    }
+}
+
 #[derive(Debug, Error)]
 pub enum StoreError {
     #[error("storing `{path}` failed: {error}")]
@@ -127,6 +153,10 @@ pub enum StoreError {
 }
 
 /// This sled's durable state storage.
+///
+/// NB: There must be only one locker instance per process, since
+/// our advisory locks only protect against *other* processes opening
+/// the slot files.
 #[derive(Clone, Debug)]
 pub struct Locker {
     log: Logger,
@@ -151,20 +181,8 @@ impl Locker {
         let log = log.new(o!("component" => "locker"));
         let mut locks = Vec::with_capacity(slots.len());
         for slot in &slots {
-            let path = slot.join(LOCK_FILE);
-            match File::create(&path) {
-                Ok(file) => match flock(&file, FlockOperation::NonBlockingLockExclusive) {
-                    Ok(()) => locks.push(file),
-                    Err(errno) => {
-                        return Err(Locked {
-                            path,
-                            error: errno.into(),
-                        });
-                    }
-                },
-                Err(error) => {
-                    warn!(log, "cannot create slot lock file"; "path" => %path, "error" => %error);
-                }
+            if let Some(lock) = claim(&log, slot.join(LOCK_FILE))? {
+                locks.push(lock);
             }
         }
         Ok(Self {
@@ -410,7 +428,9 @@ fn commit(
 mod test {
     use super::*;
 
+    use std::env::{current_exe, var};
     use std::fs::{create_dir, metadata, read, remove_file as remove, write};
+    use std::process::{Command, exit};
 
     use tempfile::TempDir;
 
@@ -665,16 +685,44 @@ mod test {
         ));
     }
 
-    /// A slot admits one locker at a time, and a tenant keeps the
-    /// locks alive after its locker drops.
-    #[tokio::test]
-    async fn second_locker_is_locked_out() {
+    /// A locker in another process is locked out until this one and
+    /// its tenants drop. The child is this test binary re-executed
+    /// with the slot named in the environment. Both of its outcomes
+    /// exit non-zero, so a filter that names no test exits zero and
+    /// fails here rather than reading as a lock the child never took.
+    #[test]
+    fn second_process_is_locked_out() {
+        const SLOT_VAR: &str = "SUSH_TEST_LOCK_SLOT";
+        const ACQUIRED: i32 = 43;
+        const REFUSED: i32 = 44;
+        if let Ok(slot) = var(SLOT_VAR) {
+            match Locker::new(&test_log(), vec![slot.into()]) {
+                Ok(_) => exit(ACQUIRED),
+                Err(_) => exit(REFUSED),
+            }
+        }
+
         let dir = TempDir::with_prefix("sush-locker-").unwrap();
         let slots = slots(&dir);
-        let tenant = locker(slots.clone()).tenant(SPEC);
-        assert!(Locker::new(&test_log(), slots.clone()).is_err());
+        let child = |slot: &Utf8PathBuf| {
+            Command::new(current_exe().unwrap())
+                .args(["--exact", "locker::test::second_process_is_locked_out"])
+                .env(SLOT_VAR, slot)
+                .output()
+                .unwrap()
+                .status
+                .code()
+        };
+
+        let locker = locker(slots.clone());
+        assert_eq!(child(&slots[0]), Some(REFUSED));
+
+        let tenant = locker.tenant(SPEC);
+        drop(locker);
+        assert_eq!(child(&slots[0]), Some(REFUSED));
+
         drop(tenant);
-        assert!(Locker::new(&test_log(), slots).is_ok());
+        assert_eq!(child(&slots[0]), Some(ACQUIRED));
     }
 
     /// A null locker persists nothing and never fails.
