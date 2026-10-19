@@ -440,7 +440,7 @@ mod wire_format {
                     baseboard: baseboard.clone(),
                     sush_nonce: SessionSushNonce::from_be_bytes([0x11; 32]),
                     signer_nonce: SessionSignerNonce::from_be_bytes([0x22; 32]),
-                    seq: SessionSeq::from_unix_seconds(1_760_000_000).unwrap(),
+                    seq: SessionSeq::from_unix_millis(1_760_000_000_000).unwrap(),
                 }),
             )),
             Message::Request(Request::session(actor(), SessionRequest::Stop(session))),

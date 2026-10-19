@@ -46,9 +46,10 @@ const WORD_SEPARATOR: &str = "-";
 /// the strength of the signatures produced over these phrases.
 const TRUNCATED_BITS: u32 = 88;
 
-/// A three-word phrase carries 33 bits. Not enough for an identifier,
-/// but room enough for a small ordered value, like a Unix time.
-const SHORT_BITS: u32 = 33;
+/// A four-word phrase carries 44 bits. Not enough for an identifier,
+/// but room enough for a small ordered value, like a Unix time in
+/// milliseconds.
+const SHORT_BITS: u32 = 44;
 
 /// Random code phrase like `abstract misery favorite ordinary moon talk`.
 #[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
@@ -66,7 +67,7 @@ impl Codephrase {
         self.mask(TRUNCATED_BITS)
     }
 
-    /// Chop entropy down to three words; see `SHORT_BITS`.
+    /// Chop entropy down to four words; see `SHORT_BITS`.
     pub fn shorten(self) -> Self {
         self.mask(SHORT_BITS)
     }

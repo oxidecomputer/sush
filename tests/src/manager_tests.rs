@@ -351,7 +351,7 @@ async fn fetch_rotates_server_nonce() {
         baseboard: mgr.own_baseboard().clone(),
         sush_nonce: ceremony.sush_nonce,
         signer_nonce: SessionSignerNonce::random(),
-        seq: SessionSeq::from_unix_seconds(2).unwrap(),
+        seq: SessionSeq::from_unix_millis(2).unwrap(),
     };
     mgr.session_start(
         &authn,

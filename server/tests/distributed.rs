@@ -694,7 +694,7 @@ fn ceremony(mgr: &JobManager, seq: u64) -> Ceremony {
         baseboard: mgr.own_baseboard().clone(),
         sush_nonce: SessionSushNonce::compute(client_nonce, mgr.fresh_server_nonce()),
         signer_nonce: SessionSignerNonce::random(),
-        seq: SessionSeq::from_unix_seconds(seq).unwrap(),
+        seq: SessionSeq::from_unix_millis(seq).unwrap(),
     };
     Ceremony {
         session_id: preimage.session_id(),

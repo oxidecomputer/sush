@@ -120,7 +120,7 @@ impl TryFrom<v0::Boundary> for Boundary {
             network: old.network,
             job: old.job.map(|job| Committed {
                 session: job.session,
-                seq: SessionSeq::from_unix_seconds(0).expect("zero is encodable"),
+                seq: SessionSeq::from_unix_millis(0).expect("zero is encodable"),
                 job: job.job,
                 successor: job.successor,
                 outcome: job.outcome,
@@ -382,8 +382,8 @@ mod test {
         serde_json::from_str(&format!("[{seed:?}{}]", ", 0".repeat(15))).unwrap()
     }
 
-    fn seq(seconds: u64) -> SessionSeq {
-        SessionSeq::from_unix_seconds(seconds).unwrap()
+    fn seq(millis: u64) -> SessionSeq {
+        SessionSeq::from_unix_millis(millis).unwrap()
     }
 
     fn boundary() -> Boundary {
@@ -391,7 +391,7 @@ mod test {
             network: network(1),
             job: Some(Committed {
                 session: SessionId::random(),
-                seq: seq(1_760_000_000),
+                seq: seq(1_760_000_000_000),
                 job: JobId::random(),
                 successor: JobId::random(),
                 outcome: JobOutcome::Committed,
@@ -428,7 +428,7 @@ mod test {
             network: network(1),
             job: Some(Committed {
                 session: "abandon-ability".parse().unwrap(),
-                seq: seq(1_760_000_000),
+                seq: seq(1_760_000_000_000),
                 job: "zoo-zero".parse().unwrap(),
                 successor: "able-about".parse().unwrap(),
                 outcome: JobOutcome::Committed,

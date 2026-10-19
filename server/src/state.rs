@@ -1727,18 +1727,18 @@ mod test {
         Past::new(Version::new(), committed)
     }
 
-    fn seq(seconds: u64) -> SessionSeq {
-        SessionSeq::from_unix_seconds(seconds).unwrap()
+    fn seq(millis: u64) -> SessionSeq {
+        SessionSeq::from_unix_millis(millis).unwrap()
     }
 
-    /// A preimage for a fresh session authorized at `seconds`; tests
+    /// A preimage for a fresh session authorized at `millis`; tests
     /// reference the session by the derived id.
-    fn preimage(seconds: u64) -> SessionPreimage {
+    fn preimage(millis: u64) -> SessionPreimage {
         SessionPreimage {
             baseboard: baseboard(),
             sush_nonce: SessionSushNonce::random(),
             signer_nonce: SessionSignerNonce::random(),
-            seq: seq(seconds),
+            seq: seq(millis),
         }
     }
 

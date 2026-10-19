@@ -263,7 +263,7 @@ pub fn session_ceremony(mgr: &JobManager, seq: u64) -> SessionCeremony {
         baseboard: mgr.own_baseboard().clone(),
         sush_nonce,
         signer_nonce: SessionSignerNonce::random(),
-        seq: SessionSeq::from_unix_seconds(seq).unwrap(),
+        seq: SessionSeq::from_unix_millis(seq).unwrap(),
     };
     SessionCeremony {
         session_id: preimage.session_id(),
@@ -287,7 +287,7 @@ pub async fn http_session_ceremony(
         baseboard: test_baseboard_id(),
         sush_nonce: SessionSushNonce::compute(client_nonce, server_nonce),
         signer_nonce: SessionSignerNonce::random(),
-        seq: SessionSeq::from_unix_seconds(seq).unwrap(),
+        seq: SessionSeq::from_unix_millis(seq).unwrap(),
     };
     (
         preimage.session_id(),
