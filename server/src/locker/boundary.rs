@@ -365,6 +365,8 @@ mod test {
     use slog::Discard;
     use tempfile::TempDir;
 
+    use sush_common::jobs::BaseboardId;
+
     /// Two M.2 slots.
     fn slots(dir: &TempDir) -> Vec<Utf8PathBuf> {
         ["m2a", "m2b"]
@@ -381,8 +383,16 @@ mod test {
         Logger::root(Discard, o!())
     }
 
+    fn locker(slots: Vec<Utf8PathBuf>) -> Locker {
+        let baseboard = BaseboardId {
+            part_number: "913".to_string(),
+            serial_number: "test".to_string(),
+        };
+        Locker::new(&test_log(), baseboard, slots).unwrap()
+    }
+
     async fn store(slots: Vec<Utf8PathBuf>) -> BoundaryStore {
-        let store = BoundaryStore::new(&test_log(), &Locker::new(&test_log(), slots).unwrap());
+        let store = BoundaryStore::new(&test_log(), &locker(slots));
         store.load().await;
         store
     }
@@ -469,7 +479,7 @@ mod test {
         struct Envelope(u16, #[serde(with = "crate::format::cbor_bytes")] Vec<u8>);
         let mut bytes = Vec::new();
         into_cbor(&Envelope(2, b"from the future".to_vec()), &mut bytes).unwrap();
-        let scratch = Locker::new(&test_log(), slots.clone()).unwrap();
+        let scratch = locker(slots.clone());
         scratch.tenant(BOUNDARY).store(&bytes).await.unwrap();
         drop(scratch);
 
@@ -574,11 +584,11 @@ mod test {
     async fn undecodable_record_is_untrusted() {
         let dir = TempDir::with_prefix("sush-boundary-").unwrap();
         let slots = slots(&dir);
-        let scratch = Locker::new(&test_log(), slots.clone()).unwrap();
+        let scratch = locker(slots.clone());
         scratch.tenant(BOUNDARY).store(b"scribble").await.unwrap();
         drop(scratch);
 
-        let store = BoundaryStore::new(&test_log(), &Locker::new(&test_log(), slots).unwrap());
+        let store = BoundaryStore::new(&test_log(), &locker(slots));
         store.load().await;
         assert!(store.untrusted());
     }
@@ -586,8 +596,7 @@ mod test {
     #[tokio::test]
     async fn unloaded_is_untrusted() {
         let dir = TempDir::with_prefix("sush-boundary-").unwrap();
-        let store =
-            BoundaryStore::new(&test_log(), &Locker::new(&test_log(), slots(&dir)).unwrap());
+        let store = BoundaryStore::new(&test_log(), &locker(slots(&dir)));
         assert!(store.untrusted());
         assert!(matches!(
             store.advance(&boundary()).await,

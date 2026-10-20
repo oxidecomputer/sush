@@ -41,9 +41,9 @@ use tokio_util::sync::CancellationToken;
 
 use rumors::link::routed::Endpoint;
 
-use crate::bookmark::{BookmarkSource, SushBookmark};
 use crate::link::{AttestedBaseboards, CorpusSource, SprocketsDial, SprocketsLink, Transport};
 use crate::locker::Locker;
+use crate::locker::bookmark::{BookmarkSource, SushBookmark};
 
 /// The attested baseboards of our live gossip peers.
 #[derive(Clone, Debug)]

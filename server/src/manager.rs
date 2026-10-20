@@ -39,12 +39,12 @@ use sush_common::keys::{KeyError, KeyId, SshPublicKey};
 use sush_common::targets::{Cubbies, SledHealth, SledVersion};
 use sush_common::version::LONG_VERSION;
 
-use crate::boundary::BoundaryStore;
 use crate::error::JobError;
 use crate::executor::PathIsolation;
 use crate::gossip::LinkedBaseboards;
 use crate::job::SocketSender;
 use crate::locker::Locker;
+use crate::locker::boundary::BoundaryStore;
 use crate::messages::v0::{IdentityRequest, JobRequest, Request, SessionRequest};
 use crate::output::{JobOutputDir, JobOutputFileStream};
 use crate::state::{GossipUniverse, State, StateManager};

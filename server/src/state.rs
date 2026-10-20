@@ -30,8 +30,6 @@ use sush_common::keys::{KeyError, KeyId};
 use sush_common::targets::Cubbies;
 use sush_common::version::VersionInfo;
 
-use crate::bookmark::SushBookmark;
-use crate::boundary::{Boundary, BoundaryStore, Committed, JobOutcome};
 use crate::certs::Certificates;
 use crate::executor::{Executor, PathIsolation};
 use crate::gossip::{Seed, Universe};
@@ -39,6 +37,8 @@ use crate::history::JobHistory;
 use crate::identities::Identities;
 use crate::job::SocketSender;
 use crate::locker::Locker;
+use crate::locker::bookmark::SushBookmark;
+use crate::locker::boundary::{Boundary, BoundaryStore, Committed, JobOutcome};
 use crate::messages::v0::{Event, JobEvent, JobRequest, Message, Request, SessionRequest};
 use crate::messages::{VersionedMessage, VersionedMessage::*};
 use crate::output::JobOutputDir;

@@ -2,45 +2,53 @@
 // License, v. 2.0. If a copy of the MPL was not distributed with this
 // file, You can obtain one at https://mozilla.org/MPL/2.0/.
 
-//! Durable per-sled state that is never stale.
+//! Durable per-sled state that must not mistake old records for new.
 //!
-//! A [`Locker`] spans the boot M.2s. Each M.2 contributes one *slot*
-//! directory, and each [`Tenant`] owns one file in every slot. A store
-//! writes every slot and returns `Ok` only when all of them hold the
-//! new record. A load applies the pair rules:
+//! A [`Locker`] spans the M.2 drives. Each M.2 contributes one
+//! *slot* directory, and each [`Tenant`] owns one *record*,
+//! stored as one file in every slot:
 //!
-//! | slot A        | slot B                  | verdict                  |
-//! |---------------|-------------------------|--------------------------|
-//! | record R      | record R                | adopt R                  |
-//! | record R      | missing                 | restore R (an M.2 swap)  |
-//! | missing       | missing                 | fresh                    |
-//! | R, nonce N, n | S ≠ R, nonce N, seq > n | adopt S (a torn write)   |
-//! | record R      | record S ≠ R            | discard                  |
-//! | corrupt       | anything                | discard                  |
-//! | I/O error     | anything                | discard                  |
+//! ```text
+//! baseboard                the sled's identity
+//! └── Locker               state storage handle
+//!     ├── Tenant           record x
+//!     │   ├── slot (M.2 A)   m2a/x = (envelope, record)
+//!     │   └── slot (M.2 B)   m2b/x = (envelope, record)
+//!     └── Tenant           record y
+//!         ├── slot (M.2 A)   m2a/y = (envelope, record)
+//!         └── slot (M.2 B)   m2b/y = (envelope, record)
+//! ```
 //!
-//! Every write carries a nonce drawn once per [`Locker`]. Slots that
-//! disagree under one nonce were torn by a single process, so the
-//! higher sequence number is that process's newest write, and a
-//! newer-than-acknowledged record is safe to adopt: a store that
-//! never returned had no effects.
+//! The basic operations on tenants are load and store.
+//! A store writes every slot and returns `Ok` only when all
+//! of them have the new record. A load applies the pair rules
+//! to obtain a [`Verdict`]:
 //!
-//! Discarding is a verdict, not an error, since each tenant decides
-//! what starting over means.
+//! | slot A        | slot B                  | verdict   |
+//! |---------------|-------------------------|-----------|
+//! | record R      | record R                | adopt R   |
+//! | record R      | missing                 | restore R |
+//! | missing       | missing                 | empty     |
+//! | R, nonce N, n | S ≠ R, nonce N, seq > n | adopt S   |
+//! | record R      | record S ≠ R            | discard   |
+//! | foreign sled  | anything                | discard   |
+//! | corrupt       | anything                | discard   |
+//! | I/O error     | anything                | discard   |
+//!
+//! Each slot file holds a record preceded by an `Envelope`,
+//! which includes a random per-locker nonce, a sequence
+//! number, and the baseboard ID of the sled that wrote it.
+//! Envelopes are also versioned to let the format evolve.
 //!
 //! A locker holds an advisory lock on every slot until it and all
 //! of its tenants drop. A locker in another process trying to claim
 //! any of the same slots fails instead of clobbering records.
 //!
-//! The locks are fcntl record locks. A flock would be inherited by
-//! a child forked to run a job and held until it execs; an fcntl
-//! lock belongs to the process, and no child holds one. The kernel
-//! grants a process locks it already holds, so a single process
-//! must only ever construct one locker over a slot; nothing
-//! enforces this.
-//!
-//! All of this is necessary to ensure the basic constraint that
-//! **we must never adopt stale data**.
+//! Current tenants are the execution [`boundary`] and the rumors
+//! [`bookmark`].
+
+pub mod bookmark;
+pub mod boundary;
 
 use std::collections::BTreeSet;
 use std::fs::{File, Permissions};
@@ -49,6 +57,7 @@ use std::os::unix::fs::PermissionsExt as _;
 use std::sync::{Arc, Mutex as SyncMutex};
 
 use atomicwrites::{AtomicFile, OverwriteBehavior};
+use bytes::{Buf as _, BufMut as _, Bytes, BytesMut};
 use camino::Utf8PathBuf;
 use futures::TryFutureExt as _;
 use rustix::fs::{FlockOperation, fcntl_lock};
@@ -60,19 +69,125 @@ use tokio::task::spawn_blocking;
 
 use sush_common::authn::Nonce;
 use sush_common::hash::Hasher;
+use sush_common::jobs::BaseboardId;
+
+use crate::format::{NoFormat, Versioned, Wire};
 
 const LOCK_FILE: &str = "lock";
 const MAGIC_LEN: usize = 12;
 const NONCE_LEN: usize = 32;
-const SEQ_LEN: usize = 8;
 const DIGEST_LEN: usize = 32;
 
-fn digest(nonce: &[u8; NONCE_LEN], seq: u64, record: &[u8]) -> [u8; DIGEST_LEN] {
-    let mut hasher = Hasher::new();
-    hasher.update(nonce);
-    hasher.update(&seq.to_be_bytes());
-    hasher.update(record);
-    *hasher.finalize().as_bytes()
+#[derive(Clone)]
+struct Envelope {
+    nonce: Nonce,
+    seq: u64,
+    baseboard: BaseboardId,
+    record: Vec<u8>,
+}
+
+/// See [`crate::format`] for instructions on adding this version's
+/// successor, following the usual conventions for infallible (wire)
+/// conversions. (An unversioned, pre-release version 0 existed; its
+/// records read as corrupt and discard.)
+impl Versioned for Envelope {
+    const VERSION: u16 = 1;
+}
+
+impl Wire for Envelope {
+    type Previous = NoFormat;
+}
+
+impl From<NoFormat> for Envelope {
+    fn from(none: NoFormat) -> Self {
+        match none {}
+    }
+}
+
+impl Envelope {
+    /// Append one length-prefixed envelope field, truncated to the
+    /// prefix's 16-bit width.
+    fn put(bytes: &mut BytesMut, field: &[u8]) {
+        let field = &field[..field.len().min(usize::from(u16::MAX))];
+        bytes.put_u16(field.len() as u16);
+        bytes.put_slice(field);
+    }
+
+    /// Split off one length-prefixed envelope field.
+    fn take<'a>(bytes: &mut &'a [u8]) -> Option<&'a [u8]> {
+        let len = usize::from(bytes.try_get_u16().ok()?);
+        let (field, rest) = bytes.split_at_checked(len)?;
+        *bytes = rest;
+        Some(field)
+    }
+
+    /// Hash the envelope bytes before the digest field,
+    /// then the record after it.
+    fn digest(prefix: &[u8], record: &[u8]) -> [u8; DIGEST_LEN] {
+        let mut hasher = Hasher::new();
+        hasher.update_with_len(prefix);
+        hasher.update_with_len(record);
+        *hasher.finalize().as_bytes()
+    }
+
+    fn encode(
+        magic: &[u8; MAGIC_LEN],
+        nonce: &Nonce,
+        seq: u64,
+        baseboard: &BaseboardId,
+        record: &[u8],
+    ) -> Bytes {
+        let nonce = nonce.to_be_bytes();
+        let seq = seq.to_be_bytes();
+        let fields: [&[u8]; 4] = [
+            &nonce,
+            &seq,
+            baseboard.part_number.as_bytes(),
+            baseboard.serial_number.as_bytes(),
+        ];
+        let prefixed = fields.iter().map(|f| size_of::<u16>() + f.len());
+        let mut bytes = BytesMut::with_capacity(
+            MAGIC_LEN
+                + size_of::<u16>()
+                + prefixed.sum::<usize>()
+                + size_of::<u16>()
+                + DIGEST_LEN
+                + record.len(),
+        );
+        bytes.put_slice(magic);
+        bytes.put_u16(Self::VERSION);
+        for field in fields {
+            Self::put(&mut bytes, field);
+        }
+        let digest = Self::digest(&bytes, record);
+        Self::put(&mut bytes, &digest);
+        bytes.put_slice(record);
+        bytes.freeze()
+    }
+
+    fn decode(magic: &[u8; MAGIC_LEN], bytes: &[u8]) -> Option<Self> {
+        let mut rest = bytes.strip_prefix(magic.as_slice())?;
+        if rest.try_get_u16().ok()? != Self::VERSION {
+            return None;
+        }
+        let nonce: [u8; NONCE_LEN] = Self::take(&mut rest)?.try_into().ok()?;
+        let seq = u64::from_be_bytes(Self::take(&mut rest)?.try_into().ok()?);
+        let part = Self::take(&mut rest)?;
+        let serial = Self::take(&mut rest)?;
+        let prefix = &bytes[..bytes.len() - rest.len()];
+        let digest: [u8; DIGEST_LEN] = Self::take(&mut rest)?.try_into().ok()?;
+        let record = rest;
+        let baseboard = BaseboardId {
+            part_number: String::from_utf8(part.to_vec()).ok()?,
+            serial_number: String::from_utf8(serial.to_vec()).ok()?,
+        };
+        (Self::digest(prefix, record) == digest).then(|| Self {
+            nonce: Nonce::from_be_bytes(nonce),
+            seq,
+            baseboard,
+            record: record.to_vec(),
+        })
+    }
 }
 
 /// A file name and an envelope magic.
@@ -99,6 +214,11 @@ pub enum Verdict {
 pub enum Discard {
     #[error("the slots disagree")]
     Disagree,
+    #[error("`{path}` was written by sled {baseboard}")]
+    Foreign {
+        path: Utf8PathBuf,
+        baseboard: BaseboardId,
+    },
     #[error("`{path}` is corrupt")]
     Corrupt { path: Utf8PathBuf },
     #[error("reading `{path}` failed: {error}")]
@@ -161,6 +281,9 @@ pub enum StoreError {
 pub struct Locker {
     log: Logger,
     slots: Arc<Vec<Utf8PathBuf>>,
+    /// Stamped on every envelope, and checked on every load; see the
+    /// foreign sled rule in the module doc.
+    baseboard: BaseboardId,
     /// Stamped on every envelope this process writes; see the torn
     /// write rule in the module doc.
     nonce: Nonce,
@@ -174,10 +297,14 @@ pub struct Locker {
 }
 
 impl Locker {
-    /// A locker spans `slots`. Empty means nothing persists
-    /// (the standalone server, tests). Fails when another locker
-    /// holds any of the slots.
-    pub fn new(log: &Logger, slots: Vec<Utf8PathBuf>) -> Result<Self, Locked> {
+    /// A locker spans `slots` and binds every record to `baseboard`.
+    /// Empty slots mean nothing persists (the standalone server,
+    /// tests). Fails when another locker holds any of the slots.
+    pub fn new(
+        log: &Logger,
+        baseboard: BaseboardId,
+        slots: Vec<Utf8PathBuf>,
+    ) -> Result<Self, Locked> {
         let log = log.new(o!("component" => "locker"));
         let mut locks = Vec::with_capacity(slots.len());
         for slot in &slots {
@@ -188,6 +315,7 @@ impl Locker {
         Ok(Self {
             log,
             slots: Arc::new(slots),
+            baseboard,
             nonce: Nonce::random(),
             claimed: Arc::new(SyncMutex::new(BTreeSet::from([LOCK_FILE]))),
             locks: Arc::new(locks),
@@ -196,7 +324,11 @@ impl Locker {
 
     /// A locker that loads and persists nothing.
     pub fn null() -> Self {
-        Self::new(&Logger::root(slog::Discard, o!()), Vec::new())
+        let fake = BaseboardId {
+            part_number: String::new(),
+            serial_number: String::new(),
+        };
+        Self::new(&Logger::root(slog::Discard, o!()), fake, Vec::new())
             .expect("a locker without slots takes no locks")
     }
 
@@ -212,6 +344,7 @@ impl Locker {
             log: self.log.new(o!("tenant" => spec.file)),
             spec,
             paths: self.slots.iter().map(|slot| slot.join(spec.file)).collect(),
+            baseboard: self.baseboard.clone(),
             nonce: self.nonce.clone(),
             reserved: Mutex::new(0),
             committed: Arc::new(SyncMutex::new(0)),
@@ -239,6 +372,7 @@ pub struct Tenant {
     log: Logger,
     spec: TenantSpec,
     paths: Vec<Utf8PathBuf>,
+    baseboard: BaseboardId,
     nonce: Nonce,
     /// The newest sequence number reserved or observed by this process.
     reserved: Mutex<u64>,
@@ -250,8 +384,6 @@ pub struct Tenant {
 }
 
 impl Tenant {
-    /// Serialize loads and stores. Admission checks belong under the
-    /// guard.
     pub async fn lock(&self) -> Guard<'_> {
         Guard {
             tenant: self,
@@ -267,26 +399,8 @@ impl Tenant {
         self.lock().await.store(record).await
     }
 
-    fn parse(&self, bytes: &[u8]) -> Option<(Nonce, u64, Vec<u8>)> {
-        let payload = bytes.strip_prefix(self.spec.magic.as_slice())?;
-        let (nonce, rest) = payload.split_first_chunk::<NONCE_LEN>()?;
-        let (seq, rest) = rest.split_first_chunk::<SEQ_LEN>()?;
-        let (sum, record) = rest.split_first_chunk::<DIGEST_LEN>()?;
-        let seq = u64::from_be_bytes(*seq);
-        (digest(nonce, seq, record) == *sum)
-            .then(|| (Nonce::from_be_bytes(*nonce), seq, record.to_vec()))
-    }
-
-    fn envelope(&self, seq: u64, record: &[u8]) -> Vec<u8> {
-        let mut bytes =
-            Vec::with_capacity(MAGIC_LEN + NONCE_LEN + SEQ_LEN + DIGEST_LEN + record.len());
-        bytes.extend_from_slice(self.spec.magic);
-        let nonce = self.nonce.to_be_bytes();
-        bytes.extend_from_slice(&nonce);
-        bytes.extend_from_slice(&seq.to_be_bytes());
-        bytes.extend_from_slice(&digest(&nonce, seq, record));
-        bytes.extend_from_slice(record);
-        bytes
+    fn envelope(&self, seq: u64, record: &[u8]) -> Bytes {
+        Envelope::encode(self.spec.magic, &self.nonce, seq, &self.baseboard, record)
     }
 }
 
@@ -302,7 +416,7 @@ impl Guard<'_> {
             return Verdict::Empty;
         }
 
-        let mut found: Vec<(Nonce, u64, Vec<u8>)> = Vec::new();
+        let mut found: Vec<Envelope> = Vec::new();
         for path in &tenant.paths {
             let bytes = match read(path).await {
                 Ok(bytes) => bytes,
@@ -314,8 +428,16 @@ impl Guard<'_> {
                     });
                 }
             };
-            match tenant.parse(&bytes) {
-                Some(parsed) => found.push(parsed),
+            match Envelope::decode(tenant.spec.magic, &bytes) {
+                Some(envelope) => {
+                    if envelope.baseboard != tenant.baseboard {
+                        return self.discard(Discard::Foreign {
+                            path: path.clone(),
+                            baseboard: envelope.baseboard,
+                        });
+                    }
+                    found.push(envelope);
+                }
                 None => return self.discard(Discard::Corrupt { path: path.clone() }),
             }
         }
@@ -323,43 +445,36 @@ impl Guard<'_> {
             return Verdict::Empty;
         }
         let restored = found.len() < tenant.paths.len();
-        if !found.iter().all(|(_, _, record)| *record == found[0].2) {
+        if !found.iter().all(|e| e.record == found[0].record) {
             // Slots torn by one process resolve to its newest write;
             // see the module doc. Anything else is a genuine
             // disagreement.
-            let (nonce, seq, record) = found
+            let Envelope {
+                nonce, seq, record, ..
+            } = found
                 .iter()
-                .max_by_key(|(_, seq, _)| *seq)
+                .max_by_key(|e| e.seq)
                 .cloned()
                 .expect("found is non-empty");
-            let torn = found.iter().all(|(n, ..)| *n == nonce)
-                && found.iter().filter(|(_, s, _)| *s == seq).count() == 1;
+            let torn = found.iter().all(|e| e.nonce == nonce)
+                && found.iter().filter(|e| e.seq == seq).count() == 1;
             if !torn {
                 return self.discard(Discard::Disagree);
             }
             warn!(tenant.log, "adopted the newest write of a torn pair"; "seq" => seq);
-            if seq > *self.reserved {
-                *self.reserved = seq;
-            }
+            *self.reserved = seq.max(*self.reserved);
             if let Err(error) = self.store(&record).await {
                 warn!(tenant.log, "failed to repair the torn pair"; "error" => %error);
             }
             return Verdict::Adopt(record);
         }
 
-        let (_, seq, record) = found.swap_remove(0);
-        let newest = found.iter().fold(seq, |max, (_, seq, _)| max.max(*seq));
+        let Envelope { seq, record, .. } = found.swap_remove(0);
+        let newest = found.iter().fold(seq, |max, e| max.max(e.seq));
+        *self.reserved = newest.max(*self.reserved);
 
-        // A reserved sequence number outranks a re-read of the disk.
-        // Regressing would let a cancelled write's straggler collide
-        // with a fresh reservation.
-        if newest > *self.reserved {
-            *self.reserved = newest;
-        }
         if restored {
             warn!(tenant.log, "restored from a lone slot");
-            // Repair now: the survivor must not stay lone until the
-            // next natural store.
             if let Err(error) = self.store(&record).await {
                 warn!(tenant.log, "failed to repair the lone slot"; "error" => %error);
             }
@@ -455,8 +570,15 @@ mod test {
         Logger::root(slog::Discard, o!())
     }
 
+    fn baseboard() -> BaseboardId {
+        BaseboardId {
+            part_number: "913".to_string(),
+            serial_number: "test".to_string(),
+        }
+    }
+
     fn locker(slots: Vec<Utf8PathBuf>) -> Locker {
-        Locker::new(&test_log(), slots).unwrap()
+        Locker::new(&test_log(), baseboard(), slots).unwrap()
     }
 
     fn files(slots: &[Utf8PathBuf]) -> Vec<Utf8PathBuf> {
@@ -570,23 +692,32 @@ mod test {
         ));
     }
 
-    /// A damaged nonce or sequence number fails the digest rather
-    /// than parsing.
+    /// A damaged envelope field reads as corruption, never as a
+    /// parse of the damaged bytes and never as another sled's record.
     #[tokio::test]
     async fn flipped_envelope_bytes_are_corruption() {
         let dir = TempDir::with_prefix("sush-locker-").unwrap();
         let slots = slots(&dir);
         let tenant = locker(slots.clone()).tenant(SPEC);
         let path = slots[0].join(SPEC.file);
-        for offset in [MAGIC_LEN, MAGIC_LEN + NONCE_LEN] {
+        let seq_field = MAGIC_LEN + 2 + 2 + NONCE_LEN;
+        let part_field = seq_field + 2 + 8;
+        for offset in [
+            MAGIC_LEN,
+            MAGIC_LEN + 2,
+            MAGIC_LEN + 4,
+            seq_field + 2,
+            part_field + 2,
+        ] {
             tenant.store(b"good").await.unwrap();
             let mut bytes = read(&path).unwrap();
             bytes[offset] ^= 0x80;
             write(&path, bytes).unwrap();
-            assert!(matches!(
-                tenant.load().await,
-                Verdict::Discard(Discard::Corrupt { .. })
-            ));
+            let verdict = tenant.load().await;
+            assert!(
+                matches!(verdict, Verdict::Discard(Discard::Corrupt { .. })),
+                "offset {offset}: {verdict:?}",
+            );
         }
     }
 
@@ -696,7 +827,7 @@ mod test {
         const ACQUIRED: i32 = 43;
         const REFUSED: i32 = 44;
         if let Ok(slot) = var(SLOT_VAR) {
-            match Locker::new(&test_log(), vec![slot.into()]) {
+            match Locker::new(&test_log(), baseboard(), vec![slot.into()]) {
                 Ok(_) => exit(ACQUIRED),
                 Err(_) => exit(REFUSED),
             }
@@ -723,6 +854,68 @@ mod test {
 
         drop(tenant);
         assert_eq!(child(&slots[0]), Some(ACQUIRED));
+    }
+
+    /// A record written by another sled discards. A lone one is not
+    /// restored onto the missing slot either.
+    #[tokio::test]
+    async fn foreign_records_discard() {
+        let dir = TempDir::with_prefix("sush-locker-").unwrap();
+        let slots = slots(&dir);
+        let donor = BaseboardId {
+            part_number: "913".to_string(),
+            serial_number: "donor".to_string(),
+        };
+        let tenant = Locker::new(&test_log(), donor.clone(), slots.clone())
+            .unwrap()
+            .tenant(SPEC);
+        tenant.store(b"someone else's").await.unwrap();
+        drop(tenant);
+
+        let tenant = locker(slots.clone()).tenant(SPEC);
+        assert!(matches!(
+            tenant.load().await,
+            Verdict::Discard(Discard::Foreign { baseboard, .. }) if baseboard == donor
+        ));
+        drop(tenant);
+
+        remove(slots[0].join(SPEC.file)).unwrap();
+        let tenant = locker(slots).tenant(SPEC);
+        assert!(matches!(
+            tenant.load().await,
+            Verdict::Discard(Discard::Foreign { .. })
+        ));
+    }
+
+    /// Version 1 envelope bytes, pinned; see [`crate::format`]
+    /// before changing them.
+    #[test]
+    fn pin_envelope_format_v1() {
+        const PINNED: [u8; 109] = [
+            0x53, 0x55, 0x53, 0x48, 0x4c, 0x4f, 0x43, 0x4b, 0x54, 0x45, 0x53, 0x54, 0x00, 0x01,
+            0x00, 0x20, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+            0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x42, 0x42,
+            0x42, 0x42, 0x42, 0x42, 0x42, 0x42, 0x00, 0x08, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+            0x00, 0x07, 0x00, 0x03, 0x39, 0x31, 0x33, 0x00, 0x04, 0x74, 0x65, 0x73, 0x74, 0x00,
+            0x20, 0xc6, 0xbe, 0x19, 0x2f, 0xbf, 0x89, 0x66, 0x72, 0xf3, 0xde, 0xab, 0x73, 0xb5,
+            0xe0, 0xa0, 0x11, 0x58, 0xeb, 0x27, 0x7a, 0x52, 0x15, 0x6b, 0xba, 0x1d, 0x0d, 0xb5,
+            0x0f, 0x42, 0x9b, 0x54, 0x04, 0x70, 0x69, 0x6e, 0x6e, 0x65, 0x64,
+        ];
+        let mut nonce = [0u8; NONCE_LEN];
+        nonce[24..].fill(0x42);
+        let encoded = Envelope::encode(
+            SPEC.magic,
+            &Nonce::from_be_bytes(nonce),
+            7,
+            &baseboard(),
+            b"pinned",
+        );
+        assert_eq!(encoded, PINNED.as_slice());
+
+        let decoded = Envelope::decode(SPEC.magic, &PINNED).unwrap();
+        assert_eq!(decoded.baseboard, baseboard());
+        assert_eq!(decoded.seq, 7);
+        assert_eq!(decoded.record, b"pinned");
     }
 
     /// A null locker persists nothing and never fails.

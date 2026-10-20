@@ -35,9 +35,9 @@ use sush_common::jobs::{
     JobId, JobMode, JobOutputStream, JobStartRequest, ProcessError, VerifiedJob,
 };
 
-use crate::boundary::{Boundary, BoundaryStore};
 use crate::io::JobIo;
 use crate::job::{Job, SocketSender};
+use crate::locker::boundary::{Boundary, BoundaryStore};
 use crate::messages::v0::{Event, JobEvent};
 use crate::output::JobOutputDir;
 use crate::pty::open_pty;
