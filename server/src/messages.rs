@@ -351,8 +351,7 @@ mod wire_format {
                 }
                 Event::Job(JobEvent::Error(..)) => "job-error-event",
                 Event::Job(JobEvent::Skipped(_, _, reason)) => match reason {
-                    SkipReason::BelowFloor => "job-skipped-event",
-                    SkipReason::AlreadyHandled => "already-handled-skip-event",
+                    SkipReason::SessionSuperseded => "job-skipped-event",
                     SkipReason::SessionEnded => "session-ended-skip-event",
                 },
             },
@@ -501,15 +500,7 @@ mod wire_format {
                 Event::Job(JobEvent::Skipped(
                     skip_job,
                     skip_when,
-                    SkipReason::BelowFloor,
-                )),
-            ),
-            Message::Event(
-                baseboard.clone(),
-                Event::Job(JobEvent::Skipped(
-                    skip_job,
-                    skip_when,
-                    SkipReason::AlreadyHandled,
+                    SkipReason::SessionSuperseded,
                 )),
             ),
             Message::Event(

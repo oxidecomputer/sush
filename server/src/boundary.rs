@@ -7,12 +7,11 @@
 //! One record, rewritten before each spawn, carries what this sled
 //! last committed to: the job, its session and that session's
 //! sequence number, the chain position after the job, the universe
-//! they belong to, and the job's ending once it has one. The record
-//! is this sled's execution floor: the signer assigns every session
-//! a sequence number from its wall clock, so sequence numbers order
-//! sessions totally, across restarts and across universes, and no
-//! session at or below the committed sequence number may run jobs
-//! here again.
+//! they belong to, and the job's ending once it has one. The signer
+//! assigns every session a sequence number from its wall clock, so
+//! sequence numbers order sessions totally, across restarts and
+//! across universes: no session at or below the committed one may
+//! run jobs here again.
 //!
 //! After a restart, replayed gossip rebuilds the sessions. When the
 //! committed session activates, the sled resumes its chain at the
@@ -54,10 +53,10 @@ pub const BOUNDARY: TenantSpec = TenantSpec {
 };
 
 /// The execution boundary: what this sled last committed to, and in
-/// which universe. The committed job's sequence number is the sled's
-/// global execution floor: the signer orders sessions totally and
-/// across universes, so every session a previous life could have run
-/// jobs under sits at or below this one stored number.
+/// which universe. The committed session supersedes every session at
+/// or below its sequence number: the signer orders sessions totally
+/// and across universes, so every session a previous life could have
+/// run jobs under sits at or below this one stored number.
 #[derive(Clone, Debug, Deserialize, Serialize)]
 pub struct Boundary {
     pub network: Network,
@@ -93,10 +92,13 @@ pub enum JobOutcome {
     Ended(JobStatus),
 }
 
-/// Version 1 replaced the executed-session join and the burned set
-/// with the committed sequence number. The pinned record snapshots in this
-/// module's tests freeze both versions' bytes; see [`crate::format`]
-/// for the steps a format change requires.
+/// Record version 1 replaces the v0 executed-session join and burned set
+/// with the committed sequence number from the session-v2 protocol.
+/// Don't confuse a "session-v2" (one with a sequence number) with a
+/// boundary record version 2 (which doesn't yet exist).
+///
+/// See [`crate::format`] for instructions on adding this version's
+/// successor.
 impl Versioned for Boundary {
     const VERSION: u16 = 1;
 }
@@ -108,22 +110,29 @@ impl Record for Boundary {
 impl TryFrom<v0::Boundary> for Boundary {
     type Error = &'static str;
 
-    /// A v0 record kept a per-universe join of session-start versions
-    /// instead of a sequence number, and the join yields no sequence
-    /// number, so the committed job converts with a floor of zero:
-    /// the session still resumes, and the floor refuses nothing. The
-    /// zero floor readmits nothing a previous life ran, because every
-    /// v0 record predates sequence numbers and only sessions that
-    /// carry one can start now.
     fn try_from(old: v0::Boundary) -> Result<Self, Self::Error> {
+        let v0::Boundary {
+            network,
+            burned: _,   // dropped with session-v2 protocol
+            executed: _, // also dropped with session-v2
+            job,
+        } = old;
         Ok(Self {
-            network: old.network,
-            job: old.job.map(|job| Committed {
-                session: job.session,
-                seq: SessionSeq::from_unix_millis(0).expect("zero is encodable"),
-                job: job.job,
-                successor: job.successor,
-                outcome: job.outcome,
+            network,
+            job: job.map(|job| {
+                let v0::Committed {
+                    session,
+                    job,
+                    successor,
+                    outcome,
+                } = job;
+                Committed {
+                    session,
+                    seq: SessionSeq::zero(), // any valid session-v2 will supersede this one
+                    job,
+                    successor,
+                    outcome,
+                }
             }),
         })
     }
@@ -404,8 +413,8 @@ mod test {
     }
 
     /// The frozen v0 snapshot decodes and converts: the commitment
-    /// survives with a floor of zero. Nothing can regenerate the
-    /// snapshot; the code that wrote it is gone, and git keeps the
+    /// survives with a sequence number of zero. Nothing can regenerate
+    /// the snapshot; the code that wrote it is gone, and git keeps the
     /// bytes.
     #[test]
     fn v0_record_converts() {

@@ -1619,27 +1619,10 @@
       },
       "SkipReason": {
         "description": "Why a sled will never run a job.",
-        "oneOf": [
-          {
-            "type": "string",
-            "enum": [
-              "session-ended"
-            ]
-          },
-          {
-            "description": "The job's session sits at or below the sled's execution floor, where the sled cannot tell replay from re-run.",
-            "type": "string",
-            "enum": [
-              "below-floor"
-            ]
-          },
-          {
-            "description": "The job's chain position precedes the sled's recorded commitment: a previous life already handled it.",
-            "type": "string",
-            "enum": [
-              "already-handled"
-            ]
-          }
+        "type": "string",
+        "enum": [
+          "session-superseded",
+          "session-ended"
         ]
       },
       "SledHealth": {

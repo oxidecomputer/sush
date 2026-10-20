@@ -161,8 +161,7 @@ enum Admission {
     /// Execute normally.
     Admit,
 
-    /// The session does not pass the execution floor, so skip the
-    /// job.
+    /// Refuse to execute the job because the session has been superseded.
     Refuse,
 
     /// If we cannot trust our boundary record, we must not admit
@@ -188,6 +187,9 @@ pub struct Past {
     /// across restarts.
     committed: Commitment,
 
+    /// The gossip universe this life entered.
+    network: Network,
+
     /// Jobs whose replayed start events say a previous life ran them.
     /// The end of such a job may replay later and remove it from the
     /// set, so which jobs truly lack an end is known only when replay
@@ -206,37 +208,36 @@ pub struct Past {
 }
 
 impl Past {
-    fn new(birth: Version, committed: Commitment) -> Self {
+    fn new(birth: Version, committed: Commitment, network: Network) -> Self {
         Past {
             birth,
             committed,
+            network,
             zombies: BTreeSet::new(),
             reaped: BTreeSet::new(),
             adjudicated: None,
         }
     }
 
-    /// Decide whether the active session may run a job here. The
-    /// signer's sequence numbers order sessions totally and across
-    /// universes, so the floor needs no universe scoping: a session
-    /// at or below the committed sequence number may already have run
-    /// jobs on this sled, and only the committed session itself
-    /// resumes.
+    /// Decide whether the active session may run a job here.
+    /// A committed session may only resume in the network where
+    /// this sled committed to it, and sessions are superseded
+    /// by ones with a higher sequence number.
     fn screen(&self, session: SessionId, seq: SessionSeq, live: bool) -> Admission {
         match &self.committed {
-            // Refuse all jobs if our boundary is untrusted.
             Commitment::Untrusted => Admission::Untrusted,
-
             Commitment::Trusted { boundary } => match &boundary.job {
-                Some(committed) if committed.session == session => Admission::Admit,
-                Some(committed) if seq > committed.seq => Admission::Admit,
+                Some(committed)
+                    if (boundary.network == self.network && committed.session == session)
+                        || seq > committed.seq =>
+                {
+                    Admission::Admit
+                }
                 Some(_) => Admission::Refuse,
                 None if live => Admission::Admit,
                 None => Admission::Refuse,
             },
 
-            // With no record we cannot tell replay from re-run, so
-            // only a session that started as live traffic runs jobs.
             Commitment::Absent if live => Admission::Admit,
             Commitment::Absent => Admission::Refuse,
         }
@@ -427,8 +428,8 @@ impl State {
         network: Option<Network>,
     ) -> Vec<Output> {
         let mut outputs = self.reap_zombies(log, now);
-        if let Some(network) = network {
-            outputs.extend(self.adjudicate_boundary(log, now, network));
+        if network.is_some() {
+            outputs.extend(self.adjudicate_boundary(log, now));
         }
         outputs
     }
@@ -462,12 +463,7 @@ impl State {
     /// other universe never saw the job and hears nothing, and
     /// re-entering the job's own universe replays the earlier ruling
     /// as a status, which stops a second announcement.
-    fn adjudicate_boundary(
-        &mut self,
-        log: &Logger,
-        now: DateTime<Utc>,
-        network: Network,
-    ) -> Vec<Output> {
+    fn adjudicate_boundary(&mut self, log: &Logger, now: DateTime<Utc>) -> Vec<Output> {
         // An absent or untrusted record commits to no job, so there
         // is nothing to rule on.
         let Commitment::Trusted { boundary, .. } = &self.past.committed else {
@@ -476,7 +472,7 @@ impl State {
         let Some(Committed { job, outcome, .. }) = boundary.job.as_ref() else {
             return Vec::new();
         };
-        if boundary.network != network {
+        if boundary.network != self.past.network {
             return Vec::new();
         }
         let (job_id, outcome) = (*job, outcome.clone());
@@ -629,6 +625,7 @@ impl State {
                         info!(log, "session started"; "session_id" => %session_id, "actor" => %actor);
                         let mut session = Session::started(session_id, actor.clone());
                         if let Commitment::Trusted { boundary } = &self.past.committed
+                            && boundary.network == self.past.network
                             && let Some(committed) = boundary
                                 .job
                                 .as_ref()
@@ -1017,7 +1014,7 @@ impl State {
             && queued_jobs.len() >= MAX_QUEUED_JOBS
             && !queued_jobs.contains_key(&job_id)
         {
-            // We have no choice; drop the job on the floor.
+            // We have no choice; discard the job.
             warn!(log, "too many jobs queued"; "job_id" => %job_id, "max" => MAX_QUEUED_JOBS);
         } else {
             // Insert the job into our queue. Every job joins the
@@ -1143,15 +1140,11 @@ impl State {
                         ),
                     ));
                 } else if matches!(admission, Admission::Refuse) {
-                    // Below the floor the queue skips forward in chain
-                    // order. A live job gets the terminal skip status;
-                    // a replayed one is history, and re-reporting it
-                    // on every rejoin would grow the message set.
                     if !replayed {
-                        warn!(log, "skipping job below the execution floor"; "job_id" => %job_id);
+                        warn!(log, "skipping a superseded session's job"; "job_id" => %job_id);
                         outputs.push(Output::job_event(
                             self.rack.own_baseboard(),
-                            JobEvent::Skipped(job_id, now, SkipReason::BelowFloor),
+                            JobEvent::Skipped(job_id, now, SkipReason::SessionSuperseded),
                         ));
                     }
                 } else if self
@@ -1297,7 +1290,11 @@ fn enter_universe(
         )
         .into(),
     );
-    State::new(own_baseboard, anchors, Past::new(birth, committed))
+    State::new(
+        own_baseboard,
+        anchors,
+        Past::new(birth, committed, rumors.network()),
+    )
 }
 
 /// Send a message into the gossip set, returning the version it was
@@ -1377,7 +1374,7 @@ impl StateManager {
         let mut initial_state = State::new(
             own_baseboard.clone(),
             anchors,
-            Past::new(Version::new(), Commitment::Absent),
+            Past::new(Version::new(), Commitment::Absent, initial.network()),
         )?;
         initial_state
             .rack
@@ -1724,7 +1721,7 @@ mod test {
             },
             None => Commitment::Absent,
         };
-        Past::new(Version::new(), committed)
+        Past::new(Version::new(), committed, network(1))
     }
 
     fn seq(millis: u64) -> SessionSeq {
@@ -1795,7 +1792,7 @@ mod test {
     /// An untrusted record admits nothing, live or replayed.
     #[test]
     fn untrusted_admits_nothing() {
-        let past = Past::new(Version::new(), Commitment::Untrusted);
+        let past = Past::new(Version::new(), Commitment::Untrusted, network(1));
         for live in [true, false] {
             assert!(matches!(
                 past.screen(SessionId::random(), seq(1), live),
@@ -1829,9 +1826,12 @@ mod test {
         let log = discard();
         let now = Utc::now();
         let job = JobId::random();
-        let mut state = state(past(Some(committed_boundary(job))));
+        // A sled that entered another universe never saw the job.
+        let mut elsewhere = state(past(Some(committed_boundary(job))));
+        elsewhere.past.network = network(2);
+        assert!(elsewhere.settle(&log, now, Some(network(2))).is_empty());
 
-        assert!(state.settle(&log, now, Some(network(2))).is_empty());
+        let mut state = state(past(Some(committed_boundary(job))));
         let outputs = state.settle(&log, now, Some(network(1)));
         assert_eq!(outputs.len(), 1);
         assert!(interrupted(&outputs[0], job));
@@ -2022,11 +2022,92 @@ mod test {
         assert!(sim.state.session.session().is_none());
     }
 
-    /// A session at or below the committed sequence number is
-    /// refused: its jobs skip below the floor rather than run, and
-    /// the chain still advances so the session is not wedged.
+    /// Sessions must not be resumed across networks.
     #[tokio::test]
-    async fn floor_refuses_through_step() {
+    async fn committed_session_does_not_resume_across_networks() {
+        let mut root = root();
+        let anchors = vec![root.cert().clone()];
+        let actor = root.key_id().clone();
+        let mut sim = Sim::new(&anchors, Vec::new()).await;
+
+        // A previous life, in another network, committed to job A
+        // of the session and recorded the chain position after it.
+        let committed_seq = 5;
+        let committed_preimage = preimage(committed_seq);
+        let session_id = committed_preimage.session_id();
+        let mut signer = Session::new(session_id);
+        let job_a_id = signer.next_job_id();
+        let job_a = signed_job(&mut root, job_a_id, session_id, "true").await;
+        signer.job_started(job_a.clone());
+        let successor_id = signer.next_job_id();
+        let other = network(7);
+        assert_ne!(sim.rumors.network(), other);
+        sim.state.past.committed = Commitment::Trusted {
+            boundary: Box::new(Boundary {
+                network: other,
+                job: Some(Committed {
+                    session: session_id,
+                    seq: committed_preimage.seq,
+                    job: job_a_id,
+                    successor: successor_id,
+                    outcome: JobOutcome::Committed,
+                }),
+            }),
+        };
+
+        // The session's start arrives in this network.
+        sim.request(Request::session(
+            actor.clone(),
+            SessionRequest::Start(committed_preimage),
+        ));
+        assert!(
+            sim.state
+                .session
+                .session()
+                .is_some_and(|s| s.session_id() == session_id)
+        );
+
+        // If the committed job arrives again, it skips as superseded
+        // instead of running.
+        let outputs = sim.request(Request::job(
+            actor.clone(),
+            JobRequest::Start(job_a, JobStartParams::default()),
+        ));
+        assert!(!outputs.iter().any(|o| matches!(o, Output::Run(_))));
+        assert!(outputs.iter().any(|o| matches!(
+            o,
+            Output::Gossip(Message::Event(
+                _,
+                Event::Job(JobEvent::Skipped(id, _, SkipReason::SessionSuperseded)),
+            )) if *id == job_a_id
+        )));
+
+        // That job's successor also does not run.
+        let job_b = signed_job(&mut root, successor_id, session_id, "true").await;
+        let outputs = sim.request(Request::job(
+            actor.clone(),
+            JobRequest::Start(job_b, JobStartParams::default()),
+        ));
+        assert!(!outputs.iter().any(|o| matches!(o, Output::Run(_))));
+
+        // A newer session outranks the committed one and runs.
+        let next = preimage(committed_seq + 1);
+        let next_id = next.session_id();
+        sim.request(Request::session(actor.clone(), SessionRequest::Start(next)));
+        let job_c_id = Session::new(next_id).next_job_id();
+        let job_c = signed_job(&mut root, job_c_id, next_id, "true").await;
+        let outputs = sim.request(Request::job(
+            actor,
+            JobRequest::Start(job_c, JobStartParams::default()),
+        ));
+        assert!(outputs.iter().any(|o| matches!(o, Output::Run(_))));
+    }
+
+    /// A session at or below the committed sequence number is
+    /// refused: its jobs skip as superseded rather than run, and the
+    /// chain still advances so the session is not wedged.
+    #[tokio::test]
+    async fn superseded_session_skips_through_step() {
         let (mut root, mut sim, session_id, mut session) = sim_with_session().await;
         let actor = root.key_id().clone();
 
@@ -2051,7 +2132,7 @@ mod test {
                     o,
                     Output::Gossip(Message::Event(
                         _,
-                        Event::Job(JobEvent::Skipped(id, _, SkipReason::BelowFloor)),
+                        Event::Job(JobEvent::Skipped(id, _, SkipReason::SessionSuperseded)),
                     )) if *id == job_id
                 )
             })

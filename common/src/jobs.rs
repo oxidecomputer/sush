@@ -255,6 +255,10 @@ impl SessionSeq {
     /// = 2527-06-23T06:20:44.415Z.
     pub const MAX_MILLIS: u64 = (1 << 44) - 1;
 
+    pub fn zero() -> Self {
+        Self(Codephrase::from_u64(0))
+    }
+
     /// Make a sequence number from a wall clock reading. Fails
     /// if millis is out of range.
     pub fn from_unix_millis(millis: u64) -> Result<Self, SeqOutOfRange> {
@@ -522,20 +526,14 @@ pub enum JobStatus {
 #[derive(Clone, Copy, Debug, Deserialize, Eq, JsonSchema, PartialEq, Serialize)]
 #[serde(rename_all = "kebab-case")]
 pub enum SkipReason {
-    /// The job's session sits at or below the sled's execution floor,
-    /// where the sled cannot tell replay from re-run.
-    BelowFloor,
-    /// The job's chain position precedes the sled's recorded
-    /// commitment: a previous life already handled it.
-    AlreadyHandled,
+    SessionSuperseded,
     SessionEnded,
 }
 
 impl fmt::Display for SkipReason {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.write_str(match self {
-            Self::BelowFloor => "the session sits below this sled's execution floor",
-            Self::AlreadyHandled => "a previous life of this sled already handled it",
+            Self::SessionSuperseded => "another session has superseded this one",
             Self::SessionEnded => "the session ended before the job could start",
         })
     }

@@ -675,7 +675,7 @@ async fn stragglers_do_not_interrupt_live_jobs() {
 
 /// Wait until `anchor` has applied `joiner`'s build announcement. A
 /// session started on `anchor` afterward causally follows everything
-/// `joiner` held at entry, so it clears the joiner's entry floor.
+/// `joiner` held at entry, so the joiner serves it.
 /// Everything one sled hears at session start: a client nonce, a
 /// signer nonce, the signer's clock reading, and the session id over
 /// them all.
@@ -754,8 +754,8 @@ async fn lost_suffix_never_reruns() {
     let a = Sled::start(&log, &dir, 1, &root_pem, &shutdown).await;
     let authn_a = fake_identity(&mut root).await;
     // Sled B keeps its boundary in a locker. It joins before the
-    // session starts: a record-less sled raises its floor at entry,
-    // and serves only sessions started after it arrived.
+    // session starts: a record-less sled serves only sessions
+    // that started after it arrived.
     let boundary_dir = TempDir::with_prefix("sush-boundary-").unwrap();
     let slot = Utf8PathBuf::from_path_buf(boundary_dir.path().to_path_buf()).unwrap();
     let b_shutdown = CancellationToken::new();
@@ -1076,7 +1076,7 @@ async fn session_resumes_at_stored_successor() {
 
 #[named]
 #[tokio::test]
-async fn seq_floor_crosses_universes() {
+async fn supersession_crosses_universes() {
     let (_tmp, dir) = pki("sush-flipflop-", 3);
     let mut root = common::ephemeral_root();
     let root_pem = dir.join("job-root.pem");
@@ -1229,13 +1229,13 @@ async fn seq_floor_crosses_universes() {
         .job_start(&authn_x, j3, JobStartParams::default())
         .await
         .unwrap();
-    eventually("the floor skips the old session", 120, async || {
+    eventually("the old session is superseded", 120, async || {
         a.mgr.job_status(&authn_a, &j3_id).await.is_ok_and(|map| {
             map.get(&x.baseboard).is_some_and(|s| {
                 matches!(
                     s,
                     JobStatus::Skipped {
-                        reason: SkipReason::BelowFloor,
+                        reason: SkipReason::SessionSuperseded,
                         ..
                     }
                 )
@@ -1281,7 +1281,7 @@ async fn seq_floor_crosses_universes() {
             map.get(&x.baseboard)
                 .is_some_and(|s| matches!(s, JobStatus::Stopped { result: Ok(0), .. }))
         }),
-        "a session started above the floor must serve"
+        "a session above the committed one must serve"
     );
 
     // X flops back to D's universe a second time. The job X served in
@@ -1308,13 +1308,13 @@ async fn seq_floor_crosses_universes() {
         .job_start(&authn_x, j5, JobStartParams::default())
         .await
         .unwrap();
-    eventually("the floor skips session two as well", 120, async || {
+    eventually("session two is superseded as well", 120, async || {
         x.mgr.job_status(&authn_x, &j5_id).await.is_ok_and(|map| {
             map.get(&x.baseboard).is_some_and(|s| {
                 matches!(
                     s,
                     JobStatus::Skipped {
-                        reason: SkipReason::BelowFloor,
+                        reason: SkipReason::SessionSuperseded,
                         ..
                     }
                 )
