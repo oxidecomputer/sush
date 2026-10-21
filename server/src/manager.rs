@@ -588,8 +588,12 @@ impl JobManager {
         job: SignedJob,
         params: JobStartParams,
     ) -> Result<(), JobError> {
-        let job_id = job.job_id().to_owned();
-        let wait = params.wait.to_owned();
+        // A forged job must not take a signed job's place in the chain.
+        self.state
+            .borrow()
+            .certs()
+            .verify(&job)
+            .map_err(JobError::UnverifiedJob)?;
 
         // A job can only run in the session it was signed for.
         let payload = job.payload();
@@ -611,11 +615,13 @@ impl JobManager {
         // job chain. Without this, a caller that resubmits an
         // already-completed job ID and waits would see the *original*
         // job's status returned as if it belonged to this submission.
+        let job_id = job.job_id().to_owned();
         if self.state.borrow().get_job_status(&job_id).is_some() {
             return Err(JobError::DuplicateJobId(job_id));
         }
 
         // Submit the job for execution.
+        let wait = params.wait.to_owned();
         self.job_request(authn, JobRequest::Start(job, params))
             .await?;
         self.wait_for(self.wait_for_job(&job_id, wait)).await

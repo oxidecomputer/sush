@@ -38,7 +38,7 @@ use sush_server::locker::bookmark::BOOKMARK;
 use sush_server::messages::v0::{Event, JobEvent, Message};
 use sush_server::output::JobOutputDir;
 use sush_server::state::GossipUniverse;
-use sush_server::{JobManager, seed_gossip};
+use sush_server::{JobError, JobManager, seed_gossip};
 
 use common::{
     baseboard, corpus, eventually, fake_identity, gossip_config, localhost, pki, sign_job,
@@ -226,6 +226,73 @@ async fn jobs_gossip_between_sleds() {
             .is_some_and(|s| s.session_id() == successor)
     })
     .await;
+
+    shutdown.cancel();
+}
+
+/// The front door refuses a forged job, and the signed job it mimics
+/// still runs.
+#[named]
+#[tokio::test]
+async fn unverified_job_is_refused() {
+    let (_tmp, dir) = pki("sush-unverified-", 1);
+    let mut root = common::ephemeral_root();
+    let root_pem = dir.join("job-root.pem");
+    write(
+        &root_pem,
+        pem_cert_chain(vec![root.cert().to_owned()]).unwrap(),
+    )
+    .unwrap();
+
+    let log = test_logger(function_name!());
+    let shutdown = CancellationToken::new();
+    let a = Sled::start(&log, &dir, 1, &root_pem, &shutdown).await;
+    let authn = fake_identity(&mut root).await;
+    let Ceremony {
+        session_id,
+        client_nonce,
+        signer_nonce,
+        seq,
+    } = ceremony(&a.mgr, 1);
+    a.mgr
+        .session_start(&authn, session_id, client_nonce, signer_nonce, seq, true)
+        .await
+        .unwrap();
+
+    // A job carrying another job's signature is refused and leaves no
+    // trace.
+    let job_id = Session::new(session_id).next_job_id();
+    let job = sign_job(&mut root, job_id, session_id, "true").await;
+    let other = sign_job(&mut root, job_id, session_id, "false").await;
+    let forged = SignedJob::new(
+        job.payload().clone(),
+        job.key_id().clone(),
+        other.signature().clone(),
+    );
+    assert!(matches!(
+        a.mgr
+            .job_start(&authn, forged, JobStartParams::default())
+            .await,
+        Err(JobError::UnverifiedJob(_))
+    ));
+    assert!(a.mgr.job_status(&authn, &job_id).await.is_err());
+
+    // The signed job then runs in its place.
+    a.mgr
+        .job_start(
+            &authn,
+            job,
+            JobStartParams {
+                wait: JobWait::Stop,
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+    assert!(a.mgr.job_status(&authn, &job_id).await.is_ok_and(|map| {
+        map.get(&a.baseboard)
+            .is_some_and(|s| matches!(s, JobStatus::Stopped { result: Ok(0), .. }))
+    }));
 
     shutdown.cancel();
 }

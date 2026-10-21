@@ -24,7 +24,7 @@ use x509_cert::Certificate;
 use sush_api::JobStartParams;
 use sush_common::jobs::{
     Access, JobId, JobStatus, JobStatusMap, LastJob, ProcessError, Session, SessionId, SessionSeq,
-    SignedJob, SkipReason, VerifiedJob,
+    SkipReason, VerifiedJob,
 };
 use sush_common::keys::{KeyError, KeyId};
 use sush_common::targets::Cubbies;
@@ -60,7 +60,7 @@ pub const MAX_QUEUED_JOBS: usize = 1_000;
 /// but never execute here.
 #[derive(Clone, Debug)]
 pub struct QueuedJob {
-    pub job: SignedJob,
+    pub job: VerifiedJob,
     pub params: JobStartParams,
     pub replayed: bool,
 }
@@ -727,6 +727,19 @@ impl State {
         let mut outputs = Vec::new();
         match request {
             JobRequest::Start(signed, params) => {
+                let job = match self.certs.verify(signed) {
+                    Ok(job) => job,
+                    Err(error) => {
+                        warn!(
+                            log, "refusing unverified job";
+                            "job_id" => %signed.job_id(),
+                            "actor" => %actor,
+                            "error" => %error,
+                        );
+                        return outputs;
+                    }
+                };
+
                 // The session must be active and must match the
                 // submitted job. It is safe to refuse all other jobs.
                 // By cases:
@@ -754,7 +767,7 @@ impl State {
                     .session()
                     .is_some_and(|s| s.session_id() == session_id)
                 {
-                    self.enqueue_job(log, now, signed.clone(), params.clone(), actor, !live);
+                    self.enqueue_job(log, now, job, params.clone(), actor, !live);
                     outputs.extend(self.release_ready_jobs(log, now, network));
                 } else {
                     let job_id = *signed.job_id();
@@ -946,7 +959,7 @@ impl State {
         &mut self,
         log: &Logger,
         now: DateTime<Utc>,
-        job: SignedJob,
+        job: VerifiedJob,
         params: JobStartParams,
         actor: &KeyId,
         replayed: bool,
@@ -1052,7 +1065,7 @@ impl State {
         let Some(network) = network else {
             let mut n = 0;
             while let Some(queued) = queued_jobs.remove(&session.next_job_id()) {
-                session.job_started(queued.job);
+                session.job_started(queued.job.into_signed());
                 n += 1;
             }
             if n > 0 {
@@ -1094,21 +1107,16 @@ impl State {
                     })
                     .unwrap_or(true)
                 {
-                    let checked = self
-                        .certs
-                        .verify(&request)
-                        .map_err(|error| ProcessError::InvalidJob(error.to_string()))
-                        .and_then(|job| Executor::check_command(job.payload()).map(|()| job));
-                    match checked {
+                    match Executor::check_command(request.payload()) {
                         Err(error) => outputs.push(Output::job_event(
                             self.rack.own_baseboard(),
                             JobEvent::Error(job_id, now, error),
                         )),
-                        Ok(job) => {
+                        Ok(()) => {
                             let (attachment, rx_attachment) = watch::channel(None);
                             self.attachments.insert(job_id, rx_attachment);
                             outputs.push(Output::Run(Box::new(Run {
-                                job,
+                                job: request.clone(),
                                 params,
                                 attachment,
                                 boundary: self.past.commit_to(
@@ -1118,14 +1126,14 @@ impl State {
                                     job_id,
                                     session
                                         .session_id()
-                                        .next_job_id(&LastJob::Some(request.clone())),
+                                        .next_job_id(&LastJob::Some((*request).clone())),
                                 ),
                             })));
                         }
                     }
                 }
             }
-            session.job_started(request);
+            session.job_started(request.into_signed());
         }
         outputs
     }
@@ -1558,7 +1566,7 @@ mod test {
 
     use sush_common::jobs::{
         JobMode, JobOutputState, JobStartRequest, SessionPreimage, SessionSignerNonce,
-        SessionSushNonce,
+        SessionSushNonce, SignedJob,
     };
     use sush_common::keys::{EphemeralKey, KeyType, Signer as _};
     use sush_common::targets::Target;
@@ -1932,6 +1940,40 @@ mod test {
 
         sim.request(Request::session(actor, SessionRequest::Stop(session_id)));
         assert!(sim.state.session.session().is_none());
+    }
+
+    /// A forged job never joins the queue. The chain and the history
+    /// stay untouched, and the signed job it mimics runs in its place.
+    #[tokio::test]
+    async fn unverified_job_does_not_advance_the_chain() {
+        let (mut root, mut sim, session_id, session) = sim_with_session().await;
+        let actor = root.key_id().clone();
+
+        let job_id = session.next_job_id();
+        let signed = signed_job(&mut root, job_id, session_id, "true").await;
+        let other = signed_job(&mut root, job_id, session_id, "false").await;
+        let forged = SignedJob::new(
+            signed.payload().clone(),
+            signed.key_id().clone(),
+            other.signature().clone(),
+        );
+        let outputs = sim.request(Request::job(
+            actor.clone(),
+            JobRequest::Start(forged, JobStartParams::default()),
+        ));
+        assert!(outputs.is_empty());
+        assert_eq!(sim.state.session.session().unwrap().next_job_id(), job_id);
+        assert!(!sim.state.history.contains(&job_id));
+
+        let outputs = sim.request(Request::job(
+            actor,
+            JobRequest::Start(signed, JobStartParams::default()),
+        ));
+        assert!(
+            outputs
+                .iter()
+                .any(|o| matches!(o, Output::Run(run) if *run.job.payload().job_id() == job_id))
+        );
     }
 
     /// Sessions must not be resumed across networks.
