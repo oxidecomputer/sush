@@ -41,8 +41,12 @@
 //! Envelopes are also versioned to let the format evolve.
 //!
 //! A locker holds an advisory lock on every slot until it and all
-//! of its tenants drop. A locker in another process trying to claim
-//! any of the same slots fails instead of clobbering records.
+//! of its tenants drop, so a locker in another process that tries
+//! to claim any of the same slots will fail. If a slot directory
+//! is removed, it will be *healed* by recreating it (with lock file)
+//! through a handle taken at startup on the slot's parent directory
+//! (so that we don't accidentally recreate the slot directory on
+//! the wrong filesystem).
 //!
 //! Current tenants are the execution [`boundary`] and the rumors
 //! [`bookmark`].
@@ -50,7 +54,6 @@
 pub mod bookmark;
 pub mod boundary;
 
-use std::collections::BTreeSet;
 use std::fs::{File, Permissions};
 use std::io::{self, Write as _};
 use std::os::unix::fs::PermissionsExt as _;
@@ -60,7 +63,8 @@ use atomicwrites::{AtomicFile, OverwriteBehavior};
 use bytes::{Buf as _, BufMut as _, Bytes, BytesMut};
 use camino::Utf8PathBuf;
 use futures::TryFutureExt as _;
-use rustix::fs::{FlockOperation, fcntl_lock};
+use rustix::fs::{FlockOperation, Mode, fcntl_lock, mkdirat};
+use rustix::io::Errno;
 use slog::{Logger, o, warn};
 use thiserror::Error;
 use tokio::fs::{read, remove_file, write};
@@ -190,7 +194,8 @@ impl Envelope {
     }
 }
 
-/// A file name and an envelope magic.
+/// A file name and an envelope magic. The name `lock` is reserved
+/// for the slot lock file.
 #[derive(Clone, Copy, Debug)]
 pub struct TenantSpec {
     pub file: &'static str,
@@ -238,23 +243,111 @@ pub struct Locked {
     error: io::Error,
 }
 
-/// Take the slot lock at `path`, or `Ok(None)` when the lock file
-/// cannot be created. The kernel holds the lock until the file
-/// closes.
-fn claim(log: &Logger, path: Utf8PathBuf) -> Result<Option<File>, Locked> {
-    let file = match File::create(&path) {
-        Ok(file) => file,
-        Err(error) => {
-            warn!(log, "cannot create slot lock file"; "path" => %path, "error" => %error);
-            return Ok(None);
+/// An advisory slot lock, held until the file closes.
+#[derive(Debug)]
+struct LockFile {
+    _file: File,
+}
+
+impl LockFile {
+    /// Take the lock at `path`. If the lock file cannot be
+    /// created, log why and return `Ok(None)`; the slot is
+    /// broken.
+    fn take(log: &Logger, path: &Utf8PathBuf) -> Result<Option<Self>, Locked> {
+        let file = match File::create(path) {
+            Ok(file) => file,
+            Err(error) => {
+                warn!(log, "cannot create slot lock file"; "path" => %path, "error" => %error);
+                return Ok(None);
+            }
+        };
+        match fcntl_lock(&file, FlockOperation::NonBlockingLockExclusive) {
+            Ok(()) => Ok(Some(Self { _file: file })),
+            Err(errno) => Err(Locked {
+                path: path.clone(),
+                error: errno.into(),
+            }),
         }
-    };
-    match fcntl_lock(&file, FlockOperation::NonBlockingLockExclusive) {
-        Ok(()) => Ok(Some(file)),
-        Err(errno) => Err(Locked {
-            path,
-            error: errno.into(),
-        }),
+    }
+}
+
+/// One slot directory and this locker's claim on it.
+#[derive(Debug)]
+struct Slot {
+    path: Utf8PathBuf,
+    state: SlotState,
+}
+
+#[derive(Debug)]
+enum SlotState {
+    /// The slot could not be claimed at startup, usually because its
+    /// directory was missing. A broken slot is only ever read; it is
+    /// never written and can never heal.
+    Broken,
+
+    /// The slot is locked and healable. We serialize writes so that
+    /// concurrent heals can't race and accidentally drop the lock.
+    Claimed {
+        parent: File,
+        lock: SyncMutex<LockFile>,
+    },
+}
+
+impl Slot {
+    /// Try to lock the slot and obtain a handle to its parent.
+    fn claim(log: &Logger, path: Utf8PathBuf) -> Result<Self, Locked> {
+        let state = match LockFile::take(log, &path.join(LOCK_FILE))? {
+            Some(lock) => match path.parent().map(File::open) {
+                Some(Ok(parent)) => SlotState::Claimed {
+                    parent,
+                    lock: SyncMutex::new(lock),
+                },
+                Some(Err(error)) => {
+                    warn!(log, "cannot open the slot's parent"; "slot" => %path, "error" => %error);
+                    SlotState::Broken
+                }
+                None => {
+                    warn!(log, "the slot path has no parent"; "slot" => %path);
+                    SlotState::Broken
+                }
+            },
+            None => SlotState::Broken,
+        };
+        Ok(Self { path, state })
+    }
+
+    /// Write `envelope` to `path` inside this slot. If the write
+    /// fails because the directory is gone, recreate it and retry.
+    fn write(&self, log: &Logger, path: &Utf8PathBuf, envelope: &[u8]) -> io::Result<()> {
+        let SlotState::Claimed { parent, lock } = &self.state else {
+            return Err(io::Error::other("broken slot"));
+        };
+        let mut held = lock.lock().unwrap();
+        match write_envelope(path, envelope) {
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {
+                self.heal(parent, &mut held, log)?;
+                write_envelope(path, envelope)
+            }
+            result => result,
+        }
+    }
+
+    /// Recreate this slot's wiped directory and its lock.
+    /// Fail if another process claims the fresh slot first.
+    fn heal(&self, parent: &File, lock: &mut LockFile, log: &Logger) -> io::Result<()> {
+        let name = self
+            .path
+            .file_name()
+            .ok_or_else(|| io::Error::other("slot path has no final component"))?;
+        match mkdirat(parent, name, Mode::from_raw_mode(0o700)) {
+            Ok(()) | Err(Errno::EXIST) => {}
+            Err(errno) => return Err(errno.into()),
+        }
+        *lock = LockFile::take(log, &self.path.join(LOCK_FILE))
+            .map_err(io::Error::other)?
+            .ok_or_else(|| io::Error::other("cannot create the slot lock file"))?;
+        warn!(log, "healed a wiped slot"; "slot" => %self.path);
+        Ok(())
     }
 }
 
@@ -280,45 +373,30 @@ pub enum StoreError {
 #[derive(Clone, Debug)]
 pub struct Locker {
     log: Logger,
-    slots: Arc<Vec<Utf8PathBuf>>,
-    /// Stamped on every envelope, and checked on every load; see the
-    /// foreign sled rule in the module doc.
     baseboard: BaseboardId,
-    /// Stamped on every envelope this process writes; see the torn
-    /// write rule in the module doc.
     nonce: Nonce,
-    /// Files already claimed by a tenant. A second tenant over one
-    /// file would have its own sequence state, silently defeating
-    /// the straggler guard.
-    claimed: Arc<SyncMutex<BTreeSet<&'static str>>>,
-    /// Advisory locks held by this locker for as long as it lives.
-    /// Every non-broken slot gets a lock.
-    locks: Arc<Vec<File>>,
+    slots: Arc<Vec<Slot>>,
 }
 
 impl Locker {
     /// A locker spans `slots` and binds every record to `baseboard`.
     /// Empty slots mean nothing persists (the standalone server,
-    /// tests). Fails when another locker holds any of the slots.
+    /// tests). Fails if another locker has claimed any of the slots.
     pub fn new(
         log: &Logger,
         baseboard: BaseboardId,
         slots: Vec<Utf8PathBuf>,
     ) -> Result<Self, Locked> {
         let log = log.new(o!("component" => "locker"));
-        let mut locks = Vec::with_capacity(slots.len());
-        for slot in &slots {
-            if let Some(lock) = claim(&log, slot.join(LOCK_FILE))? {
-                locks.push(lock);
-            }
+        let mut claimed_slots = Vec::with_capacity(slots.len());
+        for path in slots {
+            claimed_slots.push(Slot::claim(&log, path)?);
         }
         Ok(Self {
             log,
-            slots: Arc::new(slots),
             baseboard,
             nonce: Nonce::random(),
-            claimed: Arc::new(SyncMutex::new(BTreeSet::from([LOCK_FILE]))),
-            locks: Arc::new(locks),
+            slots: Arc::new(claimed_slots),
         })
     }
 
@@ -332,30 +410,24 @@ impl Locker {
             .expect("a locker without slots takes no locks")
     }
 
-    /// A tenant of this locker, described by a (constant) specification.
-    /// Each file supports one tenant; a duplicate claim panics.
+    /// A tenant of this locker, described by a (constant)
+    /// specification. No two tenants may share a file.
     pub fn tenant(&self, spec: TenantSpec) -> Tenant {
-        assert!(
-            self.claimed.lock().unwrap().insert(spec.file),
-            "tenant `{}` is already claimed",
-            spec.file,
-        );
         Tenant {
             log: self.log.new(o!("tenant" => spec.file)),
             spec,
-            paths: self.slots.iter().map(|slot| slot.join(spec.file)).collect(),
+            slots: Arc::clone(&self.slots),
             baseboard: self.baseboard.clone(),
             nonce: self.nonce.clone(),
             reserved: Mutex::new(0),
             committed: Arc::new(SyncMutex::new(0)),
-            _locks: Arc::clone(&self.locks),
         }
     }
 
     /// Prove that every slot is writable by writing to every slot.
     pub async fn probe(&self) -> Result<(), StoreError> {
         for slot in self.slots.iter() {
-            let probe = slot.join("probe");
+            let probe = slot.path.join("probe");
             if let Err(error) = write(&probe, b"").and_then(|()| remove_file(&probe)).await {
                 warn!(self.log, "unusable slot"; "path" => %probe);
                 return Err(StoreError::Io { path: probe, error });
@@ -371,16 +443,11 @@ impl Locker {
 pub struct Tenant {
     log: Logger,
     spec: TenantSpec,
-    paths: Vec<Utf8PathBuf>,
+    slots: Arc<Vec<Slot>>,
     baseboard: BaseboardId,
     nonce: Nonce,
-    /// The newest sequence number reserved or observed by this process.
     reserved: Mutex<u64>,
-    /// The newest sequence number written to all slots.
     committed: Arc<SyncMutex<u64>>,
-    /// Holds the slot locks for this tenant's lifetime, so that the
-    /// locker may drop before its tenants without freeing the slots.
-    _locks: Arc<Vec<File>>,
 }
 
 impl Tenant {
@@ -412,39 +479,37 @@ pub struct Guard<'a> {
 impl Guard<'_> {
     pub async fn load(&mut self) -> Verdict {
         let tenant = self.tenant;
-        if tenant.paths.is_empty() {
+        if tenant.slots.is_empty() {
             return Verdict::Empty;
         }
 
         let mut found: Vec<Envelope> = Vec::new();
-        for path in &tenant.paths {
-            let bytes = match read(path).await {
+        for slot in tenant.slots.iter() {
+            let path = slot.path.join(tenant.spec.file);
+            let bytes = match read(&path).await {
                 Ok(bytes) => bytes,
                 Err(error) if error.kind() == io::ErrorKind::NotFound => continue,
                 Err(error) => {
-                    return self.discard(Discard::Io {
-                        path: path.clone(),
-                        error,
-                    });
+                    return self.discard(Discard::Io { path, error });
                 }
             };
             match Envelope::decode(tenant.spec.magic, &bytes) {
                 Some(envelope) => {
                     if envelope.baseboard != tenant.baseboard {
                         return self.discard(Discard::Foreign {
-                            path: path.clone(),
+                            path,
                             baseboard: envelope.baseboard,
                         });
                     }
                     found.push(envelope);
                 }
-                None => return self.discard(Discard::Corrupt { path: path.clone() }),
+                None => return self.discard(Discard::Corrupt { path }),
             }
         }
         if found.is_empty() {
             return Verdict::Empty;
         }
-        let restored = found.len() < tenant.paths.len();
+        let restored = found.len() < tenant.slots.len();
         if !found.iter().all(|e| e.record == found[0].record) {
             // Slots torn by one process resolve to its newest write;
             // see the module doc. Anything else is a genuine
@@ -486,16 +551,17 @@ impl Guard<'_> {
 
     pub async fn store(&mut self, record: &[u8]) -> Result<(), StoreError> {
         let tenant = self.tenant;
-        if tenant.paths.is_empty() {
+        if tenant.slots.is_empty() {
             return Ok(());
         }
 
         *self.reserved += 1;
         let seq = *self.reserved;
         let envelope = tenant.envelope(seq, record);
-        let paths = tenant.paths.clone();
+        let slots = Arc::clone(&tenant.slots);
         let committed = tenant.committed.clone();
-        spawn_blocking(move || commit(&committed, &paths, seq, &envelope))
+        let (log, file) = (tenant.log.clone(), tenant.spec.file);
+        spawn_blocking(move || commit(&log, &committed, &slots, file, seq, &envelope))
             .await
             .map_err(|join| StoreError::Task(join.to_string()))?
     }
@@ -511,8 +577,10 @@ impl Guard<'_> {
 /// side of the write; the blocking side is already detached, runs
 /// to completion regardless, and must not overwrite a newer record.
 fn commit(
+    log: &Logger,
     committed: &SyncMutex<u64>,
-    paths: &[Utf8PathBuf],
+    slots: &[Slot],
+    file: &str,
     seq: u64,
     envelope: &[u8],
 ) -> Result<(), StoreError> {
@@ -520,23 +588,24 @@ fn commit(
     if seq <= *committed {
         return Err(StoreError::Superseded);
     }
-    for path in paths {
-        AtomicFile::new(path, OverwriteBehavior::AllowOverwrite)
-            .write(|file| {
-                file.set_permissions(Permissions::from_mode(0o600))?;
-                file.write_all(envelope)
-            })
-            .map_err(|error| StoreError::Io {
-                path: path.clone(),
-                error: match error {
-                    atomicwrites::Error::Internal(error) | atomicwrites::Error::User(error) => {
-                        error
-                    }
-                },
-            })?;
+    for slot in slots {
+        let path = slot.path.join(file);
+        slot.write(log, &path, envelope)
+            .map_err(|error| StoreError::Io { path, error })?;
     }
     *committed = seq;
     Ok(())
+}
+
+fn write_envelope(path: &Utf8PathBuf, envelope: &[u8]) -> io::Result<()> {
+    AtomicFile::new(path, OverwriteBehavior::AllowOverwrite)
+        .write(|file| {
+            file.set_permissions(Permissions::from_mode(0o600))?;
+            file.write_all(envelope)
+        })
+        .map_err(|error| match error {
+            atomicwrites::Error::Internal(error) | atomicwrites::Error::User(error) => error,
+        })
 }
 
 #[cfg(test)]
@@ -544,7 +613,7 @@ mod test {
     use super::*;
 
     use std::env::{current_exe, var};
-    use std::fs::{create_dir, metadata, read, remove_file as remove, write};
+    use std::fs::{create_dir, metadata, read, remove_dir_all, remove_file as remove, write};
     use std::process::{Command, exit};
 
     use tempfile::TempDir;
@@ -783,7 +852,7 @@ mod test {
         ));
     }
 
-    /// A straggling write from a dropped store future cannot land on
+    /// A stale write from a dropped store future cannot land on
     /// top of a newer committed record.
     #[tokio::test]
     async fn stragglers_cannot_clobber_newer_commits() {
@@ -794,9 +863,24 @@ mod test {
 
         let newer = tenant.envelope(7, b"newer");
         let straggler = tenant.envelope(6, b"stale");
-        commit(&tenant.committed, &paths, 7, &newer).unwrap();
+        commit(
+            &test_log(),
+            &tenant.committed,
+            &tenant.slots,
+            SPEC.file,
+            7,
+            &newer,
+        )
+        .unwrap();
         assert!(matches!(
-            commit(&tenant.committed, &paths, 6, &straggler),
+            commit(
+                &test_log(),
+                &tenant.committed,
+                &tenant.slots,
+                SPEC.file,
+                6,
+                &straggler
+            ),
             Err(StoreError::Superseded)
         ));
         assert_eq!(read(&paths[0]).unwrap(), newer);
@@ -816,40 +900,78 @@ mod test {
         ));
     }
 
-    /// A locker in another process is locked out until this one and
-    /// its tenants drop. The child is this test binary re-executed
-    /// with the slot named in the environment. Both of its outcomes
-    /// exit non-zero, so a filter that names no test exits zero and
-    /// fails here rather than reading as a lock the child never took.
-    #[test]
-    fn second_process_is_locked_out() {
-        const SLOT_VAR: &str = "SUSH_TEST_LOCK_SLOT";
-        const ACQUIRED: i32 = 43;
-        const REFUSED: i32 = 44;
+    const SLOT_VAR: &str = "SUSH_TEST_LOCK_SLOT";
+    const ACQUIRED: i32 = 43;
+    const REFUSED: i32 = 44;
+
+    /// The child half of the cross-process lock tests: when the
+    /// environment names a slot, try to claim it and exit. Both
+    /// outcomes exit non-zero, so a stale test filter (exit zero)
+    /// fails loudly rather than reading as a lock the child never
+    /// took.
+    fn maybe_child() {
         if let Ok(slot) = var(SLOT_VAR) {
             match Locker::new(&test_log(), baseboard(), vec![slot.into()]) {
                 Ok(_) => exit(ACQUIRED),
                 Err(_) => exit(REFUSED),
             }
         }
+    }
 
+    /// Re-execute this test binary as `test`, pointed at `slot`.
+    fn reexec(test: &str, slot: &Utf8PathBuf) -> Option<i32> {
+        Command::new(current_exe().unwrap())
+            .args(["--exact", test])
+            .env(SLOT_VAR, slot)
+            .output()
+            .unwrap()
+            .status
+            .code()
+    }
+
+    /// A locker in another process is locked out until this one and
+    /// its tenants drop.
+    #[test]
+    fn second_process_is_locked_out() {
+        maybe_child();
         let dir = TempDir::with_prefix("sush-locker-").unwrap();
         let slots = slots(&dir);
-        let child = |slot: &Utf8PathBuf| {
-            Command::new(current_exe().unwrap())
-                .args(["--exact", "locker::test::second_process_is_locked_out"])
-                .env(SLOT_VAR, slot)
-                .output()
-                .unwrap()
-                .status
-                .code()
-        };
+        let child = |slot| reexec("locker::test::second_process_is_locked_out", slot);
 
         let locker = locker(slots.clone());
         assert_eq!(child(&slots[0]), Some(REFUSED));
 
         let tenant = locker.tenant(SPEC);
         drop(locker);
+        assert_eq!(child(&slots[0]), Some(REFUSED));
+
+        drop(tenant);
+        assert_eq!(child(&slots[0]), Some(ACQUIRED));
+    }
+
+    /// A store heals a slot directory wiped at runtime: the slots
+    /// agree again, and the healed slot is locked against other
+    /// processes.
+    #[tokio::test]
+    async fn wiped_slot_heals_and_stays_locked() {
+        maybe_child();
+        let dir = TempDir::with_prefix("sush-locker-").unwrap();
+        let slots = slots(&dir);
+        let child = |slot| reexec("locker::test::wiped_slot_heals_and_stays_locked", slot);
+
+        let tenant = locker(slots.clone()).tenant(SPEC);
+        tenant.store(b"before").await.unwrap();
+        remove_dir_all(&slots[0]).unwrap();
+
+        tenant.store(b"healed").await.unwrap();
+        assert_eq!(
+            read(slots[0].join(SPEC.file)).unwrap(),
+            read(slots[1].join(SPEC.file)).unwrap(),
+        );
+        assert!(matches!(
+            tenant.load().await,
+            Verdict::Adopt(record) if record == b"healed"
+        ));
         assert_eq!(child(&slots[0]), Some(REFUSED));
 
         drop(tenant);
