@@ -24,11 +24,12 @@ use tokio_tungstenite::tungstenite::protocol::{Role, WebSocketConfig};
 use sush_api::{
     AccessParam, Authorization, AuthorizedRangeRequest, JobHistoryParams, JobIdParam,
     JobOutputParams, JobStartParams, JobStopParams, JobTargetParams, KeyIdParam, RoutingParam,
-    SessionAndJobIds, SessionAndKeyIds, SessionIdParam, SessionStartBody, SessionStartNonce,
-    SushApi, WaitParam,
+    SessionAndJobIds, SessionAndKeyIds, SessionIdParam, SessionStartBody, SushApi, WaitParam,
 };
 use sush_common::authn::Identity;
-use sush_common::jobs::{JsonJobStatusMap, Session, SignedJob, job_status_to_json_map};
+use sush_common::jobs::{
+    JsonJobStatusMap, Session, SessionServerNonce, SignedJob, job_status_to_json_map,
+};
 use sush_common::keys::{SshPublicKey, pem_cert_chain};
 use sush_common::targets::SledVersion;
 use sush_common::version::VersionInfo;
@@ -118,18 +119,16 @@ impl SushApi for ApiServer {
         }
     }
 
-    async fn session_start_nonce(
+    async fn server_nonce(
         ctx: RequestContext<Self::Context>,
         headers: Header<Authorization>,
-    ) -> Result<HttpResponseOk<SessionStartNonce>, HttpError> {
+    ) -> Result<HttpResponseOk<SessionServerNonce>, HttpError> {
         let mgr = ctx.context();
         let Authorization { authorization } = headers.into_inner();
         let _authn = mgr
             .iam(authorization, None, request_line(&ctx.request))
             .await?;
-        Ok(HttpResponseOk(SessionStartNonce {
-            nonce: mgr.session_sush_nonce(),
-        }))
+        Ok(HttpResponseOk(mgr.fresh_server_nonce()))
     }
 
     async fn session_start(
@@ -146,8 +145,12 @@ impl SushApi for ApiServer {
             .await?;
         let WaitParam { wait } = query.into_inner();
         let SessionIdParam { session_id } = params.into_inner();
-        let SessionStartBody { signer_nonce } = body.into_inner();
-        mgr.session_start(&authn, session_id, signer_nonce, wait)
+        let SessionStartBody {
+            client_nonce,
+            signer_nonce,
+            seq,
+        } = body.into_inner();
+        mgr.session_start(&authn, session_id, client_nonce, signer_nonce, seq, wait)
             .await?;
         Ok(HttpResponseUpdatedNoContent())
     }

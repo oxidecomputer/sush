@@ -21,8 +21,8 @@ use sled_hardware_types::BaseboardId;
 
 use sush_common::authn::Identity;
 use sush_common::jobs::{
-    Access, JobId, JobLimits, JobOutputStream, JobStatus, JsonJobStatusMap, Session, SessionId,
-    SessionSignerNonce, SessionSushNonce, SignedJob,
+    Access, JobId, JobLimits, JobOutputStream, JobStatus, JsonJobStatusMap, Session,
+    SessionClientNonce, SessionId, SessionSeq, SessionServerNonce, SessionSignerNonce, SignedJob,
 };
 use sush_common::keys::{KeyId, SshPublicKey};
 use sush_common::targets::SledVersion;
@@ -74,15 +74,16 @@ pub trait SushApi {
         headers: Header<Authorization>,
     ) -> Result<HttpResponseOk<Session>, HttpError>;
 
-    /// Get the sush server nonce needed to start a new session.
+    /// Get a fresh server nonce for the session ceremony.
     ///
-    /// The nonce will need to be sent to the signer server, which will give back its own nonce.
-    /// Both nonces combined (along with the baseboard ID) will form the session ID.
-    #[endpoint { method = GET, path = "/session-nonce" }]
-    async fn session_start_nonce(
+    /// The client mixes its own nonce with this one to form the sush
+    /// nonce it submits to the signer. Fetching replaces the previous
+    /// server nonce, so only the latest ceremony can complete.
+    #[endpoint { method = GET, path = "/server-nonce" }]
+    async fn server_nonce(
         ctx: RequestContext<Self::Context>,
         headers: Header<Authorization>,
-    ) -> Result<HttpResponseOk<SessionStartNonce>, HttpError>;
+    ) -> Result<HttpResponseOk<SessionServerNonce>, HttpError>;
 
     /// Start a new support session.
     ///
@@ -287,14 +288,11 @@ pub struct JobTargetParams {
     pub target: String,
 }
 
-#[derive(Serialize, JsonSchema)]
-pub struct SessionStartNonce {
-    pub nonce: SessionSushNonce,
-}
-
 #[derive(Deserialize, JsonSchema)]
 pub struct SessionStartBody {
+    pub client_nonce: SessionClientNonce,
     pub signer_nonce: SessionSignerNonce,
+    pub seq: SessionSeq,
 }
 
 /// Job parameters _not_ specified in the signed job request.

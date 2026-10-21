@@ -31,9 +31,10 @@ use sush_common::authn::{
     Nonce, RequestVerifier, SeqWindow,
 };
 use sush_common::jobs::{
-    Access, JobId, JobStatusMap, Session, SessionId, SessionSignerNonce, SignedJob,
+    Access, JobId, JobOutputStream, JobStatusMap, Session, SessionClientNonce, SessionId,
+    SessionPreimage, SessionSeq, SessionServerNonce, SessionSignerNonce, SessionSushNonce,
+    SignedJob,
 };
-use sush_common::jobs::{JobOutputStream, SessionSushNonce};
 use sush_common::keys::{KeyError, KeyId, SshPublicKey};
 use sush_common::targets::{Cubbies, SledHealth, SledVersion};
 use sush_common::version::LONG_VERSION;
@@ -87,7 +88,7 @@ pub struct JobManager {
     log: Logger,
     nonces: Arc<Mutex<LruCache<Nonce, Instant>>>,
     identities: Arc<Mutex<LruCache<(KeyId, Nonce), CachedIdentity>>>,
-    session_sush_nonce: Arc<SyncMutex<SessionSushNonce>>,
+    session_server_nonce: Arc<SyncMutex<SessionServerNonce>>,
     output_dir: JobOutputDir,
     own_baseboard: BaseboardId,
     linked: LinkedBaseboards,
@@ -144,7 +145,7 @@ impl JobManager {
         info!(log, "starting sush"; "version" => LONG_VERSION);
         let (tx_req, rx_req) = mpsc::channel(16);
         let requests = ReceiverStream::new(rx_req);
-        let session_sush_nonce = Arc::new(SyncMutex::new(SessionSushNonce::random()));
+        let session_server_nonce = Arc::new(SyncMutex::new(SessionServerNonce::random()));
         let boundary = Arc::new(BoundaryStore::new(&log, locker));
         boundary.load().await;
         let (rx_state, join_state) = StateManager::run(
@@ -156,7 +157,6 @@ impl JobManager {
             cubbies,
             universe,
             anchors,
-            session_sush_nonce.clone(),
             boundary,
             shutdown,
         )?;
@@ -164,7 +164,7 @@ impl JobManager {
             log: log.new(o!("component" => "job manager")),
             nonces: Arc::new(Mutex::new(LruCache::new(MAX_OUTSTANDING_NONCES))),
             identities: Arc::new(Mutex::new(LruCache::new(MAX_CACHED_IDENTITIES))),
-            session_sush_nonce,
+            session_server_nonce,
             own_baseboard,
             linked,
             output_dir,
@@ -457,28 +457,41 @@ impl JobManager {
         Ok(session.into_session_id())
     }
 
-    pub fn session_sush_nonce(&self) -> SessionSushNonce {
-        *self.session_sush_nonce.lock().unwrap()
+    /// Replace the current server nonce with a fresh one and return
+    /// it. A fetch is the only rotation, so a client must finish its
+    /// ceremony before the next fetch.
+    pub fn fresh_server_nonce(&self) -> SessionServerNonce {
+        let nonce = SessionServerNonce::random();
+        *self.session_server_nonce.lock().unwrap() = nonce;
+        nonce
     }
 
     pub async fn session_start(
         &self,
         authn: &Identity,
         session_id: SessionId,
+        client_nonce: SessionClientNonce,
         signer_nonce: SessionSignerNonce,
+        seq: SessionSeq,
         wait: bool,
     ) -> Result<(), JobError> {
-        // Verify that the session ID provided by the client is meant for
-        // this instance of Sush, by checking that the signer nonce was
-        // hashed with our baseboard and nonce. The state machine rotates
-        // the nonce when a session activates.
-        let sush_nonce = *self.session_sush_nonce.lock().unwrap();
-        let computed = SessionId::compute(self.own_baseboard(), sush_nonce, signer_nonce);
-        if computed != session_id {
+        // Verify that the session ID provided by the client is meant
+        // for this instance of Sush: it must hash over our baseboard
+        // and current server nonce. The preimage then travels instead
+        // of the id, so every peer derives for itself both the id and
+        // the sequence number the id commits to.
+        let server_nonce = *self.session_server_nonce.lock().unwrap();
+        let preimage = SessionPreimage {
+            baseboard: self.own_baseboard().clone(),
+            sush_nonce: SessionSushNonce::compute(client_nonce, server_nonce),
+            signer_nonce,
+            seq,
+        };
+        if preimage.session_id() != session_id {
             return Err(JobError::InvalidSessionId);
         }
 
-        self.session_request(authn, SessionRequest::Start(session_id))
+        self.session_request(authn, SessionRequest::Start(preimage))
             .await?;
         if wait {
             self.wait_for(self.wait_for_session(session_id)).await?;

@@ -46,6 +46,11 @@ const WORD_SEPARATOR: &str = "-";
 /// the strength of the signatures produced over these phrases.
 const TRUNCATED_BITS: u32 = 88;
 
+/// A four-word phrase carries 44 bits. Not enough for an identifier,
+/// but room enough for a small ordered value, like a Unix time in
+/// milliseconds.
+const SHORT_BITS: u32 = 44;
+
 /// Random code phrase like `abstract misery favorite ordinary moon talk`.
 #[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct Codephrase(U256);
@@ -56,18 +61,43 @@ impl Codephrase {
         Self(U256::random(&mut OsRng))
     }
 
-    /// Turn 256 bits of entropy into a reasonably unique code phrase.
-    /// We use the low-order words of the full codephrase, and pad to
-    /// the canonical length; these phrases are intended for machine
-    /// consumption, and are short enough for easy transmission.
+    /// Turn 256 bits of entropy into a reasonably unique code phrase,
+    /// around eight words.
     pub fn truncate(self) -> Self {
-        let mask = U256::from_u128(2u128.pow(TRUNCATED_BITS) - 1);
+        self.mask(TRUNCATED_BITS)
+    }
+
+    /// Chop entropy down to four words; see `SHORT_BITS`.
+    pub fn shorten(self) -> Self {
+        self.mask(SHORT_BITS)
+    }
+
+    /// Keep only the low-order bits of some entropy.
+    fn mask(self, bits: u32) -> Self {
+        let mask = U256::from_u128((1 << bits) - 1);
         Self(self.0.bitand(&mask))
     }
 
     /// Construct a codephrase from its big-endian byte representation.
     pub fn from_be_bytes(bytes: [u8; 32]) -> Self {
         Self(U256::from_be_bytes(bytes))
+    }
+
+    /// Construct a codephrase from a small integer.
+    pub fn from_u64(value: u64) -> Self {
+        Self(U256::from_u64(value))
+    }
+
+    /// Return the small integer represented by a codephrase,
+    /// or `None` if it is wider than 64 bits.
+    pub fn to_u64(&self) -> Option<u64> {
+        let bytes = self.to_be_bytes();
+        if bytes[..24].iter().any(|&byte| byte != 0) {
+            return None;
+        }
+        Some(u64::from_be_bytes(
+            bytes[24..].try_into().expect("eight bytes"),
+        ))
     }
 
     /// Get the underlying big-endian byte representation of the codephrase.
@@ -77,8 +107,8 @@ impl Codephrase {
 }
 
 impl fmt::Display for Codephrase {
+    /// Turn 256 bits of entropy into an un-padded big-endian code phrase.
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        // Turn 256 bits of entropy into an un-padded big-endian code phrase.
         let b = Reciprocal::new(Limb(WORDLIST_LEN as u64)).expect("should have some words");
         let mut n = self.0;
         let mut r;
@@ -102,18 +132,17 @@ impl fmt::Debug for Codephrase {
 impl FromStr for Codephrase {
     type Err = InvalidCodephrase;
 
+    /// Decode a big endian code phrase into 256 bits of entropy.
+    ///
+    /// Decoding is non-injective, or "liberal" in the sense that it will
+    /// accept non-canonical codephrases, e.g., ones with spaces instead of
+    /// separators, words in mixed case, or without leading zeros. This is
+    /// for the comfort of humans that may have to transmit such phrases.
+    /// It rejects phrases that no entropy encodes to: unknown words, more
+    /// than `PHRASE_WORDS_256` words, or a value of 256 bits or more.
+    /// The empty phrase decodes to zero. Callers that must distinguish
+    /// absent input from zero should check before decoding.
     fn from_str(value: &str) -> Result<Self, Self::Err> {
-        // Decode a big endian code phrase into 256 bits of entropy.
-        //
-        // Decoding is non-injective, or "liberal" in the sense that it will
-        // accept non-canonical codephrases, e.g., ones with spaces instead of
-        // separators, words in mixed case, or without leading zeros. This is
-        // for the comfort of humans that may have to transmit such phrases.
-        // It rejects phrases that no entropy encodes to: unknown words, more
-        // than [`PHRASE_WORDS_256`] words, or a value of 256 bits or more.
-        // The empty phrase decodes to zero. Callers that must distinguish
-        // absent input from zero should check before decoding.
-
         let b = U256::from_u64(WORDLIST_LEN as u64);
         let mut n = U256::ZERO;
         let mut words = 0;
@@ -158,7 +187,7 @@ impl<'de> Deserialize<'de> for Codephrase {
     }
 }
 
-// Treat a codephrase as a string in JSON schemas.
+/// Treat a codephrase as a string in JSON schemas.
 impl JsonSchema for Codephrase {
     fn schema_name() -> String {
         String::schema_name()
@@ -192,13 +221,9 @@ macro_rules! codephrase_newtype {
             fn try_from(
                 codephrase: $crate::codephrases::Codephrase,
             ) -> Result<Self, Self::Error> {
-                match $crate::codephrases::CodephraseLength::$len {
-                    $crate::codephrases::CodephraseLength::Full => {}
-                    $crate::codephrases::CodephraseLength::Truncated => {
-                        if codephrase.truncate() != codephrase {
-                            return Err($crate::codephrases::InvalidCodephrase);
-                        }
-                    }
+                let length = $crate::codephrases::CodephraseLength::$len;
+                if length.canonical(codephrase) != codephrase {
+                    return Err($crate::codephrases::InvalidCodephrase);
                 }
                 Ok(Self(codephrase))
             }
@@ -207,38 +232,24 @@ macro_rules! codephrase_newtype {
         impl $name {
             #[allow(unused)]
             $vis fn random() -> Self {
-                let mut codephrase = $crate::codephrases::Codephrase::random();
-                match $crate::codephrases::CodephraseLength::$len {
-                    $crate::codephrases::CodephraseLength::Full => {}
-                    $crate::codephrases::CodephraseLength::Truncated => {
-                        codephrase = codephrase.truncate();
-                    }
-                }
-                Self(codephrase)
+                let length = $crate::codephrases::CodephraseLength::$len;
+                Self(length.canonical($crate::codephrases::Codephrase::random()))
             }
 
             #[allow(unused)]
             $vis fn from_hash(hash: $crate::hash::Hash) -> Self {
-                let mut codephrase = $crate::codephrases::Codephrase::from_be_bytes(*hash.as_bytes());
-                match $crate::codephrases::CodephraseLength::$len {
-                    $crate::codephrases::CodephraseLength::Full => {}
-                    $crate::codephrases::CodephraseLength::Truncated => {
-                        codephrase = codephrase.truncate();
-                    }
-                }
-                Self(codephrase)
+                let length = $crate::codephrases::CodephraseLength::$len;
+                Self(length.canonical(
+                    $crate::codephrases::Codephrase::from_be_bytes(*hash.as_bytes()),
+                ))
             }
 
             #[allow(unused)]
             $vis fn from_be_bytes(bytes: [u8; 32]) -> Self {
-                let mut codephrase = $crate::codephrases::Codephrase::from_be_bytes(bytes);
-                match $crate::codephrases::CodephraseLength::$len {
-                    $crate::codephrases::CodephraseLength::Full => {}
-                    $crate::codephrases::CodephraseLength::Truncated => {
-                        codephrase = codephrase.truncate();
-                    }
-                }
-                Self(codephrase)
+                let length = $crate::codephrases::CodephraseLength::$len;
+                Self(length.canonical(
+                    $crate::codephrases::Codephrase::from_be_bytes(bytes),
+                ))
             }
 
             #[allow(unused)]
@@ -273,6 +284,18 @@ macro_rules! codephrase_newtype {
 pub enum CodephraseLength {
     Full,
     Truncated,
+    Short,
+}
+
+impl CodephraseLength {
+    /// Construct a codephrase of canonical length by discarding entropy.
+    pub fn canonical(self, codephrase: Codephrase) -> Codephrase {
+        match self {
+            Self::Full => codephrase,
+            Self::Truncated => codephrase.truncate(),
+            Self::Short => codephrase.shorten(),
+        }
+    }
 }
 
 /// Decoding a phrase failed.
@@ -329,6 +352,13 @@ mod test {
             "ability-abandon-abandon-zoo"
         );
         round_trip(U256::MAX);
+    }
+
+    #[test]
+    fn small_integers() {
+        assert_eq!(Codephrase::from_u64(0).to_u64(), Some(0));
+        assert_eq!(Codephrase::from_u64(u64::MAX).to_u64(), Some(u64::MAX));
+        assert_eq!(Codephrase::from_be_bytes([0x01; 32]).to_u64(), None);
     }
 
     #[test]

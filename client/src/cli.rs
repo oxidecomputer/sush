@@ -17,7 +17,7 @@ use anstream::print;
 use anstyle::{AnsiColor, Style};
 use atomicwrites::{AtomicFile, OverwriteBehavior};
 use bytesize::ByteSize;
-use chrono::{DateTime, TimeDelta, Utc};
+use chrono::TimeDelta;
 use humantime::format_duration;
 use indicatif::{MultiProgress, ProgressBar, ProgressStyle};
 use rustix::io::ioctl_fionread;
@@ -30,8 +30,9 @@ use xdg::BaseDirectories;
 
 use sush_common::authn::Identity;
 use sush_common::jobs::{
-    Access, JobId, JobOutputState, JobOutputStream, JobStatus, JobStatusMap, Session, SessionId,
-    SessionSignerNonce, SignedJob, job_status_to_json_map,
+    Access, JobId, JobOutputState, JobOutputStream, JobStartRequest, JobStatus, JobStatusMap,
+    Session, SessionClientNonce, SessionId, SessionSeq, SessionSignerNonce, SessionSushNonce,
+    SignedJob, job_status_to_json_map,
 };
 use sush_common::keys::{KeyId, Signature, SshPublicKey};
 use sush_common::targets::{MAX_CUBBY, SledHealth, SledId, SledVersion};
@@ -40,18 +41,12 @@ use sush_common::version::VersionInfo;
 use crate::AuthzSigner;
 use crate::commands::{CommandError, GlobalArgs};
 use crate::context::{CommandContext, OutputFormat, StatusDisplayStyle};
-use crate::types::SessionStartNonce;
 
 pub(crate) const PREFIX: &str = "sush";
 const SESSION_FILE_NAME: &str = "session.json";
 const SESSION_FILE_VERSION: u32 = 1;
-const TOKEN_FILE_NAME: &str = "permslip-token.json";
-const TOKEN_FILE_VERSION: u32 = 1;
-
-/// How long a permslip token is trusted for reuse. Staying well
-/// under the server's 15 minute TTL spares a command from expiring
-/// mid-flight.
-const TOKEN_REUSE: TimeDelta = TimeDelta::minutes(10);
+const CLIENT_NONCE_FILE_NAME: &str = "client-nonce.json";
+const CLIENT_NONCE_FILE_VERSION: u32 = 1;
 
 /// The persisted session, versioned for future migrations.
 #[derive(Deserialize, Serialize)]
@@ -60,15 +55,14 @@ struct SavedSession {
     session: Session,
 }
 
-/// A persisted permslip token, versioned for future migrations. The
-/// url and fingerprint pin it to one signing server and one identity.
+/// The persisted client nonce of the pending session ceremony,
+/// versioned for future migrations. One pending ceremony at a time,
+/// mirroring the rack's one server nonce slot: `session start-params`
+/// overwrites it just as the fetch it makes overwrites the slot.
 #[derive(Deserialize, Serialize)]
-struct SavedToken {
+struct SavedClientNonce {
     version: u32,
-    url: String,
-    fingerprint: String,
-    token: String,
-    created: DateTime<Utc>,
+    client_nonce: SessionClientNonce,
 }
 
 #[derive(Clone, Debug, Default)]
@@ -79,7 +73,7 @@ pub struct Cli {
     watch: Arc<Mutex<Option<Watch>>>,
     session: Arc<Mutex<Option<Session>>>,
     session_file: Option<PathBuf>,
-    token_file: Option<PathBuf>,
+    client_nonce_file: Option<PathBuf>,
     credentials: AuthzSigner,
 }
 
@@ -110,9 +104,9 @@ impl Cli {
             Err(error) => eprintln!("❗ Ignoring the saved session: {error}"),
         }
         self.session_file = Some(path);
-        match BaseDirectories::with_prefix(PREFIX).place_state_file(TOKEN_FILE_NAME) {
-            Ok(path) => self.token_file = Some(path),
-            Err(error) => eprintln!("❗ Signing tokens will not persist: {error}"),
+        match BaseDirectories::with_prefix(PREFIX).place_state_file(CLIENT_NONCE_FILE_NAME) {
+            Ok(path) => self.client_nonce_file = Some(path),
+            Err(error) => eprintln!("❗ The client nonce will not persist: {error}"),
         }
     }
 
@@ -276,40 +270,29 @@ impl CommandContext for Cli {
         self.credentials.clone()
     }
 
-    fn permslip_token(&self, url: &str, fingerprint: &str) -> Option<String> {
-        let json = fs::read(self.token_file.as_ref()?).ok()?;
-        match serde_json::from_slice::<SavedToken>(&json) {
-            Ok(SavedToken {
-                version: TOKEN_FILE_VERSION,
-                url: saved_url,
-                fingerprint: saved_fingerprint,
-                token,
-                created,
-            }) if saved_url == url
-                && saved_fingerprint == fingerprint
-                && (TimeDelta::zero()..TOKEN_REUSE).contains(&(Utc::now() - created)) =>
-            {
-                Some(token)
-            }
+    fn pending_client_nonce(&self) -> Option<SessionClientNonce> {
+        let json = fs::read(self.client_nonce_file.as_ref()?).ok()?;
+        match serde_json::from_slice::<SavedClientNonce>(&json) {
+            Ok(SavedClientNonce {
+                version: CLIENT_NONCE_FILE_VERSION,
+                client_nonce,
+            }) => Some(client_nonce),
             _ => None,
         }
     }
 
-    fn save_permslip_token(&self, url: &str, fingerprint: &str, token: &str) {
-        let Some(path) = &self.token_file else {
+    fn save_client_nonce(&self, client_nonce: SessionClientNonce) {
+        let Some(path) = &self.client_nonce_file else {
             return;
         };
-        let result = serde_json::to_vec_pretty(&SavedToken {
-            version: TOKEN_FILE_VERSION,
-            url: url.to_owned(),
-            fingerprint: fingerprint.to_owned(),
-            token: token.to_owned(),
-            created: Utc::now(),
+        let result = serde_json::to_vec_pretty(&SavedClientNonce {
+            version: CLIENT_NONCE_FILE_VERSION,
+            client_nonce,
         })
         .map_err(io::Error::other)
         .and_then(|json| write_private(path, &json));
         if let Err(error) = result {
-            eprintln!("❗ The token was not saved: {error}");
+            eprintln!("❗ The client nonce was not saved: {error}");
         }
     }
 
@@ -329,32 +312,68 @@ impl CommandContext for Cli {
         }
     }
 
-    fn session_start_params(&self, baseboard_id: BaseboardId, nonce: SessionStartNonce) {
+    fn session_start_params(
+        &self,
+        baseboard_id: BaseboardId,
+        client_nonce: SessionClientNonce,
+        sush_nonce: SessionSushNonce,
+    ) {
         match self.get_output_format() {
             OutputFormat::Json => println!(
                 "{}",
                 json!({
                     "baseboard_id": &baseboard_id.to_string(),
-                    "sush_nonce": &nonce.nonce,
+                    "client_nonce": &client_nonce,
+                    "sush_nonce": &sush_nonce,
                 })
             ),
             OutputFormat::Text => {
-                println!("Baseboard ID: {baseboard_id}");
-                println!("Sush nonce:   {}", nonce.nonce);
+                println!("✅ Please relay these parameters to support:");
+                println!("   Baseboard ID: {baseboard_id}");
+                println!("   Sush nonce:   {sush_nonce}");
             }
         }
     }
 
-    fn session_created(&mut self, session: Session, signer_nonce: SessionSignerNonce) {
+    fn job_start_params(&self, request: &JobStartRequest) {
+        match self.get_output_format() {
+            OutputFormat::Json => println!(
+                "{}",
+                json!({
+                    "job_id": &request.job_id,
+                    "session_id": &request.session_id,
+                    "command": &request.command,
+                    "mode": &request.mode,
+                    "target": &request.target.to_string(),
+                })
+            ),
+            OutputFormat::Text => {
+                println!("✅ Please request a job with these parameters from support:");
+                println!("   Job ID:     {}", request.job_id);
+                println!("   Session ID: {}", request.session_id);
+                println!("   Command:    {}", request.command);
+                println!("   Mode:       {}", request.mode.as_str());
+                println!("   Target:     {}", request.target);
+            }
+        }
+    }
+
+    fn session_created(
+        &mut self,
+        session: Session,
+        signer_nonce: SessionSignerNonce,
+        seq: SessionSeq,
+    ) {
         let session_id = self.adopt_session(session, true);
         match self.get_output_format() {
             OutputFormat::Json => println!(
                 "{}",
-                json!({"session_created": session_id, "signer_nonce": signer_nonce})
+                json!({"session_created": session_id, "signer_nonce": signer_nonce, "seq": seq})
             ),
             OutputFormat::Text => {
                 println!("✅ Session is now `{session_id}`");
-                println!("   Signer nonce: {signer_nonce}");
+                println!("   Signer nonce:    {signer_nonce}");
+                println!("   Sequence number: {seq}");
             }
         }
     }

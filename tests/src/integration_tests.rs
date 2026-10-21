@@ -38,18 +38,17 @@ use sush_client::{AuthzSigner, Client, Error as ClientError};
 use sush_common::hash::hash;
 use sush_common::interactive::{InteractiveJobControl, InteractiveJobMessage};
 use sush_common::jobs::{
-    Access, JobLimits, JobOutputState, JobOutputStream, JobStatus, Session, SessionId,
-    SessionSignerNonce, job_status_try_from_json_map,
+    Access, JobLimits, JobOutputState, JobOutputStream, JobStatus, Session,
+    job_status_try_from_json_map,
 };
 use sush_common::targets::Cubbies;
 use sush_server::proxy::{Targets, platform_tls};
 use sush_server::{ApiServer, ProxyServer};
 
 use crate::test_utils::{
-    SignJobRequest as _, authz, ephemeral_test_root, manager_and_test_root, test_baseboard_id,
-    test_logger, test_pki, vouched_proxy_pems,
+    SignJobRequest as _, authz, ephemeral_test_root, http_session_ceremony, manager_and_test_root,
+    test_baseboard_id, test_logger, test_pki, vouched_proxy_pems,
 };
-use sush_client::types::SessionStartBody;
 
 const TIMEOUT: Duration = Duration::from_secs(10);
 
@@ -93,23 +92,12 @@ async fn client_server() {
     assert_eq!(iam, identity, "who am I?");
 
     // Start a session and run a job.
-    let signer_nonce = SessionSignerNonce::random();
-    let session_id = SessionId::compute(
-        &test_baseboard_id(),
-        client
-            .session_start_nonce()
-            .send()
-            .await
-            .unwrap()
-            .into_inner()
-            .nonce,
-        signer_nonce,
-    );
+    let (session_id, body) = http_session_ceremony(&client, 1).await;
     let session = Session::new(session_id);
     client
         .session_start()
         .session_id(session.session_id())
-        .body(SessionStartBody { signer_nonce })
+        .body(body)
         .send()
         .await
         .expect("can't start session");
@@ -210,23 +198,12 @@ async fn client_proxy_server() {
 
     // Attach to an interactive job through the proxy, routed by the
     // target path segment, and echo bytes over the bridged upgrade.
-    let signer_nonce = SessionSignerNonce::random();
-    let session_id = SessionId::compute(
-        &test_baseboard_id(),
-        client
-            .session_start_nonce()
-            .send()
-            .await
-            .unwrap()
-            .into_inner()
-            .nonce,
-        signer_nonce,
-    );
+    let (session_id, body) = http_session_ceremony(&client, 1).await;
     let session = Session::new(session_id);
     client
         .session_start()
         .session_id(session.session_id())
-        .body(SessionStartBody { signer_nonce })
+        .body(body)
         .send()
         .await
         .expect("can't start session");
@@ -389,23 +366,12 @@ async fn interactive_job() {
     assert_eq!(iam, identity, "who am I?");
 
     // Start a session and run an interactive job.
-    let signer_nonce = SessionSignerNonce::random();
-    let session_id = SessionId::compute(
-        &test_baseboard_id(),
-        client
-            .session_start_nonce()
-            .send()
-            .await
-            .unwrap()
-            .into_inner()
-            .nonce,
-        signer_nonce,
-    );
+    let (session_id, body) = http_session_ceremony(&client, 1).await;
     let session = Session::new(session_id);
     client
         .session_start()
         .session_id(session.session_id())
-        .body(SessionStartBody { signer_nonce })
+        .body(body)
         .send()
         .await
         .expect("can't start session");
@@ -693,23 +659,12 @@ async fn streaming_job() {
     signer.set(Some(credentials));
 
     // Start a streaming job too big for its pipe, so it blocks until we attach.
-    let signer_nonce = SessionSignerNonce::random();
-    let session_id = SessionId::compute(
-        &test_baseboard_id(),
-        client
-            .session_start_nonce()
-            .send()
-            .await
-            .unwrap()
-            .into_inner()
-            .nonce,
-        signer_nonce,
-    );
+    let (session_id, body) = http_session_ceremony(&client, 1).await;
     let session = Session::new(session_id);
     client
         .session_start()
         .session_id(session.session_id())
-        .body(SessionStartBody { signer_nonce })
+        .body(body)
         .send()
         .await
         .expect("can't start session");
@@ -848,23 +803,12 @@ async fn streaming_job_linger() {
     signer.set(Some(credentials));
 
     // Run a streaming job small enough to finish before anyone attaches.
-    let signer_nonce = SessionSignerNonce::random();
-    let session_id = SessionId::compute(
-        &test_baseboard_id(),
-        client
-            .session_start_nonce()
-            .send()
-            .await
-            .unwrap()
-            .into_inner()
-            .nonce,
-        signer_nonce,
-    );
+    let (session_id, body) = http_session_ceremony(&client, 1).await;
     let session = Session::new(session_id);
     client
         .session_start()
         .session_id(session.session_id())
-        .body(SessionStartBody { signer_nonce })
+        .body(body)
         .send()
         .await
         .expect("can't start session");
