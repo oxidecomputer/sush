@@ -2,16 +2,13 @@
 // License, v. 2.0. If a copy of the MPL was not distributed with this
 // file, You can obtain one at https://mozilla.org/MPL/2.0/.
 
-//! The boundary between jobs we executed and jobs we only heard about.
+//! The boundary between jobs we've committed to executing, and jobs
+//! we've only heard about via gossip.
 //!
-//! One record, rewritten before each spawn, carries what this sled
-//! last committed to: the job, its session and that session's
-//! sequence number, the chain position after the job, the universe
-//! they belong to, and the job's ending once it has one. The signer
-//! assigns every session a sequence number from its wall clock, so
-//! sequence numbers order sessions totally, across restarts and
-//! across universes: no session at or below the committed one may
-//! run jobs here again.
+//! A singleton boundary record is written before each job execution.
+//! It includes the job ID, session ID and sequence number, the chain
+//! position after the job, the universe they belong to, and the job's
+//! status (once it has one).
 //!
 //! After a restart, replayed gossip rebuilds the sessions. When the
 //! committed session activates, the sled resumes its chain at the
@@ -26,21 +23,18 @@
 //! when the record holds one, and an interrupted ending when it does
 //! not.
 //!
-//! A sled with no record cannot tell replay from re-run, so it
-//! serves only sessions that start as live traffic.
-//!
-//! A boundary that cannot be written means the job must not run. A
-//! boundary that cannot be trusted means no job may run at all, since
-//! we cannot tell what the previous life committed to. Recovery is an
-//! M.2 swap or a clean slate.
+//! A boundary that cannot be written means the job must not run;
+//! a boundary that cannot be read is treated as absent. In the
+//! absence of a boundary record, the sled cannot guarantee that
+//! any replayed job requests are safe to run (because they may
+//! already have run here), and so only serves sessions that start
+//! as observably live traffic.
 
 use std::sync::Mutex as SyncMutex;
-use std::sync::atomic::{AtomicBool, Ordering};
 
 use rumors::Network;
 use serde::{Deserialize, Serialize};
 use slog::{Logger, o, warn};
-use thiserror::Error;
 
 use sush_common::jobs::{JobId, JobStatus, ProcessError, SessionId, SessionSeq};
 
@@ -65,15 +59,16 @@ pub struct Boundary {
 
 /// The last job this sled committed to running, and how far it got.
 /// We also store the chain position *after* `job`, computed from the
-/// request's signed bytes at commit time, to allow session resumption.
+/// request's signed bytes at commit time, to allow session resumption
+/// across a crash or reboot.
 ///
-/// The sequence number itself travels unsigned, in the gossiped
-/// session preimage, yet a forged one cannot reach this record: the
-/// sled writes the record only when it commits to a signed job, the
-/// job's signed bytes name the session id, and the id hashes over
-/// the preimage, sequence number included. A preimage with a
-/// different sequence number hashes to a different session id, and
-/// no signed job names that id.
+/// Suppose we didn't store the successor, and this sled received
+/// job ID `J` with `command = reboot`. The sled could easily die
+/// before gossiping the full job; it would have written `J` to its
+/// boundary record, but would not have any way to compute the successor
+/// ID `K` unless *re-presented* with the full job for `J`. Thus,
+/// the session would be wedged unless the operator took the (unusual,
+/// undesirable) step of re-submitting a job just to advance the chain.
 #[derive(Clone, Debug, Deserialize, Serialize)]
 pub struct Committed {
     pub session: SessionId,
@@ -217,14 +212,6 @@ pub mod v0 {
     }
 }
 
-#[derive(Debug, Error)]
-pub enum BoundaryError {
-    #[error("the boundary store is untrusted")]
-    Untrusted,
-    #[error(transparent)]
-    Store(#[from] StoreError),
-}
-
 /// Durable storage for the [`Boundary`].
 #[derive(Debug)]
 pub struct BoundaryStore {
@@ -232,11 +219,6 @@ pub struct BoundaryStore {
     tenant: Tenant,
     /// The record, readable synchronously by the state machine.
     boundary: SyncMutex<Option<Boundary>>,
-    /// Untrusted until loaded, and forever if the load discards: a
-    /// write would overwrite the disagreeing slots, and the next load
-    /// would see agreement that never happened.
-    untrusted: AtomicBool,
-    loaded: AtomicBool,
 }
 
 impl BoundaryStore {
@@ -245,42 +227,28 @@ impl BoundaryStore {
             log: log.new(o!("component" => "boundary")),
             tenant: locker.tenant(BOUNDARY),
             boundary: SyncMutex::new(None),
-            untrusted: AtomicBool::new(true),
-            loaded: AtomicBool::new(false),
         }
     }
 
     /// Load the stored record once, at startup, before any job runs.
-    /// A later load could regress the in-memory record below a
-    /// spawned job, so a second call panics.
     pub async fn load(&self) {
-        assert!(
-            !self.loaded.swap(true, Ordering::SeqCst),
-            "the boundary store loads once, at startup",
-        );
         let boundary = match self.tenant.load().await {
             Verdict::Adopt(record) | Verdict::Restore(record) => {
                 match format::decode::<Boundary>(&record) {
                     Ok(boundary) => Some(boundary),
-                    // An unreadable record is not an absent one:
-                    // absent would mean a clean slate, forgetting the
-                    // previous life's commitments. The store stays
-                    // untrusted instead, and no job runs.
                     Err(error) => {
                         warn!(self.log, "unusable boundary record"; "error" => %error);
-                        return;
+                        None
                     }
                 }
             }
             Verdict::Empty => None,
-            Verdict::Discard(_) => return,
+            // The locker warned about the discard. Starting over is
+            // safe: a sled without a record serves only live-started
+            // sessions, which no previous life can have run.
+            Verdict::Discard(_) => None,
         };
         *self.boundary.lock().unwrap() = boundary;
-        self.untrusted.store(false, Ordering::SeqCst);
-    }
-
-    pub fn untrusted(&self) -> bool {
-        self.untrusted.load(Ordering::SeqCst)
     }
 
     pub fn boundary(&self) -> Option<Boundary> {
@@ -293,9 +261,6 @@ impl BoundaryStore {
     /// a newer job ignores the old job's ending.
     pub async fn record_outcome(&self, status: &JobStatus) {
         assert!(status.is_terminal());
-        if self.untrusted() {
-            return;
-        }
         let mut guard = self.tenant.lock().await;
         let updated = {
             let recorded = self.boundary.lock().unwrap();
@@ -340,13 +305,7 @@ impl BoundaryStore {
 
     /// Commit to executing the job in `boundary`. On failure the
     /// caller must not run the job.
-    pub async fn advance(&self, boundary: &Boundary) -> Result<(), BoundaryError> {
-        if self.untrusted() {
-            // Defense in depth: the state machine already refuses
-            // execution when the store is untrusted, so no launch
-            // reaches this arm.
-            return Err(BoundaryError::Untrusted);
-        }
+    pub async fn advance(&self, boundary: &Boundary) -> Result<(), StoreError> {
         let mut guard = self.tenant.lock().await;
         guard.store(&format::encode(boundary)).await?;
         *self.boundary.lock().unwrap() = Some(boundary.clone());
@@ -469,10 +428,10 @@ mod test {
         assert_eq!(decoded.successor, expected.successor);
     }
 
-    /// A record from a newer software version loads as untrusted, and
-    /// the sled reports it instead of guessing at the format.
+    /// The store starts over on a record from newer software rather
+    /// than guessing at its format.
     #[tokio::test]
-    async fn future_record_is_untrusted() {
+    async fn future_record_starts_over() {
         let dir = TempDir::with_prefix("sush-boundary-").unwrap();
         let slots = slots(&dir);
         #[derive(Serialize)]
@@ -484,7 +443,7 @@ mod test {
         drop(scratch);
 
         let store = store(slots).await;
-        assert!(store.untrusted());
+        assert!(store.boundary().is_none());
     }
 
     #[tokio::test]
@@ -501,7 +460,6 @@ mod test {
         drop(first);
 
         let next = store(slots).await;
-        assert!(!next.untrusted());
         let recorded = next.boundary().unwrap();
         assert_eq!(recorded.network, b.network);
         assert_eq!(job_of(&recorded), job_of(&b));
@@ -558,8 +516,10 @@ mod test {
         ));
     }
 
+    /// The store starts over on disagreeing slots, and the next
+    /// commit writes a fresh record.
     #[tokio::test]
-    async fn disagreement_is_untrusted_and_pins() {
+    async fn disagreement_starts_over() {
         let dir = TempDir::with_prefix("sush-boundary-").unwrap();
         let slots = slots(&dir);
         for slot in &slots {
@@ -567,40 +527,26 @@ mod test {
             lone.advance(&boundary()).await.unwrap();
         }
 
-        let untrusted = store(slots.clone()).await;
-        assert!(untrusted.untrusted());
-        assert!(untrusted.boundary().is_none());
-        assert!(matches!(
-            untrusted.advance(&boundary()).await,
-            Err(BoundaryError::Untrusted)
-        ));
-        drop(untrusted);
+        let fresh = store(slots.clone()).await;
+        assert!(fresh.boundary().is_none());
+        let committed = boundary();
+        fresh.advance(&committed).await.unwrap();
+        drop(fresh);
 
         let reload = store(slots).await;
-        assert!(reload.untrusted());
+        assert_eq!(job_of(&reload.boundary().unwrap()), job_of(&committed));
     }
 
+    /// The store starts over on a record that does not decode.
     #[tokio::test]
-    async fn undecodable_record_is_untrusted() {
+    async fn undecodable_record_starts_over() {
         let dir = TempDir::with_prefix("sush-boundary-").unwrap();
         let slots = slots(&dir);
         let scratch = locker(slots.clone());
         scratch.tenant(BOUNDARY).store(b"scribble").await.unwrap();
         drop(scratch);
 
-        let store = BoundaryStore::new(&test_log(), &locker(slots));
-        store.load().await;
-        assert!(store.untrusted());
-    }
-
-    #[tokio::test]
-    async fn unloaded_is_untrusted() {
-        let dir = TempDir::with_prefix("sush-boundary-").unwrap();
-        let store = BoundaryStore::new(&test_log(), &locker(slots(&dir)));
-        assert!(store.untrusted());
-        assert!(matches!(
-            store.advance(&boundary()).await,
-            Err(BoundaryError::Untrusted)
-        ));
+        let store = store(slots).await;
+        assert!(store.boundary().is_none());
     }
 }
