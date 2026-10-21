@@ -399,14 +399,6 @@ impl JobManager {
         self.join_state.take()
     }
 
-    fn wait_for_session(&self, session_id: SessionId) -> impl FnMut(&State) -> bool {
-        move |state| {
-            state
-                .session()
-                .is_some_and(|s| s.session_id() == session_id)
-        }
-    }
-
     fn wait_for_job(&self, job_id: &JobId, wait: JobWait) -> impl FnMut(&State) -> bool {
         move |state| {
             if wait.is_some() {
@@ -473,13 +465,8 @@ impl JobManager {
         client_nonce: SessionClientNonce,
         signer_nonce: SessionSignerNonce,
         seq: SessionSeq,
-        wait: bool,
     ) -> Result<(), JobError> {
-        // Verify that the session ID provided by the client is meant
-        // for this instance of Sush: it must hash over our baseboard
-        // and current server nonce. The preimage then travels instead
-        // of the id, so every peer derives for itself both the id and
-        // the sequence number the id commits to.
+        // Verify the session ID provided by the client.
         let server_nonce = *self.session_server_nonce.lock().unwrap();
         let preimage = SessionPreimage {
             baseboard: self.own_baseboard().clone(),
@@ -491,12 +478,31 @@ impl JobManager {
             return Err(JobError::InvalidSessionId);
         }
 
+        // Every sled keeps the start pending until a verified job of the
+        // session confirms it. Wait until it is pending here, or a session
+        // that outranks it is active, so that a job sent next finds it.
+        let rank = Some((seq, session_id));
         self.session_request(authn, SessionRequest::Start(preimage))
             .await?;
-        if wait {
-            self.wait_for(self.wait_for_session(session_id)).await?;
+        self.wait_for(move |state| state.pending_rank(session_id).is_some() || state.rank() >= rank)
+            .await
+    }
+
+    /// This sled accepts a job only if the job's session is active here,
+    /// or if the session's start is pending here for the job to confirm.
+    /// The state machine makes the final decision; this check fails fast.
+    fn session_check(&self, session_id: SessionId) -> Result<(), JobError> {
+        let state = self.state.borrow();
+        let rank = state.rank();
+        if rank.is_some_and(|(_, active)| active == session_id)
+            || state.pending_rank(session_id) > rank
+        {
+            return Ok(());
         }
-        Ok(())
+        Err(match rank {
+            None => JobError::NoSession,
+            Some(_) => JobError::SessionNotCurrent(session_id),
+        })
     }
 
     pub async fn session_stop(
@@ -594,18 +600,10 @@ impl JobManager {
             .certs()
             .verify(&job)
             .map_err(JobError::UnverifiedJob)?;
-
-        // A job can only run in the session it was signed for.
-        let payload = job.payload();
-        match self.session(authn) {
-            None => return Err(JobError::NoSession),
-            Some(session) if session.session_id() != payload.session_id() => {
-                return Err(JobError::SessionNotCurrent(payload.session_id()));
-            }
-            Some(_) => (),
-        }
+        self.session_check(job.payload().session_id())?;
 
         // A broader target would orphan jobs on unattached sleds.
+        let payload = job.payload();
         if payload.is_interactive() && payload.target().single_baseboard().is_none() {
             return Err(JobError::InteractiveTarget);
         }

@@ -588,10 +588,6 @@ pub enum SessionCommand {
         #[cfg(feature = "permslip")]
         #[arg(long, env = PERMSLIP_URL, requires = "permslip", value_name = "URL")]
         permslip_url: Option<String>,
-
-        /// Wait for the session to become active.
-        #[arg(short, long)]
-        wait: bool,
     },
 
     /// Stop a support session.
@@ -1108,7 +1104,6 @@ async fn session(
                 client_nonce,
                 permslip,
                 permslip_url,
-                wait,
             },
             Some(client),
         ) => {
@@ -1159,7 +1154,7 @@ async fn session(
                         false,
                     )
                 };
-            session_start(ctx, client, session_id, body, wait, show).await
+            session_start(ctx, client, session_id, body, show).await
         }
 
         #[cfg(feature = "permslip")]
@@ -1191,7 +1186,6 @@ async fn session(
                 nonce,
                 seq,
                 client_nonce,
-                wait,
             },
             Some(client),
         ) => {
@@ -1212,7 +1206,6 @@ async fn session(
                     signer_nonce,
                     seq,
                 },
-                wait,
                 true,
             )
             .await
@@ -1852,7 +1845,6 @@ async fn session_start(
     client: &Client,
     session_id: SessionId,
     body: SessionStartBody,
-    wait: bool,
     show: bool,
 ) -> Result<(), CommandError> {
     let session = Session::new(session_id);
@@ -1860,7 +1852,6 @@ async fn session_start(
         client
             .session_start()
             .session_id(session.session_id())
-            .wait(wait)
             .body(body.clone())
             .send()
             .await

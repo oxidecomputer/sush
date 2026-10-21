@@ -118,10 +118,6 @@ impl SessionPreimage {
 }
 
 impl SessionId {
-    pub fn first_job_id(&self) -> JobId {
-        JobId::from_hash(hash(&self.0.to_be_bytes()))
-    }
-
     pub fn next_job_id(&self, last_job: &LastJob) -> JobId {
         JobId::from_hash(match last_job {
             LastJob::None => hash(&[b"None", self.0.to_be_bytes().as_slice()].concat()),

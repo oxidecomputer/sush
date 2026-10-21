@@ -8,10 +8,12 @@
 //! messages via the gossip protocol.
 
 use std::collections::{BTreeMap, BTreeSet};
+use std::num::NonZeroUsize;
 use std::sync::Arc;
 
 use chrono::{DateTime, Utc};
 use futures::{FutureExt as _, Stream, StreamExt};
+use lru::LruCache;
 use rumors::{CausalMessages, Network, Rumors, Version};
 use sled_hardware_types::BaseboardId;
 use slog::{Logger, debug, error, info, o, warn};
@@ -23,8 +25,8 @@ use x509_cert::Certificate;
 
 use sush_api::JobStartParams;
 use sush_common::jobs::{
-    Access, JobId, JobStatus, JobStatusMap, LastJob, ProcessError, Session, SessionId, SessionSeq,
-    SkipReason, VerifiedJob,
+    Access, JobId, JobStatus, JobStatusMap, LastJob, ProcessError, Session, SessionId,
+    SessionPreimage, SessionSeq, SkipReason, VerifiedJob,
 };
 use sush_common::keys::{KeyError, KeyId};
 use sush_common::targets::Cubbies;
@@ -65,6 +67,18 @@ pub struct QueuedJob {
     pub replayed: bool,
 }
 
+/// Maximum number of session starts pending on a sled. Each one
+/// comes from a session start ceremony, so this need not be large.
+const MAX_PENDING_STARTS: NonZeroUsize = NonZeroUsize::new(10).unwrap();
+
+/// A session start that no verified job has confirmed yet.
+#[derive(Debug)]
+struct PendingStart {
+    preimage: SessionPreimage,
+    actor: KeyId,
+    live: bool,
+}
+
 #[derive(Clone, Debug, Default)]
 pub enum SessionState {
     #[default]
@@ -77,8 +91,8 @@ pub enum SessionState {
 
         /// Whether this session's start arrived as live traffic
         /// rather than replayed history. A session replayed onto a
-        /// sled with no boundary record may hold jobs a previous
-        /// life ran, so [`Past::screen`] refuses it.
+        /// sled with no boundary record may include jobs a previous
+        /// life ran, so [`Past::screen`] refuses to run its jobs.
         live: bool,
 
         /// The active session.
@@ -117,6 +131,16 @@ impl SessionState {
             return Some(Access::ReadWrite);
         }
         attach_grants.get(key_id).copied()
+    }
+
+    /// Where an active session stands in the total order of sessions
+    /// by signer-assigned sequence number, then ID.
+    pub fn rank(&self) -> Option<(SessionSeq, SessionId)> {
+        use SessionState::*;
+        match self {
+            Inactive => None,
+            Active { seq, session, .. } => Some((*seq, session.session_id())),
+        }
     }
 
     fn queued_jobs(&self) -> Option<&QueuedJobs> {
@@ -195,8 +219,8 @@ impl Past {
     fn screen(&self, session: SessionId, seq: SessionSeq, live: bool) -> Admission {
         match &self.committed {
             Some(boundary)
-                if (boundary.network == self.network && boundary.session == session)
-                    || seq > boundary.seq =>
+                if seq > boundary.seq
+                    || (boundary.network == self.network && boundary.session == session) =>
             {
                 Admission::Admit
             }
@@ -206,23 +230,11 @@ impl Past {
         }
     }
 
-    /// Construct a boundary for a verified job.
-    fn commit_to(
-        &self,
-        network: Network,
-        session_id: SessionId,
-        seq: SessionSeq,
-        job_id: JobId,
-        successor: JobId,
-    ) -> Boundary {
-        Boundary {
-            network,
-            session: session_id.to_owned(),
-            seq,
-            job: job_id,
-            successor,
-            status: None,
-        }
+    /// Return the current boundary record for this universe.
+    fn boundary(&self) -> Option<&Boundary> {
+        self.committed
+            .as_deref()
+            .filter(|boundary| boundary.network == self.network)
     }
 
     /// Whether a message at `version` is live traffic rather than
@@ -278,6 +290,8 @@ pub struct State {
     history: JobHistory,
     /// The current state of the active session, if any.
     session: SessionState,
+    /// Session starts awaiting a verified job, by session ID.
+    pending_starts: LruCache<SessionId, PendingStart>,
     /// Attachment points (socket senders) for interactive jobs.
     attachments: AttachmentPoints,
     /// Job request signing certificates.
@@ -298,6 +312,7 @@ impl State {
             rack: Rack::new(own_baseboard),
             history: Default::default(),
             session: Default::default(),
+            pending_starts: LruCache::new(MAX_PENDING_STARTS),
             attachments: Default::default(),
             certs: Certificates::new(trust_anchors)?,
             identities: Default::default(),
@@ -311,6 +326,18 @@ impl State {
 
     pub fn session(&self) -> Option<&Session> {
         self.session.session()
+    }
+
+    pub fn rank(&self) -> Option<(SessionSeq, SessionId)> {
+        self.session.rank()
+    }
+
+    /// Where a start of `session_id` would stand in the total order of
+    /// sessions, if one is pending on this sled.
+    pub fn pending_rank(&self, session_id: SessionId) -> Option<(SessionSeq, SessionId)> {
+        self.pending_starts
+            .peek(&session_id)
+            .map(|start| (start.preimage.seq, session_id))
     }
 
     pub fn attach_access(&self, key_id: &KeyId) -> Option<Access> {
@@ -425,14 +452,9 @@ impl State {
     /// re-entering the job's own universe replays the earlier ruling
     /// as a status, which stops a second announcement.
     fn adjudicate_boundary(&mut self, log: &Logger, now: DateTime<Utc>) -> Vec<Output> {
-        // An absent record commits to no job, so there
-        // is nothing to rule on.
-        let Some(boundary) = &self.past.committed else {
+        let Some(boundary) = self.past.boundary() else {
             return Vec::new();
         };
-        if boundary.network != self.past.network {
-            return Vec::new();
-        }
         let (job_id, status) = (boundary.job, boundary.status.clone());
         if self.past.adjudicated == Some(job_id) {
             return Vec::new();
@@ -561,12 +583,10 @@ impl State {
                         info!(log, "duplicate session start"; "session_id" => %session_id);
                     }
 
-                    // A start wins the slot only by exceeding the
-                    // active session in the signer-assigned order,
-                    // with ties broken by id. This one does not;
+                    // This start does not outrank the active session;
                     // ignore it.
-                    Active { seq, session, .. }
-                        if (preimage.seq, session_id) <= (*seq, session.session_id()) =>
+                    Active { seq, .. }
+                        if Some((preimage.seq, session_id)) <= self.session.rank() =>
                     {
                         info!(
                             log, "stale session start";
@@ -576,31 +596,30 @@ impl State {
                         );
                     }
 
-                    // This one does. Every peer applies the same
-                    // total order, so every peer converges on the
-                    // same session.
+                    // Ignore a resubmitted start, so its sender can't
+                    // become the starter.
+                    Inactive | Active { .. } if self.pending_starts.contains(&session_id) => {
+                        info!(
+                            log, "duplicate pending session start";
+                            "session_id" => %session_id, "actor" => %actor,
+                        );
+                    }
+
+                    // Keep an unsigned start pending until confirmed by
+                    // a verified job.
                     Inactive | Active { .. } => {
-                        info!(log, "session started"; "session_id" => %session_id, "actor" => %actor);
-                        let mut session = Session::started(session_id, actor.clone());
-                        if let Some(boundary) = &self.past.committed
-                            && boundary.network == self.past.network
-                            && boundary.session == session_id
-                        {
-                            info!(
-                                log, "resuming committed session at its successor";
-                                "session_id" => %session_id,
-                                "successor" => %boundary.successor,
-                            );
-                            session.resume_at(boundary.successor);
-                        }
-                        outputs.extend(self.skip_queued_jobs(now));
-                        self.session = Active {
-                            seq: preimage.seq,
-                            live: self.past.is_live(incoming_version),
-                            session: Box::new(session),
-                            queued_jobs: QueuedJobs::new(),
-                            attach_grants: BTreeMap::new(),
-                        };
+                        info!(
+                            log, "session start pending";
+                            "session_id" => %session_id, "actor" => %actor,
+                        );
+                        self.pending_starts.put(
+                            session_id,
+                            PendingStart {
+                                preimage: preimage.clone(),
+                                actor: actor.clone(),
+                                live: self.past.is_live(incoming_version),
+                            },
+                        );
                     }
                 }
             }
@@ -714,6 +733,56 @@ impl State {
         outputs
     }
 
+    /// Confirm a pending start of `session_id`, if it still outranks
+    /// the active session. Every peer applies the same total order,
+    /// so they all converge on the same session.
+    #[must_use]
+    fn confirm_start(
+        &mut self,
+        log: &Logger,
+        now: DateTime<Utc>,
+        session_id: SessionId,
+    ) -> Vec<Output> {
+        let Some(start) = self.pending_starts.pop(&session_id) else {
+            return Vec::new();
+        };
+        if Some((start.preimage.seq, session_id)) <= self.session.rank() {
+            info!(
+                log, "stale session start";
+                "session_id" => %session_id,
+                "seq" => %start.preimage.seq,
+                "active" => ?self.session.rank(),
+            );
+            return Vec::new();
+        }
+        info!(
+            log, "session started";
+            "session_id" => %session_id, "actor" => %start.actor,
+        );
+        let mut session = Session::started(session_id, start.actor);
+        if let Some(boundary) = self
+            .past
+            .boundary()
+            .filter(|boundary| boundary.session == session_id)
+        {
+            info!(
+                log, "resuming committed session at its successor";
+                "session_id" => %session_id,
+                "successor" => %boundary.successor,
+            );
+            session.resume_at(boundary.successor);
+        }
+        let outputs = self.skip_queued_jobs(now);
+        self.session = SessionState::Active {
+            seq: start.preimage.seq,
+            live: start.live,
+            session: Box::new(session),
+            queued_jobs: QueuedJobs::new(),
+            attach_grants: BTreeMap::new(),
+        };
+        outputs
+    }
+
     #[must_use]
     fn handle_job_request(
         &mut self,
@@ -740,28 +809,15 @@ impl State {
                     }
                 };
 
-                // The session must be active and must match the
-                // submitted job. It is safe to refuse all other jobs.
-                // By cases:
-                //
-                // - If the job came from a session in the causal
-                // past of our own, the session has been superseded,
-                // so we should not run it.
-                // - If the job came from a session concurrent to
-                // our own, both sessions should be annihilated, so
-                // we should not run it.
-                // - If the job came from a session in the causal
-                // future of our own, contradiction: we consume
-                // messages in causal order, so it's not possible to
-                // receive a job from a session before that
-                // session's own start (since each session is
-                // linearized by its accepting server).
-                //
-                // Refused jobs targeting this sled record the
-                // terminal skip status so the submitter learns
-                // their fate.
+                // A verified job confirms its session's pending start.
+                // The job then joins the queue only if its session is
+                // active; any other session was stopped or superseded.
+                // A refused job that targets this sled gets a Skipped
+                // status here, which tells its submitter it will not
+                // run.
                 let session_id = signed.payload().session_id();
                 let live = self.is_live(incoming_version);
+                outputs.extend(self.confirm_start(log, now, session_id));
                 if self
                     .session
                     .session()
@@ -1119,15 +1175,16 @@ impl State {
                                 job: request.clone(),
                                 params,
                                 attachment,
-                                boundary: self.past.commit_to(
+                                boundary: Boundary {
                                     network,
-                                    session.session_id(),
-                                    *seq,
-                                    job_id,
-                                    session
+                                    session: session.session_id(),
+                                    seq: *seq,
+                                    job: job_id,
+                                    successor: session
                                         .session_id()
                                         .next_job_id(&LastJob::Some((*request).clone())),
-                                ),
+                                    status: None,
+                                },
                             })));
                         }
                     }
@@ -1868,7 +1925,8 @@ mod test {
         }
     }
 
-    /// A fresh universe with an adopted session, ready for jobs.
+    /// A fresh universe with a pending session start, which the first
+    /// verified job of the session confirms.
     async fn sim_with_session() -> (EphemeralKey, Sim, SessionId, Session) {
         let root = root();
         let anchors = vec![root.cert().clone()];
@@ -1882,9 +1940,9 @@ mod test {
         (root, sim, session_id, Session::new(session_id))
     }
 
-    /// The happy path through the step surface alone: a session
-    /// starts, a signed job releases, the job's own events settle its
-    /// status, and the session stops.
+    /// The happy path through the step surface alone: a session start
+    /// waits, a signed job confirms it and is released to run, the
+    /// job's own events settle its status, and the session stops.
     #[tokio::test]
     async fn session_lifecycle_through_step() {
         let mut root = root();
@@ -1899,7 +1957,8 @@ mod test {
             actor.clone(),
             SessionRequest::Start(preimage),
         ));
-        assert!(sim.state.session.session().is_some());
+        assert!(sim.state.session.session().is_none());
+        assert!(sim.state.pending_rank(session_id).is_some());
 
         let job_id = session.next_job_id();
         let signed = signed_job(&mut root, job_id, session_id, "true").await;
@@ -1911,6 +1970,12 @@ mod test {
             outputs
                 .iter()
                 .any(|o| matches!(o, Output::Run(run) if *run.job.payload().job_id() == job_id))
+        );
+        assert!(
+            sim.state
+                .session
+                .session()
+                .is_some_and(|s| s.session_id() == session_id)
         );
 
         sim.send(Message::Event(
@@ -1942,8 +2007,41 @@ mod test {
         assert!(sim.state.session.session().is_none());
     }
 
-    /// A forged job never joins the queue. The chain and the history
-    /// stay untouched, and the signed job it mimics runs in its place.
+    /// When a second start of a pending session arrives from another
+    /// identity, the first submitter remains the starter once a job
+    /// confirms the session.
+    #[tokio::test]
+    async fn duplicate_start_keeps_first_actor() {
+        let mut root = root();
+        let anchors = vec![root.cert().clone()];
+        let mut sim = Sim::new(&anchors, Vec::new()).await;
+        let starter = root.key_id().clone();
+        let resubmitter = self::root().key_id().clone();
+        let preimage = preimage(1);
+        let session_id = preimage.session_id();
+        let session = Session::new(session_id);
+        for actor in [&starter, &resubmitter] {
+            sim.request(Request::session(
+                actor.clone(),
+                SessionRequest::Start(preimage.clone()),
+            ));
+        }
+
+        let job_id = session.next_job_id();
+        let signed = signed_job(&mut root, job_id, session_id, "true").await;
+        sim.request(Request::job(
+            resubmitter,
+            JobRequest::Start(signed, JobStartParams::default()),
+        ));
+        assert_eq!(
+            sim.state.session.session().and_then(Session::started_by),
+            Some(&starter)
+        );
+    }
+
+    /// A forged job never joins the queue or confirms a start. The
+    /// history stays untouched, and the signed job it mimics confirms
+    /// the start and runs in its place.
     #[tokio::test]
     async fn unverified_job_does_not_advance_the_chain() {
         let (mut root, mut sim, session_id, session) = sim_with_session().await;
@@ -1962,7 +2060,8 @@ mod test {
             JobRequest::Start(forged, JobStartParams::default()),
         ));
         assert!(outputs.is_empty());
-        assert_eq!(sim.state.session.session().unwrap().next_job_id(), job_id);
+        assert!(sim.state.session.session().is_none());
+        assert!(sim.state.pending_rank(session_id).is_some());
         assert!(!sim.state.history.contains(&job_id));
 
         let outputs = sim.request(Request::job(
@@ -2010,19 +2109,20 @@ mod test {
             actor.clone(),
             SessionRequest::Start(committed_preimage),
         ));
+        assert!(sim.state.pending_rank(session_id).is_some());
+
+        // If the committed job arrives again, it confirms the start but
+        // skips as superseded instead of running.
+        let outputs = sim.request(Request::job(
+            actor.clone(),
+            JobRequest::Start(job_a, JobStartParams::default()),
+        ));
         assert!(
             sim.state
                 .session
                 .session()
                 .is_some_and(|s| s.session_id() == session_id)
         );
-
-        // If the committed job arrives again, it skips as superseded
-        // instead of running.
-        let outputs = sim.request(Request::job(
-            actor.clone(),
-            JobRequest::Start(job_a, JobStartParams::default()),
-        ));
         assert!(!outputs.iter().any(|o| matches!(o, Output::Run(_))));
         assert!(outputs.iter().any(|o| matches!(
             o,

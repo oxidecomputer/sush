@@ -769,7 +769,7 @@
     "/sessions/{session_id}/start": {
       "post": {
         "summary": "Start a new support session.",
-        "description": "There may only be one session active on the rack at a time. If a session is already running when this request is made, the new session supersedes the old one, but the old session's jobs are not stopped.",
+        "description": "A session start is not signed, so the rack acts on it only when it verifies a signed job for the session. The new session then supersedes the active one: the rack skips the old session's queued jobs but does not stop its running jobs.",
         "operationId": "session_start",
         "parameters": [
           {
@@ -786,14 +786,6 @@
             "required": true,
             "schema": {
               "$ref": "#/components/schemas/SessionId"
-            }
-          },
-          {
-            "in": "query",
-            "name": "wait",
-            "description": "Wait for the subject to appear in the state.",
-            "schema": {
-              "type": "boolean"
             }
           }
         ],
