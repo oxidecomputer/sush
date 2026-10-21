@@ -521,10 +521,7 @@ mod wire_format {
     fn wire_formats() {
         // The boundary module pins its record formats in the same
         // directory.
-        let mut expected = BTreeSet::from([
-            "boundary-record-v0.bin".to_string(),
-            "boundary-record-v1.bin".to_string(),
-        ]);
+        let mut expected = BTreeSet::from(["boundary-record-v1.bin".to_string()]);
         for message in samples() {
             let name = snapshot_name(&message);
             assert!(

@@ -38,7 +38,7 @@ use slog::{Logger, o, warn};
 
 use sush_common::jobs::{JobId, JobStatus, ProcessError, SessionId, SessionSeq};
 
-use crate::format::{self, Record, Versioned};
+use crate::format::{self, NoFormat, Record, Versioned};
 use crate::locker::{Locker, StoreError, Tenant, TenantSpec, Verdict};
 
 pub const BOUNDARY: TenantSpec = TenantSpec {
@@ -46,18 +46,10 @@ pub const BOUNDARY: TenantSpec = TenantSpec {
     magic: b"SUSHBOUNDARY",
 };
 
-/// The execution boundary: what this sled last committed to, and in
-/// which universe. The committed session supersedes every session at
-/// or below its sequence number: the signer orders sessions totally
-/// and across universes, so every session a previous life could have
-/// run jobs under sits at or below this one stored number.
-#[derive(Clone, Debug, Deserialize, Serialize)]
-pub struct Boundary {
-    pub network: Network,
-    pub job: Option<Committed>,
-}
-
-/// The last job this sled committed to running, and how far it got.
+/// The execution boundary: the last job this sled committed to
+/// running, in which universe, and how far it got. The committed
+/// session supersedes every session at or below its sequence number.
+///
 /// We also store the chain position *after* `job`, computed from the
 /// request's signed bytes at commit time, to allow session resumption
 /// across a crash or reboot.
@@ -69,29 +61,22 @@ pub struct Boundary {
 /// ID `K` unless *re-presented* with the full job for `J`. Thus,
 /// the session would be wedged unless the operator took the (unusual,
 /// undesirable) step of re-submitting a job just to advance the chain.
+///
+/// The argument for recording the terminal status is similar:
+/// if the command ends in `reboot`, we may be able to observe
+/// and record a valid exit status but not be able to gossip it
+/// before the sled goes down. So on restart we may have the only
+/// copy of the job status.
 #[derive(Clone, Debug, Deserialize, Serialize)]
-pub struct Committed {
+pub struct Boundary {
+    pub network: Network,
     pub session: SessionId,
     pub seq: SessionSeq,
     pub job: JobId,
     pub successor: JobId,
-    pub outcome: JobOutcome,
+    pub status: Option<JobStatus>,
 }
 
-/// How far the boundary job got.
-#[derive(Clone, Debug, Deserialize, Serialize)]
-pub enum JobOutcome {
-    /// Committed to run, with no ending recorded.
-    Committed,
-    /// The job's terminal status, error endings included.
-    Ended(JobStatus),
-}
-
-/// Record version 1 replaces the v0 executed-session join and burned set
-/// with the committed sequence number from the session-v2 protocol.
-/// Don't confuse a "session-v2" (one with a sequence number) with a
-/// boundary record version 2 (which doesn't yet exist).
-///
 /// See [`crate::format`] for instructions on adding this version's
 /// successor.
 impl Versioned for Boundary {
@@ -99,116 +84,13 @@ impl Versioned for Boundary {
 }
 
 impl Record for Boundary {
-    type Previous = v0::Boundary;
+    type Previous = NoFormat;
 }
 
-impl TryFrom<v0::Boundary> for Boundary {
+impl TryFrom<NoFormat> for Boundary {
     type Error = &'static str;
-
-    fn try_from(old: v0::Boundary) -> Result<Self, Self::Error> {
-        let v0::Boundary {
-            network,
-            burned: _,   // dropped with session-v2 protocol
-            executed: _, // also dropped with session-v2
-            job,
-        } = old;
-        Ok(Self {
-            network,
-            job: job.map(|job| {
-                let v0::Committed {
-                    session,
-                    job,
-                    successor,
-                    outcome,
-                } = job;
-                Committed {
-                    session,
-                    seq: SessionSeq::zero(), // any valid session-v2 will supersede this one
-                    job,
-                    successor,
-                    outcome,
-                }
-            }),
-        })
-    }
-}
-
-/// The version 0 record shapes, kept only to decode records written
-/// before sessions carried sequence numbers.
-pub mod v0 {
-    use super::{JobId, JobOutcome, Network, SessionId};
-    use crate::format::{NoFormat, Record, Versioned};
-    use serde::{Deserialize, Deserializer, Serialize, Serializer};
-    use sush_common::wire::ExactBytes;
-
-    #[derive(Deserialize, Serialize)]
-    pub struct Boundary {
-        pub network: Network,
-        pub burned: Burned,
-        #[serde(with = "version_bytes")]
-        pub executed: rumors::Version,
-        pub job: Option<Committed>,
-    }
-
-    /// The v0 burned set: the Bloom filter's 1024 bytes, decoded but
-    /// never read.
-    pub struct Burned(Box<[u8; 1024]>);
-
-    impl Serialize for Burned {
-        fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
-            serializer.serialize_bytes(&self.0[..])
-        }
-    }
-
-    impl<'de> Deserialize<'de> for Burned {
-        fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
-            Ok(Self(Box::new(
-                deserializer.deserialize_bytes(ExactBytes::<1024>)?,
-            )))
-        }
-    }
-
-    #[derive(Deserialize, Serialize)]
-    pub struct Committed {
-        pub session: SessionId,
-        pub job: JobId,
-        pub successor: JobId,
-        pub outcome: JobOutcome,
-    }
-
-    impl Versioned for Boundary {
-        const VERSION: u16 = 0;
-    }
-
-    impl Record for Boundary {
-        type Previous = NoFormat;
-    }
-
-    impl TryFrom<NoFormat> for Boundary {
-        type Error = &'static str;
-        fn try_from(none: NoFormat) -> Result<Self, Self::Error> {
-            match none {}
-        }
-    }
-
-    mod version_bytes {
-        use rumors::Version;
-        use serde::de::Error as _;
-        use serde::{Deserialize, Deserializer, Serializer};
-
-        pub fn serialize<S: Serializer>(
-            version: &Version,
-            serializer: S,
-        ) -> Result<S::Ok, S::Error> {
-            serializer.serialize_bytes(&version.encode())
-        }
-
-        pub fn deserialize<'de, D: Deserializer<'de>>(
-            deserializer: D,
-        ) -> Result<Version, D::Error> {
-            let bytes = <Vec<u8>>::deserialize(deserializer)?;
-            Version::decode(bytes.as_slice()).map_err(D::Error::custom)
-        }
+    fn try_from(none: NoFormat) -> Result<Self, Self::Error> {
+        match none {}
     }
 }
 
@@ -217,7 +99,6 @@ pub mod v0 {
 pub struct BoundaryStore {
     log: Logger,
     tenant: Tenant,
-    /// The record, readable synchronously by the state machine.
     boundary: SyncMutex<Option<Boundary>>,
 }
 
@@ -242,11 +123,7 @@ impl BoundaryStore {
                     }
                 }
             }
-            Verdict::Empty => None,
-            // The locker warned about the discard. Starting over is
-            // safe: a sled without a record serves only live-started
-            // sessions, which no previous life can have run.
-            Verdict::Discard(_) => None,
+            Verdict::Empty | Verdict::Discard(_) => None,
         };
         *self.boundary.lock().unwrap() = boundary;
     }
@@ -259,23 +136,19 @@ impl BoundaryStore {
     /// `Interrupted`, mirroring the status arms in the state machine.
     /// Nothing else is overwritten, and a record that has moved on to
     /// a newer job ignores the old job's ending.
-    pub async fn record_outcome(&self, status: &JobStatus) {
+    pub async fn record_status(&self, status: &JobStatus) {
         assert!(status.is_terminal());
         let mut guard = self.tenant.lock().await;
         let updated = {
             let recorded = self.boundary.lock().unwrap();
-            let Some(boundary) = recorded.as_ref() else {
-                return;
-            };
-            let Some(committed) = boundary.job.as_ref().filter(|c| c.job == *status.job_id())
-            else {
+            let Some(boundary) = recorded.as_ref().filter(|b| b.job == *status.job_id()) else {
                 return;
             };
             let displaces = matches!(
-                (&committed.outcome, status),
-                (JobOutcome::Committed, _)
+                (&boundary.status, status),
+                (None, _)
                     | (
-                        JobOutcome::Ended(JobStatus::Error {
+                        Some(JobStatus::Error {
                             error: ProcessError::Interrupted,
                             ..
                         }),
@@ -286,11 +159,8 @@ impl BoundaryStore {
                 return;
             }
             Boundary {
-                job: Some(Committed {
-                    outcome: JobOutcome::Ended(status.clone()),
-                    ..committed.clone()
-                }),
-                network: boundary.network,
+                status: Some(status.clone()),
+                ..boundary.clone()
             }
         };
         if let Err(error) = guard.store(&format::encode(&updated)).await {
@@ -367,33 +237,12 @@ mod test {
     fn boundary() -> Boundary {
         Boundary {
             network: network(1),
-            job: Some(Committed {
-                session: SessionId::random(),
-                seq: seq(1_760_000_000_000),
-                job: JobId::random(),
-                successor: JobId::random(),
-                outcome: JobOutcome::Committed,
-            }),
+            session: SessionId::random(),
+            seq: seq(1_760_000_000_000),
+            job: JobId::random(),
+            successor: JobId::random(),
+            status: None,
         }
-    }
-
-    fn job_of(boundary: &Boundary) -> JobId {
-        boundary.job.as_ref().expect("a committed job").job
-    }
-
-    /// The frozen v0 snapshot decodes and converts: the commitment
-    /// survives with a sequence number of zero. Nothing can regenerate
-    /// the snapshot; the code that wrote it is gone, and git keeps the
-    /// bytes.
-    #[test]
-    fn v0_record_converts() {
-        let bytes = std::fs::read("tests/output/boundary-record-v0.bin").expect("missing snapshot");
-        let decoded: Boundary = format::decode(&bytes).unwrap();
-        assert_eq!(decoded.network, network(1));
-        let job = decoded.job.unwrap();
-        assert_eq!(job.session, "abandon-ability".parse().unwrap());
-        assert_eq!(job.successor, "able-about".parse().unwrap());
-        assert_eq!(job.seq, seq(0));
     }
 
     /// The record's bytes are on-disk format, frozen at version 1. If
@@ -404,13 +253,11 @@ mod test {
     fn pin_record_format_v1() {
         let record = Boundary {
             network: network(1),
-            job: Some(Committed {
-                session: "abandon-ability".parse().unwrap(),
-                seq: seq(1_760_000_000_000),
-                job: "zoo-zero".parse().unwrap(),
-                successor: "able-about".parse().unwrap(),
-                outcome: JobOutcome::Committed,
-            }),
+            session: "abandon-ability".parse().unwrap(),
+            seq: seq(1_760_000_000_000),
+            job: "zoo-zero".parse().unwrap(),
+            successor: "able-about".parse().unwrap(),
+            status: None,
         };
         let bytes = format::encode(&record);
         let path = "tests/output/boundary-record-v1.bin";
@@ -422,10 +269,10 @@ mod test {
         }
         let decoded: Boundary = format::decode(&bytes).unwrap();
         assert_eq!(decoded.network, record.network);
-        let (decoded, expected) = (decoded.job.unwrap(), record.job.unwrap());
-        assert_eq!(decoded.session, expected.session);
-        assert_eq!(decoded.seq, expected.seq);
-        assert_eq!(decoded.successor, expected.successor);
+        assert_eq!(decoded.session, record.session);
+        assert_eq!(decoded.seq, record.seq);
+        assert_eq!(decoded.job, record.job);
+        assert_eq!(decoded.successor, record.successor);
     }
 
     /// The store starts over on a record from newer software rather
@@ -462,12 +309,11 @@ mod test {
         let next = store(slots).await;
         let recorded = next.boundary().unwrap();
         assert_eq!(recorded.network, b.network);
-        assert_eq!(job_of(&recorded), job_of(&b));
-        let (recorded, expected) = (recorded.job.unwrap(), b.job.unwrap());
-        assert_eq!(recorded.session, expected.session);
-        assert_eq!(recorded.seq, expected.seq);
-        assert_eq!(recorded.successor, expected.successor);
-        assert!(matches!(recorded.outcome, JobOutcome::Committed));
+        assert_eq!(recorded.session, b.session);
+        assert_eq!(recorded.seq, b.seq);
+        assert_eq!(recorded.job, b.job);
+        assert_eq!(recorded.successor, b.successor);
+        assert!(recorded.status.is_none());
     }
 
     /// The boundary job's recorded ending survives into the next life.
@@ -479,7 +325,7 @@ mod test {
         let slots = slots(&dir);
         let first = store(slots.clone()).await;
         let b = boundary();
-        let job = job_of(&b);
+        let job = b.job;
         first.advance(&b).await.unwrap();
 
         let interrupted = JobStatus::Error {
@@ -497,19 +343,16 @@ mod test {
             time_error: chrono::Utc::now(),
             error: ProcessError::Killed(9),
         };
-        first.record_outcome(&stray).await;
-        assert!(matches!(
-            first.boundary().unwrap().job.unwrap().outcome,
-            JobOutcome::Committed
-        ));
+        first.record_status(&stray).await;
+        assert!(first.boundary().unwrap().status.is_none());
 
-        first.record_outcome(&interrupted).await;
-        first.record_outcome(&killed).await;
+        first.record_status(&interrupted).await;
+        first.record_status(&killed).await;
         drop(first);
         let next = store(slots).await;
         assert!(matches!(
-            next.boundary().unwrap().job.unwrap().outcome,
-            JobOutcome::Ended(JobStatus::Error {
+            next.boundary().unwrap().status,
+            Some(JobStatus::Error {
                 error: ProcessError::Interrupted,
                 ..
             })
@@ -534,7 +377,7 @@ mod test {
         drop(fresh);
 
         let reload = store(slots).await;
-        assert_eq!(job_of(&reload.boundary().unwrap()), job_of(&committed));
+        assert_eq!(reload.boundary().unwrap().job, committed.job);
     }
 
     /// The store starts over on a record that does not decode.

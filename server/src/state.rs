@@ -38,7 +38,7 @@ use crate::identities::Identities;
 use crate::job::SocketSender;
 use crate::locker::Locker;
 use crate::locker::bookmark::SushBookmark;
-use crate::locker::boundary::{Boundary, BoundaryStore, Committed, JobOutcome};
+use crate::locker::boundary::{Boundary, BoundaryStore};
 use crate::messages::v0::{Event, JobEvent, JobRequest, Message, Request, SessionRequest};
 use crate::messages::{VersionedMessage, VersionedMessage::*};
 use crate::output::JobOutputDir;
@@ -194,18 +194,13 @@ impl Past {
     /// by ones with a higher sequence number.
     fn screen(&self, session: SessionId, seq: SessionSeq, live: bool) -> Admission {
         match &self.committed {
-            Some(boundary) => match &boundary.job {
-                Some(committed)
-                    if (boundary.network == self.network && committed.session == session)
-                        || seq > committed.seq =>
-                {
-                    Admission::Admit
-                }
-                Some(_) => Admission::Refuse,
-                None if live => Admission::Admit,
-                None => Admission::Refuse,
-            },
-
+            Some(boundary)
+                if (boundary.network == self.network && boundary.session == session)
+                    || seq > boundary.seq =>
+            {
+                Admission::Admit
+            }
+            Some(_) => Admission::Refuse,
             None if live => Admission::Admit,
             None => Admission::Refuse,
         }
@@ -222,13 +217,11 @@ impl Past {
     ) -> Boundary {
         Boundary {
             network,
-            job: Some(Committed {
-                session: session_id.to_owned(),
-                seq,
-                job: job_id,
-                successor,
-                outcome: JobOutcome::Committed,
-            }),
+            session: session_id.to_owned(),
+            seq,
+            job: job_id,
+            successor,
+            status: None,
         }
     }
 
@@ -437,13 +430,10 @@ impl State {
         let Some(boundary) = &self.past.committed else {
             return Vec::new();
         };
-        let Some(Committed { job, outcome, .. }) = boundary.job.as_ref() else {
-            return Vec::new();
-        };
         if boundary.network != self.past.network {
             return Vec::new();
         }
-        let (job_id, outcome) = (*job, outcome.clone());
+        let (job_id, status) = (boundary.job, boundary.status.clone());
         if self.past.adjudicated == Some(job_id) {
             return Vec::new();
         }
@@ -457,8 +447,8 @@ impl State {
         // A stopped ending announces the start and stop pair, so the
         // ordinary status transitions apply on every sled; a bare stop
         // with no prior start would be dropped.
-        let events = match outcome {
-            JobOutcome::Ended(JobStatus::Stopped {
+        let events = match status {
+            Some(JobStatus::Stopped {
                 time_started,
                 time_stopped,
                 result,
@@ -468,10 +458,10 @@ impl State {
                 JobEvent::Start(job_id, time_started),
                 JobEvent::Stop(job_id, time_stopped, result, output),
             ],
-            JobOutcome::Ended(JobStatus::Error {
+            Some(JobStatus::Error {
                 time_error, error, ..
             }) => vec![JobEvent::Error(job_id, time_error, error)],
-            JobOutcome::Ended(_) | JobOutcome::Committed => {
+            Some(_) | None => {
                 vec![JobEvent::Error(job_id, now, ProcessError::Interrupted)]
             }
         };
@@ -594,17 +584,14 @@ impl State {
                         let mut session = Session::started(session_id, actor.clone());
                         if let Some(boundary) = &self.past.committed
                             && boundary.network == self.past.network
-                            && let Some(committed) = boundary
-                                .job
-                                .as_ref()
-                                .filter(|committed| committed.session == session_id)
+                            && boundary.session == session_id
                         {
                             info!(
                                 log, "resuming committed session at its successor";
                                 "session_id" => %session_id,
-                                "successor" => %committed.successor,
+                                "successor" => %boundary.successor,
                             );
-                            session.resume_at(committed.successor);
+                            session.resume_at(boundary.successor);
                         }
                         outputs.extend(self.skip_queued_jobs(now));
                         self.session = Active {
@@ -1189,7 +1176,7 @@ fn apply_outputs(
             Output::Ran(status) => {
                 executor.job_stopped(status.job_id());
                 let store = store.clone();
-                spawn(async move { store.record_outcome(&status).await });
+                spawn(async move { store.record_status(&status).await });
             }
             Output::Gossip(message) => {
                 if let Some(rumors) = rumors {
@@ -1363,12 +1350,10 @@ impl StateManager {
                         state.rack.set_cubbies(cubbies.borrow_and_update().clone());
                     });
                 }
-                if let Some(Committed { session, job, .. }) =
-                    boundary.as_ref().and_then(|boundary| boundary.job.as_ref())
-                {
+                if let Some(boundary) = boundary.as_ref() {
                     info!(
                         log, "inherited an execution boundary; the committed session resumes at its stored successor";
-                        "session_id" => %session, "job_id" => %job,
+                        "session_id" => %boundary.session, "job_id" => %boundary.job,
                     );
                 }
 
@@ -1643,13 +1628,11 @@ mod test {
     fn committed_boundary(job: JobId) -> Boundary {
         Boundary {
             network: network(1),
-            job: Some(Committed {
-                session: SessionId::random(),
-                seq: seq(10),
-                job,
-                successor: JobId::random(),
-                outcome: JobOutcome::Committed,
-            }),
+            session: SessionId::random(),
+            seq: seq(10),
+            job,
+            successor: JobId::random(),
+            status: None,
         }
     }
 
@@ -1690,13 +1673,11 @@ mod test {
         let session = SessionId::random();
         let committed = Boundary {
             network: network(1),
-            job: Some(Committed {
-                session,
-                seq: seq(10),
-                job: JobId::random(),
-                successor: JobId::random(),
-                outcome: JobOutcome::Committed,
-            }),
+            session,
+            seq: seq(10),
+            job: JobId::random(),
+            successor: JobId::random(),
+            status: None,
         };
         let past = past(Some(committed));
 
@@ -1975,13 +1956,11 @@ mod test {
         assert_ne!(sim.rumors.network(), other);
         sim.state.past.committed = Some(Box::new(Boundary {
             network: other,
-            job: Some(Committed {
-                session: session_id,
-                seq: committed_preimage.seq,
-                job: job_a_id,
-                successor: successor_id,
-                outcome: JobOutcome::Committed,
-            }),
+            session: session_id,
+            seq: committed_preimage.seq,
+            job: job_a_id,
+            successor: successor_id,
+            status: None,
         }));
 
         // The session's start arrives in this network.
@@ -2044,13 +2023,11 @@ mod test {
         // number 1, does not exceed.
         sim.state.past.committed = Some(Box::new(Boundary {
             network: sim.rumors.network(),
-            job: Some(Committed {
-                session: SessionId::random(),
-                seq: seq(10),
-                job: JobId::random(),
-                successor: JobId::random(),
-                outcome: JobOutcome::Committed,
-            }),
+            session: SessionId::random(),
+            seq: seq(10),
+            job: JobId::random(),
+            successor: JobId::random(),
+            status: None,
         }));
 
         let skipped = |outputs: &[Output], job_id: JobId| {
