@@ -33,7 +33,7 @@ use sush_common::authn::{
 use sush_common::jobs::{
     Access, JobId, JobOutputStream, JobStatusMap, Session, SessionClientNonce, SessionId,
     SessionPreimage, SessionSeq, SessionServerNonce, SessionSignerNonce, SessionSushNonce,
-    SignedJob,
+    SignedJob, VerifiedJob,
 };
 use sush_common::keys::{KeyError, KeyId, SshPublicKey};
 use sush_common::targets::{Cubbies, SledHealth, SledVersion};
@@ -58,8 +58,20 @@ const MAX_CACHED_IDENTITIES: NonZeroUsize = NonZeroUsize::new(1_000).unwrap();
 /// for the whole nonce TTL to lock a user out.
 const MAX_OUTSTANDING_NONCES: NonZeroUsize = NonZeroUsize::new(10_000).unwrap();
 
+/// Maximum number of session start requests that may be queued.
+/// Since each request is the result of a session start ceremony,
+/// this need not be large.
+const MAX_PENDING_STARTS: NonZeroUsize = NonZeroUsize::new(10).unwrap();
+
 /// Maximum amount of time we're willing to wait for job start or stop.
 const WAIT_TIMEOUT: Duration = Duration::from_secs(600);
+
+/// A session start is held until a signed job confirms it.
+#[derive(Debug)]
+struct PendingStart {
+    preimage: SessionPreimage,
+    actor: Identity,
+}
 
 /// An authenticated identity and the state that authorizes its
 /// requests: the ephemeral verifier, the spent sequence numbers, and
@@ -89,6 +101,7 @@ pub struct JobManager {
     nonces: Arc<Mutex<LruCache<Nonce, Instant>>>,
     identities: Arc<Mutex<LruCache<(KeyId, Nonce), CachedIdentity>>>,
     session_server_nonce: Arc<SyncMutex<SessionServerNonce>>,
+    pending_starts: Arc<SyncMutex<LruCache<SessionId, PendingStart>>>,
     output_dir: JobOutputDir,
     own_baseboard: BaseboardId,
     linked: LinkedBaseboards,
@@ -165,6 +178,7 @@ impl JobManager {
             nonces: Arc::new(Mutex::new(LruCache::new(MAX_OUTSTANDING_NONCES))),
             identities: Arc::new(Mutex::new(LruCache::new(MAX_CACHED_IDENTITIES))),
             session_server_nonce,
+            pending_starts: Arc::new(SyncMutex::new(LruCache::new(MAX_PENDING_STARTS))),
             own_baseboard,
             linked,
             output_dir,
@@ -399,14 +413,6 @@ impl JobManager {
         self.join_state.take()
     }
 
-    fn wait_for_session(&self, session_id: SessionId) -> impl FnMut(&State) -> bool {
-        move |state| {
-            state
-                .session()
-                .is_some_and(|s| s.session_id() == session_id)
-        }
-    }
-
     fn wait_for_job(&self, job_id: &JobId, wait: JobWait) -> impl FnMut(&State) -> bool {
         move |state| {
             if wait.is_some() {
@@ -473,13 +479,8 @@ impl JobManager {
         client_nonce: SessionClientNonce,
         signer_nonce: SessionSignerNonce,
         seq: SessionSeq,
-        wait: bool,
     ) -> Result<(), JobError> {
-        // Verify that the session ID provided by the client is meant
-        // for this instance of Sush: it must hash over our baseboard
-        // and current server nonce. The preimage then travels instead
-        // of the id, so every peer derives for itself both the id and
-        // the sequence number the id commits to.
+        // Verify the session ID provided by the client.
         let server_nonce = *self.session_server_nonce.lock().unwrap();
         let preimage = SessionPreimage {
             baseboard: self.own_baseboard().clone(),
@@ -491,12 +492,40 @@ impl JobManager {
             return Err(JobError::InvalidSessionId);
         }
 
-        self.session_request(authn, SessionRequest::Start(preimage))
-            .await?;
-        if wait {
-            self.wait_for(self.wait_for_session(session_id)).await?;
-        }
+        // Hold the start until a signed job can confirm it.
+        self.pending_starts.lock().unwrap().put(
+            session_id,
+            PendingStart {
+                preimage,
+                actor: authn.clone(),
+            },
+        );
         Ok(())
+    }
+
+    /// Confirm the session that `job` is in, and release a matching
+    /// pending start.
+    async fn confirm_session(&self, job: &VerifiedJob) -> Result<(), JobError> {
+        let session_id = job.payload().session_id();
+        let rank = self.state.borrow().rank();
+        if rank.is_some_and(|(_, active)| active == session_id) {
+            return Ok(());
+        }
+        let Some(start) = self
+            .pending_starts
+            .lock()
+            .unwrap()
+            .pop(&session_id)
+            .filter(|start| Some((start.preimage.seq, session_id)) > rank)
+        else {
+            return Err(match rank {
+                None => JobError::NoSession,
+                Some(_) => JobError::SessionNotCurrent(session_id),
+            });
+        };
+        self.session_request(&start.actor, SessionRequest::Start(start.preimage))
+            .await?;
+        self.wait_for(move |state| state.rank() != rank).await
     }
 
     pub async fn session_stop(
@@ -589,23 +618,16 @@ impl JobManager {
         params: JobStartParams,
     ) -> Result<(), JobError> {
         // A forged job must not take a signed job's place in the chain.
-        self.state
+        let verified = self
+            .state
             .borrow()
             .certs()
             .verify(&job)
             .map_err(JobError::UnverifiedJob)?;
-
-        // A job can only run in the session it was signed for.
-        let payload = job.payload();
-        match self.session(authn) {
-            None => return Err(JobError::NoSession),
-            Some(session) if session.session_id() != payload.session_id() => {
-                return Err(JobError::SessionNotCurrent(payload.session_id()));
-            }
-            Some(_) => (),
-        }
+        self.confirm_session(&verified).await?;
 
         // A broader target would orphan jobs on unattached sleds.
+        let payload = job.payload();
         if payload.is_interactive() && payload.target().single_baseboard().is_none() {
             return Err(JobError::InteractiveTarget);
         }

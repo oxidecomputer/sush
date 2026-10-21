@@ -40,7 +40,7 @@ use sush_server::output::{JobOutputDir, OutputDirs};
 use sush_server::{JobError, JobManager};
 
 use crate::test_utils::{
-    IntoBytes as _, SessionCeremony, SignJobRequest as _, ephemeral_test_root,
+    IntoBytes as _, SessionCeremony, SignJobRequest as _, confirm_start, ephemeral_test_root,
     ephemeral_test_subject, fake_identity, manager_and_test_root, manager_test_root_and_peer,
     no_cubbies, null_gossip, session_ceremony, test_baseboard_id, test_logger,
 };
@@ -110,7 +110,7 @@ async fn jobs() {
         ..
     } = session_ceremony(&mgr, 1);
     let mut session = Session::new(session_id);
-    mgr.session_start(&authn, session_id, client_nonce, signer_nonce, seq, true)
+    mgr.session_start(&authn, session_id, client_nonce, signer_nonce, seq)
         .await
         .unwrap();
 
@@ -298,9 +298,10 @@ async fn job_session_enforced() {
         seq,
         ..
     } = session_ceremony(&mgr, 1);
-    mgr.session_start(&authn, session_id, client_nonce, signer_nonce, seq, true)
+    mgr.session_start(&authn, session_id, client_nonce, signer_nonce, seq)
         .await
         .unwrap();
+    confirm_start(&mgr, &authn, &mut root, &mut Session::new(session_id)).await;
     assert!(matches!(
         mgr.job_start(&authn, job.into_signed(), JobStartParams::default())
             .await,
@@ -326,7 +327,6 @@ async fn fetch_rotates_server_nonce() {
             ceremony.client_nonce,
             ceremony.signer_nonce,
             ceremony.seq,
-            true,
         )
         .await,
         Err(JobError::InvalidSessionId)
@@ -340,7 +340,6 @@ async fn fetch_rotates_server_nonce() {
         ceremony.client_nonce,
         ceremony.signer_nonce,
         ceremony.seq,
-        true,
     )
     .await
     .unwrap();
@@ -359,7 +358,6 @@ async fn fetch_rotates_server_nonce() {
         ceremony.client_nonce,
         second.signer_nonce,
         second.seq,
-        true,
     )
     .await
     .unwrap();
@@ -379,7 +377,6 @@ async fn fetch_rotates_server_nonce() {
             ceremony.client_nonce,
             stale.signer_nonce,
             stale.seq,
-            true,
         )
         .await,
         Err(JobError::InvalidSessionId)
@@ -401,9 +398,10 @@ async fn job_stop() {
         ..
     } = session_ceremony(&mgr, 1);
     let mut session = Session::new(session_id);
-    mgr.session_start(&authn, session_id, client_nonce, signer_nonce, seq, true)
+    mgr.session_start(&authn, session_id, client_nonce, signer_nonce, seq)
         .await
         .unwrap();
+    confirm_start(&mgr, &authn, &mut root, &mut session).await;
 
     // Stopping a nonexistent job should mark it cancelled, and so succeed
     // immediately.
@@ -522,7 +520,7 @@ async fn cancel_queued_job() {
         ..
     } = session_ceremony(&mgr, 1);
     let mut session = Session::new(session_id);
-    mgr.session_start(&authn, session_id, client_nonce, signer_nonce, seq, true)
+    mgr.session_start(&authn, session_id, client_nonce, signer_nonce, seq)
         .await
         .unwrap();
 
@@ -614,7 +612,7 @@ async fn session_stop_skips_queued_jobs() {
         ..
     } = session_ceremony(&mgr, 1);
     let mut session = Session::new(session_id);
-    mgr.session_start(&authn, session_id, client_nonce, signer_nonce, seq, true)
+    mgr.session_start(&authn, session_id, client_nonce, signer_nonce, seq)
         .await
         .unwrap();
 
@@ -672,9 +670,10 @@ async fn superseding_session_skips_queued_jobs() {
         ..
     } = session_ceremony(&mgr, 1);
     let mut session = Session::new(session_id);
-    mgr.session_start(&authn, session_id, client_nonce, signer_nonce, seq, true)
+    mgr.session_start(&authn, session_id, client_nonce, signer_nonce, seq)
         .await
         .unwrap();
+    confirm_start(&mgr, &authn, &mut root, &mut session).await;
 
     let job_id = queue_job_behind_hole(&mgr, &mut root, &authn, &mut session).await;
 
@@ -691,10 +690,10 @@ async fn superseding_session_skips_queued_jobs() {
         new_client_nonce,
         new_signer_nonce,
         new_seq,
-        true,
     )
     .await
     .expect("should be able to start a superseding session");
+    confirm_start(&mgr, &authn, &mut root, &mut Session::new(new_session_id)).await;
     wait_for_session_ended_skip(&mgr, &authn, &job_id).await;
 }
 
@@ -714,7 +713,7 @@ async fn job_output_perms() {
         ..
     } = session_ceremony(&mgr, 1);
     let session = Session::new(session_id);
-    mgr.session_start(&authn, session_id, client_nonce, signer_nonce, seq, true)
+    mgr.session_start(&authn, session_id, client_nonce, signer_nonce, seq)
         .await
         .unwrap();
 
@@ -786,7 +785,7 @@ async fn cubby_targets() {
         ..
     } = session_ceremony(&mgr, 1);
     let mut session = Session::new(session_id);
-    mgr.session_start(&authn, session_id, client_nonce, signer_nonce, seq, true)
+    mgr.session_start(&authn, session_id, client_nonce, signer_nonce, seq)
         .await
         .unwrap();
     let target: Target = "14".parse().unwrap();
@@ -899,7 +898,7 @@ async fn root_certs_from_files() {
         ..
     } = session_ceremony(&mgr, 1);
     let session = Session::new(session_id);
-    mgr.session_start(&authn, session_id, client_nonce, signer_nonce, seq, true)
+    mgr.session_start(&authn, session_id, client_nonce, signer_nonce, seq)
         .await
         .unwrap();
     let job_id = session.next_job_id();
@@ -986,7 +985,7 @@ async fn job_output_dir_moves() {
         ..
     } = session_ceremony(&mgr, 1);
     let mut session = Session::new(session_id);
-    mgr.session_start(&authn, session_id, client_nonce, signer_nonce, seq, true)
+    mgr.session_start(&authn, session_id, client_nonce, signer_nonce, seq)
         .await
         .unwrap();
 
@@ -1098,7 +1097,7 @@ async fn universe_swap() {
             ..
         } = session_ceremony(mgr, seq);
         let session = Session::new(session_id);
-        mgr.session_start(authn, session_id, client_nonce, signer_nonce, seq, true)
+        mgr.session_start(authn, session_id, client_nonce, signer_nonce, seq)
             .await
             .unwrap();
         let job_id = session.next_job_id();
@@ -1178,7 +1177,7 @@ async fn shutdown() {
         ..
     } = session_ceremony(&mgr, 1);
     let session = Session::new(session_id);
-    mgr.session_start(&authn, session_id, client_nonce, signer_nonce, seq, true)
+    mgr.session_start(&authn, session_id, client_nonce, signer_nonce, seq)
         .await
         .unwrap();
 
@@ -1255,17 +1254,14 @@ async fn attribution() {
         ..
     } = session_ceremony(&mgr, 1);
     let mut session = Session::new(session_id);
-    mgr.session_start(&authn, session_id, client_nonce, signer_nonce, seq, true)
+    mgr.session_start(&authn, session_id, client_nonce, signer_nonce, seq)
         .await
         .unwrap();
-    assert_eq!(
-        mgr.session(&authn).unwrap().started_by(),
-        Some(&authn.key_id)
-    );
 
-    // Job B queues behind a hole in the job chain, attributed. The
-    // executor only runs the job whose id the chain expects next, and
-    // it never sees this one, so B stays queued until cancelled.
+    // Job A confirms the session, which names its starter. Job B
+    // queues behind a hole in the job chain, attributed. The executor
+    // only runs the job whose id the chain expects next, and it never
+    // sees B, so B stays queued until cancelled.
     let job_id_a = session.next_job_id();
     let job_a = root
         .sign_job_request(job_id_a, session_id, "sleep 60", false)
@@ -1281,6 +1277,10 @@ async fn attribution() {
     .await
     .unwrap();
     session.job_started(job_a.into_signed());
+    assert_eq!(
+        mgr.session(&authn).unwrap().started_by(),
+        Some(&authn.key_id)
+    );
     let hole_id = session.next_job_id();
     let hole = root
         .sign_job_request(hole_id, session_id, "true", false)
@@ -1350,7 +1350,7 @@ async fn job_targets() {
         ..
     } = session_ceremony(&mgr, 1);
     let mut session = Session::new(session_id);
-    mgr.session_start(&authn, session_id, client_nonce, signer_nonce, seq, true)
+    mgr.session_start(&authn, session_id, client_nonce, signer_nonce, seq)
         .await
         .unwrap();
 
@@ -1487,7 +1487,7 @@ async fn attach_grants() {
         ..
     } = session_ceremony(&mgr, 1);
     let session = Session::new(session_id);
-    mgr.session_start(&owner, session_id, client_nonce, signer_nonce, seq, true)
+    mgr.session_start(&owner, session_id, client_nonce, signer_nonce, seq)
         .await
         .unwrap();
     let job_id = session.next_job_id();
@@ -1616,10 +1616,12 @@ async fn skip_and_stop_are_starter_only() {
         seq,
         ..
     } = session_ceremony(&mgr, 1);
-    let job_id = Session::new(session_id).next_job_id();
-    mgr.session_start(&owner, session_id, client_nonce, signer_nonce, seq, true)
+    let mut session = Session::new(session_id);
+    mgr.session_start(&owner, session_id, client_nonce, signer_nonce, seq)
         .await
         .unwrap();
+    confirm_start(&mgr, &owner, &mut root, &mut session).await;
+    let job_id = session.next_job_id();
 
     assert!(matches!(
         mgr.session_skip_job(&guest, session_id, job_id).await,
@@ -1729,7 +1731,7 @@ async fn skip_racing_start_converges() {
     } = session_ceremony(&mgr, 1);
     let mut mirror = Session::new(session_id);
     let job_id = mirror.next_job_id();
-    mgr.session_start(&owner, session_id, client_nonce, signer_nonce, seq, true)
+    mgr.session_start(&owner, session_id, client_nonce, signer_nonce, seq)
         .await
         .unwrap();
 
@@ -1791,7 +1793,7 @@ async fn too_much_cpu() {
         ..
     } = session_ceremony(&mgr, 1);
     let session = Session::new(session_id);
-    mgr.session_start(&authn, session_id, client_nonce, signer_nonce, seq, true)
+    mgr.session_start(&authn, session_id, client_nonce, signer_nonce, seq)
         .await
         .unwrap();
     let job_id = session.next_job_id();
@@ -1848,7 +1850,7 @@ async fn too_much_output() {
         ..
     } = session_ceremony(&mgr, 1);
     let mut session = Session::new(session_id);
-    mgr.session_start(&authn, session_id, client_nonce, signer_nonce, seq, true)
+    mgr.session_start(&authn, session_id, client_nonce, signer_nonce, seq)
         .await
         .unwrap();
 
@@ -1950,7 +1952,7 @@ async fn output_ranges() {
         ..
     } = session_ceremony(&mgr, 1);
     let session = Session::new(session_id);
-    mgr.session_start(&authn, session_id, client_nonce, signer_nonce, seq, true)
+    mgr.session_start(&authn, session_id, client_nonce, signer_nonce, seq)
         .await
         .unwrap();
     let job_id = session.next_job_id();
@@ -2254,7 +2256,7 @@ async fn job_signal_dispositions() {
         ..
     } = session_ceremony(&mgr, 1);
     let mut session = Session::new(session_id);
-    mgr.session_start(&authn, session_id, client_nonce, signer_nonce, seq, true)
+    mgr.session_start(&authn, session_id, client_nonce, signer_nonce, seq)
         .await
         .unwrap();
 
@@ -2303,7 +2305,7 @@ async fn interactive_target_required() {
         ..
     } = session_ceremony(&mgr, 1);
     let session = Session::new(session_id);
-    mgr.session_start(&authn, session_id, client_nonce, signer_nonce, seq, true)
+    mgr.session_start(&authn, session_id, client_nonce, signer_nonce, seq)
         .await
         .unwrap();
 
@@ -2333,7 +2335,7 @@ async fn job_json() {
         ..
     } = session_ceremony(&mgr, 1);
     let mut session = Session::new(session_id);
-    mgr.session_start(&authn, session_id, client_nonce, signer_nonce, seq, true)
+    mgr.session_start(&authn, session_id, client_nonce, signer_nonce, seq)
         .await
         .unwrap();
 
@@ -2376,7 +2378,7 @@ async fn streaming_validation() {
         ..
     } = session_ceremony(&mgr, 1);
     let mut session = Session::new(session_id);
-    mgr.session_start(&authn, session_id, client_nonce, signer_nonce, seq, true)
+    mgr.session_start(&authn, session_id, client_nonce, signer_nonce, seq)
         .await
         .unwrap();
 

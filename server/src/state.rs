@@ -119,6 +119,16 @@ impl SessionState {
         attach_grants.get(key_id).copied()
     }
 
+    /// Where an active session stands in the total order of sessions
+    /// by signer-assigned sequence number, then ID.
+    pub fn rank(&self) -> Option<(SessionSeq, SessionId)> {
+        use SessionState::*;
+        match self {
+            Inactive => None,
+            Active { seq, session, .. } => Some((*seq, session.session_id())),
+        }
+    }
+
     fn queued_jobs(&self) -> Option<&QueuedJobs> {
         use SessionState::*;
         match self {
@@ -195,8 +205,8 @@ impl Past {
     fn screen(&self, session: SessionId, seq: SessionSeq, live: bool) -> Admission {
         match &self.committed {
             Some(boundary)
-                if (boundary.network == self.network && boundary.session == session)
-                    || seq > boundary.seq =>
+                if seq > boundary.seq
+                    || (boundary.network == self.network && boundary.session == session) =>
             {
                 Admission::Admit
             }
@@ -206,23 +216,11 @@ impl Past {
         }
     }
 
-    /// Construct a boundary for a verified job.
-    fn commit_to(
-        &self,
-        network: Network,
-        session_id: SessionId,
-        seq: SessionSeq,
-        job_id: JobId,
-        successor: JobId,
-    ) -> Boundary {
-        Boundary {
-            network,
-            session: session_id.to_owned(),
-            seq,
-            job: job_id,
-            successor,
-            status: None,
-        }
+    /// Return the current boundary record for this universe.
+    fn boundary(&self) -> Option<&Boundary> {
+        self.committed
+            .as_deref()
+            .filter(|boundary| boundary.network == self.network)
     }
 
     /// Whether a message at `version` is live traffic rather than
@@ -311,6 +309,10 @@ impl State {
 
     pub fn session(&self) -> Option<&Session> {
         self.session.session()
+    }
+
+    pub fn rank(&self) -> Option<(SessionSeq, SessionId)> {
+        self.session.rank()
     }
 
     pub fn attach_access(&self, key_id: &KeyId) -> Option<Access> {
@@ -425,14 +427,9 @@ impl State {
     /// re-entering the job's own universe replays the earlier ruling
     /// as a status, which stops a second announcement.
     fn adjudicate_boundary(&mut self, log: &Logger, now: DateTime<Utc>) -> Vec<Output> {
-        // An absent record commits to no job, so there
-        // is nothing to rule on.
-        let Some(boundary) = &self.past.committed else {
+        let Some(boundary) = self.past.boundary() else {
             return Vec::new();
         };
-        if boundary.network != self.past.network {
-            return Vec::new();
-        }
         let (job_id, status) = (boundary.job, boundary.status.clone());
         if self.past.adjudicated == Some(job_id) {
             return Vec::new();
@@ -561,12 +558,10 @@ impl State {
                         info!(log, "duplicate session start"; "session_id" => %session_id);
                     }
 
-                    // A start wins the slot only by exceeding the
-                    // active session in the signer-assigned order,
-                    // with ties broken by id. This one does not;
+                    // This start does not outrank the active session;
                     // ignore it.
-                    Active { seq, session, .. }
-                        if (preimage.seq, session_id) <= (*seq, session.session_id()) =>
+                    Active { seq, .. }
+                        if Some((preimage.seq, session_id)) <= self.session.rank() =>
                     {
                         info!(
                             log, "stale session start";
@@ -582,9 +577,10 @@ impl State {
                     Inactive | Active { .. } => {
                         info!(log, "session started"; "session_id" => %session_id, "actor" => %actor);
                         let mut session = Session::started(session_id, actor.clone());
-                        if let Some(boundary) = &self.past.committed
-                            && boundary.network == self.past.network
-                            && boundary.session == session_id
+                        if let Some(boundary) = self
+                            .past
+                            .boundary()
+                            .filter(|boundary| boundary.session == session_id)
                         {
                             info!(
                                 log, "resuming committed session at its successor";
@@ -1119,15 +1115,16 @@ impl State {
                                 job: request.clone(),
                                 params,
                                 attachment,
-                                boundary: self.past.commit_to(
+                                boundary: Boundary {
                                     network,
-                                    session.session_id(),
-                                    *seq,
-                                    job_id,
-                                    session
+                                    session: session.session_id(),
+                                    seq: *seq,
+                                    job: job_id,
+                                    successor: session
                                         .session_id()
                                         .next_job_id(&LastJob::Some((*request).clone())),
-                                ),
+                                    status: None,
+                                },
                             })));
                         }
                     }
