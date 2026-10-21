@@ -5,60 +5,6 @@
     "version": "0.1.0"
   },
   "paths": {
-    "/certs": {
-      "put": {
-        "summary": "Import a certificate, verify its signature, and return a key ID for it.",
-        "description": "The body should be a PEM encoded X.509 certificate.",
-        "operationId": "cert_import",
-        "parameters": [
-          {
-            "in": "header",
-            "name": "authorization",
-            "description": "Authorization to access some resource, such as a signature.\n\nSee: <https://developer.mozilla.org/en-US/docs/Web/HTTP/Reference/Headers/Authorization>",
-            "schema": {
-              "type": "string"
-            }
-          },
-          {
-            "in": "query",
-            "name": "wait",
-            "description": "Wait for the subject to appear in the state.",
-            "schema": {
-              "type": "boolean"
-            }
-          }
-        ],
-        "requestBody": {
-          "content": {
-            "application/json": {
-              "schema": {
-                "title": "String",
-                "type": "string"
-              }
-            }
-          },
-          "required": true
-        },
-        "responses": {
-          "200": {
-            "description": "successful operation",
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/KeyId"
-                }
-              }
-            }
-          },
-          "4XX": {
-            "$ref": "#/components/responses/Error"
-          },
-          "5XX": {
-            "$ref": "#/components/responses/Error"
-          }
-        }
-      }
-    },
     "/certs/{key_id}": {
       "get": {
         "summary": "Get the certificate chain that validates a key.",
@@ -93,50 +39,6 @@
                 }
               }
             }
-          },
-          "4XX": {
-            "$ref": "#/components/responses/Error"
-          },
-          "5XX": {
-            "$ref": "#/components/responses/Error"
-          }
-        }
-      }
-    },
-    "/certs/{key_id}/revoke": {
-      "post": {
-        "summary": "Revoke a certificate.",
-        "description": "Revocation is permanent and propagates across the rack. Root certificates cannot be revoked.",
-        "operationId": "cert_revoke",
-        "parameters": [
-          {
-            "in": "header",
-            "name": "authorization",
-            "description": "Authorization to access some resource, such as a signature.\n\nSee: <https://developer.mozilla.org/en-US/docs/Web/HTTP/Reference/Headers/Authorization>",
-            "schema": {
-              "type": "string"
-            }
-          },
-          {
-            "in": "path",
-            "name": "key_id",
-            "required": true,
-            "schema": {
-              "$ref": "#/components/schemas/KeyId"
-            }
-          },
-          {
-            "in": "query",
-            "name": "wait",
-            "description": "Wait for the subject to appear in the state.",
-            "schema": {
-              "type": "boolean"
-            }
-          }
-        ],
-        "responses": {
-          "204": {
-            "description": "resource updated"
           },
           "4XX": {
             "$ref": "#/components/responses/Error"
@@ -229,50 +131,6 @@
                 }
               }
             }
-          },
-          "4XX": {
-            "$ref": "#/components/responses/Error"
-          },
-          "5XX": {
-            "$ref": "#/components/responses/Error"
-          }
-        }
-      }
-    },
-    "/iam/{key_id}/revoke": {
-      "post": {
-        "summary": "Revoke an SSH identity.",
-        "description": "Expires the key's identities and refuses its future logins, across the rack.",
-        "operationId": "iam_revoke",
-        "parameters": [
-          {
-            "in": "header",
-            "name": "authorization",
-            "description": "Authorization to access some resource, such as a signature.\n\nSee: <https://developer.mozilla.org/en-US/docs/Web/HTTP/Reference/Headers/Authorization>",
-            "schema": {
-              "type": "string"
-            }
-          },
-          {
-            "in": "path",
-            "name": "key_id",
-            "required": true,
-            "schema": {
-              "$ref": "#/components/schemas/KeyId"
-            }
-          },
-          {
-            "in": "query",
-            "name": "wait",
-            "description": "Wait for the subject to appear in the state.",
-            "schema": {
-              "type": "boolean"
-            }
-          }
-        ],
-        "responses": {
-          "204": {
-            "description": "resource updated"
           },
           "4XX": {
             "$ref": "#/components/responses/Error"
@@ -700,11 +558,11 @@
         }
       }
     },
-    "/session-nonce": {
+    "/server-nonce": {
       "get": {
-        "summary": "Get the sush server nonce needed to start a new session.",
-        "description": "The nonce will need to be sent to the signer server, which will give back its own nonce. Both nonces combined (along with the baseboard ID) will form the session ID.",
-        "operationId": "session_start_nonce",
+        "summary": "Get a fresh server nonce for the session ceremony.",
+        "description": "The client mixes its own nonce with this one to form the sush nonce it submits to the signer. Fetching replaces the previous server nonce, so only the latest ceremony can complete.",
+        "operationId": "server_nonce",
         "parameters": [
           {
             "in": "header",
@@ -721,7 +579,7 @@
             "content": {
               "application/json": {
                 "schema": {
-                  "$ref": "#/components/schemas/SessionStartNonce"
+                  "$ref": "#/components/schemas/SessionServerNonce"
                 }
               }
             }
@@ -1197,11 +1055,6 @@
             "type": "string"
           },
           "time_authenticated": {
-            "type": "string",
-            "format": "date-time"
-          },
-          "time_revoked": {
-            "nullable": true,
             "type": "string",
             "format": "date-time"
           }
@@ -1705,39 +1558,44 @@
           "session_id"
         ]
       },
+      "SessionClientNonce": {
+        "description": "The session nonce component generated by the sush client (on the operator's machine).",
+        "type": "string"
+      },
       "SessionId": {
-        "description": "A globally unique identifier for a session.",
+        "description": "A globally unique identifier for a session. Constructed only from a `SessionPreimage`.",
+        "type": "string"
+      },
+      "SessionSeq": {
+        "description": "The session's place in the signer-assigned order of sessions. Taken as whole milliseconds since the Unix epoch according to the *signer's* wall clock; the server's clock can't be trusted, so the server never interprets a sequence number as a time, only as an order. Sessions authorized in the same millisecond share a sequence number and tie-break by ID. Encoded as four codephrase words: 2048⁴ = 2⁴⁴ values, good through the year 2527.",
+        "type": "string"
+      },
+      "SessionServerNonce": {
+        "description": "The session nonce component generated by the sush server (on the rack).",
         "type": "string"
       },
       "SessionSignerNonce": {
-        "description": "The component of the hashed Session ID generated by the signer server.",
+        "description": "The component of the hashed Session ID generated by the signing server.",
         "type": "string"
       },
       "SessionStartBody": {
         "type": "object",
         "properties": {
+          "client_nonce": {
+            "$ref": "#/components/schemas/SessionClientNonce"
+          },
+          "seq": {
+            "$ref": "#/components/schemas/SessionSeq"
+          },
           "signer_nonce": {
             "$ref": "#/components/schemas/SessionSignerNonce"
           }
         },
         "required": [
+          "client_nonce",
+          "seq",
           "signer_nonce"
         ]
-      },
-      "SessionStartNonce": {
-        "type": "object",
-        "properties": {
-          "nonce": {
-            "$ref": "#/components/schemas/SessionSushNonce"
-          }
-        },
-        "required": [
-          "nonce"
-        ]
-      },
-      "SessionSushNonce": {
-        "description": "The component of the hashed Session ID generated by the Sush server.",
-        "type": "string"
       },
       "Signed_for_JobStartRequest": {
         "description": "A signed envelope around some data.",
@@ -1761,27 +1619,10 @@
       },
       "SkipReason": {
         "description": "Why a sled will never run a job.",
-        "oneOf": [
-          {
-            "type": "string",
-            "enum": [
-              "session-ended"
-            ]
-          },
-          {
-            "description": "The job's session sits at or below the sled's execution floor, where the sled cannot tell replay from re-run.",
-            "type": "string",
-            "enum": [
-              "below-floor"
-            ]
-          },
-          {
-            "description": "The job's chain position precedes the sled's recorded commitment: a previous life already handled it.",
-            "type": "string",
-            "enum": [
-              "already-handled"
-            ]
-          }
+        "type": "string",
+        "enum": [
+          "session-superseded",
+          "session-ended"
         ]
       },
       "SledHealth": {

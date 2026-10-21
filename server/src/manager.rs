@@ -23,7 +23,7 @@ use tokio::time::timeout;
 use tokio_stream::wrappers::ReceiverStream;
 use tokio_util::sync::CancellationToken;
 use x509_cert::Certificate;
-use x509_cert::der::{DecodePem as _, Encode as _};
+use x509_cert::der::DecodePem as _;
 
 use sush_api::{JobStartParams, JobStopParams, JobWait};
 use sush_common::authn::{
@@ -31,9 +31,10 @@ use sush_common::authn::{
     Nonce, RequestVerifier, SeqWindow,
 };
 use sush_common::jobs::{
-    Access, JobId, JobStatusMap, Session, SessionId, SessionSignerNonce, SignedJob,
+    Access, JobId, JobOutputStream, JobStatusMap, Session, SessionClientNonce, SessionId,
+    SessionPreimage, SessionSeq, SessionServerNonce, SessionSignerNonce, SessionSushNonce,
+    SignedJob,
 };
-use sush_common::jobs::{JobOutputStream, SessionSushNonce};
 use sush_common::keys::{KeyError, KeyId, SshPublicKey};
 use sush_common::targets::{Cubbies, SledHealth, SledVersion};
 use sush_common::version::LONG_VERSION;
@@ -44,7 +45,7 @@ use crate::executor::PathIsolation;
 use crate::gossip::LinkedBaseboards;
 use crate::job::SocketSender;
 use crate::locker::Locker;
-use crate::messages::v0::{CertRequest, IdentityRequest, JobRequest, Request, SessionRequest};
+use crate::messages::v0::{IdentityRequest, JobRequest, Request, SessionRequest};
 use crate::output::{JobOutputDir, JobOutputFileStream};
 use crate::state::{GossipUniverse, State, StateManager};
 
@@ -75,8 +76,7 @@ struct CachedIdentity {
 
 impl CachedIdentity {
     fn is_still_valid(&self) -> bool {
-        self.identity.time_revoked.is_none()
-            && self.authenticated.elapsed() < IDENTITY_MAX_TTL
+        self.authenticated.elapsed() < IDENTITY_MAX_TTL
             && self.last_used.elapsed() < IDENTITY_IDLE_TTL
     }
 }
@@ -88,7 +88,7 @@ pub struct JobManager {
     log: Logger,
     nonces: Arc<Mutex<LruCache<Nonce, Instant>>>,
     identities: Arc<Mutex<LruCache<(KeyId, Nonce), CachedIdentity>>>,
-    session_sush_nonce: Arc<SyncMutex<SessionSushNonce>>,
+    session_server_nonce: Arc<SyncMutex<SessionServerNonce>>,
     output_dir: JobOutputDir,
     own_baseboard: BaseboardId,
     linked: LinkedBaseboards,
@@ -145,7 +145,7 @@ impl JobManager {
         info!(log, "starting sush"; "version" => LONG_VERSION);
         let (tx_req, rx_req) = mpsc::channel(16);
         let requests = ReceiverStream::new(rx_req);
-        let session_sush_nonce = Arc::new(SyncMutex::new(SessionSushNonce::random()));
+        let session_server_nonce = Arc::new(SyncMutex::new(SessionServerNonce::random()));
         let boundary = Arc::new(BoundaryStore::new(&log, locker));
         boundary.load().await;
         let (rx_state, join_state) = StateManager::run(
@@ -157,7 +157,6 @@ impl JobManager {
             cubbies,
             universe,
             anchors,
-            session_sush_nonce.clone(),
             boundary,
             shutdown,
         )?;
@@ -165,7 +164,7 @@ impl JobManager {
             log: log.new(o!("component" => "job manager")),
             nonces: Arc::new(Mutex::new(LruCache::new(MAX_OUTSTANDING_NONCES))),
             identities: Arc::new(Mutex::new(LruCache::new(MAX_CACHED_IDENTITIES))),
-            session_sush_nonce,
+            session_server_nonce,
             own_baseboard,
             linked,
             output_dir,
@@ -208,13 +207,6 @@ impl JobManager {
         rows
     }
 
-    async fn cert_request(&self, authn: &Identity, request: CertRequest) -> Result<(), JobError> {
-        self.tx_req
-            .send(Request::cert(authn.key_id.clone(), request))
-            .await
-            .map_err(|_| JobError::ChannelClosed)
-    }
-
     async fn session_request(
         &self,
         authn: &Identity,
@@ -246,44 +238,12 @@ impl JobManager {
 
     // Certificate management.
 
-    pub async fn cert_import(
-        &self,
-        authn: &Identity,
-        cert: Certificate,
-        wait: bool,
-    ) -> Result<(), JobError> {
-        let key_id = self.state.borrow().certs().check_import(&cert)?;
-        let der = cert.to_der().map_err(KeyError::from)?;
-        self.cert_request(authn, CertRequest::Import(der)).await?;
-        if wait {
-            self.wait_for(self.wait_for_cert(key_id)).await?;
-        }
-        Ok(())
-    }
-
     pub fn cert_chain(
         &self,
         _authn: &Identity,
         key_id: &KeyId,
     ) -> Result<Vec<Certificate>, JobError> {
         Ok(self.state.borrow().certs().chain(key_id)?)
-    }
-
-    pub async fn cert_revoke(
-        &self,
-        authn: &Identity,
-        key_id: KeyId,
-        wait: bool,
-    ) -> Result<(), JobError> {
-        if self.state.borrow().certs().is_anchor(&key_id) {
-            return Err(JobError::TrustAnchorRevocation(key_id));
-        }
-        self.cert_request(authn, CertRequest::Revoke(key_id.clone(), Utc::now()))
-            .await?;
-        if wait {
-            self.wait_for(self.wait_for_revocation(key_id)).await?;
-        }
-        Ok(())
     }
 
     // Identity management.
@@ -384,11 +344,6 @@ impl JobManager {
             unauthorized!("initial credentials presented outside iam");
         }
 
-        // Refuse revoked keys.
-        if self.state.borrow().identities().revoked(&key_id).is_some() {
-            unauthorized!("key is revoked");
-        }
-
         // Claim the nonce.
         let Some(minted) = self.nonces.lock().await.pop(&nonce) else {
             unauthorized!("nonce not found");
@@ -438,46 +393,10 @@ impl JobManager {
             .collect())
     }
 
-    pub async fn iam_revoke(
-        &self,
-        authn: &Identity,
-        key_id: KeyId,
-        wait: bool,
-    ) -> Result<(), JobError> {
-        let now = Utc::now();
-        let mut identities = self.identities.lock().await;
-        for (_, cached) in identities.iter_mut().filter(|((id, _), _)| *id == key_id) {
-            cached.identity.time_revoked = Some(now);
-        }
-        drop(identities);
-        info!(self.log, "revoking identity"; "key_id" => %key_id, "actor" => %authn.key_id);
-        self.identity_request(
-            authn.key_id.clone(),
-            IdentityRequest::Revoke(key_id.clone(), now),
-        )
-        .await?;
-        if wait {
-            self.wait_for(self.wait_for_key_revocation(key_id)).await?;
-        }
-        Ok(())
-    }
-
     // Waiting.
 
     pub fn take_join_handle(&mut self) -> Option<JoinHandle<()>> {
         self.join_state.take()
-    }
-
-    fn wait_for_cert(&self, key_id: KeyId) -> impl FnMut(&State) -> bool {
-        move |state| state.certs().chain(&key_id).is_ok()
-    }
-
-    fn wait_for_revocation(&self, key_id: KeyId) -> impl FnMut(&State) -> bool {
-        move |state| state.certs().revoked(&key_id).is_some()
-    }
-
-    fn wait_for_key_revocation(&self, key_id: KeyId) -> impl FnMut(&State) -> bool {
-        move |state| state.identities().revoked(&key_id).is_some()
     }
 
     fn wait_for_session(&self, session_id: SessionId) -> impl FnMut(&State) -> bool {
@@ -538,28 +457,41 @@ impl JobManager {
         Ok(session.into_session_id())
     }
 
-    pub fn session_sush_nonce(&self) -> SessionSushNonce {
-        *self.session_sush_nonce.lock().unwrap()
+    /// Replace the current server nonce with a fresh one and return
+    /// it. A fetch is the only rotation, so a client must finish its
+    /// ceremony before the next fetch.
+    pub fn fresh_server_nonce(&self) -> SessionServerNonce {
+        let nonce = SessionServerNonce::random();
+        *self.session_server_nonce.lock().unwrap() = nonce;
+        nonce
     }
 
     pub async fn session_start(
         &self,
         authn: &Identity,
         session_id: SessionId,
+        client_nonce: SessionClientNonce,
         signer_nonce: SessionSignerNonce,
+        seq: SessionSeq,
         wait: bool,
     ) -> Result<(), JobError> {
-        // Verify that the session ID provided by the client is meant for
-        // this instance of Sush, by checking that the signer nonce was
-        // hashed with our baseboard and nonce. The state machine rotates
-        // the nonce when a session activates.
-        let sush_nonce = *self.session_sush_nonce.lock().unwrap();
-        let computed = SessionId::compute(self.own_baseboard(), sush_nonce, signer_nonce);
-        if computed != session_id {
+        // Verify that the session ID provided by the client is meant
+        // for this instance of Sush: it must hash over our baseboard
+        // and current server nonce. The preimage then travels instead
+        // of the id, so every peer derives for itself both the id and
+        // the sequence number the id commits to.
+        let server_nonce = *self.session_server_nonce.lock().unwrap();
+        let preimage = SessionPreimage {
+            baseboard: self.own_baseboard().clone(),
+            sush_nonce: SessionSushNonce::compute(client_nonce, server_nonce),
+            signer_nonce,
+            seq,
+        };
+        if preimage.session_id() != session_id {
             return Err(JobError::InvalidSessionId);
         }
 
-        self.session_request(authn, SessionRequest::Start(session_id))
+        self.session_request(authn, SessionRequest::Start(preimage))
             .await?;
         if wait {
             self.wait_for(self.wait_for_session(session_id)).await?;
@@ -778,13 +710,15 @@ impl JobManager {
     }
 }
 
-/// Read one PEM-encoded certificate from each of `paths`.
+/// Read one PEM-encoded certificate from each of `paths`. Trust
+/// anchors load in the order given, which [`Certificates::new`]
+/// requires to be root-to-leaf.
 pub async fn read_certs(paths: &[impl AsRef<Path>]) -> Result<Vec<Certificate>, JobError> {
     let mut anchors = Vec::with_capacity(paths.len());
     for path in paths {
         let path = path.as_ref();
         let pem = read(path).await.map_err(JobError::file_io_for(path))?;
-        anchors.push(Certificate::from_pem(&pem)?);
+        anchors.push(Certificate::from_pem(&pem).map_err(KeyError::from)?);
     }
     Ok(anchors)
 }

@@ -21,19 +21,12 @@ pub struct PermslipSigner {
     key_name: String,
 }
 
-/// Get a bearer token by the sshauth challenge, signed with the agent
-/// key named by `fingerprint`.
-pub async fn fresh_token(
-    url: &str,
-    agent_sock: String,
-    fingerprint: String,
-) -> Result<String, PermslipError> {
-    let tokens = TokenProvider::SshAuth {
-        fingerprint: Some(fingerprint),
-        server_url: url.to_owned(),
-        agent_sock,
-    };
-    let token = tokens.token().await.map_err(PermslipError::token_flow)?;
+/// Get the bearer token that `permslip login` saved for `url`.
+pub async fn saved_token(url: &str) -> Result<String, PermslipError> {
+    let token = TokenProvider::SavedCredentials
+        .token(url)
+        .await
+        .map_err(PermslipError::token_flow)?;
     let value = token.into_header_value().map_err(PermslipError::token)?;
     value
         .to_str()

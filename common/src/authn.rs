@@ -489,7 +489,6 @@ pub struct Identity {
     pub public_key: SshPublicKey,
     pub nonce: Nonce,
     pub time_authenticated: DateTime<Utc>,
-    pub time_revoked: Option<DateTime<Utc>>,
 }
 
 impl Identity {
@@ -508,7 +507,6 @@ impl Identity {
             public_key,
             nonce,
             time_authenticated,
-            time_revoked: None,
         })
     }
 }

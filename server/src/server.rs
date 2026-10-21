@@ -20,18 +20,17 @@ use hyper::body::Frame;
 use sled_hardware_types::BaseboardId;
 use tokio_tungstenite::WebSocketStream;
 use tokio_tungstenite::tungstenite::protocol::{Role, WebSocketConfig};
-use x509_cert::Certificate;
-use x509_cert::der::DecodePem as _;
 
 use sush_api::{
     AccessParam, Authorization, AuthorizedRangeRequest, JobHistoryParams, JobIdParam,
     JobOutputParams, JobStartParams, JobStopParams, JobTargetParams, KeyIdParam, RoutingParam,
-    SessionAndJobIds, SessionAndKeyIds, SessionIdParam, SessionStartBody, SessionStartNonce,
-    SushApi, WaitParam,
+    SessionAndJobIds, SessionAndKeyIds, SessionIdParam, SessionStartBody, SushApi, WaitParam,
 };
 use sush_common::authn::Identity;
-use sush_common::jobs::{JsonJobStatusMap, Session, SignedJob, job_status_to_json_map};
-use sush_common::keys::{KeyId, SshPublicKey, pem_cert_chain};
+use sush_common::jobs::{
+    JsonJobStatusMap, Session, SessionServerNonce, SignedJob, job_status_to_json_map,
+};
+use sush_common::keys::{SshPublicKey, pem_cert_chain};
 use sush_common::targets::SledVersion;
 use sush_common::version::VersionInfo;
 
@@ -57,25 +56,6 @@ impl SushApi for ApiServer {
 
     // Certificate management.
 
-    async fn cert_import(
-        ctx: RequestContext<Self::Context>,
-        headers: Header<Authorization>,
-        query: QueryParams<WaitParam>,
-        params: TypedBody<String>,
-    ) -> Result<HttpResponseOk<KeyId>, HttpError> {
-        let mgr = ctx.context();
-        let Authorization { authorization } = headers.into_inner();
-        let authn = mgr
-            .iam(authorization, None, request_line(&ctx.request))
-            .await?;
-        let WaitParam { wait } = query.into_inner();
-        let bytes = params.into_inner();
-        let cert = Certificate::from_pem(&bytes).map_err(JobError::DecodeCert)?;
-        let key_id = KeyId::try_from(&cert).map_err(JobError::Key)?;
-        mgr.cert_import(&authn, cert, wait).await?;
-        Ok(HttpResponseOk(key_id))
-    }
-
     async fn cert_chain(
         ctx: RequestContext<Self::Context>,
         headers: Header<Authorization>,
@@ -90,23 +70,6 @@ impl SushApi for ApiServer {
         let certs = mgr.cert_chain(&authn, &key_id)?;
         let chain = pem_cert_chain(certs).map_err(JobError::Key)?;
         Ok(HttpResponseOk(chain))
-    }
-
-    async fn cert_revoke(
-        ctx: RequestContext<Self::Context>,
-        headers: Header<Authorization>,
-        params: PathParams<KeyIdParam>,
-        query: QueryParams<WaitParam>,
-    ) -> Result<HttpResponseUpdatedNoContent, HttpError> {
-        let mgr = ctx.context();
-        let Authorization { authorization } = headers.into_inner();
-        let authn = mgr
-            .iam(authorization, None, request_line(&ctx.request))
-            .await?;
-        let KeyIdParam { key_id } = params.into_inner();
-        let WaitParam { wait } = query.into_inner();
-        mgr.cert_revoke(&authn, key_id, wait).await?;
-        Ok(HttpResponseUpdatedNoContent())
     }
 
     // Identity management.
@@ -138,23 +101,6 @@ impl SushApi for ApiServer {
         Ok(HttpResponseOk(mgr.identities(&authn).await?))
     }
 
-    async fn iam_revoke(
-        ctx: RequestContext<Self::Context>,
-        headers: Header<Authorization>,
-        params: PathParams<KeyIdParam>,
-        query: QueryParams<WaitParam>,
-    ) -> Result<HttpResponseUpdatedNoContent, HttpError> {
-        let mgr = ctx.context();
-        let Authorization { authorization } = headers.into_inner();
-        let authn = mgr
-            .iam(authorization, None, request_line(&ctx.request))
-            .await?;
-        let KeyIdParam { key_id } = params.into_inner();
-        let WaitParam { wait } = query.into_inner();
-        mgr.iam_revoke(&authn, key_id, wait).await?;
-        Ok(HttpResponseUpdatedNoContent())
-    }
-
     // Session management.
 
     async fn session(
@@ -173,18 +119,16 @@ impl SushApi for ApiServer {
         }
     }
 
-    async fn session_start_nonce(
+    async fn server_nonce(
         ctx: RequestContext<Self::Context>,
         headers: Header<Authorization>,
-    ) -> Result<HttpResponseOk<SessionStartNonce>, HttpError> {
+    ) -> Result<HttpResponseOk<SessionServerNonce>, HttpError> {
         let mgr = ctx.context();
         let Authorization { authorization } = headers.into_inner();
         let _authn = mgr
             .iam(authorization, None, request_line(&ctx.request))
             .await?;
-        Ok(HttpResponseOk(SessionStartNonce {
-            nonce: mgr.session_sush_nonce(),
-        }))
+        Ok(HttpResponseOk(mgr.fresh_server_nonce()))
     }
 
     async fn session_start(
@@ -201,8 +145,12 @@ impl SushApi for ApiServer {
             .await?;
         let WaitParam { wait } = query.into_inner();
         let SessionIdParam { session_id } = params.into_inner();
-        let SessionStartBody { signer_nonce } = body.into_inner();
-        mgr.session_start(&authn, session_id, signer_nonce, wait)
+        let SessionStartBody {
+            client_nonce,
+            signer_nonce,
+            seq,
+        } = body.into_inner();
+        mgr.session_start(&authn, session_id, client_nonce, signer_nonce, seq, wait)
             .await?;
         Ok(HttpResponseUpdatedNoContent())
     }

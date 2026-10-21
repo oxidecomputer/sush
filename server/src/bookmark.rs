@@ -17,13 +17,11 @@
 //! universe's identities, so a lost write costs at most a stranded
 //! identity, never a stale one.
 
-use std::io::{self, Cursor};
+use std::io::Cursor;
 use std::sync::Arc;
 
-use rumors::{Bookmark, BookmarkError, Serialized};
+use rumors::Bookmark;
 use slog::{Discard, Logger, o, warn};
-use thiserror::Error;
-use tokio::io::AsyncWrite;
 
 use crate::format::{self, NoFormat, Record, Versioned};
 use crate::locker::{Locker, StoreError, Tenant, TenantSpec, Verdict};
@@ -50,15 +48,6 @@ impl TryFrom<NoFormat> for BookmarkRecord {
     fn try_from(none: NoFormat) -> Result<Self, Self::Error> {
         match none {}
     }
-}
-
-/// What a bookmark load or store failed at.
-#[derive(Debug, Error)]
-pub enum BookmarkIoError {
-    #[error("serializing the bookmark record failed: {0}")]
-    Serialize(#[source] io::Error),
-    #[error("storing the bookmark failed: {0}")]
-    Store(#[source] StoreError),
 }
 
 /// This server's bookmark storage. Every handle shares the one record.
@@ -116,11 +105,8 @@ pub struct SushBookmark {
     shed: bool,
 }
 
-impl BookmarkError for SushBookmark {
-    type Error = BookmarkIoError;
-}
-
 impl Bookmark for SushBookmark {
+    type Error = StoreError;
     type Reader = Cursor<Vec<u8>>;
 
     async fn load(&self) -> Result<Option<Self::Reader>, Self::Error> {
@@ -148,22 +134,13 @@ impl Bookmark for SushBookmark {
         }
     }
 
-    async fn store<F>(&self, write: F) -> Result<(), Self::Error>
-    where
-        F: for<'a> FnOnce(&'a mut (dyn AsyncWrite + Unpin + Send)) -> Serialized<'a> + Send,
-    {
+    async fn store(&self, bytes: Vec<u8>) -> Result<(), Self::Error> {
         if self.shed {
             return Ok(());
         }
-        let mut buf = Cursor::new(Vec::new());
-        write(&mut buf).await.map_err(BookmarkIoError::Serialize)?;
-        let record = BookmarkRecord(buf.into_inner());
-
+        let record = BookmarkRecord(bytes);
         let mut guard = self.tenant.lock().await;
-        guard
-            .store(&format::encode(&record))
-            .await
-            .map_err(BookmarkIoError::Store)
+        guard.store(&format::encode(&record)).await
     }
 }
 
@@ -175,14 +152,7 @@ mod test {
 
     use camino::Utf8PathBuf;
     use tempfile::TempDir;
-    use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
-
-    /// A serializer closure writing fixed bytes, shaped like rumors'.
-    fn record(
-        bytes: &'static [u8],
-    ) -> impl for<'a> FnOnce(&'a mut (dyn AsyncWrite + Unpin + Send)) -> Serialized<'a> + Send {
-        move |w| Box::pin(async move { w.write_all(bytes).await })
-    }
+    use tokio::io::AsyncReadExt as _;
 
     /// Two slot directories, like two M.2s.
     fn slots(dir: &TempDir) -> Vec<Utf8PathBuf> {
@@ -219,7 +189,7 @@ mod test {
 
         let handle = source.handle();
         assert!(read_back(&handle).await.is_none());
-        handle.store(record(b"who we are")).await.unwrap();
+        handle.store(b"who we are".to_vec()).await.unwrap();
         assert_eq!(read_back(&handle).await.unwrap(), b"who we are");
     }
 
@@ -230,7 +200,7 @@ mod test {
         let slots = slots(&dir);
         for (slot, bytes) in slots.iter().zip([b"one", b"two"]) {
             let lone = source(vec![slot.clone()]);
-            lone.handle().store(record(bytes)).await.unwrap();
+            lone.handle().store(bytes.to_vec()).await.unwrap();
         }
         assert!(read_back(&source(slots).handle()).await.is_none());
     }
@@ -241,7 +211,7 @@ mod test {
         let dir = TempDir::with_prefix("sush-bookmark-").unwrap();
         let source = source(slots(&dir));
 
-        source.handle().store(record(b"shared")).await.unwrap();
+        source.handle().store(b"shared".to_vec()).await.unwrap();
         assert_eq!(read_back(&source.handle()).await.unwrap(), b"shared");
     }
 
@@ -251,15 +221,15 @@ mod test {
     async fn null_and_shed_touch_nothing() {
         let null = BookmarkSource::null();
         let handle = null.handle();
-        handle.store(record(b"lost")).await.unwrap();
+        handle.store(b"lost".to_vec()).await.unwrap();
         assert!(read_back(&handle).await.is_none());
 
         let dir = TempDir::with_prefix("sush-bookmark-").unwrap();
         let source = source(slots(&dir));
-        source.handle().store(record(b"kept")).await.unwrap();
+        source.handle().store(b"kept".to_vec()).await.unwrap();
         let shed = source.shed_handle();
         assert!(read_back(&shed).await.is_none());
-        shed.store(record(b"dropped")).await.unwrap();
+        shed.store(b"dropped".to_vec()).await.unwrap();
         assert_eq!(read_back(&source.handle()).await.unwrap(), b"kept");
     }
 }

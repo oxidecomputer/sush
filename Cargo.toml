@@ -40,18 +40,17 @@ memmap2 = "0.9"
 p256 = { version = "0.13", features = ["ecdsa", "pkcs8"] }
 pem-rfc7468 = { version = "0.7", features = ["std"] }
 percent-encoding = "2"
-permission-slip-client = { git = "https://github.com/oxidecomputer/permission-slip", rev = "c9d302ef44576e075e35f4f28f8e7ac8345bcd4b" }
-permission-slip-common = { git = "https://github.com/oxidecomputer/permission-slip", rev = "c9d302ef44576e075e35f4f28f8e7ac8345bcd4b" }
+permission-slip-client = { git = "https://github.com/oxidecomputer/permission-slip", rev = "94b68e717f2da426ca1450d5ebc9fc5000596bdc", features = ["sush-types"] }
+permission-slip-common = { git = "https://github.com/oxidecomputer/permission-slip", rev = "94b68e717f2da426ca1450d5ebc9fc5000596bdc" }
 pki-playground = { git = "https://github.com/oxidecomputer/pki-playground", rev = "7600756029ce046a02c6234aa84ce230cc5eaa04" }
 progenitor = "0.14"
 progenitor-client = "0.14"
 pwd = "1"
-qorb = { version = "0.4", default-features = false }
 rand = "0.8"
 rand_core = "0.6"
 reqwest = { version = "0.13", features = ["json", "rustls"] }
 rlimit = "0.10"
-rumors = { git = "https://github.com/oxidecomputer/rumors", rev = "90e4509dc66330affb38afa74813a8dd500edd93" }
+rumors = { git = "https://github.com/oxidecomputer/rumors", rev = "bf2ba264e2360eab1ba5f06148ea3ef3050825c8" }
 rustix = { version = "1", features = ["fs", "process", "pty", "termios"] }
 rustls = "0.23"
 rustyline = { git = "https://github.com/kkawakam/rustyline", rev = "5ab22f2f8d65e85f0b925360437ece8eeeb6db92", features = ["signal-hook", "termios"] }

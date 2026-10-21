@@ -32,7 +32,10 @@ use sush_client::context::Authz;
 use sush_client::{Client, ResponseValue};
 use sush_common::authn::{Challenge, ChallengeResponse, Credentials, Identity, Nonce, RequestKey};
 use sush_common::codephrases::Codephrase;
-use sush_common::jobs::{JobId, JobMode, JobStartRequest, SessionId, VerifiedJob};
+use sush_common::jobs::{
+    JobId, JobMode, JobStartRequest, SessionClientNonce, SessionId, SessionPreimage, SessionSeq,
+    SessionSignerNonce, SessionSushNonce, VerifiedJob,
+};
 use sush_common::keys::{EphemeralKey, KeyType, Signer, pem_cert_chain};
 use sush_common::targets::{Cubbies, Target};
 use sush_server::executor::PathIsolation;
@@ -40,7 +43,7 @@ use sush_server::gossip::{LinkedBaseboards, Universe};
 use sush_server::locker::Locker;
 use sush_server::output::{JobOutputDir, JobOutputFileStream};
 use sush_server::state::GossipNetwork;
-use sush_server::{JobError, JobManager, seed_gossip};
+use sush_server::{JobManager, seed_gossip};
 
 static TEST_BASEBOARD_ID: OnceLock<BaseboardId> = OnceLock::new();
 
@@ -232,34 +235,68 @@ pub async fn fake_identity(key: &mut EphemeralKey) -> Identity {
     Identity::new(key.ssh_public_key(), verified, Utc::now()).unwrap()
 }
 
-/// Log in at the manager layer, without a client or server.
-pub async fn manager_login(mgr: &JobManager, key: &mut EphemeralKey) -> Result<Authz, JobError> {
-    let JobError::Unauthorized(nonce) = mgr.iam(None, None, ("POST", "/iam")).await.unwrap_err()
-    else {
-        panic!("expected a challenge");
-    };
-    let challenge = Challenge::new(nonce);
-    let request_key = RequestKey::new();
-    let response = ChallengeResponse::new(challenge, request_key.verifier());
-    let signed = key.sign(response).await.unwrap();
-    let public_key = key.ssh_public_key();
-    let verified = signed.verify_with_ssh_public_key(&public_key).unwrap();
-    let mut credentials = Credentials::new(verified);
-    credentials.key_id = public_key.key_id().unwrap();
-    mgr.iam(
-        Some(credentials.to_string()),
-        Some(public_key),
-        ("POST", "/iam"),
-    )
-    .await?;
-    Ok(Authz::new(credentials, request_key))
-}
-
 pub async fn manager_and_test_root(
     log: Logger,
 ) -> (JobManager, EphemeralKey, TempDir, CancellationToken) {
     let (mgr, root, _peer, dir, shutdown) = manager_test_root_and_peer(log).await;
     (mgr, root, dir, shutdown)
+}
+
+/// Everything the rack hears at session start: a client nonce, a
+/// signer nonce, the signer's clock reading, and the session id over
+/// them all.
+pub struct SessionCeremony {
+    pub session_id: SessionId,
+    pub client_nonce: SessionClientNonce,
+    pub sush_nonce: SessionSushNonce,
+    pub signer_nonce: SessionSignerNonce,
+    pub seq: SessionSeq,
+}
+
+/// Build a [`SessionCeremony`] against `mgr`. Fetches a fresh server
+/// nonce, as `GET /session-nonce` would, so earlier ceremonies
+/// against `mgr` go stale.
+pub fn session_ceremony(mgr: &JobManager, seq: u64) -> SessionCeremony {
+    let client_nonce = SessionClientNonce::random();
+    let sush_nonce = SessionSushNonce::compute(client_nonce, mgr.fresh_server_nonce());
+    let preimage = SessionPreimage {
+        baseboard: mgr.own_baseboard().clone(),
+        sush_nonce,
+        signer_nonce: SessionSignerNonce::random(),
+        seq: SessionSeq::from_unix_millis(seq).unwrap(),
+    };
+    SessionCeremony {
+        session_id: preimage.session_id(),
+        client_nonce,
+        sush_nonce,
+        signer_nonce: preimage.signer_nonce,
+        seq: preimage.seq,
+    }
+}
+
+/// Build a session id and the start body carrying its parts: like
+/// [`session_ceremony`], but the server nonce comes from `client`'s
+/// rack over HTTP.
+pub async fn http_session_ceremony(
+    client: &Client,
+    seq: u64,
+) -> (SessionId, sush_client::types::SessionStartBody) {
+    let client_nonce = SessionClientNonce::random();
+    let server_nonce = client.server_nonce().send().await.unwrap().into_inner();
+    let preimage = SessionPreimage {
+        baseboard: test_baseboard_id(),
+        sush_nonce: SessionSushNonce::compute(client_nonce, server_nonce),
+        signer_nonce: SessionSignerNonce::random(),
+        seq: SessionSeq::from_unix_millis(seq).unwrap(),
+    };
+    (
+        preimage.session_id(),
+        sush_client::types::SessionStartBody {
+            client_nonce,
+            signer_nonce: preimage.signer_nonce,
+            seq: preimage.seq,
+        },
+    )
 }
 
 /// Like [`manager_and_test_root`], but also hands back a clone of the

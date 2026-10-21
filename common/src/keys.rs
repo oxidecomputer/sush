@@ -15,7 +15,6 @@ use std::fmt;
 use std::ops::Deref;
 
 use bytes::{Buf as _, BufMut as _, BytesMut};
-use chrono::{DateTime, Utc};
 use crypto_bigint::{ArrayEncoding as _, Random as _, U128};
 use ed25519_dalek::{
     Signature as Ed25519Signature, Signer as _, SigningKey as Ed25519SigningKey,
@@ -1066,14 +1065,8 @@ pub fn pem_cert_chain(certs: Vec<Certificate>) -> Result<String, KeyError> {
 /// What went wrong handling a key, signature, or certificate.
 #[derive(Debug, Error)]
 pub enum KeyError {
-    #[error("Certificate chain is too long")]
-    CertChainTooLong,
-    #[error("A different certificate for key `{0}` is already imported")]
-    CertConflict(KeyId),
     #[error("DER encoding error: {0}")]
     Der(#[from] x509_cert::der::Error),
-    #[error("Invalid certificate: {0}")]
-    InvalidCert(String),
     #[error(transparent)]
     InvalidCodephrase(#[from] InvalidCodephrase),
     #[error("Invalid key ID")]
@@ -1092,10 +1085,6 @@ pub enum KeyError {
     Pem(#[from] pem_rfc7468::Error),
     #[error("PKCS#8 encoding error: {0}")]
     Pkcs8(#[from] pkcs8::Error),
-    #[error("Certificate for key `{0}` was revoked at {1}")]
-    Revoked(KeyId, DateTime<Utc>),
-    #[error("Will not import a self-signed (root) certificate")]
-    SelfSigned,
     #[error("Signature error: {0}")]
     Signature(#[from] signature::Error),
     #[error("Invalid signature: too short")]
@@ -1104,8 +1093,8 @@ pub enum KeyError {
     Signer(String),
     #[error("SSH key error: {0}")]
     SshKey(#[from] SshKeyError),
-    #[error("Too many certificates ({0})")]
-    TooManyCerts(usize),
+    #[error("Trust anchor `{0}` is not signed by a preceding anchor")]
+    UnanchoredCert(KeyId),
     #[error("Signature does not attest user presence")]
     UserPresenceRequired,
 }

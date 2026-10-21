@@ -21,8 +21,8 @@ use sled_hardware_types::BaseboardId;
 
 use sush_common::authn::Identity;
 use sush_common::jobs::{
-    Access, JobId, JobLimits, JobOutputStream, JobStatus, JsonJobStatusMap, Session, SessionId,
-    SessionSignerNonce, SessionSushNonce, SignedJob,
+    Access, JobId, JobLimits, JobOutputStream, JobStatus, JsonJobStatusMap, Session,
+    SessionClientNonce, SessionId, SessionSeq, SessionServerNonce, SessionSignerNonce, SignedJob,
 };
 use sush_common::keys::{KeyId, SshPublicKey};
 use sush_common::targets::SledVersion;
@@ -35,17 +35,6 @@ pub trait SushApi {
 
     // Certificate management.
 
-    /// Import a certificate, verify its signature, and return a key ID for it.
-    ///
-    /// The body should be a PEM encoded X.509 certificate.
-    #[endpoint { method = PUT, path = "/certs" }]
-    async fn cert_import(
-        ctx: RequestContext<Self::Context>,
-        headers: Header<Authorization>,
-        query: QueryParams<WaitParam>,
-        params: TypedBody<String>,
-    ) -> Result<HttpResponseOk<KeyId>, HttpError>;
-
     /// Get the certificate chain that validates a key.
     ///
     /// Certificates are in root-to-leaf order, PEM encoded and newline separated.
@@ -55,18 +44,6 @@ pub trait SushApi {
         headers: Header<Authorization>,
         params: PathParams<KeyIdParam>,
     ) -> Result<HttpResponseOk<String>, HttpError>;
-
-    /// Revoke a certificate.
-    ///
-    /// Revocation is permanent and propagates across the rack.
-    /// Root certificates cannot be revoked.
-    #[endpoint { method = POST, path = "/certs/{key_id}/revoke" }]
-    async fn cert_revoke(
-        ctx: RequestContext<Self::Context>,
-        headers: Header<Authorization>,
-        params: PathParams<KeyIdParam>,
-        query: QueryParams<WaitParam>,
-    ) -> Result<HttpResponseUpdatedNoContent, HttpError>;
 
     // Identity management.
 
@@ -88,18 +65,6 @@ pub trait SushApi {
         headers: Header<Authorization>,
     ) -> Result<HttpResponseOk<Vec<Identity>>, HttpError>;
 
-    /// Revoke an SSH identity.
-    ///
-    /// Expires the key's identities and refuses its future logins,
-    /// across the rack.
-    #[endpoint { method = POST, path = "/iam/{key_id}/revoke" }]
-    async fn iam_revoke(
-        ctx: RequestContext<Self::Context>,
-        headers: Header<Authorization>,
-        params: PathParams<KeyIdParam>,
-        query: QueryParams<WaitParam>,
-    ) -> Result<HttpResponseUpdatedNoContent, HttpError>;
-
     // Session management.
 
     /// Get the current session from this server's point of view.
@@ -109,15 +74,16 @@ pub trait SushApi {
         headers: Header<Authorization>,
     ) -> Result<HttpResponseOk<Session>, HttpError>;
 
-    /// Get the sush server nonce needed to start a new session.
+    /// Get a fresh server nonce for the session ceremony.
     ///
-    /// The nonce will need to be sent to the signer server, which will give back its own nonce.
-    /// Both nonces combined (along with the baseboard ID) will form the session ID.
-    #[endpoint { method = GET, path = "/session-nonce" }]
-    async fn session_start_nonce(
+    /// The client mixes its own nonce with this one to form the sush
+    /// nonce it submits to the signer. Fetching replaces the previous
+    /// server nonce, so only the latest ceremony can complete.
+    #[endpoint { method = GET, path = "/server-nonce" }]
+    async fn server_nonce(
         ctx: RequestContext<Self::Context>,
         headers: Header<Authorization>,
-    ) -> Result<HttpResponseOk<SessionStartNonce>, HttpError>;
+    ) -> Result<HttpResponseOk<SessionServerNonce>, HttpError>;
 
     /// Start a new support session.
     ///
@@ -322,14 +288,11 @@ pub struct JobTargetParams {
     pub target: String,
 }
 
-#[derive(Serialize, JsonSchema)]
-pub struct SessionStartNonce {
-    pub nonce: SessionSushNonce,
-}
-
 #[derive(Deserialize, JsonSchema)]
 pub struct SessionStartBody {
+    pub client_nonce: SessionClientNonce,
     pub signer_nonce: SessionSignerNonce,
+    pub seq: SessionSeq,
 }
 
 /// Job parameters _not_ specified in the signed job request.
