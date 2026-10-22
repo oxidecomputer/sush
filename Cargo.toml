@@ -40,8 +40,7 @@ memmap2 = "0.9"
 p256 = { version = "0.13", features = ["ecdsa", "pkcs8"] }
 pem-rfc7468 = { version = "0.7", features = ["std"] }
 percent-encoding = "2"
-permission-slip-client = { git = "https://github.com/oxidecomputer/permission-slip", rev = "94b68e717f2da426ca1450d5ebc9fc5000596bdc", features = ["sush-types"] }
-permission-slip-common = { git = "https://github.com/oxidecomputer/permission-slip", rev = "94b68e717f2da426ca1450d5ebc9fc5000596bdc" }
+permission-slip-client = { git = "https://github.com/oxidecomputer/permission-slip", rev = "e1ac78d5ddf1e02b977d6c5d1c1147cb08dac1ca", features = ["sush-types"] }
 pki-playground = { git = "https://github.com/oxidecomputer/pki-playground", rev = "7600756029ce046a02c6234aa84ce230cc5eaa04" }
 progenitor = "0.14"
 progenitor-client = "0.14"
@@ -75,6 +74,7 @@ tokio-stream = "0.1"
 tokio-fd = "0.3"
 tokio-tungstenite = "0.28"
 tokio-util = "0.7"
+webbrowser = "1"
 x509-cert = { version = "0.2", features = ["pem", "std"] }
 xdg = "3"
 

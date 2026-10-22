@@ -170,6 +170,8 @@ impl CommandContext for Repl {
             offline,
             ssh_auth_sock,
             ssh_key_id,
+            #[cfg(feature = "permslip")]
+                permslip_ssh: _,
             proxy_roots: _,
             nexus: _,
             nexus_token: _,
@@ -407,6 +409,11 @@ impl CommandContext for Repl {
 
     fn please_touch(&mut self, identity: &SshPublicKey) -> Result<(), CommandError> {
         self.cli.please_touch(identity)
+    }
+
+    #[cfg(feature = "permslip")]
+    fn please_authn(&mut self, url: &str) {
+        self.cli.please_authn(url)
     }
 
     fn really_target(&mut self, sled: &SledId) -> Result<(), CommandError> {
