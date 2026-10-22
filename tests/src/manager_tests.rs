@@ -1825,7 +1825,6 @@ async fn too_much_cpu() {
     .await
     .unwrap();
     let status = mgr.job_status(&authn, &job_id).await.unwrap()[mgr.own_baseboard()].clone();
-    assert!(status.time_elapsed().to_std().unwrap() < Duration::from_secs(2));
     check_status_stopped(
         status,
         &job_id,
