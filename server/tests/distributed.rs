@@ -31,10 +31,10 @@ use sush_common::jobs::{
 use sush_common::keys::{EphemeralKey, Signer as _, pem_cert_chain};
 use sush_common::targets::{Cubbies, SledHealth, SledId, Target};
 use sush_common::version::VersionInfo;
-use sush_server::bookmark::BOOKMARK;
 use sush_server::executor::PathIsolation;
 use sush_server::gossip::spawn_gossip;
 use sush_server::locker::Locker;
+use sush_server::locker::bookmark::BOOKMARK;
 use sush_server::messages::v0::{Event, JobEvent, Message};
 use sush_server::output::JobOutputDir;
 use sush_server::state::GossipUniverse;
@@ -759,7 +759,7 @@ async fn lost_suffix_never_reruns() {
     let boundary_dir = TempDir::with_prefix("sush-boundary-").unwrap();
     let slot = Utf8PathBuf::from_path_buf(boundary_dir.path().to_path_buf()).unwrap();
     let b_shutdown = CancellationToken::new();
-    let locker = Locker::new(&log, vec![slot.clone()]).unwrap();
+    let locker = Locker::new(&log, baseboard(2), vec![slot.clone()]).unwrap();
     let b = Sled::start_with_locker(&log, &dir, 2, &root_pem, locker, &b_shutdown).await;
     let authn_b = fake_identity(&mut root).await;
     a.peers.send(BTreeSet::from([b.addr])).unwrap();
@@ -834,7 +834,7 @@ async fn lost_suffix_never_reruns() {
     b_shutdown.cancel();
     drop(b);
     sleep(Duration::from_millis(500)).await;
-    let locker = Locker::new(&log, vec![slot]).unwrap();
+    let locker = Locker::new(&log, baseboard(2), vec![slot]).unwrap();
     let b = Sled::start_with_locker(&log, &dir, 2, &root_pem, locker, &shutdown).await;
     let authn_b = fake_identity(&mut root).await;
     a.peers.send(BTreeSet::from([b.addr])).unwrap();
@@ -941,7 +941,7 @@ async fn session_resumes_at_stored_successor() {
     let boundary_dir = TempDir::with_prefix("sush-boundary-").unwrap();
     let slot = Utf8PathBuf::from_path_buf(boundary_dir.path().to_path_buf()).unwrap();
     let b_shutdown = CancellationToken::new();
-    let locker = Locker::new(&log, vec![slot.clone()]).unwrap();
+    let locker = Locker::new(&log, baseboard(2), vec![slot.clone()]).unwrap();
     let b = Sled::start_with_locker(&log, &dir, 2, &root_pem, locker, &b_shutdown).await;
     let authn_b = fake_identity(&mut root).await;
     a.peers.send(BTreeSet::from([b.addr, c.addr])).unwrap();
@@ -1027,7 +1027,7 @@ async fn session_resumes_at_stored_successor() {
     drop(b);
     a.peers.send(BTreeSet::new()).unwrap();
     sleep(Duration::from_millis(500)).await;
-    let locker = Locker::new(&log, vec![slot]).unwrap();
+    let locker = Locker::new(&log, baseboard(2), vec![slot]).unwrap();
     let b = Sled::start_with_locker(&log, &dir, 2, &root_pem, locker, &shutdown).await;
     let authn_b = fake_identity(&mut root).await;
     b.peers.send(BTreeSet::from([c.addr])).unwrap();
@@ -1110,7 +1110,7 @@ async fn supersession_crosses_universes() {
     let boundary_dir = TempDir::with_prefix("sush-boundary-").unwrap();
     let slot = Utf8PathBuf::from_path_buf(boundary_dir.path().to_path_buf()).unwrap();
     let x_shutdown = CancellationToken::new();
-    let locker = Locker::new(&log, vec![slot.clone()]).unwrap();
+    let locker = Locker::new(&log, baseboard(2), vec![slot.clone()]).unwrap();
     let x = Sled::start_with_locker(&log, &dir, 2, &root_pem, locker, &x_shutdown).await;
     let authn_x = fake_identity(&mut root).await;
     a.peers.send(BTreeSet::from([x.addr])).unwrap();
@@ -1168,7 +1168,7 @@ async fn supersession_crosses_universes() {
     a.peers.send(BTreeSet::new()).unwrap();
     sleep(Duration::from_millis(500)).await;
     let x_shutdown = CancellationToken::new();
-    let locker = Locker::new(&log, vec![slot.clone()]).unwrap();
+    let locker = Locker::new(&log, baseboard(2), vec![slot.clone()]).unwrap();
     let x = Sled::start_with_locker(&log, &dir, 2, &root_pem, locker, &x_shutdown).await;
     let authn_x = fake_identity(&mut root).await;
     d.peers.send(BTreeSet::from([x.addr])).unwrap();
@@ -1212,7 +1212,7 @@ async fn supersession_crosses_universes() {
     d.peers.send(BTreeSet::new()).unwrap();
     sleep(Duration::from_millis(500)).await;
     let x_shutdown = CancellationToken::new();
-    let locker = Locker::new(&log, vec![slot.clone()]).unwrap();
+    let locker = Locker::new(&log, baseboard(2), vec![slot.clone()]).unwrap();
     let x = Sled::start_with_locker(&log, &dir, 2, &root_pem, locker, &x_shutdown).await;
     let authn_x = fake_identity(&mut root).await;
     a.peers.send(BTreeSet::from([x.addr])).unwrap();
@@ -1291,7 +1291,7 @@ async fn supersession_crosses_universes() {
     drop(x);
     a.peers.send(BTreeSet::new()).unwrap();
     sleep(Duration::from_millis(500)).await;
-    let locker = Locker::new(&log, vec![slot]).unwrap();
+    let locker = Locker::new(&log, baseboard(2), vec![slot]).unwrap();
     let x = Sled::start_with_locker(&log, &dir, 2, &root_pem, locker, &shutdown).await;
     let authn_x = fake_identity(&mut root).await;
     d.peers.send(BTreeSet::from([x.addr])).unwrap();
@@ -1347,7 +1347,7 @@ async fn witnessed_session_survives_restart() {
     let boundary_dir = TempDir::with_prefix("sush-boundary-").unwrap();
     let slot = Utf8PathBuf::from_path_buf(boundary_dir.path().to_path_buf()).unwrap();
     let b_shutdown = CancellationToken::new();
-    let locker = Locker::new(&log, vec![slot.clone()]).unwrap();
+    let locker = Locker::new(&log, baseboard(2), vec![slot.clone()]).unwrap();
     let b = Sled::start_with_locker(&log, &dir, 2, &root_pem, locker, &b_shutdown).await;
     a.peers.send(BTreeSet::from([b.addr])).unwrap();
     b.peers.send(BTreeSet::from([a.addr])).unwrap();
@@ -1390,7 +1390,7 @@ async fn witnessed_session_survives_restart() {
     b_shutdown.cancel();
     drop(b);
     sleep(Duration::from_millis(500)).await;
-    let locker = Locker::new(&log, vec![slot]).unwrap();
+    let locker = Locker::new(&log, baseboard(2), vec![slot]).unwrap();
     let b = Sled::start_with_locker(&log, &dir, 2, &root_pem, locker, &shutdown).await;
     a.peers.send(BTreeSet::from([b.addr])).unwrap();
     b.peers.send(BTreeSet::from([a.addr])).unwrap();
@@ -1456,7 +1456,7 @@ async fn bookmarks_survive_restart() {
         &dir,
         2,
         &root_pem,
-        Locker::new(&log, vec![slot.clone()]).unwrap(),
+        Locker::new(&log, baseboard(2), vec![slot.clone()]).unwrap(),
         &b_shutdown,
     )
     .await;
@@ -1482,7 +1482,7 @@ async fn bookmarks_survive_restart() {
         &dir,
         2,
         &root_pem,
-        Locker::new(&log, vec![slot.clone()]).unwrap(),
+        Locker::new(&log, baseboard(2), vec![slot.clone()]).unwrap(),
         &shutdown,
     )
     .await;
@@ -1528,7 +1528,12 @@ async fn gossip_survives_bookmark_failure() {
         &dir,
         2,
         &root_pem,
-        Locker::new(&log, vec![Utf8PathBuf::from("/nonexistent/sush")]).unwrap(),
+        Locker::new(
+            &log,
+            baseboard(2),
+            vec![Utf8PathBuf::from("/nonexistent/sush")],
+        )
+        .unwrap(),
         &shutdown,
     )
     .await;
