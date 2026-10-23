@@ -581,6 +581,15 @@ impl JobManager {
         }
     }
 
+    /// Don't act on a job we've never seen.
+    fn known_job_check(&self, job_id: &JobId) -> Result<(), JobError> {
+        if self.state.borrow().is_job_known(job_id) {
+            Ok(())
+        } else {
+            Err(JobError::JobNotFound(job_id.to_owned()))
+        }
+    }
+
     pub async fn session_allow_attach(
         &self,
         authn: &Identity,
@@ -655,6 +664,8 @@ impl JobManager {
         job_id: &JobId,
         JobStopParams { wait, .. }: JobStopParams,
     ) -> Result<(), JobError> {
+        self.starter_check(authn)?;
+        self.known_job_check(job_id)?;
         self.job_request(authn, JobRequest::Stop(job_id.to_owned()))
             .await?;
         self.wait_for(self.wait_for_job(job_id, wait)).await

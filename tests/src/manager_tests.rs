@@ -403,30 +403,39 @@ async fn job_stop() {
         .unwrap();
     confirm_start(&mgr, &authn, &mut root, &mut session).await;
 
-    // Stopping a nonexistent job should mark it cancelled, and so succeed
-    // immediately.
+    // A job a server hasn't seen can't be stopped.
     let job_id = session.next_job_id();
-    mgr.job_stop(
-        &authn,
-        &job_id,
-        JobStopParams {
-            wait: JobWait::Stop,
-            ..Default::default()
-        },
-    )
-    .await
-    .expect("should be able to stop a nonexistent job");
-
     assert!(matches!(
-        &mgr.job_status(&authn, &job_id).await.unwrap()[baseboard_id],
-        JobStatus::Cancelled { job_id: jid, time_cancelled, .. } if *jid == job_id && *time_cancelled <= Utc::now()
+        mgr.job_stop(&authn, &job_id, JobStopParams::default())
+            .await,
+        Err(JobError::JobNotFound(_))
+    ));
+    assert!(matches!(
+        mgr.job_status(&authn, &job_id).await,
+        Err(JobError::JobNotFound(_))
     ));
 
-    // Skip the cancelled job.
+    // Skipping it is the starter's prerogative.
     session.skip_job(job_id);
     mgr.session_skip_job(&authn, session_id, job_id)
         .await
-        .expect("should be able to skip cancelled job");
+        .expect("should be able to skip a job");
+    timeout(Duration::from_secs(30), async {
+        loop {
+            if let Ok(status) = mgr.job_status(&authn, &job_id).await
+                && matches!(
+                    &status[baseboard_id],
+                    JobStatus::Cancelled { job_id: jid, time_cancelled, .. }
+                        if *jid == job_id && *time_cancelled <= Utc::now()
+                )
+            {
+                break;
+            }
+            sleep(Duration::from_millis(50)).await;
+        }
+    })
+    .await
+    .expect("skip never cancelled the job");
 
     // Start a new (potentially) long-running job.
     let command = "sleep 10";
@@ -644,16 +653,12 @@ async fn session_stop_skips_queued_jobs() {
         JobStatus::Started { .. }
     ));
 
-    mgr.job_stop(
-        &authn,
-        &job_id_a,
-        JobStopParams {
-            wait: JobWait::Stop,
-            ..Default::default()
-        },
-    )
-    .await
-    .expect("should be able to stop job A");
+    // The job outlives its session.
+    assert!(matches!(
+        mgr.job_stop(&authn, &job_id_a, JobStopParams::default())
+            .await,
+        Err(JobError::NoSession)
+    ));
 }
 
 #[named]
@@ -1629,6 +1634,11 @@ async fn skip_and_stop_are_starter_only() {
     ));
     assert!(matches!(
         mgr.session_stop(&guest, session_id).await,
+        Err(JobError::NotSessionStarter)
+    ));
+    assert!(matches!(
+        mgr.job_stop(&guest, &job_id, JobStopParams::default())
+            .await,
         Err(JobError::NotSessionStarter)
     ));
     assert!(matches!(

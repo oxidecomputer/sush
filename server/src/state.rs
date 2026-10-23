@@ -367,6 +367,14 @@ impl State {
         self.history.get_job_status(job_id)
     }
 
+    pub fn is_job_known(&self, job_id: &JobId) -> bool {
+        self.history.contains(job_id)
+            || self
+                .session
+                .queued_jobs()
+                .is_some_and(|queued| queued.contains_key(job_id))
+    }
+
     fn skip_queued_jobs(&self, now: DateTime<Utc>) -> Vec<Output> {
         let mut outputs = Vec::new();
         for (job_id, queued) in self.session.queued_jobs().into_iter().flatten() {
@@ -782,6 +790,17 @@ impl State {
                 }
             }
             JobRequest::Stop(job_id) => {
+                if self.session.session().and_then(Session::started_by) != Some(actor) {
+                    warn!(
+                        log, "ignoring job stop from non-starter";
+                        "job_id" => %job_id, "actor" => %actor,
+                    );
+                    return outputs;
+                }
+                if !self.is_job_known(job_id) {
+                    info!(log, "ignoring stop for an unknown job"; "job_id" => %job_id);
+                    return outputs;
+                }
                 outputs.push(Output::Stop(*job_id));
                 let replayed = !self.is_live(incoming_version);
                 self.cancel_job(now, job_id, actor, replayed);
@@ -1971,6 +1990,52 @@ mod test {
                 .iter()
                 .any(|o| matches!(o, Output::Run(run) if *run.job.payload().job_id() == job_id))
         );
+    }
+
+    /// A stop for a job the rack has not seen leaves no trace, so the
+    /// signed job runs when it arrives.
+    #[tokio::test]
+    async fn stop_of_unknown_job_leaves_no_trace() {
+        let (mut root, mut sim, session_id, session) = sim_with_session().await;
+        let actor = root.key_id().clone();
+        let job_id = session.next_job_id();
+
+        sim.request(Request::job(actor.clone(), JobRequest::Stop(job_id)));
+        assert!(!sim.state.history.contains(&job_id));
+
+        let signed = signed_job(&mut root, job_id, session_id, "true").await;
+        let outputs = sim.request(Request::job(
+            actor,
+            JobRequest::Start(signed, JobStartParams::default()),
+        ));
+        assert!(
+            outputs
+                .iter()
+                .any(|o| matches!(o, Output::Run(run) if *run.job.payload().job_id() == job_id))
+        );
+    }
+
+    /// Only the session starter may stop a job.
+    #[tokio::test]
+    async fn stop_from_non_starter_is_ignored() {
+        let (mut root, mut sim, session_id, session) = sim_with_session().await;
+        let actor = root.key_id().clone();
+        let job_id = session.next_job_id();
+        let signed = signed_job(&mut root, job_id, session_id, "true").await;
+        sim.request(Request::job(
+            actor,
+            JobRequest::Start(signed, JobStartParams::default()),
+        ));
+
+        let guest = self::root().key_id().clone();
+        let outputs = sim.request(Request::job(guest, JobRequest::Stop(job_id)));
+        assert!(!outputs.iter().any(|o| matches!(o, Output::Stop(_))));
+        assert!(!matches!(
+            sim.state
+                .get_job_status(&job_id)
+                .and_then(|status| status.get(&baseboard())),
+            Some(JobStatus::Cancelled { .. })
+        ));
     }
 
     /// Sessions must not be resumed across networks.
