@@ -24,7 +24,7 @@ use x509_cert::Certificate;
 use sush_api::JobStartParams;
 use sush_common::jobs::{
     Access, JobId, JobStatus, JobStatusMap, LastJob, ProcessError, Session, SessionId, SessionSeq,
-    SignedJob, SkipReason, VerifiedJob,
+    SkipReason, VerifiedJob,
 };
 use sush_common::keys::{KeyError, KeyId};
 use sush_common::targets::Cubbies;
@@ -60,7 +60,7 @@ pub const MAX_QUEUED_JOBS: usize = 1_000;
 /// but never execute here.
 #[derive(Clone, Debug)]
 pub struct QueuedJob {
-    pub job: SignedJob,
+    pub job: VerifiedJob,
     pub params: JobStartParams,
     pub replayed: bool,
 }
@@ -117,6 +117,16 @@ impl SessionState {
             return Some(Access::ReadWrite);
         }
         attach_grants.get(key_id).copied()
+    }
+
+    /// Where an active session stands in the total order of sessions
+    /// by signer-assigned sequence number, then ID.
+    pub fn rank(&self) -> Option<(SessionSeq, SessionId)> {
+        use SessionState::*;
+        match self {
+            Inactive => None,
+            Active { seq, session, .. } => Some((*seq, session.session_id())),
+        }
     }
 
     fn queued_jobs(&self) -> Option<&QueuedJobs> {
@@ -195,8 +205,8 @@ impl Past {
     fn screen(&self, session: SessionId, seq: SessionSeq, live: bool) -> Admission {
         match &self.committed {
             Some(boundary)
-                if (boundary.network == self.network && boundary.session == session)
-                    || seq > boundary.seq =>
+                if seq > boundary.seq
+                    || (boundary.network == self.network && boundary.session == session) =>
             {
                 Admission::Admit
             }
@@ -206,23 +216,11 @@ impl Past {
         }
     }
 
-    /// Construct a boundary for a verified job.
-    fn commit_to(
-        &self,
-        network: Network,
-        session_id: SessionId,
-        seq: SessionSeq,
-        job_id: JobId,
-        successor: JobId,
-    ) -> Boundary {
-        Boundary {
-            network,
-            session: session_id.to_owned(),
-            seq,
-            job: job_id,
-            successor,
-            status: None,
-        }
+    /// Return the current boundary record for this universe.
+    fn boundary(&self) -> Option<&Boundary> {
+        self.committed
+            .as_deref()
+            .filter(|boundary| boundary.network == self.network)
     }
 
     /// Whether a message at `version` is live traffic rather than
@@ -313,6 +311,10 @@ impl State {
         self.session.session()
     }
 
+    pub fn rank(&self) -> Option<(SessionSeq, SessionId)> {
+        self.session.rank()
+    }
+
     pub fn attach_access(&self, key_id: &KeyId) -> Option<Access> {
         self.session.attach_access(key_id)
     }
@@ -363,6 +365,14 @@ impl State {
 
     pub fn get_job_status(&self, job_id: &JobId) -> Option<&JobStatusMap> {
         self.history.get_job_status(job_id)
+    }
+
+    pub fn is_job_known(&self, job_id: &JobId) -> bool {
+        self.history.contains(job_id)
+            || self
+                .session
+                .queued_jobs()
+                .is_some_and(|queued| queued.contains_key(job_id))
     }
 
     fn skip_queued_jobs(&self, now: DateTime<Utc>) -> Vec<Output> {
@@ -425,14 +435,9 @@ impl State {
     /// re-entering the job's own universe replays the earlier ruling
     /// as a status, which stops a second announcement.
     fn adjudicate_boundary(&mut self, log: &Logger, now: DateTime<Utc>) -> Vec<Output> {
-        // An absent record commits to no job, so there
-        // is nothing to rule on.
-        let Some(boundary) = &self.past.committed else {
+        let Some(boundary) = self.past.boundary() else {
             return Vec::new();
         };
-        if boundary.network != self.past.network {
-            return Vec::new();
-        }
         let (job_id, status) = (boundary.job, boundary.status.clone());
         if self.past.adjudicated == Some(job_id) {
             return Vec::new();
@@ -561,12 +566,10 @@ impl State {
                         info!(log, "duplicate session start"; "session_id" => %session_id);
                     }
 
-                    // A start wins the slot only by exceeding the
-                    // active session in the signer-assigned order,
-                    // with ties broken by id. This one does not;
+                    // This start does not outrank the active session;
                     // ignore it.
-                    Active { seq, session, .. }
-                        if (preimage.seq, session_id) <= (*seq, session.session_id()) =>
+                    Active { seq, .. }
+                        if Some((preimage.seq, session_id)) <= self.session.rank() =>
                     {
                         info!(
                             log, "stale session start";
@@ -582,9 +585,10 @@ impl State {
                     Inactive | Active { .. } => {
                         info!(log, "session started"; "session_id" => %session_id, "actor" => %actor);
                         let mut session = Session::started(session_id, actor.clone());
-                        if let Some(boundary) = &self.past.committed
-                            && boundary.network == self.past.network
-                            && boundary.session == session_id
+                        if let Some(boundary) = self
+                            .past
+                            .boundary()
+                            .filter(|boundary| boundary.session == session_id)
                         {
                             info!(
                                 log, "resuming committed session at its successor";
@@ -727,6 +731,19 @@ impl State {
         let mut outputs = Vec::new();
         match request {
             JobRequest::Start(signed, params) => {
+                let job = match self.certs.verify(signed) {
+                    Ok(job) => job,
+                    Err(error) => {
+                        warn!(
+                            log, "refusing unverified job";
+                            "job_id" => %signed.job_id(),
+                            "actor" => %actor,
+                            "error" => %error,
+                        );
+                        return outputs;
+                    }
+                };
+
                 // The session must be active and must match the
                 // submitted job. It is safe to refuse all other jobs.
                 // By cases:
@@ -754,7 +771,7 @@ impl State {
                     .session()
                     .is_some_and(|s| s.session_id() == session_id)
                 {
-                    self.enqueue_job(log, now, signed.clone(), params.clone(), actor, !live);
+                    self.enqueue_job(log, now, job, params.clone(), actor, !live);
                     outputs.extend(self.release_ready_jobs(log, now, network));
                 } else {
                     let job_id = *signed.job_id();
@@ -773,6 +790,17 @@ impl State {
                 }
             }
             JobRequest::Stop(job_id) => {
+                if self.session.session().and_then(Session::started_by) != Some(actor) {
+                    warn!(
+                        log, "ignoring job stop from non-starter";
+                        "job_id" => %job_id, "actor" => %actor,
+                    );
+                    return outputs;
+                }
+                if !self.is_job_known(job_id) {
+                    info!(log, "ignoring stop for an unknown job"; "job_id" => %job_id);
+                    return outputs;
+                }
                 outputs.push(Output::Stop(*job_id));
                 let replayed = !self.is_live(incoming_version);
                 self.cancel_job(now, job_id, actor, replayed);
@@ -946,7 +974,7 @@ impl State {
         &mut self,
         log: &Logger,
         now: DateTime<Utc>,
-        job: SignedJob,
+        job: VerifiedJob,
         params: JobStartParams,
         actor: &KeyId,
         replayed: bool,
@@ -1052,7 +1080,7 @@ impl State {
         let Some(network) = network else {
             let mut n = 0;
             while let Some(queued) = queued_jobs.remove(&session.next_job_id()) {
-                session.job_started(queued.job);
+                session.job_started(queued.job.into_signed());
                 n += 1;
             }
             if n > 0 {
@@ -1094,38 +1122,34 @@ impl State {
                     })
                     .unwrap_or(true)
                 {
-                    let checked = self
-                        .certs
-                        .verify(&request)
-                        .map_err(|error| ProcessError::InvalidJob(error.to_string()))
-                        .and_then(|job| Executor::check_command(job.payload()).map(|()| job));
-                    match checked {
+                    match Executor::check_command(request.payload()) {
                         Err(error) => outputs.push(Output::job_event(
                             self.rack.own_baseboard(),
                             JobEvent::Error(job_id, now, error),
                         )),
-                        Ok(job) => {
+                        Ok(()) => {
                             let (attachment, rx_attachment) = watch::channel(None);
                             self.attachments.insert(job_id, rx_attachment);
                             outputs.push(Output::Run(Box::new(Run {
-                                job,
+                                job: request.clone(),
                                 params,
                                 attachment,
-                                boundary: self.past.commit_to(
+                                boundary: Boundary {
                                     network,
-                                    session.session_id(),
-                                    *seq,
-                                    job_id,
-                                    session
+                                    session: session.session_id(),
+                                    seq: *seq,
+                                    job: job_id,
+                                    successor: session
                                         .session_id()
-                                        .next_job_id(&LastJob::Some(request.clone())),
-                                ),
+                                        .next_job_id(&LastJob::Some((*request).clone())),
+                                    status: None,
+                                },
                             })));
                         }
                     }
                 }
             }
-            session.job_started(request);
+            session.job_started(request.into_signed());
         }
         outputs
     }
@@ -1558,7 +1582,7 @@ mod test {
 
     use sush_common::jobs::{
         JobMode, JobOutputState, JobStartRequest, SessionPreimage, SessionSignerNonce,
-        SessionSushNonce,
+        SessionSushNonce, SignedJob,
     };
     use sush_common::keys::{EphemeralKey, KeyType, Signer as _};
     use sush_common::targets::Target;
@@ -1932,6 +1956,86 @@ mod test {
 
         sim.request(Request::session(actor, SessionRequest::Stop(session_id)));
         assert!(sim.state.session.session().is_none());
+    }
+
+    /// A forged job never joins the queue. The chain and the history
+    /// stay untouched, and the signed job it mimics runs in its place.
+    #[tokio::test]
+    async fn unverified_job_does_not_advance_the_chain() {
+        let (mut root, mut sim, session_id, session) = sim_with_session().await;
+        let actor = root.key_id().clone();
+
+        let job_id = session.next_job_id();
+        let signed = signed_job(&mut root, job_id, session_id, "true").await;
+        let other = signed_job(&mut root, job_id, session_id, "false").await;
+        let forged = SignedJob::new(
+            signed.payload().clone(),
+            signed.key_id().clone(),
+            other.signature().clone(),
+        );
+        let outputs = sim.request(Request::job(
+            actor.clone(),
+            JobRequest::Start(forged, JobStartParams::default()),
+        ));
+        assert!(outputs.is_empty());
+        assert_eq!(sim.state.session.session().unwrap().next_job_id(), job_id);
+        assert!(!sim.state.history.contains(&job_id));
+
+        let outputs = sim.request(Request::job(
+            actor,
+            JobRequest::Start(signed, JobStartParams::default()),
+        ));
+        assert!(
+            outputs
+                .iter()
+                .any(|o| matches!(o, Output::Run(run) if *run.job.payload().job_id() == job_id))
+        );
+    }
+
+    /// A stop for a job the rack has not seen leaves no trace, so the
+    /// signed job runs when it arrives.
+    #[tokio::test]
+    async fn stop_of_unknown_job_leaves_no_trace() {
+        let (mut root, mut sim, session_id, session) = sim_with_session().await;
+        let actor = root.key_id().clone();
+        let job_id = session.next_job_id();
+
+        sim.request(Request::job(actor.clone(), JobRequest::Stop(job_id)));
+        assert!(!sim.state.history.contains(&job_id));
+
+        let signed = signed_job(&mut root, job_id, session_id, "true").await;
+        let outputs = sim.request(Request::job(
+            actor,
+            JobRequest::Start(signed, JobStartParams::default()),
+        ));
+        assert!(
+            outputs
+                .iter()
+                .any(|o| matches!(o, Output::Run(run) if *run.job.payload().job_id() == job_id))
+        );
+    }
+
+    /// Only the session starter may stop a job.
+    #[tokio::test]
+    async fn stop_from_non_starter_is_ignored() {
+        let (mut root, mut sim, session_id, session) = sim_with_session().await;
+        let actor = root.key_id().clone();
+        let job_id = session.next_job_id();
+        let signed = signed_job(&mut root, job_id, session_id, "true").await;
+        sim.request(Request::job(
+            actor,
+            JobRequest::Start(signed, JobStartParams::default()),
+        ));
+
+        let guest = self::root().key_id().clone();
+        let outputs = sim.request(Request::job(guest, JobRequest::Stop(job_id)));
+        assert!(!outputs.iter().any(|o| matches!(o, Output::Stop(_))));
+        assert!(!matches!(
+            sim.state
+                .get_job_status(&job_id)
+                .and_then(|status| status.get(&baseboard())),
+            Some(JobStatus::Cancelled { .. })
+        ));
     }
 
     /// Sessions must not be resumed across networks.

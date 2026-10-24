@@ -82,6 +82,8 @@ pub enum JobError {
     Wait,
     #[error("The provided session ID is invalid")]
     InvalidSessionId,
+    #[error("Job signature verification failed: {0}")]
+    UnverifiedJob(KeyError),
 }
 
 impl JobError {
@@ -179,7 +181,7 @@ impl From<JobError> for HttpError {
                 HttpError::for_client_error(None, ClientErrorStatusCode::NOT_FOUND, message)
             }
             DuplicateJobId(_) | InteractiveTarget | InvalidCommand | Json(_) | MultipleSessions
-            | InvalidSessionId => {
+            | InvalidSessionId | UnverifiedJob(_) => {
                 HttpError::for_client_error(None, ClientErrorStatusCode::BAD_REQUEST, message)
             }
             NotNextJob(_) => {

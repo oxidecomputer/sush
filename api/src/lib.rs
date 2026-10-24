@@ -87,16 +87,15 @@ pub trait SushApi {
 
     /// Start a new support session.
     ///
-    /// There may only be one session active on the rack at a time.
-    /// If a session is already running when this request is made,
-    /// the new session supersedes the old one, but the old session's
-    /// jobs are not stopped.
+    /// A session start is not signed, so the rack acts on it only
+    /// when it verifies a signed job for the session. The new
+    /// session then supersedes the active one: the rack skips the
+    /// old session's queued jobs but does not stop its running jobs.
     #[endpoint { method = POST, path = "/sessions/{session_id}/start" }]
     async fn session_start(
         ctx: RequestContext<Self::Context>,
         headers: Header<Authorization>,
         params: PathParams<SessionIdParam>,
-        query: QueryParams<WaitParam>,
         body: TypedBody<SessionStartBody>,
     ) -> Result<HttpResponseUpdatedNoContent, HttpError>;
 
@@ -241,13 +240,6 @@ pub struct RoutingParam {
 #[derive(Deserialize, JsonSchema)]
 pub struct KeyIdParam {
     pub key_id: KeyId,
-}
-
-#[derive(Clone, Debug, Default, Deserialize, JsonSchema, Serialize)]
-#[serde(default)]
-pub struct WaitParam {
-    /// Wait for the subject to appear in the state.
-    pub wait: bool,
 }
 
 #[derive(Deserialize, JsonSchema)]

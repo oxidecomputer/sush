@@ -24,7 +24,7 @@ use tokio_tungstenite::tungstenite::protocol::{Role, WebSocketConfig};
 use sush_api::{
     AccessParam, Authorization, AuthorizedRangeRequest, JobHistoryParams, JobIdParam,
     JobOutputParams, JobStartParams, JobStopParams, JobTargetParams, KeyIdParam, RoutingParam,
-    SessionAndJobIds, SessionAndKeyIds, SessionIdParam, SessionStartBody, SushApi, WaitParam,
+    SessionAndJobIds, SessionAndKeyIds, SessionIdParam, SessionStartBody, SushApi,
 };
 use sush_common::authn::Identity;
 use sush_common::jobs::{
@@ -135,7 +135,6 @@ impl SushApi for ApiServer {
         ctx: RequestContext<Self::Context>,
         headers: Header<Authorization>,
         params: PathParams<SessionIdParam>,
-        query: QueryParams<WaitParam>,
         body: TypedBody<SessionStartBody>,
     ) -> Result<HttpResponseUpdatedNoContent, HttpError> {
         let mgr = ctx.context();
@@ -143,14 +142,13 @@ impl SushApi for ApiServer {
         let authn = mgr
             .iam(authorization, None, request_line(&ctx.request))
             .await?;
-        let WaitParam { wait } = query.into_inner();
         let SessionIdParam { session_id } = params.into_inner();
         let SessionStartBody {
             client_nonce,
             signer_nonce,
             seq,
         } = body.into_inner();
-        mgr.session_start(&authn, session_id, client_nonce, signer_nonce, seq, wait)
+        mgr.session_start(&authn, session_id, client_nonce, signer_nonce, seq)
             .await?;
         Ok(HttpResponseUpdatedNoContent())
     }
