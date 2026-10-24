@@ -4,6 +4,9 @@
 
 //! Job server errors.
 
+use std::ffi::c_int;
+use std::fmt::Display;
+use std::io;
 use std::path::{Path, PathBuf};
 
 use dropshot::{ClientErrorStatusCode, HttpError};
@@ -13,6 +16,21 @@ use sush_common::authn::{Challenge, Nonce};
 use sush_common::interactive::InteractiveJobError;
 use sush_common::jobs::{ExecutionError, JobId, JobOutputHash, SessionId};
 use sush_common::keys::{KeyError, KeyId};
+
+/// Prefix an I/O error with `what` we were doing.
+pub fn io_context(what: impl Display, error: io::Error) -> io::Error {
+    io::Error::new(error.kind(), format!("{what}: {error}"))
+}
+
+/// Check the result of a C function that returns an error number rather
+/// than setting the global `errno`, as libcontract and posix_spawn(3C) do.
+pub fn check_errno(what: impl Display, errno: c_int) -> io::Result<()> {
+    if errno == 0 {
+        Ok(())
+    } else {
+        Err(io_context(what, io::Error::from_raw_os_error(errno)))
+    }
+}
 
 /// What went wrong processing a client job request.
 #[derive(Debug, Error)]

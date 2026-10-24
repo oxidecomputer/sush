@@ -8,22 +8,18 @@
 //! machine, but session agnostic.
 
 use std::collections::{BTreeMap, BTreeSet};
+use std::ffi::OsString;
 use std::io;
-use std::mem::MaybeUninit;
-use std::os::fd::AsRawFd as _;
-use std::process::Stdio;
-use std::ptr::null_mut;
 use std::sync::{Arc, RwLock};
 
 use chrono::Utc;
 use futures::Stream;
 use pwd::Passwd;
-use rustix::io::{Errno, close};
-use rustix::process::{Pid, Signal, ioctl_tiocsctty, kill_process_group, setsid};
-use slog::{Logger, debug, error, o, warn};
+#[cfg(target_os = "illumos")]
+use slog::debug;
+use slog::{Logger, error, o, warn};
 use tokio::fs::{DirBuilder, OpenOptions};
 use tokio::io::AsyncWriteExt as _;
-use tokio::process::{Child, Command};
 use tokio::spawn;
 use tokio::sync::{mpsc, watch};
 use tokio_stream::wrappers::ReceiverStream;
@@ -42,10 +38,24 @@ use crate::job::{Job, SocketSender};
 use crate::locker::boundary::{Boundary, BoundaryStore};
 use crate::messages::v0::{Event, JobEvent};
 use crate::output::JobOutputDir;
-use crate::pty::open_pty;
+use crate::spawn::{JobChild, PosixSpawn, SpawnStdio};
 
 pub const DEFAULT_PATH: &str = "/usr/sbin:/usr/bin:/sbin:/bin";
 pub const DEFAULT_TERM: &str = "vt100";
+
+const BASH: &str = "/usr/bin/bash";
+
+/// A bash script that sets a job's soft limits and then execs the job
+/// in `$BASH`, the bash running the script. posix_spawn cannot set
+/// resource limits on the child, so the child must set its own before
+/// it execs the job. The script's arguments are the maximum CPU seconds,
+/// address space (in KiB), file size (in KiB), and the job command.
+///
+/// For compatibility with `ssh`, we set `SSH_CLIENT` so that bash reads
+/// `/root/.bashrc`. We set it only for the exec'd job, so that bash reads
+/// it only once.
+const LIMITS_SHIM: &str =
+    r#"ulimit -S -t "$1" -v "$2" -f "$3" && SSH_CLIENT=sush exec "$BASH" -c "$4""#;
 
 /// This queue size is an arbitrary choice. We expect to consume
 /// messages from the channel very rapidly, so should not
@@ -255,7 +265,14 @@ async fn job_spawn(launch: Launch) {
         cols,
         wait: _,
     } = params;
-    let mut limits = requested.clone().clamp();
+    let mut limits = match requested.clone().clamp() {
+        Ok(limits) => limits,
+        Err(error) => {
+            let error = ProcessError::io("reading resource limits", error);
+            send_error(&log, &job_id, &events, error).await;
+            return;
+        }
+    };
     if limits != requested {
         warn!(
             log, "clamped requested job limits";
@@ -364,141 +381,71 @@ async fn job_spawn(launch: Launch) {
         format!("writing job request file `{}`", job_path.display())
     );
 
-    // Set up the job command.
-    let mut cmd = Command::new("bash");
-    cmd.kill_on_drop(true);
-    cmd.arg("-c").arg(&command);
-
-    // Set up basic environment.
-    cmd.env_clear();
+    // Set up the job's environment.
+    let mut env = Vec::new();
     match path_isolation {
-        PathIsolation::Enable => {
-            cmd.env("PATH", DEFAULT_PATH);
-        }
+        PathIsolation::Enable => env.push(("PATH", OsString::from(DEFAULT_PATH))),
         PathIsolation::InsecureDisable => {
             if let Some(path) = std::env::var_os("PATH") {
-                cmd.env("PATH", path);
+                env.push(("PATH", path));
             }
         }
     }
-    if let Some(pwd) = Passwd::current_user() {
-        cmd.current_dir(&pwd.dir)
-            .env("HOME", &pwd.dir)
-            .env("LOGNAME", &pwd.name)
-            .env("USER", &pwd.name);
+    let pwd = Passwd::current_user();
+    if let Some(pwd) = &pwd {
+        env.push(("HOME", pwd.dir.clone().into()));
+        env.push(("LOGNAME", pwd.name.clone().into()));
+        env.push(("USER", pwd.name.clone().into()));
     }
-    cmd.env("SSH_CLIENT", "sush") // read bashrc
-        .env("SUSH_JOB_ID", job_id.to_string())
-        .env("SUSH_COMMAND", &command)
-        .env("SUSH_JOB_OUTPUT_DIR", &job_dir);
+    env.push(("SUSH_JOB_ID", job_id.to_string().into()));
+    env.push(("SUSH_COMMAND", command.clone().into()));
+    env.push(("SUSH_JOB_OUTPUT_DIR", job_dir.clone().into()));
 
-    // Set process limits.
-    unsafe {
-        let limits = limits.clone();
-        cmd.pre_exec(move || limits.apply());
-    }
+    let args = [
+        BASH.to_string(),
+        "-c".to_string(),
+        LIMITS_SHIM.to_string(),
+        "sush".to_string(),
+        limits.max_cpu.to_string(),
+        limits.max_mem.div_ceil(1024).to_string(),
+        limits.max_fsize.div_ceil(1024).to_string(),
+        command,
+    ];
 
-    // Always create a new process session and group.
-    // Job stop kills the whole group.
-    unsafe {
-        cmd.pre_exec(move || {
-            setsid()?;
-            Ok(())
-        });
-    }
-
-    // Reset signal dispositions and the signal mask.
-    // macOS has no realtime signals.
-    #[cfg(target_os = "macos")]
-    let max_signal = 31;
-    #[cfg(not(target_os = "macos"))]
-    let max_signal = libc::SIGRTMAX();
-    unsafe {
-        cmd.pre_exec(move || {
-            for signal in 1..=max_signal {
-                libc::signal(signal, libc::SIG_DFL);
-            }
-            let mut none = MaybeUninit::<libc::sigset_t>::uninit();
-            libc::sigemptyset(none.as_mut_ptr());
-            libc::sigprocmask(libc::SIG_SETMASK, none.as_ptr(), null_mut());
-            Ok(())
-        });
-    }
-
-    let job = if mode.is_interactive() {
-        // Create a pseudoterminal and wire the child up to it.
-        let (pty, writer, pts, pts_path) =
-            with_io_err!(open_pty(), "opening pseudoterminal".to_string());
-        macro_rules! pts_clone {
-            () => {
-                with_io_err!(pts.try_clone(), "cloning pseudoterminal".to_string())
-            };
-        }
-        cmd.env("SUSH_TTY", &pts_path)
-            .stdin(pts_clone!())
-            .stdout(pts_clone!())
-            .stderr(pts_clone!());
-
-        unsafe {
-            let pty = pty.as_raw_fd();
-            cmd.pre_exec(move || {
-                close(pty); // not needed in the child
-                ioctl_tiocsctty(&pts)?; // set controlling terminal
-                Ok(())
-            });
-        }
-
-        // Initialize the pseudoterminal.
-        cmd.env("TERM", term.unwrap_or_else(|| DEFAULT_TERM.to_string()));
+    let (mut io, stdio) = with_io_err!(
+        JobIo::open(mode, stop.child_token()),
+        "opening job I/O".to_string()
+    );
+    if let SpawnStdio::Terminal { path, .. } = &stdio {
+        env.push(("SUSH_TTY", path.clone().into()));
+        env.push((
+            "TERM",
+            term.unwrap_or_else(|| DEFAULT_TERM.to_string()).into(),
+        ));
         if let (Some(rows), Some(cols)) = (rows, cols) {
             with_io_err!(
-                pty.set_window_size(WindowSize { rows, cols }),
+                io.set_window_size(WindowSize { rows, cols }),
                 "resizing pseudoterminal window".to_string()
             );
         }
+    }
 
-        // Start the interactive job.
-        let child = with_io_err!(
-            spawn_job(&log, &job_id, &mut cmd),
-            "spawning interactive job".to_string()
-        );
-        let io = JobIo::interactive(pty, writer, stop.child_token());
-        Job::start(
-            log.new(o!("mode" => mode.as_str())),
-            limits,
-            child,
-            io,
-            stdout_file,
-            stderr_file,
-            mode,
-            stop,
-        )
-    } else {
-        // For batch jobs, close stdin and send output to pipes.
-        cmd.stdin(Stdio::null())
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped());
-
-        // Start the batch job.
-        let mut child = with_io_err!(
-            spawn_job(&log, &job_id, &mut cmd),
-            "spawning batch job".to_string()
-        );
-        let io = JobIo::batch(
-            child.stdout.take().expect("batch job should have stdout"),
-            child.stderr.take().expect("batch job should have stderr"),
-        );
-        Job::start(
-            log.new(o!("mode" => mode.as_str())),
-            limits,
-            child,
-            io,
-            stdout_file,
-            stderr_file,
-            mode,
-            stop,
-        )
-    };
+    // Start the job in $HOME.
+    let home = pwd.as_ref().map(|pwd| pwd.dir.as_str());
+    let child = with_io_err!(
+        spawn_job(&log, &job_id, home, stdio, &args, &env),
+        format!("spawning {} job", mode.as_str())
+    );
+    let job = Job::start(
+        log.new(o!("mode" => mode.as_str())),
+        limits,
+        child,
+        io,
+        stdout_file,
+        stderr_file,
+        mode,
+        stop,
+    );
 
     // Send the attachment point.
     if tx_attachment.send(Some(job.attachment())).is_err() {
@@ -536,18 +483,31 @@ async fn job_spawn(launch: Launch) {
     });
 }
 
-/// Spawn a job process, with a fresh contract under illumos.
-fn spawn_job(log: &Logger, job_id: &JobId, cmd: &mut Command) -> io::Result<Child> {
+/// Spawn a job's shell in `dir`, on illumos into a contract of its own.
+fn spawn_job(
+    log: &Logger,
+    job_id: &JobId,
+    dir: Option<&str>,
+    stdio: SpawnStdio,
+    args: &[String],
+    env: &[(&str, OsString)],
+) -> io::Result<JobChild> {
+    let mut posix_spawn = PosixSpawn::new()?;
+    if let Some(dir) = dir {
+        posix_spawn.chdir(dir)?;
+    }
+    posix_spawn.stdio(stdio)?;
+    let spawn = || posix_spawn.spawn(BASH, args, env);
     #[cfg(target_os = "illumos")]
     {
-        let (child, ctid) = spawn_in_contract(job_id, || cmd.spawn())?;
+        let (child, ctid) = spawn_in_contract(job_id, spawn)?;
         debug!(log, "spawned job"; "ctid" => ctid);
         Ok(child)
     }
     #[cfg(not(target_os = "illumos"))]
     {
         let _ = (log, job_id);
-        cmd.spawn()
+        spawn()
     }
 }
 
@@ -566,27 +526,6 @@ async fn send_error(
         .await
     {
         error!(log, "can't send error event"; "error" => %send_error);
-    }
-}
-
-/// A job's process group ID, which its `child` leads. Capture it
-/// before the leader is reaped, after which `id` returns nothing.
-pub fn job_pgid(child: &Child) -> Option<Pid> {
-    Pid::from_raw(child.id()?.try_into().ok()?)
-}
-
-/// Send a signal to a job's whole process group.
-pub fn kill_job(log: &Logger, pgid: Option<Pid>, signal: Signal) {
-    let Some(pgid) = pgid else {
-        debug!(log, "job has no process group");
-        return;
-    };
-    match kill_process_group(pgid, signal) {
-        Ok(()) => debug!(log, "signalled job processes"; "signal" => ?signal),
-        Err(Errno::SRCH) => debug!(log, "job processes are already dead"),
-        Err(error) => {
-            error!(log, "unable to signal job"; "signal" => ?signal, "error" => %error)
-        }
     }
 }
 

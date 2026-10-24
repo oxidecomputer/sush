@@ -740,37 +740,24 @@ pub struct JobLimits {
 }
 
 impl JobLimits {
-    /// Clamp each limit to the default ceiling. Limits arrive as
-    /// unsigned request parameters, which may narrow the server's
-    /// limits but never widen them.
-    pub fn clamp(self) -> Self {
+    /// Clamp each limit to the default ceiling and to this process's
+    /// hard limit (since a job inherits these). Limits are unsigned
+    /// request parameters, so they may only narrow the server's limits.
+    pub fn clamp(self) -> Result<Self, IoError> {
         let ceiling = Self::default();
-        Self {
-            max_cpu: self.max_cpu.min(ceiling.max_cpu),
-            max_mem: self.max_mem.min(ceiling.max_mem),
-            max_fsize: self.max_fsize.min(ceiling.max_fsize),
-        }
-    }
-
-    pub fn apply(&self) -> Result<(), IoError> {
-        let Self {
-            max_cpu,
-            max_mem,
-            max_fsize,
-        } = *self;
-        self.set_limit(Resource::CPU, max_cpu)?;
-        self.set_limit(Resource::AS, max_mem)?;
-        self.set_limit(Resource::FSIZE, max_fsize)?;
-        Ok(())
-    }
-
-    fn set_limit(&self, resource: Resource, value: u64) -> Result<(), IoError> {
-        let (_soft, hard) = resource.get()?;
-        resource.set(value.min(hard), hard)
+        let hard = |resource: Resource| resource.get().map(|(_soft, hard)| hard);
+        Ok(Self {
+            max_cpu: self.max_cpu.min(ceiling.max_cpu).min(hard(Resource::CPU)?),
+            max_mem: self.max_mem.min(ceiling.max_mem).min(hard(Resource::AS)?),
+            max_fsize: self
+                .max_fsize
+                .min(ceiling.max_fsize)
+                .min(hard(Resource::FSIZE)?),
+        })
     }
 }
 
-/// The default limits are also the ceilings: see [`JobLimits::clamp`].
+/// The default limits are also the ceilings; see [`JobLimits::clamp`].
 impl Default for JobLimits {
     fn default() -> Self {
         JobLimits {
@@ -1045,12 +1032,15 @@ mod test {
             max_mem: GB,
             max_fsize: GB,
         };
-        assert_eq!(narrowed.clone().clamp(), narrowed);
+        assert_eq!(narrowed.clone().clamp().unwrap(), narrowed);
         let widened = JobLimits {
             max_cpu: u64::MAX,
             max_mem: u64::MAX,
             max_fsize: u64::MAX,
         };
-        assert_eq!(widened.clamp(), JobLimits::default());
+        assert_eq!(
+            widened.clamp().unwrap(),
+            JobLimits::default().clamp().unwrap()
+        );
     }
 }

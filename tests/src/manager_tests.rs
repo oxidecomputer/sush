@@ -340,6 +340,117 @@ async fn job_contract() {
     check_status_stopped(status, &job_id, Ok(0), None, None);
 }
 
+/// A job's bash sees the job's limits as soft limits, and sees
+/// `SSH_CLIENT` set.
+#[named]
+#[tokio::test]
+async fn job_limits_and_environment() {
+    let log = test_logger(function_name!());
+    let (mgr, mut root, _dir, _shutdown) = manager_and_test_root(log).await;
+    let authn = fake_identity(&mut root).await;
+    let SessionCeremony {
+        session_id,
+        client_nonce,
+        signer_nonce,
+        seq,
+        ..
+    } = session_ceremony(&mgr, 1);
+    let session = Session::new(session_id);
+    mgr.session_start(&authn, session_id, client_nonce, signer_nonce, seq)
+        .await
+        .unwrap();
+
+    let job_id = session.next_job_id();
+    let command = r#"echo "$(ulimit -S -t) $(ulimit -S -v) $(ulimit -S -f) $SSH_CLIENT""#;
+    let job = root
+        .sign_job_request(job_id, session_id, command, false)
+        .await;
+    mgr.job_start(
+        &authn,
+        job.into_signed(),
+        JobStartParams {
+            wait: JobWait::Stop,
+            ..Default::default()
+        },
+    )
+    .await
+    .unwrap();
+    let baseboard_id = mgr.own_baseboard();
+    let stdout = mgr
+        .job_output(&authn, &job_id, baseboard_id, Stdout, None)
+        .await
+        .unwrap()
+        .into_bytes()
+        .await;
+    let JobLimits {
+        max_cpu,
+        max_mem,
+        max_fsize,
+    } = JobLimits::default().clamp().unwrap();
+    assert_eq!(
+        String::from_utf8_lossy(&stdout),
+        format!(
+            "{max_cpu} {} {} sush\n",
+            max_mem.div_ceil(1024),
+            max_fsize.div_ceil(1024)
+        )
+    );
+}
+
+/// An interactive job leads its own session, with its pseudoterminal
+/// as its controlling terminal.
+#[named]
+#[tokio::test]
+async fn interactive_job_session() {
+    let log = test_logger(function_name!());
+    let (mgr, mut root, _dir, _shutdown) = manager_and_test_root(log).await;
+    let authn = fake_identity(&mut root).await;
+    let SessionCeremony {
+        session_id,
+        client_nonce,
+        signer_nonce,
+        seq,
+        ..
+    } = session_ceremony(&mgr, 1);
+    let session = Session::new(session_id);
+    mgr.session_start(&authn, session_id, client_nonce, signer_nonce, seq)
+        .await
+        .unwrap();
+
+    let job_id = session.next_job_id();
+    let command = r#"
+        test $(ps -o sid= -p $$) -eq $$ || echo "not a session leader"
+        { : </dev/tty; } 2>/dev/null || echo "no controlling terminal"
+        test "$(tty)" = "$SUSH_TTY" || echo "stdin is not the job's terminal""#;
+    let job = root
+        .sign_job_request_for(
+            job_id,
+            session_id,
+            command,
+            true,
+            test_baseboard_id().into(),
+        )
+        .await;
+    mgr.job_start(
+        &authn,
+        job.into_signed(),
+        JobStartParams {
+            wait: JobWait::Stop,
+            ..Default::default()
+        },
+    )
+    .await
+    .unwrap();
+    let baseboard_id = mgr.own_baseboard();
+    let stdout = mgr
+        .job_output(&authn, &job_id, baseboard_id, Stdout, None)
+        .await
+        .unwrap()
+        .into_bytes()
+        .await;
+    assert!(stdout.is_empty(), "{}", String::from_utf8_lossy(&stdout));
+}
+
 /// A job signed for anything but the active session is refused with
 /// an error status, not silently discarded.
 #[named]
