@@ -21,6 +21,7 @@ use std::os::fd::AsRawFd as _;
 use libc::ctid_t;
 use rustix::fs::{Mode, OFlags};
 use rustix::io::{Errno, FdFlags, fcntl_setfd};
+use rustix::process::Signal;
 
 use sush_common::jobs::JobId;
 
@@ -42,6 +43,10 @@ unsafe extern "C" {
     fn ct_status_get_id(stathdl: ct_stathdl_t) -> ctid_t;
     fn ct_status_free(stathdl: ct_stathdl_t);
     fn ct_ctl_abandon(fd: c_int) -> c_int;
+}
+
+unsafe extern "C" {
+    fn sigsend(idtype: libc::idtype_t, id: libc::id_t, sig: c_int) -> c_int;
 }
 
 /// Process had an uncorrectable hardware error.
@@ -66,6 +71,15 @@ fn open(flags: OFlags, path: String) -> io::Result<File> {
     let fd = rustix::fs::open(&path, flags, Mode::empty()).map_err(named)?;
     fcntl_setfd(&fd, FdFlags::CLOEXEC).map_err(named)?;
     Ok(File::from(fd))
+}
+
+/// Send `signal` to every process in contract `ctid`.
+pub fn signal_contract(ctid: ctid_t, signal: Signal) -> io::Result<()> {
+    if unsafe { sigsend(libc::P_CTID, ctid, signal.as_raw()) } == 0 {
+        Ok(())
+    } else {
+        Err(io::Error::last_os_error())
+    }
 }
 
 /// Run `spawn` with a job's contract template active, then abandon the
