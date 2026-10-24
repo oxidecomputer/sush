@@ -270,6 +270,76 @@ async fn jobs() {
     );
 }
 
+/// A job runs in a contract of its own, labeled with its job ID.
+#[cfg(target_os = "illumos")]
+#[named]
+#[tokio::test]
+async fn job_contract() {
+    let log = test_logger(function_name!());
+    let (mgr, mut root, _dir, _shutdown) = manager_and_test_root(log).await;
+    let authn = fake_identity(&mut root).await;
+    let SessionCeremony {
+        session_id,
+        client_nonce,
+        signer_nonce,
+        seq,
+        ..
+    } = session_ceremony(&mgr, 1);
+    let session = Session::new(session_id);
+    mgr.session_start(&authn, session_id, client_nonce, signer_nonce, seq)
+        .await
+        .unwrap();
+
+    let job_id = session.next_job_id();
+    // We abandon the contract after the spawn returns, so the job may
+    // see it held at first.
+    let command = r#"
+        ctid=$(ps -o ctid= -p $$)
+        fail() { echo "$1" >&2; ctstat -v -i $ctid >&2; exit 1; }
+        test $ctid != $(ps -o ctid= -p $PPID) ||
+            fail "job shares contract $ctid with its parent"
+        for i in 1 2 3 4 5; do
+            state=$(ctstat -i $ctid | awk 'NR == 2 { print $4 }')
+            test "$state" = orphan && break
+            sleep 1
+        done
+        test "$state" = orphan || fail "contract $ctid is $state, not orphan"
+        status=$(ctstat -v -i $ctid | sed 's/^[[:space:]]*//; s/:[[:space:]]*/: /')
+        for field in \
+            "critical event set: none" \
+            "informative event set: none" \
+            "fatal event set: hwerr" \
+            "parameter set: none" \
+            "aux: sush job $SUSH_JOB_ID"
+        do
+            echo "$status" | grep -Fqx "$field" ||
+                fail "contract $ctid lacks \"$field\""
+        done"#;
+    let job = root
+        .sign_job_request(job_id, session_id, command, false)
+        .await;
+    mgr.job_start(
+        &authn,
+        job.into_signed(),
+        JobStartParams {
+            wait: JobWait::Stop,
+            ..Default::default()
+        },
+    )
+    .await
+    .unwrap();
+    let baseboard_id = mgr.own_baseboard();
+    let stderr = mgr
+        .job_output(&authn, &job_id, baseboard_id, Stderr, None)
+        .await
+        .unwrap()
+        .into_bytes()
+        .await;
+    assert!(stderr.is_empty(), "{}", String::from_utf8_lossy(&stderr));
+    let status = mgr.job_status(&authn, &job_id).await.unwrap()[baseboard_id].clone();
+    check_status_stopped(status, &job_id, Ok(0), None, None);
+}
+
 /// A job signed for anything but the active session is refused with
 /// an error status, not silently discarded.
 #[named]

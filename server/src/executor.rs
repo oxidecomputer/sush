@@ -35,6 +35,8 @@ use sush_common::jobs::{
     JobId, JobMode, JobOutputStream, JobStartRequest, ProcessError, VerifiedJob,
 };
 
+#[cfg(target_os = "illumos")]
+use crate::contract::spawn_in_contract;
 use crate::io::JobIo;
 use crate::job::{Job, SocketSender};
 use crate::locker::boundary::{Boundary, BoundaryStore};
@@ -456,7 +458,10 @@ async fn job_spawn(launch: Launch) {
         }
 
         // Start the interactive job.
-        let child = with_io_err!(cmd.spawn(), "spawning interactive job".to_string());
+        let child = with_io_err!(
+            spawn_job(&log, &job_id, &mut cmd),
+            "spawning interactive job".to_string()
+        );
         let io = JobIo::interactive(pty, writer, stop.child_token());
         Job::start(
             log.new(o!("mode" => mode.as_str())),
@@ -475,7 +480,10 @@ async fn job_spawn(launch: Launch) {
             .stderr(Stdio::piped());
 
         // Start the batch job.
-        let mut child = with_io_err!(cmd.spawn(), "spawning batch job".to_string());
+        let mut child = with_io_err!(
+            spawn_job(&log, &job_id, &mut cmd),
+            "spawning batch job".to_string()
+        );
         let io = JobIo::batch(
             child.stdout.take().expect("batch job should have stdout"),
             child.stderr.take().expect("batch job should have stderr"),
@@ -526,6 +534,21 @@ async fn job_spawn(launch: Launch) {
             }
         }
     });
+}
+
+/// Spawn a job process, with a fresh contract under illumos.
+fn spawn_job(log: &Logger, job_id: &JobId, cmd: &mut Command) -> io::Result<Child> {
+    #[cfg(target_os = "illumos")]
+    {
+        let (child, ctid) = spawn_in_contract(job_id, || cmd.spawn())?;
+        debug!(log, "spawned job"; "ctid" => ctid);
+        Ok(child)
+    }
+    #[cfg(not(target_os = "illumos"))]
+    {
+        let _ = (log, job_id);
+        cmd.spawn()
+    }
 }
 
 async fn send_error(
