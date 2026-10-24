@@ -340,6 +340,80 @@ async fn job_contract() {
     check_status_stopped(status, &job_id, Ok(0), None, None);
 }
 
+/// Stopping a job kills every process in its contract, including one
+/// in a process group of its own.
+#[cfg(target_os = "illumos")]
+#[named]
+#[tokio::test]
+async fn job_stop_reaches_contract() {
+    let log = test_logger(function_name!());
+    let (mgr, mut root, _dir, _shutdown) = manager_and_test_root(log).await;
+    let authn = fake_identity(&mut root).await;
+    let SessionCeremony {
+        session_id,
+        client_nonce,
+        signer_nonce,
+        seq,
+        ..
+    } = session_ceremony(&mgr, 1);
+    let session = Session::new(session_id);
+    mgr.session_start(&authn, session_id, client_nonce, signer_nonce, seq)
+        .await
+        .unwrap();
+
+    // With job control on, bash runs `sleep` in its own process group.
+    let job_id = session.next_job_id();
+    let command = "set -m; sleep 1000 & echo $!; wait";
+    let job = root
+        .sign_job_request(job_id, session_id, command, false)
+        .await;
+    mgr.job_start(
+        &authn,
+        job.into_signed(),
+        JobStartParams {
+            wait: JobWait::Start,
+            ..Default::default()
+        },
+    )
+    .await
+    .unwrap();
+    let baseboard_id = mgr.own_baseboard();
+    let pid: i32 = timeout(Duration::from_secs(10), async {
+        loop {
+            let stdout = mgr
+                .job_output(&authn, &job_id, baseboard_id, Stdout, None)
+                .await
+                .unwrap()
+                .into_bytes()
+                .await;
+            if let Ok(pid) = String::from_utf8_lossy(&stdout).trim().parse() {
+                break pid;
+            }
+            sleep(Duration::from_millis(50)).await;
+        }
+    })
+    .await
+    .expect("job never reported its sleep's pid");
+
+    mgr.job_stop(
+        &authn,
+        &job_id,
+        JobStopParams {
+            wait: JobWait::Stop,
+            ..Default::default()
+        },
+    )
+    .await
+    .unwrap();
+    timeout(Duration::from_secs(10), async {
+        while unsafe { libc::kill(pid, 0) } == 0 {
+            sleep(Duration::from_millis(50)).await;
+        }
+    })
+    .await
+    .expect("sleep outside the job's process group survived the stop");
+}
+
 /// A job's bash sees the job's limits as soft limits, and sees
 /// `SSH_CLIENT` set.
 #[named]

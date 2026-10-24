@@ -502,7 +502,7 @@ fn spawn_job(
     {
         let (child, ctid) = spawn_in_contract(job_id, spawn)?;
         debug!(log, "spawned job"; "ctid" => ctid);
-        Ok(child)
+        Ok(child.in_contract(ctid))
     }
     #[cfg(not(target_os = "illumos"))]
     {

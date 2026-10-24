@@ -24,6 +24,8 @@ use std::path::{Path, PathBuf};
 use std::process::ExitStatus;
 use std::ptr::null_mut;
 
+#[cfg(target_os = "illumos")]
+use libc::ctid_t;
 use libc::{
     EINTR, EIO, O_RDONLY, O_RDWR, POSIX_SPAWN_SETSIGDEF, POSIX_SPAWN_SETSIGMASK, SIGKILL, SIGSTOP,
     WNOHANG, posix_spawn, posix_spawn_file_actions_adddup2, posix_spawn_file_actions_addopen,
@@ -38,6 +40,8 @@ use rustix::process::{Pid, Signal, kill_process_group};
 use tokio::runtime::Handle;
 use tokio::signal::unix::{Signal as SignalStream, SignalKind, signal};
 
+#[cfg(target_os = "illumos")]
+use crate::contract::signal_contract;
 use crate::error::{check_errno, io_context};
 
 // The libc crate lacks these for macOS, which has had both since 10.15.
@@ -235,6 +239,8 @@ impl Drop for PosixSpawn {
 /// A spawned job process. Only [`JobChild::wait`] reaps it.
 pub struct JobChild {
     pid: Pid,
+    #[cfg(target_os = "illumos")]
+    contract: Option<ctid_t>,
     sigchld: SignalStream,
     /// The exit status, or the error number `waitpid` failed with.
     reaped: Option<Result<ExitStatus, i32>>,
@@ -244,14 +250,29 @@ impl JobChild {
     fn new(pid: Pid, sigchld: SignalStream) -> Self {
         Self {
             pid,
+            #[cfg(target_os = "illumos")]
+            contract: None,
             sigchld,
             reaped: None,
         }
     }
 
-    /// Send `signal` to every process in the job's process group, which
-    /// the child leads.
+    /// Record the contract that holds the child and its descendants.
+    #[cfg(target_os = "illumos")]
+    pub fn in_contract(mut self, ctid: ctid_t) -> Self {
+        self.contract = Some(ctid);
+        self
+    }
+
+    /// Send `signal` to every process in the job: its contract if we
+    /// know it, or else its process group, which the child leads.
+    /// Signalling the contract also reaches descendants that left the
+    /// process group.
     pub fn kill(&self, signal: Signal) -> io::Result<()> {
+        #[cfg(target_os = "illumos")]
+        if let Some(ctid) = self.contract {
+            return signal_contract(ctid, signal);
+        }
         Ok(kill_process_group(self.pid, signal)?)
     }
 
