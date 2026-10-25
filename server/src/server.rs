@@ -23,8 +23,8 @@ use tokio_tungstenite::tungstenite::protocol::{Role, WebSocketConfig};
 
 use sush_api::{
     AccessParam, Authorization, AuthorizedRangeRequest, JobHistoryParams, JobIdParam,
-    JobOutputParams, JobStartParams, JobStopParams, JobTargetParams, KeyIdParam, RoutingParam,
-    SessionAndJobIds, SessionAndKeyIds, SessionIdParam, SessionStartBody, SushApi,
+    JobOutputParams, JobStartParams, JobStarted, JobStopParams, JobTargetParams, KeyIdParam,
+    RoutingParam, SessionAndJobIds, SessionAndKeyIds, SessionIdParam, SessionStartBody, SushApi,
 };
 use sush_common::authn::Identity;
 use sush_common::jobs::{
@@ -224,7 +224,7 @@ impl SushApi for ApiServer {
         params: PathParams<JobTargetParams>,
         query: QueryParams<JobStartParams>,
         body: TypedBody<SignedJob>,
-    ) -> Result<HttpResponseUpdatedNoContent, HttpError> {
+    ) -> Result<HttpResponseOk<JobStarted>, HttpError> {
         let mgr = ctx.context();
         let Authorization { authorization } = headers.into_inner();
         let authn = mgr
@@ -239,8 +239,8 @@ impl SushApi for ApiServer {
                 String::from("Path parameter job ID does not match body"),
             ));
         }
-        mgr.job_start(&authn, job, query.into_inner()).await?;
-        Ok(HttpResponseUpdatedNoContent())
+        let sleds = mgr.job_start(&authn, job, query.into_inner()).await?;
+        Ok(HttpResponseOk(JobStarted { sleds }))
     }
 
     async fn job_stop(

@@ -439,8 +439,15 @@
           "required": true
         },
         "responses": {
-          "204": {
-            "description": "resource updated"
+          "200": {
+            "description": "successful operation",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/JobStarted"
+                }
+              }
+            }
           },
           "4XX": {
             "$ref": "#/components/responses/Error"
@@ -1137,6 +1144,23 @@
           "command",
           "job_id",
           "session_id"
+        ]
+      },
+      "JobStarted": {
+        "description": "Acknowledgement that a job was accepted.",
+        "type": "object",
+        "properties": {
+          "sleds": {
+            "description": "Which sleds the job will run on.",
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/BaseboardId"
+            },
+            "uniqueItems": true
+          }
+        },
+        "required": [
+          "sleds"
         ]
       },
       "JobStatus": {

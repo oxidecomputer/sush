@@ -6,6 +6,7 @@
 //!
 //! May be executed via either the main CLI or the interactive REPL.
 
+use std::collections::BTreeSet;
 use std::fs::{File, OpenOptions, read};
 use std::io::ErrorKind;
 use std::io::{Seek as _, SeekFrom, Write as _, stdin};
@@ -302,56 +303,49 @@ fn watch_settling() {
         time_started: Utc::now(),
     };
 
-    let all = Target::All;
     let mut settling = Settling::default();
     let mut status = JobStatusMap::new();
-    assert!(!settling.done(&all, None, &status), "empty never settles");
+    assert!(!settling.done(None, None, &status), "empty never settles");
 
     status.insert(sled("A"), terminal.clone());
-    assert!(!settling.done(&all, None, &status), "new sled resets");
-    assert!(!settling.done(&all, None, &status), "first quiet poll");
+    assert!(!settling.done(None, None, &status), "new sled resets");
+    assert!(!settling.done(None, None, &status), "first quiet poll");
     assert!(
-        !settling.done(&all, None, &status),
+        !settling.done(None, None, &status),
         "quiet but too young for gossip"
     );
-    assert!(settling.done(&all, None, &status), "old enough, quiet");
+    assert!(settling.done(None, None, &status), "old enough, quiet");
 
     let mut settling = Settling::default();
     status.insert(sled("B"), running.clone());
-    assert!(!settling.done(&all, None, &status), "running sled holds");
+    assert!(!settling.done(None, None, &status), "running sled holds");
     status.insert(sled("B"), terminal.clone());
     assert!(
-        !settling.done(&all, Some(2), &status),
+        !settling.done(None, Some(2), &status),
         "the rack count must hold"
     );
     assert!(
-        settling.done(&all, Some(2), &status),
+        settling.done(None, Some(2), &status),
         "the rack count held twice"
     );
 
-    let named: Target = format!("{},{}", sled("A"), sled("B")).parse().unwrap();
+    let known = BTreeSet::from([sled("A"), sled("B")]);
     let mut settling = Settling::default();
     assert!(
-        settling.done(&named, None, &status),
-        "named sleds settle on the first terminal poll"
-    );
-    let duplicates: Target = format!("{},{}", sled("A"), sled("A")).parse().unwrap();
-    let mut settling = Settling::default();
-    assert!(
-        settling.done(&duplicates, None, &status),
-        "duplicate baseboards collapse"
+        settling.done(Some(&known), None, &status),
+        "known sleds settle on the first terminal poll"
     );
     status.insert(sled("B"), running);
     assert!(
-        !settling.done(&named, None, &status),
-        "a running named sled holds"
+        !settling.done(Some(&known), None, &status),
+        "a running known sled holds"
     );
     status.insert(sled("B"), terminal);
-    let missing: Target = format!("{},{}", sled("A"), sled("C")).parse().unwrap();
+    let missing = BTreeSet::from([sled("A"), sled("C")]);
     let mut settling = Settling::default();
     assert!(
-        !settling.done(&missing, None, &status),
-        "a missing named sled holds"
+        !settling.done(Some(&missing), None, &status),
+        "a missing known sled holds"
     );
 }
 
@@ -1376,7 +1370,7 @@ async fn job(
                 job_start(ctx, client, job, start_args.to_owned()).await
             } else {
                 ctx.job_signed(&job, true);
-                ctx.job_started(&job, false);
+                ctx.job_started(&job, None, false);
                 Ok(())
             }
         }
@@ -1418,7 +1412,7 @@ async fn job(
                 StatusDisplayStyle::Short
             };
             if wait {
-                let status = job_watch(ctx, client, &job_id, &Target::All).await?;
+                let status = job_watch(ctx, client, &job_id, None).await?;
                 ctx.job_status(&job_id, &status, style);
                 Ok(())
             } else {
@@ -1535,8 +1529,8 @@ async fn job_start(
 
     // Start the job.
     if interactive {
-        start.await?;
-        ctx.job_started(&job, true);
+        let sleds = start.await?.into_inner().sleds;
+        ctx.job_started(&job, Some(&sleds), true);
         match job_attach(ctx, client, &job_id, &target).await {
             Ok(()) | Err(CommandError::NotFound(_)) => {
                 job_status(ctx, client, &job_id, StatusDisplayStyle::Short).await?
@@ -1557,10 +1551,10 @@ async fn job_start(
         let file = options
             .open(&path)
             .map_err(|error| CommandError::io(&path, error))?;
-        start.await?;
-        ctx.job_started(&job, true);
+        let sleds = start.await?.into_inner().sleds;
+        ctx.job_started(&job, Some(&sleds), true);
         let hasher = job_stream(ctx, client, &job_id, &target, &path, file).await?;
-        let status = job_watch(ctx, client, &job_id, &target.clone().into()).await?;
+        let status = job_watch(ctx, client, &job_id, Some(sleds)).await?;
         ctx.job_status(&job_id, &status, StatusDisplayStyle::Short);
         let Some(JobStatus::Stopped {
             result: Ok(0),
@@ -1593,6 +1587,7 @@ async fn job_start(
         // watching until the job settles everywhere.
         ctx.job_watch_started(&job_id);
         let job_target = job.payload().target().clone();
+        let mut sleds = None;
         let mut ticker = interval(WATCH_INTERVAL);
         ticker.set_missed_tick_behavior(MissedTickBehavior::Skip);
         let mut last = JobStatusMap::new();
@@ -1606,7 +1601,12 @@ async fn job_start(
                 // Wait for the start request to finish.
                 start_result = &mut start, if !started => {
                     match start_result {
-                        Ok(_) | Err(CommandError::TimedOut) => ctx.job_started(&job, true),
+                        Ok(response) => {
+                            let started = response.into_inner().sleds;
+                            ctx.job_started(&job, Some(&started), true);
+                            sleds = Some(started);
+                        }
+                        Err(CommandError::TimedOut) => ctx.job_started(&job, None, true),
                         Err(error) => {
                             ctx.job_watch_finished(&job_id);
                             return Err(error);
@@ -1627,8 +1627,11 @@ async fn job_start(
                         }
                     };
                     ctx.job_watch_update(&last);
-                    let rack = rack_sleds(client, &job_target).await;
-                    if settling.done(&job_target, rack, &last) && started {
+                    let rack = match sleds {
+                        Some(_) => None,
+                        None => rack_sleds(client).await,
+                    };
+                    if settling.done(sleds.as_ref(), rack, &last) && started {
                         break last;
                     }
                     if !stalled && last.is_empty() && settling.polls >= WATCH_STALL_POLLS {
@@ -1708,8 +1711,8 @@ async fn job_start(
             }
         }
     } else {
-        start.await?;
-        ctx.job_started(&job, true);
+        let sleds = start.await?.into_inner().sleds;
+        ctx.job_started(&job, Some(&sleds), true);
     }
     Ok(())
 }
@@ -1918,17 +1921,22 @@ const WATCH_INTERVAL: Duration = Duration::from_secs(1);
 
 /// Watch a job's status across the rack, one live line per sled, until
 /// it settles or the user interrupts. Returns the last status map.
+/// `sleds`, if known, are the sleds the job runs on.
 async fn job_watch(
     ctx: &mut impl CommandContext,
     client: &Client,
     job_id: &JobId,
-    target: &Target,
+    sleds: Option<BTreeSet<BaseboardId>>,
 ) -> Result<JobStatusMap, CommandError> {
     ctx.job_watch_started(job_id);
+    let via = sleds
+        .as_ref()
+        .filter(|sleds| sleds.len() == 1)
+        .and_then(BTreeSet::first);
     let mut settling = Settling::default();
     let mut sigint = signal(SignalKind::interrupt())?;
     let status = loop {
-        let status = match job_status_map(ctx, client, job_id, target.single_baseboard()).await {
+        let status = match job_status_map(ctx, client, job_id, via).await {
             Ok(status) => status,
             Err(error) => {
                 ctx.job_watch_finished(job_id);
@@ -1936,8 +1944,11 @@ async fn job_watch(
             }
         };
         ctx.job_watch_update(&status);
-        let rack = rack_sleds(client, target).await;
-        if settling.done(target, rack, &status) {
+        let rack = match sleds {
+            Some(_) => None,
+            None => rack_sleds(client).await,
+        };
+        if settling.done(sleds.as_ref(), rack, &status) {
             break status;
         }
         select! {
@@ -1969,12 +1980,17 @@ struct Settling {
 
 impl Settling {
     /// A watched job has settled once every sled it runs on reports a
-    /// terminal status. A target naming only baseboards is settled as
-    /// soon as they all report. Against the rack inventory, the count
+    /// terminal status. When those `sleds` are known, the job is settled
+    /// as soon as they all report. Against the rack inventory, the count
     /// must match on consecutive polls. Either way, the watch is done
     /// once it is old enough for gossip to have named every sled and
     /// the set of sleds has been stable for a couple of polls.
-    fn done(&mut self, target: &Target, rack: Option<usize>, status: &JobStatusMap) -> bool {
+    fn done(
+        &mut self,
+        sleds: Option<&BTreeSet<BaseboardId>>,
+        rack: Option<usize>,
+        status: &JobStatusMap,
+    ) -> bool {
         self.polls += 1;
         let terminal = !status.is_empty() && status.values().all(JobStatus::is_terminal);
         if terminal && status.len() == self.sleds {
@@ -1988,9 +2004,9 @@ impl Settling {
         } else {
             self.met = 0;
         }
-        if let Some(named) = target.named_baseboards()
-            && named
-                .into_iter()
+        if let Some(sleds) = sleds
+            && sleds
+                .iter()
                 .all(|sled| status.get(sled).is_some_and(JobStatus::is_terminal))
         {
             return true;
@@ -2000,11 +2016,7 @@ impl Settling {
 }
 
 /// The number of sleds in the rack's own inventory, where available.
-/// Skips the fetch for targets whose sleds are named.
-async fn rack_sleds(client: &Client, target: &Target) -> Option<usize> {
-    if target.named_baseboards().is_some() {
-        return None;
-    }
+async fn rack_sleds(client: &Client) -> Option<usize> {
     let sleds = client.versions().send().await.ok()?.into_inner().len();
     (sleds > 0).then_some(sleds)
 }

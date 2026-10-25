@@ -21,6 +21,7 @@
 
 use std::cmp::Ordering;
 use std::collections::{BTreeSet, HashMap, HashSet};
+use std::future::pending;
 use std::io;
 use std::net::{SocketAddr, SocketAddrV6};
 use std::time::Duration;
@@ -58,6 +59,18 @@ impl LinkedBaseboards {
 
     pub fn borrow(&self) -> watch::Ref<'_, BTreeSet<BaseboardId>> {
         self.0.borrow()
+    }
+
+    pub fn borrow_and_update(&mut self) -> watch::Ref<'_, BTreeSet<BaseboardId>> {
+        self.0.borrow_and_update()
+    }
+
+    /// Wait for the set to change. Once the gossip manager is gone, the
+    /// set can no longer change, so this never returns.
+    pub async fn changed(&mut self) {
+        if self.0.changed().await.is_err() {
+            pending().await
+        }
     }
 }
 

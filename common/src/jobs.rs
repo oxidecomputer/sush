@@ -4,7 +4,7 @@
 
 //! Signed job requests.
 
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::fmt;
 use std::io::Error as IoError;
 use std::ops::Deref;
@@ -24,7 +24,7 @@ use crate::codephrases::Codephrase;
 use crate::hash::{Hash, Hasher, hash};
 use crate::interactive::InteractiveJobError;
 use crate::keys::{KeyId, Signed, ToBeSigned, ToBeSignedFields, Verified};
-use crate::targets::{Cubbies, Target};
+use crate::targets::Target;
 
 codephrase_newtype! {
     /// A globally unique identifier for a job within a session.
@@ -421,13 +421,13 @@ impl JobStartRequest {
         }
     }
 
+    /// Whether this job runs on `baseboard`. The signed target must match
+    /// `sleds`, so the sled that accepted the job cannot widen it.
     /// Interactive jobs run only on their single named baseboard.
-    pub fn runs_on(&self, baseboard: &BaseboardId, cubbies: &Cubbies) -> bool {
-        if self.mode.is_interactive() {
-            self.target.single_baseboard() == Some(baseboard)
-        } else {
-            self.target.includes(baseboard, cubbies)
-        }
+    pub fn runs_on(&self, baseboard: &BaseboardId, sleds: &BTreeSet<BaseboardId>) -> bool {
+        sleds.contains(baseboard)
+            && self.target.matches(sleds)
+            && (!self.mode.is_interactive() || self.target.single_baseboard() == Some(baseboard))
     }
 
     pub fn job_id(&self) -> &JobId {
@@ -1009,19 +1009,42 @@ mod test {
             serial_number: serial.to_string(),
         };
         let me = sled("me");
-        let cubbies = Cubbies::from([(14, me.clone())]);
+        let sleds = BTreeSet::from([me.clone()]);
         let job = |mode, target| {
             JobStartRequest::new(JobId::random(), SessionId::random(), "true", mode, target)
         };
         use JobMode::*;
         let just_me = Target::Sleds(vec![SledId::Baseboard(me.clone())]);
-        assert!(job(Interactive, just_me.clone()).runs_on(&me, &cubbies));
-        assert!(job(Batch, just_me).runs_on(&me, &cubbies));
-        assert!(!job(Interactive, Target::All).runs_on(&me, &cubbies));
-        assert!(job(Batch, Target::All).runs_on(&me, &cubbies));
+        assert!(job(Interactive, just_me.clone()).runs_on(&me, &sleds));
+        assert!(job(Batch, just_me).runs_on(&me, &sleds));
+        assert!(!job(Interactive, Target::All).runs_on(&me, &sleds));
+        assert!(job(Batch, Target::All).runs_on(&me, &sleds));
         let my_cubby = Target::Sleds(vec![SledId::Cubby(14)]);
-        assert!(!job(Interactive, my_cubby.clone()).runs_on(&me, &cubbies));
-        assert!(job(Batch, my_cubby).runs_on(&me, &cubbies));
+        assert!(!job(Interactive, my_cubby.clone()).runs_on(&me, &sleds));
+        assert!(job(Batch, my_cubby).runs_on(&me, &sleds));
+    }
+
+    /// A job runs only on the sleds its target resolved to, and only
+    /// if the signed target matches them.
+    #[test]
+    fn resolved_targets() {
+        let sled = |serial: &str| BaseboardId {
+            part_number: "913".to_string(),
+            serial_number: serial.to_string(),
+        };
+        let (me, you) = (sled("me"), sled("you"));
+        let job = |target| {
+            JobStartRequest::new(
+                JobId::random(),
+                SessionId::random(),
+                "true",
+                JobMode::Batch,
+                target,
+            )
+        };
+        assert!(!job(Target::All).runs_on(&me, &BTreeSet::from([you.clone()])));
+        let just_you = Target::from(you.clone());
+        assert!(!job(just_you).runs_on(&me, &BTreeSet::from([me.clone(), you])));
     }
 
     /// Requested limits may narrow the default ceiling, never widen it.

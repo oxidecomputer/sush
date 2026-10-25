@@ -64,6 +64,7 @@ pub const MAX_QUEUED_JOBS: usize = 1_000;
 pub struct QueuedJob {
     pub job: VerifiedJob,
     pub params: JobStartParams,
+    pub sleds: BTreeSet<BaseboardId>,
     pub replayed: bool,
 }
 
@@ -403,7 +404,7 @@ impl State {
     fn skip_queued_jobs(&self, now: DateTime<Utc>) -> Vec<Output> {
         let mut outputs = Vec::new();
         for (job_id, queued) in self.session.queued_jobs().into_iter().flatten() {
-            if !queued.replayed && self.rack.runs_here(&queued.job) {
+            if !queued.replayed && self.rack.runs_here(&queued.job, &queued.sleds) {
                 outputs.push(Output::job_event(
                     self.rack.own_baseboard(),
                     JobEvent::Skipped(*job_id, now, SkipReason::SessionEnded),
@@ -803,7 +804,7 @@ impl State {
     ) -> Vec<Output> {
         let mut outputs = Vec::new();
         match request {
-            JobRequest::Start(signed, params) => {
+            JobRequest::Start(signed, params, sleds) => {
                 let job = match self.certs.verify(signed) {
                     Ok(job) => job,
                     Err(error) => {
@@ -831,7 +832,13 @@ impl State {
                     .session()
                     .is_some_and(|s| s.session_id() == session_id)
                 {
-                    self.enqueue_job(log, now, job, params.clone(), actor, !live);
+                    let queued = QueuedJob {
+                        job,
+                        params: params.clone(),
+                        sleds: sleds.clone(),
+                        replayed: !live,
+                    };
+                    self.enqueue_job(log, now, queued, actor);
                     outputs.extend(self.release_ready_jobs(log, now, network));
                 } else {
                     let job_id = *signed.job_id();
@@ -841,7 +848,8 @@ impl State {
                         "session_id" => %session_id,
                         "actor" => %actor,
                     );
-                    if live && self.rack.runs_here(signed) && !self.history.contains(&job_id) {
+                    if live && self.rack.runs_here(signed, sleds) && !self.history.contains(&job_id)
+                    {
                         outputs.push(Output::job_event(
                             self.rack.own_baseboard(),
                             JobEvent::Skipped(job_id, now, SkipReason::SessionEnded),
@@ -1030,20 +1038,13 @@ impl State {
         outputs
     }
 
-    fn enqueue_job(
-        &mut self,
-        log: &Logger,
-        now: DateTime<Utc>,
-        job: VerifiedJob,
-        params: JobStartParams,
-        actor: &KeyId,
-        replayed: bool,
-    ) {
+    fn enqueue_job(&mut self, log: &Logger, now: DateTime<Utc>, queued: QueuedJob, actor: &KeyId) {
         let SessionState::Active { queued_jobs, .. } = &mut self.session else {
             return;
         };
-        let job_id = *job.job_id();
-        let targeted = self.rack.runs_here(&job);
+        let job_id = *queued.job.job_id();
+        let replayed = queued.replayed;
+        let targeted = self.rack.runs_here(&queued.job, &queued.sleds);
 
         // Adjudication can give the boundary job a status before its
         // request replays. The queue releases jobs in order, so
@@ -1064,14 +1065,7 @@ impl State {
             // queue to keep the causal chain whole, but only jobs
             // targeting this sled that can actually run here record
             // a local status.
-            queued_jobs.insert(
-                job_id,
-                QueuedJob {
-                    job,
-                    params,
-                    replayed,
-                },
-            );
+            queued_jobs.insert(job_id, queued);
             if targeted && !replayed {
                 self.history.set_job_status(
                     &job_id,
@@ -1093,7 +1087,7 @@ impl State {
             return;
         };
         let cancel_here = match queued_jobs.remove(job_id) {
-            Some(queued) => self.rack.runs_here(&queued.job),
+            Some(queued) => self.rack.runs_here(&queued.job, &queued.sleds),
             None => !self.history.contains(job_id),
         };
         if !replayed && cancel_here {
@@ -1161,10 +1155,11 @@ impl State {
             let QueuedJob {
                 job: request,
                 params,
+                sleds,
                 replayed,
             } = queued_jobs.remove(&next_id).expect("checked above");
             let job_id = request.payload().job_id().to_owned();
-            if self.rack.runs_here(&request) {
+            if self.rack.runs_here(&request, &sleds) {
                 if matches!(admission, Admission::Refuse) {
                     if !replayed {
                         warn!(log, "skipping a superseded session's job"; "job_id" => %job_id);
@@ -1693,6 +1688,15 @@ mod test {
         .unwrap()
     }
 
+    /// A request to start `signed` on this test's sled.
+    fn start(signed: SignedJob) -> JobRequest {
+        JobRequest::Start(
+            signed,
+            JobStartParams::default(),
+            BTreeSet::from([baseboard()]),
+        )
+    }
+
     fn discard() -> Logger {
         Logger::root(slog::Discard, o!())
     }
@@ -1983,10 +1987,7 @@ mod test {
 
         let job_id = session.next_job_id();
         let signed = signed_job(&mut root, job_id, session_id, "true").await;
-        let outputs = sim.request(Request::job(
-            actor.clone(),
-            JobRequest::Start(signed, JobStartParams::default()),
-        ));
+        let outputs = sim.request(Request::job(actor.clone(), start(signed)));
         assert!(
             outputs
                 .iter()
@@ -2050,10 +2051,7 @@ mod test {
 
         let job_id = session.next_job_id();
         let signed = signed_job(&mut root, job_id, session_id, "true").await;
-        sim.request(Request::job(
-            resubmitter,
-            JobRequest::Start(signed, JobStartParams::default()),
-        ));
+        sim.request(Request::job(resubmitter, start(signed)));
         assert_eq!(
             sim.state.session.session().and_then(Session::started_by),
             Some(&starter)
@@ -2076,19 +2074,13 @@ mod test {
             signed.key_id().clone(),
             other.signature().clone(),
         );
-        let outputs = sim.request(Request::job(
-            actor.clone(),
-            JobRequest::Start(forged, JobStartParams::default()),
-        ));
+        let outputs = sim.request(Request::job(actor.clone(), start(forged)));
         assert!(outputs.is_empty());
         assert!(sim.state.session.session().is_none());
         assert!(sim.state.pending_rank(session_id).is_some());
         assert!(!sim.state.history.contains(&job_id));
 
-        let outputs = sim.request(Request::job(
-            actor,
-            JobRequest::Start(signed, JobStartParams::default()),
-        ));
+        let outputs = sim.request(Request::job(actor, start(signed)));
         assert!(
             outputs
                 .iter()
@@ -2108,10 +2100,7 @@ mod test {
         assert!(!sim.state.history.contains(&job_id));
 
         let signed = signed_job(&mut root, job_id, session_id, "true").await;
-        let outputs = sim.request(Request::job(
-            actor,
-            JobRequest::Start(signed, JobStartParams::default()),
-        ));
+        let outputs = sim.request(Request::job(actor, start(signed)));
         assert!(
             outputs
                 .iter()
@@ -2141,7 +2130,11 @@ mod test {
             .unwrap();
         sim.request(Request::job(
             actor.clone(),
-            JobRequest::Start(signed, JobStartParams::default()),
+            JobRequest::Start(
+                signed,
+                JobStartParams::default(),
+                BTreeSet::from([other.clone()]),
+            ),
         ));
         sim.send(Message::Event(
             other.clone(),
@@ -2165,10 +2158,7 @@ mod test {
         let actor = root.key_id().clone();
         let job_id = session.next_job_id();
         let signed = signed_job(&mut root, job_id, session_id, "true").await;
-        sim.request(Request::job(
-            actor,
-            JobRequest::Start(signed, JobStartParams::default()),
-        ));
+        sim.request(Request::job(actor, start(signed)));
 
         let guest = self::root().key_id().clone();
         let outputs = sim.request(Request::job(guest, JobRequest::Stop(job_id)));
@@ -2219,10 +2209,7 @@ mod test {
 
         // If the committed job arrives again, it confirms the start but
         // skips as superseded instead of running.
-        let outputs = sim.request(Request::job(
-            actor.clone(),
-            JobRequest::Start(job_a, JobStartParams::default()),
-        ));
+        let outputs = sim.request(Request::job(actor.clone(), start(job_a)));
         assert!(
             sim.state
                 .session
@@ -2240,10 +2227,7 @@ mod test {
 
         // That job's successor also does not run.
         let job_b = signed_job(&mut root, successor_id, session_id, "true").await;
-        let outputs = sim.request(Request::job(
-            actor.clone(),
-            JobRequest::Start(job_b, JobStartParams::default()),
-        ));
+        let outputs = sim.request(Request::job(actor.clone(), start(job_b)));
         assert!(!outputs.iter().any(|o| matches!(o, Output::Run(_))));
 
         // A newer session outranks the committed one and runs.
@@ -2252,10 +2236,7 @@ mod test {
         sim.request(Request::session(actor.clone(), SessionRequest::Start(next)));
         let job_c_id = Session::new(next_id).next_job_id();
         let job_c = signed_job(&mut root, job_c_id, next_id, "true").await;
-        let outputs = sim.request(Request::job(
-            actor,
-            JobRequest::Start(job_c, JobStartParams::default()),
-        ));
+        let outputs = sim.request(Request::job(actor, start(job_c)));
         assert!(outputs.iter().any(|o| matches!(o, Output::Run(_))));
     }
 
@@ -2292,20 +2273,14 @@ mod test {
 
         let job_id = session.next_job_id();
         let signed = signed_job(&mut root, job_id, session_id, "true").await;
-        let outputs = sim.request(Request::job(
-            actor.clone(),
-            JobRequest::Start(signed.clone(), JobStartParams::default()),
-        ));
+        let outputs = sim.request(Request::job(actor.clone(), start(signed.clone())));
         assert!(!outputs.iter().any(|o| matches!(o, Output::Run(_))));
         assert!(skipped(&outputs, job_id));
 
         session.job_started(signed);
         let next_id = session.next_job_id();
         let next = signed_job(&mut root, next_id, session_id, "true").await;
-        let outputs = sim.request(Request::job(
-            actor,
-            JobRequest::Start(next, JobStartParams::default()),
-        ));
+        let outputs = sim.request(Request::job(actor, start(next)));
         assert!(skipped(&outputs, next_id));
     }
 
@@ -2319,10 +2294,7 @@ mod test {
 
         let job_id = session.next_job_id();
         let signed = signed_job(&mut root, job_id, session_id, "true").await;
-        sim.send(Message::Request(Request::job(
-            actor,
-            JobRequest::Start(signed.clone(), JobStartParams::default()),
-        )));
+        sim.send(Message::Request(Request::job(actor, start(signed.clone()))));
         let outputs = sim.pump_draining();
         assert!(!outputs.iter().any(|o| matches!(o, Output::Run(_))));
 
@@ -2340,10 +2312,7 @@ mod test {
 
         let job_id = session.next_job_id();
         let signed = signed_job(&mut root, job_id, session_id, "-rf").await;
-        let outputs = sim.request(Request::job(
-            actor,
-            JobRequest::Start(signed.clone(), JobStartParams::default()),
-        ));
+        let outputs = sim.request(Request::job(actor, start(signed.clone())));
         assert!(!outputs.iter().any(|o| matches!(o, Output::Run(_))));
         assert!(outputs.iter().any(|o| matches!(
             o,
@@ -2376,10 +2345,7 @@ mod test {
                 actor.clone(),
                 SessionRequest::Start(preimage),
             )),
-            Message::Request(Request::job(
-                actor,
-                JobRequest::Start(signed, JobStartParams::default()),
-            )),
+            Message::Request(Request::job(actor, start(signed))),
             Message::Event(baseboard(), Event::Job(JobEvent::Start(job_id, Utc::now()))),
         ];
 

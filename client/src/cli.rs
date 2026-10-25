@@ -4,7 +4,7 @@
 
 //! Possibly-interactive command-line interface.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
 use std::fs;
 use std::io::{self, BufRead as _, ErrorKind, Read as _, Write as _, stderr, stdin, stdout};
@@ -35,7 +35,7 @@ use sush_common::jobs::{
     SignedJob, job_status_to_json_map,
 };
 use sush_common::keys::{KeyId, Signature, SshPublicKey};
-use sush_common::targets::{MAX_CUBBY, SledHealth, SledId, SledVersion};
+use sush_common::targets::{MAX_CUBBY, SledHealth, SledId, SledVersion, Target};
 use sush_common::version::VersionInfo;
 
 use crate::AuthzSigner;
@@ -481,7 +481,7 @@ impl CommandContext for Cli {
 
     // Job management
 
-    fn job_started(&mut self, job: &SignedJob, show: bool) {
+    fn job_started(&mut self, job: &SignedJob, sleds: Option<&BTreeSet<BaseboardId>>, show: bool) {
         if let Some(session) = self.session.lock().unwrap().as_mut() {
             session.job_started(job.to_owned());
             self.save_session(Some(session));
@@ -491,12 +491,26 @@ impl CommandContext for Cli {
         }
         let job_id = job.job_id();
         match self.get_output_format() {
-            OutputFormat::Json => println!("{}", json!({"job_started": job_id})),
+            OutputFormat::Json => println!("{}", json!({"job_started": job_id, "sleds": sleds})),
             OutputFormat::Text => {
-                if let Some(watch) = self.watch.lock().unwrap().as_ref() {
-                    let _ = watch.multi.println(format!("✅ Started job `{job_id}`"));
-                } else {
-                    println!("✅ Started job `{job_id}`");
+                let watch = self.watch.lock().unwrap();
+                let print = |line: String| match watch.as_ref() {
+                    Some(watch) => {
+                        let _ = watch.multi.println(line);
+                    }
+                    None => println!("{line}"),
+                };
+                print(format!("✅ Started job `{job_id}`"));
+                if let (Target::Sleds(named), Some(sleds)) = (job.payload().target(), sleds) {
+                    for sled in named {
+                        if let SledId::Baseboard(baseboard) = sled
+                            && !sleds.contains(baseboard)
+                        {
+                            print(format!(
+                                "❗ Job `{job_id}` will not run on unreachable sled `{baseboard}`"
+                            ));
+                        }
+                    }
                 }
             }
         }

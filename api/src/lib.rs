@@ -4,7 +4,7 @@
 
 //! Oxide Support Shell API
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
 
 use dropshot::{
@@ -147,7 +147,7 @@ pub trait SushApi {
         params: PathParams<JobTargetParams>,
         query: QueryParams<JobStartParams>,
         body: TypedBody<SignedJob>,
-    ) -> Result<HttpResponseUpdatedNoContent, HttpError>;
+    ) -> Result<HttpResponseOk<JobStarted>, HttpError>;
 
     /// Stop a (running) job.
     #[endpoint { method = POST, path = "/jobs/{job_id}/stop" }]
@@ -285,6 +285,13 @@ pub struct SessionStartBody {
     pub client_nonce: SessionClientNonce,
     pub signer_nonce: SessionSignerNonce,
     pub seq: SessionSeq,
+}
+
+/// Acknowledgement that a job was accepted.
+#[derive(Clone, Debug, Deserialize, Eq, JsonSchema, PartialEq, Serialize)]
+pub struct JobStarted {
+    /// Which sleds the job will run on.
+    pub sleds: BTreeSet<BaseboardId>,
 }
 
 /// Job parameters _not_ specified in the signed job request.

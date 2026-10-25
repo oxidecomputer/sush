@@ -18,11 +18,11 @@ use sled_hardware_types::BaseboardId;
 use slog::{Logger, o};
 use tempfile::TempDir;
 use tokio::sync::watch;
-use tokio::time::sleep;
+use tokio::time::{sleep, timeout};
 use tokio_util::sync::CancellationToken;
 
 use chrono::Utc;
-use sush_api::{JobStartParams, JobWait};
+use sush_api::{JobStartParams, JobStopParams, JobWait};
 use sush_common::authn::Identity;
 use sush_common::jobs::{
     JobId, JobMode, JobOutputState, JobStartRequest, JobStatus, ProcessError, Session,
@@ -52,6 +52,7 @@ struct Sled {
     peers: watch::Sender<BTreeSet<SocketAddrV6>>,
     addr: SocketAddrV6,
     baseboard: BaseboardId,
+    cubbies: watch::Sender<Cubbies>,
     _output: TempDir,
 }
 
@@ -93,13 +94,13 @@ impl Sled {
         // The manager's baseboard must be the one sprockets attests,
         // as it is on a sled, or the health join can never match.
         let baseboard = baseboard(identity);
-        let (_cubbies, cubbies) = watch::channel(Cubbies::new());
+        let (cubbies, cubbies_rx) = watch::channel(Cubbies::new());
         let mgr = JobManager::new(
             log.clone(),
             PathIsolation::InsecureDisable,
             JobOutputDir::fixed(output.path()),
             baseboard.clone(),
-            cubbies,
+            cubbies_rx,
             universe.clone(),
             linked,
             &locker,
@@ -114,6 +115,7 @@ impl Sled {
             peers,
             addr,
             baseboard,
+            cubbies,
             _output: output,
         }
     }
@@ -175,11 +177,12 @@ async fn jobs_gossip_between_sleds() {
         .await
         .unwrap();
 
-    // That job, submitted to A, runs on both sleds, and each sled
-    // learns the other's result.
+    // That job, submitted to A, runs on both sleds. A waits for both
+    // results before it returns, and B learns A's result too.
     let job_id = session.next_job_id();
     let job = sign_job(&mut root, job_id, session_id, "true").await;
-    a.mgr
+    let sleds = a
+        .mgr
         .job_start(
             &authn_a,
             job,
@@ -190,6 +193,10 @@ async fn jobs_gossip_between_sleds() {
         )
         .await
         .unwrap();
+    assert_eq!(
+        sleds,
+        BTreeSet::from([a.baseboard.clone(), b.baseboard.clone()])
+    );
     eventually("session gossips to B", 60, async || {
         b.mgr
             .session(&authn_b)
@@ -202,12 +209,9 @@ async fn jobs_gossip_between_sleds() {
                 .is_some_and(|s| matches!(s, JobStatus::Stopped { .. }))
         })
     };
+    assert!(stopped(&a.mgr, &authn_a, &b.baseboard).await);
     eventually("A's run visible on B", 60, async || {
         stopped(&b.mgr, &authn_b, &a.baseboard).await
-    })
-    .await;
-    eventually("B's run visible on A", 60, async || {
-        stopped(&a.mgr, &authn_a, &b.baseboard).await
     })
     .await;
 
@@ -291,6 +295,157 @@ async fn first_job_confirms_start_on_another_sled() {
         })
         .await;
     }
+
+    shutdown.cancel();
+}
+
+/// A job that names a cubby runs on the sled in that cubby even while
+/// that sled's own cubby map is empty, because the sled that accepts
+/// the job resolves the cubby.
+#[named]
+#[tokio::test]
+async fn cubby_resolves_on_accepting_sled() {
+    let (_tmp, dir) = pki("sush-distributed-", 2);
+    let mut root = common::ephemeral_root();
+    let root_pem = dir.join("job-root.pem");
+    write(
+        &root_pem,
+        pem_cert_chain(vec![root.cert().to_owned()]).unwrap(),
+    )
+    .unwrap();
+
+    let log = test_logger(function_name!());
+    let shutdown = CancellationToken::new();
+    let a = Sled::start(&log, &dir, 1, &root_pem, &shutdown).await;
+    let b = Sled::start(&log, &dir, 2, &root_pem, &shutdown).await;
+    a.peers.send(BTreeSet::from([b.addr])).unwrap();
+    b.peers.send(BTreeSet::from([a.addr])).unwrap();
+    eventually("universe convergence", 120, async || {
+        a.universe.borrow().rumors.network() == b.universe.borrow().rumors.network()
+    })
+    .await;
+    sees(&a, &b).await;
+
+    // Only A knows that B is in cubby 14.
+    a.cubbies
+        .send(Cubbies::from([(14, b.baseboard.clone())]))
+        .unwrap();
+
+    let authn = fake_identity(&mut root).await;
+    let Ceremony {
+        session_id,
+        client_nonce,
+        signer_nonce,
+        seq,
+    } = ceremony(&a.mgr, 1);
+    a.mgr
+        .session_start(&authn, session_id, client_nonce, signer_nonce, seq)
+        .await
+        .unwrap();
+    let job_id = Session::new(session_id).next_job_id();
+    let job = root
+        .sign(JobStartRequest::new(
+            job_id,
+            session_id,
+            "true",
+            JobMode::Batch,
+            "14".parse().unwrap(),
+        ))
+        .await
+        .unwrap();
+
+    // A's map update lands whenever its state task gets to it, so
+    // retry the job until A accepts it.
+    let wait = JobStartParams {
+        wait: JobWait::Stop,
+        ..Default::default()
+    };
+    let sleds = loop {
+        match a.mgr.job_start(&authn, job.clone(), wait.clone()).await {
+            Ok(sleds) => break sleds,
+            Err(JobError::UnknownCubby(14)) => sleep(Duration::from_millis(50)).await,
+            Err(error) => panic!("job start failed: {error}"),
+        }
+    };
+    assert_eq!(sleds, BTreeSet::from([b.baseboard.clone()]));
+    let status = a.mgr.job_status(&authn, &job_id).await.unwrap();
+    assert!(matches!(
+        status.get(&b.baseboard),
+        Some(JobStatus::Stopped { .. })
+    ));
+    assert!(!status.contains_key(&a.baseboard));
+
+    shutdown.cancel();
+}
+
+/// A stop waits for the sleds the job runs on, even when the sled that
+/// takes the stop is not one of them.
+#[named]
+#[tokio::test]
+async fn stop_waits_for_remote_sleds() {
+    let (_tmp, dir) = pki("sush-distributed-", 2);
+    let mut root = common::ephemeral_root();
+    let root_pem = dir.join("job-root.pem");
+    write(
+        &root_pem,
+        pem_cert_chain(vec![root.cert().to_owned()]).unwrap(),
+    )
+    .unwrap();
+
+    let log = test_logger(function_name!());
+    let shutdown = CancellationToken::new();
+    let a = Sled::start(&log, &dir, 1, &root_pem, &shutdown).await;
+    let b = Sled::start(&log, &dir, 2, &root_pem, &shutdown).await;
+    a.peers.send(BTreeSet::from([b.addr])).unwrap();
+    b.peers.send(BTreeSet::from([a.addr])).unwrap();
+    eventually("universe convergence", 120, async || {
+        a.universe.borrow().rumors.network() == b.universe.borrow().rumors.network()
+    })
+    .await;
+    sees(&a, &b).await;
+
+    let authn = fake_identity(&mut root).await;
+    let Ceremony {
+        session_id,
+        client_nonce,
+        signer_nonce,
+        seq,
+    } = ceremony(&a.mgr, 1);
+    a.mgr
+        .session_start(&authn, session_id, client_nonce, signer_nonce, seq)
+        .await
+        .unwrap();
+
+    // A takes a job that runs only on B, and waits for it to start.
+    let job_id = Session::new(session_id).next_job_id();
+    let job = sign_job_for(&mut root, job_id, session_id, "sleep 1000", &b.baseboard).await;
+    a.mgr
+        .job_start(
+            &authn,
+            job,
+            JobStartParams {
+                wait: JobWait::Start,
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+
+    // A takes the stop, and returns once B has stopped the job.
+    let stop = JobStopParams {
+        wait: JobWait::Stop,
+        ..Default::default()
+    };
+    timeout(
+        Duration::from_secs(60),
+        a.mgr.job_stop(&authn, &job_id, stop),
+    )
+    .await
+    .expect("the stop waits only for B")
+    .unwrap();
+    let status = a.mgr.job_status(&authn, &job_id).await.unwrap();
+    assert!(status[&b.baseboard].is_terminal());
+    assert!(!status.contains_key(&a.baseboard));
 
     shutdown.cancel();
 }
@@ -977,12 +1132,12 @@ fn ceremony(mgr: &JobManager, seq: u64) -> Ceremony {
 }
 
 async fn sees(anchor: &Sled, joiner: &Sled) {
-    eventually("the anchor sees the joiner", 60, async || {
+    eventually("the anchor links the joiner", 60, async || {
         anchor
             .mgr
             .versions()
             .iter()
-            .any(|row| row.baseboard == joiner.baseboard)
+            .any(|row| row.baseboard == joiner.baseboard && row.health == Some(SledHealth::Linked))
     })
     .await;
 }
@@ -1686,6 +1841,7 @@ async fn witnessed_session_survives_restart() {
         a.universe.borrow().rumors.network() == b.universe.borrow().rumors.network()
     })
     .await;
+    sees(&a, &b).await;
 
     session.job_started(j1);
     let j2_id = session.next_job_id();
