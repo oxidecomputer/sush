@@ -75,6 +75,7 @@ progenitor::generate_api!(
         JobLimits = sush_common::jobs::JobLimits,
         JobOutputHash = sush_common::jobs::JobOutputHash,
         JobOutputStream = sush_common::jobs::JobOutputStream,
+        JobStarted = sush_api::JobStarted,
         JobStatus = sush_common::jobs::JobStatus,
         JobWait = sush_api::JobWait,
         KeyId = sush_common::keys::KeyId,

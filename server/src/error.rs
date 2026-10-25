@@ -68,6 +68,8 @@ pub enum JobError {
     Key(#[from] KeyError),
     #[error("Only one session may be running at a time")]
     MultipleSessions,
+    #[error("No sled this job targets is reachable")]
+    NoReachableTarget,
     #[error("No current session")]
     NoSession,
     #[error("Job `{0}` is not the session's next job")]
@@ -96,6 +98,8 @@ pub enum JobError {
     TooManyOutputRequests(usize),
     #[error("Unauthorized request")]
     Unauthorized(Nonce),
+    #[error("Which sled is in cubby {0} has not yet been reported")]
+    UnknownCubby(u8),
     #[error("Unable to wait for job end")]
     Wait,
     #[error("The provided session ID is invalid")]
@@ -199,7 +203,7 @@ impl From<JobError> for HttpError {
                 HttpError::for_client_error(None, ClientErrorStatusCode::NOT_FOUND, message)
             }
             DuplicateJobId(_) | InteractiveTarget | InvalidCommand | Json(_) | MultipleSessions
-            | InvalidSessionId | UnverifiedJob(_) => {
+            | InvalidSessionId | NoReachableTarget | UnknownCubby(_) | UnverifiedJob(_) => {
                 HttpError::for_client_error(None, ClientErrorStatusCode::BAD_REQUEST, message)
             }
             NotNextJob(_) => {
