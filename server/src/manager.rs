@@ -399,14 +399,6 @@ impl JobManager {
         self.join_state.take()
     }
 
-    fn wait_for_session(&self, session_id: SessionId) -> impl FnMut(&State) -> bool {
-        move |state| {
-            state
-                .session()
-                .is_some_and(|s| s.session_id() == session_id)
-        }
-    }
-
     fn wait_for_job(&self, job_id: &JobId, wait: JobWait) -> impl FnMut(&State) -> bool {
         move |state| {
             if wait.is_some() {
@@ -473,13 +465,8 @@ impl JobManager {
         client_nonce: SessionClientNonce,
         signer_nonce: SessionSignerNonce,
         seq: SessionSeq,
-        wait: bool,
     ) -> Result<(), JobError> {
-        // Verify that the session ID provided by the client is meant
-        // for this instance of Sush: it must hash over our baseboard
-        // and current server nonce. The preimage then travels instead
-        // of the id, so every peer derives for itself both the id and
-        // the sequence number the id commits to.
+        // Verify the session ID provided by the client.
         let server_nonce = *self.session_server_nonce.lock().unwrap();
         let preimage = SessionPreimage {
             baseboard: self.own_baseboard().clone(),
@@ -491,12 +478,31 @@ impl JobManager {
             return Err(JobError::InvalidSessionId);
         }
 
+        // Every sled keeps the start pending until a verified job of the
+        // session confirms it. Wait until it is pending here, or a session
+        // that outranks it is active, so that a job sent next finds it.
+        let rank = Some((seq, session_id));
         self.session_request(authn, SessionRequest::Start(preimage))
             .await?;
-        if wait {
-            self.wait_for(self.wait_for_session(session_id)).await?;
+        self.wait_for(move |state| state.pending_rank(session_id).is_some() || state.rank() >= rank)
+            .await
+    }
+
+    /// This sled accepts a job only if the job's session is active here,
+    /// or if the session's start is pending here for the job to confirm.
+    /// The state machine makes the final decision; this check fails fast.
+    fn session_check(&self, session_id: SessionId) -> Result<(), JobError> {
+        let state = self.state.borrow();
+        let rank = state.rank();
+        if rank.is_some_and(|(_, active)| active == session_id)
+            || state.pending_rank(session_id) > rank
+        {
+            return Ok(());
         }
-        Ok(())
+        Err(match rank {
+            None => JobError::NoSession,
+            Some(_) => JobError::SessionNotCurrent(session_id),
+        })
     }
 
     pub async fn session_stop(
@@ -552,6 +558,15 @@ impl JobManager {
         }
     }
 
+    /// Don't act on a job we've never seen.
+    fn known_job_check(&self, job_id: &JobId) -> Result<(), JobError> {
+        if self.state.borrow().is_job_known(job_id) {
+            Ok(())
+        } else {
+            Err(JobError::JobNotFound(job_id.to_owned()))
+        }
+    }
+
     pub async fn session_allow_attach(
         &self,
         authn: &Identity,
@@ -588,20 +603,16 @@ impl JobManager {
         job: SignedJob,
         params: JobStartParams,
     ) -> Result<(), JobError> {
-        let job_id = job.job_id().to_owned();
-        let wait = params.wait.to_owned();
-
-        // A job can only run in the session it was signed for.
-        let payload = job.payload();
-        match self.session(authn) {
-            None => return Err(JobError::NoSession),
-            Some(session) if session.session_id() != payload.session_id() => {
-                return Err(JobError::SessionNotCurrent(payload.session_id()));
-            }
-            Some(_) => (),
-        }
+        // A forged job must not take a signed job's place in the chain.
+        self.state
+            .borrow()
+            .certs()
+            .verify(&job)
+            .map_err(JobError::UnverifiedJob)?;
+        self.session_check(job.payload().session_id())?;
 
         // A broader target would orphan jobs on unattached sleds.
+        let payload = job.payload();
         if payload.is_interactive() && payload.target().single_baseboard().is_none() {
             return Err(JobError::InteractiveTarget);
         }
@@ -611,11 +622,13 @@ impl JobManager {
         // job chain. Without this, a caller that resubmits an
         // already-completed job ID and waits would see the *original*
         // job's status returned as if it belonged to this submission.
+        let job_id = job.job_id().to_owned();
         if self.state.borrow().get_job_status(&job_id).is_some() {
             return Err(JobError::DuplicateJobId(job_id));
         }
 
         // Submit the job for execution.
+        let wait = params.wait.to_owned();
         self.job_request(authn, JobRequest::Start(job, params))
             .await?;
         self.wait_for(self.wait_for_job(&job_id, wait)).await
@@ -627,6 +640,8 @@ impl JobManager {
         job_id: &JobId,
         JobStopParams { wait, .. }: JobStopParams,
     ) -> Result<(), JobError> {
+        self.starter_check(authn)?;
+        self.known_job_check(job_id)?;
         self.job_request(authn, JobRequest::Stop(job_id.to_owned()))
             .await?;
         self.wait_for(self.wait_for_job(job_id, wait)).await

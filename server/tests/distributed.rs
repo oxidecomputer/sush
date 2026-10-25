@@ -23,6 +23,7 @@ use tokio_util::sync::CancellationToken;
 
 use chrono::Utc;
 use sush_api::{JobStartParams, JobWait};
+use sush_common::authn::Identity;
 use sush_common::jobs::{
     JobId, JobMode, JobOutputState, JobStartRequest, JobStatus, ProcessError, Session,
     SessionClientNonce, SessionId, SessionPreimage, SessionSeq, SessionSignerNonce,
@@ -38,7 +39,7 @@ use sush_server::locker::bookmark::BOOKMARK;
 use sush_server::messages::v0::{Event, JobEvent, Message};
 use sush_server::output::JobOutputDir;
 use sush_server::state::GossipUniverse;
-use sush_server::{JobManager, seed_gossip};
+use sush_server::{JobError, JobManager, seed_gossip};
 
 use common::{
     baseboard, corpus, eventually, fake_identity, gossip_config, localhost, pki, sign_job,
@@ -158,7 +159,8 @@ async fn jobs_gossip_between_sleds() {
     })
     .await;
 
-    // A session started on sled A becomes B's active session too.
+    // A session started on sled A becomes B's active session too,
+    // once a signed job confirms it.
     let authn_a = fake_identity(&mut root).await;
     let authn_b = fake_identity(&mut root).await;
     let Ceremony {
@@ -169,18 +171,12 @@ async fn jobs_gossip_between_sleds() {
     } = ceremony(&a.mgr, 1);
     let session = Session::new(session_id);
     a.mgr
-        .session_start(&authn_a, session_id, client_nonce, signer_nonce, seq, true)
+        .session_start(&authn_a, session_id, client_nonce, signer_nonce, seq)
         .await
         .unwrap();
-    eventually("session gossips to B", 60, async || {
-        b.mgr
-            .session(&authn_b)
-            .is_some_and(|s| s.session_id() == session_id)
-    })
-    .await;
 
-    // A job submitted to A runs on both sleds, and each sled learns the
-    // other's result.
+    // That job, submitted to A, runs on both sleds, and each sled
+    // learns the other's result.
     let job_id = session.next_job_id();
     let job = sign_job(&mut root, job_id, session_id, "true").await;
     a.mgr
@@ -194,6 +190,12 @@ async fn jobs_gossip_between_sleds() {
         )
         .await
         .unwrap();
+    eventually("session gossips to B", 60, async || {
+        b.mgr
+            .session(&authn_b)
+            .is_some_and(|s| s.session_id() == session_id)
+    })
+    .await;
     let stopped = async |mgr: &JobManager, authn, baseboard: &BaseboardId| {
         mgr.job_status(authn, &job_id).await.is_ok_and(|map| {
             map.get(baseboard)
@@ -217,13 +219,290 @@ async fn jobs_gossip_between_sleds() {
         seq,
     } = ceremony(&b.mgr, 2);
     b.mgr
-        .session_start(&authn_b, successor, client_nonce, signer_nonce, seq, true)
+        .session_start(&authn_b, successor, client_nonce, signer_nonce, seq)
         .await
         .unwrap();
+    confirm_start(&b, &authn_b, &mut root, &mut Session::new(successor)).await;
     eventually("supersession gossips to A", 60, async || {
         a.mgr
             .session(&authn_a)
             .is_some_and(|s| s.session_id() == successor)
+    })
+    .await;
+
+    shutdown.cancel();
+}
+
+/// A session's first job confirms its start on whichever sled receives
+/// the job, not only on the sled that took the start.
+#[named]
+#[tokio::test]
+async fn first_job_confirms_start_on_another_sled() {
+    let (_tmp, dir) = pki("sush-distributed-", 2);
+    let mut root = common::ephemeral_root();
+    let root_pem = dir.join("job-root.pem");
+    write(
+        &root_pem,
+        pem_cert_chain(vec![root.cert().to_owned()]).unwrap(),
+    )
+    .unwrap();
+
+    let log = test_logger(function_name!());
+    let shutdown = CancellationToken::new();
+    let a = Sled::start(&log, &dir, 1, &root_pem, &shutdown).await;
+    let b = Sled::start(&log, &dir, 2, &root_pem, &shutdown).await;
+    a.peers.send(BTreeSet::from([b.addr])).unwrap();
+    b.peers.send(BTreeSet::from([a.addr])).unwrap();
+    eventually("universe convergence", 120, async || {
+        a.universe.borrow().rumors.network() == b.universe.borrow().rumors.network()
+    })
+    .await;
+
+    // A takes the start.
+    let authn_a = fake_identity(&mut root).await;
+    let authn_b = fake_identity(&mut root).await;
+    let Ceremony {
+        session_id,
+        client_nonce,
+        signer_nonce,
+        seq,
+    } = ceremony(&a.mgr, 1);
+    a.mgr
+        .session_start(&authn_a, session_id, client_nonce, signer_nonce, seq)
+        .await
+        .unwrap();
+
+    // B accepts the first job once the pending start reaches it, and
+    // the job confirms the session on both sleds.
+    let job_id = Session::new(session_id).next_job_id();
+    let job = sign_job(&mut root, job_id, session_id, "true").await;
+    eventually("B accepts the first job", 60, async || {
+        b.mgr
+            .job_start(&authn_b, job.clone(), JobStartParams::default())
+            .await
+            .is_ok()
+    })
+    .await;
+    for (name, sled, authn) in [("A", &a, &authn_a), ("B", &b, &authn_b)] {
+        eventually(&format!("session active on {name}"), 60, async || {
+            sled.mgr
+                .session(authn)
+                .is_some_and(|s| s.session_id() == session_id)
+        })
+        .await;
+    }
+
+    shutdown.cancel();
+}
+
+/// The front door refuses a forged job, and the signed job it mimics
+/// still runs.
+#[named]
+#[tokio::test]
+async fn unverified_job_is_refused() {
+    let (_tmp, dir) = pki("sush-unverified-", 1);
+    let mut root = common::ephemeral_root();
+    let root_pem = dir.join("job-root.pem");
+    write(
+        &root_pem,
+        pem_cert_chain(vec![root.cert().to_owned()]).unwrap(),
+    )
+    .unwrap();
+
+    let log = test_logger(function_name!());
+    let shutdown = CancellationToken::new();
+    let a = Sled::start(&log, &dir, 1, &root_pem, &shutdown).await;
+    let authn = fake_identity(&mut root).await;
+    let Ceremony {
+        session_id,
+        client_nonce,
+        signer_nonce,
+        seq,
+    } = ceremony(&a.mgr, 1);
+    a.mgr
+        .session_start(&authn, session_id, client_nonce, signer_nonce, seq)
+        .await
+        .unwrap();
+
+    // The sled refuses a job carrying another job's signature, records
+    // nothing under its id, and leaves the start pending.
+    let job_id = Session::new(session_id).next_job_id();
+    let job = sign_job(&mut root, job_id, session_id, "true").await;
+    let other = sign_job(&mut root, job_id, session_id, "false").await;
+    let forged = SignedJob::new(
+        job.payload().clone(),
+        job.key_id().clone(),
+        other.signature().clone(),
+    );
+    assert!(matches!(
+        a.mgr
+            .job_start(&authn, forged, JobStartParams::default())
+            .await,
+        Err(JobError::UnverifiedJob(_))
+    ));
+    assert!(a.mgr.job_status(&authn, &job_id).await.is_err());
+    assert!(a.mgr.session(&authn).is_none());
+
+    // The signed job then runs in its place.
+    a.mgr
+        .job_start(
+            &authn,
+            job,
+            JobStartParams {
+                wait: JobWait::Stop,
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+    assert!(a.mgr.job_status(&authn, &job_id).await.is_ok_and(|map| {
+        map.get(&a.baseboard)
+            .is_some_and(|s| matches!(s, JobStatus::Stopped { result: Ok(0), .. }))
+    }));
+
+    shutdown.cancel();
+}
+
+/// A forged start neither displaces the active session nor blocks
+/// the next genuine one. The sled refuses the jobs of a pending start
+/// the active session outranks, and any verified job confirms a
+/// pending start.
+#[named]
+#[tokio::test]
+async fn forged_start_never_takes_effect() {
+    let (_tmp, dir) = pki("sush-forged-start-", 1);
+    let mut root = common::ephemeral_root();
+    let root_pem = dir.join("job-root.pem");
+    write(
+        &root_pem,
+        pem_cert_chain(vec![root.cert().to_owned()]).unwrap(),
+    )
+    .unwrap();
+
+    let log = test_logger(function_name!());
+    let shutdown = CancellationToken::new();
+    let a = Sled::start(&log, &dir, 1, &root_pem, &shutdown).await;
+    let authn = fake_identity(&mut root).await;
+    let mut forger = common::ephemeral_root();
+    let authn_forger = fake_identity(&mut forger).await;
+
+    // A genuine session's first job confirms it.
+    let Ceremony {
+        session_id,
+        client_nonce,
+        signer_nonce,
+        seq,
+    } = ceremony(&a.mgr, 2);
+    let mut session = Session::new(session_id);
+    a.mgr
+        .session_start(&authn, session_id, client_nonce, signer_nonce, seq)
+        .await
+        .unwrap();
+    confirm_start(&a, &authn, &mut root, &mut session).await;
+    assert!(
+        a.mgr
+            .session(&authn)
+            .is_some_and(|s| s.session_id() == session_id)
+    );
+
+    // A forged start changes nothing.
+    let forged = ceremony(&a.mgr, SessionSeq::MAX_MILLIS);
+    a.mgr
+        .session_start(
+            &authn_forger,
+            forged.session_id,
+            forged.client_nonce,
+            forged.signer_nonce,
+            forged.seq,
+        )
+        .await
+        .unwrap();
+    assert!(
+        a.mgr
+            .session(&authn)
+            .is_some_and(|s| s.session_id() == session_id)
+    );
+
+    // The next genuine session takes the slot regardless.
+    let Ceremony {
+        session_id: next_id,
+        client_nonce,
+        signer_nonce,
+        seq,
+    } = ceremony(&a.mgr, 3);
+    let mut next = Session::new(next_id);
+    a.mgr
+        .session_start(&authn, next_id, client_nonce, signer_nonce, seq)
+        .await
+        .unwrap();
+    confirm_start(&a, &authn, &mut root, &mut next).await;
+    assert!(
+        a.mgr
+            .session(&authn)
+            .is_some_and(|s| s.session_id() == next_id)
+    );
+
+    // The sled refuses the first job of a start the active session
+    // outranks.
+    let Ceremony {
+        session_id: stale_id,
+        client_nonce,
+        signer_nonce,
+        seq,
+    } = ceremony(&a.mgr, 1);
+    a.mgr
+        .session_start(&authn, stale_id, client_nonce, signer_nonce, seq)
+        .await
+        .unwrap();
+    let stale = Session::new(stale_id);
+    let job = sign_job(&mut root, stale.next_job_id(), stale_id, "true").await;
+    assert!(matches!(
+        a.mgr.job_start(&authn, job, JobStartParams::default()).await,
+        Err(JobError::SessionNotCurrent(id)) if id == stale_id
+    ));
+
+    // A verified job past the first confirms a pending session just
+    // as well, and queues behind the hole until the first job fills it.
+    let Ceremony {
+        session_id: last_id,
+        client_nonce,
+        signer_nonce,
+        seq,
+    } = ceremony(&a.mgr, 4);
+    a.mgr
+        .session_start(&authn, last_id, client_nonce, signer_nonce, seq)
+        .await
+        .unwrap();
+    let mut last = Session::new(last_id);
+    let first = sign_job(&mut root, last.next_job_id(), last_id, "true").await;
+    last.job_started(first.clone());
+    let second_id = last.next_job_id();
+    let second = sign_job(&mut root, second_id, last_id, "true").await;
+    a.mgr
+        .job_start(&authn, second, JobStartParams::default())
+        .await
+        .unwrap();
+    a.mgr
+        .job_start(
+            &authn,
+            first,
+            JobStartParams {
+                wait: JobWait::Stop,
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+    assert!(
+        a.mgr
+            .session(&authn)
+            .is_some_and(|s| s.session_id() == last_id)
+    );
+    eventually("the queued job runs after the hole fills", 60, async || {
+        a.mgr.job_status(&authn, &second_id).await.is_ok_and(|map| {
+            map.get(&a.baseboard)
+                .is_some_and(|s| matches!(s, JobStatus::Stopped { result: Ok(0), .. }))
+        })
     })
     .await;
 
@@ -273,10 +552,10 @@ async fn partitioned_sessions_converge_on_higher_seq() {
             a_ceremony.client_nonce,
             a_ceremony.signer_nonce,
             a_ceremony.seq,
-            true,
         )
         .await
         .unwrap();
+    confirm_start(&a, &authn_a, &mut root, &mut session).await;
     let b_ceremony = ceremony(&b.mgr, 2);
     let session_b = b_ceremony.session_id;
     b.mgr
@@ -286,10 +565,10 @@ async fn partitioned_sessions_converge_on_higher_seq() {
             b_ceremony.client_nonce,
             b_ceremony.signer_nonce,
             b_ceremony.seq,
-            true,
         )
         .await
         .unwrap();
+    confirm_start(&b, &authn_b, &mut root, &mut Session::new(session_b)).await;
 
     // A job on A sits queued behind a hole in the chain, so it can
     // never run before B's session supersedes A's.
@@ -372,7 +651,7 @@ async fn rejoining_replays_without_reexecuting() {
     } = ceremony(&a.mgr, 1);
     let session = Session::new(session_id);
     a.mgr
-        .session_start(&authn_a, session_id, client_nonce, signer_nonce, seq, true)
+        .session_start(&authn_a, session_id, client_nonce, signer_nonce, seq)
         .await
         .unwrap();
     let job_id = session.next_job_id();
@@ -422,14 +701,7 @@ async fn rejoining_replays_without_reexecuting() {
     } = ceremony(&a.mgr, 2);
     let fresh = Session::new(successor);
     a.mgr
-        .session_start(
-            &authn_a,
-            successor,
-            client_nonce,
-            successor_nonce,
-            seq,
-            true,
-        )
+        .session_start(&authn_a, successor, client_nonce, successor_nonce, seq)
         .await
         .unwrap();
     let live_job = fresh.next_job_id();
@@ -628,7 +900,7 @@ async fn stragglers_do_not_interrupt_live_jobs() {
     } = ceremony(&a.mgr, 1);
     let session = Session::new(session_id);
     a.mgr
-        .session_start(&authn_a, session_id, client_nonce, signer_nonce, seq, true)
+        .session_start(&authn_a, session_id, client_nonce, signer_nonce, seq)
         .await
         .unwrap();
     let job_id = session.next_job_id();
@@ -735,6 +1007,30 @@ async fn sign_job_for(
     .unwrap()
 }
 
+/// Confirm the start pending on `sled` with the session's first job,
+/// and advance `session` past it.
+async fn confirm_start(
+    sled: &Sled,
+    authn: &Identity,
+    root: &mut EphemeralKey,
+    session: &mut Session,
+) {
+    let job_id = session.next_job_id();
+    let job = sign_job_for(root, job_id, session.session_id(), "true", &sled.baseboard).await;
+    sled.mgr
+        .job_start(
+            authn,
+            job.clone(),
+            JobStartParams {
+                wait: JobWait::Stop,
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+    session.job_started(job);
+}
+
 #[named]
 #[tokio::test]
 async fn lost_suffix_never_reruns() {
@@ -777,9 +1073,10 @@ async fn lost_suffix_never_reruns() {
     } = ceremony(&a.mgr, 1);
     let mut session = Session::new(session_id);
     a.mgr
-        .session_start(&authn_a, session_id, client_nonce, signer_nonce, seq, true)
+        .session_start(&authn_a, session_id, client_nonce, signer_nonce, seq)
         .await
         .unwrap();
+    confirm_start(&a, &authn_a, &mut root, &mut session).await;
     eventually("the session gossips to B", 120, async || {
         b.mgr
             .session(&authn_b)
@@ -875,7 +1172,7 @@ async fn lost_suffix_never_reruns() {
     );
     assert_eq!(read_to_string(&footprint).unwrap(), "run\n");
 
-    // A new session serves immediately.
+    // A new session, confirmed by a job for B, serves immediately.
     let Ceremony {
         session_id: session2_id,
         client_nonce,
@@ -884,35 +1181,22 @@ async fn lost_suffix_never_reruns() {
     } = ceremony(&a.mgr, 2);
     let session2 = Session::new(session2_id);
     a.mgr
-        .session_start(&authn_a, session2_id, client_nonce, signer_nonce, seq, true)
+        .session_start(&authn_a, session2_id, client_nonce, signer_nonce, seq)
         .await
         .unwrap();
-    eventually("the new session gossips to B", 120, async || {
-        b.mgr
-            .session(&authn_b)
-            .is_some_and(|s| s.session_id() == session2_id)
-    })
-    .await;
     let j3_id = session2.next_job_id();
     let j3 = sign_job_for(&mut root, j3_id, session2_id, "true", &b.baseboard).await;
-    b.mgr
-        .job_start(
-            &authn_b,
-            j3,
-            JobStartParams {
-                wait: JobWait::Stop,
-                ..Default::default()
-            },
-        )
+    a.mgr
+        .job_start(&authn_a, j3, JobStartParams::default())
         .await
         .unwrap();
-    assert!(
+    eventually("a new session must not be held", 120, async || {
         b.mgr.job_status(&authn_b, &j3_id).await.is_ok_and(|map| {
             map.get(&b.baseboard)
                 .is_some_and(|s| matches!(s, JobStatus::Stopped { result: Ok(0), .. }))
-        }),
-        "a new session must not be held"
-    );
+        })
+    })
+    .await;
 
     shutdown.cancel();
 }
@@ -963,9 +1247,10 @@ async fn session_resumes_at_stored_successor() {
     } = ceremony(&a.mgr, 1);
     let mut session = Session::new(session_id);
     a.mgr
-        .session_start(&authn_a, session_id, client_nonce, signer_nonce, seq, true)
+        .session_start(&authn_a, session_id, client_nonce, signer_nonce, seq)
         .await
         .unwrap();
+    confirm_start(&a, &authn_a, &mut root, &mut session).await;
     eventually("the session gossips to B and C", 120, async || {
         [(&b.mgr, &authn_b), (&c.mgr, &authn_c)]
             .iter()
@@ -1102,9 +1387,10 @@ async fn supersession_crosses_universes() {
     } = ceremony(&d.mgr, 2);
     let mut session2 = Session::new(session2_id);
     d.mgr
-        .session_start(&authn_d, session2_id, client_nonce, signer_nonce, seq, true)
+        .session_start(&authn_d, session2_id, client_nonce, signer_nonce, seq)
         .await
         .unwrap();
+    confirm_start(&d, &authn_d, &mut root, &mut session2).await;
 
     // X joins A's universe and runs a job there.
     let boundary_dir = TempDir::with_prefix("sush-boundary-").unwrap();
@@ -1128,9 +1414,10 @@ async fn supersession_crosses_universes() {
     } = ceremony(&a.mgr, 1);
     let mut session1 = Session::new(session1_id);
     a.mgr
-        .session_start(&authn_a, session1_id, client_nonce, signer_nonce, seq, true)
+        .session_start(&authn_a, session1_id, client_nonce, signer_nonce, seq)
         .await
         .unwrap();
+    confirm_start(&a, &authn_a, &mut root, &mut session1).await;
     eventually("session one gossips to X", 120, async || {
         x.mgr
             .session(&authn_x)
@@ -1252,11 +1539,12 @@ async fn supersession_crosses_universes() {
         signer_nonce,
         seq,
     } = ceremony(&a.mgr, 3);
-    let session3 = Session::new(session3_id);
+    let mut session3 = Session::new(session3_id);
     a.mgr
-        .session_start(&authn_a, session3_id, client_nonce, signer_nonce, seq, true)
+        .session_start(&authn_a, session3_id, client_nonce, signer_nonce, seq)
         .await
         .unwrap();
+    confirm_start(&a, &authn_a, &mut root, &mut session3).await;
     eventually("session three gossips to X", 120, async || {
         x.mgr
             .session(&authn_x)
@@ -1364,7 +1652,7 @@ async fn witnessed_session_survives_restart() {
     } = ceremony(&a.mgr, 1);
     let mut session = Session::new(session_id);
     a.mgr
-        .session_start(&authn_a, session_id, client_nonce, signer_nonce, seq, true)
+        .session_start(&authn_a, session_id, client_nonce, signer_nonce, seq)
         .await
         .unwrap();
 
@@ -1442,7 +1730,7 @@ async fn bookmarks_survive_restart() {
         seq,
     } = ceremony(&a.mgr, 1);
     a.mgr
-        .session_start(&authn_a, session_id, client_nonce, signer_nonce, seq, true)
+        .session_start(&authn_a, session_id, client_nonce, signer_nonce, seq)
         .await
         .unwrap();
 
@@ -1552,7 +1840,7 @@ async fn gossip_survives_bookmark_failure() {
     } = ceremony(&a.mgr, 1);
     let session = Session::new(session_id);
     a.mgr
-        .session_start(&authn_a, session_id, client_nonce, signer_nonce, seq, true)
+        .session_start(&authn_a, session_id, client_nonce, signer_nonce, seq)
         .await
         .unwrap();
 

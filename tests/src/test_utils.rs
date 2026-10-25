@@ -28,13 +28,14 @@ use tokio_util::sync::CancellationToken;
 use x509_cert::name::Name;
 use x509_cert::time::Validity;
 
+use sush_api::{JobStartParams, JobWait};
 use sush_client::context::Authz;
 use sush_client::{Client, ResponseValue};
 use sush_common::authn::{Challenge, ChallengeResponse, Credentials, Identity, Nonce, RequestKey};
 use sush_common::codephrases::Codephrase;
 use sush_common::jobs::{
-    JobId, JobMode, JobStartRequest, SessionClientNonce, SessionId, SessionPreimage, SessionSeq,
-    SessionSignerNonce, SessionSushNonce, VerifiedJob,
+    JobId, JobMode, JobStartRequest, Session, SessionClientNonce, SessionId, SessionPreimage,
+    SessionSeq, SessionSignerNonce, SessionSushNonce, VerifiedJob,
 };
 use sush_common::keys::{EphemeralKey, KeyType, Signer, pem_cert_chain};
 use sush_common::targets::{Cubbies, Target};
@@ -272,6 +273,30 @@ pub fn session_ceremony(mgr: &JobManager, seq: u64) -> SessionCeremony {
         signer_nonce: preimage.signer_nonce,
         seq: preimage.seq,
     }
+}
+
+/// Confirm the start pending on `mgr` with the session's first job,
+/// and advance `session` past it.
+pub async fn confirm_start(
+    mgr: &JobManager,
+    authn: &Identity,
+    root: &mut EphemeralKey,
+    session: &mut Session,
+) {
+    let job = root
+        .sign_job_request(session.next_job_id(), session.session_id(), "true", false)
+        .await;
+    mgr.job_start(
+        authn,
+        job.clone().into_signed(),
+        JobStartParams {
+            wait: JobWait::Stop,
+            ..Default::default()
+        },
+    )
+    .await
+    .unwrap();
+    session.job_started(job.into_signed());
 }
 
 /// Build a session id and the start body carrying its parts: like
