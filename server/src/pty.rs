@@ -21,7 +21,7 @@ use rustix::pty::{OpenptFlags, grantpt, openpt, ptsname, unlockpt};
 use rustix::termios::{tcgetwinsize, tcsetwinsize};
 
 use tokio::io::unix::AsyncFd;
-use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
+use tokio::io::{AsyncRead, AsyncWrite, Interest, ReadBuf};
 
 use sush_common::interactive::WindowSize;
 
@@ -55,9 +55,9 @@ pub fn open_pty() -> io::Result<(PtyReader, PtyWriter, OwnedFd, PathBuf)> {
         }
     }
 
-    let dup = AsyncFd::new(pty.try_clone()?)?;
-    let fd = AsyncFd::new(pty)?;
-    Ok((PtyReader(fd), PtyWriter(dup), pts, pts_path))
+    let read_fd = AsyncFd::with_interest(pty.try_clone()?, Interest::READABLE)?;
+    let write_fd = AsyncFd::with_interest(pty, Interest::WRITABLE)?;
+    Ok((PtyReader(read_fd), PtyWriter(write_fd), pts, pts_path))
 }
 
 #[derive(Debug)]
