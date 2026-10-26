@@ -2,12 +2,53 @@
 // License, v. 2.0. If a copy of the MPL was not distributed with this
 // file, You can obtain one at https://mozilla.org/MPL/2.0/.
 
+use std::fmt::Arguments;
+use std::io::{self, ErrorKind, Write as _, stdout};
+use std::process::exit;
 use std::sync::{Arc, Mutex};
 
 use reqwest::header::AUTHORIZATION;
 use sush_common::authn::AuthnError;
 
 use crate::context::Authz;
+
+/// Like `print!`, but exit quietly if stdout is a closed pipe.
+#[macro_export]
+macro_rules! qprint {
+    ($($arg:tt)*) => {
+        $crate::quiet_print(::std::format_args!($($arg)*))
+    };
+}
+
+/// Like `println!`, but exit quietly if stdout is a closed pipe.
+#[macro_export]
+macro_rules! qprintln {
+    () => {
+        $crate::quiet_print(::std::format_args!("\n"))
+    };
+    ($($arg:tt)*) => {
+        $crate::quiet_print(::std::format_args!("{}\n", ::std::format_args!($($arg)*)))
+    };
+}
+
+#[doc(hidden)]
+pub fn quiet_print(args: Arguments<'_>) {
+    if let Err(error) = anstream::stdout().lock().write_fmt(args) {
+        if error.kind() == ErrorKind::BrokenPipe {
+            exit(0);
+        }
+        panic!("failed printing to stdout: {error}");
+    }
+}
+
+/// Write `bytes` to standard output (unaltered), but exit quietly if
+/// it is a closed pipe.
+pub fn quiet_write(bytes: &[u8]) -> io::Result<()> {
+    match stdout().lock().write_all(bytes) {
+        Err(error) if error.kind() == ErrorKind::BrokenPipe => exit(0),
+        result => result,
+    }
+}
 
 pub mod agent;
 pub mod cli;

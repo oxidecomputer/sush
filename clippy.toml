@@ -11,3 +11,23 @@ replacement = "sush_common::keys::SshPublicKey"
 path = "ssh_key::Signature"
 reason = "use wrapper instead"
 replacement = "sush_common::keys::Signature"
+
+[[disallowed-macros]]
+path = "std::print"
+reason = "panics on a closed pipe"
+replacement = "qprint"
+
+[[disallowed-macros]]
+path = "std::println"
+reason = "panics on a closed pipe"
+replacement = "qprintln"
+
+[[disallowed-macros]]
+path = "anstream::print"
+reason = "panics on a closed pipe"
+replacement = "qprint"
+
+[[disallowed-macros]]
+path = "anstream::println"
+reason = "panics on a closed pipe"
+replacement = "qprintln"
