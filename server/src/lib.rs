@@ -11,6 +11,8 @@ extern crate function_name;
 compile_error!("`test-support` must not be enabled for an embedded server");
 
 pub mod certs;
+#[cfg(target_os = "illumos")]
+pub mod contract;
 pub mod error;
 pub mod executor;
 pub mod format;
@@ -29,6 +31,7 @@ pub mod proxy;
 pub mod pty;
 pub mod rack;
 pub mod server;
+pub mod spawn;
 pub mod state;
 
 pub use error::JobError;

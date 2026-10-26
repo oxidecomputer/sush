@@ -33,7 +33,6 @@ use slog::{Logger, debug, error, info, warn};
 use sush_common::hash::Hasher;
 use tokio::fs::File;
 use tokio::io::{AsyncReadExt as _, AsyncSeekExt as _, AsyncWriteExt as _};
-use tokio::process::Child;
 use tokio::sync::mpsc;
 use tokio::task::{JoinError, JoinHandle};
 use tokio::time::{Duration, Instant, sleep, timeout};
@@ -49,9 +48,9 @@ use sush_common::jobs::{
 };
 use tokio_util::sync::CancellationToken;
 
-use crate::executor::{job_pgid, kill_job};
 use crate::io::JobIo;
 use crate::mux::WebSocketMux;
+use crate::spawn::JobChild;
 
 pub type SocketStream = WebSocketStream<WebsocketConnectionRaw>;
 pub type SocketSender = mpsc::Sender<(SocketStream, Access)>;
@@ -85,7 +84,7 @@ impl Job {
     pub fn start(
         log: Logger,
         limits: JobLimits,
-        child: Child,
+        child: JobChild,
         io: JobIo,
         stdout: File,
         stderr: File,
@@ -116,7 +115,7 @@ impl Job {
 async fn job(
     log: Logger,
     JobLimits { max_fsize, .. }: JobLimits,
-    mut child: Child,
+    mut child: JobChild,
     mut io: JobIo,
     mut stdout_file: File,
     mut stderr_file: File,
@@ -128,7 +127,6 @@ async fn job(
     let mut stderr_hasher = Hasher::new();
     let mut clients = WebSocketMux::new();
     let mut fatal = Option::<ProcessError>::None;
-    let pgid = job_pgid(&child);
     let mut killed = false;
     let mut kills = 0;
     let mut dead = false;
@@ -349,7 +347,7 @@ async fn job(
 
             // Stop job on cancellation signal: terminate first, then kill.
             _ = stop.cancelled(), if !killed => {
-                kill_job(&log, pgid, Signal::TERM);
+                kill_job(&log, &child, Signal::TERM);
                 kill_timeout.as_mut().reset(Instant::now() + KILL_GRACE);
                 killed = true;
             }
@@ -358,7 +356,7 @@ async fn job(
             // period, even if its leader is already dead.
             _ = &mut kill_timeout, if killed && kills < KILL_ATTEMPTS => {
                 warn!(log, "job survived SIGTERM grace period, upgrading to SIGKILL");
-                kill_job(&log, pgid, Signal::KILL);
+                kill_job(&log, &child, Signal::KILL);
                 kill_timeout.as_mut().reset(Instant::now() + KILL_GRACE);
                 kills += 1;
             }
@@ -427,11 +425,11 @@ async fn job(
     let exit_status = select! {
         status = child.wait() => status,
         _ = stop.cancelled(), if !killed => {
-            kill_job(&log, pgid, Signal::KILL);
+            kill_job(&log, &child, Signal::KILL);
             child.wait().await
         }
         _ = sleep(KILL_GRACE), if killed && !dead => {
-            kill_job(&log, pgid, Signal::KILL);
+            kill_job(&log, &child, Signal::KILL);
             child.wait().await
         }
     };
@@ -439,7 +437,7 @@ async fn job(
         Some(error) => Err(error),
         None => match exit_status {
             Ok(status) => process_exit(status),
-            Err(error) => Err(ProcessError::Interactive(error.to_string())),
+            Err(error) => Err(ProcessError::io("reaping job process", error)),
         },
     };
     info!(log, "job stopped");
@@ -487,6 +485,19 @@ async fn stream_output(
     .await;
 }
 
+/// Send a signal to every process in a job.
+fn kill_job(log: &Logger, child: &JobChild, signal: Signal) {
+    match child.kill(signal) {
+        Ok(()) => debug!(log, "signalled job processes"; "signal" => ?signal),
+        Err(error) if error.raw_os_error() == Some(libc::ESRCH) => {
+            debug!(log, "job processes are already dead")
+        }
+        Err(error) => {
+            error!(log, "unable to signal job"; "signal" => ?signal, "error" => %error)
+        }
+    }
+}
+
 fn process_exit(exit_status: ExitStatus) -> Result<i32, ProcessError> {
     if let Some(code) = exit_status.code() {
         Ok(code)
@@ -528,10 +539,9 @@ mod test {
     use slog::{Drain as _, o};
     use slog_term::{FullFormat, PlainSyncDecorator, TestStdoutWriter};
     use tempfile::NamedTempFile;
-    use tokio::process::Command;
 
     use crate::io::JobIo;
-    use crate::pty::open_pty;
+    use crate::spawn::{PosixSpawn, SpawnStdio};
 
     use super::*;
 
@@ -544,17 +554,20 @@ mod test {
             let decorator = PlainSyncDecorator::new(TestStdoutWriter);
             let drain = FullFormat::new(decorator).build().fuse();
             let log = Logger::root(drain, o!("test" => function_name!()));
-            let (pty, writer, pts, pts_path) = open_pty().unwrap();
+            let stop = CancellationToken::new();
+            let (io, stdio) = JobIo::open(JobMode::Interactive, stop.child_token()).unwrap();
+            let SpawnStdio::Terminal { path: pts_path, .. } = &stdio else {
+                panic!("interactive job has no terminal");
+            };
+            let pts_path = pts_path.clone();
             assert!(pts_path.starts_with("/dev/pts/"));
 
             let output_file = NamedTempFile::new().unwrap();
-            let child = Command::new("tty")
-                .stdin(pts.try_clone().unwrap())
-                .stdout(pts.try_clone().unwrap())
-                .spawn()
+            let mut posix_spawn = PosixSpawn::new().unwrap();
+            posix_spawn.stdio(stdio).unwrap();
+            let child = posix_spawn
+                .spawn("/usr/bin/tty", &["tty"], &[] as &[(&str, &str)])
                 .unwrap();
-            let stop = CancellationToken::new();
-            let io = JobIo::interactive(pty, writer, stop.child_token());
             let job = Job::start(
                 log,
                 JobLimits::default(),
