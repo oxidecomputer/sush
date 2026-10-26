@@ -1548,11 +1548,25 @@ async fn job_start(
         let sleds = start.await?.into_inner().sleds;
         ctx.job_started(&job, Some(&sleds), true);
         match job_attach(ctx, client, &job_id, &target).await {
-            Ok(()) | Err(CommandError::NotFound(_)) => {
-                job_status(ctx, client, &job_id, StatusDisplayStyle::Short).await?
+            Ok(()) => (),
+            Err(CommandError::NotFound(_)) => {
+                let output = JobOutput {
+                    job_id,
+                    binary: true,
+                    file: None,
+                    force: false,
+                    chunk_size: DEFAULT_CHUNK_SIZE,
+                    parallel: PARALLEL_CHUNKS,
+                };
+                if let Err(error) = job_output_from(ctx, client, &target, Stdout, output).await
+                    && !error.is_unfinished_job()
+                {
+                    let _ = ctx.job_error(error);
+                }
             }
             Err(error) => return Err(error),
         }
+        job_status(ctx, client, &job_id, StatusDisplayStyle::Short).await?
     } else if streaming {
         let Some(path) = file else {
             return Err(CommandError::StreamingNeedsFile);
@@ -2743,6 +2757,11 @@ impl CommandError {
             path: path.as_ref().to_owned(),
             error,
         }
+    }
+
+    /// Whether this error says the job has not yet finished.
+    pub fn is_unfinished_job(&self) -> bool {
+        matches!(self, Self::JobNotYetRunning(_) | Self::JobStillRunning(_))
     }
 }
 
