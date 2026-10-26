@@ -1441,8 +1441,14 @@ async fn job(
                 },
                 TargetArg::Target(target) => resolve_target(client, target).await?,
             };
-            job_attach(ctx, client, &job_id, &target).await?;
-            Ok(())
+            match job_attach(ctx, client, &job_id, &target).await {
+                Err(CommandError::NotFound(_)) => {
+                    let error = attach_refused(ctx, client, &job_id, &target).await;
+                    let _ = ctx.job_error(error);
+                    Ok(())
+                }
+                result => result,
+            }
         }
 
         (JobCommand::History { limit, offset }, Some(client)) => {
@@ -2298,6 +2304,30 @@ async fn byte_stream_to_file(
     }
 }
 
+/// Explain, from the job's status on `target`, why an attach to
+/// `job_id` there found nothing to attach to.
+async fn attach_refused(
+    ctx: &mut impl CommandContext,
+    client: &Client,
+    job_id: &JobId,
+    target: &BaseboardId,
+) -> CommandError {
+    let status = match job_status_map(ctx, client, job_id, Some(target)).await {
+        Ok(status) => status,
+        Err(error) => return error,
+    };
+    match status.get(target) {
+        None => CommandError::JobNotOnSled(*job_id, target.clone()),
+        Some(JobStatus::Queued { .. }) => CommandError::JobNotYetRunning(*job_id),
+        Some(JobStatus::Started { .. }) => CommandError::JobNotInteractive(*job_id),
+        Some(JobStatus::Cancelled { .. }) => CommandError::JobCancelled(*job_id),
+        Some(JobStatus::Skipped { reason, .. }) => CommandError::JobSkipped(*job_id, *reason),
+        Some(JobStatus::Stopped { .. } | JobStatus::Error { .. }) => {
+            CommandError::JobFinished(*job_id)
+        }
+    }
+}
+
 /// Connect via WebSockets to a running interactive job.
 async fn job_attach(
     ctx: &mut impl CommandContext,
@@ -2589,6 +2619,12 @@ pub enum CommandError {
     JobCancelled(JobId),
     #[error("❌ Job `{0}` did not run")]
     JobDidNotRun(JobId),
+    #[error("❌ Job `{0}` has finished, try `job status` or `job output`")]
+    JobFinished(JobId),
+    #[error("❌ Job `{0}` is not interactive, try `job status` or `job output`")]
+    JobNotInteractive(JobId),
+    #[error("❌ Job `{0}` not found on sled `{1}`")]
+    JobNotOnSled(JobId, BaseboardId),
     #[error("❌ Job `{0}` is not yet running")]
     JobNotYetRunning(JobId),
     #[error("⏩ Job `{0}` was skipped on this sled: {1}")]
