@@ -17,6 +17,7 @@ use std::convert::Infallible;
 use std::io;
 use std::net::SocketAddr;
 use std::sync::Arc;
+use std::time::Duration;
 
 use camino::{Utf8Path, Utf8PathBuf};
 use http::header::CONTENT_TYPE;
@@ -42,6 +43,7 @@ use slog::{Logger, debug, error, info, o, warn};
 use tokio::io::{AsyncRead, AsyncWrite, copy_bidirectional};
 use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::watch;
+use tokio::time::timeout;
 use tokio::{select, spawn, try_join};
 use tokio_rustls::TlsAcceptor;
 use tokio_util::sync::CancellationToken;
@@ -51,6 +53,9 @@ use sush_common::version::VersionInfo;
 
 /// Server addresses by baseboard.
 pub type Sleds = BTreeMap<BaseboardId, SocketAddr>;
+
+/// How long to wait for a sled to accept a connection.
+const CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
 
 /// The sush servers the proxy may route to. The sled and cubby maps are
 /// discovered independently (by DDM and MGS, resp.), so each arrives on
@@ -371,7 +376,9 @@ async fn try_forward(
     addr: SocketAddr,
     mut request: Request<Incoming>,
 ) -> Result<Response<Incoming>, Box<dyn std::error::Error + Send + Sync>> {
-    let stream = TcpStream::connect(addr).await?;
+    let stream = timeout(CONNECT_TIMEOUT, TcpStream::connect(addr))
+        .await
+        .map_err(|_| format!("no answer within {}s", CONNECT_TIMEOUT.as_secs()))??;
     let (mut sender, conn) = client_conn::handshake(TokioIo::new(stream)).await?;
     spawn({
         let log = log.clone();
