@@ -102,6 +102,7 @@ const MAX_PARALLEL_CHUNKS: NonZeroU8 = NonZeroU8::new(64).unwrap();
 
 // Job polling and spinner update intervals.
 const JOB_STOP_RETRY_INTERVAL: Duration = Duration::from_millis(100);
+
 #[cfg(feature = "permslip")]
 const SIGNING_UPDATE_INTERVAL: Duration = Duration::from_millis(100);
 
@@ -1600,8 +1601,22 @@ async fn job_start(
         let mut settling = Settling::default();
         let mut started = false;
         let mut stalled = false;
+        let mut stopping = false;
         let mut stopped = false;
         let mut sigint = signal(SignalKind::interrupt())?;
+        let mut stop_ctx = ctx.clone();
+        let via = job_target.single_baseboard();
+        let stop = async {
+            // A stop can race the start, so retry it a few times.
+            for _ in 0..3 {
+                match job_stop(&mut stop_ctx, client, &job_id, via).await {
+                    Err(CommandError::NotFound(_)) => sleep(JOB_STOP_RETRY_INTERVAL).await,
+                    result => return result.map(|()| true),
+                }
+            }
+            Ok(false)
+        };
+        pin!(stop);
         let status = loop {
             select! {
                 // Wait for the start request to finish.
@@ -1646,32 +1661,25 @@ async fn job_start(
                     }
                 }
 
-                // While the job runs, an interrupt stops it but keeps
-                // watching: the start future must still resolve, and the
-                // stops are worth seeing. There is a race with the start,
-                // so retry the stop a few times if needed. Once the job
-                // has stopped, or after a first interrupt, an interrupt
-                // just ends the watch.
+                // While the job runs, a first interrupt stops it and keeps
+                // watching; a second ends the watch.
                 _ = sigint.recv() => {
-                    if started || stopped {
+                    if started || stopping {
                         break last;
                     }
-                    for _ in 0..3 {
-                        match job_stop(ctx, client, &job_id, job_target.single_baseboard()).await {
-                            Ok(_) => {
-                                ctx.job_stopped(&job_id);
-                                stopped = true;
-                                break;
-                            }
-                            Err(CommandError::NotFound(_)) => {
-                                sleep(JOB_STOP_RETRY_INTERVAL).await;
-                            }
-                            Err(error) => {
-                                ctx.job_watch_finished(&job_id);
-                                return Err(error);
-                            }
+                    stopping = true;
+                }
+
+                stop_result = &mut stop, if stopping && !stopped => {
+                    match stop_result {
+                        Ok(true) => ctx.job_stopped(&job_id),
+                        Ok(false) => (),
+                        Err(error) => {
+                            ctx.job_watch_finished(&job_id);
+                            return Err(error);
                         }
                     }
+                    stopped = true;
                 }
             }
         };
