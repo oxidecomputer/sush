@@ -36,6 +36,7 @@ use rustls::pki_types::{CertificateDer, PrivateKeyDer};
 use rustls::server::{ClientHello, ResolvesServerCert};
 use rustls::sign::CertifiedKey;
 use rustls::version::TLS13;
+use serde_json::json;
 use sled_hardware_types::BaseboardId;
 use slog::{Logger, debug, error, info, o, warn};
 use tokio::io::{AsyncRead, AsyncWrite, copy_bidirectional};
@@ -197,12 +198,12 @@ impl Router {
             Some(Ok(target)) => self.targets.resolve(&target).ok_or_else(|| {
                 Box::new(error_response(
                     StatusCode::BAD_GATEWAY,
-                    format!("no route to target `{target}`"),
+                    format!("No reachable sled matches `{target}`"),
                 ))
             }),
             Some(Err(bad)) => Err(Box::new(error_response(
                 StatusCode::BAD_REQUEST,
-                format!("unable to parse target `{bad}`"),
+                format!("Invalid target `{bad}`"),
             ))),
             None => {
                 let sleds = self.targets.sleds.borrow();
@@ -210,14 +211,14 @@ impl Router {
                     Some(home) => sleds.get(home).copied().ok_or_else(|| {
                         Box::new(error_response(
                             StatusCode::SERVICE_UNAVAILABLE,
-                            format!("home sled `{home}` unknown to the proxy"),
+                            format!("The proxy's own sled `{home}` is not reachable"),
                         ))
                     }),
                     None => match sleds.iter().next() {
                         Some((_, addr)) => Ok(*addr),
                         None => Err(Box::new(error_response(
                             StatusCode::SERVICE_UNAVAILABLE,
-                            "no sleds known to the proxy",
+                            "No sleds are reachable",
                         ))),
                     },
                 }
@@ -358,7 +359,7 @@ async fn forward(log: Logger, addr: SocketAddr, request: Request<Incoming>) -> R
         Ok(response) => response.map(Either::Left),
         Err(err) => error_response(
             StatusCode::BAD_GATEWAY,
-            format!("unable to reach sled at `{addr}`: {err}"),
+            format!("Unable to reach sled at `{addr}`: {err}"),
         ),
     }
 }
@@ -408,10 +409,12 @@ async fn bridge(log: Logger, client: OnUpgrade, sled: OnUpgrade) {
     }
 }
 
-fn error_response(status: StatusCode, message: impl Into<Bytes>) -> Response<ProxyBody> {
+fn error_response(status: StatusCode, message: impl Into<String>) -> Response<ProxyBody> {
+    let body = json!({ "request_id": "", "message": message.into() });
     Response::builder()
         .status(status)
-        .body(Either::Right(Full::new(message.into())))
+        .header(CONTENT_TYPE, "application/json")
+        .body(Either::Right(Full::new(body.to_string().into())))
         .expect("error response should build")
 }
 
@@ -425,6 +428,19 @@ mod test {
 
     fn target(s: &str) -> Target {
         s.parse().unwrap()
+    }
+
+    /// Check that proxy errors carry the fields clients require.
+    #[tokio::test]
+    async fn error_body() {
+        use http_body_util::BodyExt as _;
+
+        let response = error_response(StatusCode::BAD_GATEWAY, "no route");
+        assert_eq!(response.headers()[CONTENT_TYPE], "application/json");
+        let body = response.into_body().collect().await.unwrap().to_bytes();
+        let body: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(body["message"], "no route");
+        assert_eq!(body["request_id"], "");
     }
 
     /// Unrouted requests go to the home sled, or fail while the
