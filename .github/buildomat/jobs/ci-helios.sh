@@ -1,7 +1,7 @@
 #!/bin/bash
 #: name = "Build Helios client / CI"
 #: variety = "basic"
-#: target = "helios-2.0"
+#: target = "helios-3.0"
 #: rust_toolchain = true
 #: output_rules = ["=/work/sush"]
 #: access_repos = ["oxidecomputer/permission-slip"]
@@ -15,6 +15,7 @@ set -o errexit
 set -o pipefail
 set -o xtrace
 
+uname -v
 cargo --version
 rustc --version
 
