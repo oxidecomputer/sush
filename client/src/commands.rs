@@ -617,11 +617,10 @@ pub enum JobCommand {
         job_id: JobId,
     },
 
-    /// Decline a job, burning its ID and advancing the session.
+    /// Decline to run a job, burning its ID and advancing the session.
     Skip {
-        /// The job to skip.
-        #[clap(env = SUSH_JOB_ID)]
-        job_id: JobId,
+        /// The job to skip. By default, the next job in the current session.
+        job_id: Option<JobId>,
     },
 
     /// Get the status of a started job.
@@ -1368,7 +1367,13 @@ async fn job(
             };
             if let Some(client) = client {
                 ctx.job_signed(&job, false);
-                job_start(ctx, client, job, start_args.to_owned()).await
+                let job_id = *job.job_id();
+                match job_start(ctx, client, job, start_args.to_owned()).await {
+                    Err(error) if ctx.next_job_id().ok() == Some(job_id) => {
+                        Err(CommandError::JobNotStarted(job_id, Box::new(error)))
+                    }
+                    result => result,
+                }
             } else {
                 ctx.job_signed(&job, true);
                 ctx.job_started(&job, None, false);
@@ -1387,6 +1392,10 @@ async fn job(
         (JobCommand::Skip { job_id }, client) => {
             let Some(session_id) = ctx.session_id() else {
                 return Err(CommandError::MissingSession);
+            };
+            let job_id = match job_id {
+                Some(job_id) => job_id,
+                None => ctx.next_job_id()?,
             };
             if let Some(client) = client {
                 with_login(ctx, client, async || {
@@ -2633,6 +2642,8 @@ pub enum CommandError {
     JobNotInteractive(JobId),
     #[error("❌ Job `{0}` not found on sled `{1}`")]
     JobNotOnSled(JobId, BaseboardId),
+    #[error("{1}\n❗ Job `{0}` was signed but not started, try `job skip`")]
+    JobNotStarted(JobId, Box<CommandError>),
     #[error("❌ Job `{0}` is not yet running")]
     JobNotYetRunning(JobId),
     #[error("⏩ Job `{0}` was skipped on this sled: {1}")]
