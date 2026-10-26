@@ -62,6 +62,9 @@ tokio-util.workspace = true
 tokio-tungstenite.workspace = true
 x509-cert.workspace = true
 
+[target.'cfg(target_os = "illumos")'.dependencies]
+libcontract-sys.workspace = true
+
 [dev-dependencies]
 attest-mock.workspace = true
 ciborium.workspace = true
