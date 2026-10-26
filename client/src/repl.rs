@@ -197,11 +197,11 @@ impl CommandContext for Repl {
                 if let Some(arg) = $arg {
                     unsafe { env::set_var($var, arg.to_string()) }
                     args.$arg = Some(arg.clone());
-                    println!("✅ {} set to `{}`", $name, arg);
+                    qprintln!("✅ {} set to `{}`", $name, arg);
                 } else {
                     unsafe { env::remove_var($var) }
                     args.$arg = None;
-                    println!("✅ {} unset", $name);
+                    qprintln!("✅ {} unset", $name);
                 }
             }};
         }

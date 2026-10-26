@@ -7,13 +7,12 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
 use std::fs;
-use std::io::{self, BufRead as _, ErrorKind, Read as _, Write as _, stderr, stdin, stdout};
+use std::io::{self, BufRead as _, ErrorKind, Read as _, Write as _, stderr, stdin};
 use std::os::unix::fs::OpenOptionsExt as _;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, SystemTime};
 
-use anstream::print;
 use anstyle::{AnsiColor, Style};
 use atomicwrites::{AtomicFile, OverwriteBehavior};
 use bytesize::ByteSize;
@@ -38,9 +37,9 @@ use sush_common::keys::{KeyId, Signature, SshPublicKey};
 use sush_common::targets::{MAX_CUBBY, SledHealth, SledId, SledVersion, Target};
 use sush_common::version::VersionInfo;
 
-use crate::AuthzSigner;
 use crate::commands::{CommandError, GlobalArgs};
 use crate::context::{CommandContext, OutputFormat, StatusDisplayStyle};
+use crate::{AuthzSigner, quiet_write};
 
 pub(crate) const PREFIX: &str = "sush";
 const SESSION_FILE_NAME: &str = "session.json";
@@ -248,17 +247,17 @@ impl CommandContext for Cli {
         sleds: &[SledVersion],
     ) {
         match self.get_output_format() {
-            OutputFormat::Json => println!(
+            OutputFormat::Json => qprintln!(
                 "{}",
                 json!({"client": client, "server": server, "sleds": sleds})
             ),
             OutputFormat::Text => {
-                println!("Client:\t{client}");
+                qprintln!("Client:\t{client}");
                 if let Some(server) = server {
-                    println!("Server:\t{server}");
+                    qprintln!("Server:\t{server}");
                 }
                 if !sleds.is_empty() {
-                    print!("{}", draw_rack(sleds));
+                    qprint!("{}", draw_rack(sleds));
                 }
             }
         }
@@ -319,7 +318,7 @@ impl CommandContext for Cli {
         sush_nonce: SessionSushNonce,
     ) {
         match self.get_output_format() {
-            OutputFormat::Json => println!(
+            OutputFormat::Json => qprintln!(
                 "{}",
                 json!({
                     "baseboard_id": &baseboard_id.to_string(),
@@ -328,16 +327,16 @@ impl CommandContext for Cli {
                 })
             ),
             OutputFormat::Text => {
-                println!("✅ Please relay these parameters to support:");
-                println!("   Baseboard ID: {baseboard_id}");
-                println!("   Sush nonce:   {sush_nonce}");
+                qprintln!("✅ Please relay these parameters to support:");
+                qprintln!("   Baseboard ID: {baseboard_id}");
+                qprintln!("   Sush nonce:   {sush_nonce}");
             }
         }
     }
 
     fn job_start_params(&self, request: &JobStartRequest) {
         match self.get_output_format() {
-            OutputFormat::Json => println!(
+            OutputFormat::Json => qprintln!(
                 "{}",
                 json!({
                     "job_id": &request.job_id,
@@ -348,12 +347,12 @@ impl CommandContext for Cli {
                 })
             ),
             OutputFormat::Text => {
-                println!("✅ Please request a job with these parameters from support:");
-                println!("   Job ID:     {}", request.job_id);
-                println!("   Session ID: {}", request.session_id);
-                println!("   Command:    {}", request.command);
-                println!("   Mode:       {}", request.mode.as_str());
-                println!("   Target:     {}", request.target);
+                qprintln!("✅ Please request a job with these parameters from support:");
+                qprintln!("   Job ID:     {}", request.job_id);
+                qprintln!("   Session ID: {}", request.session_id);
+                qprintln!("   Command:    {}", request.command);
+                qprintln!("   Mode:       {}", request.mode.as_str());
+                qprintln!("   Target:     {}", request.target);
             }
         }
     }
@@ -366,14 +365,14 @@ impl CommandContext for Cli {
     ) {
         let session_id = self.adopt_session(session, true);
         match self.get_output_format() {
-            OutputFormat::Json => println!(
+            OutputFormat::Json => qprintln!(
                 "{}",
                 json!({"session_created": session_id, "signer_nonce": signer_nonce, "seq": seq})
             ),
             OutputFormat::Text => {
-                println!("✅ Session is now `{session_id}`");
-                println!("   Signer nonce:    {signer_nonce}");
-                println!("   Sequence number: {seq}");
+                qprintln!("✅ Session is now `{session_id}`");
+                qprintln!("   Signer nonce:    {signer_nonce}");
+                qprintln!("   Sequence number: {seq}");
             }
         }
     }
@@ -381,8 +380,8 @@ impl CommandContext for Cli {
     fn session_started(&mut self, session: Session, force: bool) {
         let session_id = self.adopt_session(session, force);
         match self.get_output_format() {
-            OutputFormat::Json => println!("{}", json!({"session_started": session_id})),
-            OutputFormat::Text => println!("✅ Session is now `{session_id}`"),
+            OutputFormat::Json => qprintln!("{}", json!({"session_started": session_id})),
+            OutputFormat::Text => qprintln!("✅ Session is now `{session_id}`"),
         }
     }
 
@@ -395,26 +394,26 @@ impl CommandContext for Cli {
             self.save_session(None);
         }
         match self.get_output_format() {
-            OutputFormat::Json => println!("{}", json!({"session_stopped": session_id})),
-            OutputFormat::Text => println!("✅ Stopped session `{session_id}`"),
+            OutputFormat::Json => qprintln!("{}", json!({"session_stopped": session_id})),
+            OutputFormat::Text => qprintln!("✅ Stopped session `{session_id}`"),
         }
     }
 
     fn attach_allowed(&mut self, key_id: &KeyId, access: Access) {
         match self.get_output_format() {
             OutputFormat::Json => {
-                println!("{}", json!({"attach_allowed": key_id, "access": access}))
+                qprintln!("{}", json!({"attach_allowed": key_id, "access": access}))
             }
             OutputFormat::Text => {
-                println!("✅ Allowed {} attach for `{key_id}`", access.as_str())
+                qprintln!("✅ Allowed {} attach for `{key_id}`", access.as_str())
             }
         }
     }
 
     fn attach_denied(&mut self, key_id: &KeyId) {
         match self.get_output_format() {
-            OutputFormat::Json => println!("{}", json!({"attach_denied": key_id})),
-            OutputFormat::Text => println!("✅ Denied attach for `{key_id}`"),
+            OutputFormat::Json => qprintln!("{}", json!({"attach_denied": key_id})),
+            OutputFormat::Text => qprintln!("✅ Denied attach for `{key_id}`"),
         }
     }
 
@@ -463,15 +462,15 @@ impl CommandContext for Cli {
         }
 
         match self.get_output_format() {
-            OutputFormat::Json => println!("{}", json!(certs)),
+            OutputFormat::Json => qprintln!("{}", json!(certs)),
             OutputFormat::Text => {
                 if roots.is_empty() {
-                    println!("✅ Verified chain consistency");
+                    qprintln!("✅ Verified chain consistency");
                 } else {
-                    println!("✅ Verified chain against supplied root");
+                    qprintln!("✅ Verified chain against supplied root");
                 }
                 for cert in &chain {
-                    println!("   {}", cert.tbs_certificate.subject);
+                    qprintln!("   {}", cert.tbs_certificate.subject);
                 }
             }
         }
@@ -491,14 +490,14 @@ impl CommandContext for Cli {
         }
         let job_id = job.job_id();
         match self.get_output_format() {
-            OutputFormat::Json => println!("{}", json!({"job_started": job_id, "sleds": sleds})),
+            OutputFormat::Json => qprintln!("{}", json!({"job_started": job_id, "sleds": sleds})),
             OutputFormat::Text => {
                 let watch = self.watch.lock().unwrap();
                 let print = |line: String| match watch.as_ref() {
                     Some(watch) => {
                         let _ = watch.multi.println(line);
                     }
-                    None => println!("{line}"),
+                    None => qprintln!("{line}"),
                 };
                 print(format!("✅ Started job `{job_id}`"));
                 if let (Target::Sleds(named), Some(sleds)) = (job.payload().target(), sleds) {
@@ -518,12 +517,12 @@ impl CommandContext for Cli {
 
     fn job_stopped(&mut self, job_id: &JobId) {
         match self.get_output_format() {
-            OutputFormat::Json => println!("{}", json!({"job_stopped": job_id})),
+            OutputFormat::Json => qprintln!("{}", json!({"job_stopped": job_id})),
             OutputFormat::Text => {
                 if let Some(watch) = self.watch.lock().unwrap().as_ref() {
                     let _ = watch.multi.println(format!("✅ Stopped job `{job_id}`"));
                 } else {
-                    println!("\r✅ Stopped job `{job_id}`");
+                    qprintln!("\r✅ Stopped job `{job_id}`");
                 }
             }
         }
@@ -538,8 +537,8 @@ impl CommandContext for Cli {
         if skipped {
             self.save_session(session_guard.as_ref());
             match self.get_output_format() {
-                OutputFormat::Json => println!("{}", json!({"job_skipped": job_id})),
-                OutputFormat::Text => println!("✅ Skipped job `{job_id}`"),
+                OutputFormat::Json => qprintln!("{}", json!({"job_skipped": job_id})),
+                OutputFormat::Text => qprintln!("✅ Skipped job `{job_id}`"),
             }
         }
         skipped
@@ -552,8 +551,8 @@ impl CommandContext for Cli {
 
     fn job_output_target(&mut self, target: &BaseboardId) {
         match self.get_output_format() {
-            OutputFormat::Json => println!("{}", json!({ "target": target.to_string() })),
-            OutputFormat::Text => println!(" » {target} «"),
+            OutputFormat::Json => qprintln!("{}", json!({ "target": target.to_string() })),
+            OutputFormat::Text => qprintln!(" » {target} «"),
         }
     }
 
@@ -565,24 +564,24 @@ impl CommandContext for Cli {
         binary: bool,
     ) {
         match self.get_output_format() {
-            OutputFormat::Json if binary => println!("{}", json!(output)),
-            OutputFormat::Json => println!("{}", json!(String::from_utf8_lossy(output))),
+            OutputFormat::Json if binary => qprintln!("{}", json!(output)),
+            OutputFormat::Json => qprintln!("{}", json!(String::from_utf8_lossy(output))),
             OutputFormat::Text if binary => {
-                if let Err(err) = stdout().write_all(output) {
+                if let Err(err) = quiet_write(output) {
                     eprintln!("{err}");
                 }
             }
             OutputFormat::Text if output.is_empty() => (),
             OutputFormat::Text => {
                 match stream {
-                    JobOutputStream::Stdout => println!("✅ Job stdout:"),
-                    JobOutputStream::Stderr => println!("✅ Job stderr:"),
+                    JobOutputStream::Stdout => qprintln!("✅ Job stdout:"),
+                    JobOutputStream::Stderr => qprintln!("✅ Job stderr:"),
                 };
                 let output = String::from_utf8_lossy(output);
                 if output.ends_with('\n') {
-                    print!("{output}");
+                    qprint!("{output}");
                 } else {
-                    println!("{output}");
+                    qprintln!("{output}");
                 }
             }
         }
@@ -648,7 +647,7 @@ impl CommandContext for Cli {
             if let Some(stage) = stage {
                 let length = ByteSize::b(progress.length().unwrap_or(progress.position()));
                 let elapsed = progress.elapsed();
-                println!(
+                qprintln!(
                     "{stage} {stream}:\t{} in {} ({:.0} MB/s)",
                     length.display().si(),
                     format_duration(progress.elapsed()),
@@ -727,17 +726,17 @@ impl CommandContext for Cli {
 
     fn job_attached(&mut self, job_id: &JobId) {
         match self.get_output_format() {
-            OutputFormat::Json => println!("{}", json!({"attached": job_id})),
+            OutputFormat::Json => qprintln!("{}", json!({"attached": job_id})),
             OutputFormat::Text => {
-                println!("✅ Attached to interactive job `{job_id}`, detach with `^]`")
+                qprintln!("✅ Attached to interactive job `{job_id}`, detach with `^]`")
             }
         }
     }
 
     fn job_detached(&mut self, job_id: &JobId) {
         match self.get_output_format() {
-            OutputFormat::Json => println!("{}", json!({"detached": job_id})),
-            OutputFormat::Text => println!("\r✅ Detached from interactive job `{job_id}`"),
+            OutputFormat::Json => qprintln!("{}", json!({"detached": job_id})),
+            OutputFormat::Text => qprintln!("\r✅ Detached from interactive job `{job_id}`"),
         }
     }
 
@@ -771,18 +770,18 @@ impl CommandContext for Cli {
             progress.finish_and_clear();
         }
         if matches!(self.get_output_format(), OutputFormat::Text) {
-            println!("✅ Signed request for job `{job_id}`");
+            qprintln!("✅ Signed request for job `{job_id}`");
         }
     }
 
     fn job_signed(&mut self, job: &SignedJob, show: bool) {
         if show {
             match self.get_output_format() {
-                OutputFormat::Json => println!(
+                OutputFormat::Json => qprintln!(
                     "{}",
                     to_json_string(&job).expect("job should be JSON-serializable")
                 ),
-                OutputFormat::Text => println!(
+                OutputFormat::Text => qprintln!(
                     "{}",
                     to_json_string_pretty(&job).expect("job should be JSON-serializable")
                 ),
@@ -792,7 +791,7 @@ impl CommandContext for Cli {
 
     fn job_status(&mut self, job_id: &JobId, status: &JobStatusMap, style: StatusDisplayStyle) {
         match self.get_output_format() {
-            OutputFormat::Json => println!("{}", json!(job_status_to_json_map(status.clone()))),
+            OutputFormat::Json => qprintln!("{}", json!(job_status_to_json_map(status.clone()))),
             OutputFormat::Text if matches!(style, StatusDisplayStyle::Short) => {
                 let icon = if status.values().any(|s| {
                     matches!(
@@ -811,10 +810,10 @@ impl CommandContext for Cli {
                     .map(|b| b.to_string().len())
                     .max()
                     .unwrap_or(0);
-                println!("{icon} Job ID:\t{job_id}");
+                qprintln!("{icon} Job ID:\t{job_id}");
                 for (baseboard_id, status) in status {
                     let id = baseboard_id.to_string();
-                    println!("   {id:<width$}  {}", short_status_row(status));
+                    qprintln!("   {id:<width$}  {}", short_status_row(status));
                 }
             }
             OutputFormat::Text => {
@@ -825,7 +824,7 @@ impl CommandContext for Cli {
                             time_cancelled,
                             actor,
                         } => {
-                            println!(
+                            qprintln!(
                                 "❌ Job ID:\t{job_id}\n   \
                                     Target:\t{baseboard_id}\n   \
                                     Job status:\tCancelled\n   \
@@ -838,7 +837,7 @@ impl CommandContext for Cli {
                             time_queued,
                             actor,
                         } => {
-                            println!(
+                            qprintln!(
                                 "⏳ Job ID:\t{job_id}\n   \
                                     Target:\t{baseboard_id}\n   \
                                     Job status:\tQueued\n   \
@@ -850,7 +849,7 @@ impl CommandContext for Cli {
                             job_id,
                             time_started,
                         } => {
-                            println!(
+                            qprintln!(
                                 "✅ Job ID:\t{job_id}\n   \
                                     Target:\t{baseboard_id}\n   \
                                     Job status:\tStarted\n   \
@@ -873,7 +872,7 @@ impl CommandContext for Cli {
                             let duration = format_elapsed_duration(status.time_elapsed());
                             let stdout_len = byte_size(*stdout_len);
                             let stderr_len = byte_size(*stderr_len);
-                            println!(
+                            qprintln!(
                                 "✅ Job ID:\t{job_id}\n   \
                                     Target:\t{baseboard_id}\n   \
                                     Job status:\tStopped\n   \
@@ -902,7 +901,7 @@ impl CommandContext for Cli {
                             let duration = format_elapsed_duration(status.time_elapsed());
                             let stdout_len = byte_size(*stdout_len);
                             let stderr_len = byte_size(*stderr_len);
-                            println!(
+                            qprintln!(
                                 "✅ Job ID:\t{job_id}\n   \
                                     Target:\t{baseboard_id}\n   \
                                     Job status:\t{err}\n   \
@@ -919,7 +918,7 @@ impl CommandContext for Cli {
                             time_error,
                             error,
                         } => {
-                            println!(
+                            qprintln!(
                                 "❌ Job ID:\t{job_id}\n   \
                                     Target:\t{baseboard_id}\n   \
                                     Job status:\tError\n   \
@@ -932,7 +931,7 @@ impl CommandContext for Cli {
                             time_skipped,
                             reason,
                         } => {
-                            println!(
+                            qprintln!(
                                 "⏩ Job ID:\t{job_id}\n   \
                                     Target:\t{baseboard_id}\n   \
                                     Job status:\tSkipped\n   \
@@ -958,7 +957,7 @@ impl CommandContext for Cli {
 
     fn iam(&mut self, identity: &Identity) -> Result<(), CommandError> {
         match self.get_output_format() {
-            OutputFormat::Json => println!("{}", to_json_string(identity)?),
+            OutputFormat::Json => qprintln!("{}", to_json_string(identity)?),
             OutputFormat::Text => {
                 let Identity {
                     key_id,
@@ -969,7 +968,7 @@ impl CommandContext for Cli {
                 let fingerprint = public_key.fingerprint();
                 let algorithm = public_key.algorithm();
                 let comment = public_key.comment();
-                println!(
+                qprintln!(
                     "✅ Key ID:\t{key_id}\n   \
                         Fingerprint:\t{fingerprint}\n   \
                         Algorithm:\t{algorithm}\n   \
@@ -986,8 +985,8 @@ impl CommandContext for Cli {
         let n = keys.len();
         if n == 0 {
             match self.get_output_format() {
-                OutputFormat::Json => println!("[]"),
-                OutputFormat::Text => println!("❌ No SSH identities found"),
+                OutputFormat::Json => qprintln!("[]"),
+                OutputFormat::Text => qprintln!("❌ No SSH identities found"),
             }
         } else {
             for key in keys {
@@ -996,7 +995,7 @@ impl CommandContext for Cli {
                 let algorithm = key.algorithm();
                 let comment = key.comment();
                 match self.get_output_format() {
-                    OutputFormat::Json => println!(
+                    OutputFormat::Json => qprintln!(
                         "{}",
                         json!({
                             "key_id": key_id,
@@ -1006,7 +1005,7 @@ impl CommandContext for Cli {
                         })
                     ),
                     OutputFormat::Text => {
-                        println!(
+                        qprintln!(
                             "✅ Key ID:\t{key_id}\n   \
                                 Fingerprint:\t{fingerprint}\n   \
                                 Algorithm:\t{algorithm}\n   \
