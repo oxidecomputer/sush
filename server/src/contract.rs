@@ -14,13 +14,11 @@
 //! login session, in OpenSSH's `openbsd-compat/port-solaris.c`.
 
 use std::ffi::{CString, c_char, c_int, c_uint};
-use std::fs::File;
+use std::fs::{File, OpenOptions};
 use std::io;
 use std::os::fd::AsRawFd as _;
 
 use libc::ctid_t;
-use rustix::fs::{Mode, OFlags};
-use rustix::io::{Errno, FdFlags, fcntl_setfd};
 use rustix::process::Signal;
 
 use sush_common::jobs::JobId;
@@ -60,17 +58,11 @@ const CTD_COMMON: c_int = 0;
 
 const PROCESS: &str = "/system/contract/process";
 
-/// Open a ctfs file, naming it in any error. Until illumos 18395, ctfs
-/// refuses opens with `O_CLOEXEC`, which `std::fs` always sets, so we
-/// open without it and set `FD_CLOEXEC` afterward.
-fn open(flags: OFlags, path: String) -> io::Result<File> {
-    let named = |error: Errno| {
-        let error = io::Error::from(error);
-        io::Error::new(error.kind(), format!("opening {path}: {error}"))
-    };
-    let fd = rustix::fs::open(&path, flags, Mode::empty()).map_err(named)?;
-    fcntl_setfd(&fd, FdFlags::CLOEXEC).map_err(named)?;
-    Ok(File::from(fd))
+/// Open a ctfs file, naming it in any error.
+fn open(options: &OpenOptions, path: String) -> io::Result<File> {
+    options
+        .open(&path)
+        .map_err(|error| io::Error::new(error.kind(), format!("opening {path}: {error}")))
 }
 
 /// Send `signal` to every process in contract `ctid`.
@@ -107,7 +99,10 @@ impl Template {
     /// As in sshd, a hardware error kills only the process group of the
     /// process it struck. The contract is labeled by job ID.
     fn activate(job_id: &JobId) -> io::Result<Self> {
-        let file = open(OFlags::RDWR, format!("{PROCESS}/template"))?;
+        let file = open(
+            OpenOptions::new().read(true).write(true),
+            format!("{PROCESS}/template"),
+        )?;
         let fd = file.as_raw_fd();
         let aux = CString::new(format!("sush job {job_id}")).map_err(io::Error::other)?;
         unsafe {
@@ -130,7 +125,7 @@ impl Template {
     /// Abandon the newest contract this thread created, and return its
     /// ID.
     fn abandon_latest(self) -> io::Result<ctid_t> {
-        let latest = open(OFlags::RDONLY, format!("{PROCESS}/latest"))?;
+        let latest = open(OpenOptions::new().read(true), format!("{PROCESS}/latest"))?;
         let ctid = unsafe {
             let mut status: ct_stathdl_t = std::ptr::null_mut();
             check_errno(
@@ -141,7 +136,10 @@ impl Template {
             ct_status_free(status);
             ctid
         };
-        let ctl = open(OFlags::WRONLY, format!("{PROCESS}/{ctid}/ctl"))?;
+        let ctl = open(
+            OpenOptions::new().write(true),
+            format!("{PROCESS}/{ctid}/ctl"),
+        )?;
         check_errno("abandoning contract", unsafe {
             ct_ctl_abandon(ctl.as_raw_fd())
         })?;
