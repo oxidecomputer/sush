@@ -17,6 +17,7 @@ use lru::LruCache;
 use sled_hardware_types::BaseboardId;
 use slog::{Logger, debug, info, o, warn};
 use tokio::fs::read;
+use tokio::select;
 use tokio::sync::{Mutex, mpsc, watch};
 use tokio::task::JoinHandle;
 use tokio::time::timeout;
@@ -36,7 +37,7 @@ use sush_common::jobs::{
     SignedJob,
 };
 use sush_common::keys::{KeyError, KeyId, SshPublicKey};
-use sush_common::targets::{Cubbies, SledHealth, SledVersion};
+use sush_common::targets::{Cubbies, SledHealth, SledVersion, Target, UnknownCubby};
 use sush_common::version::LONG_VERSION;
 
 use crate::error::JobError;
@@ -399,18 +400,39 @@ impl JobManager {
         self.join_state.take()
     }
 
-    fn wait_for_job(&self, job_id: &JobId, wait: JobWait) -> impl FnMut(&State) -> bool {
-        move |state| {
-            if wait.is_some() {
-                state
-                    .get_job_status(job_id)
-                    .and_then(|map| map.get(self.own_baseboard()))
-                    .map(|status| wait.matches_status(status))
-                    .unwrap_or(false)
-            } else {
-                true
-            }
+    /// Wait until the job's status matches `wait` on each of `sleds`
+    /// that this sled still links to.
+    async fn wait_for_job(
+        &self,
+        job_id: &JobId,
+        wait: JobWait,
+        sleds: BTreeSet<BaseboardId>,
+    ) -> Result<(), JobError> {
+        if !wait.is_some() {
+            return Ok(());
         }
+        let settled = |state: &State, linked: &BTreeSet<BaseboardId>| {
+            let statuses = state.get_job_status(job_id);
+            sleds.iter().all(|sled| {
+                let gone = *sled != self.own_baseboard && !linked.contains(sled);
+                gone || statuses
+                    .and_then(|map| map.get(sled))
+                    .is_some_and(|status| wait.matches_status(status))
+            })
+        };
+        let mut state = self.state.clone();
+        let mut linked = self.linked.clone();
+        timeout(WAIT_TIMEOUT, async {
+            while !settled(&state.borrow_and_update(), &linked.borrow_and_update()) {
+                select! {
+                    changed = state.changed() => changed.map_err(JobError::closed)?,
+                    () = linked.changed() => (),
+                }
+            }
+            Ok(())
+        })
+        .await
+        .map_err(|_| JobError::Timeout)?
     }
 
     async fn wait_for(&self, predicate: impl FnMut(&State) -> bool) -> Result<(), JobError> {
@@ -597,12 +619,15 @@ impl JobManager {
 
     // Job management.
 
+    /// Start `job` on the sleds its target names that this sled can
+    /// reach, wait until the job's status matches `params.wait` on all
+    /// of them, and return them.
     pub async fn job_start(
         &self,
         authn: &Identity,
         job: SignedJob,
         params: JobStartParams,
-    ) -> Result<(), JobError> {
+    ) -> Result<BTreeSet<BaseboardId>, JobError> {
         // A forged job must not take a signed job's place in the chain.
         self.state
             .borrow()
@@ -628,10 +653,26 @@ impl JobManager {
         }
 
         // Submit the job for execution.
+        let sleds = self.reachable_targets(payload.target())?;
         let wait = params.wait.to_owned();
-        self.job_request(authn, JobRequest::Start(job, params))
+        self.job_request(authn, JobRequest::Start(job, params, sleds.clone()))
             .await?;
-        self.wait_for(self.wait_for_job(&job_id, wait)).await
+        self.wait_for_job(&job_id, wait, sleds.clone()).await?;
+        Ok(sleds)
+    }
+
+    /// The sleds `target` names that this sled can reach: itself and
+    /// the sleds it holds live gossip links to.
+    fn reachable_targets(&self, target: &Target) -> Result<BTreeSet<BaseboardId>, JobError> {
+        let mut reachable = self.linked.borrow().clone();
+        reachable.insert(self.own_baseboard.clone());
+        let sleds = target
+            .resolve(&reachable, self.state.borrow().rack().cubbies())
+            .map_err(|UnknownCubby(cubby)| JobError::UnknownCubby(cubby))?;
+        if sleds.is_empty() {
+            return Err(JobError::NoReachableTarget);
+        }
+        Ok(sleds)
     }
 
     pub async fn job_stop(
@@ -644,7 +685,13 @@ impl JobManager {
         self.known_job_check(job_id)?;
         self.job_request(authn, JobRequest::Stop(job_id.to_owned()))
             .await?;
-        self.wait_for(self.wait_for_job(job_id, wait)).await
+        let sleds = self
+            .state
+            .borrow()
+            .get_job_status(job_id)
+            .map(|statuses| statuses.keys().cloned().collect())
+            .unwrap_or_default();
+        self.wait_for_job(job_id, wait, sleds).await
     }
 
     pub async fn job_status(

@@ -4,6 +4,7 @@
 
 //! Job manager tests.
 
+use std::collections::BTreeSet;
 use std::mem::MaybeUninit;
 use std::os::unix::fs::PermissionsExt as _;
 use std::path::Path;
@@ -1014,10 +1015,11 @@ async fn job_output_perms() {
     assert_eq!(mode(&out.job_output_path(&job_id, Stderr)).await, 0o600);
 }
 
+/// A cubby resolves through the rack's cubby map when a job is
+/// accepted.
 #[named]
 #[tokio::test]
 async fn cubby_targets() {
-    // A cubby target only matches through the rack's cubby map.
     let log = test_logger(function_name!());
     let dir = TempDir::with_prefix("sush-").unwrap();
     let mut root = ephemeral_test_root();
@@ -1049,74 +1051,40 @@ async fn cubby_targets() {
         .await
         .unwrap();
     let target: Target = "14".parse().unwrap();
-
-    // With the map empty, a cubby-targeted job records no status here.
-    // The all-target job behind it in the session's job chain proves
-    // it was processed, not merely still queued.
-    let skipped_id = session.next_job_id();
-    let job = root
-        .sign_job_request_for(skipped_id, session_id, "true", false, target.clone())
-        .await;
-    mgr.job_start(&authn, job.clone().into_signed(), JobStartParams::default())
-        .await
-        .unwrap();
-    session.job_started(job.into_signed());
-    let job_id = session.next_job_id();
-    let job = root
-        .sign_job_request(job_id, session_id, "true", false)
-        .await;
-    mgr.job_start(
-        &authn,
-        job.clone().into_signed(),
-        JobStartParams {
-            wait: JobWait::Stop,
-            ..Default::default()
-        },
-    )
-    .await
-    .unwrap();
-    session.job_started(job.into_signed());
-    assert!(matches!(
-        mgr.job_status(&authn, &skipped_id).await.unwrap_err(),
-        JobError::JobNotFound(jid) if jid == skipped_id
-    ));
-
-    // Name this baseboard in the map. The update lands whenever the
-    // state task gets to it, so probe with fresh jobs until one takes.
-    cubbies
-        .send(Cubbies::from([(14, test_baseboard_id())]))
-        .unwrap();
-    loop {
-        let job_id = session.next_job_id();
-        let job = root
-            .sign_job_request_for(job_id, session_id, "true", false, target.clone())
-            .await;
-        mgr.job_start(&authn, job.clone().into_signed(), JobStartParams::default())
-            .await
-            .unwrap();
-        session.job_started(job.into_signed());
-        sleep(Duration::from_millis(50)).await;
-        if mgr.job_status(&authn, &job_id).await.is_ok() {
-            break;
-        }
-    }
-
-    // Now cubby-targeted jobs run here.
     let job_id = session.next_job_id();
     let job = root
         .sign_job_request_for(job_id, session_id, "true", false, target)
         .await;
-    mgr.job_start(
-        &authn,
-        job.clone().into_signed(),
-        JobStartParams {
-            wait: JobWait::Stop,
-            ..Default::default()
-        },
-    )
-    .await
-    .unwrap();
+    let wait = JobStartParams {
+        wait: JobWait::Stop,
+        ..Default::default()
+    };
+
+    // With the map empty, no known sled occupies the cubby, so the
+    // job is refused.
+    assert!(matches!(
+        mgr.job_start(&authn, job.clone().into_signed(), wait.clone())
+            .await,
+        Err(JobError::UnknownCubby(14)),
+    ));
+
+    // Name this baseboard in the map. The update lands whenever the
+    // state task gets to it, so retry the job until it is accepted.
+    cubbies
+        .send(Cubbies::from([(14, test_baseboard_id())]))
+        .unwrap();
+    let sleds = loop {
+        match mgr
+            .job_start(&authn, job.clone().into_signed(), wait.clone())
+            .await
+        {
+            Ok(sleds) => break sleds,
+            Err(JobError::UnknownCubby(14)) => sleep(Duration::from_millis(50)).await,
+            Err(error) => panic!("job start failed: {error}"),
+        }
+    };
     session.job_started(job.into_signed());
+    assert_eq!(sleds, BTreeSet::from([test_baseboard_id()]));
     let status = mgr.job_status(&authn, &job_id).await.unwrap()[mgr.own_baseboard()].clone();
     check_status_stopped(status, &job_id, Ok(0), Some(0), Some(0));
 }
@@ -1593,9 +1561,9 @@ async fn attribution() {
     .unwrap();
 }
 
-/// A job runs only on the sleds its signed target names. Jobs naming
-/// another baseboard, or a cubby while no mapping is known, are
-/// processed but never run here, and the causal chain moves on.
+/// A job runs only on the sleds its target names that the accepting
+/// sled can reach. A job left with none, because it names only an
+/// unreachable baseboard or an unknown cubby, is refused.
 #[named]
 #[tokio::test]
 async fn job_targets() {
@@ -1629,29 +1597,30 @@ async fn job_targets() {
             .unwrap()
             .verify_with_cert(root.cert())
             .unwrap();
-        mgr.job_start(&authn, job.clone().into_signed(), JobStartParams::default())
-            .await
-            .unwrap();
+        let sleds = mgr
+            .job_start(&authn, job.clone().into_signed(), JobStartParams::default())
+            .await?;
         session.job_started(job.into_signed());
-        job_id
+        Ok::<_, JobError>((job_id, sleds))
     };
 
-    let elsewhere = start("true", "913-0000019:BRM00000000").await;
-    let by_cubby = start("true", "14").await;
-    let here = start("true", &test_baseboard_id().to_string()).await;
-
-    // The targeted job runs, which proves the untargeted ones were
-    // already processed and skipped.
+    let elsewhere = "913-0000019:BRM00000000";
+    assert!(matches!(
+        start("true", elsewhere).await,
+        Err(JobError::NoReachableTarget),
+    ));
+    assert!(matches!(
+        start("true", "14").await,
+        Err(JobError::UnknownCubby(14)),
+    ));
+    let (here, sleds) = start("true", &format!("{elsewhere},{}", test_baseboard_id()))
+        .await
+        .unwrap();
+    assert_eq!(sleds, BTreeSet::from([test_baseboard_id()]));
     timeout(Duration::from_secs(30), mgr.wait_for_job_status(&here))
         .await
         .expect("timed out waiting for targeted job")
         .unwrap();
-    for skipped in [elsewhere, by_cubby] {
-        assert!(matches!(
-            mgr.job_status(&authn, &skipped).await,
-            Err(JobError::JobNotFound(_)),
-        ));
-    }
 }
 
 /// A login gossips as evidence every sled verifies for itself: real
@@ -2670,7 +2639,9 @@ async fn streaming_validation() {
     expect_invalid(JobMode::StreamOutput, Target::All).await;
     expect_invalid(
         JobMode::StreamOutput,
-        format!("{},14", test_baseboard_id()).parse().unwrap(),
+        format!("{},913-0000019:BRM00000000", test_baseboard_id())
+            .parse()
+            .unwrap(),
     )
     .await;
     expect_invalid(JobMode::StreamInput, test_baseboard_id().into()).await;

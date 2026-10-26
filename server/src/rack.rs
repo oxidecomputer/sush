@@ -37,8 +37,8 @@ impl Rack {
         }
     }
 
-    pub fn runs_here(&self, job: &SignedJob) -> bool {
-        job.runs_on(&self.own_baseboard, &self.cubbies)
+    pub fn runs_here(&self, job: &SignedJob, sleds: &BTreeSet<BaseboardId>) -> bool {
+        job.runs_on(&self.own_baseboard, sleds)
     }
 
     pub fn own_baseboard(&self) -> &BaseboardId {

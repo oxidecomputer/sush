@@ -4,6 +4,8 @@
 
 //! Messages gossiped via rumors.
 
+use std::collections::BTreeSet;
+
 use chrono::{DateTime, Utc};
 use ciborium::{Value, de::from_reader as from_cbor, ser::into_writer as into_cbor};
 use serde::{Deserialize, Serialize};
@@ -223,7 +225,7 @@ pub mod v0 {
     #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
     #[allow(clippy::large_enum_variant)]
     pub enum JobRequest {
-        Start(SignedJob, JobStartParams),
+        Start(SignedJob, JobStartParams, BTreeSet<BaseboardId>),
         Stop(JobId),
     }
 
@@ -333,7 +335,7 @@ mod wire_format {
                 SessionRequest::DenyAttach(..) => "session-deny-attach-request",
             },
             Message::Request(Request::Job(r)) => match &r.request {
-                JobRequest::Start(_, params) if params.term.is_some() => {
+                JobRequest::Start(_, params, _) if params.term.is_some() => {
                     "job-start-interactive-request"
                 }
                 JobRequest::Start(..) => "job-start-request",
@@ -374,6 +376,10 @@ mod wire_format {
         let baseboard = BaseboardId {
             part_number: "913-0000019".to_string(),
             serial_number: "BRM42220030".to_string(),
+        };
+        let other = BaseboardId {
+            part_number: "913-0000019".to_string(),
+            serial_number: "BRM42220031".to_string(),
         };
         let signature = |flags, counter| EncodedSignature {
             r: "abandon".parse().unwrap(),
@@ -457,11 +463,19 @@ mod wire_format {
             )),
             Message::Request(Request::job(
                 actor(),
-                JobRequest::Start(batch, JobStartParams::default()),
+                JobRequest::Start(
+                    batch,
+                    JobStartParams::default(),
+                    BTreeSet::from([baseboard.clone(), other.clone()]),
+                ),
             )),
             Message::Request(Request::job(
                 actor(),
-                JobRequest::Start(interactive, interactive_params),
+                JobRequest::Start(
+                    interactive,
+                    interactive_params,
+                    BTreeSet::from([baseboard.clone()]),
+                ),
             )),
             Message::Request(Request::job(actor(), JobRequest::Stop(long_job))),
             Message::Request(Request::identity(
