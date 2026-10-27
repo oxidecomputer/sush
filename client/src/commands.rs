@@ -1454,7 +1454,7 @@ async fn job(
             match job_attach(ctx, client, &job_id, &target).await {
                 Err(CommandError::NotFound(_)) => {
                     let error = attach_refused(ctx, client, &job_id, &target).await;
-                    let _ = ctx.job_error(error);
+                    ctx.command_error(&error);
                     Ok(())
                 }
                 result => result,
@@ -1561,7 +1561,7 @@ async fn job_start(
                 if let Err(error) = job_output_from(ctx, client, &target, Stdout, output).await
                     && !error.is_unfinished_job()
                 {
-                    let _ = ctx.job_error(error);
+                    ctx.command_error(&error);
                 }
             }
             Err(error) => return Err(error),
@@ -1740,9 +1740,7 @@ async fn job_start(
                         let output = byte_stream_to_vec(byte_stream.into_inner()).await?;
                         ctx.job_output(&job_id, baseboard, stream, &output, binary);
                     }
-                    Err(error) if multiple => {
-                        let _ = ctx.job_error(error);
-                    }
+                    Err(error) if multiple => ctx.command_error(&error),
                     Err(error) => return Err(error),
                 }
             }
@@ -2127,7 +2125,7 @@ async fn job_output(
     for baseboard in status.keys() {
         ctx.job_output_target(baseboard);
         if let Err(error) = job_output_from(ctx, client, baseboard, stream, args.clone()).await {
-            let _ = ctx.job_error(error);
+            ctx.command_error(&error);
         }
     }
     Ok(())
@@ -2592,161 +2590,161 @@ async fn resolve_serial(
 /// What went wrong parsing, preparing, or executing a client command.
 #[derive(Debug, Error)]
 pub enum CommandError {
-    #[error("❌ Serial `{0}` matches more than one sled, use a full baseboard ID")]
+    #[error("Serial `{0}` matches more than one sled, use a full baseboard ID")]
     AmbiguousSerial(String),
-    #[error("❌ Authentication error")]
+    #[error("Authentication error")]
     Authn(#[from] AuthnError),
     #[error(
-        "❌ Authentication failed, client and server are different builds\n   \
-            Client: {client}\n   \
-            Server: {server}"
+        "Authentication failed, client and server are different builds\n   \
+         Client: {client}\n   \
+         Server: {server}"
     )]
     AuthnBuildMismatch {
         client: VersionInfo,
         server: VersionInfo,
     },
-    #[error("❌ Canceled")]
+    #[error("Canceled")]
     Canceled,
-    #[error("❌ Certificate for `{0}` is outside its validity window")]
+    #[error("Certificate for `{0}` is outside its validity window")]
     CertExpired(String),
-    #[error("❌ Chunk size must be positive")]
+    #[error("Chunk size must be positive")]
     ChunkSizeZero,
-    #[error("❓ {0}")]
+    #[error("{0}")]
     Clap(#[from] clap::Error),
-    #[error("❌ {0}")]
+    #[error("{0}")]
     Client(String),
-    #[error("❌ {0}")]
+    #[error("{0}")]
     Der(#[from] x509_cert::der::Error),
-    #[error("❌ {0}")]
+    #[error("{0}")]
     DurationOutOfRange(#[from] chrono::OutOfRangeError),
-    #[error("❌ Empty certificate chain")]
+    #[error("Empty certificate chain")]
     EmptyCertChain,
-    #[error("❌ Identity error: {0}")]
+    #[error("Identity error: {0}")]
     Identity(#[from] IdentityError),
     #[error(
-        "❌ Identity mismatch,  tried to start an interactive job\n   \
-            for `{interactive}`\n    \
-             as `{key_id}`"
+        "Identity mismatch,  tried to start an interactive job\n   \
+         for `{interactive}`\n    \
+          as `{key_id}`"
     )]
     IdentityMismatch { interactive: KeyId, key_id: KeyId },
-    #[error("❌ Interactive job error: {0}")]
+    #[error("Interactive job error: {0}")]
     Interactive(#[from] InteractiveJobError),
-    #[error("❌ Interactive jobs must target exactly one sled")]
+    #[error("Interactive jobs must target exactly one sled")]
     InteractiveTarget,
-    #[error("❌ Local I/O error accessing `{path}`: {error}")]
+    #[error("Local I/O error accessing `{path}`: {error}")]
     Io {
         path: PathBuf,
         error: std::io::Error,
     },
-    #[error("❌ Signal handling error: {0}")]
+    #[error("Signal handling error: {0}")]
     Signal(#[from] std::io::Error),
-    #[error("❌ Unauthorized, try `iam`")]
+    #[error("Unauthorized, try `iam`")]
     InvalidAuthorization,
-    #[error("❌ Leaf certificate does not match key `{0}`")]
+    #[error("Leaf certificate does not match key `{0}`")]
     InvalidLeafCert(KeyId),
-    #[error("❌ Root certificate is not self-signed")]
+    #[error("Root certificate is not self-signed")]
     InvalidRootCert,
-    #[error("❌ Job `{0}` was cancelled before it started")]
+    #[error("Job `{0}` was cancelled before it started")]
     JobCancelled(JobId),
-    #[error("❌ Job `{0}` did not run")]
+    #[error("Job `{0}` did not run")]
     JobDidNotRun(JobId),
-    #[error("❌ Job `{0}` has finished, try `job status` or `job output`")]
+    #[error("Job `{0}` has finished, try `job status` or `job output`")]
     JobFinished(JobId),
-    #[error("❌ Job `{0}` is not interactive, try `job status` or `job output`")]
+    #[error("Job `{0}` is not interactive, try `job status` or `job output`")]
     JobNotInteractive(JobId),
-    #[error("❌ Job `{0}` not found on sled `{1}`")]
+    #[error("Job `{0}` not found on sled `{1}`")]
     JobNotOnSled(JobId, BaseboardId),
-    #[error("{1}\n❗ Job `{0}` was signed but not started, try `job skip`")]
+    #[error("Job `{0}` was signed but not started, try `job skip`")]
     JobNotStarted(JobId, Box<CommandError>),
-    #[error("❌ Job `{0}` is not yet running")]
+    #[error("Job `{0}` is not yet running")]
     JobNotYetRunning(JobId),
-    #[error("⏩ Job `{0}` was skipped on this sled: {1}")]
+    #[error("Job `{0}` was skipped on this sled: {1}")]
     JobSkipped(JobId, SkipReason),
-    #[error("❌ Job `{0}` is still running")]
+    #[error("Job `{0}` is still running")]
     JobStillRunning(JobId),
-    #[error("❌ JSON error: {0}")]
+    #[error("JSON error: {0}")]
     Json(#[from] serde_json::Error),
-    #[error("❌ Key error: {0}")]
+    #[error("Key error: {0}")]
     Key(#[from] KeyError),
-    #[error("❌ Length mismatch: expected {expected} bytes, received {received}")]
+    #[error("Length mismatch: expected {expected} bytes, received {received}")]
     LengthMismatch { expected: u64, received: u64 },
-    #[error("❌ Missing client nonce: run `session start-params` first, or pass one")]
+    #[error("Missing client nonce: run `session start-params` first, or pass one")]
     MissingClientNonce,
-    #[error("❌ Missing job command, try `--help`")]
+    #[error("Missing job command, try `--help`")]
     MissingCommand,
     #[cfg(feature = "permslip")]
-    #[error("❌ Missing signing key name, try `--permslip`")]
+    #[error("Missing signing key name, try `--permslip`")]
     MissingKeyName,
     #[cfg(feature = "permslip")]
-    #[error("❌ Missing permslip URL, try `--permslip-url` or setting `PERMSLIP_URL`")]
+    #[error("Missing permslip URL, try `--permslip-url` or setting `PERMSLIP_URL`")]
     MissingPermslipUrl,
-    #[error("❌ Missing rack ID, try `--rack` (IDs from `oxide system hardware rack list`)")]
+    #[error("Missing rack ID, try `--rack` (IDs from `oxide system hardware rack list`)")]
     MissingRack,
-    #[error("❌ Missing Nexus token, try `--nexus-token` or setting `SUSH_NEXUS_TOKEN`")]
+    #[error("Missing Nexus token, try `--nexus-token` or setting `SUSH_NEXUS_TOKEN`")]
     MissingNexusToken,
-    #[error("❌ Missing session, try `session start`")]
+    #[error("Missing session, try `session start`")]
     MissingSession,
-    #[error("❌ Missing SSH agent socket, try `--ssh-auth-sock`")]
+    #[error("Missing SSH agent socket, try `--ssh-auth-sock`")]
     MissingSshAuthSock,
-    #[error("❌ {0}")]
+    #[error("{0}")]
     NotFound(String),
-    #[error("❌ Job `{0}` is not the session's next job")]
+    #[error("Job `{0}` is not the session's next job")]
     NotNextJob(JobId),
-    #[error("❌ Command not supported in offline mode, try `--url`")]
+    #[error("Command not supported in offline mode, try `--url`")]
     Offline,
     #[error(
-        "❌ Hash mismatch, output may be truncated or corrupted\n   \
-            Expected: {expected}\n   \
-            Received: {received}"
+        "Hash mismatch, output may be truncated or corrupted\n   \
+         Expected: {expected}\n   \
+         Received: {received}"
     )]
     OutputHashMismatch {
         expected: JobOutputHash,
         received: JobOutputHash,
     },
-    #[error("❌ `--binary` and `--file` need a specific `--target`")]
+    #[error("`--binary` and `--file` need a specific `--target`")]
     OutputNeedsTarget,
     #[cfg(feature = "permslip")]
-    #[error("❌ permslip error: {0}")]
+    #[error("permslip error: {0}")]
     Permslip(#[from] PermslipError),
-    #[error("❌ Job process error: {0}")]
+    #[error("Job process error: {0}")]
     Process(#[from] sush_common::jobs::ProcessError),
-    #[error("❌ Proxy TLS error: {0}")]
+    #[error("Proxy TLS error: {0}")]
     ProxyTls(#[from] tls::ProxyTlsError),
-    #[error("👋 Goodbye!")]
+    #[error("Goodbye!")]
     Quit,
-    #[error("❌ {0}")]
+    #[error("{0}")]
     Readline(#[from] rustyline::error::ReadlineError),
     #[error(transparent)]
     Recursive(#[from] Box<Self>),
-    #[error("❌ Reqwest error: {0}")]
+    #[error("Reqwest error: {0}")]
     Reqwest(#[from] reqwest::Error),
-    #[error("❌ SSH signature error on key ID `{0}`")]
+    #[error("SSH signature error on key ID `{0}`")]
     Signature(KeyId),
-    #[error("❌ Streaming jobs need `--file`")]
+    #[error("Streaming jobs need `--file`")]
     StreamingNeedsFile,
-    #[error("❌ Job `{0}` did not exit cleanly, streamed output is unverified")]
+    #[error("Job `{0}` did not exit cleanly, streamed output is unverified")]
     StreamUnverified(JobId),
-    #[error("❌ Can't parse target baseboard ID: {0}")]
+    #[error("Can't parse target baseboard ID: {0}")]
     BaseboardIdParseError(sled_hardware_types::BaseboardIdParseError),
-    #[error("❌ SSH key error: {0}")]
+    #[error("SSH key error: {0}")]
     SshKey(#[from] ssh_key::Error),
-    #[error("❌ Timed out waiting for job")]
+    #[error("Timed out waiting for job")]
     TimedOut,
-    #[error("❌ Too much output to display on terminal, try `--file`")]
+    #[error("Too much output to display on terminal, try `--file`")]
     TooMuchOutput,
-    #[error("❌ Tunnel error: {0}")]
+    #[error("Tunnel error: {0}")]
     Tunnel(#[from] TunnelError),
-    #[error("❌ No sled with serial `{serial}` has a status for job `{job_id}`")]
+    #[error("No sled with serial `{serial}` has a status for job `{job_id}`")]
     UnknownSerial { serial: String, job_id: JobId },
-    #[error("❌ Serial `{0}` matches no sled in the rack inventory")]
+    #[error("Serial `{0}` matches no sled in the rack inventory")]
     UnknownRackSerial(String),
-    #[error("❌ Chain root does not match any supplied root certificate")]
+    #[error("Chain root does not match any supplied root certificate")]
     UntrustedRoot,
-    #[error("❌ Can't start interactive session: {0}")]
+    #[error("Can't start interactive session: {0}")]
     Upgrade(String),
-    #[error("❌ UTF-8 error: {0}")]
+    #[error("UTF-8 error: {0}")]
     Utf8(#[from] std::string::FromUtf8Error),
-    #[error("❌ WebSocket error: {0}")]
+    #[error("WebSocket error: {0}")]
     WebSocket(#[from] WebSocketError),
 }
 
@@ -2762,6 +2760,30 @@ impl CommandError {
     /// Whether this error says the job has not yet finished.
     pub fn is_unfinished_job(&self) -> bool {
         matches!(self, Self::JobNotYetRunning(_) | Self::JobStillRunning(_))
+    }
+
+    fn icon(&self) -> &'static str {
+        match self {
+            Self::Clap(_) => "❓",
+            Self::JobNotStarted(..) => "❗",
+            Self::JobSkipped(..) => "⏩",
+            Self::Quit => "👋",
+            Self::Recursive(error) => error.icon(),
+            _ => "❌",
+        }
+    }
+
+    /// The icon and message of each error in this one, inner first.
+    pub fn errors(&self) -> Vec<(&'static str, String)> {
+        match self {
+            Self::JobNotStarted(_, error) => {
+                let mut errors = error.errors();
+                errors.push((self.icon(), self.to_string()));
+                errors
+            }
+            Self::Recursive(error) => error.errors(),
+            _ => vec![(self.icon(), self.to_string())],
+        }
     }
 }
 

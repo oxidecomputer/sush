@@ -12,6 +12,7 @@ use rustix::termios::{OptionalActions, OutputModes, Termios, isatty, tcgetattr, 
 
 use sush_client::cli::Cli;
 use sush_client::commands::ClientArgs;
+use sush_client::context::CommandContext as _;
 
 /// The kernel tab-expansion bits, which rustix does not expose on
 /// illumos: TABDLY from illumos sys/termios.h.
@@ -44,7 +45,7 @@ async fn main() -> ExitCode {
     let code = match ClientArgs::parse().execute(&mut cli).await {
         Ok(()) => ExitCode::SUCCESS,
         Err(error) => {
-            eprintln!("{error}");
+            cli.command_error(&error);
             ExitCode::FAILURE
         }
     };

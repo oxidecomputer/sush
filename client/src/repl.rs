@@ -101,12 +101,15 @@ impl Repl {
                     };
                     let command = match ReplCommandParser::try_parse(&words, &mut self) {
                         Ok(ReplCommandParser { command }) => command,
-                        Err(err) => perr!("{err}"),
+                        Err(err) => {
+                            self.command_error(&err);
+                            continue;
+                        }
                     };
                     match command.execute(&mut self).await {
                         Ok(()) => (),
                         Err(CommandError::Quit) => break,
-                        Err(err) => perr!("{err}"),
+                        Err(err) => self.command_error(&err),
                     }
                 }
                 Err(ReadlineError::Interrupted) => continue,
@@ -213,6 +216,12 @@ impl CommandContext for Repl {
         self.cli.set_globals(args);
     }
 
+    // Errors
+
+    fn command_error(&mut self, error: &CommandError) {
+        self.cli.command_error(error)
+    }
+
     // Build provenance
 
     fn versions(
@@ -310,10 +319,6 @@ impl CommandContext for Repl {
 
     fn job_skipped(&mut self, job_id: &JobId) -> bool {
         self.cli.job_skipped(job_id)
-    }
-
-    fn job_error(&mut self, error: CommandError) -> CommandError {
-        self.cli.job_error(error)
     }
 
     fn job_output_target(&mut self, target: &BaseboardId) {
