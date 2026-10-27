@@ -958,9 +958,9 @@ where
     with_login_via(ctx, client, None, make_request).await
 }
 
-/// Like [`with_login`], for requests a proxy routes to a particular
-/// sled. Identities live on one sled, so the login must go where the
-/// request it retries went.
+/// Like [`with_login`], for a request that the proxy routes to sled
+/// `via`. A sled that refuses a request answers with a login challenge
+/// that only it can verify, so the login goes to `via` as well.
 async fn with_login_via<T, E, Req>(
     ctx: &mut impl CommandContext,
     client: &Client,
@@ -971,14 +971,23 @@ where
     Req: AsyncFnMut() -> Result<T, ClientError<E>>,
     CommandError: From<ClientError<E>>,
 {
-    match make_request().await {
-        Err(ClientError::ErrorResponse(err)) if err.status() == StatusCode::UNAUTHORIZED => {
-            let (_identity, authz) = authenticate(ctx, client, via, err).await?;
-            ctx.set_credentials(Some(authz));
-            Ok(make_request().await?)
+    let signer = ctx.authz_signer();
+    let mut generation = signer.generation();
+    let mut logged_in = false;
+    loop {
+        match make_request().await {
+            Err(ClientError::ErrorResponse(err))
+                if err.status() == StatusCode::UNAUTHORIZED && !logged_in =>
+            {
+                if let Some(_login) = signer.login_needed(generation).await {
+                    let (_identity, authz) = authenticate(ctx, client, via, err).await?;
+                    ctx.set_credentials(Some(authz));
+                    logged_in = true;
+                }
+                generation = signer.generation();
+            }
+            result => return Ok(result?),
         }
-        Err(err) => Err(err.into()),
-        Ok(res) => Ok(res),
     }
 }
 
