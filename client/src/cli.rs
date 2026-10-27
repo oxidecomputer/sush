@@ -22,6 +22,7 @@ use chrono::TimeDelta;
 use humantime::format_duration;
 use indicatif::{MultiProgress, ProgressBar, ProgressStyle};
 use rustix::io::ioctl_fionread;
+use rustix::termios::{LocalModes, OptionalActions, Termios, isatty, tcgetattr, tcsetattr};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, to_string as to_json_string, to_string_pretty as to_json_string_pretty};
 use sled_hardware_types::BaseboardId;
@@ -218,6 +219,31 @@ struct Watch {
     multi: MultiProgress,
     bars: BTreeMap<BaseboardId, ProgressBar>,
     width: usize,
+    saved: Option<Termios>,
+}
+
+impl Watch {
+    fn new() -> Self {
+        Self {
+            multi: MultiProgress::new(),
+            bars: BTreeMap::new(),
+            width: 0,
+            saved: no_echo_control(),
+        }
+    }
+}
+
+/// Stop the terminal from echoing control sequences.
+fn no_echo_control() -> Option<Termios> {
+    let input = stdin();
+    if !isatty(&input) {
+        return None;
+    }
+    let old = tcgetattr(&input).ok()?;
+    let mut new = old.clone();
+    new.local_modes &= !LocalModes::ECHOCTL;
+    tcsetattr(&input, OptionalActions::Now, &new).ok()?;
+    Some(old)
 }
 
 impl fmt::Debug for Watch {
@@ -759,11 +785,7 @@ impl CommandContext for Cli {
 
     fn job_watch_started(&mut self, _job_id: &JobId) {
         if matches!(self.get_output_format(), OutputFormat::Text) {
-            *self.watch.lock().unwrap() = Some(Watch {
-                multi: MultiProgress::new(),
-                bars: BTreeMap::new(),
-                width: 0,
-            });
+            *self.watch.lock().unwrap() = Some(Watch::new());
         }
     }
 
@@ -820,6 +842,9 @@ impl CommandContext for Cli {
                 bar.finish_and_clear();
             }
             let _ = watch.multi.clear();
+            if let Some(saved) = watch.saved {
+                let _ = tcsetattr(stdin(), OptionalActions::Now, &saved);
+            }
         }
     }
 
