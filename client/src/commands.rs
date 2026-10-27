@@ -1521,10 +1521,9 @@ async fn job_start(
     } = start_args;
     let interactive = job.payload().is_interactive();
     let streaming = matches!(job.payload().mode, JobMode::StreamOutput);
-    let wait = if interactive || streaming {
+    let watch = wait;
+    let wait = if interactive || streaming || watch {
         JobWait::Start
-    } else if wait {
-        JobWait::Stop
     } else {
         JobWait::None
     };
@@ -1625,7 +1624,7 @@ async fn job_start(
                 received,
             });
         }
-    } else if wait.is_some() {
+    } else if watch {
         // Watch the whole rack while the start request runs, and keep
         // watching until the job settles everywhere.
         ctx.job_watch_started(&job_id);
@@ -1702,7 +1701,10 @@ async fn job_start(
                 // While the job runs, a first interrupt stops it and keeps
                 // watching; a second ends the watch.
                 _ = sigint.recv() => {
-                    if started || stopping {
+                    let finished = started
+                        && !last.is_empty()
+                        && last.values().all(JobStatus::is_terminal);
+                    if finished || stopping {
                         break last;
                     }
                     stopping = true;
