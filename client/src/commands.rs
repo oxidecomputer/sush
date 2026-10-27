@@ -1578,7 +1578,8 @@ async fn job_start(
             }
             Err(error) => return Err(error),
         }
-        job_status(ctx, client, &job_id, StatusDisplayStyle::Short).await?
+        let status = job_status_map(ctx, client, &job_id, Some(&target)).await?;
+        ctx.job_status(&job_id, &status, StatusDisplayStyle::Short);
     } else if streaming {
         let Some(path) = file else {
             return Err(CommandError::StreamingNeedsFile);
