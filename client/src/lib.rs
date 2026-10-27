@@ -9,6 +9,7 @@ use std::sync::{Arc, Mutex};
 
 use reqwest::header::AUTHORIZATION;
 use sush_common::authn::AuthnError;
+use tokio::sync::{Mutex as AsyncMutex, MutexGuard as AsyncMutexGuard};
 
 use crate::context::Authz;
 
@@ -66,15 +67,41 @@ pub mod tunnel;
 /// client's pre-send hook, which signs every request with the current
 /// ephemeral key once one exists.
 #[derive(Clone, Debug, Default)]
-pub struct AuthzSigner(Arc<Mutex<Option<Authz>>>);
+pub struct AuthzSigner(Arc<AuthzState>);
+
+#[derive(Debug, Default)]
+struct AuthzState {
+    /// The current authorization, and how many times it has been set.
+    authz: Mutex<(Option<Authz>, u64)>,
+
+    /// Held during a login. When the server refuses several concurrent
+    /// requests, the first to take this lock logs in, and the others
+    /// retry with its credentials.
+    login: AsyncMutex<()>,
+}
 
 impl AuthzSigner {
     pub fn get(&self) -> Option<Authz> {
-        self.0.lock().unwrap().clone()
+        self.0.authz.lock().unwrap().0.clone()
     }
 
     pub fn set(&self, authz: Option<Authz>) {
-        *self.0.lock().unwrap() = authz;
+        let mut guard = self.0.authz.lock().unwrap();
+        guard.0 = authz;
+        guard.1 += 1;
+    }
+
+    /// How many times the authorization has been set.
+    pub fn generation(&self) -> u64 {
+        self.0.authz.lock().unwrap().1
+    }
+
+    /// Wait for any login in progress. Return the login guard if the
+    /// authorization has not been set since `generation`, or `None` if
+    /// another login set it.
+    pub async fn login_needed(&self, generation: u64) -> Option<AsyncMutexGuard<'_, ()>> {
+        let login = self.0.login.lock().await;
+        (self.generation() == generation).then_some(login)
     }
 }
 
