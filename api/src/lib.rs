@@ -18,6 +18,7 @@ use schemars::JsonSchema;
 use serde::de::{Deserializer, Error as DeserializeError, IntoDeserializer, MapAccess, Visitor};
 use serde::{Deserialize, Serialize};
 use sled_hardware_types::BaseboardId;
+use strum::{Display, EnumString};
 
 use sush_common::authn::Identity;
 use sush_common::jobs::{
@@ -316,6 +317,14 @@ pub struct JobStartParams {
     /// Wait for the job to start or stop.
     #[serde(skip_serializing_if = "JobWait::is_none")]
     pub wait: JobWait,
+}
+
+/// Codes for the errors a client may act on. `Display` gives the
+/// `error_code` string of the response body.
+#[derive(Clone, Copy, Debug, Display, EnumString, Eq, PartialEq)]
+pub enum ErrorCode {
+    NoSession,
+    SessionNotCurrent,
 }
 
 /// Whether and until what state is reached to wait for a job start/stop request.

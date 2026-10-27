@@ -67,6 +67,7 @@ slog-term = "2"
 sprockets-tls = { git = "https://github.com/oxidecomputer/sprockets.git", rev = "98615b86d51f74ce220198eb16c57932fd24e7cb", default-features = false }
 sprockets-tls-test-utils = { git = "https://github.com/oxidecomputer/sprockets.git", rev = "98615b86d51f74ce220198eb16c57932fd24e7cb" }
 ssh-key = { version = "0.6", features = ["ed25519", "p256", "serde"] }
+strum = { version = "0.27", features = ["derive"] }
 tempfile = "3"
 thiserror = "1"
 tokio = { version = "1", features = ["macros", "process", "rt", "signal", "sync", "time"] }

@@ -41,7 +41,7 @@ use tokio_tungstenite::tungstenite::protocol::Role;
 use x509_cert::Certificate;
 use x509_cert::der::DecodePem as _;
 
-use sush_api::JobWait;
+use sush_api::{ErrorCode, JobWait};
 use sush_common::authn::{
     AuthnError, Challenge, ChallengeResponse, Credentials, Identity, RequestKey,
 };
@@ -1081,7 +1081,7 @@ async fn session(
                 return Err(CommandError::MissingSession);
             }
             // The server's session state is authoritative.
-            ctx.session_started(session, true);
+            ctx.session_joined(session, true);
             Ok(())
         }
 
@@ -1092,7 +1092,7 @@ async fn session(
             },
             None,
         ) => {
-            ctx.session_started(Session::new(session_id), force);
+            ctx.session_joined(Session::new(session_id), force);
             Ok(())
         }
 
@@ -1364,12 +1364,12 @@ async fn job(
             let job = loop {
                 select! {
                     job = &mut sign => {
-                        ctx.job_signing_finished(&job_id);
+                        ctx.job_signing_finished(&job_id, job.is_ok());
                         break job?;
                     }
                     _ = interval.tick() => ctx.job_signing_update(&job_id),
                     _ = sigint.recv() => {
-                        ctx.job_signing_finished(&job_id);
+                        ctx.job_signing_finished(&job_id, false);
                         return Err(CommandError::Canceled);
                     }
                 }
@@ -1378,7 +1378,10 @@ async fn job(
                 ctx.job_signed(&job, false);
                 let job_id = *job.job_id();
                 match job_start(ctx, client, job, start_args.to_owned()).await {
-                    Err(error) if ctx.next_job_id().ok() == Some(job_id) => {
+                    Err(error)
+                        if !matches!(error, CommandError::Session(_))
+                            && ctx.next_job_id().ok() == Some(job_id) =>
+                    {
                         Err(CommandError::JobNotStarted(job_id, Box::new(error)))
                     }
                     result => result,
@@ -2729,6 +2732,8 @@ pub enum CommandError {
     Recursive(#[from] Box<Self>),
     #[error("Reqwest error: {0}")]
     Reqwest(#[from] reqwest::Error),
+    #[error("{0}")]
+    Session(String),
     #[error("SSH signature error on key ID `{0}`")]
     Signature(KeyId),
     #[error("Streaming jobs need `--file`")]
@@ -2806,6 +2811,14 @@ impl From<ClientError<ApiError>> for CommandError {
             CommunicationError(e) if e.is_timeout() => CommandError::TimedOut,
             CommunicationError(e) => CommandError::Client(format!("Communication error: {e}")),
             InvalidUpgrade(e) => CommandError::Client(e.to_string()),
+            ErrorResponse(e)
+                if matches!(
+                    e.error_code.as_deref().map(str::parse),
+                    Some(Ok(ErrorCode::NoSession | ErrorCode::SessionNotCurrent))
+                ) =>
+            {
+                CommandError::Session(e.message.to_owned())
+            }
             ErrorResponse(e) if e.status() == StatusCode::NOT_FOUND => {
                 CommandError::NotFound(e.message.to_owned())
             }
