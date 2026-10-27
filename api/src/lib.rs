@@ -20,7 +20,7 @@ use serde::{Deserialize, Serialize};
 use sled_hardware_types::BaseboardId;
 use strum::{Display, EnumString};
 
-use sush_common::authn::Identity;
+use sush_common::authn::{Identity, LoginReceipt};
 use sush_common::jobs::{
     Access, JobId, JobLimits, JobOutputStream, JobStatus, JsonJobStatusMap, Session,
     SessionClientNonce, SessionId, SessionSeq, SessionServerNonce, SessionSignerNonce, SignedJob,
@@ -54,8 +54,8 @@ pub trait SushApi {
         ctx: RequestContext<Self::Context>,
         headers: Header<Authorization>,
         query: QueryParams<RoutingParam>,
-        body: TypedBody<Option<SshPublicKey>>,
-    ) -> Result<HttpResponseOk<Identity>, HttpError>;
+        body: TypedBody<IamRequest>,
+    ) -> Result<HttpResponseOk<IamResponse>, HttpError>;
 
     /// List cached identities.
     ///
@@ -279,6 +279,40 @@ pub struct JobTargetParams {
 
     /// Used by proxies for routing.
     pub target: String,
+}
+
+/// Login evidence that accompanies initial credentials.
+#[derive(Clone, Debug, Default, Deserialize, Eq, JsonSchema, PartialEq, Serialize)]
+pub struct IamRequest {
+    /// The key that signed the credentials.
+    pub public_key: Option<SshPublicKey>,
+
+    /// Another server's receipt for the credentials.
+    pub receipt: Option<LoginReceipt>,
+}
+
+impl IamRequest {
+    pub fn new(public_key: SshPublicKey, receipt: Option<LoginReceipt>) -> Self {
+        Self {
+            public_key: Some(public_key),
+            receipt,
+        }
+    }
+}
+
+impl From<SshPublicKey> for IamRequest {
+    fn from(public_key: SshPublicKey) -> Self {
+        Self::new(public_key, None)
+    }
+}
+
+/// The result of a successful login.
+#[derive(Clone, Debug, Deserialize, Eq, JsonSchema, PartialEq, Serialize)]
+pub struct IamResponse {
+    pub identity: Identity,
+
+    /// A receipt for the login, present when the server issues receipts.
+    pub receipt: Option<LoginReceipt>,
 }
 
 #[derive(Deserialize, JsonSchema)]

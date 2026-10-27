@@ -13,6 +13,7 @@ use clap::ValueEnum;
 use sled_hardware_types::BaseboardId;
 use x509_cert::Certificate;
 
+use sush_api::IamRequest;
 use sush_common::authn::{BoundRequest, Credentials, Identity, RequestKey};
 use sush_common::jobs::{
     Access, JobId, JobOutputStream, JobStartRequest, JobStatusMap, Session, SessionClientNonce,
@@ -30,6 +31,7 @@ use crate::commands::{CommandError, GlobalArgs};
 #[derive(Clone, Debug)]
 pub struct Authz {
     pub credentials: Credentials,
+    pub receipt: Option<IamRequest>,
     key: RequestKey,
     seq: Arc<AtomicU64>,
 }
@@ -38,6 +40,7 @@ impl Authz {
     pub fn new(credentials: Credentials, key: RequestKey) -> Self {
         Self {
             credentials,
+            receipt: None,
             key,
             seq: Arc::new(AtomicU64::new(1)),
         }

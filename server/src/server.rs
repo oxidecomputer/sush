@@ -22,15 +22,16 @@ use tokio_tungstenite::WebSocketStream;
 use tokio_tungstenite::tungstenite::protocol::{Role, WebSocketConfig};
 
 use sush_api::{
-    AccessParam, Authorization, AuthorizedRangeRequest, JobHistoryParams, JobIdParam,
-    JobOutputParams, JobStartParams, JobStarted, JobStopParams, JobTargetParams, KeyIdParam,
-    RoutingParam, SessionAndJobIds, SessionAndKeyIds, SessionIdParam, SessionStartBody, SushApi,
+    AccessParam, Authorization, AuthorizedRangeRequest, IamRequest, IamResponse, JobHistoryParams,
+    JobIdParam, JobOutputParams, JobStartParams, JobStarted, JobStopParams, JobTargetParams,
+    KeyIdParam, RoutingParam, SessionAndJobIds, SessionAndKeyIds, SessionIdParam, SessionStartBody,
+    SushApi,
 };
 use sush_common::authn::Identity;
 use sush_common::jobs::{
     JsonJobStatusMap, Session, SessionServerNonce, SignedJob, job_status_to_json_map,
 };
-use sush_common::keys::{SshPublicKey, pem_cert_chain};
+use sush_common::keys::pem_cert_chain;
 use sush_common::targets::SledVersion;
 use sush_common::version::VersionInfo;
 
@@ -63,9 +64,7 @@ impl SushApi for ApiServer {
     ) -> Result<HttpResponseOk<String>, HttpError> {
         let mgr = ctx.context();
         let Authorization { authorization } = headers.into_inner();
-        let authn = mgr
-            .iam(authorization, None, request_line(&ctx.request))
-            .await?;
+        let authn = mgr.iam(authorization, request_line(&ctx.request)).await?;
         let KeyIdParam { key_id } = params.into_inner();
         let certs = mgr.cert_chain(&authn, &key_id)?;
         let chain = pem_cert_chain(certs).map_err(JobError::Key)?;
@@ -78,15 +77,14 @@ impl SushApi for ApiServer {
         ctx: RequestContext<Self::Context>,
         headers: Header<Authorization>,
         _query: QueryParams<RoutingParam>,
-        body: TypedBody<Option<SshPublicKey>>,
-    ) -> Result<HttpResponseOk<Identity>, HttpError> {
+        body: TypedBody<IamRequest>,
+    ) -> Result<HttpResponseOk<IamResponse>, HttpError> {
         let mgr = ctx.context();
         let Authorization { authorization } = headers.into_inner();
-        let public_key = body.into_inner();
-        let identity = mgr
-            .iam(authorization, public_key, request_line(&ctx.request))
+        let response = mgr
+            .login(authorization, body.into_inner(), request_line(&ctx.request))
             .await?;
-        Ok(HttpResponseOk(identity))
+        Ok(HttpResponseOk(response))
     }
 
     async fn identities(
@@ -95,9 +93,7 @@ impl SushApi for ApiServer {
     ) -> Result<HttpResponseOk<Vec<Identity>>, HttpError> {
         let mgr = ctx.context();
         let Authorization { authorization } = headers.into_inner();
-        let authn = mgr
-            .iam(authorization, None, request_line(&ctx.request))
-            .await?;
+        let authn = mgr.iam(authorization, request_line(&ctx.request)).await?;
         Ok(HttpResponseOk(mgr.identities(&authn).await?))
     }
 
@@ -109,9 +105,7 @@ impl SushApi for ApiServer {
     ) -> Result<HttpResponseOk<Session>, HttpError> {
         let mgr = ctx.context();
         let Authorization { authorization } = headers.into_inner();
-        let authn = mgr
-            .iam(authorization, None, request_line(&ctx.request))
-            .await?;
+        let authn = mgr.iam(authorization, request_line(&ctx.request)).await?;
         if let Some(session) = mgr.session(&authn) {
             Ok(HttpResponseOk(session))
         } else {
@@ -125,9 +119,7 @@ impl SushApi for ApiServer {
     ) -> Result<HttpResponseOk<SessionServerNonce>, HttpError> {
         let mgr = ctx.context();
         let Authorization { authorization } = headers.into_inner();
-        let _authn = mgr
-            .iam(authorization, None, request_line(&ctx.request))
-            .await?;
+        let _authn = mgr.iam(authorization, request_line(&ctx.request)).await?;
         Ok(HttpResponseOk(mgr.fresh_server_nonce()))
     }
 
@@ -139,9 +131,7 @@ impl SushApi for ApiServer {
     ) -> Result<HttpResponseUpdatedNoContent, HttpError> {
         let mgr = ctx.context();
         let Authorization { authorization } = headers.into_inner();
-        let authn = mgr
-            .iam(authorization, None, request_line(&ctx.request))
-            .await?;
+        let authn = mgr.iam(authorization, request_line(&ctx.request)).await?;
         let SessionIdParam { session_id } = params.into_inner();
         let SessionStartBody {
             client_nonce,
@@ -160,9 +150,7 @@ impl SushApi for ApiServer {
     ) -> Result<HttpResponseUpdatedNoContent, HttpError> {
         let mgr = ctx.context();
         let Authorization { authorization } = headers.into_inner();
-        let authn = mgr
-            .iam(authorization, None, request_line(&ctx.request))
-            .await?;
+        let authn = mgr.iam(authorization, request_line(&ctx.request)).await?;
         let SessionIdParam { session_id } = params.into_inner();
         mgr.session_stop(&authn, session_id).await?;
         Ok(HttpResponseUpdatedNoContent())
@@ -175,9 +163,7 @@ impl SushApi for ApiServer {
     ) -> Result<HttpResponseUpdatedNoContent, HttpError> {
         let mgr = ctx.context();
         let Authorization { authorization } = headers.into_inner();
-        let authn = mgr
-            .iam(authorization, None, request_line(&ctx.request))
-            .await?;
+        let authn = mgr.iam(authorization, request_line(&ctx.request)).await?;
         let SessionAndJobIds { session_id, job_id } = params.into_inner();
         mgr.session_skip_job(&authn, session_id, job_id).await?;
         Ok(HttpResponseUpdatedNoContent())
@@ -191,9 +177,7 @@ impl SushApi for ApiServer {
     ) -> Result<HttpResponseUpdatedNoContent, HttpError> {
         let mgr = ctx.context();
         let Authorization { authorization } = headers.into_inner();
-        let authn = mgr
-            .iam(authorization, None, request_line(&ctx.request))
-            .await?;
+        let authn = mgr.iam(authorization, request_line(&ctx.request)).await?;
         let SessionAndKeyIds { session_id, key_id } = params.into_inner();
         let AccessParam { access } = query.into_inner();
         mgr.session_allow_attach(&authn, session_id, key_id, access)
@@ -208,9 +192,7 @@ impl SushApi for ApiServer {
     ) -> Result<HttpResponseUpdatedNoContent, HttpError> {
         let mgr = ctx.context();
         let Authorization { authorization } = headers.into_inner();
-        let authn = mgr
-            .iam(authorization, None, request_line(&ctx.request))
-            .await?;
+        let authn = mgr.iam(authorization, request_line(&ctx.request)).await?;
         let SessionAndKeyIds { session_id, key_id } = params.into_inner();
         mgr.session_deny_attach(&authn, session_id, key_id).await?;
         Ok(HttpResponseUpdatedNoContent())
@@ -227,9 +209,7 @@ impl SushApi for ApiServer {
     ) -> Result<HttpResponseOk<JobStarted>, HttpError> {
         let mgr = ctx.context();
         let Authorization { authorization } = headers.into_inner();
-        let authn = mgr
-            .iam(authorization, None, request_line(&ctx.request))
-            .await?;
+        let authn = mgr.iam(authorization, request_line(&ctx.request)).await?;
         let JobTargetParams { job_id, target: _ } = params.into_inner();
         let job = body.into_inner();
         if *job.job_id() != job_id {
@@ -251,9 +231,7 @@ impl SushApi for ApiServer {
     ) -> Result<HttpResponseUpdatedNoContent, HttpError> {
         let mgr = ctx.context();
         let Authorization { authorization } = headers.into_inner();
-        let authn = mgr
-            .iam(authorization, None, request_line(&ctx.request))
-            .await?;
+        let authn = mgr.iam(authorization, request_line(&ctx.request)).await?;
         let JobIdParam { job_id } = params.into_inner();
         mgr.job_stop(&authn, &job_id, query.into_inner()).await?;
         Ok(HttpResponseUpdatedNoContent())
@@ -267,9 +245,7 @@ impl SushApi for ApiServer {
     ) -> Result<HttpResponseOk<JsonJobStatusMap>, HttpError> {
         let mgr = ctx.context();
         let Authorization { authorization } = headers.into_inner();
-        let authn = mgr
-            .iam(authorization, None, request_line(&ctx.request))
-            .await?;
+        let authn = mgr.iam(authorization, request_line(&ctx.request)).await?;
         let JobIdParam { job_id } = params.into_inner();
         Ok(HttpResponseOk(job_status_to_json_map(
             mgr.job_status(&authn, &job_id).await?,
@@ -286,7 +262,7 @@ impl SushApi for ApiServer {
         let headers = headers.into_inner();
         let range = headers.range()?;
         let authn = mgr
-            .iam(headers.authorization, None, request_line(&ctx.request))
+            .iam(headers.authorization, request_line(&ctx.request))
             .await?;
         let JobOutputParams {
             job_id,
@@ -326,9 +302,7 @@ impl SushApi for ApiServer {
     ) -> WebsocketEndpointResult {
         let mgr = ctx.context();
         let Authorization { authorization } = headers.into_inner();
-        let authn = mgr
-            .iam(authorization, None, request_line(&ctx.request))
-            .await?;
+        let authn = mgr.iam(authorization, request_line(&ctx.request)).await?;
         let JobTargetParams { job_id, target } = params.into_inner();
         let target = if target == "*" {
             mgr.own_baseboard().clone()
@@ -362,9 +336,7 @@ impl SushApi for ApiServer {
     ) -> Result<HttpResponseOk<Vec<JsonJobStatusMap>>, HttpError> {
         let mgr = ctx.context();
         let Authorization { authorization } = headers.into_inner();
-        let authn = mgr
-            .iam(authorization, None, request_line(&ctx.request))
-            .await?;
+        let authn = mgr.iam(authorization, request_line(&ctx.request)).await?;
         let JobHistoryParams { limit, offset } = query.into_inner();
         Ok(HttpResponseOk(
             mgr.job_history(&authn, limit, offset)

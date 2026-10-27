@@ -113,9 +113,7 @@
           "content": {
             "application/json": {
               "schema": {
-                "nullable": true,
-                "title": "Nullable_String",
-                "type": "string"
+                "$ref": "#/components/schemas/IamRequest"
               }
             }
           },
@@ -127,7 +125,7 @@
             "content": {
               "application/json": {
                 "schema": {
-                  "$ref": "#/components/schemas/Identity"
+                  "$ref": "#/components/schemas/IamResponse"
                 }
               }
             }
@@ -1040,6 +1038,47 @@
           "request_id"
         ]
       },
+      "IamRequest": {
+        "description": "Login evidence that accompanies initial credentials.",
+        "type": "object",
+        "properties": {
+          "public_key": {
+            "nullable": true,
+            "description": "The key that signed the credentials.",
+            "type": "string"
+          },
+          "receipt": {
+            "nullable": true,
+            "description": "Another server's receipt for the credentials.",
+            "allOf": [
+              {
+                "$ref": "#/components/schemas/LoginReceipt"
+              }
+            ]
+          }
+        }
+      },
+      "IamResponse": {
+        "description": "The result of a successful login.",
+        "type": "object",
+        "properties": {
+          "identity": {
+            "$ref": "#/components/schemas/Identity"
+          },
+          "receipt": {
+            "nullable": true,
+            "description": "A receipt for the login, present when the server issues receipts.",
+            "allOf": [
+              {
+                "$ref": "#/components/schemas/LoginReceipt"
+              }
+            ]
+          }
+        },
+        "required": [
+          "identity"
+        ]
+      },
       "Identity": {
         "description": "An authenticated identity.",
         "type": "object",
@@ -1405,6 +1444,28 @@
             ],
             "additionalProperties": false
           }
+        ]
+      },
+      "LoginReceipt": {
+        "description": "A sush server's signed statement that it verified a login.",
+        "type": "object",
+        "properties": {
+          "cert_chain": {
+            "description": "The issuing server's vouched certificate, then the platform chain, PEM encoded and newline separated.",
+            "type": "string"
+          },
+          "signature": {
+            "description": "The issuing server's signature over the login's credentials.",
+            "allOf": [
+              {
+                "$ref": "#/components/schemas/EncodedSignature"
+              }
+            ]
+          }
+        },
+        "required": [
+          "cert_chain",
+          "signature"
         ]
       },
       "Nonce": {

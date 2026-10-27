@@ -1050,6 +1050,10 @@ pub fn pem_cert_chain(certs: Vec<Certificate>) -> Result<String, KeyError> {
 /// What went wrong handling a key, signature, or certificate.
 #[derive(Debug, Error)]
 pub enum KeyError {
+    #[error("Certificate chain too long")]
+    ChainTooLong,
+    #[error("Certificate chain too short")]
+    ChainTooShort,
     #[error("DER encoding error: {0}")]
     Der(#[from] x509_cert::der::Error),
     #[error(transparent)]

@@ -24,6 +24,7 @@ bytesize.workspace = true
 chrono.workspace = true
 async-trait.workspace = true
 clap.workspace = true
+dice-mfg-msgs.workspace = true
 dropshot.workspace = true
 ed25519-dalek.workspace = true
 futures.workspace = true
@@ -52,7 +53,7 @@ slog-term.workspace = true
 sprockets-tls.workspace = true
 ssh-key.workspace = true
 sush-api = { path = "../api" }
-sush-common = { path = "../common" }
+sush-common = { path = "../common", features = ["verify-vouchers"] }
 tempfile.workspace = true
 thiserror.workspace = true
 tokio.workspace = true

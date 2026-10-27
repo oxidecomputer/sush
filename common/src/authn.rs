@@ -26,6 +26,7 @@
 
 use std::collections::HashMap;
 use std::fmt;
+use std::iter;
 use std::str::FromStr;
 use std::time::Duration;
 
@@ -37,13 +38,16 @@ use rand_core::OsRng;
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
+use x509_cert::Certificate;
 
 use crate::codephrase_newtype;
 use crate::codephrases::InvalidCodephrase;
 use crate::keys::{
-    EccR, EccS, EncodedSignature, KeyError, KeyId, Signed, SshPublicKey, ToBeSigned,
-    ToBeSignedFields, Verified,
+    EccR, EccS, EncodedSignature, EphemeralKey, KeyError, KeyId, Signed, Signer as _, SshPublicKey,
+    ToBeSigned, ToBeSignedFields, Verified, pem_cert_chain,
 };
+#[cfg(feature = "verify-vouchers")]
+use crate::vouchers::{VoucherRole, verify_voucher};
 
 /// The name of our custom HTTP authentication scheme.
 pub const AUTHN_SCHEME: &str = "Sush";
@@ -482,6 +486,87 @@ impl FromStr for Credentials {
     }
 }
 
+/// The most certificates a receipt's chain may carry. This allows the
+/// vouched cert, the five-cert TQ chain, and two more intermediates.
+pub const MAX_RECEIPT_CHAIN_LEN: usize = 8;
+
+/// A sush server's signed statement that it verified a login.
+#[derive(Clone, Debug, Deserialize, Eq, JsonSchema, PartialEq, Serialize)]
+pub struct LoginReceipt {
+    /// The issuing server's signature over the login's credentials.
+    signature: EncodedSignature,
+
+    /// The issuing server's vouched certificate, then the platform chain,
+    /// PEM encoded and newline separated.
+    cert_chain: String,
+}
+
+impl LoginReceipt {
+    /// Sign a receipt for `credentials` with `key`. The caller must have
+    /// verified `credentials`, and the first cert in `platform` must
+    /// vouch for `key` as a server key.
+    pub async fn new(
+        key: &mut EphemeralKey,
+        platform: &[Certificate],
+        credentials: &Credentials,
+    ) -> Result<Self, KeyError> {
+        let signed = key.sign(ReceiptFields(credentials)).await?;
+        let certs = iter::once(key.cert()).chain(platform).cloned().collect();
+        Ok(Self {
+            signature: signed.signature().clone(),
+            cert_chain: pem_cert_chain(certs)?,
+        })
+    }
+
+    /// Verify that this receipt is signed over `credentials` with a
+    /// vouched server key. Return the platform chain, which the caller
+    /// must verify against its trust anchors.
+    #[cfg(feature = "verify-vouchers")]
+    pub fn verify(&self, credentials: &Credentials) -> Result<Vec<Certificate>, KeyError> {
+        let mut chain = Certificate::load_pem_chain(self.cert_chain.as_bytes())?;
+        if chain.len() > MAX_RECEIPT_CHAIN_LEN {
+            return Err(KeyError::ChainTooLong);
+        }
+        let [cert, platform, ..] = chain.as_slice() else {
+            return Err(KeyError::ChainTooShort);
+        };
+        verify_voucher(VoucherRole::Server, cert, platform)?;
+        Signed::new(
+            ReceiptFields(credentials),
+            KeyId::try_from(cert)?,
+            self.signature.clone(),
+        )
+        .verify_with_cert(cert)?;
+        Ok(chain.split_off(1))
+    }
+}
+
+/// The fields of a login that a receipt signs.
+struct ReceiptFields<'a>(&'a Credentials);
+
+impl ReceiptFields<'_> {
+    const TYPE_NAME: &'static [u8] = b"sush_common::authn::LoginReceipt";
+}
+
+impl ToBeSigned for ReceiptFields<'_> {
+    /// Hash of the labeled login fields.
+    fn to_be_signed(&self) -> Vec<u8> {
+        let Credentials {
+            key_id,
+            nonce,
+            cnonce,
+            epk,
+            signature: _,
+        } = self.0;
+        ToBeSignedFields::new(Self::TYPE_NAME)
+            .field(b"key_id", &key_id.to_be_bytes())
+            .field(b"nonce", &nonce.to_be_bytes())
+            .field(b"cnonce", &cnonce.to_be_bytes())
+            .field(b"epk", &epk.to_be_bytes())
+            .finish()
+    }
+}
+
 /// An authenticated identity.
 #[derive(Clone, Debug, Deserialize, Eq, JsonSchema, PartialEq, Serialize)]
 pub struct Identity {
@@ -605,7 +690,7 @@ mod test {
     use x509_cert::name::Name;
     use x509_cert::time::Validity;
 
-    use crate::keys::{EphemeralKey, KeyType, Signer as _};
+    use crate::keys::KeyType;
 
     use super::*;
 

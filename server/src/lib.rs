@@ -30,6 +30,7 @@ pub mod output;
 pub mod proxy;
 pub mod pty;
 pub mod rack;
+pub mod receipts;
 pub mod server;
 pub mod spawn;
 pub mod state;

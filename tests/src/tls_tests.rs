@@ -7,7 +7,7 @@
 //! the vouchers that verify against its roots; see RFD 620 §4.6.2.1.
 
 use std::collections::BTreeMap;
-use std::fs::{read, read_to_string};
+use std::fs::read_to_string;
 use std::net::SocketAddr;
 use std::sync::Arc;
 
@@ -16,7 +16,7 @@ use dropshot::{ConfigDropshot, HttpServer, ServerBuilder};
 use function_name::named;
 use slog::Logger;
 use sprockets_tls_test_utils::{
-    cert_path, certlist_path, device_id_prefix, platform_id_prefix, private_key_path, root_prefix,
+    cert_path, certlist_path, device_id_prefix, platform_id_prefix, private_key_path,
     signer_prefix, sprockets_auth_prefix,
 };
 use tempfile::TempDir;
@@ -24,8 +24,8 @@ use tokio::sync::watch;
 use tokio::test;
 use tokio_util::sync::CancellationToken;
 use x509_cert::Certificate;
-use x509_cert::der::DecodePem as _;
 
+use sush_api::IamRequest;
 use sush_api::sush_api_mod::api_description;
 use sush_client::tls::client as tls_client;
 use sush_client::{AuthzSigner, Client, Error as ClientError};
@@ -35,8 +35,8 @@ use sush_server::proxy::{Sleds, Targets, platform_tls};
 use sush_server::{ApiServer, JobManager, ProxyServer};
 
 use crate::test_utils::{
-    authz, crafted_proxy_pems, manager_and_test_root, test_baseboard_id, test_logger, test_pki,
-    vouched_proxy_pems,
+    authz, crafted_proxy_pems, manager_and_test_root, pki_roots, test_baseboard_id, test_logger,
+    test_pki, vouched_proxy_pems,
 };
 
 fn local_addr() -> SocketAddr {
@@ -98,12 +98,6 @@ impl ProxiedServer {
     }
 }
 
-/// The root cert of `pki`, as the platform roots a client takes.
-fn pki_roots(pki: &Utf8PathBuf) -> Vec<Certificate> {
-    let pem = read(cert_path(pki.clone(), &root_prefix())).unwrap();
-    vec![Certificate::from_pem(&pem).unwrap()]
-}
-
 /// A client rooted at `roots` must fail its handshake with `url`.
 /// Only a transport-level error counts: an HTTP response, even an
 /// error, means the handshake succeeded.
@@ -113,7 +107,7 @@ async fn refuse_handshake(url: &str, roots: Vec<Certificate>) {
         tls_client(roots, None).unwrap(),
         AuthzSigner::default(),
     );
-    match client.iam().body(None).send().await {
+    match client.iam().body(IamRequest::default()).send().await {
         Err(ClientError::CommunicationError(_)) => (),
         Err(other) => panic!("expected a refused handshake: {other}"),
         Ok(_) => panic!("expected a refused handshake, request succeeded"),
@@ -136,7 +130,12 @@ async fn client_tls_proxy_server() {
         tls_client(pki_roots(&pki), None).unwrap(),
         signer.clone(),
     );
-    let ClientError::ErrorResponse(unauthz) = client.iam().body(None).send().await.unwrap_err()
+    let ClientError::ErrorResponse(unauthz) = client
+        .iam()
+        .body(IamRequest::default())
+        .send()
+        .await
+        .unwrap_err()
     else {
         panic!("expected error response")
     };
@@ -145,12 +144,12 @@ async fn client_tls_proxy_server() {
     signer.set(Some(credentials));
     let iam = client
         .iam()
-        .body(None)
+        .body(IamRequest::default())
         .send()
         .await
         .expect("can't authenticate")
         .into_inner();
-    assert_eq!(iam, identity, "who am I?");
+    assert_eq!(iam.identity, identity, "who am I?");
 
     proxied.stop().await;
 }

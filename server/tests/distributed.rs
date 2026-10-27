@@ -38,6 +38,7 @@ use sush_server::locker::Locker;
 use sush_server::locker::bookmark::BOOKMARK;
 use sush_server::messages::v0::{Event, JobEvent, Message};
 use sush_server::output::JobOutputDir;
+use sush_server::receipts::Receipts;
 use sush_server::state::GossipUniverse;
 use sush_server::{JobError, JobManager, seed_gossip};
 
@@ -103,6 +104,7 @@ impl Sled {
             cubbies_rx,
             universe.clone(),
             linked,
+            Receipts::none(),
             &locker,
             from_ref(root_pem),
             shutdown.clone(),

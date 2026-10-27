@@ -136,6 +136,8 @@ progenitor::generate_api!(
     replace = {
         Access = sush_common::jobs::Access,
         BaseboardId = sled_hardware_types::BaseboardId,
+        IamRequest = sush_api::IamRequest,
+        IamResponse = sush_api::IamResponse,
         Identity = sush_common::authn::Identity,
         Session = sush_common::jobs::Session,
         SessionId = sush_common::jobs::SessionId,

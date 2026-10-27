@@ -202,7 +202,7 @@ impl Baseboards {
 }
 
 /// The baseboard a platform id names (`prefix:part:revision:serial`).
-fn baseboard(log: &Logger, platform_id: &str) -> Option<BaseboardId> {
+pub(crate) fn baseboard(log: &Logger, platform_id: &str) -> Option<BaseboardId> {
     let mut fields = platform_id.split(':');
     match (fields.nth(1), fields.nth(1)) {
         (Some(part_number), Some(serial_number)) => Some(BaseboardId {

@@ -57,6 +57,12 @@ impl LinkedBaseboards {
         Self(rx)
     }
 
+    /// A set that never changes.
+    pub fn fixed(sleds: BTreeSet<BaseboardId>) -> Self {
+        let (_tx, rx) = watch::channel(sleds);
+        Self(rx)
+    }
+
     pub fn borrow(&self) -> watch::Ref<'_, BTreeSet<BaseboardId>> {
         self.0.borrow()
     }

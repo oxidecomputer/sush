@@ -42,7 +42,7 @@ use tokio_tungstenite::tungstenite::protocol::Role;
 use x509_cert::Certificate;
 use x509_cert::der::DecodePem as _;
 
-use sush_api::{ErrorCode, JobWait};
+use sush_api::{ErrorCode, IamRequest, IamResponse, JobWait};
 use sush_common::authn::{
     AuthnError, Challenge, ChallengeResponse, Credentials, Identity, RequestKey,
 };
@@ -918,19 +918,37 @@ async fn authenticate<E>(
     let mut request = client
         .iam()
         .authorization(credentials.to_string())
-        .body(public_key.to_string());
+        .body(IamRequest::from(public_key.clone()));
     if let Some(via) = via {
         request = request.via(via.to_string());
     }
-    let identity = match request.send().await {
-        Ok(identity) => identity.into_inner(),
+    let IamResponse { identity, receipt } = match request.send().await {
+        Ok(response) => response.into_inner(),
         Err(error) if error.status() == Some(StatusCode::UNAUTHORIZED) => {
             let server = client.version().send().await.ok().map(|v| v.into_inner());
             return Err(login_refused(server, error.into()));
         }
         Err(error) => return Err(error.into()),
     };
-    Ok((identity, Authz::new(credentials, key)))
+    let mut authz = Authz::new(credentials, key);
+    authz.receipt = receipt.map(|receipt| IamRequest::new(public_key, Some(receipt)));
+    Ok((identity, authz))
+}
+
+/// Present the receipt in `authz` to sled `via`, and return whether
+/// the sled accepted it.
+async fn present_receipt(client: &Client, via: Option<&BaseboardId>, authz: Authz) -> bool {
+    let Some(receipt) = authz.receipt else {
+        return false;
+    };
+    let mut request = client
+        .iam()
+        .authorization(authz.credentials.to_string())
+        .body(receipt);
+    if let Some(via) = via {
+        request = request.via(via.to_string());
+    }
+    request.send().await.is_ok()
 }
 
 /// A refused login usually indicates build skew rather than a bad key.
@@ -960,8 +978,8 @@ where
 }
 
 /// Like [`with_login`], for a request that the proxy routes to sled
-/// `via`. A sled that refuses a request answers with a login challenge
-/// that only it can verify, so the login goes to `via` as well.
+/// `via`. If `via` refuses the request, present the current login's
+/// receipt to it, and if it refuses that too, log in at `via`.
 async fn with_login_via<T, E, Req>(
     ctx: &mut impl CommandContext,
     client: &Client,
@@ -974,6 +992,7 @@ where
 {
     let signer = ctx.authz_signer();
     let mut generation = signer.generation();
+    let mut presented = false;
     let mut logged_in = false;
     loop {
         match make_request().await {
@@ -981,9 +1000,16 @@ where
                 if err.status() == StatusCode::UNAUTHORIZED && !logged_in =>
             {
                 if let Some(_login) = signer.login_needed(generation).await {
-                    let (_identity, authz) = authenticate(ctx, client, via, err).await?;
-                    ctx.set_credentials(Some(authz));
-                    logged_in = true;
+                    if !presented
+                        && let Some(authz) = signer.get()
+                        && present_receipt(client, via, authz).await
+                    {
+                        presented = true;
+                    } else {
+                        let (_identity, authz) = authenticate(ctx, client, via, err).await?;
+                        ctx.set_credentials(Some(authz));
+                        logged_in = true;
+                    }
                 }
                 generation = signer.generation();
             }
@@ -1029,10 +1055,9 @@ async fn iam(
         }
 
         IdentityCommand::Login => {
-            let identity = with_login(ctx, client, async || client.iam().body(None).send().await)
-                .await?
-                .into_inner();
-            ctx.iam(&identity)
+            let request = async || client.iam().body(IamRequest::default()).send().await;
+            let response = with_login(ctx, client, request).await?.into_inner();
+            ctx.iam(&response.identity)
         }
     }
 }

@@ -4929,6 +4929,7 @@ dependencies = [
  "chrono",
  "ciborium",
  "clap",
+ "dice-mfg-msgs",
  "dropshot",
  "ed25519-dalek",
  "function_name",

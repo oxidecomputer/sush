@@ -26,7 +26,7 @@ use tokio_util::sync::CancellationToken;
 use x509_cert::Certificate;
 use x509_cert::der::DecodePem as _;
 
-use sush_api::{JobStartParams, JobStopParams, JobWait};
+use sush_api::{IamRequest, IamResponse, JobStartParams, JobStopParams, JobWait};
 use sush_common::authn::{
     Authn, BoundRequest, Credentials, IDENTITY_IDLE_TTL, IDENTITY_MAX_TTL, Identity, NONCE_TTL,
     Nonce, RequestVerifier, SeqWindow,
@@ -36,7 +36,7 @@ use sush_common::jobs::{
     SessionPreimage, SessionSeq, SessionServerNonce, SessionSignerNonce, SessionSushNonce,
     SignedJob,
 };
-use sush_common::keys::{KeyError, KeyId, SshPublicKey};
+use sush_common::keys::{KeyError, KeyId};
 use sush_common::targets::{Cubbies, SledHealth, SledVersion, Target, UnknownCubby};
 use sush_common::version::LONG_VERSION;
 
@@ -48,6 +48,7 @@ use crate::locker::Locker;
 use crate::locker::boundary::BoundaryStore;
 use crate::messages::v0::{IdentityRequest, JobRequest, Request, SessionRequest};
 use crate::output::{JobOutputDir, JobOutputFileStream};
+use crate::receipts::Receipts;
 use crate::state::{GossipUniverse, State, StateManager};
 
 /// Maximum number of cached identities.
@@ -93,6 +94,7 @@ pub struct JobManager {
     output_dir: JobOutputDir,
     own_baseboard: BaseboardId,
     linked: LinkedBaseboards,
+    receipts: Receipts,
     state: watch::Receiver<State>, // from the state manager
     tx_req: mpsc::Sender<Request>, // to the state manager
     join_state: Option<JoinHandle<()>>,
@@ -110,6 +112,7 @@ impl JobManager {
         cubbies: watch::Receiver<Cubbies>,
         universe: watch::Receiver<GossipUniverse>,
         linked: LinkedBaseboards,
+        receipts: Receipts,
         locker: &Locker,
         anchors: &[impl AsRef<Path>],
         shutdown: CancellationToken,
@@ -123,6 +126,7 @@ impl JobManager {
             cubbies,
             universe,
             linked,
+            receipts,
             locker,
             &anchors,
             shutdown,
@@ -139,6 +143,7 @@ impl JobManager {
         cubbies: watch::Receiver<Cubbies>,
         universe: watch::Receiver<GossipUniverse>,
         linked: LinkedBaseboards,
+        receipts: Receipts,
         locker: &Locker,
         anchors: &[Certificate],
         shutdown: CancellationToken,
@@ -168,6 +173,7 @@ impl JobManager {
             session_server_nonce,
             own_baseboard,
             linked,
+            receipts,
             output_dir,
             state: rx_state,
             tx_req,
@@ -249,15 +255,26 @@ impl JobManager {
 
     // Identity management.
 
-    /// Authenticate initial credentials at `iam`, or authorize a bound
-    /// request against a cached identity. `request` is the request
-    /// line: the method and the target exactly as received.
+    /// Authorize a bound request.
     pub async fn iam(
         &self,
         authorization: Option<String>,
-        public_key: Option<SshPublicKey>,
         request: (&str, &str),
     ) -> Result<Identity, JobError> {
+        self.login(authorization, IamRequest::default(), request)
+            .await
+            .map(|response| response.identity)
+    }
+
+    /// Authenticate initial credentials at `iam`, or authorize a bound
+    /// request. Initial credentials must sign a nonce this server issued,
+    /// or come with a receipt from a linked sled.
+    pub async fn login(
+        &self,
+        authorization: Option<String>,
+        login: IamRequest,
+        request: (&str, &str),
+    ) -> Result<IamResponse, JobError> {
         // NB: Do not use the `?` operator in this function! We must ensure
         // that all authentication failures are logged and receive a proper
         // 401 Unauthorized response with a fresh nonce.
@@ -333,7 +350,10 @@ impl JobManager {
                 }
                 cached.last_used = Instant::now();
                 debug!(self.log, "bound request authorized"; "key_id" => %bound.key_id);
-                return Ok(cached.identity.clone());
+                return Ok(IamResponse {
+                    identity: cached.identity.clone(),
+                    receipt: None,
+                });
             }
             Authn::Initial(credentials) => *credentials,
         };
@@ -345,6 +365,51 @@ impl JobManager {
             unauthorized!("initial credentials presented outside iam");
         }
 
+        let IamRequest {
+            public_key,
+            receipt,
+        } = login;
+        let Some(public_key) = public_key else {
+            unauthorized!("missing public key");
+        };
+
+        // Verify the supplied credentials.
+        if public_key.key_id().ok() != Some(key_id.clone()) {
+            unauthorized!("invalid key ID");
+        }
+        let response = credentials.clone().into_challenge_response();
+        let verified = try_authn!(response.clone().verify_with_ssh_public_key(&public_key));
+        let identity = try_authn!(Identity::new(public_key.clone(), verified, now));
+        let cached = CachedIdentity {
+            identity: identity.clone(),
+            verifier: credentials.epk.clone(),
+            window: SeqWindow::default(),
+            authenticated: Instant::now(),
+            last_used: Instant::now(),
+        };
+
+        // Accept a valid receipt from a linked sled, but don't gossip about it.
+        if let Some(receipt) = receipt {
+            let issuer = try_authn!(self.receipts.verify(&receipt, &credentials));
+            if !self.linked.borrow().contains(&issuer) {
+                unauthorized!(format!("receipt from unlinked sled {issuer}"));
+            }
+            debug!(self.log, "adopting login with receipt"; "key_id" => %key_id, "issuer" => %issuer);
+            let mut identities = self.identities.lock().await;
+            let key = (key_id, nonce);
+            return Ok(IamResponse {
+                identity: if let Some(entry) = identities.get(&key)
+                    && entry.is_still_valid()
+                {
+                    entry.identity.clone()
+                } else {
+                    identities.put(key, cached);
+                    identity
+                },
+                receipt: None,
+            });
+        }
+
         // Claim the nonce.
         let Some(minted) = self.nonces.lock().await.pop(&nonce) else {
             unauthorized!("nonce not found");
@@ -353,34 +418,18 @@ impl JobManager {
             unauthorized!("nonce expired");
         };
 
-        // Verify the supplied credentials.
-        let Some(public_key) = public_key else {
-            unauthorized!("missing public key");
-        };
-        if public_key.key_id().ok() != Some(key_id.clone()) {
-            unauthorized!("invalid key ID");
-        }
-        let response = credentials.clone().into_challenge_response();
-        let verified = try_authn!(response.clone().verify_with_ssh_public_key(&public_key));
-        let identity = try_authn!(Identity::new(public_key.clone(), verified, now));
-
         // Authenticated! Cache the identity and its request verifier,
         // and gossip the evidence.
         debug!(self.log, "authenticated credentials for identity"; "key_id" => %key_id);
-        self.identities.lock().await.put(
-            (key_id.clone(), nonce),
-            CachedIdentity {
-                identity: identity.clone(),
-                verifier: credentials.epk,
-                window: SeqWindow::default(),
-                authenticated: Instant::now(),
-                last_used: Instant::now(),
-            },
-        );
+        self.identities
+            .lock()
+            .await
+            .put((key_id.clone(), nonce), cached);
+        let receipt = self.receipts.issue(&credentials).await;
         let login = IdentityRequest::Login(public_key.to_openssh()?, response);
         self.identity_request(key_id, login)
             .await
-            .map(|()| identity)
+            .map(|()| IamResponse { identity, receipt })
     }
 
     pub async fn identities(&self, _authn: &Identity) -> Result<Vec<Identity>, JobError> {

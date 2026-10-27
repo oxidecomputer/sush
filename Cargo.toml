@@ -22,6 +22,7 @@ chrono = { version = "0.4", features = ["serde"] }
 ciborium = "0.2"
 clap = { version = "4", features = ["derive", "env", "wrap_help"] }
 crypto-bigint = "0.5"
+dice-mfg-msgs = { git = "https://github.com/oxidecomputer/dice-util", rev = "4a39ef08d81e5177edee0bddb1146032aa21074d", features = ["std"] }
 dropshot = "0.17"
 ed25519-dalek = { version = "2", features = ["pkcs8", "rand_core"] }
 function_name = "0.3"

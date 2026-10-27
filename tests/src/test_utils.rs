@@ -5,7 +5,7 @@
 //! Integration test utilities.
 
 use std::convert::Infallible;
-use std::fs::{read_to_string, write};
+use std::fs::{read, read_to_string, write};
 use std::sync::OnceLock;
 use std::time::Duration;
 
@@ -21,14 +21,18 @@ use rand_core::{OsRng, RngCore as _};
 use sled_hardware_types::BaseboardId;
 use slog::{Drain as _, Logger, o};
 use slog_term::{FullFormat, PlainSyncDecorator, TestStdoutWriter};
-use sprockets_tls_test_utils::{certlist_path, private_key_path, sprockets_auth_prefix};
+use sprockets_tls_test_utils::{
+    cert_path, certlist_path, private_key_path, root_prefix, sprockets_auth_prefix,
+};
 use tempfile::TempDir;
 use tokio::sync::watch;
 use tokio_util::sync::CancellationToken;
+use x509_cert::Certificate;
+use x509_cert::der::DecodePem as _;
 use x509_cert::name::Name;
 use x509_cert::time::Validity;
 
-use sush_api::{JobStartParams, JobWait};
+use sush_api::{IamRequest, JobStartParams, JobWait};
 use sush_client::context::Authz;
 use sush_client::{Client, ResponseValue};
 use sush_common::authn::{Challenge, ChallengeResponse, Credentials, Identity, Nonce, RequestKey};
@@ -44,6 +48,7 @@ use sush_server::executor::PathIsolation;
 use sush_server::gossip::{LinkedBaseboards, Universe};
 use sush_server::locker::Locker;
 use sush_server::output::{JobOutputDir, JobOutputFileStream};
+use sush_server::receipts::Receipts;
 use sush_server::state::GossipNetwork;
 use sush_server::{JobManager, seed_gossip};
 
@@ -195,11 +200,31 @@ pub fn test_pki(prefix: &'static str) -> (TempDir, Utf8PathBuf) {
 /// A fresh proxy key vouched for by the test PKI's platform identity,
 /// written under `pki` as the key and chain PEMs `platform_tls` takes.
 pub fn vouched_proxy_pems(pki: &Utf8PathBuf) -> (Utf8PathBuf, Utf8PathBuf) {
+    let (signer_pem, chain_pem) = platform_identity_pems(pki);
+    crafted_proxy_pems(pki, &signer_pem, &chain_pem)
+}
+
+/// The platform roots of `pki`.
+pub fn pki_roots(pki: &Utf8PathBuf) -> Vec<Certificate> {
+    let pem = read(cert_path(pki.clone(), &root_prefix())).unwrap();
+    vec![Certificate::from_pem(&pem).unwrap()]
+}
+
+/// The baseboard named by the test PKI's platform identity.
+pub fn pki_baseboard() -> BaseboardId {
+    BaseboardId {
+        part_number: "913-0000019".to_string(),
+        serial_number: "2FAKE001".to_string(),
+    }
+}
+
+/// The test PKI's platform identity key and chain, as PEM.
+fn platform_identity_pems(pki: &Utf8PathBuf) -> (String, String) {
     let signer_pem = read_to_string(private_key_path(pki.clone(), &sprockets_auth_prefix(1)))
         .expect("can't read the platform key");
     let chain_pem = read_to_string(certlist_path(pki.clone(), &sprockets_auth_prefix(1)))
         .expect("can't read the platform chain");
-    crafted_proxy_pems(pki, &signer_pem, &chain_pem)
+    (signer_pem, chain_pem)
 }
 
 /// A fresh proxy key vouched for by the `signer_pem` key and served
@@ -225,6 +250,35 @@ pub fn crafted_proxy_pems(
     let cert_pem = pem_cert_chain(vec![vouched.cert().clone()]).unwrap();
     write(&chain_path, format!("{cert_pem}{chain_pem}")).unwrap();
     (key_path, chain_path)
+}
+
+/// A fresh key vouched for `role` by the test PKI's platform identity,
+/// and that identity's chain.
+pub fn vouched_key(pki: &Utf8PathBuf, role: VoucherRole) -> (EphemeralKey, Vec<Certificate>) {
+    let (signer_pem, chain_pem) = platform_identity_pems(pki);
+    let signer = SigningKey::from_pkcs8_pem(&signer_pem).expect("can't parse the vouching key");
+    let vouched = EphemeralKey::new_vouched(
+        role,
+        KeyType::Ed25519,
+        "CN=sush-server".parse().unwrap(),
+        Validity::from_now(Duration::from_secs(600)).unwrap(),
+        |digest| Ok::<_, Infallible>(signer.sign(digest).to_vec()),
+    )
+    .expect("can't generate a vouched cert");
+    let platform =
+        Certificate::load_pem_chain(chain_pem.as_bytes()).expect("can't parse the platform chain");
+    (vouched, platform)
+}
+
+/// Login credentials for `key`, as a client presents them to `/iam`.
+pub async fn fake_credentials(key: &mut EphemeralKey) -> Credentials {
+    let challenge = Challenge::new(Nonce::random());
+    let response = ChallengeResponse::new(challenge, RequestKey::new().verifier());
+    let signed = key.sign(response).await.unwrap();
+    let verified = signed
+        .verify_with_ssh_public_key(&key.ssh_public_key())
+        .unwrap();
+    Credentials::new(verified)
 }
 
 pub async fn fake_identity(key: &mut EphemeralKey) -> Identity {
@@ -337,6 +391,22 @@ pub async fn manager_test_root_and_peer(
     TempDir,
     CancellationToken,
 ) {
+    manager_with_receipts(log, LinkedBaseboards::lonely(), Receipts::none()).await
+}
+
+/// Like [`manager_test_root_and_peer`], but with the given linked sleds
+/// and receipt handling.
+pub async fn manager_with_receipts(
+    log: Logger,
+    linked: LinkedBaseboards,
+    receipts: Receipts,
+) -> (
+    JobManager,
+    EphemeralKey,
+    GossipNetwork,
+    TempDir,
+    CancellationToken,
+) {
     let dir = TempDir::with_prefix("sush-").unwrap();
     let seed = null_gossip().await;
     let peer = seed.clone();
@@ -350,7 +420,8 @@ pub async fn manager_test_root_and_peer(
         test_baseboard_id(),
         no_cubbies(),
         gossip,
-        LinkedBaseboards::lonely(),
+        linked,
+        receipts,
         &Locker::null(),
         &[root.cert().to_owned()],
         shutdown.clone(),
@@ -396,10 +467,11 @@ pub async fn authz<E>(
     let identity = client
         .iam()
         .authorization(credentials.to_string())
-        .body(public_key.to_string())
+        .body(IamRequest::from(public_key))
         .send()
         .await
         .unwrap()
-        .into_inner();
+        .into_inner()
+        .identity;
     (identity, Authz::new(credentials, request_key))
 }

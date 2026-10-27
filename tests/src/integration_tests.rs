@@ -30,8 +30,8 @@ use sprockets_tls_test_utils::{cert_path, root_prefix};
 use x509_cert::Certificate;
 use x509_cert::der::DecodePem as _;
 
-use sush_api::JobWait;
 use sush_api::sush_api_mod::api_description;
+use sush_api::{IamRequest, JobWait};
 use sush_client::tls::client as tls_client;
 use sush_client::tunnel::{Tunnel, pipe};
 use sush_client::{AuthzSigner, Client, Error as ClientError};
@@ -75,7 +75,12 @@ async fn client_server() {
     let addr = server.local_addr();
     let signer = AuthzSigner::default();
     let client = Client::new(&format!("http://{addr}"), signer.clone());
-    let ClientError::ErrorResponse(unauthz) = client.iam().body(None).send().await.unwrap_err()
+    let ClientError::ErrorResponse(unauthz) = client
+        .iam()
+        .body(IamRequest::default())
+        .send()
+        .await
+        .unwrap_err()
     else {
         panic!("expected error response")
     };
@@ -84,12 +89,12 @@ async fn client_server() {
     signer.set(Some(credentials));
     let iam = client
         .iam()
-        .body(None)
+        .body(IamRequest::default())
         .send()
         .await
         .expect("can't authenticate")
         .into_inner();
-    assert_eq!(iam, identity, "who am I?");
+    assert_eq!(iam.identity, identity, "who am I?");
 
     // Start a session and run a job.
     let (session_id, body) = http_session_ceremony(&client, 1).await;
@@ -180,7 +185,12 @@ async fn client_proxy_server() {
     // Connect and authenticate to the server via the proxy.
     let signer = AuthzSigner::default();
     let client = Client::new(&format!("http://{proxy_addr}"), signer.clone());
-    let ClientError::ErrorResponse(unauthz) = client.iam().body(None).send().await.unwrap_err()
+    let ClientError::ErrorResponse(unauthz) = client
+        .iam()
+        .body(IamRequest::default())
+        .send()
+        .await
+        .unwrap_err()
     else {
         panic!("expected error response")
     };
@@ -189,12 +199,12 @@ async fn client_proxy_server() {
     signer.set(Some(credentials));
     let iam = client
         .iam()
-        .body(None)
+        .body(IamRequest::default())
         .send()
         .await
         .expect("can't authenticate")
         .into_inner();
-    assert_eq!(iam, identity, "who am I?");
+    assert_eq!(iam.identity, identity, "who am I?");
 
     // Attach to an interactive job through the proxy, routed by the
     // target path segment, and echo bytes over the bridged upgrade.
@@ -286,7 +296,12 @@ async fn client_proxy_server() {
 
     // With no sleds in the table, everything is refused.
     tx_targets.send_replace(BTreeMap::new());
-    let unavailable = client.iam().body(None).send().await.unwrap_err();
+    let unavailable = client
+        .iam()
+        .body(IamRequest::default())
+        .send()
+        .await
+        .unwrap_err();
     if let ClientError::UnexpectedResponse(response) = unavailable {
         assert_eq!(response.status(), 503);
     }
@@ -349,7 +364,12 @@ async fn interactive_job() {
     let addr = server.local_addr();
     let signer = AuthzSigner::default();
     let client = Client::new(&format!("http://{addr}"), signer.clone());
-    let ClientError::ErrorResponse(unauthz) = client.iam().body(None).send().await.unwrap_err()
+    let ClientError::ErrorResponse(unauthz) = client
+        .iam()
+        .body(IamRequest::default())
+        .send()
+        .await
+        .unwrap_err()
     else {
         panic!("expected error response")
     };
@@ -358,12 +378,12 @@ async fn interactive_job() {
     signer.set(Some(credentials));
     let iam = client
         .iam()
-        .body(None)
+        .body(IamRequest::default())
         .send()
         .await
         .expect("can't authenticate")
         .into_inner();
-    assert_eq!(iam, identity, "who am I?");
+    assert_eq!(iam.identity, identity, "who am I?");
 
     // Start a session and run an interactive job.
     let (session_id, body) = http_session_ceremony(&client, 1).await;
@@ -468,8 +488,12 @@ async fn interactive_job() {
     let mut guest_key = ephemeral_test_root();
     let guest_signer = AuthzSigner::default();
     let guest_client = Client::new(&format!("http://{addr}"), guest_signer.clone());
-    let ClientError::ErrorResponse(unauthz) =
-        guest_client.iam().body(None).send().await.unwrap_err()
+    let ClientError::ErrorResponse(unauthz) = guest_client
+        .iam()
+        .body(IamRequest::default())
+        .send()
+        .await
+        .unwrap_err()
     else {
         panic!("expected error response")
     };
@@ -651,7 +675,12 @@ async fn streaming_job() {
     let addr = server.local_addr();
     let signer = AuthzSigner::default();
     let client = Client::new(&format!("http://{addr}"), signer.clone());
-    let ClientError::ErrorResponse(unauthz) = client.iam().body(None).send().await.unwrap_err()
+    let ClientError::ErrorResponse(unauthz) = client
+        .iam()
+        .body(IamRequest::default())
+        .send()
+        .await
+        .unwrap_err()
     else {
         panic!("expected error response")
     };
@@ -795,7 +824,12 @@ async fn streaming_job_linger() {
     let addr = server.local_addr();
     let signer = AuthzSigner::default();
     let client = Client::new(&format!("http://{addr}"), signer.clone());
-    let ClientError::ErrorResponse(unauthz) = client.iam().body(None).send().await.unwrap_err()
+    let ClientError::ErrorResponse(unauthz) = client
+        .iam()
+        .body(IamRequest::default())
+        .send()
+        .await
+        .unwrap_err()
     else {
         panic!("expected error response")
     };
@@ -985,7 +1019,12 @@ async fn client_tunnels_through_nexus() {
         tls_client(roots, None).unwrap(),
         signer.clone(),
     );
-    let ClientError::ErrorResponse(unauthz) = client.iam().body(None).send().await.unwrap_err()
+    let ClientError::ErrorResponse(unauthz) = client
+        .iam()
+        .body(IamRequest::default())
+        .send()
+        .await
+        .unwrap_err()
     else {
         panic!("expected error response")
     };
@@ -994,12 +1033,12 @@ async fn client_tunnels_through_nexus() {
     signer.set(Some(credentials));
     let iam = client
         .iam()
-        .body(None)
+        .body(IamRequest::default())
         .send()
         .await
         .expect("can't authenticate")
         .into_inner();
-    assert_eq!(iam, identity, "who am I?");
+    assert_eq!(iam.identity, identity, "who am I?");
 
     // A tunnel whose Nexus URL names an unresolvable host still works
     // when --nexus-resolve supplies the address.
@@ -1014,7 +1053,12 @@ async fn client_tunnels_through_nexus() {
         tls_client(roots, None).unwrap(),
         signer.clone(),
     );
-    let ClientError::ErrorResponse(unauthz) = client.iam().body(None).send().await.unwrap_err()
+    let ClientError::ErrorResponse(unauthz) = client
+        .iam()
+        .body(IamRequest::default())
+        .send()
+        .await
+        .unwrap_err()
     else {
         panic!("expected error response")
     };
@@ -1022,10 +1066,10 @@ async fn client_tunnels_through_nexus() {
     signer.set(Some(credentials));
     let iam = client
         .iam()
-        .body(None)
+        .body(IamRequest::default())
         .send()
         .await
         .expect("can't authenticate via the resolved tunnel")
         .into_inner();
-    assert_eq!(iam, identity, "who am I, resolved?");
+    assert_eq!(iam.identity, identity, "who am I, resolved?");
 }

@@ -23,7 +23,7 @@ use tokio::time::{sleep, timeout};
 use tokio_util::sync::CancellationToken;
 use x509_cert::time::Validity;
 
-use sush_api::{JobStartParams, JobStopParams, JobWait};
+use sush_api::{IamRequest, JobStartParams, JobStopParams, JobWait};
 use sush_client::context::Authz;
 use sush_common::authn::{Challenge, ChallengeResponse, Credentials, Identity, Nonce, RequestKey};
 use sush_common::jobs::{
@@ -38,6 +38,7 @@ use sush_server::io::BATCH_OUTPUT_BUFFER_SIZE;
 use sush_server::locker::Locker;
 use sush_server::messages::v0::{IdentityRequest, Message, Request, SessionRequest};
 use sush_server::output::{JobOutputDir, OutputDirs};
+use sush_server::receipts::Receipts;
 use sush_server::{JobError, JobManager};
 
 use crate::test_utils::{
@@ -1032,6 +1033,7 @@ async fn cubby_targets() {
         cubbies_rx,
         Universe::isolated(null_gossip().await),
         LinkedBaseboards::lonely(),
+        Receipts::none(),
         &Locker::null(),
         &[root.cert().to_owned()],
         CancellationToken::new(),
@@ -1109,6 +1111,7 @@ async fn root_certs_from_files() {
         no_cubbies(),
         Universe::isolated(null_gossip().await),
         LinkedBaseboards::lonely(),
+        Receipts::none(),
         &Locker::null(),
         &[path],
         CancellationToken::new(),
@@ -1165,6 +1168,7 @@ async fn bad_root_cert_files() {
                 no_cubbies(),
                 Universe::isolated(null_gossip().await),
                 LinkedBaseboards::lonely(),
+                Receipts::none(),
                 &Locker::null(),
                 &[path],
                 CancellationToken::new(),
@@ -1197,6 +1201,7 @@ async fn job_output_dir_moves() {
         no_cubbies(),
         Universe::isolated(null_gossip().await),
         LinkedBaseboards::lonely(),
+        Receipts::none(),
         &Locker::null(),
         &[root.cert().to_owned()],
         CancellationToken::new(),
@@ -1303,6 +1308,7 @@ async fn universe_swap() {
         no_cubbies(),
         universe_rx,
         LinkedBaseboards::lonely(),
+        Receipts::none(),
         &Locker::null(),
         &[root.cert().to_owned()],
         CancellationToken::new(),
@@ -1674,7 +1680,7 @@ async fn gossiped_identities() {
     let authn = timeout(Duration::from_secs(30), async {
         loop {
             let header = authz.header("GET", "/sessions");
-            match mgr.iam(Some(header), None, ("GET", "/sessions")).await {
+            match mgr.iam(Some(header), ("GET", "/sessions")).await {
                 Ok(authn) => break authn,
                 Err(_) => sleep(Duration::from_millis(50)).await,
             }
@@ -1687,11 +1693,7 @@ async fn gossiped_identities() {
     // The fabricated login was processed before the real one on the
     // same handle, and registered nothing.
     let header = bogus_authz.header("GET", "/sessions");
-    assert!(
-        mgr.iam(Some(header), None, ("GET", "/sessions"))
-            .await
-            .is_err()
-    );
+    assert!(mgr.iam(Some(header), ("GET", "/sessions")).await.is_err());
 }
 
 /// Attach access: strangers are refused, the starter grants and
@@ -2392,8 +2394,7 @@ async fn output_ranges() {
 async fn iam() {
     let log = test_logger(function_name!());
     let (mgr, mut root, _dir, _shutdown) = manager_and_test_root(log).await;
-    let JobError::Unauthorized(nonce) = mgr.iam(None, None, ("POST", "/iam")).await.unwrap_err()
-    else {
+    let JobError::Unauthorized(nonce) = mgr.iam(None, ("POST", "/iam")).await.unwrap_err() else {
         panic!("should not be authorized yet");
     };
 
@@ -2409,23 +2410,25 @@ async fn iam() {
     credentials.key_id = key_id.clone(); // override cert key ID
 
     // Register our identity. Initial credentials work only at `iam`.
+    let login = IamRequest::from(public_key.clone());
     assert!(
-        mgr.iam(
+        mgr.login(
             Some(credentials.to_string()),
-            Some(public_key.clone()),
+            login.clone(),
             ("GET", "/sessions"),
         )
         .await
         .is_err()
     );
     let identity = mgr
-        .iam(
+        .login(
             Some(credentials.to_string()),
-            Some(public_key.clone()),
+            login.clone(),
             ("POST", "/iam"),
         )
         .await
-        .unwrap();
+        .unwrap()
+        .identity;
     let Identity {
         key_id: iam_key_id,
         public_key: iam_public_key,
@@ -2442,23 +2445,19 @@ async fn iam() {
     let authz = Authz::new(credentials.clone(), request_key);
     let header = authz.header("GET", "/sessions");
     assert_eq!(
-        mgr.iam(Some(header.clone()), None, ("GET", "/sessions"))
+        mgr.iam(Some(header.clone()), ("GET", "/sessions"))
             .await
             .unwrap()
             .key_id,
         key_id,
     );
-    assert!(
-        mgr.iam(Some(header), None, ("GET", "/sessions"))
-            .await
-            .is_err()
-    );
+    assert!(mgr.iam(Some(header), ("GET", "/sessions")).await.is_err());
     let header = authz.header("GET", "/sessions");
-    assert!(mgr.iam(Some(header), None, ("GET", "/jobs")).await.is_err());
+    assert!(mgr.iam(Some(header), ("GET", "/jobs")).await.is_err());
 
     // Replayed initial credentials are rejected: the nonce is spent.
     assert!(
-        mgr.iam(Some(credentials.to_string()), None, ("POST", "/iam"))
+        mgr.login(Some(credentials.to_string()), login, ("POST", "/iam"))
             .await
             .is_err()
     );

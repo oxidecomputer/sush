@@ -25,6 +25,7 @@ use sush_server::gossip::{LinkedBaseboards, Universe};
 use sush_server::locker::Locker;
 use sush_server::manager::JobManager;
 use sush_server::output::JobOutputDir;
+use sush_server::receipts::Receipts;
 use sush_server::server::ApiServer;
 use sush_server::{read_certs, seed_gossip};
 
@@ -112,6 +113,7 @@ async fn main() -> Result<(), String> {
         cubbies,
         gossip,
         LinkedBaseboards::lonely(),
+        Receipts::none(),
         &Locker::null(),
         &anchors,
         shutdown.clone(),
