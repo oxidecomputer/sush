@@ -13,7 +13,6 @@ use std::net::{Ipv6Addr, SocketAddr, SocketAddrV6};
 use std::sync::Arc;
 use std::time::Duration;
 
-use attest_data::{DICE_TCB_INFO, DiceTcbInfo};
 use ed25519_dalek::{Signature, VerifyingKey};
 use rustls::client::danger::{HandshakeSignatureValid, ServerCertVerified, ServerCertVerifier};
 use rustls::pki_types::{CertificateDer, ServerName, UnixTime};
@@ -21,11 +20,11 @@ use rustls::version::TLS13;
 use rustls::{CertificateError, ClientConfig, DigitallySignedStruct, SignatureScheme};
 use slog::{Discard, Logger, o};
 use sprockets_tls::keys::RotCertVerifier;
-use sush_common::keys::{VOUCHER_OID, voucher_digest};
+use sush_common::keys::KeyError;
+use sush_common::vouchers::{VoucherRole, verify_voucher};
 use thiserror::Error;
 use x509_cert::Certificate;
 use x509_cert::der::{Decode as _, DecodePem as _};
-use x509_cert::ext::pkix::BasicConstraints;
 
 /// The same request timeout as the generated default client.
 const TIMEOUT: Duration = Duration::from_secs(600);
@@ -160,7 +159,15 @@ impl ServerCertVerifier for PlatformVerifier {
             ));
         };
         self.inner.verify_cert(platform, rest)?;
-        verify_vouched_cert(end_entity, platform)?;
+        let cert = Certificate::from_der(end_entity).map_err(|_| bad_encoding())?;
+        let platform = Certificate::from_der(platform).map_err(|_| bad_encoding())?;
+        verify_voucher(VoucherRole::Proxy, &cert, &platform).map_err(|error| match error {
+            KeyError::Der(_) => bad_encoding(),
+            KeyError::NotVouchingCert | KeyError::UnknownCriticalExtension(_) => {
+                rustls::Error::InvalidCertificate(CertificateError::InvalidPurpose)
+            }
+            _ => bad_signature(),
+        })?;
         Ok(ServerCertVerified::assertion())
     }
 
@@ -200,68 +207,6 @@ impl ServerCertVerifier for PlatformVerifier {
     }
 }
 
-/// Verify the voucher (RFD 620 §4.6.2.1) on a certificate.
-/// The cert must include a [`VOUCHER_OID`] extension containing
-/// a valid signature over its tagged SPKI.
-fn verify_vouched_cert(
-    cert: &CertificateDer<'_>,
-    platform: &CertificateDer<'_>,
-) -> Result<(), rustls::Error> {
-    let cert = Certificate::from_der(cert).map_err(|_| bad_encoding())?;
-    let platform = Certificate::from_der(platform).map_err(|_| bad_encoding())?;
-    verify_vouching_cert(&platform)?;
-    let mut voucher = None;
-    for extension in cert
-        .tbs_certificate
-        .extensions
-        .as_deref()
-        .unwrap_or_default()
-    {
-        if extension.extn_id == VOUCHER_OID {
-            voucher = Some(extension.extn_value.as_bytes());
-        } else if extension.critical {
-            return Err(rustls::Error::InvalidCertificate(
-                CertificateError::InvalidPurpose,
-            ));
-        }
-    }
-    let Some(voucher) = voucher else {
-        return Err(bad_signature());
-    };
-    let digest = voucher_digest(&cert.tbs_certificate.subject_public_key_info)
-        .map_err(|_| bad_encoding())?;
-    let signature = Signature::from_slice(voucher).map_err(|_| bad_signature())?;
-    spki_key(&platform)?
-        .verify_strict(&digest, &signature)
-        .map_err(|_| bad_signature())
-}
-
-/// Verify that a platform identity cert may vouch for the proxy key.
-/// Any cert that chains to a platform root passes [`RotCertVerifier`],
-/// including the CAs above the Trust Quorum cert, but only the RoT
-/// may sign a voucher. We check that the vouching cert is *not* a CA
-/// but *does* contain a plausible DICE TCB info constraint.
-fn verify_vouching_cert(platform: &Certificate) -> Result<(), rustls::Error> {
-    let constraints = platform.tbs_certificate.get::<BasicConstraints>();
-    let tcb_info = platform
-        .tbs_certificate
-        .extensions
-        .as_deref()
-        .unwrap_or_default()
-        .iter()
-        .find(|ext| ext.extn_id == DICE_TCB_INFO)
-        .and_then(|ext| DiceTcbInfo::from_der(ext.extn_value.as_bytes()).ok());
-    match (constraints, tcb_info) {
-        (
-            Ok(Some((_, BasicConstraints { ca: false, .. }))),
-            Some(DiceTcbInfo { fwids: Some(fwids) }),
-        ) if !fwids.is_empty() => Ok(()),
-        _ => Err(rustls::Error::InvalidCertificate(
-            CertificateError::InvalidPurpose,
-        )),
-    }
-}
-
 /// The Ed25519 key in a certificate's SPKI.
 fn spki_key(cert: &Certificate) -> Result<VerifyingKey, rustls::Error> {
     let key: [u8; 32] = cert
@@ -285,20 +230,6 @@ fn bad_signature() -> rustls::Error {
 #[cfg(test)]
 mod test {
     use super::*;
-
-    /// The DICE TCB info extension from hubris's trust-quorum-dhe
-    /// cert template (lib/dice/src/trust_quorum_dhe_cert_tmpl.rs)
-    /// decodes as the type the voucher check requires.
-    #[test]
-    fn tq_dhe_tcb_info_decodes() {
-        let mut extn_value = vec![
-            0x30, 0x31, 0xa6, 0x2f, 0x30, 0x2d, 0x06, 0x09, 0x60, 0x86, 0x48, 0x01, 0x65, 0x03,
-            0x04, 0x02, 0x08, 0x04, 0x20,
-        ];
-        extn_value.extend([0; 32]);
-        let tcb_info = DiceTcbInfo::from_der(&extn_value).unwrap();
-        assert_eq!(tcb_info.fwids.unwrap().len(), 1);
-    }
 
     #[test]
     fn descoped_urls() {

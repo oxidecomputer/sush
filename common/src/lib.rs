@@ -13,6 +13,7 @@ pub mod jobs;
 pub mod keys;
 pub mod targets;
 pub mod version;
+pub mod vouchers;
 pub mod wire;
 pub mod wordlist;
 

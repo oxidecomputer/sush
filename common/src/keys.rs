@@ -47,6 +47,7 @@ use x509_cert::{Certificate, TbsCertificate, Version};
 
 use crate::codephrases::InvalidCodephrase;
 use crate::hash::{Hasher, hash};
+use crate::vouchers::{VOUCHER_OID, VoucherRole, voucher_digest};
 
 codephrase_newtype! {
     /// SHA-256 of a certificate subject or an identity public key,
@@ -799,23 +800,6 @@ impl SigningKey {
     }
 }
 
-/// A signature in a trenchcoat; see RFD 620 §4.6.2.1. Allocated in OANA.
-pub const VOUCHER_OID: ObjectIdentifier = ObjectIdentifier::new_unwrap("1.3.6.1.4.1.57551.3.1");
-
-/// Domain separation for [`voucher_digest`]. ASCII, so the preimage
-/// can never collide with a DER certificate, which begins `0x30`.
-const VOUCHER_TAG: &[u8] = b"sush-proxy-voucher-v0:";
-
-/// Produce the SHA-3 digest the RoT signs to make a voucher for a key.
-/// We must use only its public key info, because it is to be embedded
-/// in a self-signed certificate.
-pub fn voucher_digest(spki: &SubjectPublicKeyInfo<Any, BitString>) -> Result<[u8; 32], KeyError> {
-    let mut hasher = Hasher::new();
-    hasher.update(VOUCHER_TAG);
-    hasher.update(&spki.to_der()?);
-    Ok(*hasher.finalize().as_bytes())
-}
-
 pub struct EphemeralKey {
     key: SigningKey,
     key_id: KeyId,
@@ -874,16 +858,17 @@ impl EphemeralKey {
         Ok(Self { key, key_id, cert })
     }
 
-    /// Ephemeral key with a self-signed cert carrying a voucher
-    /// embedded as a critical extension under [`VOUCHER_OID`].
+    /// Ephemeral key with a self-signed cert carrying a voucher for
+    /// `role`, embedded as a critical extension under [`VOUCHER_OID`].
     pub fn new_vouched<E: fmt::Display>(
+        role: VoucherRole,
         key_type: KeyType,
         subject: Name,
         validity: Validity,
         vouch: impl FnOnce(&[u8; 32]) -> Result<Vec<u8>, E>,
     ) -> Result<Self, KeyError> {
         let key = SigningKey::new(key_type);
-        let voucher = vouch(&voucher_digest(&key.spki())?).map_err(KeyError::signer)?;
+        let voucher = vouch(&voucher_digest(role, &key.spki())?).map_err(KeyError::signer)?;
         let signature_algorithm = key.signature_algorithm();
         let mut tbs_certificate = Self::tbs_certificate(
             &key,
@@ -1081,6 +1066,10 @@ pub enum KeyError {
     InvalidSignatureEncoding,
     #[error("Can't find certificate for key `{0}`")]
     MissingCert(KeyId),
+    #[error("Certificate is missing a voucher")]
+    MissingVoucher,
+    #[error("Certificate can't vouch for keys")]
+    NotVouchingCert,
     #[error(transparent)]
     Pem(#[from] pem_rfc7468::Error),
     #[error("PKCS#8 encoding error: {0}")]
@@ -1095,6 +1084,8 @@ pub enum KeyError {
     SshKey(#[from] SshKeyError),
     #[error("Trust anchor `{0}` is not signed by a preceding anchor")]
     UnanchoredCert(KeyId),
+    #[error("Unknown critical certificate extension `{0}`")]
+    UnknownCriticalExtension(ObjectIdentifier),
     #[error("Signature does not attest user presence")]
     UserPresenceRequired,
 }
@@ -1114,34 +1105,13 @@ mod test {
 
     use super::*;
 
-    /// The voucher digest is a convention shared with the
-    /// signatures on deployed proxy certificates. If this
-    /// fails, STOP: existing vouchers would no longer verify.
-    #[test]
-    fn pin_voucher_digest() {
-        let spki = SubjectPublicKeyInfo {
-            algorithm: AlgorithmIdentifierOwned {
-                oid: ID_ED_25519,
-                parameters: None,
-            },
-            subject_public_key: BitString::from_bytes(&[0x42; 32]).unwrap(),
-        };
-        assert_eq!(
-            voucher_digest(&spki).unwrap(),
-            [
-                0x3c, 0x39, 0xf5, 0x94, 0x94, 0xa7, 0x6c, 0xe4, 0x37, 0x01, 0x97, 0xa3, 0xfc, 0xbd,
-                0xf1, 0x28, 0x52, 0x3f, 0x87, 0x0b, 0x07, 0xf2, 0x44, 0x99, 0xcf, 0xf0, 0xdb, 0x14,
-                0x97, 0x03, 0xa6, 0xeb,
-            ],
-        );
-    }
-
     /// A vouched certificate is self-signed, has the voucher as its
     /// one critical extension, and verifies against the vouching key.
     #[test]
     fn vouched_cert_round_trip() {
         let authority = ed25519_dalek::SigningKey::generate(&mut OsRng);
         let key = EphemeralKey::new_vouched(
+            VoucherRole::Proxy,
             KeyType::Ed25519,
             "CN=vouched".parse().unwrap(),
             Validity::from_now(Duration::from_secs(60)).unwrap(),
@@ -1155,7 +1125,11 @@ mod test {
         assert_eq!(extension.extn_id, VOUCHER_OID);
         assert!(extension.critical);
 
-        let digest = voucher_digest(&key.cert().tbs_certificate.subject_public_key_info).unwrap();
+        let digest = voucher_digest(
+            VoucherRole::Proxy,
+            &key.cert().tbs_certificate.subject_public_key_info,
+        )
+        .unwrap();
         let signature =
             ed25519_dalek::Signature::from_slice(extension.extn_value.as_bytes()).unwrap();
         authority

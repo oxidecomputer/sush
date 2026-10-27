@@ -39,6 +39,7 @@ use sush_common::jobs::{
 };
 use sush_common::keys::{EphemeralKey, KeyType, Signer, pem_cert_chain};
 use sush_common::targets::{Cubbies, Target};
+use sush_common::vouchers::VoucherRole;
 use sush_server::executor::PathIsolation;
 use sush_server::gossip::{LinkedBaseboards, Universe};
 use sush_server::locker::Locker;
@@ -211,6 +212,7 @@ pub fn crafted_proxy_pems(
 ) -> (Utf8PathBuf, Utf8PathBuf) {
     let signer = SigningKey::from_pkcs8_pem(signer_pem).expect("can't parse the vouching key");
     let vouched = EphemeralKey::new_vouched(
+        VoucherRole::Proxy,
         KeyType::Ed25519,
         "CN=sush-proxy".parse().unwrap(),
         Validity::from_now(Duration::from_secs(600)).unwrap(),

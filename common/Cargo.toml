@@ -8,6 +8,7 @@ repository = "https://github.com/oxidecomputer/sush"
 publish = false
 
 [dependencies]
+attest-data = { workspace = true, optional = true }
 bytes.workspace = true
 bytesize.workspace = true
 chrono.workspace = true
@@ -36,6 +37,9 @@ thiserror.workspace = true
 tokio.workspace = true
 tokio-tungstenite.workspace = true
 x509-cert.workspace = true
+
+[features]
+verify-vouchers = ["dep:attest-data"]
 
 [dev-dependencies]
 ciborium.workspace = true

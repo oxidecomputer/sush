@@ -4835,7 +4835,6 @@ dependencies = [
  "anyhow",
  "async-recursion",
  "atomicwrites",
- "attest-data",
  "base64 0.22.1",
  "bytes",
  "bytesize",
@@ -4885,6 +4884,7 @@ dependencies = [
 name = "sush-common"
 version = "0.1.0"
 dependencies = [
+ "attest-data",
  "bytes",
  "bytesize",
  "chrono",
