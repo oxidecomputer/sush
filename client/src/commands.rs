@@ -1629,7 +1629,6 @@ async fn job_start(
         // Watch the whole rack while the start request runs, and keep
         // watching until the job settles everywhere.
         ctx.job_watch_started(&job_id);
-        let job_target = job.payload().target().clone();
         let mut sleds = None;
         let mut ticker = interval(WATCH_INTERVAL);
         ticker.set_missed_tick_behavior(MissedTickBehavior::Skip);
@@ -1641,7 +1640,7 @@ async fn job_start(
         let mut stopped = false;
         let mut sigint = signal(SignalKind::interrupt())?;
         let mut stop_ctx = ctx.clone();
-        let via = job_target.single_baseboard();
+        let via = job.payload().target().is_single().then_some(&target);
         let stop = async {
             // A stop can race the start, so retry it a few times.
             for _ in 0..3 {
