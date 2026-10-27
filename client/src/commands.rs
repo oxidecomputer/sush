@@ -1738,7 +1738,7 @@ async fn job_start(
                 {
                     Ok(byte_stream) => {
                         let output = byte_stream_to_vec(byte_stream.into_inner()).await?;
-                        ctx.job_output(&job_id, stream, &output, binary);
+                        ctx.job_output(&job_id, baseboard, stream, &output, binary);
                     }
                     Err(error) if multiple => {
                         let _ = ctx.job_error(error);
@@ -2267,7 +2267,7 @@ async fn job_output_from(
         .into_inner();
         let bytes = byte_stream_to_vec(byte_stream).await?;
         check_hash!(hash(&bytes), None)?;
-        ctx.job_output(&job_id, stream, &bytes, binary);
+        ctx.job_output(&job_id, target, stream, &bytes, binary);
         Ok(())
     }
 }

@@ -320,9 +320,16 @@ impl CommandContext for Repl {
         self.cli.job_output_target(target)
     }
 
-    fn job_output(&mut self, job_id: &JobId, stream: JobOutputStream, output: &[u8], binary: bool) {
+    fn job_output(
+        &mut self,
+        job_id: &JobId,
+        target: &BaseboardId,
+        stream: JobOutputStream,
+        output: &[u8],
+        binary: bool,
+    ) {
         self.set_job_id(Some(job_id.to_owned()));
-        self.cli.job_output(job_id, stream, output, binary);
+        self.cli.job_output(job_id, target, stream, output, binary);
     }
 
     fn job_output_started(
