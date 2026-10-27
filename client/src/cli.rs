@@ -111,6 +111,13 @@ impl Cli {
         }
     }
 
+    fn print(&self, message: impl fmt::Display) {
+        match self.watch.lock().unwrap().as_ref() {
+            Some(watch) => watch.multi.suspend(|| eprintln!("{message}")),
+            None => qprintln!("{message}"),
+        }
+    }
+
     /// Adopt `session` unless one with the same ID is already
     /// attached and `force` is unset.
     fn adopt_session(&mut self, session: Session, force: bool) -> SessionId {
@@ -559,20 +566,13 @@ impl CommandContext for Cli {
                 })
             ),
             OutputFormat::Text => {
-                let watch = self.watch.lock().unwrap();
-                let print = |line: String| match watch.as_ref() {
-                    Some(watch) => {
-                        let _ = watch.multi.println(line);
-                    }
-                    None => qprintln!("{line}"),
-                };
-                print(format!("✅ Started job `{job_id}`"));
+                self.print(format!("✅ Started job `{job_id}`"));
                 if let (Target::Sleds(named), Some(sleds)) = (job.payload().target(), sleds) {
                     for sled in named {
                         if let SledId::Baseboard(baseboard) = sled
                             && !sleds.contains(baseboard)
                         {
-                            print(format!(
+                            self.print(format!(
                                 "❗ Job `{job_id}` will not run on unreachable sled `{baseboard}`"
                             ));
                         }
@@ -586,11 +586,7 @@ impl CommandContext for Cli {
         match self.get_output_format() {
             OutputFormat::Json => qprintln!("{}", json!({"job_stopped": job_id})),
             OutputFormat::Text => {
-                if let Some(watch) = self.watch.lock().unwrap().as_ref() {
-                    let _ = watch.multi.println(format!("✅ Stopped job `{job_id}`"));
-                } else {
-                    qprintln!("\r✅ Stopped job `{job_id}`");
-                }
+                self.print(format!("\r✅ Stopped job `{job_id}`"));
             }
         }
     }
@@ -787,9 +783,8 @@ impl CommandContext for Cli {
     }
 
     fn job_watch_stalled(&mut self, job_id: &JobId) {
-        let guard = self.watch.lock().unwrap();
-        if let Some(watch) = guard.as_ref() {
-            let _ = watch.multi.println(format!(
+        if matches!(self.get_output_format(), OutputFormat::Text) {
+            self.print(format!(
                 "❗ No sled has reported a status for job `{job_id}`"
             ));
         }
