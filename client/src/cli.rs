@@ -826,18 +826,16 @@ impl CommandContext for Cli {
     fn job_attached(&mut self, job_id: &JobId) {
         match self.get_output_format() {
             OutputFormat::Json => qprintln!("{}", json!({"attached": job_id})),
-            OutputFormat::Text => self.note(format!(
-                "✅ Attached to interactive job `{job_id}`, detach with `^]`"
-            )),
+            OutputFormat::Text => {
+                self.note(format!("✅ Attached to job `{job_id}`, detach with `^]`"))
+            }
         }
     }
 
     fn job_detached(&mut self, job_id: &JobId) {
         match self.get_output_format() {
             OutputFormat::Json => qprintln!("{}", json!({"detached": job_id})),
-            OutputFormat::Text => {
-                self.note(format!("\r✅ Detached from interactive job `{job_id}`"))
-            }
+            OutputFormat::Text => self.note(format!("\r✅ Detached from job `{job_id}`")),
         }
     }
 
