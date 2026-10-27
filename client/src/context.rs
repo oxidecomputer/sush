@@ -103,6 +103,9 @@ pub trait CommandContext: Clone + Send + Sync {
     fn set_globals(&mut self, _args: GlobalArgs) {}
     fn pre_parse_hook(&mut self, _command: &str) {}
 
+    // Errors
+    fn command_error(&mut self, error: &CommandError);
+
     // Build provenance
     fn versions(
         &mut self,
@@ -156,7 +159,6 @@ pub trait CommandContext: Clone + Send + Sync {
     fn job_started(&mut self, job: &SignedJob, sleds: Option<&BTreeSet<BaseboardId>>, show: bool);
     fn job_stopped(&mut self, id: &JobId);
     fn job_skipped(&mut self, id: &JobId) -> bool;
-    fn job_error(&mut self, error: CommandError) -> CommandError;
     fn job_output(
         &mut self,
         id: &JobId,

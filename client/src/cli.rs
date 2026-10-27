@@ -240,6 +240,27 @@ impl CommandContext for Cli {
         *self.globals.lock().unwrap() = args;
     }
 
+    // Errors
+
+    fn command_error(&mut self, error: &CommandError) {
+        let errors = error.errors();
+        match self.get_output_format() {
+            OutputFormat::Json => {
+                let message = errors
+                    .into_iter()
+                    .map(|(_, message)| message)
+                    .collect::<Vec<_>>()
+                    .join("\n");
+                qprintln!("{}", json!({"error": {"message": message}}))
+            }
+            OutputFormat::Text => {
+                for (icon, message) in errors {
+                    eprintln!("{icon} {message}");
+                }
+            }
+        }
+    }
+
     // Build provenance
 
     fn versions(
@@ -588,11 +609,6 @@ impl CommandContext for Cli {
             }
         }
         skipped
-    }
-
-    fn job_error(&mut self, error: CommandError) -> CommandError {
-        eprintln!("{error}");
-        error
     }
 
     fn job_output_target(&mut self, target: &BaseboardId) {
