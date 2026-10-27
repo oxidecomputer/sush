@@ -57,7 +57,7 @@ use sush_common::targets::{SledId, Target};
 use sush_common::version::VersionInfo;
 
 use crate::ByteStream;
-use crate::context::{Authz, CommandContext, OutputFormat, StatusDisplayStyle};
+use crate::context::{Authz, CommandContext, OutputFormat, StartedDisplay, StatusDisplayStyle};
 use crate::identity::{IdentityError, SshAgentConnection};
 use crate::interactive::interactive_job;
 #[cfg(feature = "permslip")]
@@ -1385,7 +1385,7 @@ async fn job(
                 }
             } else {
                 ctx.job_signed(&job, true);
-                ctx.job_started(&job, None, false);
+                ctx.job_started(&job, None, StartedDisplay::None);
                 Ok(())
             }
         }
@@ -1555,7 +1555,7 @@ async fn job_start(
     // Start the job.
     if interactive {
         let sleds = start.await?.into_inner().sleds;
-        ctx.job_started(&job, Some(&sleds), true);
+        ctx.job_started(&job, Some(&sleds), StartedDisplay::Note);
         match job_attach(ctx, client, &job_id, &target).await {
             Ok(()) => (),
             Err(CommandError::NotFound(_)) => {
@@ -1591,7 +1591,7 @@ async fn job_start(
             .open(&path)
             .map_err(|error| CommandError::io(&path, error))?;
         let sleds = start.await?.into_inner().sleds;
-        ctx.job_started(&job, Some(&sleds), true);
+        ctx.job_started(&job, Some(&sleds), StartedDisplay::Note);
         let hasher = job_stream(ctx, client, &job_id, &target, &path, file).await?;
         let status = job_watch(ctx, client, &job_id, Some(sleds)).await?;
         ctx.job_status(&job_id, &status, StatusDisplayStyle::Short);
@@ -1656,10 +1656,12 @@ async fn job_start(
                     match start_result {
                         Ok(response) => {
                             let started = response.into_inner().sleds;
-                            ctx.job_started(&job, Some(&started), true);
+                            ctx.job_started(&job, Some(&started), StartedDisplay::Note);
                             sleds = Some(started);
                         }
-                        Err(CommandError::TimedOut) => ctx.job_started(&job, None, true),
+                        Err(CommandError::TimedOut) => {
+                            ctx.job_started(&job, None, StartedDisplay::Note)
+                        }
                         Err(error) => {
                             ctx.job_watch_finished(&job_id);
                             return Err(error);
@@ -1756,7 +1758,7 @@ async fn job_start(
         }
     } else {
         let sleds = start.await?.into_inner().sleds;
-        ctx.job_started(&job, Some(&sleds), true);
+        ctx.job_started(&job, Some(&sleds), StartedDisplay::Full);
     }
     Ok(())
 }

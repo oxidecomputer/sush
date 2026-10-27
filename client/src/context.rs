@@ -78,6 +78,19 @@ pub enum StatusDisplayStyle {
     Full,
 }
 
+/// What to show when a job starts.
+#[derive(Clone, Copy, Debug)]
+pub enum StartedDisplay {
+    /// Display nothing; the job was signed offline.
+    None,
+
+    /// Display a note to stderr only.
+    Note,
+
+    /// Display a note to stderr, and the job ID to stdout.
+    Full,
+}
+
 impl OutputFormat {
     pub fn as_str(&self) -> &'static str {
         match self {
@@ -156,7 +169,12 @@ pub trait CommandContext: Clone + Send + Sync {
 
     // Job management
     fn really_target(&mut self, sled: &SledId) -> Result<(), CommandError>;
-    fn job_started(&mut self, job: &SignedJob, sleds: Option<&BTreeSet<BaseboardId>>, show: bool);
+    fn job_started(
+        &mut self,
+        job: &SignedJob,
+        sleds: Option<&BTreeSet<BaseboardId>>,
+        display: StartedDisplay,
+    );
     fn job_stopped(&mut self, id: &JobId);
     fn job_skipped(&mut self, id: &JobId) -> bool;
     fn job_output(
