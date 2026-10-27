@@ -20,6 +20,7 @@ use std::time::Duration;
 use async_recursion::async_recursion;
 use bytesize::ByteSize;
 use clap::{Parser, Subcommand};
+use futures::future::{Fuse, FusedFuture as _};
 use futures::stream;
 use futures::{FutureExt as _, StreamExt as _};
 use http::header::WWW_AUTHENTICATE;
@@ -1652,6 +1653,8 @@ async fn job_start(
             Ok(false)
         };
         pin!(stop);
+        let poll = Fuse::terminated();
+        pin!(poll);
         let status = loop {
             select! {
                 // Wait for the start request to finish.
@@ -1674,10 +1677,18 @@ async fn job_start(
                     ticker.reset_immediately();
                 }
 
-                _ = ticker.tick() => {
-                    last = match job_status_map(ctx, client, &job_id, job_target.single_baseboard()).await {
+                _ = ticker.tick(), if poll.is_terminated() => {
+                    let mut poll_ctx = ctx.clone();
+                    let job_id = &job_id;
+                    poll.set(
+                        async move { job_status_map(&mut poll_ctx, client, job_id, via).await }
+                            .fuse(),
+                    );
+                }
+
+                status = &mut poll, if !poll.is_terminated() => {
+                    last = match status {
                         Ok(status) => status,
-                        // The job may not be visible anywhere yet.
                         Err(CommandError::NotFound(_)) => JobStatusMap::new(),
                         Err(error) => {
                             ctx.job_watch_finished(&job_id);
