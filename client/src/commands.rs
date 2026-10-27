@@ -2363,7 +2363,7 @@ async fn attach_refused(
     match status.get(target) {
         None => CommandError::JobNotOnSled(*job_id, target.clone()),
         Some(JobStatus::Queued { .. }) => CommandError::JobNotYetRunning(*job_id),
-        Some(JobStatus::Started { .. }) => CommandError::JobNotInteractive(*job_id),
+        Some(JobStatus::Started { .. }) => CommandError::JobStartingOrStopping(*job_id),
         Some(JobStatus::Cancelled { .. }) => CommandError::JobCancelled(*job_id),
         Some(JobStatus::Skipped { reason, .. }) => CommandError::JobSkipped(*job_id, *reason),
         Some(JobStatus::Stopped { .. } | JobStatus::Error { .. }) => {
@@ -2665,8 +2665,6 @@ pub enum CommandError {
     JobDidNotRun(JobId),
     #[error("Job `{0}` has finished, try `job status` or `job output`")]
     JobFinished(JobId),
-    #[error("Job `{0}` is not interactive, try `job status` or `job output`")]
-    JobNotInteractive(JobId),
     #[error("Job `{0}` not found on sled `{1}`")]
     JobNotOnSled(JobId, BaseboardId),
     #[error("Job `{0}` was signed but not started, try `job skip`")]
@@ -2675,6 +2673,8 @@ pub enum CommandError {
     JobNotYetRunning(JobId),
     #[error("Job `{0}` was skipped on this sled: {1}")]
     JobSkipped(JobId, SkipReason),
+    #[error("Job `{0}` is starting or stopping, try again")]
+    JobStartingOrStopping(JobId),
     #[error("Job `{0}` is still running")]
     JobStillRunning(JobId),
     #[error("JSON error: {0}")]
