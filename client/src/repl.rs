@@ -34,7 +34,7 @@ use crate::commands::{
     ClientCommand, CommandError, GlobalArgs, SSH_AUTH_SOCK, SUSH_JOB_ID, SUSH_KEY_ID,
     SUSH_OUTPUT_FORMAT, SUSH_URL,
 };
-use crate::context::{CommandContext, OutputFormat, StatusDisplayStyle};
+use crate::context::{CommandContext, OutputFormat, StartedDisplay, StatusDisplayStyle};
 use crate::{AuthzSigner, Client};
 
 const HISTORY_FILE: &str = "history.txt";
@@ -200,11 +200,11 @@ impl CommandContext for Repl {
                 if let Some(arg) = $arg {
                     unsafe { env::set_var($var, arg.to_string()) }
                     args.$arg = Some(arg.clone());
-                    qprintln!("✅ {} set to `{}`", $name, arg);
+                    eprintln!("✅ {} set to `{}`", $name, arg);
                 } else {
                     unsafe { env::remove_var($var) }
                     args.$arg = None;
-                    qprintln!("✅ {} unset", $name);
+                    eprintln!("✅ {} unset", $name);
                 }
             }};
         }
@@ -307,9 +307,14 @@ impl CommandContext for Repl {
 
     // Job management
 
-    fn job_started(&mut self, job: &SignedJob, sleds: Option<&BTreeSet<BaseboardId>>, show: bool) {
+    fn job_started(
+        &mut self,
+        job: &SignedJob,
+        sleds: Option<&BTreeSet<BaseboardId>>,
+        display: StartedDisplay,
+    ) {
         self.set_job_id(Some(job.job_id().to_owned()));
-        self.cli.job_started(job, sleds, show);
+        self.cli.job_started(job, sleds, display);
     }
 
     fn job_stopped(&mut self, job_id: &JobId) {

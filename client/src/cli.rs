@@ -40,7 +40,7 @@ use sush_common::targets::{MAX_CUBBY, SledHealth, SledId, SledVersion, Target};
 use sush_common::version::VersionInfo;
 
 use crate::commands::{CommandError, GlobalArgs};
-use crate::context::{CommandContext, OutputFormat, StatusDisplayStyle};
+use crate::context::{CommandContext, OutputFormat, StartedDisplay, StatusDisplayStyle};
 use crate::{AuthzSigner, quiet_write};
 
 pub(crate) const PREFIX: &str = "sush";
@@ -111,10 +111,10 @@ impl Cli {
         }
     }
 
-    fn print(&self, message: impl fmt::Display) {
+    fn note(&self, message: impl fmt::Display) {
         match self.watch.lock().unwrap().as_ref() {
             Some(watch) => watch.multi.suspend(|| eprintln!("{message}")),
-            None => qprintln!("{message}"),
+            None => eprintln!("{message}"),
         }
     }
 
@@ -375,7 +375,7 @@ impl CommandContext for Cli {
                 })
             ),
             OutputFormat::Text => {
-                qprintln!("✅ Please relay these parameters to support:");
+                self.note("✅ Please relay these parameters to support:");
                 qprintln!("   Baseboard ID: {baseboard_id}");
                 qprintln!("   Sush nonce:   {sush_nonce}");
             }
@@ -397,7 +397,7 @@ impl CommandContext for Cli {
                 })
             ),
             OutputFormat::Text => {
-                qprintln!("✅ Please request a job with these parameters from support:");
+                self.note("✅ Please request a job with these parameters from support:");
                 qprintln!("   Job ID:     {}", request.job_id);
                 qprintln!("   Session ID: {}", request.session_id);
                 qprintln!("   Command:    {}", request.command);
@@ -426,7 +426,8 @@ impl CommandContext for Cli {
                 })
             ),
             OutputFormat::Text => {
-                qprintln!("✅ Session is now `{session_id}`");
+                self.note("✅ Created session");
+                qprintln!("   Session ID:      {session_id}");
                 qprintln!("   Signer nonce:    {signer_nonce}");
                 qprintln!("   Sequence number: {seq}");
             }
@@ -437,7 +438,10 @@ impl CommandContext for Cli {
         let session_id = self.adopt_session(session, force);
         match self.get_output_format() {
             OutputFormat::Json => qprintln!("{}", json!({"session_started": session_id})),
-            OutputFormat::Text => qprintln!("✅ Session is now `{session_id}`"),
+            OutputFormat::Text => {
+                self.note("✅ Session is now current");
+                qprintln!("   Session ID: {session_id}");
+            }
         }
     }
 
@@ -451,7 +455,7 @@ impl CommandContext for Cli {
         }
         match self.get_output_format() {
             OutputFormat::Json => qprintln!("{}", json!({"session_stopped": session_id})),
-            OutputFormat::Text => qprintln!("✅ Stopped session `{session_id}`"),
+            OutputFormat::Text => self.note(format!("✅ Stopped session `{session_id}`")),
         }
     }
 
@@ -468,16 +472,17 @@ impl CommandContext for Cli {
                     })
                 )
             }
-            OutputFormat::Text => {
-                qprintln!("✅ Allowed {} attach for `{key_id}`", access.as_str())
-            }
+            OutputFormat::Text => self.note(format!(
+                "✅ Allowed {} attach for `{key_id}`",
+                access.as_str()
+            )),
         }
     }
 
     fn attach_denied(&mut self, key_id: &KeyId) {
         match self.get_output_format() {
             OutputFormat::Json => qprintln!("{}", json!({"attach_denied": key_id})),
-            OutputFormat::Text => qprintln!("✅ Denied attach for `{key_id}`"),
+            OutputFormat::Text => self.note(format!("✅ Denied attach for `{key_id}`")),
         }
     }
 
@@ -529,9 +534,9 @@ impl CommandContext for Cli {
             OutputFormat::Json => qprintln!("{}", json!({"certs": certs})),
             OutputFormat::Text => {
                 if roots.is_empty() {
-                    qprintln!("✅ Verified chain consistency");
+                    self.note("✅ Verified chain consistency");
                 } else {
-                    qprintln!("✅ Verified chain against supplied root");
+                    self.note("✅ Verified chain against supplied root");
                 }
                 for cert in &chain {
                     qprintln!("   {}", cert.tbs_certificate.subject);
@@ -544,12 +549,17 @@ impl CommandContext for Cli {
 
     // Job management
 
-    fn job_started(&mut self, job: &SignedJob, sleds: Option<&BTreeSet<BaseboardId>>, show: bool) {
+    fn job_started(
+        &mut self,
+        job: &SignedJob,
+        sleds: Option<&BTreeSet<BaseboardId>>,
+        display: StartedDisplay,
+    ) {
         if let Some(session) = self.session.lock().unwrap().as_mut() {
             session.job_started(job.to_owned());
             self.save_session(Some(session));
         }
-        if !show {
+        if matches!(display, StartedDisplay::None) {
             return;
         }
         let job_id = job.job_id();
@@ -566,13 +576,16 @@ impl CommandContext for Cli {
                 })
             ),
             OutputFormat::Text => {
-                self.print(format!("✅ Started job `{job_id}`"));
+                self.note(format!("✅ Started job `{job_id}`"));
+                if matches!(display, StartedDisplay::Full) {
+                    qprintln!("   Job ID: {job_id}");
+                }
                 if let (Target::Sleds(named), Some(sleds)) = (job.payload().target(), sleds) {
                     for sled in named {
                         if let SledId::Baseboard(baseboard) = sled
                             && !sleds.contains(baseboard)
                         {
-                            self.print(format!(
+                            self.note(format!(
                                 "❗ Job `{job_id}` will not run on unreachable sled `{baseboard}`"
                             ));
                         }
@@ -586,7 +599,7 @@ impl CommandContext for Cli {
         match self.get_output_format() {
             OutputFormat::Json => qprintln!("{}", json!({"job_stopped": job_id})),
             OutputFormat::Text => {
-                self.print(format!("\r✅ Stopped job `{job_id}`"));
+                self.note(format!("\r✅ Stopped job `{job_id}`"));
             }
         }
     }
@@ -601,7 +614,7 @@ impl CommandContext for Cli {
             self.save_session(session_guard.as_ref());
             match self.get_output_format() {
                 OutputFormat::Json => qprintln!("{}", json!({"job_skipped": job_id})),
-                OutputFormat::Text => qprintln!("✅ Skipped job `{job_id}`"),
+                OutputFormat::Text => self.note(format!("✅ Skipped job `{job_id}`")),
             }
         }
         skipped
@@ -610,7 +623,7 @@ impl CommandContext for Cli {
     fn job_output_target(&mut self, target: &BaseboardId) {
         match self.get_output_format() {
             OutputFormat::Json => (),
-            OutputFormat::Text => qprintln!(" » {target} «"),
+            OutputFormat::Text => self.note(format!(" » {target} «")),
         }
     }
 
@@ -650,8 +663,8 @@ impl CommandContext for Cli {
             OutputFormat::Text if output.is_empty() => (),
             OutputFormat::Text => {
                 match stream {
-                    JobOutputStream::Stdout => qprintln!("✅ Job stdout:"),
-                    JobOutputStream::Stderr => qprintln!("✅ Job stderr:"),
+                    JobOutputStream::Stdout => self.note("✅ Job stdout:"),
+                    JobOutputStream::Stderr => self.note("✅ Job stderr:"),
                 };
                 let output = String::from_utf8_lossy(output);
                 if output.ends_with('\n') {
@@ -723,12 +736,12 @@ impl CommandContext for Cli {
             if let Some(stage) = stage {
                 let length = ByteSize::b(progress.length().unwrap_or(progress.position()));
                 let elapsed = progress.elapsed();
-                qprintln!(
+                self.note(format!(
                     "{stage} {stream}:\t{} in {} ({:.0} MB/s)",
                     length.display().si(),
                     format_duration(progress.elapsed()),
                     length.as_mb() / elapsed.as_secs_f64(),
-                );
+                ));
             }
         }
     }
@@ -784,7 +797,7 @@ impl CommandContext for Cli {
 
     fn job_watch_stalled(&mut self, job_id: &JobId) {
         if matches!(self.get_output_format(), OutputFormat::Text) {
-            self.print(format!(
+            self.note(format!(
                 "❗ No sled has reported a status for job `{job_id}`"
             ));
         }
@@ -802,16 +815,18 @@ impl CommandContext for Cli {
     fn job_attached(&mut self, job_id: &JobId) {
         match self.get_output_format() {
             OutputFormat::Json => qprintln!("{}", json!({"attached": job_id})),
-            OutputFormat::Text => {
-                qprintln!("✅ Attached to interactive job `{job_id}`, detach with `^]`")
-            }
+            OutputFormat::Text => self.note(format!(
+                "✅ Attached to interactive job `{job_id}`, detach with `^]`"
+            )),
         }
     }
 
     fn job_detached(&mut self, job_id: &JobId) {
         match self.get_output_format() {
             OutputFormat::Json => qprintln!("{}", json!({"detached": job_id})),
-            OutputFormat::Text => qprintln!("\r✅ Detached from interactive job `{job_id}`"),
+            OutputFormat::Text => {
+                self.note(format!("\r✅ Detached from interactive job `{job_id}`"))
+            }
         }
     }
 
@@ -845,7 +860,7 @@ impl CommandContext for Cli {
             progress.finish_and_clear();
         }
         if matches!(self.get_output_format(), OutputFormat::Text) {
-            qprintln!("✅ Signed request for job `{job_id}`");
+            self.note(format!("✅ Signed request for job `{job_id}`"));
         }
     }
 
@@ -1080,7 +1095,7 @@ impl CommandContext for Cli {
                     .collect::<Result<Vec<_>, CommandError>>()?;
                 qprintln!("{}", json!({"identities": identities}));
             }
-            OutputFormat::Text if keys.is_empty() => qprintln!("❌ No SSH identities found"),
+            OutputFormat::Text if keys.is_empty() => self.note("❌ No SSH identities found"),
             OutputFormat::Text => {
                 for key in keys {
                     let key_id = key.key_id()?;
