@@ -15,6 +15,8 @@ use std::time::{Duration, SystemTime};
 
 use anstyle::{AnsiColor, Style};
 use atomicwrites::{AtomicFile, OverwriteBehavior};
+use base64::Engine as _;
+use base64::engine::general_purpose::STANDARD;
 use bytesize::ByteSize;
 use chrono::TimeDelta;
 use humantime::format_duration;
@@ -249,7 +251,23 @@ impl CommandContext for Cli {
         match self.get_output_format() {
             OutputFormat::Json => qprintln!(
                 "{}",
-                json!({"client": client, "server": server, "sleds": sleds})
+                json!({
+                    "version": {
+                        "client": client,
+                        "server": server,
+                        "sleds": sleds
+                            .iter()
+                            .map(|sled| {
+                                json!({
+                                    "cubby": sled.cubby,
+                                    "baseboard": sled.baseboard.to_string(),
+                                    "version": sled.version,
+                                    "health": sled.health,
+                                })
+                            })
+                            .collect::<Vec<_>>(),
+                    }
+                })
             ),
             OutputFormat::Text => {
                 qprintln!("Client:\t{client}");
@@ -321,9 +339,11 @@ impl CommandContext for Cli {
             OutputFormat::Json => qprintln!(
                 "{}",
                 json!({
-                    "baseboard_id": &baseboard_id.to_string(),
-                    "client_nonce": &client_nonce,
-                    "sush_nonce": &sush_nonce,
+                    "session_start_params": {
+                        "baseboard_id": &baseboard_id.to_string(),
+                        "client_nonce": &client_nonce,
+                        "sush_nonce": &sush_nonce,
+                    }
                 })
             ),
             OutputFormat::Text => {
@@ -339,11 +359,13 @@ impl CommandContext for Cli {
             OutputFormat::Json => qprintln!(
                 "{}",
                 json!({
-                    "job_id": &request.job_id,
-                    "session_id": &request.session_id,
-                    "command": &request.command,
-                    "mode": &request.mode,
-                    "target": &request.target.to_string(),
+                    "job_start_params": {
+                        "job_id": &request.job_id,
+                        "session_id": &request.session_id,
+                        "command": &request.command,
+                        "mode": &request.mode,
+                        "target": &request.target.to_string(),
+                    }
                 })
             ),
             OutputFormat::Text => {
@@ -367,7 +389,13 @@ impl CommandContext for Cli {
         match self.get_output_format() {
             OutputFormat::Json => qprintln!(
                 "{}",
-                json!({"session_created": session_id, "signer_nonce": signer_nonce, "seq": seq})
+                json!({
+                    "session_created": {
+                        "session_id": session_id,
+                        "signer_nonce": signer_nonce,
+                        "seq": seq,
+                    }
+                })
             ),
             OutputFormat::Text => {
                 qprintln!("✅ Session is now `{session_id}`");
@@ -402,7 +430,15 @@ impl CommandContext for Cli {
     fn attach_allowed(&mut self, key_id: &KeyId, access: Access) {
         match self.get_output_format() {
             OutputFormat::Json => {
-                qprintln!("{}", json!({"attach_allowed": key_id, "access": access}))
+                qprintln!(
+                    "{}",
+                    json!({
+                        "attach_allowed": {
+                            "key_id": key_id,
+                            "access": access,
+                        }
+                    })
+                )
             }
             OutputFormat::Text => {
                 qprintln!("✅ Allowed {} attach for `{key_id}`", access.as_str())
@@ -462,7 +498,7 @@ impl CommandContext for Cli {
         }
 
         match self.get_output_format() {
-            OutputFormat::Json => qprintln!("{}", json!(certs)),
+            OutputFormat::Json => qprintln!("{}", json!({"certs": certs})),
             OutputFormat::Text => {
                 if roots.is_empty() {
                     qprintln!("✅ Verified chain consistency");
@@ -490,7 +526,17 @@ impl CommandContext for Cli {
         }
         let job_id = job.job_id();
         match self.get_output_format() {
-            OutputFormat::Json => qprintln!("{}", json!({"job_started": job_id, "sleds": sleds})),
+            OutputFormat::Json => qprintln!(
+                "{}",
+                json!({
+                    "job_started": {
+                        "job_id": job_id,
+                        "sleds": sleds.map(|sleds| {
+                            sleds.iter().map(ToString::to_string).collect::<Vec<_>>()
+                        }),
+                    }
+                })
+            ),
             OutputFormat::Text => {
                 let watch = self.watch.lock().unwrap();
                 let print = |line: String| match watch.as_ref() {
@@ -551,21 +597,39 @@ impl CommandContext for Cli {
 
     fn job_output_target(&mut self, target: &BaseboardId) {
         match self.get_output_format() {
-            OutputFormat::Json => qprintln!("{}", json!({ "target": target.to_string() })),
+            OutputFormat::Json => (),
             OutputFormat::Text => qprintln!(" » {target} «"),
         }
     }
 
     fn job_output(
         &mut self,
-        _job_id: &JobId,
+        job_id: &JobId,
+        target: &BaseboardId,
         stream: JobOutputStream,
         output: &[u8],
         binary: bool,
     ) {
         match self.get_output_format() {
-            OutputFormat::Json if binary => qprintln!("{}", json!(output)),
-            OutputFormat::Json => qprintln!("{}", json!(String::from_utf8_lossy(output))),
+            OutputFormat::Json => {
+                let (output, encoding) = if binary {
+                    (STANDARD.encode(output), "base64")
+                } else {
+                    (String::from_utf8_lossy(output).into_owned(), "utf-8")
+                };
+                qprintln!(
+                    "{}",
+                    json!({
+                        "job_output": {
+                            "job_id": job_id,
+                            "target": target.to_string(),
+                            "stream": stream,
+                            "encoding": encoding,
+                            "output": output,
+                        }
+                    })
+                )
+            }
             OutputFormat::Text if binary => {
                 if let Err(err) = quiet_write(output) {
                     eprintln!("{err}");
@@ -791,7 +855,15 @@ impl CommandContext for Cli {
 
     fn job_status(&mut self, job_id: &JobId, status: &JobStatusMap, style: StatusDisplayStyle) {
         match self.get_output_format() {
-            OutputFormat::Json => qprintln!("{}", json!(job_status_to_json_map(status.clone()))),
+            OutputFormat::Json => qprintln!(
+                "{}",
+                json!({
+                    "job_status": {
+                        "job_id": job_id,
+                        "sleds": job_status_to_json_map(status.clone()),
+                    }
+                })
+            ),
             OutputFormat::Text if matches!(style, StatusDisplayStyle::Short) => {
                 let icon = if status.values().any(|s| {
                     matches!(
@@ -957,7 +1029,7 @@ impl CommandContext for Cli {
 
     fn iam(&mut self, identity: &Identity) -> Result<(), CommandError> {
         match self.get_output_format() {
-            OutputFormat::Json => qprintln!("{}", to_json_string(identity)?),
+            OutputFormat::Json => qprintln!("{}", json!({"identity": identity})),
             OutputFormat::Text => {
                 let Identity {
                     key_id,
@@ -982,36 +1054,34 @@ impl CommandContext for Cli {
     }
 
     fn identities(&mut self, keys: &[SshPublicKey]) -> Result<(), CommandError> {
-        let n = keys.len();
-        if n == 0 {
-            match self.get_output_format() {
-                OutputFormat::Json => qprintln!("[]"),
-                OutputFormat::Text => qprintln!("❌ No SSH identities found"),
-            }
-        } else {
-            for key in keys {
-                let key_id = key.key_id()?;
-                let fingerprint = key.fingerprint();
-                let algorithm = key.algorithm();
-                let comment = key.comment();
-                match self.get_output_format() {
-                    OutputFormat::Json => qprintln!(
-                        "{}",
-                        json!({
-                            "key_id": key_id,
-                            "fingerprint": fingerprint,
-                            "algorithm": algorithm.to_string(),
+        match self.get_output_format() {
+            OutputFormat::Json => {
+                let identities = keys
+                    .iter()
+                    .map(|key| {
+                        Ok(json!({
+                            "key_id": key.key_id()?,
+                            "fingerprint": key.fingerprint(),
+                            "algorithm": key.algorithm().to_string(),
                             "public_key": key.to_openssh()?,
-                        })
-                    ),
-                    OutputFormat::Text => {
-                        qprintln!(
-                            "✅ Key ID:\t{key_id}\n   \
-                                Fingerprint:\t{fingerprint}\n   \
-                                Algorithm:\t{algorithm}\n   \
-                                Comment:\t{comment}",
-                        );
-                    }
+                        }))
+                    })
+                    .collect::<Result<Vec<_>, CommandError>>()?;
+                qprintln!("{}", json!({"identities": identities}));
+            }
+            OutputFormat::Text if keys.is_empty() => qprintln!("❌ No SSH identities found"),
+            OutputFormat::Text => {
+                for key in keys {
+                    let key_id = key.key_id()?;
+                    let fingerprint = key.fingerprint();
+                    let algorithm = key.algorithm();
+                    let comment = key.comment();
+                    qprintln!(
+                        "✅ Key ID:\t{key_id}\n   \
+                            Fingerprint:\t{fingerprint}\n   \
+                            Algorithm:\t{algorithm}\n   \
+                            Comment:\t{comment}",
+                    );
                 }
             }
         }

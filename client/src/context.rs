@@ -62,8 +62,11 @@ impl Authz {
 /// communication with a human user (if there is one).
 #[derive(Clone, Copy, Debug, Default, ValueEnum)]
 pub enum OutputFormat {
+    /// UTF-8 encoded text
     #[default]
     Text,
+
+    /// One JSON object per line
     Json,
 }
 
@@ -154,7 +157,14 @@ pub trait CommandContext: Clone + Send + Sync {
     fn job_stopped(&mut self, id: &JobId);
     fn job_skipped(&mut self, id: &JobId) -> bool;
     fn job_error(&mut self, error: CommandError) -> CommandError;
-    fn job_output(&mut self, id: &JobId, stream: JobOutputStream, output: &[u8], binary: bool);
+    fn job_output(
+        &mut self,
+        id: &JobId,
+        target: &BaseboardId,
+        stream: JobOutputStream,
+        output: &[u8],
+        binary: bool,
+    );
     fn job_output_target(&mut self, target: &BaseboardId);
     fn job_output_started(
         &mut self,
