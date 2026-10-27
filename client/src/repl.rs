@@ -282,6 +282,10 @@ impl CommandContext for Repl {
         self.cli.session_started(session, force)
     }
 
+    fn session_joined(&mut self, session: Session, force: bool) {
+        self.cli.session_joined(session, force)
+    }
+
     fn session_stopped(&mut self, session_id: &SessionId) {
         self.cli.session_stopped(session_id)
     }
@@ -382,8 +386,8 @@ impl CommandContext for Repl {
         self.cli.job_signing_update(job_id);
     }
 
-    fn job_signing_finished(&mut self, job_id: &JobId) {
-        self.cli.job_signing_finished(job_id);
+    fn job_signing_finished(&mut self, job_id: &JobId, signed: bool) {
+        self.cli.job_signing_finished(job_id, signed);
     }
 
     fn job_signed(&mut self, job: &SignedJob, show: bool) {

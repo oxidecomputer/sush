@@ -155,6 +155,7 @@ pub trait CommandContext: Clone + Send + Sync {
         seq: SessionSeq,
     );
     fn session_started(&mut self, session: Session, force: bool);
+    fn session_joined(&mut self, session: Session, force: bool);
     fn session_stopped(&mut self, session_id: &SessionId);
     fn attach_allowed(&mut self, key_id: &KeyId, access: Access);
     fn attach_denied(&mut self, key_id: &KeyId);
@@ -203,7 +204,7 @@ pub trait CommandContext: Clone + Send + Sync {
     fn job_detached(&mut self, id: &JobId);
     fn job_signing_started(&mut self, id: &JobId);
     fn job_signing_update(&mut self, id: &JobId);
-    fn job_signing_finished(&mut self, id: &JobId);
+    fn job_signing_finished(&mut self, id: &JobId, signed: bool);
     fn job_signed(&mut self, job: &SignedJob, show: bool);
     fn job_status(&mut self, id: &JobId, status: &JobStatusMap, style: StatusDisplayStyle);
     fn read_signed_job(&mut self) -> Result<SignedJob, CommandError>;

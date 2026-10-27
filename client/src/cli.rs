@@ -439,7 +439,18 @@ impl CommandContext for Cli {
         match self.get_output_format() {
             OutputFormat::Json => qprintln!("{}", json!({"session_started": session_id})),
             OutputFormat::Text => {
-                self.note("✅ Session is now current");
+                self.note("✅ Started session");
+                qprintln!("   Session ID: {session_id}");
+            }
+        }
+    }
+
+    fn session_joined(&mut self, session: Session, force: bool) {
+        let session_id = self.adopt_session(session, force);
+        match self.get_output_format() {
+            OutputFormat::Json => qprintln!("{}", json!({"session_joined": session_id})),
+            OutputFormat::Text => {
+                self.note("✅ Joined session");
                 qprintln!("   Session ID: {session_id}");
             }
         }
@@ -855,11 +866,11 @@ impl CommandContext for Cli {
         }
     }
 
-    fn job_signing_finished(&mut self, job_id: &JobId) {
+    fn job_signing_finished(&mut self, job_id: &JobId, signed: bool) {
         if let Some(progress) = self.progress.lock().unwrap().take() {
             progress.finish_and_clear();
         }
-        if matches!(self.get_output_format(), OutputFormat::Text) {
+        if signed && matches!(self.get_output_format(), OutputFormat::Text) {
             self.note(format!("✅ Signed request for job `{job_id}`"));
         }
     }
