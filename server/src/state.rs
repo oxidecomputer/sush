@@ -36,7 +36,6 @@ use crate::certs::Certificates;
 use crate::executor::{Executor, PathIsolation};
 use crate::gossip::{Seed, Universe};
 use crate::history::JobHistory;
-use crate::identities::Identities;
 use crate::job::SocketSender;
 use crate::locker::Locker;
 use crate::locker::bookmark::SushBookmark;
@@ -297,8 +296,6 @@ pub struct State {
     attachments: AttachmentPoints,
     /// Job request signing certificates.
     certs: Certificates,
-    /// SSH identities for request attribution.
-    identities: Identities,
     /// This incarnation's relationship to its own past.
     past: Past,
 }
@@ -316,7 +313,6 @@ impl State {
             pending_starts: LruCache::new(MAX_PENDING_STARTS),
             attachments: Default::default(),
             certs: Certificates::new(trust_anchors)?,
-            identities: Default::default(),
             past,
         })
     }
@@ -355,10 +351,6 @@ impl State {
 
     pub fn certs(&self) -> &Certificates {
         &self.certs
-    }
-
-    pub fn identities(&self) -> &Identities {
-        &self.identities
     }
 
     /// Jobs running on our own baseboard, according to our history.
@@ -536,10 +528,6 @@ impl State {
                 let actor = request.actor();
                 let log = log.new(o!("actor" => actor.to_string()));
                 match request {
-                    Request::Identity(r) => {
-                        self.identities.apply(&log, r.request());
-                        Vec::new()
-                    }
                     Request::Session(r) => self.handle_session_request(
                         &log,
                         now,
