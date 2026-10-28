@@ -193,6 +193,7 @@ impl CommandContext for Repl {
         }
         if ssh_auth_sock.is_some() || ssh_key_id.is_some() {
             self.set_credentials(None);
+            self.authz_signer().clear_claim();
         }
 
         macro_rules! set_or_unset {

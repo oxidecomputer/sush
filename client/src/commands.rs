@@ -67,7 +67,7 @@ use crate::repl::Repl;
 use crate::tls;
 use crate::tunnel::{Tunnel, TunnelError};
 use crate::types::{Error as ApiError, SessionStartBody};
-use crate::{Client, Error as ClientError};
+use crate::{AuthzSigner, Client, Error as ClientError};
 
 // Names of environment variables for argument defaults
 // (to prevent mispellings).
@@ -888,7 +888,6 @@ impl ClientCommand {
 async fn authenticate<E>(
     ctx: &mut impl CommandContext,
     client: &Client,
-    via: Option<&BaseboardId>,
     response: ResponseValue<E>,
 ) -> Result<(Identity, Authz), CommandError> {
     let mut ssh_agent = if let Some(ssh_auth_sock) = &ctx.get_globals().ssh_auth_sock {
@@ -915,13 +914,10 @@ async fn authenticate<E>(
     };
     let verified = signed.verify_with_ssh_public_key(&public_key)?;
     let credentials = Credentials::new(verified);
-    let mut request = client
+    let request = client
         .iam()
         .authorization(credentials.to_string())
         .body(public_key.to_string());
-    if let Some(via) = via {
-        request = request.via(via.to_string());
-    }
     let identity = match request.send().await {
         Ok(identity) => identity.into_inner(),
         Err(error) if error.status() == Some(StatusCode::UNAUTHORIZED) => {
@@ -931,6 +927,24 @@ async fn authenticate<E>(
         Err(error) => return Err(error.into()),
     };
     Ok((identity, Authz::new(credentials, key)))
+}
+
+/// Record the agent's key ID, so that requests made before logging
+/// in claim it. A server with no proxy in front needs nothing more.
+/// If the agent has no key to offer, record nothing, and let the
+/// login report why.
+async fn claim_key(ctx: &impl CommandContext, signer: &AuthzSigner) {
+    if signer.get().is_some() || signer.claim().is_some() {
+        return;
+    }
+    let globals = ctx.get_globals();
+    if let Some(ssh_auth_sock) = &globals.ssh_auth_sock
+        && let Ok(mut ssh_agent) = SshAgentConnection::connect(ssh_auth_sock).await
+        && let Ok(public_key) = ssh_agent.identity(globals.ssh_key_id.as_ref()).await
+        && let Ok(key_id) = public_key.key_id()
+    {
+        signer.set_claim(key_id);
+    }
 }
 
 /// A refused login usually indicates build skew rather than a bad key.
@@ -950,22 +964,6 @@ fn login_refused(server: Option<VersionInfo>, error: CommandError) -> CommandErr
 async fn with_login<T, E, Req>(
     ctx: &mut impl CommandContext,
     client: &Client,
-    make_request: Req,
-) -> Result<T, CommandError>
-where
-    Req: AsyncFnMut() -> Result<T, ClientError<E>>,
-    CommandError: From<ClientError<E>>,
-{
-    with_login_via(ctx, client, None, make_request).await
-}
-
-/// Like [`with_login`], for a request that the proxy routes to sled
-/// `via`. A sled that refuses a request answers with a login challenge
-/// that only it can verify, so the login goes to `via` as well.
-async fn with_login_via<T, E, Req>(
-    ctx: &mut impl CommandContext,
-    client: &Client,
-    via: Option<&BaseboardId>,
     mut make_request: Req,
 ) -> Result<T, CommandError>
 where
@@ -973,6 +971,7 @@ where
     CommandError: From<ClientError<E>>,
 {
     let signer = ctx.authz_signer();
+    claim_key(ctx, &signer).await;
     let mut generation = signer.generation();
     let mut logged_in = false;
     loop {
@@ -981,7 +980,7 @@ where
                 if err.status() == StatusCode::UNAUTHORIZED && !logged_in =>
             {
                 if let Some(_login) = signer.login_needed(generation).await {
-                    let (_identity, authz) = authenticate(ctx, client, via, err).await?;
+                    let (_identity, authz) = authenticate(ctx, client, err).await?;
                     ctx.set_credentials(Some(authz));
                     logged_in = true;
                 }
@@ -1534,7 +1533,7 @@ async fn job_start(
         max_fsize,
     } = limits.as_limits();
     let mut start_ctx = ctx.clone();
-    let start = with_login_via(&mut start_ctx, client, Some(&target), async || {
+    let start = with_login(&mut start_ctx, client, async || {
         let mut start = client
             .job_start()
             .job_id(job.job_id())
@@ -1749,7 +1748,7 @@ async fn job_start(
         let multiple = status.len() > 1;
         for baseboard in status.keys() {
             for stream in [Stdout, Stderr] {
-                match with_login_via(ctx, client, Some(baseboard), async || {
+                match with_login(ctx, client, async || {
                     client
                         .job_output()
                         .job_id(job_id)
@@ -1932,7 +1931,7 @@ async fn job_stop(
     job_id: &JobId,
     via: Option<&BaseboardId>,
 ) -> Result<(), CommandError> {
-    with_login_via(ctx, client, via, async || {
+    with_login(ctx, client, async || {
         let mut request = client.job_stop().job_id(job_id).wait(JobWait::Stop);
         if let Some(via) = via {
             request = request.via(via.to_string());
@@ -1963,7 +1962,7 @@ async fn job_status_map(
     job_id: &JobId,
     via: Option<&BaseboardId>,
 ) -> Result<JobStatusMap, CommandError> {
-    let status = with_login_via(ctx, client, via, async || {
+    let status = with_login(ctx, client, async || {
         let mut request = client.job_status().job_id(job_id);
         if let Some(via) = via {
             request = request.via(via.to_string());
@@ -2273,7 +2272,7 @@ async fn job_output_from(
     } else {
         // Download and print the output all at once. If hash verification
         // fails here, do not print any output.
-        let byte_stream = with_login_via(ctx, client, Some(target), {
+        let byte_stream = with_login(ctx, client, {
             async || {
                 client
                     .job_output()
@@ -2387,7 +2386,7 @@ async fn job_attach(
     job_id: &JobId,
     target: &BaseboardId,
 ) -> Result<(), CommandError> {
-    match with_login_via(ctx, client, Some(target), async || {
+    match with_login(ctx, client, async || {
         client
             .job_attach()
             .job_id(job_id)
@@ -2422,7 +2421,7 @@ async fn job_stream(
     mut file: File,
 ) -> Result<Hasher, CommandError> {
     let io_error = |error| CommandError::io(path, error);
-    let socket = with_login_via(ctx, client, Some(target), async || {
+    let socket = with_login(ctx, client, async || {
         client
             .job_attach()
             .job_id(job_id)

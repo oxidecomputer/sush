@@ -4,13 +4,18 @@
 
 //! Proxy server for the Oxide Support Shell API.
 //!
-//! Terminates client connections and routes each request to a sled,
-//! answering only `/version` itself.
-//! A request that names a target goes to the first sled the target
-//! resolves to. Anything else goes to the sled hosting the proxy,
-//! which any request may reach.
-//! Requests are forwarded untouched: bound request signatures cover
-//! the exact request line, so the proxy may never rewrite one.
+//! Terminates client connections, verifies request credentials,
+//! and routes requests to servers. The proxy answers `/version`
+//! and `/iam` itself; other requests are forwarded untouched.
+//!
+//! A request that specifies a target goes to the first sled the
+//! target resolves to. Anything else goes to the server on the
+//! sled hosting the proxy, the proxy's *home* sled.
+//!
+//! Clients authenticate the proxy by its RoT-vouched certificate;
+//! see [`platform_tls`].
+
+pub mod login;
 
 use std::collections::BTreeMap;
 use std::convert::Infallible;
@@ -20,9 +25,9 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use camino::{Utf8Path, Utf8PathBuf};
-use http::header::CONTENT_TYPE;
+use http::header::{AUTHORIZATION, CONTENT_TYPE, WWW_AUTHENTICATE};
 use http::{Method, StatusCode};
-use http_body_util::{Either, Full};
+use http_body_util::{BodyExt as _, Either, Full, Limited};
 use hyper::body::{Bytes, Incoming};
 use hyper::client::conn::http1 as client_conn;
 use hyper::server::conn::http1 as server_conn;
@@ -37,9 +42,11 @@ use rustls::pki_types::{CertificateDer, PrivateKeyDer};
 use rustls::server::{ClientHello, ResolvesServerCert};
 use rustls::sign::CertifiedKey;
 use rustls::version::TLS13;
+use serde::Serialize;
 use serde_json::json;
 use sled_hardware_types::BaseboardId;
 use slog::{Logger, debug, error, info, o, warn};
+use thiserror::Error;
 use tokio::io::{AsyncRead, AsyncWrite, copy_bidirectional};
 use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::watch;
@@ -48,14 +55,28 @@ use tokio::{select, spawn, try_join};
 use tokio_rustls::TlsAcceptor;
 use tokio_util::sync::CancellationToken;
 
+use sush_common::authn::Challenge;
+use sush_common::keys::SshPublicKey;
 use sush_common::targets::{Cubbies, SledId, Target};
 use sush_common::version::VersionInfo;
+
+use crate::login::{Logins, Unauthorized};
 
 /// Server addresses by baseboard.
 pub type Sleds = BTreeMap<BaseboardId, SocketAddr>;
 
 /// How long to wait for a sled to accept a connection.
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
+
+/// Cap on a login's body, which holds only an SSH public key.
+const MAX_IAM_BODY_BYTES: usize = 0x1_0000;
+
+/// Discovery endpoints that don't require a login.
+const UNAUTHENTICATED: &[(Method, &str)] = &[
+    (Method::GET, "/target"),
+    (Method::GET, "/version"),
+    (Method::GET, "/versions"),
+];
 
 /// The sush servers the proxy may route to. The sled and cubby maps are
 /// discovered independently (by DDM and MGS, resp.), so each arrives on
@@ -98,7 +119,7 @@ impl Targets {
 /// Backend responses pass through. Proxy errors carry their own body.
 type ProxyBody = Either<Incoming, Full<Bytes>>;
 
-#[derive(Debug, thiserror::Error)]
+#[derive(Debug, Error)]
 pub enum ProxyTlsError {
     #[error("reading `{path}` failed: {error}")]
     Pem {
@@ -167,7 +188,12 @@ impl ProxyServer {
         let listener = TcpListener::bind(local_addr).await?;
         let local_addr = listener.local_addr()?;
         let acceptor = tls.map(|config| TlsAcceptor::from(Arc::new(config)));
-        let router = Arc::new(Router { targets, home });
+        let logins = Logins::new(log.new(o!("component" => "logins")));
+        let router = Arc::new(Router {
+            targets,
+            home,
+            logins,
+        });
         spawn(listen(
             log.new(o!("component" => "proxy")),
             listener,
@@ -191,10 +217,11 @@ impl ProxyServer {
     }
 }
 
-/// Pick a sled for each request.
+/// Check each request's login, and pick a sled for it.
 struct Router {
     targets: Targets,
     home: Option<BaseboardId>,
+    logins: Logins,
 }
 
 impl Router {
@@ -284,6 +311,110 @@ fn own_version<B>(log: &Logger, request: &Request<B>) -> Option<Response<ProxyBo
     response
 }
 
+/// What to do with a request once its login is checked.
+enum Checked {
+    /// Forward it to a sled.
+    Forward(Request<Incoming>),
+    /// Answer it here.
+    Answer(Response<ProxyBody>),
+}
+
+/// Verify the identity claimed by a request before forwarding.
+async fn check_login(logins: &Logins, request: Request<Incoming>) -> Checked {
+    // Special-case unauthenticated endpoints (see `test::unauthenticated_endpoints`).
+    if UNAUTHENTICATED
+        .iter()
+        .any(|(method, path)| request.method() == method && request.uri().path() == *path)
+    {
+        return Checked::Forward(request);
+    }
+
+    let (head, body) = request.into_parts();
+    let mut authz_headers = head.headers.get_all(AUTHORIZATION).iter();
+    let authz = authz_headers.next().and_then(|value| value.to_str().ok());
+    if authz_headers.next().is_some() {
+        return Checked::Answer(error_response(
+            StatusCode::BAD_REQUEST,
+            "Requests may have only one `Authorization` header",
+        ));
+    }
+    let method = head.method.as_str();
+    let target = head.uri.path_and_query().map_or("", |pq| pq.as_str());
+    match (&head.method, head.uri.path()) {
+        (&Method::POST, "/iam") => {
+            let public_key = match login_key(body).await {
+                Ok(public_key) => public_key,
+                Err(err) => {
+                    return Checked::Answer(error_response(
+                        StatusCode::BAD_REQUEST,
+                        err.to_string(),
+                    ));
+                }
+            };
+            let result = match public_key {
+                Some(public_key) => logins.login(authz, public_key).await,
+                None => logins.authorize(authz, (method, target)).await,
+            };
+            Checked::Answer(match result {
+                Ok(identity) => json_response(&identity),
+                Err(err) => login_refused(err),
+            })
+        }
+        (&Method::GET, "/iam") => {
+            Checked::Answer(match logins.authorize(authz, (method, target)).await {
+                Ok(_) => json_response(&logins.identities().await),
+                Err(err) => login_refused(err),
+            })
+        }
+        _ => match logins.authorize(authz, (method, target)).await {
+            Ok(_) => Checked::Forward(Request::from_parts(head, body)),
+            Err(err) => Checked::Answer(login_refused(err)),
+        },
+    }
+}
+
+/// Read the public key from the body of a request to `iam`.
+async fn login_key(body: Incoming) -> Result<Option<SshPublicKey>, LoginKeyError> {
+    let body = Limited::new(body, MAX_IAM_BODY_BYTES);
+    let body = body.collect().await.map_err(LoginKeyError::Unreadable)?;
+    Ok(serde_json::from_slice(&body.to_bytes())?)
+}
+
+#[derive(Debug, Error)]
+enum LoginKeyError {
+    #[error("Unable to read login request body: {0}")]
+    Unreadable(Box<dyn std::error::Error + Send + Sync>),
+    #[error("Invalid public key: {0}")]
+    InvalidKey(#[from] serde_json::Error),
+}
+
+/// Answer a refused login with a fresh challenge.
+fn login_refused(Unauthorized(nonce): Unauthorized) -> Response<ProxyBody> {
+    let mut response = error_response(
+        StatusCode::UNAUTHORIZED,
+        "Authentication required, try `iam`",
+    );
+    let challenge = Challenge::new(nonce).to_string();
+    response.headers_mut().insert(
+        WWW_AUTHENTICATE,
+        challenge
+            .parse()
+            .expect("challenge should be a valid header"),
+    );
+    response
+}
+
+fn json_response(value: &impl Serialize) -> Response<ProxyBody> {
+    match serde_json::to_vec(value) {
+        Ok(body) => Response::builder()
+            .status(StatusCode::OK)
+            .header(CONTENT_TYPE, "application/json")
+            .body(Either::Right(Full::new(body.into())))
+            .expect("JSON response should build"),
+        Err(err) => error_response(StatusCode::INTERNAL_SERVER_ERROR, err.to_string()),
+    }
+}
+
 async fn listen(
     log: Logger,
     listener: TcpListener,
@@ -334,18 +465,22 @@ where
         let log = log.clone();
         let router = router.clone();
         async move {
-            Ok::<_, Infallible>(match own_version(&log, &request) {
-                Some(response) => response,
-                None => match router.route(&request) {
-                    Ok(addr) => forward(log, addr, request).await,
-                    Err(response) => {
-                        warn!(
-                            log, "request not routable";
-                            "uri" => %request.uri(), "status" => %response.status()
-                        );
-                        *response
-                    }
-                },
+            if let Some(response) = own_version(&log, &request) {
+                return Ok::<_, Infallible>(response);
+            }
+            let request = match check_login(&router.logins, request).await {
+                Checked::Forward(request) => request,
+                Checked::Answer(response) => return Ok(response),
+            };
+            Ok(match router.route(&request) {
+                Ok(addr) => forward(log, addr, request).await,
+                Err(response) => {
+                    warn!(
+                        log, "request not routable";
+                        "uri" => %request.uri(), "status" => %response.status()
+                    );
+                    *response
+                }
             })
         }
     });
@@ -427,7 +562,41 @@ fn error_response(status: StatusCode, message: impl Into<String>) -> Response<Pr
 
 #[cfg(test)]
 mod test {
+    use std::collections::BTreeSet;
+
+    use sush_api::sush_api_mod::stub_api_description;
+    use sush_common::{OPENAPI_TITLE, OPENAPI_VERSION};
+
     use super::*;
+
+    /// The proxy lets through without a login exactly the endpoints
+    /// whose API signatures take no `Authorization` header.
+    #[test]
+    fn unauthenticated_endpoints() {
+        let api = stub_api_description().unwrap();
+        let openapi = api
+            .openapi(OPENAPI_TITLE, OPENAPI_VERSION.parse().unwrap())
+            .json()
+            .unwrap();
+        let mut unauthenticated = BTreeSet::new();
+        for (path, item) in openapi["paths"].as_object().unwrap() {
+            for (method, operation) in item.as_object().unwrap() {
+                let authorized = operation["parameters"]
+                    .as_array()
+                    .into_iter()
+                    .flatten()
+                    .any(|param| param["in"] == "header" && param["name"] == "authorization");
+                if !authorized {
+                    unauthenticated.insert((method.to_uppercase(), path.clone()));
+                }
+            }
+        }
+        let expected: BTreeSet<_> = UNAUTHENTICATED
+            .iter()
+            .map(|(method, path)| (method.to_string(), path.to_string()))
+            .collect();
+        assert_eq!(unauthenticated, expected);
+    }
 
     fn request(path_and_query: &str) -> Request<()> {
         Request::builder().uri(path_and_query).body(()).unwrap()
@@ -464,9 +633,11 @@ mod test {
             sleds.insert(sled("away"), addr(1));
             sleds.insert(sled("home"), addr(2));
         });
+        let logins = || Logins::new(Logger::root(slog::Discard, o!()));
         let router = Router {
             targets: targets.clone(),
             home: Some(sled("home")),
+            logins: logins(),
         };
         let get = request("/versions");
         assert_eq!(router.route(&get).unwrap(), addr(2));
@@ -484,6 +655,7 @@ mod test {
         let homeless = Router {
             targets,
             home: None,
+            logins: logins(),
         };
         assert_eq!(homeless.route(&get).unwrap(), addr(1));
     }

@@ -138,14 +138,16 @@ impl RequestKey {
         let signature = self.0.sign(&request.to_be_signed(&key_id, &nonce));
         BoundCredentials {
             key_id,
-            nonce,
-            seq: request.seq,
-            signature: EncodedSignature {
-                r: EccR::from_be_bytes(*signature.r_bytes()),
-                s: EccS::from_be_bytes(*signature.s_bytes()),
-                flags: 0,
-                counter: 0,
-            },
+            signature: Some(RequestSignature {
+                nonce,
+                seq: request.seq,
+                signature: EncodedSignature {
+                    r: EccR::from_be_bytes(*signature.r_bytes()),
+                    s: EccS::from_be_bytes(*signature.s_bytes()),
+                    flags: 0,
+                    counter: 0,
+                },
+            }),
         }
     }
 }
@@ -157,16 +159,17 @@ codephrase_newtype! {
 }
 
 impl RequestVerifier {
-    /// Verify that `credentials` sign `request`.
+    /// Verify that `proof` signs `request` for `key_id`.
     pub fn verify(
         &self,
         request: &BoundRequest,
-        credentials: &BoundCredentials,
+        key_id: &KeyId,
+        proof: &RequestSignature,
     ) -> Result<(), AuthnError> {
-        if request.seq != credentials.seq {
+        if request.seq != proof.seq {
             return Err(AuthnError::InvalidSignature);
         }
-        let EncodedSignature { r, s, .. } = &credentials.signature;
+        let EncodedSignature { r, s, .. } = &proof.signature;
         let signature = Ed25519Signature::from_components(r.to_be_bytes(), s.to_be_bytes());
 
         let key =
@@ -177,11 +180,8 @@ impl RequestVerifier {
             return Err(AuthnError::InvalidKey);
         }
 
-        key.verify_strict(
-            &request.to_be_signed(&credentials.key_id, &credentials.nonce),
-            &signature,
-        )
-        .map_err(|_| AuthnError::InvalidSignature)
+        key.verify_strict(&request.to_be_signed(key_id, &proof.nonce), &signature)
+            .map_err(|_| AuthnError::InvalidSignature)
     }
 }
 
@@ -227,12 +227,21 @@ impl BoundRequest {
     }
 }
 
-/// Credentials binding one request to an authenticated identity.
+/// Credentials for one request. The key ID claims the requester's
+/// identity. The signature proves the claim, but is absent until the
+/// client logs in.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct BoundCredentials {
-    /// Key ID of the authenticated identity.
+    /// Key ID of the requester.
     pub key_id: KeyId,
-    /// The server-chosen nonce from authentication.
+    /// Proof that the requester logged in and sent this request.
+    pub signature: Option<RequestSignature>,
+}
+
+/// An ephemeral signature binding one request to a login.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct RequestSignature {
+    /// The server-chosen nonce from the login.
     pub nonce: Nonce,
     /// The request's sequence number.
     pub seq: u64,
@@ -240,18 +249,29 @@ pub struct BoundCredentials {
     pub signature: EncodedSignature,
 }
 
+impl BoundCredentials {
+    /// Claim `key_id` as the requester's identity, without proof.
+    pub fn claim(key_id: KeyId) -> Self {
+        Self {
+            key_id,
+            signature: None,
+        }
+    }
+}
+
 impl fmt::Display for BoundCredentials {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        let Self {
-            key_id,
+        let Self { key_id, signature } = self;
+        write!(f, "{AUTHN_SCHEME} key-id={key_id}")?;
+        if let Some(RequestSignature {
             nonce,
             seq,
             signature: EncodedSignature { r, s, .. },
-        } = self;
-        write!(
-            f,
-            "{AUTHN_SCHEME} key-id={key_id}, nonce={nonce}, seq={seq}, r={r}, s={s}",
-        )
+        }) = signature
+        {
+            write!(f, ", nonce={nonce}, seq={seq}, r={r}, s={s}")?;
+        }
+        Ok(())
     }
 }
 
@@ -260,25 +280,28 @@ impl FromStr for BoundCredentials {
 
     fn from_str(s: &str) -> Result<Self, Self::Err> {
         let mut params = AuthnParams::from_str(s)?;
-        let creds = Self {
-            key_id: params.parse("key-id")?,
-            nonce: params.parse("nonce")?,
-            seq: params.parse("seq")?,
-            signature: EncodedSignature {
-                r: params.parse("r")?,
-
-                s: params.parse("s")?,
-                flags: 0,
-                counter: 0,
-            },
+        let key_id = params.parse("key-id")?;
+        let signature = if ["nonce", "seq", "r", "s"].iter().any(|p| params.has(p)) {
+            Some(RequestSignature {
+                nonce: params.parse("nonce")?,
+                seq: params.parse("seq")?,
+                signature: EncodedSignature {
+                    r: params.parse("r")?,
+                    s: params.parse("s")?,
+                    flags: 0,
+                    counter: 0,
+                },
+            })
+        } else {
+            None
         };
         params.finished()?;
-        Ok(creds)
+        Ok(Self { key_id, signature })
     }
 }
 
 /// An `Authorization` header: initial credentials authenticate at
-/// `iam`, bound credentials authorize every other request.
+/// `iam`, bound credentials identify the sender of every other request.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum Authn {
     Initial(Box<Credentials>),
@@ -289,10 +312,20 @@ impl FromStr for Authn {
     type Err = AuthnError;
 
     fn from_str(s: &str) -> Result<Self, Self::Err> {
-        if AuthnParams::from_str(s)?.has("seq") {
-            Ok(Self::Bound(s.parse()?))
-        } else {
+        if AuthnParams::from_str(s)?.has("cnonce") {
             Ok(Self::Initial(Box::new(s.parse()?)))
+        } else {
+            Ok(Self::Bound(s.parse()?))
+        }
+    }
+}
+
+impl Authn {
+    /// The key ID of the requester.
+    pub fn key_id(&self) -> &KeyId {
+        match self {
+            Self::Initial(credentials) => &credentials.key_id,
+            Self::Bound(credentials) => &credentials.key_id,
         }
     }
 }
@@ -729,11 +762,26 @@ mod test {
             Authn::Bound(parsed) if parsed == creds
         ));
 
+        // Without a signature, the header is only a claim.
+        let claimed = BoundCredentials::claim(creds.key_id.clone());
+        assert_eq!(claimed.to_string(), format!("Sush key-id={}", creds.key_id));
+        assert!(matches!(
+            claimed.to_string().parse::<Authn>().unwrap(),
+            Authn::Bound(parsed) if parsed == claimed
+        ));
+        assert!(matches!(
+            format!("{claimed}, seq=7").parse::<BoundCredentials>(),
+            Err(AuthnError::MissingParam(_))
+        ));
+
         // The method is signed case-insensitively. Everything else
         // must match exactly.
-        verifier.verify(&request, &creds).unwrap();
-        let verify =
-            |method, target, seq| verifier.verify(&BoundRequest::new(method, target, seq), &creds);
+        let key_id = &creds.key_id;
+        let proof = creds.signature.as_ref().unwrap();
+        verifier.verify(&request, key_id, proof).unwrap();
+        let verify = |method, target, seq| {
+            verifier.verify(&BoundRequest::new(method, target, seq), key_id, proof)
+        };
         verify("GET", "/jobs?limit=1", 7).unwrap();
         assert!(verify("POST", "/jobs?limit=1", 7).is_err());
         assert!(verify("GET", "/jobs?limit=2", 7).is_err());
@@ -741,22 +789,19 @@ mod test {
         assert!(
             RequestKey::new()
                 .verifier()
-                .verify(&request, &creds)
+                .verify(&request, key_id, proof)
                 .is_err()
         );
 
         // The identity is part of the signed material: credentials
         // re-labeled with another key ID or nonce do not verify.
-        let relabeled = BoundCredentials {
-            key_id: KeyId::from_str("ability").unwrap(),
-            ..creds.clone()
-        };
-        assert!(verifier.verify(&request, &relabeled).is_err());
-        let relabeled = BoundCredentials {
+        let other = KeyId::from_str("ability").unwrap();
+        assert!(verifier.verify(&request, &other, proof).is_err());
+        let relabeled = RequestSignature {
             nonce: Nonce::random(),
-            ..creds.clone()
+            ..proof.clone()
         };
-        assert!(verifier.verify(&request, &relabeled).is_err());
+        assert!(verifier.verify(&request, key_id, &relabeled).is_err());
 
         // A small-order ephemeral key is refused at parse.
         let weak = RequestVerifier::from_be_bytes({
@@ -765,7 +810,7 @@ mod test {
             identity
         });
         assert!(matches!(
-            weak.verify(&request, &creds).unwrap_err(),
+            weak.verify(&request, key_id, proof).unwrap_err(),
             AuthnError::InvalidKey
         ));
     }

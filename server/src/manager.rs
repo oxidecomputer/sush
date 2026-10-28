@@ -2,23 +2,20 @@
 // License, v. 2.0. If a copy of the MPL was not distributed with this
 // file, You can obtain one at https://mozilla.org/MPL/2.0/.
 
-//! Manage authentication, job signature verification, and the session
-//! state machine. Does not manage jobs directly.
+//! Manage job signature verification and the session state machine.
+//! Does not manage jobs directly.
 
 use std::collections::BTreeSet;
-use std::num::NonZeroUsize;
 use std::path::Path;
 use std::sync::{Arc, Mutex as SyncMutex};
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
-use chrono::Utc;
 use http_range_header::SyntacticallyCorrectRange as Range;
-use lru::LruCache;
 use sled_hardware_types::BaseboardId;
-use slog::{Logger, debug, info, o, warn};
+use slog::{Logger, info, o};
 use tokio::fs::read;
 use tokio::select;
-use tokio::sync::{Mutex, mpsc, watch};
+use tokio::sync::{mpsc, watch};
 use tokio::task::JoinHandle;
 use tokio::time::timeout;
 use tokio_stream::wrappers::ReceiverStream;
@@ -27,16 +24,12 @@ use x509_cert::Certificate;
 use x509_cert::der::DecodePem as _;
 
 use sush_api::{JobStartParams, JobStopParams, JobWait};
-use sush_common::authn::{
-    Authn, BoundRequest, Credentials, IDENTITY_IDLE_TTL, IDENTITY_MAX_TTL, Identity, NONCE_TTL,
-    Nonce, RequestVerifier, SeqWindow,
-};
 use sush_common::jobs::{
     Access, JobId, JobOutputStream, JobStatusMap, Session, SessionClientNonce, SessionId,
     SessionPreimage, SessionSeq, SessionServerNonce, SessionSignerNonce, SessionSushNonce,
     SignedJob,
 };
-use sush_common::keys::{KeyError, KeyId, SshPublicKey};
+use sush_common::keys::{KeyError, KeyId};
 use sush_common::targets::{Cubbies, SledHealth, SledVersion, Target, UnknownCubby};
 use sush_common::version::LONG_VERSION;
 
@@ -50,45 +43,12 @@ use crate::messages::v0::{JobRequest, Request, SessionRequest};
 use crate::output::{JobOutputDir, JobOutputFileStream};
 use crate::state::{GossipUniverse, State, StateManager};
 
-/// Maximum number of cached identities.
-const MAX_CACHED_IDENTITIES: NonZeroUsize = NonZeroUsize::new(1_000).unwrap();
-
-/// Maximum number of outstanding authentication nonces. Every failed
-/// request mints one, so garbage traffic evicts real challenges. This
-/// is sized so a flood must sustain hundreds of requests per second
-/// for the whole nonce TTL to lock a user out.
-const MAX_OUTSTANDING_NONCES: NonZeroUsize = NonZeroUsize::new(10_000).unwrap();
-
 /// Maximum amount of time we're willing to wait for job start or stop.
 const WAIT_TIMEOUT: Duration = Duration::from_secs(600);
 
-/// An authenticated identity and the state that authorizes its
-/// requests: the ephemeral verifier, the spent sequence numbers, and
-/// its lifetime, kept on the monotonic clock because the wall clock
-/// may step by decades when NTP first syncs.
 #[derive(Debug)]
-struct CachedIdentity {
-    identity: Identity,
-    verifier: RequestVerifier,
-    window: SeqWindow,
-    authenticated: Instant,
-    last_used: Instant,
-}
-
-impl CachedIdentity {
-    fn is_still_valid(&self) -> bool {
-        self.authenticated.elapsed() < IDENTITY_MAX_TTL
-            && self.last_used.elapsed() < IDENTITY_IDLE_TTL
-    }
-}
-
-/// NB: All tables must have a fixed maximum size!
-#[derive(Debug)]
-#[allow(clippy::type_complexity)]
 pub struct JobManager {
     log: Logger,
-    nonces: Arc<Mutex<LruCache<Nonce, Instant>>>,
-    identities: Arc<Mutex<LruCache<(KeyId, Nonce), CachedIdentity>>>,
     session_server_nonce: Arc<SyncMutex<SessionServerNonce>>,
     output_dir: JobOutputDir,
     own_baseboard: BaseboardId,
@@ -163,8 +123,6 @@ impl JobManager {
         )?;
         Ok(Self {
             log: log.new(o!("component" => "job manager")),
-            nonces: Arc::new(Mutex::new(LruCache::new(MAX_OUTSTANDING_NONCES))),
-            identities: Arc::new(Mutex::new(LruCache::new(MAX_CACHED_IDENTITIES))),
             session_server_nonce,
             own_baseboard,
             linked,
@@ -210,149 +168,26 @@ impl JobManager {
 
     async fn session_request(
         &self,
-        authn: &Identity,
+        authn: &KeyId,
         request: SessionRequest,
     ) -> Result<(), JobError> {
         self.tx_req
-            .send(Request::session(authn.key_id.clone(), request))
+            .send(Request::session(authn.clone(), request))
             .await
             .map_err(|_| JobError::ChannelClosed)
     }
 
-    async fn job_request(&self, authn: &Identity, request: JobRequest) -> Result<(), JobError> {
+    async fn job_request(&self, authn: &KeyId, request: JobRequest) -> Result<(), JobError> {
         self.tx_req
-            .send(Request::job(authn.key_id.clone(), request))
+            .send(Request::job(authn.clone(), request))
             .await
             .map_err(|_| JobError::ChannelClosed)
     }
 
     // Certificate management.
 
-    pub fn cert_chain(
-        &self,
-        _authn: &Identity,
-        key_id: &KeyId,
-    ) -> Result<Vec<Certificate>, JobError> {
+    pub fn cert_chain(&self, _authn: &KeyId, key_id: &KeyId) -> Result<Vec<Certificate>, JobError> {
         Ok(self.state.borrow().certs().chain(key_id)?)
-    }
-
-    // Identity management.
-
-    /// Authenticate initial credentials at `iam`, or authorize a bound
-    /// request against a cached identity. `request` is the request
-    /// line: the method and the target exactly as received.
-    pub async fn iam(
-        &self,
-        authorization: Option<String>,
-        public_key: Option<SshPublicKey>,
-        request: (&str, &str),
-    ) -> Result<Identity, JobError> {
-        // NB: Do not use the `?` operator in this function! We must ensure
-        // that all authentication failures are logged and receive a proper
-        // 401 Unauthorized response with a fresh nonce.
-        macro_rules! unauthorized {
-            ($error:expr) => {{
-                warn!(self.log, "authentication failed"; "error" => %$error);
-                let nonce = Nonce::random();
-                self.nonces.lock().await.put(nonce.clone(), Instant::now());
-                return Err(JobError::unauthorized(nonce));
-            }};
-        }
-
-        macro_rules! try_authn {
-            // $expr -> Result
-            ($expr:expr) => {
-                match $expr {
-                    Ok(value) => value,
-                    Err(error) => unauthorized!(error),
-                }
-            };
-            // $expr -> bool
-            ($expr:expr, $error:expr) => {
-                $expr || unauthorized!($error)
-            };
-        }
-
-        // Parse the supplied credentials.
-        let Some(authorization) = authorization else {
-            unauthorized!("missing authorization")
-        };
-        let now = Utc::now();
-        let credentials = match try_authn!(authorization.parse::<Authn>()) {
-            // A bound request authorizes against a cached identity.
-            Authn::Bound(bound) => {
-                let mut identities = self.identities.lock().await;
-                let cache_key = (bound.key_id.clone(), bound.nonce.clone());
-                let Some(cached) = identities.get_mut(&cache_key) else {
-                    unauthorized!("unknown identity");
-                };
-                if !cached.is_still_valid() {
-                    identities.pop(&cache_key);
-                    unauthorized!("identity expired");
-                }
-                let (method, target) = request;
-                let received = BoundRequest::new(method, target, bound.seq);
-                try_authn!(cached.verifier.verify(&received, &bound));
-                if !cached.window.spend(bound.seq) {
-                    unauthorized!("sequence number already spent");
-                }
-                cached.last_used = Instant::now();
-                debug!(self.log, "bound request authorized"; "key_id" => %bound.key_id);
-                return Ok(cached.identity.clone());
-            }
-            Authn::Initial(credentials) => *credentials,
-        };
-        let Credentials { key_id, nonce, .. } = credentials.clone();
-
-        // Initial credentials authenticate only at `iam` itself.
-        let (method, target) = request;
-        if method != "POST" || target.split('?').next() != Some("/iam") {
-            unauthorized!("initial credentials presented outside iam");
-        }
-
-        // Claim the nonce.
-        let Some(minted) = self.nonces.lock().await.pop(&nonce) else {
-            unauthorized!("nonce not found");
-        };
-        if minted.elapsed() >= NONCE_TTL {
-            unauthorized!("nonce expired");
-        };
-
-        // Verify the supplied credentials.
-        let Some(public_key) = public_key else {
-            unauthorized!("missing public key");
-        };
-        if public_key.key_id().ok() != Some(key_id.clone()) {
-            unauthorized!("invalid key ID");
-        }
-        let response = credentials.clone().into_challenge_response();
-        let verified = try_authn!(response.verify_with_ssh_public_key(&public_key));
-        let identity = try_authn!(Identity::new(public_key, verified, now));
-
-        // Authenticated! Cache the identity and its request verifier.
-        debug!(self.log, "authenticated credentials for identity"; "key_id" => %key_id);
-        self.identities.lock().await.put(
-            (key_id, nonce),
-            CachedIdentity {
-                identity: identity.clone(),
-                verifier: credentials.epk,
-                window: SeqWindow::default(),
-                authenticated: Instant::now(),
-                last_used: Instant::now(),
-            },
-        );
-        Ok(identity)
-    }
-
-    pub async fn identities(&self, _authn: &Identity) -> Result<Vec<Identity>, JobError> {
-        Ok(self
-            .identities
-            .lock()
-            .await
-            .iter()
-            .filter(|(_, cached)| cached.is_still_valid())
-            .map(|(_, cached)| cached.identity.to_owned())
-            .collect())
     }
 
     // Waiting.
@@ -421,11 +256,11 @@ impl JobManager {
 
     // Session management.
 
-    pub fn session(&self, _authn: &Identity) -> Option<Session> {
+    pub fn session(&self, _authn: &KeyId) -> Option<Session> {
         self.state.borrow().session().cloned()
     }
 
-    pub async fn session_id(&self, authn: &Identity) -> Result<SessionId, JobError> {
+    pub async fn session_id(&self, authn: &KeyId) -> Result<SessionId, JobError> {
         let Some(session) = self.session(authn) else {
             return Err(JobError::NoSession);
         };
@@ -443,7 +278,7 @@ impl JobManager {
 
     pub async fn session_start(
         &self,
-        authn: &Identity,
+        authn: &KeyId,
         session_id: SessionId,
         client_nonce: SessionClientNonce,
         signer_nonce: SessionSignerNonce,
@@ -488,11 +323,7 @@ impl JobManager {
         })
     }
 
-    pub async fn session_stop(
-        &self,
-        authn: &Identity,
-        session_id: SessionId,
-    ) -> Result<(), JobError> {
+    pub async fn session_stop(&self, authn: &KeyId, session_id: SessionId) -> Result<(), JobError> {
         self.starter_check(authn)?;
         self.currency_check(session_id)?;
         self.session_request(authn, SessionRequest::Stop(session_id))
@@ -503,7 +334,7 @@ impl JobManager {
     /// requests that lost a race. This check fails fast and loudly.
     pub async fn session_skip_job(
         &self,
-        authn: &Identity,
+        authn: &KeyId,
         session_id: SessionId,
         job_id: JobId,
     ) -> Result<(), JobError> {
@@ -533,10 +364,10 @@ impl JobManager {
     /// Only the session starter may stop the session, skip its jobs,
     /// or grant and deny attach access. The authoritative check is in
     /// the state machine. This one fails fast.
-    fn starter_check(&self, authn: &Identity) -> Result<(), JobError> {
+    fn starter_check(&self, authn: &KeyId) -> Result<(), JobError> {
         match self.state.borrow().session() {
             None => Err(JobError::NoSession),
-            Some(session) if session.started_by() == Some(&authn.key_id) => Ok(()),
+            Some(session) if session.started_by() == Some(authn) => Ok(()),
             Some(_) => Err(JobError::NotSessionStarter),
         }
     }
@@ -552,7 +383,7 @@ impl JobManager {
 
     pub async fn session_allow_attach(
         &self,
-        authn: &Identity,
+        authn: &KeyId,
         session_id: SessionId,
         key_id: KeyId,
         access: Access,
@@ -568,7 +399,7 @@ impl JobManager {
 
     pub async fn session_deny_attach(
         &self,
-        authn: &Identity,
+        authn: &KeyId,
         session_id: SessionId,
         key_id: KeyId,
     ) -> Result<(), JobError> {
@@ -585,7 +416,7 @@ impl JobManager {
     /// of them, and return them.
     pub async fn job_start(
         &self,
-        authn: &Identity,
+        authn: &KeyId,
         job: SignedJob,
         params: JobStartParams,
     ) -> Result<BTreeSet<BaseboardId>, JobError> {
@@ -638,7 +469,7 @@ impl JobManager {
 
     pub async fn job_stop(
         &self,
-        authn: &Identity,
+        authn: &KeyId,
         job_id: &JobId,
         JobStopParams { wait, .. }: JobStopParams,
     ) -> Result<(), JobError> {
@@ -657,7 +488,7 @@ impl JobManager {
 
     pub async fn job_status(
         &self,
-        _authn: &Identity,
+        _authn: &KeyId,
         job_id: &JobId,
     ) -> Result<JobStatusMap, JobError> {
         if let Some(status) = self.state.borrow().get_job_status(job_id) {
@@ -669,7 +500,7 @@ impl JobManager {
 
     pub async fn job_output(
         &self,
-        authn: &Identity,
+        authn: &KeyId,
         job_id: &JobId,
         target: &BaseboardId,
         stream: JobOutputStream,
@@ -685,7 +516,7 @@ impl JobManager {
         {
             info!(
                 self.log, "job output read";
-                "job_id" => %job_id, "stream" => %stream, "actor" => %authn.key_id,
+                "job_id" => %job_id, "stream" => %stream, "actor" => %authn,
             );
             self.output_dir.job_output(job_id, stream, range).await
         } else {
@@ -695,11 +526,11 @@ impl JobManager {
 
     pub async fn job_attachment(
         &self,
-        authn: &Identity,
+        authn: &KeyId,
         job_id: &JobId,
         target: &BaseboardId,
     ) -> Result<(SocketSender, Access), JobError> {
-        let Some(access) = self.state.borrow().attach_access(&authn.key_id) else {
+        let Some(access) = self.state.borrow().attach_access(authn) else {
             return Err(JobError::AttachDenied);
         };
         if self.own_baseboard() == target
@@ -707,7 +538,7 @@ impl JobManager {
         {
             info!(
                 self.log, "job attach";
-                "job_id" => %job_id, "access" => ?access, "actor" => %authn.key_id,
+                "job_id" => %job_id, "access" => ?access, "actor" => %authn,
             );
             Ok((attachment.to_owned(), access))
         } else {
@@ -717,7 +548,7 @@ impl JobManager {
 
     pub async fn job_history(
         &self,
-        _authn: &Identity,
+        _authn: &KeyId,
         limit: u32,
         offset: u32,
     ) -> Result<Vec<JobStatusMap>, JobError> {

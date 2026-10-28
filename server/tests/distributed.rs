@@ -23,13 +23,12 @@ use tokio_util::sync::CancellationToken;
 
 use chrono::Utc;
 use sush_api::{JobStartParams, JobStopParams, JobWait};
-use sush_common::authn::Identity;
 use sush_common::jobs::{
     JobId, JobMode, JobOutputState, JobStartRequest, JobStatus, ProcessError, Session,
     SessionClientNonce, SessionId, SessionPreimage, SessionSeq, SessionSignerNonce,
     SessionSushNonce, SignedJob, SkipReason,
 };
-use sush_common::keys::{EphemeralKey, Signer as _, pem_cert_chain};
+use sush_common::keys::{EphemeralKey, KeyId, Signer as _, pem_cert_chain};
 use sush_common::targets::{Cubbies, SledHealth, SledId, Target};
 use sush_common::version::VersionInfo;
 use sush_server::executor::PathIsolation;
@@ -42,7 +41,7 @@ use sush_server::state::GossipUniverse;
 use sush_server::{JobError, JobManager, seed_gossip};
 
 use common::{
-    baseboard, corpus, eventually, fake_identity, gossip_config, localhost, pki, sign_job,
+    baseboard, corpus, eventually, gossip_config, localhost, pki, requester, sign_job,
     sprockets_config, test_logger,
 };
 
@@ -163,8 +162,8 @@ async fn jobs_gossip_between_sleds() {
 
     // A session started on sled A becomes B's active session too,
     // once a signed job confirms it.
-    let authn_a = fake_identity(&mut root).await;
-    let authn_b = fake_identity(&mut root).await;
+    let authn_a = requester(&root);
+    let authn_b = requester(&root);
     let Ceremony {
         session_id,
         client_nonce,
@@ -263,8 +262,8 @@ async fn first_job_confirms_start_on_another_sled() {
     .await;
 
     // A takes the start.
-    let authn_a = fake_identity(&mut root).await;
-    let authn_b = fake_identity(&mut root).await;
+    let authn_a = requester(&root);
+    let authn_b = requester(&root);
     let Ceremony {
         session_id,
         client_nonce,
@@ -331,7 +330,7 @@ async fn cubby_resolves_on_accepting_sled() {
         .send(Cubbies::from([(14, b.baseboard.clone())]))
         .unwrap();
 
-    let authn = fake_identity(&mut root).await;
+    let authn = requester(&root);
     let Ceremony {
         session_id,
         client_nonce,
@@ -404,7 +403,7 @@ async fn stop_waits_for_remote_sleds() {
     .await;
     sees(&a, &b).await;
 
-    let authn = fake_identity(&mut root).await;
+    let authn = requester(&root);
     let Ceremony {
         session_id,
         client_nonce,
@@ -467,7 +466,7 @@ async fn unverified_job_is_refused() {
     let log = test_logger(function_name!());
     let shutdown = CancellationToken::new();
     let a = Sled::start(&log, &dir, 1, &root_pem, &shutdown).await;
-    let authn = fake_identity(&mut root).await;
+    let authn = requester(&root);
     let Ceremony {
         session_id,
         client_nonce,
@@ -537,9 +536,9 @@ async fn forged_start_never_takes_effect() {
     let log = test_logger(function_name!());
     let shutdown = CancellationToken::new();
     let a = Sled::start(&log, &dir, 1, &root_pem, &shutdown).await;
-    let authn = fake_identity(&mut root).await;
-    let mut forger = common::ephemeral_root();
-    let authn_forger = fake_identity(&mut forger).await;
+    let authn = requester(&root);
+    let forger = common::ephemeral_root();
+    let authn_forger = requester(&forger);
 
     // A genuine session's first job confirms it.
     let Ceremony {
@@ -680,8 +679,8 @@ async fn partitioned_sessions_converge_on_higher_seq() {
     let shutdown = CancellationToken::new();
     let a = Sled::start(&log, &dir, 1, &root_pem, &shutdown).await;
     let b = Sled::start(&log, &dir, 2, &root_pem, &shutdown).await;
-    let authn_a = fake_identity(&mut root).await;
-    let authn_b = fake_identity(&mut root).await;
+    let authn_a = requester(&root);
+    let authn_b = requester(&root);
     a.peers.send(BTreeSet::from([b.addr])).unwrap();
     b.peers.send(BTreeSet::from([a.addr])).unwrap();
     eventually("universe convergence", 120, async || {
@@ -797,7 +796,7 @@ async fn rejoining_replays_without_reexecuting() {
 
     // Sled A runs a whole job before B exists.
     let a = Sled::start(&log, &dir, 1, &root_pem, &shutdown).await;
-    let authn_a = fake_identity(&mut root).await;
+    let authn_a = requester(&root);
     let Ceremony {
         session_id,
         client_nonce,
@@ -828,7 +827,7 @@ async fn rejoining_replays_without_reexecuting() {
     let b = Sled::start(&log, &dir, 2, &root_pem, &shutdown).await;
     a.peers.send(BTreeSet::from([b.addr])).unwrap();
     b.peers.send(BTreeSet::from([a.addr])).unwrap();
-    let authn_b = fake_identity(&mut root).await;
+    let authn_b = requester(&root);
     eventually("A's history replays on B", 120, async || {
         b.mgr.job_status(&authn_b, &job_id).await.is_ok_and(|map| {
             map.get(&a.baseboard)
@@ -901,7 +900,7 @@ async fn rejoining_replays_without_reexecuting() {
 #[tokio::test]
 async fn interrupted_jobs_get_stopped() {
     let (_tmp, dir) = pki("sush-interrupted-", 2);
-    let mut root = common::ephemeral_root();
+    let root = common::ephemeral_root();
     let root_pem = dir.join("job-root.pem");
     write(
         &root_pem,
@@ -912,7 +911,7 @@ async fn interrupted_jobs_get_stopped() {
     let log = test_logger(function_name!());
     let shutdown = CancellationToken::new();
     let a = Sled::start(&log, &dir, 1, &root_pem, &shutdown).await;
-    let authn_a = fake_identity(&mut root).await;
+    let authn_a = requester(&root);
 
     // A previous life of sled 2 started a job and died before stopping
     // it: the rack's history shows it running forever.
@@ -1046,7 +1045,7 @@ async fn stragglers_do_not_interrupt_live_jobs() {
     })
     .await;
     sees(&a, &b).await;
-    let authn_a = fake_identity(&mut root).await;
+    let authn_a = requester(&root);
     let Ceremony {
         session_id,
         client_nonce,
@@ -1084,7 +1083,7 @@ async fn stragglers_do_not_interrupt_live_jobs() {
     a.peers.send(BTreeSet::from([b.addr, c.addr])).unwrap();
     b.peers.send(BTreeSet::from([a.addr, c.addr])).unwrap();
     c.peers.send(BTreeSet::from([a.addr, b.addr])).unwrap();
-    let authn_b = fake_identity(&mut root).await;
+    let authn_b = requester(&root);
     eventually("the marooned message reaches B", 120, async || {
         b.mgr.versions().iter().any(|row| row.baseboard == marooned)
     })
@@ -1164,12 +1163,7 @@ async fn sign_job_for(
 
 /// Confirm the start pending on `sled` with the session's first job,
 /// and advance `session` past it.
-async fn confirm_start(
-    sled: &Sled,
-    authn: &Identity,
-    root: &mut EphemeralKey,
-    session: &mut Session,
-) {
+async fn confirm_start(sled: &Sled, authn: &KeyId, root: &mut EphemeralKey, session: &mut Session) {
     let job_id = session.next_job_id();
     let job = sign_job_for(root, job_id, session.session_id(), "true", &sled.baseboard).await;
     sled.mgr
@@ -1203,7 +1197,7 @@ async fn lost_suffix_never_reruns() {
 
     // Sled A anchors the session and survives throughout.
     let a = Sled::start(&log, &dir, 1, &root_pem, &shutdown).await;
-    let authn_a = fake_identity(&mut root).await;
+    let authn_a = requester(&root);
     // Sled B keeps its boundary in a locker. It joins before the
     // session starts: a record-less sled serves only sessions
     // that started after it arrived.
@@ -1212,7 +1206,7 @@ async fn lost_suffix_never_reruns() {
     let b_shutdown = CancellationToken::new();
     let locker = Locker::new(&log, baseboard(2), vec![slot.clone()]).unwrap();
     let b = Sled::start_with_locker(&log, &dir, 2, &root_pem, locker, &b_shutdown).await;
-    let authn_b = fake_identity(&mut root).await;
+    let authn_b = requester(&root);
     a.peers.send(BTreeSet::from([b.addr])).unwrap();
     b.peers.send(BTreeSet::from([a.addr])).unwrap();
     eventually("universe convergence", 120, async || {
@@ -1288,7 +1282,7 @@ async fn lost_suffix_never_reruns() {
     sleep(Duration::from_millis(500)).await;
     let locker = Locker::new(&log, baseboard(2), vec![slot]).unwrap();
     let b = Sled::start_with_locker(&log, &dir, 2, &root_pem, locker, &shutdown).await;
-    let authn_b = fake_identity(&mut root).await;
+    let authn_b = requester(&root);
     a.peers.send(BTreeSet::from([b.addr])).unwrap();
     b.peers.send(BTreeSet::from([a.addr])).unwrap();
 
@@ -1374,15 +1368,15 @@ async fn session_resumes_at_stored_successor() {
     // Three sleds converge, then the session starts, so everyone
     // serves it. B keeps its boundary in a locker.
     let a = Sled::start(&log, &dir, 1, &root_pem, &shutdown).await;
-    let authn_a = fake_identity(&mut root).await;
+    let authn_a = requester(&root);
     let c = Sled::start(&log, &dir, 3, &root_pem, &shutdown).await;
-    let authn_c = fake_identity(&mut root).await;
+    let authn_c = requester(&root);
     let boundary_dir = TempDir::with_prefix("sush-boundary-").unwrap();
     let slot = Utf8PathBuf::from_path_buf(boundary_dir.path().to_path_buf()).unwrap();
     let b_shutdown = CancellationToken::new();
     let locker = Locker::new(&log, baseboard(2), vec![slot.clone()]).unwrap();
     let b = Sled::start_with_locker(&log, &dir, 2, &root_pem, locker, &b_shutdown).await;
-    let authn_b = fake_identity(&mut root).await;
+    let authn_b = requester(&root);
     a.peers.send(BTreeSet::from([b.addr, c.addr])).unwrap();
     b.peers.send(BTreeSet::from([a.addr])).unwrap();
     c.peers.send(BTreeSet::from([a.addr])).unwrap();
@@ -1469,7 +1463,7 @@ async fn session_resumes_at_stored_successor() {
     sleep(Duration::from_millis(500)).await;
     let locker = Locker::new(&log, baseboard(2), vec![slot]).unwrap();
     let b = Sled::start_with_locker(&log, &dir, 2, &root_pem, locker, &shutdown).await;
-    let authn_b = fake_identity(&mut root).await;
+    let authn_b = requester(&root);
     b.peers.send(BTreeSet::from([c.addr])).unwrap();
     c.peers.send(BTreeSet::from([b.addr])).unwrap();
     eventually("the session replays to B", 120, async || {
@@ -1531,9 +1525,9 @@ async fn supersession_crosses_universes() {
 
     // Two universes that never meet: A anchors one session, D another.
     let a = Sled::start(&log, &dir, 1, &root_pem, &shutdown).await;
-    let authn_a = fake_identity(&mut root).await;
+    let authn_a = requester(&root);
     let d = Sled::start(&log, &dir, 3, &root_pem, &shutdown).await;
-    let authn_d = fake_identity(&mut root).await;
+    let authn_d = requester(&root);
     let Ceremony {
         session_id: session2_id,
         client_nonce,
@@ -1553,7 +1547,7 @@ async fn supersession_crosses_universes() {
     let x_shutdown = CancellationToken::new();
     let locker = Locker::new(&log, baseboard(2), vec![slot.clone()]).unwrap();
     let x = Sled::start_with_locker(&log, &dir, 2, &root_pem, locker, &x_shutdown).await;
-    let authn_x = fake_identity(&mut root).await;
+    let authn_x = requester(&root);
     a.peers.send(BTreeSet::from([x.addr])).unwrap();
     x.peers.send(BTreeSet::from([a.addr])).unwrap();
     eventually("universe convergence", 120, async || {
@@ -1612,7 +1606,7 @@ async fn supersession_crosses_universes() {
     let x_shutdown = CancellationToken::new();
     let locker = Locker::new(&log, baseboard(2), vec![slot.clone()]).unwrap();
     let x = Sled::start_with_locker(&log, &dir, 2, &root_pem, locker, &x_shutdown).await;
-    let authn_x = fake_identity(&mut root).await;
+    let authn_x = requester(&root);
     d.peers.send(BTreeSet::from([x.addr])).unwrap();
     x.peers.send(BTreeSet::from([d.addr])).unwrap();
     eventually("session two gossips to X", 120, async || {
@@ -1656,7 +1650,7 @@ async fn supersession_crosses_universes() {
     let x_shutdown = CancellationToken::new();
     let locker = Locker::new(&log, baseboard(2), vec![slot.clone()]).unwrap();
     let x = Sled::start_with_locker(&log, &dir, 2, &root_pem, locker, &x_shutdown).await;
-    let authn_x = fake_identity(&mut root).await;
+    let authn_x = requester(&root);
     a.peers.send(BTreeSet::from([x.addr])).unwrap();
     x.peers.send(BTreeSet::from([a.addr])).unwrap();
     eventually("session one replays to X", 120, async || {
@@ -1736,7 +1730,7 @@ async fn supersession_crosses_universes() {
     sleep(Duration::from_millis(500)).await;
     let locker = Locker::new(&log, baseboard(2), vec![slot]).unwrap();
     let x = Sled::start_with_locker(&log, &dir, 2, &root_pem, locker, &shutdown).await;
-    let authn_x = fake_identity(&mut root).await;
+    let authn_x = requester(&root);
     d.peers.send(BTreeSet::from([x.addr])).unwrap();
     x.peers.send(BTreeSet::from([d.addr])).unwrap();
     eventually("session two replays to X", 120, async || {
@@ -1785,7 +1779,7 @@ async fn witnessed_session_survives_restart() {
     let shutdown = CancellationToken::new();
 
     let a = Sled::start(&log, &dir, 1, &root_pem, &shutdown).await;
-    let authn_a = fake_identity(&mut root).await;
+    let authn_a = requester(&root);
 
     let boundary_dir = TempDir::with_prefix("sush-boundary-").unwrap();
     let slot = Utf8PathBuf::from_path_buf(boundary_dir.path().to_path_buf()).unwrap();
@@ -1865,7 +1859,7 @@ async fn witnessed_session_survives_restart() {
 #[tokio::test]
 async fn bookmarks_survive_restart() {
     let (_tmp, dir) = pki("sush-bookmark-", 2);
-    let mut root = common::ephemeral_root();
+    let root = common::ephemeral_root();
     let root_pem = dir.join("job-root.pem");
     write(
         &root_pem,
@@ -1878,7 +1872,7 @@ async fn bookmarks_survive_restart() {
 
     // Sled A holds session history, so it wins every dominance contest.
     let a = Sled::start(&log, &dir, 1, &root_pem, &shutdown).await;
-    let authn_a = fake_identity(&mut root).await;
+    let authn_a = requester(&root);
     let Ceremony {
         session_id,
         client_nonce,
@@ -1962,7 +1956,7 @@ async fn gossip_survives_bookmark_failure() {
     let shutdown = CancellationToken::new();
 
     let a = Sled::start(&log, &dir, 1, &root_pem, &shutdown).await;
-    let authn_a = fake_identity(&mut root).await;
+    let authn_a = requester(&root);
 
     // Sled 2's bookmark points into a directory that does not exist.
     // It sheds the bookmark and gossips anyway, stranding identities
