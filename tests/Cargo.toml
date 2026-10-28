@@ -20,6 +20,7 @@ libc.workspace = true
 pki-playground.workspace = true
 pwd.workspace = true
 rand_core.workspace = true
+reqwest.workspace = true
 rumors.workspace = true
 serde_json.workspace = true
 sha3.workspace = true
@@ -31,6 +32,7 @@ sprockets-tls-test-utils.workspace = true
 sush-api = { path = "../api" }
 sush-client = { path = "../client" }
 sush-common = { path = "../common" }
+sush-proxy = { path = "../proxy" }
 sush-server = { path = "../server", features = ["test-support"] }
 tempfile.workspace = true
 tokio.workspace = true

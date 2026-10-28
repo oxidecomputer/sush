@@ -13,7 +13,6 @@ use dropshot::{ClientErrorStatusCode, HttpError};
 use thiserror::Error;
 
 use sush_api::ErrorCode;
-use sush_common::authn::{Challenge, Nonce};
 use sush_common::interactive::InteractiveJobError;
 use sush_common::jobs::{ExecutionError, JobId, JobOutputHash, SessionId};
 use sush_common::keys::{KeyError, KeyId};
@@ -71,6 +70,8 @@ pub enum JobError {
     MultipleSessions,
     #[error("No sled this job targets is reachable")]
     NoReachableTarget,
+    #[error("Requests must include an identity, is `SSH_AUTH_SOCK` set?")]
+    NoRequester,
     #[error("No current session, try `session start`")]
     NoSession,
     #[error("Job `{0}` is not the session's next job")]
@@ -89,6 +90,8 @@ pub enum JobError {
     PublicKeyMismatch(KeyId),
     #[error("Public key `{0}` not found")]
     PublicKeyNotFound(KeyId),
+    #[error("Only available at proxy servers")]
+    ProxyOnly,
     #[error(transparent)]
     Slice(#[from] std::array::TryFromSliceError),
     #[error(transparent)]
@@ -97,8 +100,6 @@ pub enum JobError {
     Timeout,
     #[error("Too many simultaneous output requests ({0})")]
     TooManyOutputRequests(usize),
-    #[error("Unauthorized request")]
-    Unauthorized(Nonce),
     #[error("Which sled is in cubby {0} has not yet been reported")]
     UnknownCubby(u8),
     #[error("Unable to wait for job end")]
@@ -112,10 +113,6 @@ pub enum JobError {
 impl JobError {
     pub fn closed<E>(_err: E) -> Self {
         Self::ChannelClosed
-    }
-
-    pub fn unauthorized(nonce: Nonce) -> Self {
-        Self::Unauthorized(nonce)
     }
 
     /// Report I/O errors with the corresponding stream name.
@@ -185,17 +182,6 @@ impl From<JobError> for HttpError {
                 ClientErrorStatusCode::TOO_MANY_REQUESTS,
                 error.to_string(),
             ),
-            Unauthorized(nonce) => {
-                let mut err = HttpError::for_client_error(
-                    None,
-                    ClientErrorStatusCode::UNAUTHORIZED,
-                    String::from("Authentication required, try `iam`"),
-                );
-                let challenge = Challenge::new(nonce);
-                err.add_header("WWW-Authenticate", challenge)
-                    .expect("should be able to add WWW-Authenticate header");
-                err
-            }
             AttachDenied | NotSessionStarter => {
                 HttpError::for_client_error(None, ClientErrorStatusCode::FORBIDDEN, message)
             }
@@ -213,8 +199,12 @@ impl From<JobError> for HttpError {
                 message,
             ),
             DuplicateJobId(_) | InteractiveTarget | InvalidCommand | Json(_) | MultipleSessions
-            | InvalidSessionId | NoReachableTarget | UnknownCubby(_) | UnverifiedJob(_) => {
+            | InvalidSessionId | NoReachableTarget | NoRequester | UnknownCubby(_)
+            | UnverifiedJob(_) => {
                 HttpError::for_client_error(None, ClientErrorStatusCode::BAD_REQUEST, message)
+            }
+            ProxyOnly => {
+                HttpError::for_client_error(None, ClientErrorStatusCode::NOT_FOUND, message)
             }
             NotNextJob(_) => {
                 HttpError::for_client_error(None, ClientErrorStatusCode::CONFLICT, message)

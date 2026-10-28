@@ -14,7 +14,6 @@ use std::time::Duration;
 
 use attest_mock::{MockData as _, MockLog, corim, corim::MockCorim, log};
 use camino::Utf8PathBuf;
-use chrono::Utc;
 use rand_core::{OsRng, RngCore as _};
 use slog::{Drain as _, Logger, o};
 use slog_term::{FullFormat, PlainSyncDecorator, TestStdoutWriter};
@@ -25,10 +24,9 @@ use sprockets_tls_test_utils::{
     OutputFileExistsBehavior, alias_prefix, cert_path, certlist_path, generate_config, platform_id,
     private_key_path, root_prefix, sprockets_auth_prefix,
 };
-use sush_common::authn::{Challenge, ChallengeResponse, Identity, Nonce, RequestKey};
 use sush_common::codephrases::Codephrase;
 use sush_common::jobs::{BaseboardId, JobId, JobMode, JobStartRequest, SessionId, SignedJob};
-use sush_common::keys::{EphemeralKey, KeyType, Signer as _};
+use sush_common::keys::{EphemeralKey, KeyId, KeyType, Signer as _};
 use sush_common::targets::Target;
 use sush_server::gossip::GossipConfig;
 use sush_server::link::CorpusSource;
@@ -147,15 +145,9 @@ pub fn ephemeral_root() -> EphemeralKey {
     .unwrap()
 }
 
-/// An authenticated identity for `key`, as `iam` would produce.
-pub async fn fake_identity(key: &mut EphemeralKey) -> Identity {
-    let challenge = Challenge::new(Nonce::random());
-    let response = ChallengeResponse::new(challenge, RequestKey::new().verifier());
-    let signed = key.sign(response).await.unwrap();
-    let verified = signed
-        .verify_with_ssh_public_key(&key.ssh_public_key())
-        .unwrap();
-    Identity::new(key.ssh_public_key(), verified, Utc::now()).unwrap()
+/// Return the key ID to claim on a request from `key`.
+pub fn requester(key: &EphemeralKey) -> KeyId {
+    key.ssh_public_key().key_id().unwrap()
 }
 
 /// Sign a batch job request with `root`.

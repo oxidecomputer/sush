@@ -8,7 +8,8 @@ use std::process::exit;
 use std::sync::{Arc, Mutex};
 
 use reqwest::header::AUTHORIZATION;
-use sush_common::authn::AuthnError;
+use sush_common::authn::{AuthnError, BoundCredentials};
+use sush_common::keys::KeyId;
 use tokio::sync::{Mutex as AsyncMutex, MutexGuard as AsyncMutexGuard};
 
 use crate::context::Authz;
@@ -74,6 +75,9 @@ struct AuthzState {
     /// The current authorization, and how many times it has been set.
     authz: Mutex<(Option<Authz>, u64)>,
 
+    /// The key ID to claim in requests made before logging in.
+    claim: Mutex<Option<KeyId>>,
+
     /// Held during a login. When the server refuses several concurrent
     /// requests, the first to take this lock logs in, and the others
     /// retry with its credentials.
@@ -91,6 +95,18 @@ impl AuthzSigner {
         guard.1 += 1;
     }
 
+    pub fn claim(&self) -> Option<KeyId> {
+        self.0.claim.lock().unwrap().clone()
+    }
+
+    pub fn set_claim(&self, key_id: KeyId) {
+        *self.0.claim.lock().unwrap() = Some(key_id);
+    }
+
+    pub fn clear_claim(&self) {
+        *self.0.claim.lock().unwrap() = None;
+    }
+
     /// How many times the authorization has been set.
     pub fn generation(&self) -> u64 {
         self.0.authz.lock().unwrap().1
@@ -105,27 +121,35 @@ impl AuthzSigner {
     }
 }
 
-/// Sign `request` with the current ephemeral key, unless it already
-/// carries an `Authorization` header (initial authentication does).
+/// Sign `request` with the login's ephemeral key. Before logging in,
+/// only claim the key that will log in.
 async fn sign_request(
     signer: &AuthzSigner,
     request: &mut reqwest::Request,
 ) -> Result<(), AuthnError> {
+    // A login request carries its own credentials.
     if request.headers().contains_key(AUTHORIZATION) {
         return Ok(());
     }
-    let Some(authz) = signer.get() else {
+    let header = if let Some(authz) = signer.get() {
+        authz.sign(request.method().as_str(), &request_target(request.url()))
+    } else if let Some(key_id) = signer.claim() {
+        BoundCredentials::claim(key_id).to_string()
+    } else {
         return Ok(());
     };
-    let url = request.url();
-    let target = match url.query() {
-        Some(query) => format!("{}?{query}", url.path()),
-        None => url.path().to_string(),
-    };
-    let header = authz.header(request.method().as_str(), &target);
     let header = header.parse().map_err(|_| AuthnError::InvalidParam)?;
     request.headers_mut().insert(AUTHORIZATION, header);
     Ok(())
+}
+
+/// Format the path and query of `url` exactly as sent. The proxy
+/// verifies the request signature against these bytes.
+fn request_target(url: &reqwest::Url) -> String {
+    match url.query() {
+        Some(query) => format!("{}?{query}", url.path()),
+        None => url.path().to_string(),
+    }
 }
 
 progenitor::generate_api!(

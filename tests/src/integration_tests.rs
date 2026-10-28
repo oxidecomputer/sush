@@ -35,6 +35,7 @@ use sush_api::sush_api_mod::api_description;
 use sush_client::tls::client as tls_client;
 use sush_client::tunnel::{Tunnel, pipe};
 use sush_client::{AuthzSigner, Client, Error as ClientError};
+use sush_common::authn::BoundCredentials;
 use sush_common::hash::hash;
 use sush_common::interactive::{InteractiveJobControl, InteractiveJobMessage};
 use sush_common::jobs::{
@@ -42,12 +43,12 @@ use sush_common::jobs::{
     job_status_try_from_json_map,
 };
 use sush_common::targets::Cubbies;
-use sush_server::proxy::{Targets, platform_tls};
-use sush_server::{ApiServer, ProxyServer};
+use sush_proxy::{ProxyServer, Targets, platform_tls};
+use sush_server::ApiServer;
 
 use crate::test_utils::{
     SignJobRequest as _, authz, ephemeral_test_root, http_session_ceremony, manager_and_test_root,
-    test_baseboard_id, test_logger, test_pki, vouched_proxy_pems,
+    requester, test_baseboard_id, test_logger, test_pki, vouched_proxy_pems,
 };
 
 const TIMEOUT: Duration = Duration::from_secs(10);
@@ -71,25 +72,21 @@ async fn client_server() {
         .start()
         .expect("failed to start server");
 
-    // Connect and authenticate to the server.
+    // With no proxy in front, a request must claim a key, and logins
+    // are not checked here.
     let addr = server.local_addr();
     let signer = AuthzSigner::default();
     let client = Client::new(&format!("http://{addr}"), signer.clone());
-    let ClientError::ErrorResponse(unauthz) = client.iam().body(None).send().await.unwrap_err()
+    let ClientError::ErrorResponse(nameless) = client.session().send().await.unwrap_err() else {
+        panic!("expected error response")
+    };
+    assert_eq!(nameless.status(), 400, "expected 400 Bad Request");
+    signer.set_claim(requester(&root));
+    let ClientError::ErrorResponse(login) = client.iam().body(None).send().await.unwrap_err()
     else {
         panic!("expected error response")
     };
-    assert_eq!(unauthz.status(), 401, "expected 401 Unauthorized");
-    let (identity, credentials) = authz(&client, unauthz, &mut root).await;
-    signer.set(Some(credentials));
-    let iam = client
-        .iam()
-        .body(None)
-        .send()
-        .await
-        .expect("can't authenticate")
-        .into_inner();
-    assert_eq!(iam, identity, "who am I?");
+    assert_eq!(login.status(), 404, "expected 404 Not Found");
 
     // Start a session and run a job.
     let (session_id, body) = http_session_ceremony(&client, 1).await;
@@ -196,6 +193,28 @@ async fn client_proxy_server() {
         .into_inner();
     assert_eq!(iam, identity, "who am I?");
 
+    // Claiming a key is not a login at the proxy.
+    let claim = AuthzSigner::default();
+    claim.set_claim(requester(&root));
+    let claimant = Client::new(&format!("http://{proxy_addr}"), claim);
+    let ClientError::ErrorResponse(claimed) = claimant.session().send().await.unwrap_err() else {
+        panic!("expected error response")
+    };
+    assert_eq!(claimed.status(), 401, "expected 401 Unauthorized");
+
+    // A second `Authorization` header could smuggle an unchecked claim
+    // past the proxy, so a request may carry only one.
+    let signed = signer.get().unwrap().sign("GET", "/sessions");
+    let smuggled = BoundCredentials::claim(requester(&ephemeral_test_root())).to_string();
+    let response = reqwest::Client::new()
+        .get(format!("http://{proxy_addr}/sessions"))
+        .header("authorization", signed)
+        .header("authorization", smuggled)
+        .send()
+        .await
+        .expect("can't send request");
+    assert_eq!(response.status(), 400, "expected 400 Bad Request");
+
     // Attach to an interactive job through the proxy, routed by the
     // target path segment, and echo bytes over the bridged upgrade.
     let (session_id, body) = http_session_ceremony(&client, 1).await;
@@ -284,9 +303,15 @@ async fn client_proxy_server() {
         .into_inner();
     assert_eq!(resolved, test_baseboard_id());
 
-    // With no sleds in the table, everything is refused.
+    // With no sleds in the table, everything but logins is refused.
     tx_targets.send_replace(BTreeMap::new());
-    let unavailable = client.iam().body(None).send().await.unwrap_err();
+    client
+        .iam()
+        .body(None)
+        .send()
+        .await
+        .expect("the proxy answers logins itself");
+    let unavailable = client.session().send().await.unwrap_err();
     if let ClientError::UnexpectedResponse(response) = unavailable {
         assert_eq!(response.status(), 503);
     }
@@ -345,25 +370,11 @@ async fn interactive_job() {
         .start()
         .expect("failed to start server");
 
-    // Connect and authenticate to the server.
+    // Connect to the server.
     let addr = server.local_addr();
     let signer = AuthzSigner::default();
+    signer.set_claim(requester(&root));
     let client = Client::new(&format!("http://{addr}"), signer.clone());
-    let ClientError::ErrorResponse(unauthz) = client.iam().body(None).send().await.unwrap_err()
-    else {
-        panic!("expected error response")
-    };
-    assert_eq!(unauthz.status(), 401, "expected 401 Unauthorized");
-    let (identity, credentials) = authz(&client, unauthz, &mut root).await;
-    signer.set(Some(credentials));
-    let iam = client
-        .iam()
-        .body(None)
-        .send()
-        .await
-        .expect("can't authenticate")
-        .into_inner();
-    assert_eq!(iam, identity, "who am I?");
 
     // Start a session and run an interactive job.
     let (session_id, body) = http_session_ceremony(&client, 1).await;
@@ -463,18 +474,12 @@ async fn interactive_job() {
     assert_eq!(next_data_message(&mut stream1).await, &again);
     assert_eq!(next_data_message(&mut stream2).await, &again);
 
-    // A guest key authenticates, on its own client, but cannot attach
-    // until granted.
-    let mut guest_key = ephemeral_test_root();
+    // A guest key, on its own client, cannot attach until granted.
+    let guest_key = ephemeral_test_root();
+    let guest = requester(&guest_key);
     let guest_signer = AuthzSigner::default();
+    guest_signer.set_claim(guest.clone());
     let guest_client = Client::new(&format!("http://{addr}"), guest_signer.clone());
-    let ClientError::ErrorResponse(unauthz) =
-        guest_client.iam().body(None).send().await.unwrap_err()
-    else {
-        panic!("expected error response")
-    };
-    let (guest, guest_authz) = authz(&guest_client, unauthz, &mut guest_key).await;
-    guest_signer.set(Some(guest_authz));
     let guest_attach = async || {
         guest_client
             .job_attach()
@@ -493,7 +498,7 @@ async fn interactive_job() {
     client
         .session_allow_attach()
         .session_id(session.session_id())
-        .key_id(guest.key_id.clone())
+        .key_id(guest.clone())
         .access(Access::ReadOnly)
         .send()
         .await
@@ -541,7 +546,7 @@ async fn interactive_job() {
     client
         .session_deny_attach()
         .session_id(session.session_id())
-        .key_id(guest.key_id.clone())
+        .key_id(guest.clone())
         .send()
         .await
         .expect("can't deny attach");
@@ -558,7 +563,7 @@ async fn interactive_job() {
     client
         .session_allow_attach()
         .session_id(session.session_id())
-        .key_id(guest.key_id.clone())
+        .key_id(guest.clone())
         .access(Access::ReadWrite)
         .send()
         .await
@@ -647,16 +652,11 @@ async fn streaming_job() {
         .start()
         .expect("failed to start server");
 
-    // Connect and authenticate to the server.
+    // Connect to the server.
     let addr = server.local_addr();
     let signer = AuthzSigner::default();
+    signer.set_claim(requester(&root));
     let client = Client::new(&format!("http://{addr}"), signer.clone());
-    let ClientError::ErrorResponse(unauthz) = client.iam().body(None).send().await.unwrap_err()
-    else {
-        panic!("expected error response")
-    };
-    let (_identity, credentials) = authz(&client, unauthz, &mut root).await;
-    signer.set(Some(credentials));
 
     // Start a streaming job too big for its pipe, so it blocks until we attach.
     let (session_id, body) = http_session_ceremony(&client, 1).await;
@@ -791,16 +791,11 @@ async fn streaming_job_linger() {
         .start()
         .expect("failed to start server");
 
-    // Connect and authenticate to the server.
+    // Connect to the server.
     let addr = server.local_addr();
     let signer = AuthzSigner::default();
+    signer.set_claim(requester(&root));
     let client = Client::new(&format!("http://{addr}"), signer.clone());
-    let ClientError::ErrorResponse(unauthz) = client.iam().body(None).send().await.unwrap_err()
-    else {
-        panic!("expected error response")
-    };
-    let (_identity, credentials) = authz(&client, unauthz, &mut root).await;
-    signer.set(Some(credentials));
 
     // Run a streaming job small enough to finish before anyone attaches.
     let (session_id, body) = http_session_ceremony(&client, 1).await;

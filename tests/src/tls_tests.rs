@@ -31,8 +31,8 @@ use sush_client::tls::client as tls_client;
 use sush_client::{AuthzSigner, Client, Error as ClientError};
 use sush_common::keys::EphemeralKey;
 use sush_common::targets::Cubbies;
-use sush_server::proxy::{Sleds, Targets, platform_tls};
-use sush_server::{ApiServer, JobManager, ProxyServer};
+use sush_proxy::{ProxyServer, Sleds, Targets, platform_tls};
+use sush_server::{ApiServer, JobManager};
 
 use crate::test_utils::{
     authz, crafted_proxy_pems, manager_and_test_root, test_baseboard_id, test_logger, test_pki,

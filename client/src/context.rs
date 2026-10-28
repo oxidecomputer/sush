@@ -43,8 +43,9 @@ impl Authz {
         }
     }
 
-    /// The `Authorization` header binding one request.
-    pub fn header(&self, method: &str, target: &str) -> String {
+    /// Sign one request with the login's ephemeral key, yielding its
+    /// `Authorization` header.
+    pub fn sign(&self, method: &str, target: &str) -> String {
         let seq = self.seq.fetch_add(1, Ordering::Relaxed);
         let request = BoundRequest::new(method, target, seq);
         self.key
