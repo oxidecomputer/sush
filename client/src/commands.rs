@@ -1432,7 +1432,7 @@ async fn job(
             let style = if full {
                 StatusDisplayStyle::Full
             } else {
-                StatusDisplayStyle::Short
+                StatusDisplayStyle::Medium
             };
             if wait {
                 let status = job_watch(ctx, client, &job_id, None).await?;
@@ -1489,7 +1489,7 @@ async fn job(
                 let status = job_status_try_from_json_map(job)
                     .map_err(CommandError::BaseboardIdParseError)?;
                 if let Some(s) = status.values().next() {
-                    ctx.job_status(s.job_id(), &status, StatusDisplayStyle::Short);
+                    ctx.job_status(s.job_id(), &status, StatusDisplayStyle::Medium);
                 }
             }
             Ok(())
@@ -1579,7 +1579,7 @@ async fn job_start(
             Err(error) => return Err(error),
         }
         let status = job_status_map(ctx, client, &job_id, Some(&target)).await?;
-        ctx.job_status(&job_id, &status, StatusDisplayStyle::Short);
+        ctx.job_status(&job_id, &status, StatusDisplayStyle::Medium);
     } else if streaming {
         let Some(path) = file else {
             return Err(CommandError::StreamingNeedsFile);
@@ -1748,9 +1748,6 @@ async fn job_start(
         // Show the output of every sled the job ran on.
         let multiple = status.len() > 1;
         for baseboard in status.keys() {
-            if multiple {
-                ctx.job_output_target(baseboard);
-            }
             for stream in [Stdout, Stderr] {
                 match with_login_via(ctx, client, Some(baseboard), async || {
                     client
@@ -2150,7 +2147,6 @@ async fn job_output(
         )));
     }
     for baseboard in status.keys() {
-        ctx.job_output_target(baseboard);
         if let Err(error) = job_output_from(ctx, client, baseboard, stream, args.clone()).await {
             ctx.command_error(&error);
         }

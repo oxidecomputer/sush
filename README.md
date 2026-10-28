@@ -37,22 +37,18 @@ sush# job start -w hostname
 👋 Please confirm user presence to sign with key `federal-worth-fee-seed-skin-interest-road-luggage`
 ✅ Session is now `front-edit-bless-suggest-defy-bacon-retire-person`
 ✅ Signed request for job `kingdom-owner-dilemma-craft-soda-hungry-lumber-festival`
-✅ Job ID:      kingdom-owner-dilemma-craft-soda-hungry-lumber-festival
+✅ Started job `kingdom-owner-dilemma-craft-soda-hungry-lumber-festival`
    913-0000019:BRM23230010  Stopped, exit 0 (5ms 545us 307ns), 12 B out, 0 B err
    913-0000019:BRM23230018  Stopped, exit 0 (6ms 165us 887ns), 12 B out, 0 B err
    913-0000019:BRM27230037  Stopped, exit 0 (5ms 927us 316ns), 12 B out, 0 B err
    913-0000023:2F8JEXDK     Stopped, exit 0 (5ms 282us 774ns), 9 B out, 0 B err
- » 913-0000019:BRM23230010 «
-✅ Job stdout:
+ » 913-0000019:BRM23230010 stdout «
 BRM23230010
- » 913-0000019:BRM23230018 «
-✅ Job stdout:
+ » 913-0000019:BRM23230018 stdout «
 BRM23230018
- » 913-0000019:BRM27230037 «
-✅ Job stdout:
+ » 913-0000019:BRM27230037 stdout «
 BRM27230037
- » 913-0000023:2F8JEXDK «
-✅ Job stdout:
+ » 913-0000023:2F8JEXDK stdout «
 2F8JEXDK
 ```
 
@@ -100,9 +96,9 @@ test try running the command `echo $SUSH_JOB_ID`:
 ```
 sush# job start --wait "echo $SUSH_JOB_ID"
 ✅ Signed request for job `install-there-mutual-warfare-sound-live-order-man`
-✅ Job ID:    install-there-mutual-warfare-sound-live-order-man
+✅ Started job `install-there-mutual-warfare-sound-live-order-man`
    a part:0001  Stopped, exit 0 (68ms 190us 114ns), 50 B out, 0 B err
-✅ Job stdout:
+ » a part:0001 stdout «
 install-there-mutual-warfare-sound-live-order-man
 ```
 

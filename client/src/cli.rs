@@ -657,13 +657,6 @@ impl CommandContext for Cli {
         skipped
     }
 
-    fn job_output_target(&mut self, target: &BaseboardId) {
-        match self.get_output_format() {
-            OutputFormat::Json => (),
-            OutputFormat::Text => self.note(format!(" » {target} «")),
-        }
-    }
-
     fn job_output(
         &mut self,
         job_id: &JobId,
@@ -692,22 +685,20 @@ impl CommandContext for Cli {
                     })
                 )
             }
-            OutputFormat::Text if binary => {
-                if let Err(err) = quiet_write(output) {
-                    eprintln!("{err}");
-                }
-            }
             OutputFormat::Text if output.is_empty() => (),
             OutputFormat::Text => {
-                match stream {
-                    JobOutputStream::Stdout => self.note("✅ Job stdout:"),
-                    JobOutputStream::Stderr => self.note("✅ Job stderr:"),
-                };
-                let output = String::from_utf8_lossy(output);
-                if output.ends_with('\n') {
-                    qprint!("{output}");
+                self.note(format!(" » {target} {stream} «"));
+                if binary {
+                    if let Err(err) = quiet_write(output) {
+                        eprintln!("{err}");
+                    }
                 } else {
-                    qprintln!("{output}");
+                    let output = String::from_utf8_lossy(output);
+                    if output.ends_with('\n') {
+                        qprint!("{output}");
+                    } else {
+                        qprintln!("{output}");
+                    }
                 }
             }
         }
@@ -924,25 +915,27 @@ impl CommandContext for Cli {
                     }
                 })
             ),
-            OutputFormat::Text if matches!(style, StatusDisplayStyle::Short) => {
-                let icon = if status.values().any(|s| {
-                    matches!(
-                        s,
-                        JobStatus::Error { .. }
-                            | JobStatus::Cancelled { .. }
-                            | JobStatus::Stopped { result: Err(_), .. }
-                    )
-                }) {
-                    "❌"
-                } else {
-                    "✅"
-                };
+            OutputFormat::Text if !matches!(style, StatusDisplayStyle::Full) => {
+                if matches!(style, StatusDisplayStyle::Medium) {
+                    let icon = if status.values().any(|s| {
+                        matches!(
+                            s,
+                            JobStatus::Error { .. }
+                                | JobStatus::Cancelled { .. }
+                                | JobStatus::Stopped { result: Err(_), .. }
+                        )
+                    }) {
+                        "❌"
+                    } else {
+                        "✅"
+                    };
+                    qprintln!("{icon} Job ID:\t{job_id}");
+                }
                 let width = status
                     .keys()
                     .map(|b| b.to_string().len())
                     .max()
                     .unwrap_or(0);
-                qprintln!("{icon} Job ID:\t{job_id}");
                 for (baseboard_id, status) in status {
                     let id = baseboard_id.to_string();
                     qprintln!("   {id:<width$}  {}", short_status_row(status));
