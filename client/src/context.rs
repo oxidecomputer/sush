@@ -62,16 +62,33 @@ impl Authz {
 /// communication with a human user (if there is one).
 #[derive(Clone, Copy, Debug, Default, ValueEnum)]
 pub enum OutputFormat {
+    /// UTF-8 encoded text
     #[default]
     Text,
+
+    /// One JSON object per line
     Json,
 }
 
 /// How much of a job's per-sled status to show.
 #[derive(Clone, Copy, Debug, Default)]
 pub enum StatusDisplayStyle {
-    #[default]
     Short,
+    #[default]
+    Medium,
+    Full,
+}
+
+/// What to show when a job starts.
+#[derive(Clone, Copy, Debug)]
+pub enum StartedDisplay {
+    /// Display nothing; the job was signed offline.
+    None,
+
+    /// Display a note to stderr only.
+    Note,
+
+    /// Display a note to stderr, and the job ID to stdout.
     Full,
 }
 
@@ -99,6 +116,9 @@ pub trait CommandContext: Clone + Send + Sync {
     fn get_globals(&self) -> GlobalArgs;
     fn set_globals(&mut self, _args: GlobalArgs) {}
     fn pre_parse_hook(&mut self, _command: &str) {}
+
+    // Errors
+    fn command_error(&mut self, error: &CommandError);
 
     // Build provenance
     fn versions(
@@ -136,6 +156,7 @@ pub trait CommandContext: Clone + Send + Sync {
         seq: SessionSeq,
     );
     fn session_started(&mut self, session: Session, force: bool);
+    fn session_joined(&mut self, session: Session, force: bool);
     fn session_stopped(&mut self, session_id: &SessionId);
     fn attach_allowed(&mut self, key_id: &KeyId, access: Access);
     fn attach_denied(&mut self, key_id: &KeyId);
@@ -150,12 +171,22 @@ pub trait CommandContext: Clone + Send + Sync {
 
     // Job management
     fn really_target(&mut self, sled: &SledId) -> Result<(), CommandError>;
-    fn job_started(&mut self, job: &SignedJob, sleds: Option<&BTreeSet<BaseboardId>>, show: bool);
+    fn job_started(
+        &mut self,
+        job: &SignedJob,
+        sleds: Option<&BTreeSet<BaseboardId>>,
+        display: StartedDisplay,
+    );
     fn job_stopped(&mut self, id: &JobId);
     fn job_skipped(&mut self, id: &JobId) -> bool;
-    fn job_error(&mut self, error: CommandError) -> CommandError;
-    fn job_output(&mut self, id: &JobId, stream: JobOutputStream, output: &[u8], binary: bool);
-    fn job_output_target(&mut self, target: &BaseboardId);
+    fn job_output(
+        &mut self,
+        id: &JobId,
+        target: &BaseboardId,
+        stream: JobOutputStream,
+        output: &[u8],
+        binary: bool,
+    );
     fn job_output_started(
         &mut self,
         id: &JobId,
@@ -173,7 +204,7 @@ pub trait CommandContext: Clone + Send + Sync {
     fn job_detached(&mut self, id: &JobId);
     fn job_signing_started(&mut self, id: &JobId);
     fn job_signing_update(&mut self, id: &JobId);
-    fn job_signing_finished(&mut self, id: &JobId);
+    fn job_signing_finished(&mut self, id: &JobId, signed: bool);
     fn job_signed(&mut self, job: &SignedJob, show: bool);
     fn job_status(&mut self, id: &JobId, status: &JobStatusMap, style: StatusDisplayStyle);
     fn read_signed_job(&mut self) -> Result<SignedJob, CommandError>;

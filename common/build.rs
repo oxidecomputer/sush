@@ -5,6 +5,9 @@
 //! Embed the git commit, "-dirty" suffixed when the tree has
 //! uncommitted changes.
 
+// Cargo reads build script instructions from stdout.
+#![allow(clippy::disallowed_macros)]
+
 use std::process::Command;
 
 fn main() {

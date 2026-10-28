@@ -34,7 +34,7 @@ use crate::commands::{
     ClientCommand, CommandError, GlobalArgs, SSH_AUTH_SOCK, SUSH_JOB_ID, SUSH_KEY_ID,
     SUSH_OUTPUT_FORMAT, SUSH_URL,
 };
-use crate::context::{CommandContext, OutputFormat, StatusDisplayStyle};
+use crate::context::{CommandContext, OutputFormat, StartedDisplay, StatusDisplayStyle};
 use crate::{AuthzSigner, Client};
 
 const HISTORY_FILE: &str = "history.txt";
@@ -101,12 +101,15 @@ impl Repl {
                     };
                     let command = match ReplCommandParser::try_parse(&words, &mut self) {
                         Ok(ReplCommandParser { command }) => command,
-                        Err(err) => perr!("{err}"),
+                        Err(err) => {
+                            self.command_error(&err);
+                            continue;
+                        }
                     };
                     match command.execute(&mut self).await {
                         Ok(()) => (),
                         Err(CommandError::Quit) => break,
-                        Err(err) => perr!("{err}"),
+                        Err(err) => self.command_error(&err),
                     }
                 }
                 Err(ReadlineError::Interrupted) => continue,
@@ -197,11 +200,11 @@ impl CommandContext for Repl {
                 if let Some(arg) = $arg {
                     unsafe { env::set_var($var, arg.to_string()) }
                     args.$arg = Some(arg.clone());
-                    println!("✅ {} set to `{}`", $name, arg);
+                    eprintln!("✅ {} set to `{}`", $name, arg);
                 } else {
                     unsafe { env::remove_var($var) }
                     args.$arg = None;
-                    println!("✅ {} unset", $name);
+                    eprintln!("✅ {} unset", $name);
                 }
             }};
         }
@@ -211,6 +214,12 @@ impl CommandContext for Repl {
         set_or_unset!(ssh_key_id, SUSH_KEY_ID, "SSH key ID");
 
         self.cli.set_globals(args);
+    }
+
+    // Errors
+
+    fn command_error(&mut self, error: &CommandError) {
+        self.cli.command_error(error)
     }
 
     // Build provenance
@@ -273,6 +282,10 @@ impl CommandContext for Repl {
         self.cli.session_started(session, force)
     }
 
+    fn session_joined(&mut self, session: Session, force: bool) {
+        self.cli.session_joined(session, force)
+    }
+
     fn session_stopped(&mut self, session_id: &SessionId) {
         self.cli.session_stopped(session_id)
     }
@@ -298,9 +311,14 @@ impl CommandContext for Repl {
 
     // Job management
 
-    fn job_started(&mut self, job: &SignedJob, sleds: Option<&BTreeSet<BaseboardId>>, show: bool) {
+    fn job_started(
+        &mut self,
+        job: &SignedJob,
+        sleds: Option<&BTreeSet<BaseboardId>>,
+        display: StartedDisplay,
+    ) {
         self.set_job_id(Some(job.job_id().to_owned()));
-        self.cli.job_started(job, sleds, show);
+        self.cli.job_started(job, sleds, display);
     }
 
     fn job_stopped(&mut self, job_id: &JobId) {
@@ -312,17 +330,16 @@ impl CommandContext for Repl {
         self.cli.job_skipped(job_id)
     }
 
-    fn job_error(&mut self, error: CommandError) -> CommandError {
-        self.cli.job_error(error)
-    }
-
-    fn job_output_target(&mut self, target: &BaseboardId) {
-        self.cli.job_output_target(target)
-    }
-
-    fn job_output(&mut self, job_id: &JobId, stream: JobOutputStream, output: &[u8], binary: bool) {
+    fn job_output(
+        &mut self,
+        job_id: &JobId,
+        target: &BaseboardId,
+        stream: JobOutputStream,
+        output: &[u8],
+        binary: bool,
+    ) {
         self.set_job_id(Some(job_id.to_owned()));
-        self.cli.job_output(job_id, stream, output, binary);
+        self.cli.job_output(job_id, target, stream, output, binary);
     }
 
     fn job_output_started(
@@ -365,8 +382,8 @@ impl CommandContext for Repl {
         self.cli.job_signing_update(job_id);
     }
 
-    fn job_signing_finished(&mut self, job_id: &JobId) {
-        self.cli.job_signing_finished(job_id);
+    fn job_signing_finished(&mut self, job_id: &JobId, signed: bool) {
+        self.cli.job_signing_finished(job_id, signed);
     }
 
     fn job_signed(&mut self, job: &SignedJob, show: bool) {

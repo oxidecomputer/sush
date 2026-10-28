@@ -20,6 +20,7 @@ use std::time::Duration;
 use async_recursion::async_recursion;
 use bytesize::ByteSize;
 use clap::{Parser, Subcommand};
+use futures::future::{Fuse, FusedFuture as _};
 use futures::stream;
 use futures::{FutureExt as _, StreamExt as _};
 use http::header::WWW_AUTHENTICATE;
@@ -41,7 +42,7 @@ use tokio_tungstenite::tungstenite::protocol::Role;
 use x509_cert::Certificate;
 use x509_cert::der::DecodePem as _;
 
-use sush_api::JobWait;
+use sush_api::{ErrorCode, JobWait};
 use sush_common::authn::{
     AuthnError, Challenge, ChallengeResponse, Credentials, Identity, RequestKey,
 };
@@ -57,7 +58,7 @@ use sush_common::targets::{SledId, Target};
 use sush_common::version::VersionInfo;
 
 use crate::ByteStream;
-use crate::context::{Authz, CommandContext, OutputFormat, StatusDisplayStyle};
+use crate::context::{Authz, CommandContext, OutputFormat, StartedDisplay, StatusDisplayStyle};
 use crate::identity::{IdentityError, SshAgentConnection};
 use crate::interactive::interactive_job;
 #[cfg(feature = "permslip")]
@@ -102,6 +103,7 @@ const MAX_PARALLEL_CHUNKS: NonZeroU8 = NonZeroU8::new(64).unwrap();
 
 // Job polling and spinner update intervals.
 const JOB_STOP_RETRY_INTERVAL: Duration = Duration::from_millis(100);
+
 #[cfg(feature = "permslip")]
 const SIGNING_UPDATE_INTERVAL: Duration = Duration::from_millis(100);
 
@@ -616,11 +618,10 @@ pub enum JobCommand {
         job_id: JobId,
     },
 
-    /// Decline a job, burning its ID and advancing the session.
+    /// Decline to run a job, burning its ID and advancing the session.
     Skip {
-        /// The job to skip.
-        #[clap(env = SUSH_JOB_ID)]
-        job_id: JobId,
+        /// The job to skip. By default, the next job in the current session.
+        job_id: Option<JobId>,
     },
 
     /// Get the status of a started job.
@@ -958,9 +959,9 @@ where
     with_login_via(ctx, client, None, make_request).await
 }
 
-/// Like [`with_login`], for requests a proxy routes to a particular
-/// sled. Identities live on one sled, so the login must go where the
-/// request it retries went.
+/// Like [`with_login`], for a request that the proxy routes to sled
+/// `via`. A sled that refuses a request answers with a login challenge
+/// that only it can verify, so the login goes to `via` as well.
 async fn with_login_via<T, E, Req>(
     ctx: &mut impl CommandContext,
     client: &Client,
@@ -971,14 +972,23 @@ where
     Req: AsyncFnMut() -> Result<T, ClientError<E>>,
     CommandError: From<ClientError<E>>,
 {
-    match make_request().await {
-        Err(ClientError::ErrorResponse(err)) if err.status() == StatusCode::UNAUTHORIZED => {
-            let (_identity, authz) = authenticate(ctx, client, via, err).await?;
-            ctx.set_credentials(Some(authz));
-            Ok(make_request().await?)
+    let signer = ctx.authz_signer();
+    let mut generation = signer.generation();
+    let mut logged_in = false;
+    loop {
+        match make_request().await {
+            Err(ClientError::ErrorResponse(err))
+                if err.status() == StatusCode::UNAUTHORIZED && !logged_in =>
+            {
+                if let Some(_login) = signer.login_needed(generation).await {
+                    let (_identity, authz) = authenticate(ctx, client, via, err).await?;
+                    ctx.set_credentials(Some(authz));
+                    logged_in = true;
+                }
+                generation = signer.generation();
+            }
+            result => return Ok(result?),
         }
-        Err(err) => Err(err.into()),
-        Ok(res) => Ok(res),
     }
 }
 
@@ -1072,7 +1082,7 @@ async fn session(
                 return Err(CommandError::MissingSession);
             }
             // The server's session state is authoritative.
-            ctx.session_started(session, true);
+            ctx.session_joined(session, true);
             Ok(())
         }
 
@@ -1083,7 +1093,7 @@ async fn session(
             },
             None,
         ) => {
-            ctx.session_started(Session::new(session_id), force);
+            ctx.session_joined(Session::new(session_id), force);
             Ok(())
         }
 
@@ -1355,22 +1365,31 @@ async fn job(
             let job = loop {
                 select! {
                     job = &mut sign => {
-                        ctx.job_signing_finished(&job_id);
+                        ctx.job_signing_finished(&job_id, job.is_ok());
                         break job?;
                     }
                     _ = interval.tick() => ctx.job_signing_update(&job_id),
                     _ = sigint.recv() => {
-                        ctx.job_signing_finished(&job_id);
+                        ctx.job_signing_finished(&job_id, false);
                         return Err(CommandError::Canceled);
                     }
                 }
             };
             if let Some(client) = client {
                 ctx.job_signed(&job, false);
-                job_start(ctx, client, job, start_args.to_owned()).await
+                let job_id = *job.job_id();
+                match job_start(ctx, client, job, start_args.to_owned()).await {
+                    Err(error)
+                        if !matches!(error, CommandError::Session(_))
+                            && ctx.next_job_id().ok() == Some(job_id) =>
+                    {
+                        Err(CommandError::JobNotStarted(job_id, Box::new(error)))
+                    }
+                    result => result,
+                }
             } else {
                 ctx.job_signed(&job, true);
-                ctx.job_started(&job, None, false);
+                ctx.job_started(&job, None, StartedDisplay::None);
                 Ok(())
             }
         }
@@ -1386,6 +1405,10 @@ async fn job(
         (JobCommand::Skip { job_id }, client) => {
             let Some(session_id) = ctx.session_id() else {
                 return Err(CommandError::MissingSession);
+            };
+            let job_id = match job_id {
+                Some(job_id) => job_id,
+                None => ctx.next_job_id()?,
             };
             if let Some(client) = client {
                 with_login(ctx, client, async || {
@@ -1409,7 +1432,7 @@ async fn job(
             let style = if full {
                 StatusDisplayStyle::Full
             } else {
-                StatusDisplayStyle::Short
+                StatusDisplayStyle::Medium
             };
             if wait {
                 let status = job_watch(ctx, client, &job_id, None).await?;
@@ -1441,8 +1464,14 @@ async fn job(
                 },
                 TargetArg::Target(target) => resolve_target(client, target).await?,
             };
-            job_attach(ctx, client, &job_id, &target).await?;
-            Ok(())
+            match job_attach(ctx, client, &job_id, &target).await {
+                Err(CommandError::NotFound(_)) => {
+                    let error = attach_refused(ctx, client, &job_id, &target).await;
+                    ctx.command_error(&error);
+                    Ok(())
+                }
+                result => result,
+            }
         }
 
         (JobCommand::History { limit, offset }, Some(client)) => {
@@ -1460,7 +1489,7 @@ async fn job(
                 let status = job_status_try_from_json_map(job)
                     .map_err(CommandError::BaseboardIdParseError)?;
                 if let Some(s) = status.values().next() {
-                    ctx.job_status(s.job_id(), &status, StatusDisplayStyle::Short);
+                    ctx.job_status(s.job_id(), &status, StatusDisplayStyle::Medium);
                 }
             }
             Ok(())
@@ -1493,10 +1522,9 @@ async fn job_start(
     } = start_args;
     let interactive = job.payload().is_interactive();
     let streaming = matches!(job.payload().mode, JobMode::StreamOutput);
-    let wait = if interactive || streaming {
+    let watch = wait;
+    let wait = if interactive || streaming || watch {
         JobWait::Start
-    } else if wait {
-        JobWait::Stop
     } else {
         JobWait::None
     };
@@ -1530,13 +1558,28 @@ async fn job_start(
     // Start the job.
     if interactive {
         let sleds = start.await?.into_inner().sleds;
-        ctx.job_started(&job, Some(&sleds), true);
+        ctx.job_started(&job, Some(&sleds), StartedDisplay::Note);
         match job_attach(ctx, client, &job_id, &target).await {
-            Ok(()) | Err(CommandError::NotFound(_)) => {
-                job_status(ctx, client, &job_id, StatusDisplayStyle::Short).await?
+            Ok(()) => (),
+            Err(CommandError::NotFound(_)) => {
+                let output = JobOutput {
+                    job_id,
+                    binary: true,
+                    file: None,
+                    force: false,
+                    chunk_size: DEFAULT_CHUNK_SIZE,
+                    parallel: PARALLEL_CHUNKS,
+                };
+                if let Err(error) = job_output_from(ctx, client, &target, Stdout, output).await
+                    && !error.is_unfinished_job()
+                {
+                    ctx.command_error(&error);
+                }
             }
             Err(error) => return Err(error),
         }
+        let status = job_status_map(ctx, client, &job_id, Some(&target)).await?;
+        ctx.job_status(&job_id, &status, StatusDisplayStyle::Medium);
     } else if streaming {
         let Some(path) = file else {
             return Err(CommandError::StreamingNeedsFile);
@@ -1552,7 +1595,7 @@ async fn job_start(
             .open(&path)
             .map_err(|error| CommandError::io(&path, error))?;
         let sleds = start.await?.into_inner().sleds;
-        ctx.job_started(&job, Some(&sleds), true);
+        ctx.job_started(&job, Some(&sleds), StartedDisplay::Note);
         let hasher = job_stream(ctx, client, &job_id, &target, &path, file).await?;
         let status = job_watch(ctx, client, &job_id, Some(sleds)).await?;
         ctx.job_status(&job_id, &status, StatusDisplayStyle::Short);
@@ -1582,11 +1625,10 @@ async fn job_start(
                 received,
             });
         }
-    } else if wait.is_some() {
+    } else if watch {
         // Watch the whole rack while the start request runs, and keep
         // watching until the job settles everywhere.
         ctx.job_watch_started(&job_id);
-        let job_target = job.payload().target().clone();
         let mut sleds = None;
         let mut ticker = interval(WATCH_INTERVAL);
         ticker.set_missed_tick_behavior(MissedTickBehavior::Skip);
@@ -1594,8 +1636,24 @@ async fn job_start(
         let mut settling = Settling::default();
         let mut started = false;
         let mut stalled = false;
+        let mut stopping = false;
         let mut stopped = false;
         let mut sigint = signal(SignalKind::interrupt())?;
+        let mut stop_ctx = ctx.clone();
+        let via = job.payload().target().is_single().then_some(&target);
+        let stop = async {
+            // A stop can race the start, so retry it a few times.
+            for _ in 0..3 {
+                match job_stop(&mut stop_ctx, client, &job_id, via).await {
+                    Err(CommandError::NotFound(_)) => sleep(JOB_STOP_RETRY_INTERVAL).await,
+                    result => return result.map(|()| true),
+                }
+            }
+            Ok(false)
+        };
+        pin!(stop);
+        let poll = Fuse::terminated();
+        pin!(poll);
         let status = loop {
             select! {
                 // Wait for the start request to finish.
@@ -1603,10 +1661,12 @@ async fn job_start(
                     match start_result {
                         Ok(response) => {
                             let started = response.into_inner().sleds;
-                            ctx.job_started(&job, Some(&started), true);
+                            ctx.job_started(&job, Some(&started), StartedDisplay::Note);
                             sleds = Some(started);
                         }
-                        Err(CommandError::TimedOut) => ctx.job_started(&job, None, true),
+                        Err(CommandError::TimedOut) => {
+                            ctx.job_started(&job, None, StartedDisplay::Note)
+                        }
                         Err(error) => {
                             ctx.job_watch_finished(&job_id);
                             return Err(error);
@@ -1616,10 +1676,18 @@ async fn job_start(
                     ticker.reset_immediately();
                 }
 
-                _ = ticker.tick() => {
-                    last = match job_status_map(ctx, client, &job_id, job_target.single_baseboard()).await {
+                _ = ticker.tick(), if poll.is_terminated() => {
+                    let mut poll_ctx = ctx.clone();
+                    let job_id = &job_id;
+                    poll.set(
+                        async move { job_status_map(&mut poll_ctx, client, job_id, via).await }
+                            .fuse(),
+                    );
+                }
+
+                status = &mut poll, if !poll.is_terminated() => {
+                    last = match status {
                         Ok(status) => status,
-                        // The job may not be visible anywhere yet.
                         Err(CommandError::NotFound(_)) => JobStatusMap::new(),
                         Err(error) => {
                             ctx.job_watch_finished(&job_id);
@@ -1640,32 +1708,28 @@ async fn job_start(
                     }
                 }
 
-                // While the job runs, an interrupt stops it but keeps
-                // watching: the start future must still resolve, and the
-                // stops are worth seeing. There is a race with the start,
-                // so retry the stop a few times if needed. Once the job
-                // has stopped, or after a first interrupt, an interrupt
-                // just ends the watch.
+                // While the job runs, a first interrupt stops it and keeps
+                // watching; a second ends the watch.
                 _ = sigint.recv() => {
-                    if started || stopped {
+                    let finished = started
+                        && !last.is_empty()
+                        && last.values().all(JobStatus::is_terminal);
+                    if finished || stopping {
                         break last;
                     }
-                    for _ in 0..3 {
-                        match job_stop(ctx, client, &job_id, job_target.single_baseboard()).await {
-                            Ok(_) => {
-                                ctx.job_stopped(&job_id);
-                                stopped = true;
-                                break;
-                            }
-                            Err(CommandError::NotFound(_)) => {
-                                sleep(JOB_STOP_RETRY_INTERVAL).await;
-                            }
-                            Err(error) => {
-                                ctx.job_watch_finished(&job_id);
-                                return Err(error);
-                            }
+                    stopping = true;
+                }
+
+                stop_result = &mut stop, if stopping && !stopped => {
+                    match stop_result {
+                        Ok(true) => ctx.job_stopped(&job_id),
+                        Ok(false) => (),
+                        Err(error) => {
+                            ctx.job_watch_finished(&job_id);
+                            return Err(error);
                         }
                     }
+                    stopped = true;
                 }
             }
         };
@@ -1684,9 +1748,6 @@ async fn job_start(
         // Show the output of every sled the job ran on.
         let multiple = status.len() > 1;
         for baseboard in status.keys() {
-            if multiple {
-                ctx.job_output_target(baseboard);
-            }
             for stream in [Stdout, Stderr] {
                 match with_login_via(ctx, client, Some(baseboard), async || {
                     client
@@ -1701,18 +1762,16 @@ async fn job_start(
                 {
                     Ok(byte_stream) => {
                         let output = byte_stream_to_vec(byte_stream.into_inner()).await?;
-                        ctx.job_output(&job_id, stream, &output, binary);
+                        ctx.job_output(&job_id, baseboard, stream, &output, binary);
                     }
-                    Err(error) if multiple => {
-                        let _ = ctx.job_error(error);
-                    }
+                    Err(error) if multiple => ctx.command_error(&error),
                     Err(error) => return Err(error),
                 }
             }
         }
     } else {
         let sleds = start.await?.into_inner().sleds;
-        ctx.job_started(&job, Some(&sleds), true);
+        ctx.job_started(&job, Some(&sleds), StartedDisplay::Full);
     }
     Ok(())
 }
@@ -2088,9 +2147,8 @@ async fn job_output(
         )));
     }
     for baseboard in status.keys() {
-        ctx.job_output_target(baseboard);
         if let Err(error) = job_output_from(ctx, client, baseboard, stream, args.clone()).await {
-            let _ = ctx.job_error(error);
+            ctx.command_error(&error);
         }
     }
     Ok(())
@@ -2230,7 +2288,7 @@ async fn job_output_from(
         .into_inner();
         let bytes = byte_stream_to_vec(byte_stream).await?;
         check_hash!(hash(&bytes), None)?;
-        ctx.job_output(&job_id, stream, &bytes, binary);
+        ctx.job_output(&job_id, target, stream, &bytes, binary);
         Ok(())
     }
 }
@@ -2295,6 +2353,30 @@ async fn byte_stream_to_file(
             expected: range.len(),
             received: n,
         })
+    }
+}
+
+/// Explain, from the job's status on `target`, why an attach to
+/// `job_id` there found nothing to attach to.
+async fn attach_refused(
+    ctx: &mut impl CommandContext,
+    client: &Client,
+    job_id: &JobId,
+    target: &BaseboardId,
+) -> CommandError {
+    let status = match job_status_map(ctx, client, job_id, Some(target)).await {
+        Ok(status) => status,
+        Err(error) => return error,
+    };
+    match status.get(target) {
+        None => CommandError::JobNotOnSled(*job_id, target.clone()),
+        Some(JobStatus::Queued { .. }) => CommandError::JobNotYetRunning(*job_id),
+        Some(JobStatus::Started { .. }) => CommandError::JobStartingOrStopping(*job_id),
+        Some(JobStatus::Cancelled { .. }) => CommandError::JobCancelled(*job_id),
+        Some(JobStatus::Skipped { reason, .. }) => CommandError::JobSkipped(*job_id, *reason),
+        Some(JobStatus::Stopped { .. } | JobStatus::Error { .. }) => {
+            CommandError::JobFinished(*job_id)
+        }
     }
 }
 
@@ -2531,153 +2613,163 @@ async fn resolve_serial(
 /// What went wrong parsing, preparing, or executing a client command.
 #[derive(Debug, Error)]
 pub enum CommandError {
-    #[error("❌ Serial `{0}` matches more than one sled, use a full baseboard ID")]
+    #[error("Serial `{0}` matches more than one sled, use a full baseboard ID")]
     AmbiguousSerial(String),
-    #[error("❌ Authentication error")]
+    #[error("Authentication error")]
     Authn(#[from] AuthnError),
     #[error(
-        "❌ Authentication failed, client and server are different builds\n   \
-            Client: {client}\n   \
-            Server: {server}"
+        "Authentication failed, client and server are different builds\n   \
+         Client: {client}\n   \
+         Server: {server}"
     )]
     AuthnBuildMismatch {
         client: VersionInfo,
         server: VersionInfo,
     },
-    #[error("❌ Canceled")]
+    #[error("Canceled")]
     Canceled,
-    #[error("❌ Certificate for `{0}` is outside its validity window")]
+    #[error("Certificate for `{0}` is outside its validity window")]
     CertExpired(String),
-    #[error("❌ Chunk size must be positive")]
+    #[error("Chunk size must be positive")]
     ChunkSizeZero,
-    #[error("❓ {0}")]
+    #[error("{0}")]
     Clap(#[from] clap::Error),
-    #[error("❌ {0}")]
+    #[error("{0}")]
     Client(String),
-    #[error("❌ {0}")]
+    #[error("{0}")]
     Der(#[from] x509_cert::der::Error),
-    #[error("❌ {0}")]
+    #[error("{0}")]
     DurationOutOfRange(#[from] chrono::OutOfRangeError),
-    #[error("❌ Empty certificate chain")]
+    #[error("Empty certificate chain")]
     EmptyCertChain,
-    #[error("❌ Identity error: {0}")]
+    #[error("Identity error: {0}")]
     Identity(#[from] IdentityError),
     #[error(
-        "❌ Identity mismatch,  tried to start an interactive job\n   \
-            for `{interactive}`\n    \
-             as `{key_id}`"
+        "Identity mismatch,  tried to start an interactive job\n   \
+         for `{interactive}`\n    \
+          as `{key_id}`"
     )]
     IdentityMismatch { interactive: KeyId, key_id: KeyId },
-    #[error("❌ Interactive job error: {0}")]
+    #[error("Interactive job error: {0}")]
     Interactive(#[from] InteractiveJobError),
-    #[error("❌ Interactive jobs must target exactly one sled")]
+    #[error("Interactive jobs must target exactly one sled")]
     InteractiveTarget,
-    #[error("❌ Local I/O error accessing `{path}`: {error}")]
+    #[error("Local I/O error accessing `{path}`: {error}")]
     Io {
         path: PathBuf,
         error: std::io::Error,
     },
-    #[error("❌ Signal handling error: {0}")]
+    #[error("Signal handling error: {0}")]
     Signal(#[from] std::io::Error),
-    #[error("❌ Unauthorized, try `iam`")]
+    #[error("Unauthorized, try `iam`")]
     InvalidAuthorization,
-    #[error("❌ Leaf certificate does not match key `{0}`")]
+    #[error("Leaf certificate does not match key `{0}`")]
     InvalidLeafCert(KeyId),
-    #[error("❌ Root certificate is not self-signed")]
+    #[error("Root certificate is not self-signed")]
     InvalidRootCert,
-    #[error("❌ Job `{0}` was cancelled before it started")]
+    #[error("Job `{0}` was cancelled before it started")]
     JobCancelled(JobId),
-    #[error("❌ Job `{0}` did not run")]
+    #[error("Job `{0}` did not run")]
     JobDidNotRun(JobId),
-    #[error("❌ Job `{0}` is not yet running")]
+    #[error("Job `{0}` has finished, try `job status` or `job output`")]
+    JobFinished(JobId),
+    #[error("Job `{0}` not found on sled `{1}`")]
+    JobNotOnSled(JobId, BaseboardId),
+    #[error("Job `{0}` was signed but not started, try `job skip`")]
+    JobNotStarted(JobId, Box<CommandError>),
+    #[error("Job `{0}` is not yet running")]
     JobNotYetRunning(JobId),
-    #[error("⏩ Job `{0}` was skipped on this sled: {1}")]
+    #[error("Job `{0}` was skipped on this sled: {1}")]
     JobSkipped(JobId, SkipReason),
-    #[error("❌ Job `{0}` is still running")]
+    #[error("Job `{0}` is starting or stopping, try again")]
+    JobStartingOrStopping(JobId),
+    #[error("Job `{0}` is still running")]
     JobStillRunning(JobId),
-    #[error("❌ JSON error: {0}")]
+    #[error("JSON error: {0}")]
     Json(#[from] serde_json::Error),
-    #[error("❌ Key error: {0}")]
+    #[error("Key error: {0}")]
     Key(#[from] KeyError),
-    #[error("❌ Length mismatch: expected {expected} bytes, received {received}")]
+    #[error("Length mismatch: expected {expected} bytes, received {received}")]
     LengthMismatch { expected: u64, received: u64 },
-    #[error("❌ Missing client nonce: run `session start-params` first, or pass one")]
+    #[error("Missing client nonce: run `session start-params` first, or pass one")]
     MissingClientNonce,
-    #[error("❌ Missing job command, try `--help`")]
+    #[error("Missing job command, try `--help`")]
     MissingCommand,
     #[cfg(feature = "permslip")]
-    #[error("❌ Missing signing key name, try `--permslip`")]
+    #[error("Missing signing key name, try `--permslip`")]
     MissingKeyName,
     #[cfg(feature = "permslip")]
-    #[error("❌ Missing permslip URL, try `--permslip-url` or setting `PERMSLIP_URL`")]
+    #[error("Missing permslip URL, try `--permslip-url` or setting `PERMSLIP_URL`")]
     MissingPermslipUrl,
-    #[error("❌ Missing rack ID, try `--rack` (IDs from `oxide system hardware rack list`)")]
+    #[error("Missing rack ID, try `--rack` (IDs from `oxide system hardware rack list`)")]
     MissingRack,
-    #[error("❌ Missing Nexus token, try `--nexus-token` or setting `SUSH_NEXUS_TOKEN`")]
+    #[error("Missing Nexus token, try `--nexus-token` or setting `SUSH_NEXUS_TOKEN`")]
     MissingNexusToken,
-    #[error("❌ Missing session, try `session start`")]
+    #[error("Missing session, try `session start`")]
     MissingSession,
-    #[error("❌ Missing SSH agent socket, try `--ssh-auth-sock`")]
+    #[error("Missing SSH agent socket, try `--ssh-auth-sock`")]
     MissingSshAuthSock,
-    #[error("❌ {0}")]
+    #[error("{0}")]
     NotFound(String),
-    #[error("❌ Job `{0}` is not the session's next job")]
+    #[error("Job `{0}` is not the session's next job")]
     NotNextJob(JobId),
-    #[error("❌ Command not supported in offline mode, try `--url`")]
+    #[error("Command not supported in offline mode, try `--url`")]
     Offline,
     #[error(
-        "❌ Hash mismatch, output may be truncated or corrupted\n   \
-            Expected: {expected}\n   \
-            Received: {received}"
+        "Hash mismatch, output may be truncated or corrupted\n   \
+         Expected: {expected}\n   \
+         Received: {received}"
     )]
     OutputHashMismatch {
         expected: JobOutputHash,
         received: JobOutputHash,
     },
-    #[error("❌ `--binary` and `--file` need a specific `--target`")]
+    #[error("`--binary` and `--file` need a specific `--target`")]
     OutputNeedsTarget,
     #[cfg(feature = "permslip")]
-    #[error("❌ permslip error: {0}")]
+    #[error("permslip error: {0}")]
     Permslip(#[from] PermslipError),
-    #[error("❌ Job process error: {0}")]
+    #[error("Job process error: {0}")]
     Process(#[from] sush_common::jobs::ProcessError),
-    #[error("❌ Proxy TLS error: {0}")]
+    #[error("Proxy TLS error: {0}")]
     ProxyTls(#[from] tls::ProxyTlsError),
-    #[error("👋 Goodbye!")]
+    #[error("Goodbye!")]
     Quit,
-    #[error("❌ {0}")]
+    #[error("{0}")]
     Readline(#[from] rustyline::error::ReadlineError),
     #[error(transparent)]
     Recursive(#[from] Box<Self>),
-    #[error("❌ Reqwest error: {0}")]
+    #[error("Reqwest error: {0}")]
     Reqwest(#[from] reqwest::Error),
-    #[error("❌ SSH signature error on key ID `{0}`")]
+    #[error("{0}")]
+    Session(String),
+    #[error("SSH signature error on key ID `{0}`")]
     Signature(KeyId),
-    #[error("❌ Streaming jobs need `--file`")]
+    #[error("Streaming jobs need `--file`")]
     StreamingNeedsFile,
-    #[error("❌ Job `{0}` did not exit cleanly, streamed output is unverified")]
+    #[error("Job `{0}` did not exit cleanly, streamed output is unverified")]
     StreamUnverified(JobId),
-    #[error("❌ Can't parse target baseboard ID: {0}")]
+    #[error("Can't parse target baseboard ID: {0}")]
     BaseboardIdParseError(sled_hardware_types::BaseboardIdParseError),
-    #[error("❌ SSH key error: {0}")]
+    #[error("SSH key error: {0}")]
     SshKey(#[from] ssh_key::Error),
-    #[error("❌ Timed out waiting for job")]
+    #[error("Timed out waiting for job")]
     TimedOut,
-    #[error("❌ Too much output to display on terminal, try `--file`")]
+    #[error("Too much output to display on terminal, try `--file`")]
     TooMuchOutput,
-    #[error("❌ Tunnel error: {0}")]
+    #[error("Tunnel error: {0}")]
     Tunnel(#[from] TunnelError),
-    #[error("❌ No sled with serial `{serial}` has a status for job `{job_id}`")]
+    #[error("No sled with serial `{serial}` has a status for job `{job_id}`")]
     UnknownSerial { serial: String, job_id: JobId },
-    #[error("❌ Serial `{0}` matches no sled in the rack inventory")]
+    #[error("Serial `{0}` matches no sled in the rack inventory")]
     UnknownRackSerial(String),
-    #[error("❌ Chain root does not match any supplied root certificate")]
+    #[error("Chain root does not match any supplied root certificate")]
     UntrustedRoot,
-    #[error("❌ Can't start interactive session: {0}")]
+    #[error("Can't start interactive session: {0}")]
     Upgrade(String),
-    #[error("❌ UTF-8 error: {0}")]
+    #[error("UTF-8 error: {0}")]
     Utf8(#[from] std::string::FromUtf8Error),
-    #[error("❌ WebSocket error: {0}")]
+    #[error("WebSocket error: {0}")]
     WebSocket(#[from] WebSocketError),
 }
 
@@ -2687,6 +2779,35 @@ impl CommandError {
         Self::Io {
             path: path.as_ref().to_owned(),
             error,
+        }
+    }
+
+    /// Whether this error says the job has not yet finished.
+    pub fn is_unfinished_job(&self) -> bool {
+        matches!(self, Self::JobNotYetRunning(_) | Self::JobStillRunning(_))
+    }
+
+    fn icon(&self) -> &'static str {
+        match self {
+            Self::Clap(_) => "❓",
+            Self::JobNotStarted(..) => "❗",
+            Self::JobSkipped(..) => "⏩",
+            Self::Quit => "👋",
+            Self::Recursive(error) => error.icon(),
+            _ => "❌",
+        }
+    }
+
+    /// The icon and message of each error in this one, inner first.
+    pub fn errors(&self) -> Vec<(&'static str, String)> {
+        match self {
+            Self::JobNotStarted(_, error) => {
+                let mut errors = error.errors();
+                errors.push((self.icon(), self.to_string()));
+                errors
+            }
+            Self::Recursive(error) => error.errors(),
+            _ => vec![(self.icon(), self.to_string())],
         }
     }
 }
@@ -2699,6 +2820,14 @@ impl From<ClientError<ApiError>> for CommandError {
             CommunicationError(e) if e.is_timeout() => CommandError::TimedOut,
             CommunicationError(e) => CommandError::Client(format!("Communication error: {e}")),
             InvalidUpgrade(e) => CommandError::Client(e.to_string()),
+            ErrorResponse(e)
+                if matches!(
+                    e.error_code.as_deref().map(str::parse),
+                    Some(Ok(ErrorCode::NoSession | ErrorCode::SessionNotCurrent))
+                ) =>
+            {
+                CommandError::Session(e.message.to_owned())
+            }
             ErrorResponse(e) if e.status() == StatusCode::NOT_FOUND => {
                 CommandError::NotFound(e.message.to_owned())
             }

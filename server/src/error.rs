@@ -12,6 +12,7 @@ use std::path::{Path, PathBuf};
 use dropshot::{ClientErrorStatusCode, HttpError};
 use thiserror::Error;
 
+use sush_api::ErrorCode;
 use sush_common::authn::{Challenge, Nonce};
 use sush_common::interactive::InteractiveJobError;
 use sush_common::jobs::{ExecutionError, JobId, JobOutputHash, SessionId};
@@ -70,13 +71,13 @@ pub enum JobError {
     MultipleSessions,
     #[error("No sled this job targets is reachable")]
     NoReachableTarget,
-    #[error("No current session")]
+    #[error("No current session, try `session start`")]
     NoSession,
     #[error("Job `{0}` is not the session's next job")]
     NotNextJob(JobId),
     #[error("Only the session starter may manage the session")]
     NotSessionStarter,
-    #[error("Session `{0}` is no longer current")]
+    #[error("Session `{0}` is no longer current, try `session attach` or `session start`")]
     SessionNotCurrent(SessionId),
     #[error("Job output hash mismatch, file may be corrupt")]
     OutputHashMismatch(JobId, JobOutputHash),
@@ -198,10 +199,19 @@ impl From<JobError> for HttpError {
             AttachDenied | NotSessionStarter => {
                 HttpError::for_client_error(None, ClientErrorStatusCode::FORBIDDEN, message)
             }
-            IdentityNotFound(_) | JobNotFound(_) | NoSession | OutputFileMissing(_)
-            | SessionNotCurrent(_) => {
+            IdentityNotFound(_) | JobNotFound(_) | OutputFileMissing(_) => {
                 HttpError::for_client_error(None, ClientErrorStatusCode::NOT_FOUND, message)
             }
+            NoSession => HttpError::for_client_error(
+                Some(ErrorCode::NoSession.to_string()),
+                ClientErrorStatusCode::NOT_FOUND,
+                message,
+            ),
+            SessionNotCurrent(_) => HttpError::for_client_error(
+                Some(ErrorCode::SessionNotCurrent.to_string()),
+                ClientErrorStatusCode::GONE,
+                message,
+            ),
             DuplicateJobId(_) | InteractiveTarget | InvalidCommand | Json(_) | MultipleSessions
             | InvalidSessionId | NoReachableTarget | UnknownCubby(_) | UnverifiedJob(_) => {
                 HttpError::for_client_error(None, ClientErrorStatusCode::BAD_REQUEST, message)

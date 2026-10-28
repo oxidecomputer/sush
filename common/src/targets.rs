@@ -127,6 +127,11 @@ impl Target {
         matches!(self, Self::All)
     }
 
+    /// Whether this target names exactly one sled, by baseboard or cubby.
+    pub fn is_single(&self) -> bool {
+        matches!(self, Self::Sleds(sleds) if sleds.len() == 1)
+    }
+
     /// A singular target or `None`.
     pub fn single_baseboard(&self) -> Option<&BaseboardId> {
         match self {
@@ -267,6 +272,15 @@ mod test {
         }
         // Display canonicalizes whitespace.
         assert_eq!("14, 16".parse::<Target>().unwrap().to_string(), "14,16");
+    }
+
+    #[test]
+    fn targets_single() {
+        let single = |target: &str| target.parse::<Target>().unwrap().is_single();
+        assert!(single("14"));
+        assert!(single("913-0000019:BRM42220031"));
+        assert!(!single("14,16"));
+        assert!(!single("*"));
     }
 
     #[test]
