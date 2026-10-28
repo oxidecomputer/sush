@@ -12,7 +12,6 @@ use serde::{Deserialize, Serialize};
 use sled_hardware_types::BaseboardId;
 
 use sush_api::JobStartParams;
-use sush_common::authn::SignedLogin;
 use sush_common::jobs::JobOutputState;
 use sush_common::jobs::{
     Access, JobId, ProcessError, SessionId, SessionPreimage, SignedJob, SkipReason,
@@ -169,7 +168,6 @@ pub mod v0 {
     pub enum Request {
         Session(Box<Attributed<SessionRequest>>),
         Job(Box<Attributed<JobRequest>>),
-        Identity(Box<Attributed<IdentityRequest>>),
     }
 
     impl Request {
@@ -181,15 +179,10 @@ pub mod v0 {
             Self::Job(Box::new(Attributed { actor, request }))
         }
 
-        pub fn identity(actor: KeyId, request: IdentityRequest) -> Self {
-            Self::Identity(Box::new(Attributed { actor, request }))
-        }
-
         pub fn actor(&self) -> &KeyId {
             match self {
                 Self::Session(r) => r.as_parts().0,
                 Self::Job(r) => r.as_parts().0,
-                Self::Identity(r) => r.as_parts().0,
             }
         }
 
@@ -205,9 +198,6 @@ pub mod v0 {
                 Self::Job(r) => match r.request {
                     JobRequest::Start(..) => "job start",
                     JobRequest::Stop(_) => "job stop",
-                },
-                Self::Identity(r) => match r.request {
-                    IdentityRequest::Login(..) => "identity login",
                 },
             }
         }
@@ -227,16 +217,6 @@ pub mod v0 {
     pub enum JobRequest {
         Start(SignedJob, JobStartParams, BTreeSet<BaseboardId>),
         Stop(JobId),
-    }
-
-    /// Identity gossip carries evidence, not assertions: every sled
-    /// verifies a login's challenge-response signature itself, so a
-    /// registered identity never depends on another sled's honesty.
-    #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
-    #[allow(clippy::large_enum_variant)]
-    pub enum IdentityRequest {
-        /// OpenSSH public keys are string encoded and decoded at use.
-        Login(String, SignedLogin),
     }
 
     #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -277,7 +257,6 @@ mod wire_format {
     use std::fs::{read, read_dir, write};
 
     use sush_api::JobWait;
-    use sush_common::authn::{ChallengeResponse, Nonce, RequestVerifier};
     use sush_common::hash::hash;
     use sush_common::jobs::{
         JobMode, JobStartRequest, SessionSeq, SessionSignerNonce, SessionSushNonce,
@@ -340,9 +319,6 @@ mod wire_format {
                 }
                 JobRequest::Start(..) => "job-start-request",
                 JobRequest::Stop(_) => "job-stop-request",
-            },
-            Message::Request(Request::Identity(r)) => match r.request {
-                IdentityRequest::Login(..) => "identity-login-request",
             },
             Message::Event(_, event) => match event {
                 Event::Version(_) => "version-event",
@@ -418,19 +394,6 @@ mod wire_format {
             ..Default::default()
         };
 
-        // Deterministic login evidence: nonces, then the ed25519
-        // basepoint as the verifier.
-        let mut epk = [0x66; 32];
-        epk[0] = 0x58;
-        let response: ChallengeResponse = serde_json::from_value(serde_json::json!({
-            "nonce": "abandon".parse::<Nonce>().unwrap(),
-            "cnonce": "ability".parse::<Nonce>().unwrap(),
-            "epk": RequestVerifier::from_be_bytes(epk),
-        }))
-        .unwrap();
-        let openssh = "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAILM+rvN+ot98qgEN796jTiQfZfG1KaT0PtFDJ13gEiGB test@sush";
-        let login = Signed::new(response, actor(), signature(0, 0));
-
         let output = JobOutputState {
             stdout_len: 22,
             stderr_len: 0,
@@ -478,10 +441,6 @@ mod wire_format {
                 ),
             )),
             Message::Request(Request::job(actor(), JobRequest::Stop(long_job))),
-            Message::Request(Request::identity(
-                actor(),
-                IdentityRequest::Login(openssh.to_string(), login),
-            )),
             Message::Event(
                 baseboard.clone(),
                 Event::Version(VersionInfo {

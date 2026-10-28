@@ -46,7 +46,7 @@ use crate::gossip::LinkedBaseboards;
 use crate::job::SocketSender;
 use crate::locker::Locker;
 use crate::locker::boundary::BoundaryStore;
-use crate::messages::v0::{IdentityRequest, JobRequest, Request, SessionRequest};
+use crate::messages::v0::{JobRequest, Request, SessionRequest};
 use crate::output::{JobOutputDir, JobOutputFileStream};
 use crate::receipts::Receipts;
 use crate::state::{GossipUniverse, State, StateManager};
@@ -232,17 +232,6 @@ impl JobManager {
             .map_err(|_| JobError::ChannelClosed)
     }
 
-    async fn identity_request(
-        &self,
-        actor: KeyId,
-        request: IdentityRequest,
-    ) -> Result<(), JobError> {
-        self.tx_req
-            .send(Request::identity(actor, request))
-            .await
-            .map_err(|_| JobError::ChannelClosed)
-    }
-
     // Certificate management.
 
     pub fn cert_chain(
@@ -311,30 +300,6 @@ impl JobManager {
             Authn::Bound(bound) => {
                 let mut identities = self.identities.lock().await;
                 let cache_key = (bound.key_id.clone(), bound.nonce.clone());
-                // A login elsewhere on the rack reaches us as a
-                // registered identity. Adopt it on first use.
-                if !identities.contains(&cache_key) {
-                    let Some(registered) = self
-                        .state
-                        .borrow()
-                        .identities()
-                        .registered_identity(&cache_key)
-                        .cloned()
-                    else {
-                        unauthorized!("unknown identity");
-                    };
-                    debug!(self.log, "adopting registered identity"; "key_id" => %bound.key_id);
-                    identities.put(
-                        cache_key.clone(),
-                        CachedIdentity {
-                            identity: registered.identity,
-                            verifier: registered.verifier,
-                            window: SeqWindow::default(),
-                            authenticated: Instant::now(),
-                            last_used: Instant::now(),
-                        },
-                    );
-                }
                 let Some(cached) = identities.get_mut(&cache_key) else {
                     unauthorized!("unknown identity");
                 };
@@ -378,8 +343,8 @@ impl JobManager {
             unauthorized!("invalid key ID");
         }
         let response = credentials.clone().into_challenge_response();
-        let verified = try_authn!(response.clone().verify_with_ssh_public_key(&public_key));
-        let identity = try_authn!(Identity::new(public_key.clone(), verified, now));
+        let verified = try_authn!(response.verify_with_ssh_public_key(&public_key));
+        let identity = try_authn!(Identity::new(public_key, verified, now));
         let cached = CachedIdentity {
             identity: identity.clone(),
             verifier: credentials.epk.clone(),
@@ -388,7 +353,7 @@ impl JobManager {
             last_used: Instant::now(),
         };
 
-        // Accept a valid receipt from a linked sled, but don't gossip about it.
+        // Accept a valid receipt from a linked sled.
         if let Some(receipt) = receipt {
             let issuer = try_authn!(self.receipts.verify(&receipt, &credentials));
             if !self.linked.borrow().contains(&issuer) {
@@ -418,18 +383,11 @@ impl JobManager {
             unauthorized!("nonce expired");
         };
 
-        // Authenticated! Cache the identity and its request verifier,
-        // and gossip the evidence.
+        // Authenticated! Cache the identity and its request verifier.
         debug!(self.log, "authenticated credentials for identity"; "key_id" => %key_id);
-        self.identities
-            .lock()
-            .await
-            .put((key_id.clone(), nonce), cached);
+        self.identities.lock().await.put((key_id, nonce), cached);
         let receipt = self.receipts.issue(&credentials).await;
-        let login = IdentityRequest::Login(public_key.to_openssh()?, response);
-        self.identity_request(key_id, login)
-            .await
-            .map(|()| IamResponse { identity, receipt })
+        Ok(IamResponse { identity, receipt })
     }
 
     pub async fn identities(&self, _authn: &Identity) -> Result<Vec<Identity>, JobError> {
