@@ -11,7 +11,6 @@ use std::time::Duration;
 
 use bytes::Bytes;
 use camino::{Utf8Path, Utf8PathBuf};
-use chrono::Utc;
 use ed25519_dalek::pkcs8::DecodePrivateKey as _;
 use ed25519_dalek::{Signer as _, SigningKey};
 use futures::TryStreamExt as _;
@@ -31,13 +30,13 @@ use x509_cert::time::Validity;
 use sush_api::{JobStartParams, JobWait};
 use sush_client::context::Authz;
 use sush_client::{Client, ResponseValue};
-use sush_common::authn::{Challenge, ChallengeResponse, Credentials, Identity, Nonce, RequestKey};
+use sush_common::authn::{Challenge, ChallengeResponse, Credentials, Identity, RequestKey};
 use sush_common::codephrases::Codephrase;
 use sush_common::jobs::{
     JobId, JobMode, JobStartRequest, Session, SessionClientNonce, SessionId, SessionPreimage,
     SessionSeq, SessionSignerNonce, SessionSushNonce, VerifiedJob,
 };
-use sush_common::keys::{EphemeralKey, KeyType, Signer, pem_cert_chain};
+use sush_common::keys::{EphemeralKey, KeyId, KeyType, Signer, pem_cert_chain};
 use sush_common::targets::{Cubbies, Target};
 use sush_server::executor::PathIsolation;
 use sush_server::gossip::{LinkedBaseboards, Universe};
@@ -225,15 +224,9 @@ pub fn crafted_proxy_pems(
     (key_path, chain_path)
 }
 
-pub async fn fake_identity(key: &mut EphemeralKey) -> Identity {
-    let nonce = Nonce::random();
-    let challenge = Challenge::new(nonce.clone());
-    let response = ChallengeResponse::new(challenge, RequestKey::new().verifier());
-    let signed = key.sign(response).await.unwrap();
-    let verified = signed
-        .verify_with_ssh_public_key(&key.ssh_public_key())
-        .unwrap();
-    Identity::new(key.ssh_public_key(), verified, Utc::now()).unwrap()
+/// Return the key ID to claim on a request from `key`.
+pub fn requester(key: &EphemeralKey) -> KeyId {
+    key.ssh_public_key().key_id().unwrap()
 }
 
 pub async fn manager_and_test_root(
@@ -279,7 +272,7 @@ pub fn session_ceremony(mgr: &JobManager, seq: u64) -> SessionCeremony {
 /// and advance `session` past it.
 pub async fn confirm_start(
     mgr: &JobManager,
-    authn: &Identity,
+    authn: &KeyId,
     root: &mut EphemeralKey,
     session: &mut Session,
 ) {

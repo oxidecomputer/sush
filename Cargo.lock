@@ -4589,7 +4589,7 @@ checksum = "3a0219bd7d979d58245a4f41f695e1ac9f8befdffadd7f61f1bae9e39abc6620"
 [[package]]
 name = "sprockets-tls"
 version = "0.1.0"
-source = "git+https://github.com/oxidecomputer/sprockets.git?rev=98615b86d51f74ce220198eb16c57932fd24e7cb#98615b86d51f74ce220198eb16c57932fd24e7cb"
+source = "git+https://github.com/oxidecomputer/sprockets.git?rev=02c7e5414d97c0c85d629cb76d1f6beab73d960e#02c7e5414d97c0c85d629cb76d1f6beab73d960e"
 dependencies = [
  "anyhow",
  "attest-data",
@@ -4621,7 +4621,7 @@ dependencies = [
 [[package]]
 name = "sprockets-tls-test-utils"
 version = "0.1.0"
-source = "git+https://github.com/oxidecomputer/sprockets.git?rev=98615b86d51f74ce220198eb16c57932fd24e7cb#98615b86d51f74ce220198eb16c57932fd24e7cb"
+source = "git+https://github.com/oxidecomputer/sprockets.git?rev=02c7e5414d97c0c85d629cb76d1f6beab73d960e#02c7e5414d97c0c85d629cb76d1f6beab73d960e"
 dependencies = [
  "camino",
  "pki-playground 0.2.0 (git+https://github.com/oxidecomputer/pki-playground?rev=7600756029ce046a02c6234aa84ce230cc5eaa04)",
@@ -4917,6 +4917,32 @@ dependencies = [
 ]
 
 [[package]]
+name = "sush-proxy"
+version = "0.1.0"
+dependencies = [
+ "camino",
+ "chrono",
+ "http 1.5.0",
+ "http-body-util",
+ "hyper",
+ "hyper-util",
+ "lru",
+ "percent-encoding",
+ "rustls",
+ "serde",
+ "serde_json",
+ "sled-hardware-types",
+ "slog",
+ "sush-api",
+ "sush-common",
+ "thiserror 1.0.69",
+ "tokio",
+ "tokio-rustls",
+ "tokio-util",
+ "x509-cert",
+]
+
+[[package]]
 name = "sush-server"
 version = "0.1.0"
 dependencies = [
@@ -4937,18 +4963,15 @@ dependencies = [
  "http-body-util",
  "http-range-header",
  "hyper",
- "hyper-util",
  "libc",
  "libcontract-sys",
  "lru",
  "memmap2",
  "p256",
- "percent-encoding",
  "pwd",
  "rand_core 0.6.4",
  "rumors",
  "rustix 1.1.4",
- "rustls",
  "schemars 0.8.22",
  "serde",
  "serde_json",
@@ -4964,7 +4987,6 @@ dependencies = [
  "tempfile",
  "thiserror 1.0.69",
  "tokio",
- "tokio-rustls",
  "tokio-stream",
  "tokio-tungstenite",
  "tokio-util",
@@ -4987,6 +5009,7 @@ dependencies = [
  "pki-playground 0.2.0 (git+https://github.com/oxidecomputer/pki-playground?rev=7600756029ce046a02c6234aa84ce230cc5eaa04)",
  "pwd",
  "rand_core 0.6.4",
+ "reqwest",
  "rumors",
  "serde_json",
  "sha3 0.12.0",
@@ -4998,6 +5021,7 @@ dependencies = [
  "sush-api",
  "sush-client",
  "sush-common",
+ "sush-proxy",
  "sush-server",
  "tempfile",
  "tokio",
