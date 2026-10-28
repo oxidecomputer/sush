@@ -330,10 +330,6 @@ impl CommandContext for Repl {
         self.cli.job_skipped(job_id)
     }
 
-    fn job_output_target(&mut self, target: &BaseboardId) {
-        self.cli.job_output_target(target)
-    }
-
     fn job_output(
         &mut self,
         job_id: &JobId,

@@ -73,8 +73,9 @@ pub enum OutputFormat {
 /// How much of a job's per-sled status to show.
 #[derive(Clone, Copy, Debug, Default)]
 pub enum StatusDisplayStyle {
-    #[default]
     Short,
+    #[default]
+    Medium,
     Full,
 }
 
@@ -186,7 +187,6 @@ pub trait CommandContext: Clone + Send + Sync {
         output: &[u8],
         binary: bool,
     );
-    fn job_output_target(&mut self, target: &BaseboardId);
     fn job_output_started(
         &mut self,
         id: &JobId,
