@@ -25,7 +25,7 @@ use x509_cert::time::Validity;
 
 use sush_api::{JobStartParams, JobStopParams, JobWait};
 use sush_client::context::Authz;
-use sush_common::authn::{Challenge, ChallengeResponse, Credentials, Identity, Nonce, RequestKey};
+use sush_common::authn::{Challenge, ChallengeResponse, Credentials, Identity, RequestKey};
 use sush_common::jobs::{
     Access, JobId, JobLimits, JobMode, JobOutputState, JobOutputStream::*, JobStartRequest,
     JobStatus, ProcessError, Session, SessionId, SessionPreimage, SessionSeq, SessionSignerNonce,
@@ -36,7 +36,7 @@ use sush_common::targets::{Cubbies, Target};
 use sush_server::gossip::{LinkedBaseboards, Universe};
 use sush_server::io::BATCH_OUTPUT_BUFFER_SIZE;
 use sush_server::locker::Locker;
-use sush_server::messages::v0::{IdentityRequest, Message, Request, SessionRequest};
+use sush_server::messages::v0::{Message, Request, SessionRequest};
 use sush_server::output::{JobOutputDir, OutputDirs};
 use sush_server::{JobError, JobManager};
 
@@ -1621,77 +1621,6 @@ async fn job_targets() {
         .await
         .expect("timed out waiting for targeted job")
         .unwrap();
-}
-
-/// A login gossips as evidence every sled verifies for itself: real
-/// evidence authorizes bound requests with no local login, and
-/// fabricated evidence registers nothing.
-#[named]
-#[tokio::test]
-async fn gossiped_identities() {
-    let log = test_logger(function_name!());
-    let (mgr, mut root, peer, _dir, _shutdown) = manager_test_root_and_peer(log).await;
-    let mut liar = ephemeral_test_root();
-    let root_pk = root.ssh_public_key();
-    let root_key_id = root_pk.key_id().unwrap();
-
-    // A liar claims root's key with evidence signed by their own.
-    let bogus_key = RequestKey::new();
-    let bogus = ChallengeResponse::new(Challenge::new(Nonce::random()), bogus_key.verifier());
-    let signed_by_liar = liar.sign(bogus).await.unwrap();
-    let bogus_verified = signed_by_liar
-        .clone()
-        .verify_with_ssh_public_key(&liar.ssh_public_key())
-        .unwrap();
-    let mut bogus_credentials = Credentials::new(bogus_verified);
-    bogus_credentials.key_id = root_key_id.clone();
-    let bogus_authz = Authz::new(bogus_credentials, bogus_key);
-    peer.send(
-        Message::Request(Request::identity(
-            root_key_id.clone(),
-            IdentityRequest::Login(root_pk.to_openssh().unwrap(), signed_by_liar),
-        ))
-        .into(),
-    )
-    .unwrap();
-
-    // Real evidence authorizes here without ever logging in here.
-    let request_key = RequestKey::new();
-    let response = ChallengeResponse::new(Challenge::new(Nonce::random()), request_key.verifier());
-    let signed = root.sign(response).await.unwrap();
-    let verified = signed.clone().verify_with_ssh_public_key(&root_pk).unwrap();
-    let mut credentials = Credentials::new(verified);
-    credentials.key_id = root_key_id.clone();
-    peer.send(
-        Message::Request(Request::identity(
-            root_key_id.clone(),
-            IdentityRequest::Login(root_pk.to_openssh().unwrap(), signed),
-        ))
-        .into(),
-    )
-    .unwrap();
-    let authz = Authz::new(credentials, request_key);
-    let authn = timeout(Duration::from_secs(30), async {
-        loop {
-            let header = authz.header("GET", "/sessions");
-            match mgr.iam(Some(header), None, ("GET", "/sessions")).await {
-                Ok(authn) => break authn,
-                Err(_) => sleep(Duration::from_millis(50)).await,
-            }
-        }
-    })
-    .await
-    .expect("gossiped login never registered");
-    assert_eq!(authn.key_id, root_key_id);
-
-    // The fabricated login was processed before the real one on the
-    // same handle, and registered nothing.
-    let header = bogus_authz.header("GET", "/sessions");
-    assert!(
-        mgr.iam(Some(header), None, ("GET", "/sessions"))
-            .await
-            .is_err()
-    );
 }
 
 /// Attach access: strangers are refused, the starter grants and

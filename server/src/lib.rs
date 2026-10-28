@@ -18,7 +18,6 @@ pub mod executor;
 pub mod format;
 pub mod gossip;
 pub mod history;
-pub mod identities;
 pub mod io;
 pub mod job;
 pub mod link;

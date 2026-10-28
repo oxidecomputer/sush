@@ -352,9 +352,6 @@ pub struct ChallengeResponse {
     epk: RequestVerifier,
 }
 
-/// Signed authentication evidence, self-certifying to any verifier.
-pub type SignedLogin = Signed<ChallengeResponse>;
-
 impl ChallengeResponse {
     const TYPE_NAME: &[u8] = b"sush_common::authn::ChallengeResponse";
 
@@ -601,7 +598,10 @@ pub enum AuthnError {
 
 #[cfg(test)]
 mod test {
+    use std::env;
+    use std::fs::{read_to_string, write};
     use std::time::Duration;
+
     use x509_cert::name::Name;
     use x509_cert::time::Validity;
 
@@ -609,20 +609,19 @@ mod test {
 
     use super::*;
 
-    /// A login is signed, gossiped, and re-verified by every sled,
-    /// which rebuilds it from the wire to check the signature. Two
-    /// shapes in one rack disagree about which logins verify. This
-    /// pin freezes the shape: any field change fails here. Do not
-    /// re-pin; add a new wire version.
+    /// The client signs a `ChallengeResponse` and the server rebuilds it
+    /// to verify the signature. The client and server must therefore
+    /// agree on the fields. To change them, add a new wire version;
+    /// do not re-pin.
     #[test]
     fn pin_challenge_response_schema() {
         let schema =
             serde_json::to_string_pretty(&schemars::schema_for!(ChallengeResponse)).unwrap();
         let path = "tests/output/challenge-response-schema.json";
-        if std::env::var("EXPECTORATE").as_deref() == Ok("overwrite") {
-            std::fs::write(path, &schema).unwrap();
+        if env::var("EXPECTORATE").as_deref() == Ok("overwrite") {
+            write(path, &schema).unwrap();
         } else {
-            let expected = std::fs::read_to_string(path).expect("missing snapshot");
+            let expected = read_to_string(path).expect("missing snapshot");
             assert_eq!(schema, expected, "the signed login's shape changed");
         }
     }
