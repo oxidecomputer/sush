@@ -255,138 +255,6 @@ impl ClientArgs {
     }
 }
 
-/// A rack-wide target can't combine with `--binary` or `--file`.
-#[tokio::test]
-async fn output_needs_target() {
-    use crate::cli::Cli;
-
-    let client =
-        Client::new_with_client("http://[::1]:1", reqwest::Client::new(), Default::default());
-    let output = JobOutput::try_parse_from([
-        "job-stdout",
-        "--binary",
-        "sea-say-sting-palm-tunnel-festival-pull-bid",
-    ])
-    .unwrap();
-    let err = job_output(
-        &mut Cli::default(),
-        &client,
-        &"*".parse::<TargetArg>().unwrap(),
-        Stdout,
-        output,
-    )
-    .await
-    .unwrap_err();
-    assert!(matches!(err, CommandError::OutputNeedsTarget));
-}
-
-/// The watch settles only after the sled set is stable and every sled
-/// is terminal for consecutive polls.
-#[test]
-fn watch_settling() {
-    use chrono::Utc;
-
-    fn sled(serial: &str) -> BaseboardId {
-        BaseboardId {
-            part_number: "913-0000019".to_owned(),
-            serial_number: serial.to_owned(),
-        }
-    }
-    let job_id: JobId = "sea-say-sting-palm-tunnel-festival-pull-bid"
-        .parse()
-        .unwrap();
-    let terminal = JobStatus::Cancelled {
-        job_id,
-        time_cancelled: Utc::now(),
-        actor: KeyId::random(),
-    };
-    let running = JobStatus::Started {
-        job_id,
-        time_started: Utc::now(),
-    };
-
-    let mut settling = Settling::default();
-    let mut status = JobStatusMap::new();
-    assert!(!settling.done(None, None, &status), "empty never settles");
-
-    status.insert(sled("A"), terminal.clone());
-    assert!(!settling.done(None, None, &status), "new sled resets");
-    assert!(!settling.done(None, None, &status), "first quiet poll");
-    assert!(
-        !settling.done(None, None, &status),
-        "quiet but too young for gossip"
-    );
-    assert!(settling.done(None, None, &status), "old enough, quiet");
-
-    let mut settling = Settling::default();
-    status.insert(sled("B"), running.clone());
-    assert!(!settling.done(None, None, &status), "running sled holds");
-    status.insert(sled("B"), terminal.clone());
-    assert!(
-        !settling.done(None, Some(2), &status),
-        "the rack count must hold"
-    );
-    assert!(
-        settling.done(None, Some(2), &status),
-        "the rack count held twice"
-    );
-
-    let known = BTreeSet::from([sled("A"), sled("B")]);
-    let mut settling = Settling::default();
-    assert!(
-        settling.done(Some(&known), None, &status),
-        "known sleds settle on the first terminal poll"
-    );
-    status.insert(sled("B"), running);
-    assert!(
-        !settling.done(Some(&known), None, &status),
-        "a running known sled holds"
-    );
-    status.insert(sled("B"), terminal);
-    let missing = BTreeSet::from([sled("A"), sled("C")]);
-    let mut settling = Settling::default();
-    assert!(
-        !settling.done(Some(&missing), None, &status),
-        "a missing known sled holds"
-    );
-}
-
-/// Anything the target grammar accepts stays a target.
-#[test]
-fn target_arg() {
-    assert!(matches!("*".parse(), Ok(TargetArg::Target(_))));
-    assert!(matches!("14".parse(), Ok(TargetArg::Target(_))));
-    assert!(matches!(
-        "913-0000019:BRM42220030".parse(),
-        Ok(TargetArg::Target(_))
-    ));
-    assert!(matches!(
-        "brm42220030".parse(),
-        Ok(TargetArg::Abbreviated(sleds))
-            if matches!(sleds.as_slice(), [SledArg::Serial(s)] if s == "brm42220030")
-    ));
-    assert!(matches!(
-        "14,brm42220030".parse(),
-        Ok(TargetArg::Abbreviated(sleds))
-            if matches!(sleds.as_slice(), [SledArg::Sled(SledId::Cubby(14)), SledArg::Serial(_)])
-    ));
-    assert!(matches!(
-        "913-0000019:BRM42220036,brm42220030".parse(),
-        Ok(TargetArg::Abbreviated(sleds))
-            if matches!(sleds.as_slice(), [SledArg::Sled(SledId::Baseboard(_)), SledArg::Serial(_)])
-    ));
-    assert!("n!ot,a:target".parse::<TargetArg>().is_err());
-    assert!("*,brm42220030".parse::<TargetArg>().is_err());
-}
-
-/// [`ClientArgs`] must satisfy Clap's internal consistency asserts
-/// (unique shorts per subcommand, valid references).
-#[test]
-fn client_args() {
-    use clap::CommandFactory as _;
-    ClientArgs::command().debug_assert();
-}
-
 /// Arguments for `job-stdout` and `job-stderr`.
 #[derive(Clone, Debug, Parser)]
 pub struct JobOutput {
@@ -2876,7 +2744,138 @@ impl From<ClientError<Upgraded>> for CommandError {
 
 #[cfg(test)]
 mod tests {
+    use chrono::Utc;
+    use clap::CommandFactory as _;
+
     use super::*;
+    use crate::cli::Cli;
+
+    /// A rack-wide target can't combine with `--binary` or `--file`.
+    #[tokio::test]
+    async fn output_needs_target() {
+        let client =
+            Client::new_with_client("http://[::1]:1", reqwest::Client::new(), Default::default());
+        let output = JobOutput::try_parse_from([
+            "job-stdout",
+            "--binary",
+            "sea-say-sting-palm-tunnel-festival-pull-bid",
+        ])
+        .unwrap();
+        let err = job_output(
+            &mut Cli::default(),
+            &client,
+            &"*".parse::<TargetArg>().unwrap(),
+            Stdout,
+            output,
+        )
+        .await
+        .unwrap_err();
+        assert!(matches!(err, CommandError::OutputNeedsTarget));
+    }
+
+    /// The watch settles only after the sled set is stable and every sled
+    /// is terminal for consecutive polls.
+    #[test]
+    fn watch_settling() {
+        fn sled(serial: &str) -> BaseboardId {
+            BaseboardId {
+                part_number: "913-0000019".to_owned(),
+                serial_number: serial.to_owned(),
+            }
+        }
+        let job_id: JobId = "sea-say-sting-palm-tunnel-festival-pull-bid"
+            .parse()
+            .unwrap();
+        let terminal = JobStatus::Cancelled {
+            job_id,
+            time_cancelled: Utc::now(),
+            actor: KeyId::random(),
+        };
+        let running = JobStatus::Started {
+            job_id,
+            time_started: Utc::now(),
+        };
+
+        let mut settling = Settling::default();
+        let mut status = JobStatusMap::new();
+        assert!(!settling.done(None, None, &status), "empty never settles");
+
+        status.insert(sled("A"), terminal.clone());
+        assert!(!settling.done(None, None, &status), "new sled resets");
+        assert!(!settling.done(None, None, &status), "first quiet poll");
+        assert!(
+            !settling.done(None, None, &status),
+            "quiet but too young for gossip"
+        );
+        assert!(settling.done(None, None, &status), "old enough, quiet");
+
+        let mut settling = Settling::default();
+        status.insert(sled("B"), running.clone());
+        assert!(!settling.done(None, None, &status), "running sled holds");
+        status.insert(sled("B"), terminal.clone());
+        assert!(
+            !settling.done(None, Some(2), &status),
+            "the rack count must hold"
+        );
+        assert!(
+            settling.done(None, Some(2), &status),
+            "the rack count held twice"
+        );
+
+        let known = BTreeSet::from([sled("A"), sled("B")]);
+        let mut settling = Settling::default();
+        assert!(
+            settling.done(Some(&known), None, &status),
+            "known sleds settle on the first terminal poll"
+        );
+        status.insert(sled("B"), running);
+        assert!(
+            !settling.done(Some(&known), None, &status),
+            "a running known sled holds"
+        );
+        status.insert(sled("B"), terminal);
+        let missing = BTreeSet::from([sled("A"), sled("C")]);
+        let mut settling = Settling::default();
+        assert!(
+            !settling.done(Some(&missing), None, &status),
+            "a missing known sled holds"
+        );
+    }
+
+    /// Anything the target grammar accepts stays a target.
+    #[test]
+    fn target_arg() {
+        assert!(matches!("*".parse(), Ok(TargetArg::Target(_))));
+        assert!(matches!("14".parse(), Ok(TargetArg::Target(_))));
+        assert!(matches!(
+            "913-0000019:BRM42220030".parse(),
+            Ok(TargetArg::Target(_))
+        ));
+        assert!(matches!(
+            "brm42220030".parse(),
+            Ok(TargetArg::Abbreviated(sleds))
+                if matches!(sleds.as_slice(), [SledArg::Serial(s)] if s == "brm42220030")
+        ));
+        assert!(matches!(
+            "14,brm42220030".parse(),
+            Ok(TargetArg::Abbreviated(sleds))
+                if matches!(sleds.as_slice(), [SledArg::Sled(SledId::Cubby(14)), SledArg::Serial(_)])
+        ));
+        assert!(matches!(
+            "913-0000019:BRM42220036,brm42220030".parse(),
+            Ok(TargetArg::Abbreviated(sleds))
+                if matches!(sleds.as_slice(), [SledArg::Sled(SledId::Baseboard(_)), SledArg::Serial(_)])
+        ));
+        assert!("n!ot,a:target".parse::<TargetArg>().is_err());
+        assert!("*,brm42220030".parse::<TargetArg>().is_err());
+    }
+
+    /// [`ClientArgs`] must satisfy Clap's internal consistency asserts
+    /// (unique shorts per subcommand, valid references).
+    #[test]
+    fn client_args() {
+        ClientArgs::command().debug_assert();
+    }
 
     #[test]
     fn login_refused_blames_build_skew() {
