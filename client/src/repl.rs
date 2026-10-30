@@ -12,13 +12,12 @@ use std::ffi::OsString;
 use std::fs::{Permissions, set_permissions};
 use std::os::unix::fs::PermissionsExt as _;
 
-use clap::Parser;
+use clap::{CommandFactory as _, FromArgMatches as _, Parser};
 use rustyline::DefaultEditor;
 use rustyline::error::ReadlineError;
 use shlex::split as split_command;
 use sled_hardware_types::BaseboardId;
 use x509_cert::Certificate;
-use xdg::BaseDirectories;
 
 use sush_common::authn::Identity;
 use sush_common::jobs::{
@@ -29,13 +28,14 @@ use sush_common::keys::{KeyId, SshPublicKey};
 use sush_common::targets::{SledId, SledVersion};
 use sush_common::version::VersionInfo;
 
-use crate::cli::{Cli, PREFIX};
+use crate::cli::Cli;
 use crate::commands::{
     ClientCommand, CommandError, GlobalArgs, SSH_AUTH_SOCK, SUSH_JOB_ID, SUSH_KEY_ID,
     SUSH_OUTPUT_FORMAT, SUSH_URL,
 };
+use crate::config::{ConfigOptions, parse_with_config};
 use crate::context::{CommandContext, OutputFormat, StartedDisplay, StatusDisplayStyle};
-use crate::{AuthzSigner, Client};
+use crate::{AuthzSigner, Client, PREFIX, base_directories};
 
 const HISTORY_FILE: &str = "history.txt";
 
@@ -47,7 +47,12 @@ struct ReplCommandParser {
 }
 
 impl ReplCommandParser {
-    fn try_parse<I, T, C>(words: I, ctx: &mut C) -> Result<Self, CommandError>
+    /// Parse `words`, taking defaults from `options`.
+    fn try_parse<I, T, C>(
+        ctx: &mut C,
+        words: I,
+        options: &ConfigOptions,
+    ) -> Result<Self, CommandError>
     where
         I: IntoIterator<Item = T>,
         T: Into<OsString> + Clone,
@@ -59,7 +64,8 @@ impl ReplCommandParser {
         {
             ctx.pre_parse_hook(command);
         }
-        Ok(Self::try_parse_from(words)?)
+        let matches = parse_with_config(Self::command(), words, options)?;
+        Ok(Self::from_arg_matches(&matches)?)
     }
 }
 
@@ -77,8 +83,8 @@ impl Repl {
     ) -> Result<(), CommandError> {
         self.set_globals(args.clone());
         self.cli.load_session();
-        let xdg = BaseDirectories::with_prefix(PREFIX);
-        let history_file = xdg
+        let options = ConfigOptions::load(args.config, args.profile)?;
+        let history_file = base_directories()
             .place_state_file(HISTORY_FILE)
             .map_err(|error| CommandError::io(HISTORY_FILE, error))?;
         let mut rl = DefaultEditor::new()?;
@@ -99,7 +105,7 @@ impl Repl {
                     let Some(words) = split_command(&command) else {
                         perr!("❌ Invalid quoting in command");
                     };
-                    let command = match ReplCommandParser::try_parse(&words, &mut self) {
+                    let command = match ReplCommandParser::try_parse(&mut self, &words, &options) {
                         Ok(ReplCommandParser { command }) => command,
                         Err(err) => {
                             self.command_error(&err);
@@ -182,6 +188,8 @@ impl CommandContext for Repl {
             nexus_roots: _,
             nexus_resolve: _,
             rack: _,
+            config: _,
+            profile: _,
         } = args;
         if json {
             output = Some(OutputFormat::Json);
