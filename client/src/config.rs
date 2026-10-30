@@ -20,6 +20,7 @@
 
 use std::cmp::Ordering;
 use std::collections::{BTreeMap, BTreeSet};
+use std::env::var_os;
 use std::ffi::OsString;
 use std::fs::read_to_string;
 use std::io;
@@ -27,23 +28,24 @@ use std::path::{Path, PathBuf};
 
 use clap::parser::ValueSource;
 use clap::{Arg, ArgMatches, Command, CommandFactory as _, FromArgMatches as _};
+use strum::Display;
 use thiserror::Error;
 use toml::{Table, Value};
 
-use crate::base_directories;
 use crate::commands::{ClientArgs, CommandError, GlobalArgs};
+use crate::{PREFIX, base_directories};
 
 const FILE_NAME: &str = "sush.toml";
 
 /// One profile's settings, ready to become option defaults.
-#[derive(Debug, Default)]
+#[derive(Clone, Debug, Default)]
 pub struct ConfigOptions {
     values: BTreeMap<String, Vec<String>>,
 }
 
 impl ConfigOptions {
     /// Read `path`, or the default file if it exists.
-    pub fn load(path: Option<PathBuf>, profile: Option<String>) -> Result<Self, ConfigError> {
+    fn load(path: Option<PathBuf>, profile: Option<String>) -> Result<Self, ConfigError> {
         let path = path.or_else(|| base_directories().find_config_file(FILE_NAME));
         let Some(path) = path else {
             return match profile {
@@ -56,6 +58,17 @@ impl ConfigOptions {
             error,
         })?;
         Self::from_toml(path, &text, profile)
+    }
+
+    /// Load the config file and profile that `supplied` and the
+    /// environment select.
+    pub fn from_supplied(supplied: &SuppliedOptions) -> Result<Self, CommandError> {
+        let words = supplied.command_line();
+        let matches = parse_with_config(GlobalArgs::command(), words, &Self::default())?;
+        let GlobalArgs {
+            config, profile, ..
+        } = GlobalArgs::from_arg_matches(&matches)?;
+        Ok(Self::load(config, profile)?)
     }
 
     fn from_toml(path: PathBuf, text: &str, profile: Option<String>) -> Result<Self, ConfigError> {
@@ -93,6 +106,70 @@ impl ConfigOptions {
     fn values_for(&self, arg: &Arg) -> Option<&Vec<String>> {
         arg_keys(arg).find_map(|key| self.values.get(key))
     }
+
+    /// Describe each option that has a value from the command line,
+    /// the environment, or this config, as `key = value (source)`.
+    /// The values of global options come from `matches`. Subcommand
+    /// options take their values from the environment or this config.
+    pub fn describe(&self, matches: &ArgMatches) -> Vec<String> {
+        let command = ClientArgs::command();
+        let mut described = BTreeSet::new();
+        let mut lines = Vec::new();
+        for arg in all_arguments(&command) {
+            let Some(long_name) = arg.get_long() else {
+                continue;
+            };
+            if !described.insert(long_name) {
+                continue;
+            }
+            let value = match matches.try_get_raw(arg_id(arg)) {
+                Ok(_) => self.parsed_value(arg, matches),
+                Err(_) => self.unparsed_value(arg),
+            };
+            if let Some((values, source)) = value {
+                lines.push(format!("{long_name} = {values} ({source})"));
+            }
+        }
+        lines
+    }
+
+    /// Find the value of `arg` in `matches`, and its source.
+    fn parsed_value(&self, arg: &Arg, matches: &ArgMatches) -> Option<(String, OptionSource)> {
+        let source = match matches.value_source(arg_id(arg))? {
+            ValueSource::CommandLine => OptionSource::CommandLine,
+            ValueSource::EnvVariable => OptionSource::Environment,
+            _ if self.values_for(arg).is_none() => return None,
+            _ => OptionSource::ConfigFile,
+        };
+        Some((display_values(arg, matches), source))
+    }
+
+    /// Find the value of a configurable `arg` in the environment or
+    /// this config, and its source.
+    fn unparsed_value(&self, arg: &Arg) -> Option<(String, OptionSource)> {
+        if !is_configurable(arg) {
+            return None;
+        }
+        match (arg.get_env().and_then(var_os), self.values_for(arg)) {
+            (Some(value), _) => Some((
+                value.to_string_lossy().into_owned(),
+                OptionSource::Environment,
+            )),
+            (None, Some(values)) => Some((values.join(", "), OptionSource::ConfigFile)),
+            (None, None) => None,
+        }
+    }
+}
+
+/// Where an option's value comes from.
+#[derive(Clone, Copy, Debug, Display)]
+enum OptionSource {
+    #[strum(to_string = "command line")]
+    CommandLine,
+    #[strum(to_string = "environment")]
+    Environment,
+    #[strum(to_string = "config file")]
+    ConfigFile,
 }
 
 /// Convert the entries of `table` to option values. Fails on
@@ -200,9 +277,15 @@ impl UnmergedArgs {
     }
 }
 
+/// An option is configurable if it has an environment variable
+/// whose value is not a secret.
+fn is_configurable(arg: &Arg) -> bool {
+    arg.get_env().is_some() && !arg.is_hide_env_values_set()
+}
+
 /// List the config file keys that can set `arg`.
 fn arg_keys(arg: &Arg) -> impl Iterator<Item = &str> {
-    let configurable = arg.get_env().is_some() && !arg.is_hide_env_values_set();
+    let configurable = is_configurable(arg);
     arg.get_long()
         .into_iter()
         .chain(arg.get_all_aliases().unwrap_or_default())
@@ -211,15 +294,20 @@ fn arg_keys(arg: &Arg) -> impl Iterator<Item = &str> {
 
 /// Collect the config file keys valid anywhere in `command`.
 fn all_keys(command: &Command) -> BTreeSet<String> {
-    let mut keys = command
-        .get_arguments()
+    all_arguments(command)
+        .into_iter()
         .flat_map(arg_keys)
         .map(str::to_owned)
-        .collect::<BTreeSet<_>>();
+        .collect()
+}
+
+/// Collect the arguments of `command` and all its subcommands.
+fn all_arguments(command: &Command) -> Vec<&Arg> {
+    let mut args = command.get_arguments().collect::<Vec<_>>();
     for subcommand in command.get_subcommands() {
-        keys.extend(all_keys(subcommand));
+        args.extend(all_arguments(subcommand));
     }
-    keys
+    args
 }
 
 fn compute_merge_losers(
@@ -259,6 +347,112 @@ fn compute_merge_losers(
 
 fn map_command_tree(command: Command, f: &impl Fn(Command) -> Command) -> Command {
     f(command).mut_subcommands(|subcommand| map_command_tree(subcommand, f))
+}
+
+/// Options explicitly supplied on the command line, by long name, with
+/// their values (none for a flag).
+#[derive(Clone, Debug, Default)]
+pub struct SuppliedOptions(BTreeMap<String, Vec<OsString>>);
+
+impl SuppliedOptions {
+    /// Collect the options of `command` that `matches` shows were
+    /// supplied on the command line.
+    pub fn from_matches(command: &Command, matches: &ArgMatches) -> Self {
+        let mut supplied = BTreeMap::new();
+        for arg in command.get_arguments() {
+            let Some(long_name) = arg.get_long() else {
+                continue;
+            };
+            if matches.value_source(arg_id(arg)) != Some(ValueSource::CommandLine) {
+                continue;
+            }
+            let values = match arg.get_action().takes_values() {
+                true => matches
+                    .get_raw(arg_id(arg))
+                    .into_iter()
+                    .flatten()
+                    .map(ToOwned::to_owned)
+                    .collect(),
+                false => Vec::new(),
+            };
+            supplied.insert(long_name.to_owned(), values);
+        }
+        Self(supplied)
+    }
+
+    /// Supply the option of `command` named `long_name`, replacing any
+    /// supplied with that name or one that conflicts with it.
+    pub fn set(&mut self, command: &Command, long_name: &str, values: Vec<OsString>) {
+        for conflicting in conflicting_long_names(command, long_name) {
+            self.0.remove(&conflicting);
+        }
+        self.0.insert(long_name.to_owned(), values);
+    }
+
+    /// Stop supplying the option named `long_name`. Returns false
+    /// if that option was not supplied.
+    pub fn remove(&mut self, long_name: &str) -> bool {
+        self.0.remove(long_name).is_some()
+    }
+
+    /// Supply each of the options in `other`, as by [`Self::set`].
+    pub fn update(&mut self, command: &Command, other: &Self) {
+        for (long_name, values) in &other.0 {
+            self.set(command, long_name, values.clone());
+        }
+    }
+
+    /// Write these options as a command line.
+    pub fn command_line(&self) -> Vec<OsString> {
+        let mut words = vec![OsString::from(PREFIX)];
+        for (long_name, values) in &self.0 {
+            if values.is_empty() {
+                words.push(OsString::from(format!("--{long_name}")));
+            }
+            for value in values {
+                let mut word = OsString::from(format!("--{long_name}="));
+                word.push(value);
+                words.push(word);
+            }
+        }
+        words
+    }
+}
+
+/// List the long names of the options of `command` that conflict with
+/// the option named `long_name`.
+fn conflicting_long_names(command: &Command, long_name: &str) -> Vec<String> {
+    let mut names = Vec::new();
+    for arg in command.get_arguments() {
+        for other in command.get_arg_conflicts_with(arg) {
+            if arg.get_long() == Some(long_name) {
+                names.extend(other.get_long().map(str::to_owned));
+            }
+            if other.get_long() == Some(long_name) {
+                names.extend(arg.get_long().map(str::to_owned));
+            }
+        }
+    }
+    names
+}
+
+/// Show the values of `arg` in `matches`, hiding secrets.
+fn display_values(arg: &Arg, matches: &ArgMatches) -> String {
+    if arg.is_hide_env_values_set() {
+        return "(hidden)".to_owned();
+    }
+    if !arg.get_action().takes_values() {
+        return matches.get_flag(arg_id(arg)).to_string();
+    }
+    let values = matches.get_raw(arg_id(arg)).into_iter().flatten();
+    let values = values
+        .map(|value| value.to_string_lossy())
+        .collect::<Vec<_>>();
+    values.join(", ")
+}
+
+fn arg_id(arg: &Arg) -> &str {
+    arg.get_id().as_str()
 }
 
 fn arg_values(value: Value) -> Option<Vec<String>> {
@@ -308,6 +502,7 @@ pub enum ConfigError {
 mod test {
     use std::env::{remove_var, set_var};
     use std::fs::write;
+    use std::iter::once;
 
     use rusty_fork::rusty_fork_test;
     use tempfile::NamedTempFile;
@@ -345,6 +540,65 @@ mod test {
 
     fn globals(text: &str, env: &[(&str, &str)], words: &str) -> GlobalArgs {
         GlobalArgs::from_arg_matches(&parse(text, env, words).unwrap()).unwrap()
+    }
+
+    /// Collect the global options supplied in `words`, ignoring the
+    /// environment.
+    fn supplied(words: &str) -> SuppliedOptions {
+        let command = map_command_tree(GlobalArgs::command(), &|command| {
+            command.mut_args(|arg| arg.env(None))
+        });
+        let words = once("sush").chain(words.split_whitespace());
+        let matches = command.clone().try_get_matches_from(words).unwrap();
+        SuppliedOptions::from_matches(&command, &matches)
+    }
+
+    fn command_line(supplied: &SuppliedOptions) -> Vec<String> {
+        let words = supplied.command_line().into_iter();
+        words.map(|word| word.into_string().unwrap()).collect()
+    }
+
+    /// Supplied options come back out as a command line with a flag, a
+    /// value, and a repeated value, and that command line parses back to
+    /// the same options.
+    #[test]
+    fn supplied_command_line() {
+        let options = supplied("--offline --rack r --nexus-root a.pem --nexus-root b.pem");
+        let words = [
+            "sush",
+            "--nexus-root=a.pem",
+            "--nexus-root=b.pem",
+            "--offline",
+            "--rack=r",
+        ];
+        assert_eq!(command_line(&options), words);
+        assert_eq!(command_line(&supplied(&words[1..].join(" "))), words);
+    }
+
+    /// Supplying an option replaces any supplied option that conflicts
+    /// with it, in either direction, and keeps the rest.
+    #[test]
+    fn supplied_update() {
+        let command = GlobalArgs::command();
+        let mut options = supplied("--nexus https://nexus --rack r");
+        options.update(&command, &supplied("--url https://url"));
+        assert_eq!(
+            command_line(&options),
+            ["sush", "--rack=r", "--url=https://url"],
+            "url replaces nexus, which declares the conflict"
+        );
+        options.update(&command, &supplied("--offline"));
+        assert_eq!(
+            command_line(&options),
+            ["sush", "--offline", "--rack=r"],
+            "offline replaces url"
+        );
+        options.update(&command, &supplied("--rack s"));
+        assert_eq!(
+            command_line(&options),
+            ["sush", "--offline", "--rack=s"],
+            "a new value replaces the old"
+        );
     }
 
     rusty_fork_test! {
