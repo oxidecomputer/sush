@@ -61,7 +61,7 @@ impl Authz {
 /// What kind of output to emit on standard output. Standard input
 /// and standard error may be used with all formats for interactive
 /// communication with a human user (if there is one).
-#[derive(Clone, Copy, Debug, Default, ValueEnum)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, ValueEnum)]
 pub enum OutputFormat {
     /// UTF-8 encoded text
     #[default]

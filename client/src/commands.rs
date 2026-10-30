@@ -7,6 +7,7 @@
 //! May be executed via either the main CLI or the interactive REPL.
 
 use std::collections::BTreeSet;
+use std::env::args_os;
 use std::fs::{File, OpenOptions, read};
 use std::io::ErrorKind;
 use std::io::{Seek as _, SeekFrom, Write as _, stdin};
@@ -19,7 +20,7 @@ use std::time::Duration;
 
 use async_recursion::async_recursion;
 use bytesize::ByteSize;
-use clap::{Parser, Subcommand};
+use clap::{CommandFactory as _, FromArgMatches as _, Parser, Subcommand};
 use futures::future::{Fuse, FusedFuture as _};
 use futures::stream;
 use futures::{FutureExt as _, StreamExt as _};
@@ -58,6 +59,7 @@ use sush_common::targets::{SledId, Target};
 use sush_common::version::VersionInfo;
 
 use crate::ByteStream;
+use crate::config::{ConfigError, parse_and_merge_config};
 use crate::context::{Authz, CommandContext, OutputFormat, StartedDisplay, StatusDisplayStyle};
 use crate::identity::{IdentityError, SshAgentConnection};
 use crate::interactive::interactive_job;
@@ -74,6 +76,7 @@ use crate::{AuthzSigner, Client, Error as ClientError};
 #[cfg(feature = "permslip")]
 pub const PERMSLIP_URL: &str = "PERMSLIP_URL";
 pub const SSH_AUTH_SOCK: &str = "SSH_AUTH_SOCK";
+pub const SUSH_CONFIG: &str = "SUSH_CONFIG";
 pub const SUSH_JOB_ID: &str = "SUSH_JOB_ID";
 pub const SUSH_KEY_ID: &str = "SUSH_KEY_ID";
 pub const SUSH_MAX_CPU: &str = "SUSH_MAX_CPU";
@@ -83,6 +86,7 @@ pub const SUSH_MAX_FSIZE: &str = "SUSH_MAX_FSIZE";
 pub const SUSH_PERMSLIP_KEY: &str = "SUSH_PERMSLIP_KEY";
 #[cfg(feature = "permslip")]
 pub const SUSH_PERMSLIP_SSH: &str = "SUSH_PERMSLIP_SSH";
+pub const SUSH_PROFILE: &str = "SUSH_PROFILE";
 pub const SUSH_OUTPUT_FORMAT: &str = "SUSH_OUTPUT_FORMAT";
 pub const SUSH_NEXUS: &str = "SUSH_NEXUS";
 pub const SUSH_NEXUS_RESOLVE: &str = "SUSH_NEXUS_RESOLVE";
@@ -142,6 +146,16 @@ impl LimitArgs {
 /// Optional global arguments, i.e., ones that apply to every command.
 #[derive(Clone, Debug, Default, Parser)]
 pub struct GlobalArgs {
+    /// Configuration file, defaults to XDG config `sush/sush.toml`
+    #[arg(long, env = SUSH_CONFIG, value_name = "TOML")]
+    #[clap(global = true)]
+    pub config: Option<PathBuf>,
+
+    /// Configuration profile
+    #[arg(long, env = SUSH_PROFILE, value_name = "NAME")]
+    #[clap(global = true)]
+    pub profile: Option<String>,
+
     /// Output format
     #[arg(long,
           env = SUSH_OUTPUT_FORMAT,
@@ -167,8 +181,6 @@ pub struct GlobalArgs {
     pub url: Option<String>,
 
     /// Nexus URL to tunnel through instead of a tech port URL
-    // Not env OXIDE_HOST: clap applies conflict rules to env-sourced
-    // values, so the oxide CLI's variable would poison --url.
     #[arg(long, env = SUSH_NEXUS, conflicts_with_all = ["url", "offline"])]
     #[clap(global = true)]
     pub nexus: Option<String>,
@@ -249,6 +261,18 @@ pub struct ClientArgs {
 }
 
 impl ClientArgs {
+    /// Parse the process arguments, taking defaults from the
+    /// configuration file. Exits on a parse error, like clap.
+    pub fn parse_and_merge_config() -> Result<Self, CommandError> {
+        match parse_and_merge_config(Self::command(), args_os()) {
+            Ok(matches) => {
+                Ok(Self::from_arg_matches(&matches).unwrap_or_else(|error| error.exit()))
+            }
+            Err(CommandError::Clap(error)) => error.exit(),
+            Err(error) => Err(error),
+        }
+    }
+
     pub async fn execute(&mut self, ctx: &mut impl CommandContext) -> Result<(), CommandError> {
         ctx.set_globals(self.globals.clone());
         self.command.clone().execute(ctx).await
@@ -417,10 +441,10 @@ pub enum SessionCommand {
 
         /// Use `permslip` to sign sessions and jobs with this key name.
         #[arg(short, long, env = SUSH_PERMSLIP_KEY, value_name = "KEY_NAME")]
-        permslip: Option<String>,
+        permslip_key: Option<String>,
 
         /// The `permslip` server to contact for signing.
-        #[arg(long, env = PERMSLIP_URL, requires = "permslip", value_name = "URL")]
+        #[arg(long, env = PERMSLIP_URL, value_name = "URL")]
         permslip_url: Option<String>,
     },
 
@@ -446,11 +470,11 @@ pub enum SessionCommand {
         /// Use `permslip` to sign sessions and jobs with this key name.
         #[cfg(feature = "permslip")]
         #[arg(short, long, env = SUSH_PERMSLIP_KEY, value_name = "KEY_NAME")]
-        permslip: Option<String>,
+        permslip_key: Option<String>,
 
         /// The `permslip` server to contact for signing.
         #[cfg(feature = "permslip")]
-        #[arg(long, env = PERMSLIP_URL, requires = "permslip", value_name = "URL")]
+        #[arg(long, env = PERMSLIP_URL, value_name = "URL")]
         permslip_url: Option<String>,
     },
 
@@ -590,11 +614,11 @@ pub struct JobStartArgs {
     /// Use `permslip` to sign job requests with this key name.
     #[cfg(feature = "permslip")]
     #[arg(short, long, env = SUSH_PERMSLIP_KEY, value_name = "KEY_NAME")]
-    permslip: Option<String>,
+    permslip_key: Option<String>,
 
     /// The `permslip` server to contact for signing.
     #[cfg(feature = "permslip")]
-    #[arg(long, env = PERMSLIP_URL, requires = "permslip", value_name = "URL")]
+    #[arg(long, env = PERMSLIP_URL, value_name = "URL")]
     permslip_url: Option<String>,
 
     /// Terminal type for interactive jobs.
@@ -973,7 +997,7 @@ async fn session(
                 nonce,
                 seq,
                 client_nonce,
-                permslip,
+                permslip_key,
                 permslip_url,
             },
             Some(client),
@@ -999,7 +1023,7 @@ async fn session(
                     let Some(permslip_url) = permslip_url else {
                         return session_start_params(ctx, client).await;
                     };
-                    let Some(permslip_key) = permslip else {
+                    let Some(permslip_key) = permslip_key else {
                         return Err(CommandError::MissingKeyName);
                     };
                     let (baseboard_id, nonce) = with_login(ctx, client, async || {
@@ -1033,7 +1057,7 @@ async fn session(
             SessionCommand::Create {
                 baseboard_id,
                 nonce,
-                permslip,
+                permslip_key,
                 permslip_url,
             },
             _,
@@ -1041,7 +1065,7 @@ async fn session(
             let Some(permslip_url) = permslip_url else {
                 return Err(CommandError::MissingPermslipUrl);
             };
-            let Some(permslip_key) = permslip else {
+            let Some(permslip_key) = permslip_key else {
                 return Err(CommandError::MissingKeyName);
             };
             let (session_id, nonce, seq) =
@@ -1202,7 +1226,10 @@ async fn job(
         #[cfg(feature = "permslip")]
         (
             JobCommand::Start {
-                start_args: JobStartArgs { permslip: None, .. },
+                start_args:
+                    JobStartArgs {
+                        permslip_key: None, ..
+                    },
                 ..
             },
             Some(_),
@@ -1213,7 +1240,7 @@ async fn job(
             JobCommand::Start {
                 start_args:
                     ref start_args @ JobStartArgs {
-                        permslip: Some(ref key_name),
+                        permslip_key: Some(ref key_name),
                         permslip_url: Some(ref permslip_url),
                         ..
                     },
@@ -2503,6 +2530,8 @@ pub enum CommandError {
     Clap(#[from] clap::Error),
     #[error("{0}")]
     Client(String),
+    #[error("Configuration error: {0}")]
+    Config(#[from] ConfigError),
     #[error("{0}")]
     Der(#[from] x509_cert::der::Error),
     #[error("{0}")]
@@ -2563,7 +2592,7 @@ pub enum CommandError {
     #[error("Missing job command, try `--help`")]
     MissingCommand,
     #[cfg(feature = "permslip")]
-    #[error("Missing signing key name, try `--permslip`")]
+    #[error("Missing signing key name, try `--permslip-key`")]
     MissingKeyName,
     #[cfg(feature = "permslip")]
     #[error("Missing permslip URL, try `--permslip-url` or setting `PERMSLIP_URL`")]
@@ -2745,7 +2774,6 @@ impl From<ClientError<Upgraded>> for CommandError {
 #[cfg(test)]
 mod tests {
     use chrono::Utc;
-    use clap::CommandFactory as _;
 
     use super::*;
     use crate::cli::Cli;

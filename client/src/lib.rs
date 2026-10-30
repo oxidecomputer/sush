@@ -11,8 +11,17 @@ use reqwest::header::AUTHORIZATION;
 use sush_common::authn::{AuthnError, BoundCredentials};
 use sush_common::keys::KeyId;
 use tokio::sync::{Mutex as AsyncMutex, MutexGuard as AsyncMutexGuard};
+use xdg::BaseDirectories;
 
 use crate::context::Authz;
+
+/// The client's name.
+pub(crate) const PREFIX: &str = "sush";
+
+/// The client's XDG directories.
+pub(crate) fn base_directories() -> BaseDirectories {
+    BaseDirectories::with_prefix(PREFIX)
+}
 
 /// Like `print!`, but exit quietly if stdout is a closed pipe.
 #[macro_export]
@@ -55,6 +64,7 @@ pub fn quiet_write(bytes: &[u8]) -> io::Result<()> {
 pub mod agent;
 pub mod cli;
 pub mod commands;
+pub mod config;
 pub mod context;
 pub mod identity;
 pub mod interactive;

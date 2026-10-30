@@ -28,7 +28,6 @@ use serde_json::{json, to_string as to_json_string, to_string_pretty as to_json_
 use sled_hardware_types::BaseboardId;
 use x509_cert::Certificate;
 use x509_cert::der::Encode as _;
-use xdg::BaseDirectories;
 
 use sush_common::authn::Identity;
 use sush_common::jobs::{
@@ -42,9 +41,8 @@ use sush_common::version::VersionInfo;
 
 use crate::commands::{CommandError, GlobalArgs};
 use crate::context::{CommandContext, OutputFormat, StartedDisplay, StatusDisplayStyle};
-use crate::{AuthzSigner, quiet_write};
+use crate::{AuthzSigner, base_directories, quiet_write};
 
-pub(crate) const PREFIX: &str = "sush";
 const SESSION_FILE_NAME: &str = "session.json";
 const SESSION_FILE_VERSION: u32 = 1;
 const CLIENT_NONCE_FILE_NAME: &str = "client-nonce.json";
@@ -84,7 +82,7 @@ impl Cli {
     /// Without persistence, every one-shot command would need a fresh
     /// `session attach`.
     pub fn load_session(&mut self) {
-        let path = match BaseDirectories::with_prefix(PREFIX).place_state_file(SESSION_FILE_NAME) {
+        let path = match base_directories().place_state_file(SESSION_FILE_NAME) {
             Ok(path) => path,
             Err(error) => {
                 eprintln!("❗ The session will not persist: {error}");
@@ -106,7 +104,7 @@ impl Cli {
             Err(error) => eprintln!("❗ Ignoring the saved session: {error}"),
         }
         self.session_file = Some(path);
-        match BaseDirectories::with_prefix(PREFIX).place_state_file(CLIENT_NONCE_FILE_NAME) {
+        match base_directories().place_state_file(CLIENT_NONCE_FILE_NAME) {
             Ok(path) => self.client_nonce_file = Some(path),
             Err(error) => eprintln!("❗ The client nonce will not persist: {error}"),
         }
