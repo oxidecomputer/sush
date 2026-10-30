@@ -10,6 +10,7 @@ use std::collections::BTreeSet;
 use std::ffi::OsString;
 use std::fs::{Permissions, set_permissions};
 use std::os::unix::fs::PermissionsExt as _;
+use std::sync::Arc;
 
 use clap::{ArgMatches, CommandFactory as _, FromArgMatches as _, Parser};
 use rustyline::DefaultEditor;
@@ -28,7 +29,7 @@ use sush_common::targets::{SledId, SledVersion};
 use sush_common::version::VersionInfo;
 
 use crate::cli::Cli;
-use crate::commands::{ClientCommand, CommandError, GlobalArgs};
+use crate::commands::{ClientCommand, ClientHandle, CommandError, GlobalArgs};
 use crate::config::{ConfigOptions, SuppliedOptions, parse_with_config};
 use crate::context::{CommandContext, OutputFormat, StartedDisplay, StatusDisplayStyle};
 use crate::{AuthzSigner, PREFIX, base_directories};
@@ -76,6 +77,9 @@ pub struct Repl {
 
     /// The default for job ID arguments.
     last_job_id: Option<JobId>,
+
+    /// The client handle each command reuses until the options change.
+    client_handle: Option<Arc<ClientHandle>>,
 }
 
 impl Repl {
@@ -141,6 +145,7 @@ impl Repl {
         }
         self.supplied = supplied;
         self.config = config;
+        self.client_handle = None;
         self.cli.set_globals(globals);
         self.show_options()
     }
@@ -160,7 +165,8 @@ impl Repl {
             Some(profile) => format!(" [{profile}]"),
             None => String::new(),
         };
-        let offline = if args.url.is_some() { "" } else { " (offline)" };
+        let online = args.url.is_some() || args.nexus.is_some();
+        let offline = if online { "" } else { " (offline)" };
         format!("{PREFIX}{profile}{offline}# ")
     }
 }
@@ -242,6 +248,17 @@ impl CommandContext for Repl {
 
     fn authz_signer(&self) -> AuthzSigner {
         self.cli.authz_signer()
+    }
+
+    async fn client_handle(
+        &mut self,
+        args: &GlobalArgs,
+    ) -> Result<Option<Arc<ClientHandle>>, CommandError> {
+        if self.client_handle.is_none() {
+            let handle = ClientHandle::from_args(args, self.authz_signer()).await?;
+            self.client_handle = handle.map(Arc::new);
+        }
+        Ok(self.client_handle.clone())
     }
 
     fn session_id(&self) -> Option<SessionId> {

@@ -23,7 +23,7 @@ use sush_common::targets::{SledId, SledVersion};
 use sush_common::version::VersionInfo;
 
 use crate::AuthzSigner;
-use crate::commands::{CommandError, GlobalArgs};
+use crate::commands::{ClientHandle, CommandError, GlobalArgs};
 use crate::config::SuppliedOptions;
 
 /// Authorization state: the credentials that authenticated us, and the
@@ -140,6 +140,14 @@ pub trait CommandContext: Clone + Send + Sync {
 
     // Session management
     fn authz_signer(&self) -> AuthzSigner;
+    #[expect(async_fn_in_trait, reason = "commands run as non-`Send` futures")]
+    async fn client_handle(
+        &mut self,
+        args: &GlobalArgs,
+    ) -> Result<Option<Arc<ClientHandle>>, CommandError> {
+        let handle = ClientHandle::from_args(args, self.authz_signer()).await?;
+        Ok(handle.map(Arc::new))
+    }
     fn get_credentials(&self) -> Option<Authz> {
         self.authz_signer().get()
     }

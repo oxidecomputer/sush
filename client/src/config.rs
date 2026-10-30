@@ -380,25 +380,20 @@ impl SuppliedOptions {
         Self(supplied)
     }
 
-    /// Supply the option of `command` named `long_name`, replacing any
-    /// supplied with that name or one that conflicts with it.
-    pub fn set(&mut self, command: &Command, long_name: &str, values: Vec<OsString>) {
-        for conflicting in conflicting_long_names(command, long_name) {
-            self.0.remove(&conflicting);
-        }
-        self.0.insert(long_name.to_owned(), values);
-    }
-
     /// Stop supplying the option named `long_name`. Returns false
     /// if that option was not supplied.
     pub fn remove(&mut self, long_name: &str) -> bool {
         self.0.remove(long_name).is_some()
     }
 
-    /// Supply each of the options in `other`, as by [`Self::set`].
+    /// Supply each of the options of `command` in `other`, replacing any
+    /// supplied with the same name or one that conflicts with it.
     pub fn update(&mut self, command: &Command, other: &Self) {
         for (long_name, values) in &other.0 {
-            self.set(command, long_name, values.clone());
+            for conflicting in conflicting_long_names(command, long_name) {
+                self.0.remove(&conflicting);
+            }
+            self.0.insert(long_name.clone(), values.clone());
         }
     }
 

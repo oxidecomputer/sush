@@ -111,6 +111,36 @@ const JOB_STOP_RETRY_INTERVAL: Duration = Duration::from_millis(100);
 #[cfg(feature = "permslip")]
 const SIGNING_UPDATE_INTERVAL: Duration = Duration::from_millis(100);
 
+/// Properties of client commands.
+trait ClientCommandProperties {
+    /// Whether a command contacts the server.
+    fn is_online(&self) -> bool {
+        true
+    }
+
+    /// Whether a command handles SIGINT itself.
+    fn handles_sigint(&self) -> bool {
+        false
+    }
+}
+
+/// An omitted subcommand has the properties of its default.
+impl<T: ClientCommandProperties + Default> ClientCommandProperties for Option<T> {
+    fn is_online(&self) -> bool {
+        match self {
+            Some(command) => command.is_online(),
+            None => T::default().is_online(),
+        }
+    }
+
+    fn handles_sigint(&self) -> bool {
+        match self {
+            Some(command) => command.handles_sigint(),
+            None => T::default().handles_sigint(),
+        }
+    }
+}
+
 /// Process limits for job execution.
 #[derive(Clone, Debug, Parser)]
 pub struct LimitArgs {
@@ -251,16 +281,6 @@ impl GlobalArgs {
             self.output
         }
     }
-
-    /// Point these options at an open tunnel's local `url` instead of
-    /// Nexus. The REPL re-enters `run` for each command and parses its
-    /// supplied options each time, so they must name the tunnel too;
-    /// otherwise each command would open a tunnel of its own.
-    fn use_tunnel(&mut self, url: &str) {
-        self.url = Some(url.to_owned());
-        self.nexus = None;
-        self.supplied.set(&Self::command(), "url", vec![url.into()]);
-    }
 }
 
 #[derive(Debug, Parser)]
@@ -358,10 +378,6 @@ pub enum ClientCommand {
     Iam {
         #[clap(subcommand)]
         command: Option<IdentityCommand>,
-
-        /// Shortcut for `iam available`
-        #[arg(short = 'l')]
-        available: bool,
     },
 
     /// Session management.
@@ -418,10 +434,13 @@ pub enum CertCommand {
     },
 }
 
+impl ClientCommandProperties for CertCommand {}
+
 #[derive(Clone, Debug, Default, Subcommand)]
 pub enum IdentityCommand {
     /// List available local SSH agent identities.
     /// Does not communicate with the server.
+    #[command(short_flag = 'l')]
     Available,
 
     /// List SSH identities registered with the server.
@@ -430,6 +449,12 @@ pub enum IdentityCommand {
     /// Log in to the server as an SSH identity.
     #[default]
     Login,
+}
+
+impl ClientCommandProperties for IdentityCommand {
+    fn is_online(&self) -> bool {
+        !matches!(self, Self::Available)
+    }
 }
 
 #[derive(Clone, Debug, Subcommand)]
@@ -524,6 +549,8 @@ impl Default for SessionCommand {
     }
 }
 
+impl ClientCommandProperties for SessionCommand {}
+
 #[derive(Clone, Debug, Subcommand)]
 pub enum JobCommand {
     /// Sign and start a job.
@@ -606,6 +633,12 @@ pub enum JobCommand {
     },
 }
 
+impl ClientCommandProperties for JobCommand {
+    fn handles_sigint(&self) -> bool {
+        matches!(self, Self::Start { .. } | Self::Attach { .. })
+    }
+}
+
 #[derive(Clone, Debug, Parser)]
 pub struct JobStartArgs {
     #[clap(flatten)]
@@ -671,23 +704,32 @@ impl JobStartArgs {
     }
 }
 
-impl ClientCommand {
-    /// Whether a command handles SIGINT itself.
+impl ClientCommandProperties for ClientCommand {
+    fn is_online(&self) -> bool {
+        match self {
+            Self::Cert { command } => command.is_online(),
+            Self::Iam { command } => command.is_online(),
+            Self::Session { command } => command.is_online(),
+            Self::Job { command } => command.is_online(),
+            Self::Shell | Self::Version | Self::Set { .. } | Self::Unset { .. } | Self::Quit => {
+                false
+            }
+        }
+    }
+
     fn handles_sigint(&self) -> bool {
-        matches!(
-            self,
-            Self::Shell
-                | Self::Job {
-                    command: JobCommand::Start { .. } | JobCommand::Attach { .. },
-                }
-        )
+        match self {
+            Self::Cert { command } => command.handles_sigint(),
+            Self::Iam { command } => command.handles_sigint(),
+            Self::Session { command } => command.handles_sigint(),
+            Self::Job { command } => command.handles_sigint(),
+            Self::Shell => true,
+            Self::Version | Self::Set { .. } | Self::Unset { .. } | Self::Quit => false,
+        }
     }
+}
 
-    /// Whether a command contacts the server.
-    fn needs_server(&self) -> bool {
-        !matches!(self, Self::Set { .. } | Self::Unset { .. } | Self::Quit)
-    }
-
+impl ClientCommand {
     /// Run the command, letting an interrupt cancel it unless the
     /// command handles SIGINT itself.
     #[async_recursion(?Send)]
@@ -702,67 +744,26 @@ impl ClientCommand {
     }
 
     async fn run(self, ctx: &mut impl CommandContext) -> Result<(), CommandError> {
-        let mut args = ctx.get_globals().to_owned();
+        let args = ctx.get_globals();
         if let Some(output) = args.output_format() {
             ctx.set_output_format(output);
         }
 
-        // The tunnel stands in for the proxy until the command ends.
-        let _tunnel = match args.nexus.as_ref() {
-            Some(nexus) if self.needs_server() => {
-                let rack = args.rack.as_ref().ok_or(CommandError::MissingRack)?;
-                let token = args
-                    .nexus_token
-                    .as_ref()
-                    .ok_or(CommandError::MissingNexusToken)?;
-                let tunnel =
-                    Tunnel::start(nexus, rack, token, &args.nexus_roots, args.nexus_resolve)
-                        .await?;
-                args.use_tunnel(&tunnel.url);
-                Some(tunnel)
-            }
-            _ => None,
+        let handle = match self.is_online() {
+            true => ctx.client_handle(&args).await?,
+            false => None,
         };
-
-        let client = match args.url.as_ref() {
-            Some(url) if self.needs_server() => {
-                let roots = if args.proxy_roots.is_empty() {
-                    tls::platform_roots()?
-                } else {
-                    let mut roots = Vec::new();
-                    for path in &args.proxy_roots {
-                        let pem = read(path).map_err(|err| CommandError::io(path, err))?;
-                        roots.push(Certificate::from_pem(&pem)?);
-                    }
-                    roots
-                };
-                {
-                    let (url, resolve) = tls::descope_url(url)?;
-                    Some(Client::new_with_client(
-                        &url,
-                        tls::client(roots, resolve)?,
-                        ctx.authz_signer(),
-                    ))
-                }
-            }
-            _ => None,
-        };
+        let client = handle.as_ref().map(|handle| handle.client.clone());
         match (self, client) {
             (ClientCommand::Cert { command }, Some(client)) => cert(ctx, &client, command).await,
 
-            (ClientCommand::Iam { command, available }, Some(client)) => {
+            (ClientCommand::Iam { command }, client) => {
                 iam(
                     ctx,
-                    &client,
+                    client.as_ref(),
                     &args.ssh_auth_sock,
                     &args.ssh_key_id,
-                    command.unwrap_or_else(|| {
-                        if available {
-                            IdentityCommand::Available
-                        } else {
-                            IdentityCommand::default()
-                        }
-                    }),
+                    command.unwrap_or_default(),
                 )
                 .await
             }
@@ -782,8 +783,12 @@ impl ClientCommand {
                 Ok(())
             }
 
-            (ClientCommand::Version, client) => {
-                let (server, sleds) = match client {
+            (ClientCommand::Version, _) => {
+                let handle = ctx.client_handle(&args).await.unwrap_or_else(|error| {
+                    ctx.command_error(&error);
+                    None
+                });
+                let (server, sleds) = match handle.as_ref().map(|handle| &handle.client) {
                     Some(client) => (
                         Some(client.version().send().await?.into_inner()),
                         client
@@ -803,6 +808,56 @@ impl ClientCommand {
 
             (_, None) => Err(CommandError::Offline),
         }
+    }
+}
+
+/// A client and the tunnel it goes through, if any.
+/// Dropping the handle closes the tunnel.
+#[derive(Debug)]
+pub struct ClientHandle {
+    pub client: Client,
+    _tunnel: Option<Tunnel>,
+}
+
+impl ClientHandle {
+    /// Make a client and maybe a tunnel, or nothing if offline.
+    pub async fn from_args(
+        args: &GlobalArgs,
+        signer: AuthzSigner,
+    ) -> Result<Option<Self>, CommandError> {
+        let (url, tunnel) = match &args.nexus {
+            Some(nexus) => {
+                let rack = args.rack.as_ref().ok_or(CommandError::MissingRack)?;
+                let token = args
+                    .nexus_token
+                    .as_ref()
+                    .ok_or(CommandError::MissingNexusToken)?;
+                let tunnel =
+                    Tunnel::start(nexus, rack, token, &args.nexus_roots, args.nexus_resolve)
+                        .await?;
+                (Some(tunnel.url.clone()), Some(tunnel))
+            }
+            None => (args.url.clone(), None),
+        };
+        let Some(url) = url else {
+            return Ok(None);
+        };
+        let roots = if args.proxy_roots.is_empty() {
+            tls::platform_roots()?
+        } else {
+            let mut roots = Vec::new();
+            for path in &args.proxy_roots {
+                let pem = read(path).map_err(|err| CommandError::io(path, err))?;
+                roots.push(Certificate::from_pem(&pem)?);
+            }
+            roots
+        };
+        let (url, resolve) = tls::descope_url(&url)?;
+        let client = Client::new_with_client(&url, tls::client(roots, resolve)?, signer);
+        Ok(Some(Self {
+            client,
+            _tunnel: tunnel,
+        }))
     }
 }
 
@@ -914,7 +969,7 @@ where
 
 async fn iam(
     ctx: &mut impl CommandContext,
-    client: &Client,
+    client: Option<&Client>,
     ssh_auth_sock: &Option<String>,
     ssh_key_id: &Option<KeyId>,
     command: IdentityCommand,
@@ -939,6 +994,7 @@ async fn iam(
         }
 
         IdentityCommand::List => {
+            let client = client.ok_or(CommandError::Offline)?;
             let identities = with_login(ctx, client, async || client.identities().send().await)
                 .await?
                 .into_inner();
@@ -949,6 +1005,7 @@ async fn iam(
         }
 
         IdentityCommand::Login => {
+            let client = client.ok_or(CommandError::Offline)?;
             let identity = with_login(ctx, client, async || client.iam().body(None).send().await)
                 .await?
                 .into_inner();
@@ -2820,6 +2877,8 @@ impl From<ClientError<Upgraded>> for CommandError {
 
 #[cfg(test)]
 mod tests {
+    use std::iter::once;
+
     use chrono::Utc;
 
     use super::*;
@@ -2950,6 +3009,41 @@ mod tests {
     #[test]
     fn client_args() {
         ClientArgs::command().debug_assert();
+    }
+
+    /// Only commands that contact the server are online, and only the
+    /// REPL, `job start`, and `job attach` handle SIGINT. `sush` with no
+    /// command starts the REPL.
+    #[test]
+    fn command_properties() {
+        let command = |words: &str| {
+            let words = once("sush").chain(words.split_whitespace());
+            let args = ClientArgs::try_parse_from(words).unwrap();
+            args.command.unwrap_or_default()
+        };
+        for words in ["iam", "iam list", "job status"] {
+            assert!(command(words).is_online(), "`{words}` is online");
+        }
+        for words in [
+            "",
+            "iam -l",
+            "iam available",
+            "set --rack r",
+            "unset rack",
+            "version",
+            "quit",
+        ] {
+            assert!(!command(words).is_online(), "`{words}` is offline");
+        }
+        for words in ["", "job start uptime", "job attach"] {
+            assert!(command(words).handles_sigint(), "`{words}` handles SIGINT");
+        }
+        for words in ["job status", "iam", "session", "version"] {
+            assert!(
+                !command(words).handles_sigint(),
+                "`{words}` leaves SIGINT alone"
+            );
+        }
     }
 
     #[test]
