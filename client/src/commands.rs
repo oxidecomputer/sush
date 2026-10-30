@@ -272,7 +272,7 @@ pub struct ClientArgs {
     globals: GlobalArgs,
 
     #[clap(subcommand)]
-    command: ClientCommand,
+    command: Option<ClientCommand>,
 }
 
 impl ClientArgs {
@@ -294,7 +294,7 @@ impl ClientArgs {
 
     pub async fn execute(&mut self, ctx: &mut impl CommandContext) -> Result<(), CommandError> {
         ctx.set_globals(self.globals.clone());
-        self.command.clone().execute(ctx).await
+        self.command.clone().unwrap_or_default().execute(ctx).await
     }
 }
 
@@ -345,7 +345,7 @@ fn parallel_chunks(s: &str) -> Result<NonZeroU8, String> {
 }
 
 /// Support Shell job management command
-#[derive(Clone, Debug, Subcommand)]
+#[derive(Clone, Debug, Default, Subcommand)]
 pub enum ClientCommand {
     /// Job-signing certificate management.
     Cert {
@@ -392,8 +392,9 @@ pub enum ClientCommand {
         options: Vec<String>,
     },
 
-    /// Start an interactive REPL.
+    /// Start an interactive REPL (the default).
     #[clap(alias = "repl")]
+    #[default]
     Shell,
 
     /// Report client and sled build versions.
