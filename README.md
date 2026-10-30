@@ -70,28 +70,44 @@ Aug 09 03:41:44.594 INFO listening, local_addr: 0.0.0.0:44444
 > On NixOS you will have to pass the `--insecure-disable-path-isolation` flag to
 > the server, otherwise spawning commands will fail.
 
-In another terminal, point the client at the server and start it up
-in REPL mode. Signing job requests needs a client built with the
-`permslip` feature and a reachable Permission Slip instance holding
-your signing key:
+In another terminal, point the client at the server and start it up:
 
 ```
 $ export PERMSLIP_URL="https://your-permslip-server.example"
 $ export SUSH_PERMSLIP_KEY="Your Signing Key"
 $ export SUSH_URL="http://localhost:44444"
-$ cargo run --bin=sush --features permslip -- repl
-     Running `target/debug/sush repl`
-✅ Output format set to `text`
-✅ Server URL set to `http://localhost:44444`
-✅ SSH agent socket set to `/run/user/1000/ssh-agent.sock`
-✅ SSH key ID unset
+$ cargo run --bin=sush --features permslip
+     Running `target/debug/sush`
+✅ url = http://localhost:44444 (environment)
+✅ ssh-auth-sock = /run/user/1000/ssh-agent.sock (environment)
 sush# 
 ```
 
-We can explicitly start a session with `session start`, or we can
-let `job start` implicitly start one for us. The server automatically
-sets some environment variables for job processes, so as a simple
-test try running the command `echo $SUSH_JOB_ID`:
+With no command, `sush` starts its interactive REPL (aka shell).
+Try `help` for a list of commands, or any `sush` sub-command,
+such as `session`, `job`, etc. The REPL offers some convenient
+features for running multiple jobs, such as transparent use of
+the previous job ID, Nexus tunnel reuse, command history, etc.
+Exit the REPL with `quit` or Ctrl-D.
+
+You can begin a session with `session start`. You may be prompted
+to touch your authentication token (e.g., YubiKey) and to authenticate
+to the signing service:
+
+```
+sush# session start
+👋 Please confirm user presence to sign with key `excite-cabbage-reject-wave-learn-police-that-glad`
+🔑 Open this URL in your browser to authenticate to the signing service:
+https://your-permslip-server.example/google/07c339c687e9ac919af7ab2ac5025881
+✅ Created session
+   Session ID:      slush-olympic-universe-ill-total-risk-host-suggest
+   Signer nonce:    private-else-nut-erosion-trend-tube-token-man
+   Sequence number: borrow-session-iron-author
+```
+
+Now you're ready to run a job. The server automatically sets some
+environment variables for job processes, so as a simple test try
+running the command `echo $SUSH_JOB_ID`:
 
 ```
 sush# job start --wait "echo $SUSH_JOB_ID"
@@ -134,5 +150,39 @@ of cubby numbers, serial numbers, and full baseboard IDs are also
 accepted. Interactive and streaming jobs must target exactly one sled,
 which defaults to the sled they are talking to.
 
-The `version` command shows which versions of `sush` are running where
-in the rack. See `help` for a list of other commands.
+The `version` command shows which versions of `sush` are running on
+which sleds, as well as a visual indication of their health. Green means
+the `sush` server is running and connected to the internal gossip network;
+yellow means the server couldn't connect to the gossip network; and red
+means that no `sush` server is running there at all.
+
+## Configuration files and the options system
+
+The `sush` client reads a configuration file in TOML format from the
+standard XDG directories, e.g., `~/.config/sush/sush.toml`, or wherever
+you point `--config` to. In such files, the keys are long option names,
+and the values provide defaults for those options.
+
+Top-level options provide global defaults, while tables in the config file
+let you organize sets of options into named *profiles*, e.g., for different
+environments. You can choose a profile via a top-level `profile` key, or
+the `SUSH_PROFILE` environment variable, or the `--profile` global option:
+
+```toml
+permslip-url = "https://your-permslip-server.example"
+permslip-key = "Your Signing Key"
+profile = "local"
+
+[local]
+url = "http://localhost:44444"
+permslip-key = "Local Signing Key"
+
+[remote]
+url = "https://somewhere-else.example"
+```
+
+Configuration files provide defaults for options in such a way that
+environment variables override them, and explicit command line options
+override those. You can see which options support environment variables
+with `--help`; any of those may also be set in the config file, except
+for ones whose values are secrets, such as `SUSH_NEXUS_TOKEN`.
