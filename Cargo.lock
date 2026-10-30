@@ -4887,6 +4887,7 @@ dependencies = [
  "slog",
  "sprockets-tls",
  "ssh-key",
+ "strum 0.27.2",
  "sush-api",
  "sush-common",
  "tempfile",

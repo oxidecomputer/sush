@@ -7,12 +7,11 @@
 //! Inherits most of its behavior from the (non-interactive) CLI.
 
 use std::collections::BTreeSet;
-use std::env;
 use std::ffi::OsString;
 use std::fs::{Permissions, set_permissions};
 use std::os::unix::fs::PermissionsExt as _;
 
-use clap::{CommandFactory as _, FromArgMatches as _, Parser};
+use clap::{ArgMatches, CommandFactory as _, FromArgMatches as _, Parser};
 use rustyline::DefaultEditor;
 use rustyline::error::ReadlineError;
 use shlex::split as split_command;
@@ -29,13 +28,10 @@ use sush_common::targets::{SledId, SledVersion};
 use sush_common::version::VersionInfo;
 
 use crate::cli::Cli;
-use crate::commands::{
-    ClientCommand, CommandError, GlobalArgs, SSH_AUTH_SOCK, SUSH_JOB_ID, SUSH_KEY_ID,
-    SUSH_OUTPUT_FORMAT, SUSH_URL,
-};
-use crate::config::{ConfigOptions, parse_with_config};
+use crate::commands::{ClientCommand, CommandError, GlobalArgs};
+use crate::config::{ConfigOptions, SuppliedOptions, parse_with_config};
 use crate::context::{CommandContext, OutputFormat, StartedDisplay, StatusDisplayStyle};
-use crate::{AuthzSigner, Client, PREFIX, base_directories};
+use crate::{AuthzSigner, PREFIX, base_directories};
 
 const HISTORY_FILE: &str = "history.txt";
 
@@ -48,42 +44,48 @@ struct ReplCommandParser {
 
 impl ReplCommandParser {
     /// Parse `words`, taking defaults from `options`.
-    fn try_parse<I, T, C>(
-        ctx: &mut C,
-        words: I,
-        options: &ConfigOptions,
-    ) -> Result<Self, CommandError>
+    fn try_parse<I, T>(words: I, options: &ConfigOptions) -> Result<Self, CommandError>
     where
         I: IntoIterator<Item = T>,
-        T: Into<OsString> + Clone,
-        C: CommandContext,
+        T: Into<OsString>,
     {
-        let mut words = words.into_iter().peekable();
-        if let Some(command) = words.peek()
-            && let Ok(command) = command.clone().into().as_os_str().try_into()
+        let command = Self::command();
+        let matches = parse_with_config(command.clone(), words, options)?;
+        let mut parsed = Self::from_arg_matches(&matches)?;
+        if let ClientCommand::Set { args } = &mut parsed.command
+            && let Some((name, matches)) = matches.subcommand()
+            && let Some(set) = command.find_subcommand(name)
         {
-            ctx.pre_parse_hook(command);
+            args.supplied = SuppliedOptions::from_matches(set, matches);
         }
-        let matches = parse_with_config(Self::command(), words, options)?;
-        Ok(Self::from_arg_matches(&matches)?)
+        Ok(parsed)
     }
 }
 
 /// Interactive REPL context.
 #[derive(Clone, Debug, Default)]
 pub struct Repl {
+    /// The underlying CLI context. Most methods forward to this.
     cli: Cli,
+
+    /// Configuration options for the selected profile.
+    config: ConfigOptions,
+
+    /// Global options explicitly supplied on the command line.
+    supplied: SuppliedOptions,
+
+    /// The default for job ID arguments.
+    last_job_id: Option<JobId>,
 }
 
 impl Repl {
-    pub async fn run(
-        mut self,
-        args: GlobalArgs,
-        _client: Option<Client>,
-    ) -> Result<(), CommandError> {
-        self.set_globals(args.clone());
+    pub async fn run(mut self, args: GlobalArgs) -> Result<(), CommandError> {
         self.cli.load_session();
-        let options = ConfigOptions::load(args.config, args.profile)?;
+        self.config = ConfigOptions::from_supplied(&args.supplied)?;
+        self.supplied = args.supplied;
+        let (globals, _) = parse_globals(&self.supplied, &self.config)?;
+        self.cli.set_globals(globals);
+        self.show_options()?;
         let history_file = base_directories()
             .place_state_file(HISTORY_FILE)
             .map_err(|error| CommandError::io(HISTORY_FILE, error))?;
@@ -105,7 +107,7 @@ impl Repl {
                     let Some(words) = split_command(&command) else {
                         perr!("❌ Invalid quoting in command");
                     };
-                    let command = match ReplCommandParser::try_parse(&mut self, &words, &options) {
+                    let command = match ReplCommandParser::try_parse(&words, &self.config) {
                         Ok(ReplCommandParser { command }) => command,
                         Err(err) => {
                             self.command_error(&err);
@@ -129,29 +131,50 @@ impl Repl {
         Ok(())
     }
 
-    /// Get the default job ID from the `SUSH_JOB_ID` environment variable.
-    #[allow(unused)]
-    fn default_job_id(&self) -> Option<JobId> {
-        env::var(SUSH_JOB_ID)
-            .ok()
-            .and_then(|job_id| job_id.parse().ok())
-    }
-
-    /// (Un)set the `SUSH_JOB_ID` environment variable as a default for
-    /// job ID arguments.
-    fn set_job_id(&mut self, job_id: Option<JobId>) {
-        if let Some(job_id) = job_id {
-            unsafe { env::set_var(SUSH_JOB_ID, job_id.to_string()) }
-        } else {
-            unsafe { env::remove_var(SUSH_JOB_ID) }
+    fn apply_options(&mut self, supplied: SuppliedOptions) -> Result<(), CommandError> {
+        let config = ConfigOptions::from_supplied(&supplied)?;
+        let old = self.get_globals();
+        let (globals, _) = parse_globals(&supplied, &config)?;
+        if (&old.ssh_auth_sock, &old.ssh_key_id) != (&globals.ssh_auth_sock, &globals.ssh_key_id) {
+            self.set_credentials(None);
+            self.authz_signer().clear_claim();
         }
+        self.supplied = supplied;
+        self.config = config;
+        self.cli.set_globals(globals);
+        self.show_options()
     }
 
-    /// Make a prompt indicating online/offline status.
-    fn prompt(&self, args: &GlobalArgs) -> String {
-        let offline = if args.url.is_some() { "" } else { " (offline)" };
-        format!("{PREFIX}{offline}# ")
+    /// Print each global option that has a value, and its source.
+    fn show_options(&self) -> Result<(), CommandError> {
+        let (_, matches) = parse_globals(&self.supplied, &self.config)?;
+        for line in self.config.describe(&matches) {
+            eprintln!("✅ {line}");
+        }
+        Ok(())
     }
+
+    /// Make a prompt indicating the profile and online/offline status.
+    fn prompt(&self, args: &GlobalArgs) -> String {
+        let profile = match &args.profile {
+            Some(profile) => format!(" [{profile}]"),
+            None => String::new(),
+        };
+        let offline = if args.url.is_some() { "" } else { " (offline)" };
+        format!("{PREFIX}{profile}{offline}# ")
+    }
+}
+
+/// Parse the global options in `supplied`, as if typed on the command
+/// line, over the environment and `options`.
+fn parse_globals(
+    supplied: &SuppliedOptions,
+    options: &ConfigOptions,
+) -> Result<(GlobalArgs, ArgMatches), CommandError> {
+    let matches = parse_with_config(GlobalArgs::command(), supplied.command_line(), options)?;
+    let mut globals = GlobalArgs::from_arg_matches(&matches)?;
+    globals.supplied = supplied.clone();
+    Ok((globals, matches))
 }
 
 /// Most of these methods simply punt to those of [`Cli`] for display.
@@ -171,58 +194,31 @@ impl CommandContext for Repl {
         self.cli.get_globals()
     }
 
-    fn set_globals(&mut self, mut args: GlobalArgs) {
-        let GlobalArgs {
-            mut output,
-            json,
-            text,
-            mut url,
-            offline,
-            ssh_auth_sock,
-            ssh_key_id,
-            #[cfg(feature = "permslip")]
-                permslip_ssh: _,
-            proxy_roots: _,
-            nexus: _,
-            nexus_token: _,
-            nexus_roots: _,
-            nexus_resolve: _,
-            rack: _,
-            config: _,
-            profile: _,
-        } = args;
-        if json {
-            output = Some(OutputFormat::Json);
-        } else if text {
-            output = Some(OutputFormat::Text);
-        }
-        if offline {
-            url = None;
-        }
-        if ssh_auth_sock.is_some() || ssh_key_id.is_some() {
-            self.set_credentials(None);
-            self.authz_signer().clear_claim();
-        }
+    fn last_job_id(&self) -> Option<JobId> {
+        self.last_job_id
+    }
 
-        macro_rules! set_or_unset {
-            ($arg:ident, $var:expr, $name:literal) => {{
-                if let Some(arg) = $arg {
-                    unsafe { env::set_var($var, arg.to_string()) }
-                    args.$arg = Some(arg.clone());
-                    eprintln!("✅ {} set to `{}`", $name, arg);
-                } else {
-                    unsafe { env::remove_var($var) }
-                    args.$arg = None;
-                    eprintln!("✅ {} unset", $name);
-                }
-            }};
-        }
-        set_or_unset!(output, SUSH_OUTPUT_FORMAT, "Output format");
-        set_or_unset!(url, SUSH_URL, "Server URL");
-        set_or_unset!(ssh_auth_sock, SSH_AUTH_SOCK, "SSH agent socket");
-        set_or_unset!(ssh_key_id, SUSH_KEY_ID, "SSH key ID");
+    fn set_options(&mut self, options: SuppliedOptions) -> Result<(), CommandError> {
+        let mut supplied = self.supplied.clone();
+        supplied.update(&GlobalArgs::command(), &options);
+        self.apply_options(supplied)
+    }
 
-        self.cli.set_globals(args);
+    fn unset_options(&mut self, long_names: &[String]) -> Result<(), CommandError> {
+        let command = GlobalArgs::command();
+        let mut supplied = self.supplied.clone();
+        for long_name in long_names {
+            if !command
+                .get_arguments()
+                .any(|arg| arg.get_long() == Some(long_name))
+            {
+                return Err(CommandError::UnknownOption(long_name.to_owned()));
+            }
+            if !supplied.remove(long_name) {
+                return Err(CommandError::OptionNotSet(long_name.to_owned()));
+            }
+        }
+        self.apply_options(supplied)
     }
 
     // Errors
@@ -326,12 +322,12 @@ impl CommandContext for Repl {
         sleds: Option<&BTreeSet<BaseboardId>>,
         display: StartedDisplay,
     ) {
-        self.set_job_id(Some(job.job_id().to_owned()));
+        self.last_job_id = Some(*job.job_id());
         self.cli.job_started(job, sleds, display);
     }
 
     fn job_stopped(&mut self, job_id: &JobId) {
-        self.set_job_id(Some(job_id.to_owned()));
+        self.last_job_id = Some(*job_id);
         self.cli.job_stopped(job_id);
     }
 
@@ -347,7 +343,7 @@ impl CommandContext for Repl {
         output: &[u8],
         binary: bool,
     ) {
-        self.set_job_id(Some(job_id.to_owned()));
+        self.last_job_id = Some(*job_id);
         self.cli.job_output(job_id, target, stream, output, binary);
     }
 
@@ -358,7 +354,7 @@ impl CommandContext for Repl {
         stage: &str,
         total: u64,
     ) {
-        self.set_job_id(Some(job_id.to_owned()));
+        self.last_job_id = Some(*job_id);
         self.cli.job_output_started(job_id, stream, stage, total);
     }
 
@@ -416,7 +412,7 @@ impl CommandContext for Repl {
     }
 
     fn job_status(&mut self, job_id: &JobId, status: &JobStatusMap, style: StatusDisplayStyle) {
-        self.set_job_id(Some(job_id.to_owned()));
+        self.last_job_id = Some(*job_id);
         self.cli.job_status(job_id, status, style);
     }
 

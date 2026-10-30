@@ -59,7 +59,7 @@ use sush_common::targets::{SledId, Target};
 use sush_common::version::VersionInfo;
 
 use crate::ByteStream;
-use crate::config::{ConfigError, parse_and_merge_config};
+use crate::config::{ConfigError, SuppliedOptions, parse_and_merge_config};
 use crate::context::{Authz, CommandContext, OutputFormat, StartedDisplay, StatusDisplayStyle};
 use crate::identity::{IdentityError, SshAgentConnection};
 use crate::interactive::interactive_job;
@@ -166,12 +166,12 @@ pub struct GlobalArgs {
     pub output: Option<OutputFormat>,
 
     /// Shortcut for `--output=json`
-    #[arg(short, long, default_value_t = false, conflicts_with = "text")]
+    #[arg(short, long, default_value_t = false, conflicts_with_all = ["text", "output"])]
     #[clap(global = true)]
     pub json: bool,
 
     /// Shortcut for `--output=text`
-    #[arg(short, long, default_value_t = false, conflicts_with = "json")]
+    #[arg(short, long, default_value_t = false, conflicts_with_all = ["json", "output"])]
     #[clap(global = true)]
     pub text: bool,
 
@@ -234,6 +234,11 @@ pub struct GlobalArgs {
     #[arg(short, long, env = SUSH_KEY_ID)]
     #[clap(global = true)]
     pub ssh_key_id: Option<KeyId>,
+
+    /// Options explicitly supplied on the command line. For REPL
+    /// bookkeeping only.
+    #[arg(skip)]
+    pub supplied: SuppliedOptions,
 }
 
 impl GlobalArgs {
@@ -245,6 +250,16 @@ impl GlobalArgs {
         } else {
             self.output
         }
+    }
+
+    /// Point these options at an open tunnel's local `url` instead of
+    /// Nexus. The REPL re-enters `run` for each command and parses its
+    /// supplied options each time, so they must name the tunnel too;
+    /// otherwise each command would open a tunnel of its own.
+    fn use_tunnel(&mut self, url: &str) {
+        self.url = Some(url.to_owned());
+        self.nexus = None;
+        self.supplied.set(&Self::command(), "url", vec![url.into()]);
     }
 }
 
@@ -264,9 +279,13 @@ impl ClientArgs {
     /// Parse the process arguments, taking defaults from the
     /// configuration file. Exits on a parse error, like clap.
     pub fn parse_and_merge_config() -> Result<Self, CommandError> {
-        match parse_and_merge_config(Self::command(), args_os()) {
+        let command = Self::command();
+        match parse_and_merge_config(command.clone(), args_os()) {
             Ok(matches) => {
-                Ok(Self::from_arg_matches(&matches).unwrap_or_else(|error| error.exit()))
+                let mut args =
+                    Self::from_arg_matches(&matches).unwrap_or_else(|error| error.exit());
+                args.globals.supplied = SuppliedOptions::from_matches(&command, &matches);
+                Ok(args)
             }
             Err(CommandError::Clap(error)) => error.exit(),
             Err(error) => Err(error),
@@ -284,7 +303,7 @@ impl ClientArgs {
 pub struct JobOutput {
     /// The job whose output should be fetched.
     #[clap(env = SUSH_JOB_ID)]
-    job_id: JobId,
+    job_id: Option<JobId>,
 
     /// Job output is binary, not UTF-8 encoded text.
     #[arg(short, long, default_value_t = false, conflicts_with = "file")]
@@ -357,10 +376,20 @@ pub enum ClientCommand {
         command: JobCommand,
     },
 
-    /// Arguments for subsequent interactive commands.
+    /// Set options for later commands.
+    ///
+    /// Each option replaces any earlier or conflicting one. Also reload
+    /// the config file and show the current options.
     Set {
         #[clap(flatten)]
         args: GlobalArgs,
+    },
+
+    /// Unset options supplied earlier.
+    Unset {
+        /// The long names of the options to unset, without the leading `--`.
+        #[arg(required = true, value_name = "OPTION")]
+        options: Vec<String>,
     },
 
     /// Start an interactive REPL.
@@ -507,7 +536,7 @@ pub enum JobCommand {
     Stop {
         /// The job to abort.
         #[clap(env = SUSH_JOB_ID)]
-        job_id: JobId,
+        job_id: Option<JobId>,
     },
 
     /// Decline to run a job, burning its ID and advancing the session.
@@ -520,7 +549,7 @@ pub enum JobCommand {
     Status {
         /// The job whose status should be fetched.
         #[clap(env = SUSH_JOB_ID)]
-        job_id: JobId,
+        job_id: Option<JobId>,
 
         /// Show full per-sled status instead of one line per sled.
         #[arg(short, long)]
@@ -557,7 +586,7 @@ pub enum JobCommand {
     Attach {
         /// The interactive job to attach to.
         #[clap(env = SUSH_JOB_ID)]
-        job_id: JobId,
+        job_id: Option<JobId>,
 
         /// The sled to attach to.
         #[arg(short = 'T', long, default_value = "*")]
@@ -642,9 +671,7 @@ impl JobStartArgs {
 }
 
 impl ClientCommand {
-    /// Interactive jobs forward SIGINT to the job, watches use it to
-    /// stop the job or end the watch, and the REPL turns it into a
-    /// fresh prompt.
+    /// Whether a command handles SIGINT itself.
     fn handles_sigint(&self) -> bool {
         matches!(
             self,
@@ -653,6 +680,11 @@ impl ClientCommand {
                     command: JobCommand::Start { .. } | JobCommand::Attach { .. },
                 }
         )
+    }
+
+    /// Whether a command contacts the server.
+    fn needs_server(&self) -> bool {
+        !matches!(self, Self::Set { .. } | Self::Unset { .. } | Self::Quit)
     }
 
     /// Run the command, letting an interrupt cancel it unless the
@@ -676,7 +708,7 @@ impl ClientCommand {
 
         // The tunnel stands in for the proxy until the command ends.
         let _tunnel = match args.nexus.as_ref() {
-            Some(nexus) => {
+            Some(nexus) if self.needs_server() => {
                 let rack = args.rack.as_ref().ok_or(CommandError::MissingRack)?;
                 let token = args
                     .nexus_token
@@ -685,17 +717,14 @@ impl ClientCommand {
                 let tunnel =
                     Tunnel::start(nexus, rack, token, &args.nexus_roots, args.nexus_resolve)
                         .await?;
-                args.url = Some(tunnel.url.clone());
-                // The repl re-enters run per command; commands must
-                // reuse this tunnel, not build their own.
-                args.nexus = None;
+                args.use_tunnel(&tunnel.url);
                 Some(tunnel)
             }
-            None => None,
+            _ => None,
         };
 
         let client = match args.url.as_ref() {
-            Some(url) => {
+            Some(url) if self.needs_server() => {
                 let roots = if args.proxy_roots.is_empty() {
                     tls::platform_roots()?
                 } else {
@@ -715,7 +744,7 @@ impl ClientCommand {
                     ))
                 }
             }
-            None => None,
+            _ => None,
         };
         match (self, client) {
             (ClientCommand::Cert { command }, Some(client)) => cert(ctx, &client, command).await,
@@ -743,13 +772,12 @@ impl ClientCommand {
 
             (ClientCommand::Job { command }, client) => job(ctx, &client, command).await,
 
-            (ClientCommand::Set { args }, _) => {
-                ctx.set_globals(args);
-                Ok(())
-            }
+            (ClientCommand::Set { args }, _) => ctx.set_options(args.supplied),
 
-            (ClientCommand::Shell, client) => {
-                Repl::default().run(args.clone(), client).await?;
+            (ClientCommand::Unset { options }, _) => ctx.unset_options(&options),
+
+            (ClientCommand::Shell, _) => {
+                Repl::default().run(args.clone()).await?;
                 Ok(())
             }
 
@@ -1289,6 +1317,7 @@ async fn job(
         }
 
         (JobCommand::Stop { job_id }, Some(client)) => {
+            let job_id = job_id_or_last(ctx, job_id)?;
             job_stop(ctx, client, &job_id, None).await?;
             ctx.job_stopped(&job_id);
             Ok(())
@@ -1323,6 +1352,7 @@ async fn job(
         }
 
         (JobCommand::Status { job_id, full, wait }, Some(client)) => {
+            let job_id = job_id_or_last(ctx, job_id)?;
             let style = if full {
                 StatusDisplayStyle::Full
             } else {
@@ -1346,6 +1376,7 @@ async fn job(
         }
 
         (JobCommand::Attach { job_id, target }, Some(client)) => {
+            let job_id = job_id_or_last(ctx, job_id)?;
             let target = match &target {
                 TargetArg::Abbreviated(sleds) => match sleds.as_slice() {
                     [SledArg::Serial(serial)] => {
@@ -1457,7 +1488,7 @@ async fn job_start(
             Ok(()) => (),
             Err(CommandError::NotFound(_)) => {
                 let output = JobOutput {
-                    job_id,
+                    job_id: Some(job_id),
                     binary: true,
                     file: None,
                     force: false,
@@ -2006,6 +2037,13 @@ struct Chunk(Range, ByteStream);
 /// A promise of some bytes for a range of output.
 type FutureChunk<'a> = dyn Future<Output = Result<Chunk, CommandError>> + Send + 'a;
 
+/// Take `job_id`, or else the last job `ctx` knows of.
+fn job_id_or_last(ctx: &impl CommandContext, job_id: Option<JobId>) -> Result<JobId, CommandError> {
+    job_id
+        .or_else(|| ctx.last_job_id())
+        .ok_or(CommandError::MissingJobId)
+}
+
 /// Download job output.
 async fn job_output(
     ctx: &mut impl CommandContext,
@@ -2014,11 +2052,12 @@ async fn job_output(
     stream: JobOutputStream,
     args: JobOutput,
 ) -> Result<(), CommandError> {
+    let job_id = job_id_or_last(ctx, args.job_id)?;
     let target = match target {
         TargetArg::Target(target) => target.clone(),
         TargetArg::Abbreviated(sleds) => {
             if let [SledArg::Serial(serial)] = sleds.as_slice() {
-                let baseboard = resolve_serial(ctx, client, &args.job_id, serial).await?;
+                let baseboard = resolve_serial(ctx, client, &job_id, serial).await?;
                 return job_output_from(ctx, client, &baseboard, stream, args).await;
             }
             resolve_target_arg(client, target).await?
@@ -2033,12 +2072,9 @@ async fn job_output(
     }
 
     // Fetch output from every sled with a recorded status.
-    let status = job_status_map(ctx, client, &args.job_id, None).await?;
+    let status = job_status_map(ctx, client, &job_id, None).await?;
     if status.is_empty() {
-        return Err(CommandError::NotFound(format!(
-            "Job `{}` not found",
-            args.job_id
-        )));
+        return Err(CommandError::NotFound(format!("Job `{job_id}` not found")));
     }
     for baseboard in status.keys() {
         if let Err(error) = job_output_from(ctx, client, baseboard, stream, args.clone()).await {
@@ -2062,6 +2098,8 @@ async fn job_output_from(
         parallel,
     }: JobOutput,
 ) -> Result<(), CommandError> {
+    let job_id = job_id_or_last(ctx, job_id)?;
+
     // Fetch job status for output length and hash.
     let status = job_status_map(ctx, client, &job_id, Some(target)).await?;
 
@@ -2591,6 +2629,14 @@ pub enum CommandError {
     MissingClientNonce,
     #[error("Missing job command, try `--help`")]
     MissingCommand,
+    #[error("`{0}` only works in the REPL, try `sush repl`")]
+    ReplOnly(&'static str),
+    #[error("Unknown option `{0}`, try `set --help`")]
+    UnknownOption(String),
+    #[error("Option `{0}` was not set in the REPL")]
+    OptionNotSet(String),
+    #[error("Missing job ID, try passing one or setting `SUSH_JOB_ID`")]
+    MissingJobId,
     #[cfg(feature = "permslip")]
     #[error("Missing signing key name, try `--permslip-key`")]
     MissingKeyName,

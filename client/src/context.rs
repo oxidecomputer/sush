@@ -24,6 +24,7 @@ use sush_common::version::VersionInfo;
 
 use crate::AuthzSigner;
 use crate::commands::{CommandError, GlobalArgs};
+use crate::config::SuppliedOptions;
 
 /// Authorization state: the credentials that authenticated us, and the
 /// ephemeral key that binds each request we make.
@@ -116,7 +117,15 @@ pub trait CommandContext: Clone + Send + Sync {
     fn set_output_format(&mut self, output: OutputFormat);
     fn get_globals(&self) -> GlobalArgs;
     fn set_globals(&mut self, _args: GlobalArgs) {}
-    fn pre_parse_hook(&mut self, _command: &str) {}
+    fn set_options(&mut self, _options: SuppliedOptions) -> Result<(), CommandError> {
+        Err(CommandError::ReplOnly("set"))
+    }
+    fn unset_options(&mut self, _long_names: &[String]) -> Result<(), CommandError> {
+        Err(CommandError::ReplOnly("unset"))
+    }
+    fn last_job_id(&self) -> Option<JobId> {
+        None
+    }
 
     // Errors
     fn command_error(&mut self, error: &CommandError);
