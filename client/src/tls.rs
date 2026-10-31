@@ -15,6 +15,7 @@ use std::time::Duration;
 
 use attest_data::{DICE_TCB_INFO, DiceTcbInfo};
 use ed25519_dalek::{Signature, VerifyingKey};
+use reqwest::Url;
 use rustls::client::danger::{HandshakeSignatureValid, ServerCertVerified, ServerCertVerifier};
 use rustls::pki_types::{CertificateDer, ServerName, UnixTime};
 use rustls::version::TLS13;
@@ -56,11 +57,16 @@ pub enum ProxyTlsError {
 /// Placeholder host for scoped link-local URLs.
 const SCOPED_HOST: &str = "link-local.sush";
 
-/// Split a `%zone` scope out of a bracketed IPv6 host: URLs cannot
-/// carry zone IDs, so the address maps to [`SCOPED_HOST`] and the
-/// zone becomes the scope ID of the resolved socket address. A
-/// numeric zone starting with `25` needs the RFC 6874 `%25` prefix.
+/// Replace a host with a zone ID, like `[fe80::1%sw0tp0]`, with
+/// [`SCOPED_HOST`], returning the host's address scoped to that zone.
+/// Fails if the URL does not parse.
 pub fn descope_url(url: &str) -> Result<(String, Option<SocketAddrV6>), ProxyTlsError> {
+    let (descoped, resolve) = split_zone(url)?;
+    Url::parse(&descoped).map_err(|_| ProxyTlsError::Url(url.to_string()))?;
+    Ok((descoped, resolve))
+}
+
+fn split_zone(url: &str) -> Result<(String, Option<SocketAddrV6>), ProxyTlsError> {
     let (Some(open), Some(close)) = (url.find('['), url.find(']')) else {
         return Ok((url.to_string(), None));
     };
@@ -331,5 +337,7 @@ mod test {
         assert!(descope_url("https://[fe80::1%0]:1").is_err());
         assert!(descope_url("https://[fe80::1%nosuchif0]:1").is_err());
         assert!(descope_url("https://[fe80::1%3]:notaport").is_err());
+        assert!(descope_url("https://[]:12352").is_err());
+        assert!(descope_url("not a url").is_err());
     }
 }
