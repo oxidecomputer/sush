@@ -494,6 +494,18 @@ impl CommandContext for Cli {
         }
     }
 
+    fn really_supersede(&mut self, session: &Session) -> Result<(), CommandError> {
+        if read_bool(&format!(
+            "❓ Session `{}` is active.\n   \
+                Stop it and start a new session (yes/no)? ",
+            session.session_id(),
+        ))? {
+            Ok(())
+        } else {
+            Err(CommandError::Canceled)
+        }
+    }
+
     fn attach_allowed(&mut self, key_id: &KeyId, access: Access) {
         match self.get_output_format() {
             OutputFormat::Json => {
