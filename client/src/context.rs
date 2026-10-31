@@ -167,6 +167,7 @@ pub trait CommandContext: Clone + Send + Sync {
         sush_nonce: SessionSushNonce,
     );
     fn job_start_params(&self, request: &JobStartRequest);
+    fn really_supersede(&mut self, session: &Session) -> Result<(), CommandError>;
     fn session_created(
         &mut self,
         session: Session,

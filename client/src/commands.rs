@@ -504,7 +504,11 @@ pub enum SessionCommand {
     },
 
     /// Get the parameters to send to the signer server to start a session.
-    StartParams,
+    StartParams {
+        /// Supersede an active session without asking.
+        #[arg(short, long)]
+        force: bool,
+    },
 
     /// Start a new support session.
     Start {
@@ -531,6 +535,10 @@ pub enum SessionCommand {
         #[cfg(feature = "permslip")]
         #[arg(long, env = PERMSLIP_URL, value_name = "URL")]
         permslip_url: Option<String>,
+
+        /// Supersede an active session without asking.
+        #[arg(short, long)]
+        force: bool,
     },
 
     /// Stop a support session.
@@ -1074,7 +1082,9 @@ async fn session(
             Ok(())
         }
 
-        (SessionCommand::StartParams, Some(client)) => session_start_params(ctx, client).await,
+        (SessionCommand::StartParams { force }, Some(client)) => {
+            session_start_params(ctx, client, force).await
+        }
 
         #[cfg(feature = "permslip")]
         (
@@ -1085,6 +1095,7 @@ async fn session(
                 client_nonce,
                 permslip_key,
                 permslip_url,
+                force,
             },
             Some(client),
         ) => {
@@ -1107,11 +1118,12 @@ async fn session(
                     )
                 } else {
                     let Some(permslip_url) = permslip_url else {
-                        return session_start_params(ctx, client).await;
+                        return session_start_params(ctx, client, force).await;
                     };
                     let Some(permslip_key) = permslip_key else {
                         return Err(CommandError::MissingKeyName);
                     };
+                    really_supersede(ctx, client, force).await?;
                     let (baseboard_id, nonce) = with_login(ctx, client, async || {
                         Ok((
                             client.target().send().await?.into_inner(),
@@ -1167,13 +1179,14 @@ async fn session(
                 nonce,
                 seq,
                 client_nonce,
+                force,
             },
             Some(client),
         ) => {
             // A build that cannot sign is always in the relay flow: a
             // bare start means the start parameters.
             let (Some(session_id), Some(signer_nonce), Some(seq)) = (session_id, nonce, seq) else {
-                return session_start_params(ctx, client).await;
+                return session_start_params(ctx, client, force).await;
             };
             let client_nonce = client_nonce
                 .or_else(|| ctx.pending_client_nonce())
@@ -1791,13 +1804,30 @@ async fn permslip_signer<C: CommandContext>(
     Ok(PermslipSigner::connect(ctx.clone(), key_name, permslip_url, authn).await?)
 }
 
+async fn really_supersede(
+    ctx: &mut impl CommandContext,
+    client: &Client,
+    force: bool,
+) -> Result<(), CommandError> {
+    if force {
+        return Ok(());
+    }
+    match with_login(ctx, client, async || client.session().send().await).await {
+        Ok(session) => ctx.really_supersede(&session.into_inner()),
+        Err(CommandError::Session(_)) => Ok(()),
+        Err(error) => Err(error),
+    }
+}
+
 /// Fetch the ceremony inputs from the rack and print the parameters
 /// to relay to the signer, stashing the client nonce for the
 /// eventual start.
 async fn session_start_params(
     ctx: &mut impl CommandContext,
     client: &Client,
+    force: bool,
 ) -> Result<(), CommandError> {
+    really_supersede(ctx, client, force).await?;
     let (baseboard_id, nonce) = with_login(ctx, client, async || {
         Ok((
             client.target().send().await?.into_inner(),
