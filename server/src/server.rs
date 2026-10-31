@@ -104,6 +104,19 @@ impl SushApi for ApiServer {
         }
     }
 
+    async fn session_check(
+        ctx: RequestContext<Self::Context>,
+        headers: Header<Authorization>,
+        params: PathParams<SessionIdParam>,
+    ) -> Result<HttpResponseUpdatedNoContent, HttpError> {
+        let mgr = ctx.context();
+        let Authorization { authorization } = headers.into_inner();
+        let _authn = requester(authorization)?;
+        let SessionIdParam { session_id } = params.into_inner();
+        mgr.session_check(session_id)?;
+        Ok(HttpResponseUpdatedNoContent())
+    }
+
     async fn server_nonce(
         ctx: RequestContext<Self::Context>,
         headers: Header<Authorization>,

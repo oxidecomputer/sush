@@ -309,7 +309,7 @@ impl JobManager {
     /// This sled accepts a job only if the job's session is active here,
     /// or if the session's start is pending here for the job to confirm.
     /// The state machine makes the final decision; this check fails fast.
-    fn session_check(&self, session_id: SessionId) -> Result<(), JobError> {
+    pub fn session_check(&self, session_id: SessionId) -> Result<(), JobError> {
         let state = self.state.borrow();
         let rank = state.rank();
         if rank.is_some_and(|(_, active)| active == session_id)

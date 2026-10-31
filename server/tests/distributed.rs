@@ -517,6 +517,66 @@ async fn unverified_job_is_refused() {
     shutdown.cancel();
 }
 
+/// The session check passes with a session whose start is pending or
+/// with an active session. It fails with a session the sled has never
+/// seen, or with one that a later session superseded.
+#[named]
+#[tokio::test]
+async fn session_check_passes_with_pending_start() {
+    let (_tmp, dir) = pki("sush-session-check-", 1);
+    let mut root = common::ephemeral_root();
+    let root_pem = dir.join("job-root.pem");
+    write(
+        &root_pem,
+        pem_cert_chain(vec![root.cert().to_owned()]).unwrap(),
+    )
+    .unwrap();
+
+    let log = test_logger(function_name!());
+    let shutdown = CancellationToken::new();
+    let a = Sled::start(&log, &dir, 1, &root_pem, &shutdown).await;
+    let authn = requester(&root);
+    let Ceremony {
+        session_id,
+        client_nonce,
+        signer_nonce,
+        seq,
+    } = ceremony(&a.mgr, 1);
+    assert!(matches!(
+        a.mgr.session_check(session_id),
+        Err(JobError::NoSession)
+    ));
+
+    a.mgr
+        .session_start(&authn, session_id, client_nonce, signer_nonce, seq)
+        .await
+        .unwrap();
+    assert!(a.mgr.session(&authn).is_none());
+    a.mgr.session_check(session_id).unwrap();
+
+    let mut session = Session::new(session_id);
+    confirm_start(&a, &authn, &mut root, &mut session).await;
+    a.mgr.session_check(session_id).unwrap();
+
+    let Ceremony {
+        session_id: successor,
+        client_nonce,
+        signer_nonce,
+        seq,
+    } = ceremony(&a.mgr, 2);
+    a.mgr
+        .session_start(&authn, successor, client_nonce, signer_nonce, seq)
+        .await
+        .unwrap();
+    confirm_start(&a, &authn, &mut root, &mut Session::new(successor)).await;
+    assert!(matches!(
+        a.mgr.session_check(session_id),
+        Err(JobError::SessionNotCurrent(_))
+    ));
+
+    shutdown.cancel();
+}
+
 /// A forged start neither displaces the active session nor blocks
 /// the next genuine one. The sled refuses the jobs of a pending start
 /// the active session outranks, and any verified job confirms a
