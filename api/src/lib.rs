@@ -75,6 +75,16 @@ pub trait SushApi {
         headers: Header<Authorization>,
     ) -> Result<HttpResponseOk<Session>, HttpError>;
 
+    /// Check that this server would accept a job in a session.
+    ///
+    /// Succeeds if the session is active or its start is pending.
+    #[endpoint { method = GET, path = "/sessions/{session_id}/check" }]
+    async fn session_check(
+        ctx: RequestContext<Self::Context>,
+        headers: Header<Authorization>,
+        params: PathParams<SessionIdParam>,
+    ) -> Result<HttpResponseUpdatedNoContent, HttpError>;
+
     /// Get a fresh server nonce for the session ceremony.
     ///
     /// The client mixes its own nonce with this one to form the sush

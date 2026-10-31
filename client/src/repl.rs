@@ -312,6 +312,10 @@ impl CommandContext for Repl {
         self.cli.session_stopped(session_id)
     }
 
+    fn really_supersede(&mut self, session: &Session) -> Result<(), CommandError> {
+        self.cli.really_supersede(session)
+    }
+
     fn attach_allowed(&mut self, key_id: &KeyId, access: Access) {
         self.cli.attach_allowed(key_id, access)
     }

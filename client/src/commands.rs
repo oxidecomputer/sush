@@ -504,7 +504,11 @@ pub enum SessionCommand {
     },
 
     /// Get the parameters to send to the signer server to start a session.
-    StartParams,
+    StartParams {
+        /// Supersede an active session without asking.
+        #[arg(short, long)]
+        force: bool,
+    },
 
     /// Start a new support session.
     Start {
@@ -531,6 +535,10 @@ pub enum SessionCommand {
         #[cfg(feature = "permslip")]
         #[arg(long, env = PERMSLIP_URL, value_name = "URL")]
         permslip_url: Option<String>,
+
+        /// Supersede an active session without asking.
+        #[arg(short, long)]
+        force: bool,
     },
 
     /// Stop a support session.
@@ -1074,7 +1082,9 @@ async fn session(
             Ok(())
         }
 
-        (SessionCommand::StartParams, Some(client)) => session_start_params(ctx, client).await,
+        (SessionCommand::StartParams { force }, Some(client)) => {
+            session_start_params(ctx, client, force).await
+        }
 
         #[cfg(feature = "permslip")]
         (
@@ -1085,6 +1095,7 @@ async fn session(
                 client_nonce,
                 permslip_key,
                 permslip_url,
+                force,
             },
             Some(client),
         ) => {
@@ -1107,11 +1118,12 @@ async fn session(
                     )
                 } else {
                     let Some(permslip_url) = permslip_url else {
-                        return session_start_params(ctx, client).await;
+                        return session_start_params(ctx, client, force).await;
                     };
                     let Some(permslip_key) = permslip_key else {
                         return Err(CommandError::MissingKeyName);
                     };
+                    really_supersede(ctx, client, force).await?;
                     let (baseboard_id, nonce) = with_login(ctx, client, async || {
                         Ok((
                             client.target().send().await?.into_inner(),
@@ -1167,13 +1179,14 @@ async fn session(
                 nonce,
                 seq,
                 client_nonce,
+                force,
             },
             Some(client),
         ) => {
             // A build that cannot sign is always in the relay flow: a
             // bare start means the start parameters.
             let (Some(session_id), Some(signer_nonce), Some(seq)) = (session_id, nonce, seq) else {
-                return session_start_params(ctx, client).await;
+                return session_start_params(ctx, client, force).await;
             };
             let client_nonce = client_nonce
                 .or_else(|| ctx.pending_client_nonce())
@@ -1791,13 +1804,30 @@ async fn permslip_signer<C: CommandContext>(
     Ok(PermslipSigner::connect(ctx.clone(), key_name, permslip_url, authn).await?)
 }
 
+async fn really_supersede(
+    ctx: &mut impl CommandContext,
+    client: &Client,
+    force: bool,
+) -> Result<(), CommandError> {
+    if force {
+        return Ok(());
+    }
+    match with_login(ctx, client, async || client.session().send().await).await {
+        Ok(session) => ctx.really_supersede(&session.into_inner()),
+        Err(CommandError::Session(_)) => Ok(()),
+        Err(error) => Err(error),
+    }
+}
+
 /// Fetch the ceremony inputs from the rack and print the parameters
 /// to relay to the signer, stashing the client nonce for the
 /// eventual start.
 async fn session_start_params(
     ctx: &mut impl CommandContext,
     client: &Client,
+    force: bool,
 ) -> Result<(), CommandError> {
+    really_supersede(ctx, client, force).await?;
     let (baseboard_id, nonce) = with_login(ctx, client, async || {
         Ok((
             client.target().send().await?.into_inner(),
@@ -1812,9 +1842,9 @@ async fn session_start_params(
     Ok(())
 }
 
-/// Assemble the request a job start submits for signing: the
-/// session's next job id, the resolved target, and the mode the
-/// flags name.
+/// Perform preflight checks and assemble the job request,
+/// ready for signing. Unless the session changes first,
+/// the rack should accept the job once it's signed.
 async fn job_start_request(
     ctx: &mut impl CommandContext,
     client: Option<&Client>,
@@ -1823,11 +1853,30 @@ async fn job_start_request(
     let Some(command) = &start_args.command else {
         return Err(CommandError::MissingCommand);
     };
+    let mode = if start_args.interactive {
+        JobMode::Interactive
+    } else if start_args.streaming {
+        let Some(path) = &start_args.file else {
+            return Err(CommandError::StreamingNeedsFile);
+        };
+        if !start_args.force && path.exists() {
+            return Err(CommandError::io(path, ErrorKind::AlreadyExists.into()));
+        }
+        JobMode::StreamOutput
+    } else {
+        JobMode::Batch
+    };
+
     let Some(session_id) = ctx.session_id() else {
         return Err(CommandError::MissingSession);
     };
-    let job_id = ctx.next_job_id()?;
-    let (interactive, streaming) = (start_args.interactive, start_args.streaming);
+    if let Some(client) = client {
+        with_login(ctx, client, async || {
+            client.session_check().session_id(session_id).send().await
+        })
+        .await?;
+    }
+
     let target = match &start_args.target {
         TargetArg::Target(target) => target.clone(),
         abbreviated => {
@@ -1837,37 +1886,24 @@ async fn job_start_request(
             resolve_target_arg(client, abbreviated).await?
         }
     };
-    // An interactive or streaming job binds to the single sled its
-    // attachment will land on.
-    let target = if (interactive || streaming) && target.single_baseboard().is_none() {
-        let Some(client) = client else {
-            return Err(CommandError::InteractiveTarget);
+    let target =
+        if (mode.is_interactive() || mode.is_streaming()) && target.single_baseboard().is_none() {
+            let Some(client) = client else {
+                return Err(CommandError::InteractiveTarget);
+            };
+            Target::from(resolve_target(client, &target).await?)
+        } else if let Some(client) = client {
+            preflight_target(ctx, client, target).await?
+        } else {
+            target
         };
-        Target::from(resolve_target(client, &target).await?)
-    } else {
-        target
-    };
-    // Catch output file problems before anything is signed.
-    if streaming {
-        let Some(path) = &start_args.file else {
-            return Err(CommandError::StreamingNeedsFile);
-        };
-        if !start_args.force && path.exists() {
-            return Err(CommandError::io(path, ErrorKind::AlreadyExists.into()));
-        }
-    }
-    if let Some(client) = client {
-        preflight_target(ctx, client, &target).await?;
-    }
-    let mode = if interactive {
-        JobMode::Interactive
-    } else if streaming {
-        JobMode::StreamOutput
-    } else {
-        JobMode::Batch
-    };
+
     Ok(JobStartRequest::new(
-        job_id, session_id, command, mode, target,
+        ctx.next_job_id()?,
+        session_id,
+        command,
+        mode,
+        target,
     ))
 }
 
@@ -2526,13 +2562,13 @@ impl FromStr for TargetArg {
 async fn preflight_target(
     ctx: &mut impl CommandContext,
     client: &Client,
-    target: &Target,
-) -> Result<(), CommandError> {
-    let Target::Sleds(sleds) = target else {
-        return Ok(());
+    target: Target,
+) -> Result<Target, CommandError> {
+    let Target::Sleds(sleds) = &target else {
+        return Ok(target);
     };
     let Ok(inventory) = client.versions().send().await else {
-        return Ok(());
+        return Ok(target);
     };
     let inventory = inventory.into_inner();
     for sled in sleds {
@@ -2544,7 +2580,7 @@ async fn preflight_target(
             ctx.really_target(sled)?;
         }
     }
-    Ok(())
+    Ok(target)
 }
 
 /// Resolve a target argument to a target, matching bare serial
