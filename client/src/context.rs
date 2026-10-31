@@ -23,7 +23,8 @@ use sush_common::targets::{SledId, SledVersion};
 use sush_common::version::VersionInfo;
 
 use crate::AuthzSigner;
-use crate::commands::{CommandError, GlobalArgs};
+use crate::commands::{ClientHandle, CommandError, GlobalArgs};
+use crate::config::SuppliedOptions;
 
 /// Authorization state: the credentials that authenticated us, and the
 /// ephemeral key that binds each request we make.
@@ -61,7 +62,7 @@ impl Authz {
 /// What kind of output to emit on standard output. Standard input
 /// and standard error may be used with all formats for interactive
 /// communication with a human user (if there is one).
-#[derive(Clone, Copy, Debug, Default, ValueEnum)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, ValueEnum)]
 pub enum OutputFormat {
     /// UTF-8 encoded text
     #[default]
@@ -116,7 +117,15 @@ pub trait CommandContext: Clone + Send + Sync {
     fn set_output_format(&mut self, output: OutputFormat);
     fn get_globals(&self) -> GlobalArgs;
     fn set_globals(&mut self, _args: GlobalArgs) {}
-    fn pre_parse_hook(&mut self, _command: &str) {}
+    fn set_options(&mut self, _options: SuppliedOptions) -> Result<(), CommandError> {
+        Err(CommandError::ReplOnly("set"))
+    }
+    fn unset_options(&mut self, _long_names: &[String]) -> Result<(), CommandError> {
+        Err(CommandError::ReplOnly("unset"))
+    }
+    fn last_job_id(&self) -> Option<JobId> {
+        None
+    }
 
     // Errors
     fn command_error(&mut self, error: &CommandError);
@@ -131,6 +140,14 @@ pub trait CommandContext: Clone + Send + Sync {
 
     // Session management
     fn authz_signer(&self) -> AuthzSigner;
+    #[expect(async_fn_in_trait, reason = "commands run as non-`Send` futures")]
+    async fn client_handle(
+        &mut self,
+        args: &GlobalArgs,
+    ) -> Result<Option<Arc<ClientHandle>>, CommandError> {
+        let handle = ClientHandle::from_args(args, self.authz_signer()).await?;
+        Ok(handle.map(Arc::new))
+    }
     fn get_credentials(&self) -> Option<Authz> {
         self.authz_signer().get()
     }

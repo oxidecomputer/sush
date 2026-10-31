@@ -53,6 +53,7 @@ rlimit = "0.10"
 rumors = { git = "https://github.com/oxidecomputer/rumors", rev = "bf2ba264e2360eab1ba5f06148ea3ef3050825c8" }
 rustix = { version = "1", features = ["fs", "process", "pty", "termios"] }
 rustls = "0.23"
+rusty-fork = "0.3"
 rustyline = { git = "https://github.com/kkawakam/rustyline", rev = "5ab22f2f8d65e85f0b925360437ece8eeeb6db92", features = ["signal-hook", "termios"] }
 schemars = { version = "0.8", features = ["chrono"] }
 serde = "1"
@@ -76,6 +77,7 @@ tokio-stream = "0.1"
 tokio-fd = "0.3"
 tokio-tungstenite = "0.28"
 tokio-util = "0.7"
+toml = "1"
 webbrowser = "1"
 x509-cert = { version = "0.2", features = ["pem", "std"] }
 xdg = "3"
