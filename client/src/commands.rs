@@ -739,17 +739,26 @@ impl ClientCommandProperties for ClientCommand {
     }
 }
 
+/// Await `future`, or fail with [`CommandError::Canceled`] on ^C.
+async fn cancelable<T, E>(future: impl Future<Output = Result<T, E>>) -> Result<T, CommandError>
+where
+    CommandError: From<E>,
+{
+    select! {
+        result = future => Ok(result?),
+        _ = ctrl_c() => Err(CommandError::Canceled),
+    }
+}
+
 impl ClientCommand {
     /// Run the command, letting an interrupt cancel it unless the
     /// command handles SIGINT itself.
     #[async_recursion(?Send)]
     pub async fn execute(self, ctx: &mut impl CommandContext) -> Result<(), CommandError> {
         if self.handles_sigint() {
-            return self.run(ctx).await;
-        }
-        select! {
-            result = self.run(ctx) => result,
-            _ = ctrl_c() => Err(CommandError::Canceled),
+            self.run(ctx).await
+        } else {
+            cancelable(self.run(ctx)).await
         }
     }
 
@@ -894,10 +903,7 @@ async fn authenticate<E>(
     let key = RequestKey::new();
     let response = ChallengeResponse::new(challenge, key.verifier());
     ctx.please_touch(&public_key)?;
-    let signed = select! {
-        s = ssh_agent.sign(response) => s?,
-        _ = ctrl_c() => return Err(CommandError::Canceled),
-    };
+    let signed = cancelable(ssh_agent.sign(response)).await?;
     let verified = signed.verify_with_ssh_public_key(&public_key)?;
     let credentials = Credentials::new(verified);
     let request = client
@@ -1302,7 +1308,7 @@ async fn job(
             },
             client,
         ) => {
-            let request = job_start_request(ctx, client.as_ref(), start_args).await?;
+            let request = cancelable(job_start_request(ctx, client.as_ref(), start_args)).await?;
             ctx.job_start_params(&request);
             Ok(())
         }
@@ -1319,7 +1325,7 @@ async fn job(
             },
             client,
         ) => {
-            let request = job_start_request(ctx, client.as_ref(), start_args).await?;
+            let request = cancelable(job_start_request(ctx, client.as_ref(), start_args)).await?;
             ctx.job_start_params(&request);
             Ok(())
         }
@@ -1348,9 +1354,9 @@ async fn job(
             },
             client,
         ) => {
-            let request = job_start_request(ctx, client.as_ref(), start_args).await?;
+            let request = cancelable(job_start_request(ctx, client.as_ref(), start_args)).await?;
             let job_id = request.job_id;
-            let mut signer = permslip_signer(ctx, key_name, permslip_url).await?;
+            let mut signer = cancelable(permslip_signer(ctx, key_name, permslip_url)).await?;
             let mut interval = interval(SIGNING_UPDATE_INTERVAL);
             interval.set_missed_tick_behavior(MissedTickBehavior::Skip);
             let sign = signer.sign_job_request(request);
@@ -1505,7 +1511,7 @@ async fn job_start(
 ) -> Result<(), CommandError> {
     // Resolve the signed request's target to one sled to watch and
     // fetch output from.
-    let target = resolve_target(client, job.payload().target()).await?;
+    let target = cancelable(resolve_target(client, job.payload().target())).await?;
 
     // Set up the job request and parameters.
     let job_id = job.job_id().to_owned();
@@ -1555,7 +1561,7 @@ async fn job_start(
 
     // Start the job.
     if interactive {
-        let sleds = start.await?.into_inner().sleds;
+        let sleds = cancelable(start).await?.into_inner().sleds;
         ctx.job_started(&job, Some(&sleds), StartedDisplay::Note);
         match job_attach(ctx, client, &job_id, &target).await {
             Ok(()) => (),
@@ -1592,7 +1598,7 @@ async fn job_start(
         let file = options
             .open(&path)
             .map_err(|error| CommandError::io(&path, error))?;
-        let sleds = start.await?.into_inner().sleds;
+        let sleds = cancelable(start).await?.into_inner().sleds;
         ctx.job_started(&job, Some(&sleds), StartedDisplay::Note);
         let hasher = job_stream(ctx, client, &job_id, &target, &path, file).await?;
         let status = job_watch(ctx, client, &job_id, Some(sleds)).await?;
@@ -1768,7 +1774,7 @@ async fn job_start(
             }
         }
     } else {
-        let sleds = start.await?.into_inner().sleds;
+        let sleds = cancelable(start).await?.into_inner().sleds;
         ctx.job_started(&job, Some(&sleds), StartedDisplay::Full);
     }
     Ok(())
