@@ -396,7 +396,7 @@ impl State {
     fn skip_queued_jobs(&self, now: DateTime<Utc>) -> Vec<Output> {
         let mut outputs = Vec::new();
         for (job_id, queued) in self.session.queued_jobs().into_iter().flatten() {
-            if !queued.replayed && self.rack.runs_here(&queued.job, &queued.sleds) {
+            if !queued.replayed && queued.sleds.contains(self.rack.own_baseboard()) {
                 outputs.push(Output::job_event(
                     self.rack.own_baseboard(),
                     JobEvent::Skipped(*job_id, now, SkipReason::SessionEnded),
@@ -836,7 +836,9 @@ impl State {
                         "session_id" => %session_id,
                         "actor" => %actor,
                     );
-                    if live && self.rack.runs_here(signed, sleds) && !self.history.contains(&job_id)
+                    if live
+                        && sleds.contains(self.rack.own_baseboard())
+                        && !self.history.contains(&job_id)
                     {
                         outputs.push(Output::job_event(
                             self.rack.own_baseboard(),
@@ -1032,7 +1034,7 @@ impl State {
         };
         let job_id = *queued.job.job_id();
         let replayed = queued.replayed;
-        let targeted = self.rack.runs_here(&queued.job, &queued.sleds);
+        let targeted = queued.sleds.contains(self.rack.own_baseboard());
 
         // Adjudication can give the boundary job a status before its
         // request replays. The queue releases jobs in order, so
@@ -1075,7 +1077,7 @@ impl State {
             return;
         };
         let cancel_here = match queued_jobs.remove(job_id) {
-            Some(queued) => self.rack.runs_here(&queued.job, &queued.sleds),
+            Some(queued) => queued.sleds.contains(self.rack.own_baseboard()),
             None => !self.history.contains(job_id),
         };
         if !replayed && cancel_here {
@@ -1147,10 +1149,18 @@ impl State {
                 replayed,
             } = queued_jobs.remove(&next_id).expect("checked above");
             let job_id = request.payload().job_id().to_owned();
-            if self.rack.runs_here(&request, &sleds) {
-                if matches!(admission, Admission::Refuse) {
+            if sleds.contains(self.rack.own_baseboard()) {
+                if let Some(reason) = self.rack.check_target(request.payload()) {
                     if !replayed {
-                        warn!(log, "skipping a superseded session's job"; "job_id" => %job_id);
+                        warn!(log, "refusing to execute job"; "job_id" => %job_id, "reason" => %reason);
+                        outputs.push(Output::job_event(
+                            self.rack.own_baseboard(),
+                            JobEvent::Skipped(job_id, now, reason),
+                        ));
+                    }
+                } else if matches!(admission, Admission::Refuse) {
+                    if !replayed {
+                        warn!(log, "skipping job from superseded session"; "job_id" => %job_id);
                         outputs.push(Output::job_event(
                             self.rack.own_baseboard(),
                             JobEvent::Skipped(job_id, now, SkipReason::SessionSuperseded),

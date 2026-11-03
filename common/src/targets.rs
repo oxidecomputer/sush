@@ -7,8 +7,8 @@
 //! One grammar serves signed job requests, the client, and the proxy:
 //! `*` means every sled in the rack, and a comma-separated list names
 //! sleds by baseboard ID or cubby number. The sled that accepts a job
-//! resolves its target once, to the baseboards it can reach, and every
-//! sled runs the job against that resolution.
+//! resolves its target once, to the baseboards it can reach. Sleds that
+//! receive the job only run it if the signed target includes them.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
@@ -104,22 +104,14 @@ impl Target {
         }
     }
 
-    /// Whether every sled in `sleds` is one this target names. Each cubby
-    /// matches any one sled.
-    pub fn matches(&self, sleds: &BTreeSet<BaseboardId>) -> bool {
+    /// Whether this target includes `baseboard` or `cubby`.
+    pub fn matches(&self, baseboard: &BaseboardId, cubby: Option<u8>) -> bool {
         match self {
             Self::All => true,
-            Self::Sleds(named) => {
-                let mut baseboards = BTreeSet::new();
-                let mut cubbies = BTreeSet::new();
-                for sled in named {
-                    match sled {
-                        SledId::Baseboard(baseboard) => baseboards.insert(baseboard.clone()),
-                        SledId::Cubby(cubby) => cubbies.insert(*cubby),
-                    };
-                }
-                sleds.difference(&baseboards).count() <= cubbies.len()
-            }
+            Self::Sleds(sleds) => sleds.iter().any(|sled| match sled {
+                SledId::Baseboard(listed) => listed == baseboard,
+                SledId::Cubby(listed) => Some(*listed) == cubby,
+            }),
         }
     }
 
@@ -311,21 +303,15 @@ mod test {
     #[test]
     fn targets_match() {
         let brm31 = baseboard("913-0000019:BRM42220031");
-        let brm40 = baseboard("913-0000019:BRM42220040");
-        let both = BTreeSet::from([brm31.clone(), brm40.clone()]);
-        let matches = |target: &str, sleds: &BTreeSet<BaseboardId>| {
-            target.parse::<Target>().unwrap().matches(sleds)
-        };
+        let matches =
+            |target: &str, cubby| target.parse::<Target>().unwrap().matches(&brm31, cubby);
 
-        assert!(matches("*", &both));
-        assert!(matches(
-            "913-0000019:BRM42220031",
-            &BTreeSet::from([brm31.clone()])
-        ));
-        assert!(matches("913-0000019:BRM42220031", &BTreeSet::new()));
-        assert!(!matches("913-0000019:BRM42220031", &both));
-        assert!(matches("14", &BTreeSet::from([brm40.clone()])));
-        assert!(!matches("14", &both));
-        assert!(matches("913-0000019:BRM42220031,14", &both));
+        assert!(matches("*", None));
+        assert!(matches("913-0000019:BRM42220031", None));
+        assert!(!matches("913-0000019:BRM42220040", Some(14)));
+        assert!(matches("913-0000019:BRM42220040,14", Some(14)));
+        assert!(matches("14", Some(14)));
+        assert!(!matches("14", Some(15)));
+        assert!(!matches("14", None));
     }
 }

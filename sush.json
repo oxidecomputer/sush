@@ -1674,7 +1674,9 @@
         "type": "string",
         "enum": [
           "session-superseded",
-          "session-ended"
+          "session-ended",
+          "not-targeted",
+          "cubby-unknown"
         ]
       },
       "SledHealth": {

@@ -420,28 +420,24 @@ impl JobManager {
         job: SignedJob,
         params: JobStartParams,
     ) -> Result<BTreeSet<BaseboardId>, JobError> {
-        // A forged job must not take a signed job's place in the chain.
+        // Check the job signature.
         self.state
             .borrow()
             .certs()
             .verify(&job)
             .map_err(JobError::UnverifiedJob)?;
-        self.session_check(job.payload().session_id())?;
 
-        // A broader target would orphan jobs on unattached sleds.
-        let payload = job.payload();
-        if payload.is_interactive() && payload.target().single_baseboard().is_none() {
-            return Err(JobError::InteractiveTarget);
-        }
-
-        // Reject job IDs we already know about, rather than silently
-        // queuing a resubmission that can never advance the session's
-        // job chain. Without this, a caller that resubmits an
-        // already-completed job ID and waits would see the *original*
-        // job's status returned as if it belonged to this submission.
+        // Reject jobs we already know about.
         let job_id = job.job_id().to_owned();
         if self.state.borrow().get_job_status(&job_id).is_some() {
             return Err(JobError::DuplicateJobId(job_id));
+        }
+
+        // Check the session and target.
+        let payload = job.payload();
+        self.session_check(payload.session_id())?;
+        if !payload.target_matches_mode() {
+            return Err(JobError::InteractiveTarget);
         }
 
         // Submit the job for execution.

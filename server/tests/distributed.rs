@@ -298,12 +298,12 @@ async fn first_job_confirms_start_on_another_sled() {
     shutdown.cancel();
 }
 
-/// A job that names a cubby runs on the sled in that cubby even while
-/// that sled's own cubby map is empty, because the sled that accepts
-/// the job resolves the cubby.
+/// The sled that accepts a cubby-targeted job resolves the cubby, but
+/// the listed sled runs the job only if it knows its own cubby and the
+/// signed target names it. Otherwise the listed sled skips the job.
 #[named]
 #[tokio::test]
-async fn cubby_resolves_on_accepting_sled() {
+async fn listed_sled_checks_own_cubby() {
     let (_tmp, dir) = pki("sush-distributed-", 2);
     let mut root = common::ephemeral_root();
     let root_pem = dir.join("job-root.pem");
@@ -325,11 +325,6 @@ async fn cubby_resolves_on_accepting_sled() {
     .await;
     sees(&a, &b).await;
 
-    // Only A knows that B is in cubby 14.
-    a.cubbies
-        .send(Cubbies::from([(14, b.baseboard.clone())]))
-        .unwrap();
-
     let authn = requester(&root);
     let Ceremony {
         session_id,
@@ -341,38 +336,69 @@ async fn cubby_resolves_on_accepting_sled() {
         .session_start(&authn, session_id, client_nonce, signer_nonce, seq)
         .await
         .unwrap();
-    let job_id = Session::new(session_id).next_job_id();
-    let job = root
-        .sign(JobStartRequest::new(
-            job_id,
-            session_id,
-            "true",
-            JobMode::Batch,
-            "14".parse().unwrap(),
-        ))
-        .await
-        .unwrap();
+    let mut session = Session::new(session_id);
 
+    // Start a job naming `cubby` on A, and return B's status for it.
     // A's map update lands whenever its state task gets to it, so
     // retry the job until A accepts it.
-    let wait = JobStartParams {
-        wait: JobWait::Stop,
-        ..Default::default()
+    let mut run = async |cubby: u8| {
+        let job = root
+            .sign(JobStartRequest::new(
+                session.next_job_id(),
+                session_id,
+                "true",
+                JobMode::Batch,
+                cubby.to_string().parse().unwrap(),
+            ))
+            .await
+            .unwrap();
+        let wait = JobStartParams {
+            wait: JobWait::Stop,
+            ..Default::default()
+        };
+        let sleds = loop {
+            match a.mgr.job_start(&authn, job.clone(), wait.clone()).await {
+                Ok(sleds) => break sleds,
+                Err(JobError::UnknownCubby(_)) => sleep(Duration::from_millis(50)).await,
+                Err(error) => panic!("job start failed: {error}"),
+            }
+        };
+        assert_eq!(sleds, BTreeSet::from([b.baseboard.clone()]));
+        let mut status = a.mgr.job_status(&authn, job.job_id()).await.unwrap();
+        assert!(!status.contains_key(&a.baseboard));
+        session.job_started(job);
+        status.remove(&b.baseboard).unwrap()
     };
-    let sleds = loop {
-        match a.mgr.job_start(&authn, job.clone(), wait.clone()).await {
-            Ok(sleds) => break sleds,
-            Err(JobError::UnknownCubby(14)) => sleep(Duration::from_millis(50)).await,
-            Err(error) => panic!("job start failed: {error}"),
-        }
+    let skipped = |status: &JobStatus| match status {
+        JobStatus::Skipped { reason, .. } => Some(*reason),
+        _ => None,
     };
-    assert_eq!(sleds, BTreeSet::from([b.baseboard.clone()]));
-    let status = a.mgr.job_status(&authn, &job_id).await.unwrap();
-    assert!(matches!(
-        status.get(&b.baseboard),
-        Some(JobStatus::Stopped { .. })
-    ));
-    assert!(!status.contains_key(&a.baseboard));
+
+    // Only A knows that B is in cubby 14, so B cannot tell whether the
+    // job names it.
+    a.cubbies
+        .send(Cubbies::from([(14, b.baseboard.clone())]))
+        .unwrap();
+    assert_eq!(skipped(&run(14).await), Some(SkipReason::CubbyUnknown));
+
+    // B knows it is in cubby 15, so A's map is wrong.
+    b.cubbies
+        .send(Cubbies::from([(15, b.baseboard.clone())]))
+        .unwrap();
+    eventually("B learns its cubby", 60, async || {
+        b.mgr
+            .versions()
+            .iter()
+            .any(|row| row.baseboard == b.baseboard && row.cubby == Some(15))
+    })
+    .await;
+    assert_eq!(skipped(&run(14).await), Some(SkipReason::NotTargeted));
+
+    // With A's map corrected, the job names B and runs there.
+    a.cubbies
+        .send(Cubbies::from([(15, b.baseboard.clone())]))
+        .unwrap();
+    assert!(matches!(run(15).await, JobStatus::Stopped { .. }));
 
     shutdown.cancel();
 }

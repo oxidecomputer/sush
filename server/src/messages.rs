@@ -331,6 +331,8 @@ mod wire_format {
                 Event::Job(JobEvent::Skipped(_, _, reason)) => match reason {
                     SkipReason::SessionSuperseded => "job-skipped-event",
                     SkipReason::SessionEnded => "session-ended-skip-event",
+                    SkipReason::NotTargeted => "not-targeted-skip-event",
+                    SkipReason::CubbyUnknown => "cubby-unknown-skip-event",
                 },
             },
         }
@@ -477,11 +479,27 @@ mod wire_format {
                 )),
             ),
             Message::Event(
-                baseboard,
+                baseboard.clone(),
                 Event::Job(JobEvent::Skipped(
                     skip_job,
                     skip_when,
                     SkipReason::SessionEnded,
+                )),
+            ),
+            Message::Event(
+                baseboard.clone(),
+                Event::Job(JobEvent::Skipped(
+                    skip_job,
+                    skip_when,
+                    SkipReason::NotTargeted,
+                )),
+            ),
+            Message::Event(
+                baseboard,
+                Event::Job(JobEvent::Skipped(
+                    skip_job,
+                    skip_when,
+                    SkipReason::CubbyUnknown,
                 )),
             ),
         ]

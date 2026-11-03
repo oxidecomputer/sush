@@ -4,7 +4,7 @@
 
 //! Signed job requests.
 
-use std::collections::{BTreeMap, BTreeSet, HashMap};
+use std::collections::{BTreeMap, HashMap};
 use std::fmt;
 use std::io::Error as IoError;
 use std::ops::Deref;
@@ -421,15 +421,6 @@ impl JobStartRequest {
         }
     }
 
-    /// Whether this job runs on `baseboard`. The signed target must match
-    /// `sleds`, so the sled that accepted the job cannot widen it.
-    /// Interactive jobs run only on their single named baseboard.
-    pub fn runs_on(&self, baseboard: &BaseboardId, sleds: &BTreeSet<BaseboardId>) -> bool {
-        sleds.contains(baseboard)
-            && self.target.matches(sleds)
-            && (!self.mode.is_interactive() || self.target.single_baseboard() == Some(baseboard))
-    }
-
     pub fn job_id(&self) -> &JobId {
         &self.job_id
     }
@@ -448,6 +439,10 @@ impl JobStartRequest {
 
     pub fn target(&self) -> &Target {
         &self.target
+    }
+
+    pub fn target_matches_mode(&self) -> bool {
+        self.target.is_single() || !self.is_interactive()
     }
 }
 
@@ -524,6 +519,8 @@ pub enum JobStatus {
 pub enum SkipReason {
     SessionSuperseded,
     SessionEnded,
+    NotTargeted,
+    CubbyUnknown,
 }
 
 impl fmt::Display for SkipReason {
@@ -531,6 +528,8 @@ impl fmt::Display for SkipReason {
         f.write_str(match self {
             Self::SessionSuperseded => "another session has superseded this one",
             Self::SessionEnded => "the session ended before the job could start",
+            Self::NotTargeted => "the job does not target this sled",
+            Self::CubbyUnknown => "this sled does not know its cubby yet",
         })
     }
 }
@@ -833,7 +832,6 @@ impl FromStr for JobOutputStream {
 mod test {
     use super::*;
     use crate::keys::{EccR, EccS, EncodedSignature};
-    use crate::targets::SledId;
 
     /// A sequence number encodes to four words, parses back liberally,
     /// and orders numerically.
@@ -999,52 +997,6 @@ mod test {
         let next = server.next_job_id();
         assert!(!server.skip_job(job_id));
         assert_eq!(server.next_job_id(), next);
-    }
-
-    /// Interactive jobs run only on their single named baseboard.
-    #[test]
-    fn interactive_targets() {
-        let sled = |serial: &str| BaseboardId {
-            part_number: "913".to_string(),
-            serial_number: serial.to_string(),
-        };
-        let me = sled("me");
-        let sleds = BTreeSet::from([me.clone()]);
-        let job = |mode, target| {
-            JobStartRequest::new(JobId::random(), SessionId::random(), "true", mode, target)
-        };
-        use JobMode::*;
-        let just_me = Target::Sleds(vec![SledId::Baseboard(me.clone())]);
-        assert!(job(Interactive, just_me.clone()).runs_on(&me, &sleds));
-        assert!(job(Batch, just_me).runs_on(&me, &sleds));
-        assert!(!job(Interactive, Target::All).runs_on(&me, &sleds));
-        assert!(job(Batch, Target::All).runs_on(&me, &sleds));
-        let my_cubby = Target::Sleds(vec![SledId::Cubby(14)]);
-        assert!(!job(Interactive, my_cubby.clone()).runs_on(&me, &sleds));
-        assert!(job(Batch, my_cubby).runs_on(&me, &sleds));
-    }
-
-    /// A job runs only on the sleds its target resolved to, and only
-    /// if the signed target matches them.
-    #[test]
-    fn resolved_targets() {
-        let sled = |serial: &str| BaseboardId {
-            part_number: "913".to_string(),
-            serial_number: serial.to_string(),
-        };
-        let (me, you) = (sled("me"), sled("you"));
-        let job = |target| {
-            JobStartRequest::new(
-                JobId::random(),
-                SessionId::random(),
-                "true",
-                JobMode::Batch,
-                target,
-            )
-        };
-        assert!(!job(Target::All).runs_on(&me, &BTreeSet::from([you.clone()])));
-        let just_you = Target::from(you.clone());
-        assert!(!job(just_you).runs_on(&me, &BTreeSet::from([me.clone(), you])));
     }
 
     /// Requested limits may narrow the default ceiling, never widen it.
