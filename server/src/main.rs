@@ -31,7 +31,10 @@ use sush_server::{read_certs, seed_gossip};
 const DEFAULT_ADDRESS: &str = "0.0.0.0:44444";
 const ROOT_LOG_NAME: &str = "sush";
 const REQUEST_MAX_BODY_BYTES: usize = 0xFFFF;
-const TRUST_ANCHORS: &[&[u8]] = &[include_bytes!("../certs/sandbox.pem")];
+const TRUST_ANCHORS: &[&[u8]] = &[
+    include_bytes!("../certs/support-shell-production-a1.pem"),
+    include_bytes!("../certs/support-shell-lab-a1.pem"),
+];
 
 #[derive(Parser)]
 #[clap(name = "Oxide Support Shell Server")]
