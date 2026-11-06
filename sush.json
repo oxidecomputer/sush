@@ -439,8 +439,15 @@
           "required": true
         },
         "responses": {
-          "204": {
-            "description": "resource updated"
+          "200": {
+            "description": "successful operation",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/JobStarted"
+                }
+              }
+            }
           },
           "4XX": {
             "$ref": "#/components/responses/Error"
@@ -679,6 +686,42 @@
         }
       }
     },
+    "/sessions/{session_id}/check": {
+      "get": {
+        "summary": "Check that this server would accept a job in a session.",
+        "description": "Succeeds if the session is active or its start is pending.",
+        "operationId": "session_check",
+        "parameters": [
+          {
+            "in": "header",
+            "name": "authorization",
+            "description": "Authorization to access some resource, such as a signature.\n\nSee: <https://developer.mozilla.org/en-US/docs/Web/HTTP/Reference/Headers/Authorization>",
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "in": "path",
+            "name": "session_id",
+            "required": true,
+            "schema": {
+              "$ref": "#/components/schemas/SessionId"
+            }
+          }
+        ],
+        "responses": {
+          "204": {
+            "description": "resource updated"
+          },
+          "4XX": {
+            "$ref": "#/components/responses/Error"
+          },
+          "5XX": {
+            "$ref": "#/components/responses/Error"
+          }
+        }
+      }
+    },
     "/sessions/{session_id}/deny/{key_id}": {
       "post": {
         "summary": "Withdraw a key's attach access.",
@@ -769,7 +812,7 @@
     "/sessions/{session_id}/start": {
       "post": {
         "summary": "Start a new support session.",
-        "description": "There may only be one session active on the rack at a time. If a session is already running when this request is made, the new session supersedes the old one, but the old session's jobs are not stopped.",
+        "description": "A session start is not signed, so the rack acts on it only when it verifies a signed job for the session. The new session then supersedes the active one: the rack skips the old session's queued jobs but does not stop its running jobs.",
         "operationId": "session_start",
         "parameters": [
           {
@@ -786,14 +829,6 @@
             "required": true,
             "schema": {
               "$ref": "#/components/schemas/SessionId"
-            }
-          },
-          {
-            "in": "query",
-            "name": "wait",
-            "description": "Wait for the subject to appear in the state.",
-            "schema": {
-              "type": "boolean"
             }
           }
         ],
@@ -1145,6 +1180,23 @@
           "command",
           "job_id",
           "session_id"
+        ]
+      },
+      "JobStarted": {
+        "description": "Acknowledgement that a job was accepted.",
+        "type": "object",
+        "properties": {
+          "sleds": {
+            "description": "Which sleds the job will run on.",
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/BaseboardId"
+            },
+            "uniqueItems": true
+          }
+        },
+        "required": [
+          "sleds"
         ]
       },
       "JobStatus": {
@@ -1622,7 +1674,9 @@
         "type": "string",
         "enum": [
           "session-superseded",
-          "session-ended"
+          "session-ended",
+          "not-targeted",
+          "cubby-unknown"
         ]
       },
       "SledHealth": {

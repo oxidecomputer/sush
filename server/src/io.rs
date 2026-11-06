@@ -10,7 +10,8 @@
 //! to batch jobs is dropped; input to interactive jobs is relayed over
 //! a bounded channel, and dropped if the channel is full.
 
-use std::io;
+use std::io::{self, pipe};
+use std::os::fd::OwnedFd;
 use std::time::Duration;
 
 use bytes::{Bytes, BytesMut};
@@ -22,9 +23,11 @@ use tokio::{select, spawn};
 use tokio_util::sync::CancellationToken;
 
 use sush_common::interactive::WindowSize;
+use sush_common::jobs::JobMode;
 use sush_common::jobs::JobOutputStream::{self, *};
 
-use crate::pty::{PtyReader, PtyWriter};
+use crate::pty::{PtyReader, PtyWriter, open_pty};
+use crate::spawn::SpawnStdio;
 
 const INPUT_CHANNEL_CAPACITY: usize = 100;
 pub const BATCH_OUTPUT_BUFFER_SIZE: usize = 0x10000;
@@ -60,6 +63,7 @@ impl<R: AsyncRead + Unpin> StreamState<R> {
     }
 }
 
+/// The sush server's end of a job's I/O.
 pub enum JobIo {
     Interactive {
         pty: StreamState<PtyReader>,
@@ -72,6 +76,26 @@ pub enum JobIo {
 }
 
 impl JobIo {
+    /// Create both ends of a job's I/O: a pseudoterminal for an
+    /// interactive job, and pipes for any other job.
+    pub fn open(mode: JobMode, stop: CancellationToken) -> io::Result<(Self, SpawnStdio)> {
+        if mode.is_interactive() {
+            let (pty, writer, pts, path) = open_pty()?;
+            let stdio = SpawnStdio::Terminal { pts, path };
+            Ok((Self::interactive(pty, writer, stop), stdio))
+        } else {
+            let (stdout, stdout_writer) = pipe()?;
+            let (stderr, stderr_writer) = pipe()?;
+            let stdio = SpawnStdio::Pipes {
+                stdout: stdout_writer.into(),
+                stderr: stderr_writer.into(),
+            };
+            let stdout = ChildStdout::from_std(OwnedFd::from(stdout).into())?;
+            let stderr = ChildStderr::from_std(OwnedFd::from(stderr).into())?;
+            Ok((Self::batch(stdout, stderr), stdio))
+        }
+    }
+
     pub fn interactive(pty: PtyReader, writer: PtyWriter, stop: CancellationToken) -> Self {
         let (tx_input, rx_input) = mpsc::channel::<Bytes>(INPUT_CHANNEL_CAPACITY);
         spawn(Self::relay_input(rx_input, writer, stop));
@@ -168,17 +192,8 @@ impl JobIo {
     }
 
     /// How long to keep reading output after the child dies.
-    ///
-    /// For a pty there is no portable EOF signal; a short window
-    /// after death is the best we can do (OpenSSH does this too).
-    /// Pipes deliver EOF once every writer exits, so this is only a
-    /// backstop against a descendant that escaped the process group
-    /// while holding the inherited pipe open.
     pub fn drain_timeout(&self) -> Duration {
-        match self {
-            Self::Interactive { .. } => Duration::from_millis(10),
-            Self::Batch { .. } => Duration::from_secs(5),
-        }
+        Duration::from_secs(1)
     }
 
     pub fn stop_recording(&mut self, stream: JobOutputStream) {

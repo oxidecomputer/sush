@@ -21,6 +21,7 @@
 
 use std::cmp::Ordering;
 use std::collections::{BTreeSet, HashMap, HashSet};
+use std::future::pending;
 use std::io;
 use std::net::{SocketAddr, SocketAddrV6};
 use std::time::Duration;
@@ -41,9 +42,9 @@ use tokio_util::sync::CancellationToken;
 
 use rumors::link::routed::Endpoint;
 
-use crate::bookmark::{BookmarkSource, SushBookmark};
 use crate::link::{AttestedBaseboards, CorpusSource, SprocketsDial, SprocketsLink, Transport};
 use crate::locker::Locker;
+use crate::locker::bookmark::{BookmarkSource, SushBookmark};
 
 /// The attested baseboards of our live gossip peers.
 #[derive(Clone, Debug)]
@@ -58,6 +59,18 @@ impl LinkedBaseboards {
 
     pub fn borrow(&self) -> watch::Ref<'_, BTreeSet<BaseboardId>> {
         self.0.borrow()
+    }
+
+    pub fn borrow_and_update(&mut self) -> watch::Ref<'_, BTreeSet<BaseboardId>> {
+        self.0.borrow_and_update()
+    }
+
+    /// Wait for the set to change. Once the gossip manager is gone, the
+    /// set can no longer change, so this never returns.
+    pub async fn changed(&mut self) {
+        if self.0.changed().await.is_err() {
+            pending().await
+        }
     }
 }
 

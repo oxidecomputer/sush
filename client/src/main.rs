@@ -7,11 +7,11 @@
 use std::io::stdout;
 use std::process::ExitCode;
 
-use clap::Parser as _;
 use rustix::termios::{OptionalActions, OutputModes, Termios, isatty, tcgetattr, tcsetattr};
 
 use sush_client::cli::Cli;
 use sush_client::commands::ClientArgs;
+use sush_client::context::CommandContext as _;
 
 /// The kernel tab-expansion bits, which rustix does not expose on
 /// illumos: TABDLY from illumos sys/termios.h.
@@ -41,10 +41,14 @@ async fn main() -> ExitCode {
     let saved = no_expand_tabs();
     let mut cli = Cli::default();
     cli.load_session();
-    let code = match ClientArgs::parse().execute(&mut cli).await {
+    let result = match ClientArgs::parse_and_merge_config() {
+        Ok(mut args) => args.execute(&mut cli).await,
+        Err(error) => Err(error),
+    };
+    let code = match result {
         Ok(()) => ExitCode::SUCCESS,
         Err(error) => {
-            eprintln!("{error}");
+            cli.command_error(&error);
             ExitCode::FAILURE
         }
     };

@@ -6,9 +6,9 @@
 //!
 //! One grammar serves signed job requests, the client, and the proxy:
 //! `*` means every sled in the rack, and a comma-separated list names
-//! sleds by baseboard ID or cubby number. Cubby numbers resolve
-//! against a mapping the rack learns at runtime, so a target is
-//! evaluated lazily, against what is known when it is asked.
+//! sleds by baseboard ID or cubby number. The sled that accepts a job
+//! resolves its target once, to the baseboards it can reach. Sleds that
+//! receive the job only run it if the signed target includes them.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
@@ -74,21 +74,54 @@ pub enum SledId {
 #[error("invalid target `{0}`")]
 pub struct InvalidTarget(String);
 
+/// A target names a cubby that no known sled occupies.
+#[derive(Debug, Error)]
+#[error("no known sled occupies cubby {0}")]
+pub struct UnknownCubby(pub u8);
+
 impl Target {
-    /// Whether `baseboard` is targeted, as far as `cubbies` can say.
-    /// A cubby the mapping does not know targets nothing.
-    pub fn includes(&self, baseboard: &BaseboardId, cubbies: &Cubbies) -> bool {
+    /// The sleds in `reachable` that this target names, with cubbies
+    /// looked up in `cubbies`.
+    pub fn resolve(
+        &self,
+        reachable: &BTreeSet<BaseboardId>,
+        cubbies: &Cubbies,
+    ) -> Result<BTreeSet<BaseboardId>, UnknownCubby> {
+        match self {
+            Self::All => Ok(reachable.clone()),
+            Self::Sleds(sleds) => {
+                let mut named = BTreeSet::new();
+                for sled in sleds {
+                    named.insert(match sled {
+                        SledId::Baseboard(baseboard) => baseboard.clone(),
+                        SledId::Cubby(cubby) => {
+                            cubbies.get(cubby).ok_or(UnknownCubby(*cubby))?.clone()
+                        }
+                    });
+                }
+                Ok(named.intersection(reachable).cloned().collect())
+            }
+        }
+    }
+
+    /// Whether this target includes `baseboard` or `cubby`.
+    pub fn matches(&self, baseboard: &BaseboardId, cubby: Option<u8>) -> bool {
         match self {
             Self::All => true,
             Self::Sleds(sleds) => sleds.iter().any(|sled| match sled {
-                SledId::Baseboard(named) => named == baseboard,
-                SledId::Cubby(cubby) => cubbies.get(cubby) == Some(baseboard),
+                SledId::Baseboard(listed) => listed == baseboard,
+                SledId::Cubby(listed) => Some(*listed) == cubby,
             }),
         }
     }
 
     pub fn is_all(&self) -> bool {
         matches!(self, Self::All)
+    }
+
+    /// Whether this target names exactly one sled, by baseboard or cubby.
+    pub fn is_single(&self) -> bool {
+        matches!(self, Self::Sleds(sleds) if sleds.len() == 1)
     }
 
     /// A singular target or `None`.
@@ -99,20 +132,6 @@ impl Target {
                 [SledId::Baseboard(baseboard)] => Some(baseboard),
                 _ => None,
             },
-        }
-    }
-
-    /// Every sled this target names, when it names only baseboards.
-    pub fn named_baseboards(&self) -> Option<BTreeSet<&BaseboardId>> {
-        match self {
-            Self::All => None,
-            Self::Sleds(sleds) => sleds
-                .iter()
-                .map(|sled| match sled {
-                    SledId::Baseboard(baseboard) => Some(baseboard),
-                    SledId::Cubby(_) => None,
-                })
-                .collect(),
         }
     }
 }
@@ -248,23 +267,51 @@ mod test {
     }
 
     #[test]
-    fn targets_include() {
+    fn targets_single() {
+        let single = |target: &str| target.parse::<Target>().unwrap().is_single();
+        assert!(single("14"));
+        assert!(single("913-0000019:BRM42220031"));
+        assert!(!single("14,16"));
+        assert!(!single("*"));
+    }
+
+    #[test]
+    fn targets_resolve() {
         let brm31 = baseboard("913-0000019:BRM42220031");
         let brm40 = baseboard("913-0000019:BRM42220040");
-        let cubbies = Cubbies::from([(14, brm31.clone())]);
+        let brm41 = baseboard("913-0000019:BRM42220041");
+        let reachable = BTreeSet::from([brm31.clone(), brm40.clone()]);
+        let cubbies = Cubbies::from([(14, brm31.clone()), (16, brm41.clone())]);
+        let resolve = |target: &str| {
+            target
+                .parse::<Target>()
+                .unwrap()
+                .resolve(&reachable, &cubbies)
+        };
 
-        let all = Target::All;
-        assert!(all.includes(&brm31, &cubbies));
-        assert!(all.includes(&brm40, &cubbies));
+        assert_eq!(resolve("*").unwrap(), reachable);
+        assert_eq!(
+            resolve("913-0000019:BRM42220031,913-0000019:BRM42220041").unwrap(),
+            BTreeSet::from([brm31.clone()]),
+        );
+        assert_eq!(resolve("14").unwrap(), BTreeSet::from([brm31]));
+        // Cubby 16 holds a sled we cannot reach.
+        assert!(resolve("16").unwrap().is_empty());
+        assert!(matches!(resolve("14,17"), Err(UnknownCubby(17))));
+    }
 
-        let by_baseboard: Target = "913-0000019:BRM42220031".parse().unwrap();
-        assert!(by_baseboard.includes(&brm31, &cubbies));
-        assert!(!by_baseboard.includes(&brm40, &cubbies));
+    #[test]
+    fn targets_match() {
+        let brm31 = baseboard("913-0000019:BRM42220031");
+        let matches =
+            |target: &str, cubby| target.parse::<Target>().unwrap().matches(&brm31, cubby);
 
-        let by_cubby: Target = "14,16".parse().unwrap();
-        assert!(by_cubby.includes(&brm31, &cubbies));
-        // Cubby 16 is not in the mapping, so it targets nothing.
-        assert!(!by_cubby.includes(&brm40, &cubbies));
-        assert!(!by_cubby.includes(&brm40, &Cubbies::new()));
+        assert!(matches("*", None));
+        assert!(matches("913-0000019:BRM42220031", None));
+        assert!(!matches("913-0000019:BRM42220040", Some(14)));
+        assert!(matches("913-0000019:BRM42220040,14", Some(14)));
+        assert!(matches("14", Some(14)));
+        assert!(!matches("14", Some(15)));
+        assert!(!matches("14", None));
     }
 }

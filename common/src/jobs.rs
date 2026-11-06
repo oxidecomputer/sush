@@ -24,7 +24,7 @@ use crate::codephrases::Codephrase;
 use crate::hash::{Hash, Hasher, hash};
 use crate::interactive::InteractiveJobError;
 use crate::keys::{KeyId, Signed, ToBeSigned, ToBeSignedFields, Verified};
-use crate::targets::{Cubbies, Target};
+use crate::targets::Target;
 
 codephrase_newtype! {
     /// A globally unique identifier for a job within a session.
@@ -118,10 +118,6 @@ impl SessionPreimage {
 }
 
 impl SessionId {
-    pub fn first_job_id(&self) -> JobId {
-        JobId::from_hash(hash(&self.0.to_be_bytes()))
-    }
-
     pub fn next_job_id(&self, last_job: &LastJob) -> JobId {
         JobId::from_hash(match last_job {
             LastJob::None => hash(&[b"None", self.0.to_be_bytes().as_slice()].concat()),
@@ -425,15 +421,6 @@ impl JobStartRequest {
         }
     }
 
-    /// Interactive jobs run only on their single named baseboard.
-    pub fn runs_on(&self, baseboard: &BaseboardId, cubbies: &Cubbies) -> bool {
-        if self.mode.is_interactive() {
-            self.target.single_baseboard() == Some(baseboard)
-        } else {
-            self.target.includes(baseboard, cubbies)
-        }
-    }
-
     pub fn job_id(&self) -> &JobId {
         &self.job_id
     }
@@ -452,6 +439,10 @@ impl JobStartRequest {
 
     pub fn target(&self) -> &Target {
         &self.target
+    }
+
+    pub fn target_matches_mode(&self) -> bool {
+        self.target.is_single() || !self.is_interactive()
     }
 }
 
@@ -528,6 +519,8 @@ pub enum JobStatus {
 pub enum SkipReason {
     SessionSuperseded,
     SessionEnded,
+    NotTargeted,
+    CubbyUnknown,
 }
 
 impl fmt::Display for SkipReason {
@@ -535,6 +528,8 @@ impl fmt::Display for SkipReason {
         f.write_str(match self {
             Self::SessionSuperseded => "another session has superseded this one",
             Self::SessionEnded => "the session ended before the job could start",
+            Self::NotTargeted => "the job does not target this sled",
+            Self::CubbyUnknown => "this sled does not know its cubby yet",
         })
     }
 }
@@ -744,37 +739,24 @@ pub struct JobLimits {
 }
 
 impl JobLimits {
-    /// Clamp each limit to the default ceiling. Limits arrive as
-    /// unsigned request parameters, which may narrow the server's
-    /// limits but never widen them.
-    pub fn clamp(self) -> Self {
+    /// Clamp each limit to the default ceiling and to this process's
+    /// hard limit (since a job inherits these). Limits are unsigned
+    /// request parameters, so they may only narrow the server's limits.
+    pub fn clamp(self) -> Result<Self, IoError> {
         let ceiling = Self::default();
-        Self {
-            max_cpu: self.max_cpu.min(ceiling.max_cpu),
-            max_mem: self.max_mem.min(ceiling.max_mem),
-            max_fsize: self.max_fsize.min(ceiling.max_fsize),
-        }
-    }
-
-    pub fn apply(&self) -> Result<(), IoError> {
-        let Self {
-            max_cpu,
-            max_mem,
-            max_fsize,
-        } = *self;
-        self.set_limit(Resource::CPU, max_cpu)?;
-        self.set_limit(Resource::AS, max_mem)?;
-        self.set_limit(Resource::FSIZE, max_fsize)?;
-        Ok(())
-    }
-
-    fn set_limit(&self, resource: Resource, value: u64) -> Result<(), IoError> {
-        let (_soft, hard) = resource.get()?;
-        resource.set(value.min(hard), hard)
+        let hard = |resource: Resource| resource.get().map(|(_soft, hard)| hard);
+        Ok(Self {
+            max_cpu: self.max_cpu.min(ceiling.max_cpu).min(hard(Resource::CPU)?),
+            max_mem: self.max_mem.min(ceiling.max_mem).min(hard(Resource::AS)?),
+            max_fsize: self
+                .max_fsize
+                .min(ceiling.max_fsize)
+                .min(hard(Resource::FSIZE)?),
+        })
     }
 }
 
-/// The default limits are also the ceilings: see [`JobLimits::clamp`].
+/// The default limits are also the ceilings; see [`JobLimits::clamp`].
 impl Default for JobLimits {
     fn default() -> Self {
         JobLimits {
@@ -850,7 +832,6 @@ impl FromStr for JobOutputStream {
 mod test {
     use super::*;
     use crate::keys::{EccR, EccS, EncodedSignature};
-    use crate::targets::SledId;
 
     /// A sequence number encodes to four words, parses back liberally,
     /// and orders numerically.
@@ -1018,29 +999,6 @@ mod test {
         assert_eq!(server.next_job_id(), next);
     }
 
-    /// Interactive jobs run only on their single named baseboard.
-    #[test]
-    fn interactive_targets() {
-        let sled = |serial: &str| BaseboardId {
-            part_number: "913".to_string(),
-            serial_number: serial.to_string(),
-        };
-        let me = sled("me");
-        let cubbies = Cubbies::from([(14, me.clone())]);
-        let job = |mode, target| {
-            JobStartRequest::new(JobId::random(), SessionId::random(), "true", mode, target)
-        };
-        use JobMode::*;
-        let just_me = Target::Sleds(vec![SledId::Baseboard(me.clone())]);
-        assert!(job(Interactive, just_me.clone()).runs_on(&me, &cubbies));
-        assert!(job(Batch, just_me).runs_on(&me, &cubbies));
-        assert!(!job(Interactive, Target::All).runs_on(&me, &cubbies));
-        assert!(job(Batch, Target::All).runs_on(&me, &cubbies));
-        let my_cubby = Target::Sleds(vec![SledId::Cubby(14)]);
-        assert!(!job(Interactive, my_cubby.clone()).runs_on(&me, &cubbies));
-        assert!(job(Batch, my_cubby).runs_on(&me, &cubbies));
-    }
-
     /// Requested limits may narrow the default ceiling, never widen it.
     #[test]
     fn limits_clamp() {
@@ -1049,12 +1007,15 @@ mod test {
             max_mem: GB,
             max_fsize: GB,
         };
-        assert_eq!(narrowed.clone().clamp(), narrowed);
+        assert_eq!(narrowed.clone().clamp().unwrap(), narrowed);
         let widened = JobLimits {
             max_cpu: u64::MAX,
             max_mem: u64::MAX,
             max_fsize: u64::MAX,
         };
-        assert_eq!(widened.clamp(), JobLimits::default());
+        assert_eq!(
+            widened.clamp().unwrap(),
+            JobLimits::default().clamp().unwrap()
+        );
     }
 }

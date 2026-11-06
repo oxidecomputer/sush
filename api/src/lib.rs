@@ -4,7 +4,7 @@
 
 //! Oxide Support Shell API
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
 
 use dropshot::{
@@ -18,6 +18,7 @@ use schemars::JsonSchema;
 use serde::de::{Deserializer, Error as DeserializeError, IntoDeserializer, MapAccess, Visitor};
 use serde::{Deserialize, Serialize};
 use sled_hardware_types::BaseboardId;
+use strum::{Display, EnumString};
 
 use sush_common::authn::Identity;
 use sush_common::jobs::{
@@ -74,6 +75,16 @@ pub trait SushApi {
         headers: Header<Authorization>,
     ) -> Result<HttpResponseOk<Session>, HttpError>;
 
+    /// Check that this server would accept a job in a session.
+    ///
+    /// Succeeds if the session is active or its start is pending.
+    #[endpoint { method = GET, path = "/sessions/{session_id}/check" }]
+    async fn session_check(
+        ctx: RequestContext<Self::Context>,
+        headers: Header<Authorization>,
+        params: PathParams<SessionIdParam>,
+    ) -> Result<HttpResponseUpdatedNoContent, HttpError>;
+
     /// Get a fresh server nonce for the session ceremony.
     ///
     /// The client mixes its own nonce with this one to form the sush
@@ -87,16 +98,15 @@ pub trait SushApi {
 
     /// Start a new support session.
     ///
-    /// There may only be one session active on the rack at a time.
-    /// If a session is already running when this request is made,
-    /// the new session supersedes the old one, but the old session's
-    /// jobs are not stopped.
+    /// A session start is not signed, so the rack acts on it only
+    /// when it verifies a signed job for the session. The new
+    /// session then supersedes the active one: the rack skips the
+    /// old session's queued jobs but does not stop its running jobs.
     #[endpoint { method = POST, path = "/sessions/{session_id}/start" }]
     async fn session_start(
         ctx: RequestContext<Self::Context>,
         headers: Header<Authorization>,
         params: PathParams<SessionIdParam>,
-        query: QueryParams<WaitParam>,
         body: TypedBody<SessionStartBody>,
     ) -> Result<HttpResponseUpdatedNoContent, HttpError>;
 
@@ -148,7 +158,7 @@ pub trait SushApi {
         params: PathParams<JobTargetParams>,
         query: QueryParams<JobStartParams>,
         body: TypedBody<SignedJob>,
-    ) -> Result<HttpResponseUpdatedNoContent, HttpError>;
+    ) -> Result<HttpResponseOk<JobStarted>, HttpError>;
 
     /// Stop a (running) job.
     #[endpoint { method = POST, path = "/jobs/{job_id}/stop" }]
@@ -243,13 +253,6 @@ pub struct KeyIdParam {
     pub key_id: KeyId,
 }
 
-#[derive(Clone, Debug, Default, Deserialize, JsonSchema, Serialize)]
-#[serde(default)]
-pub struct WaitParam {
-    /// Wait for the subject to appear in the state.
-    pub wait: bool,
-}
-
 #[derive(Deserialize, JsonSchema)]
 pub struct SessionIdParam {
     pub session_id: SessionId,
@@ -295,6 +298,13 @@ pub struct SessionStartBody {
     pub seq: SessionSeq,
 }
 
+/// Acknowledgement that a job was accepted.
+#[derive(Clone, Debug, Deserialize, Eq, JsonSchema, PartialEq, Serialize)]
+pub struct JobStarted {
+    /// Which sleds the job will run on.
+    pub sleds: BTreeSet<BaseboardId>,
+}
+
 /// Job parameters _not_ specified in the signed job request.
 #[derive(Clone, Debug, Default, Deserialize, Eq, JsonSchema, PartialEq, Serialize)]
 #[serde(default)]
@@ -317,6 +327,14 @@ pub struct JobStartParams {
     /// Wait for the job to start or stop.
     #[serde(skip_serializing_if = "JobWait::is_none")]
     pub wait: JobWait,
+}
+
+/// Codes for the errors a client may act on. `Display` gives the
+/// `error_code` string of the response body.
+#[derive(Clone, Copy, Debug, Display, EnumString, Eq, PartialEq)]
+pub enum ErrorCode {
+    NoSession,
+    SessionNotCurrent,
 }
 
 /// Whether and until what state is reached to wait for a job start/stop request.

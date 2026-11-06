@@ -6,6 +6,8 @@
 //!
 //! May be executed via either the main CLI or the interactive REPL.
 
+use std::collections::BTreeSet;
+use std::env::args_os;
 use std::fs::{File, OpenOptions, read};
 use std::io::ErrorKind;
 use std::io::{Seek as _, SeekFrom, Write as _, stdin};
@@ -18,7 +20,8 @@ use std::time::Duration;
 
 use async_recursion::async_recursion;
 use bytesize::ByteSize;
-use clap::{Parser, Subcommand};
+use clap::{CommandFactory as _, FromArgMatches as _, Parser, Subcommand};
+use futures::future::{Fuse, FusedFuture as _};
 use futures::stream;
 use futures::{FutureExt as _, StreamExt as _};
 use http::header::WWW_AUTHENTICATE;
@@ -40,7 +43,7 @@ use tokio_tungstenite::tungstenite::protocol::Role;
 use x509_cert::Certificate;
 use x509_cert::der::DecodePem as _;
 
-use sush_api::JobWait;
+use sush_api::{ErrorCode, JobWait};
 use sush_common::authn::{
     AuthnError, Challenge, ChallengeResponse, Credentials, Identity, RequestKey,
 };
@@ -56,7 +59,8 @@ use sush_common::targets::{SledId, Target};
 use sush_common::version::VersionInfo;
 
 use crate::ByteStream;
-use crate::context::{Authz, CommandContext, OutputFormat, StatusDisplayStyle};
+use crate::config::{ConfigError, SuppliedOptions, parse_and_merge_config};
+use crate::context::{Authz, CommandContext, OutputFormat, StartedDisplay, StatusDisplayStyle};
 use crate::identity::{IdentityError, SshAgentConnection};
 use crate::interactive::interactive_job;
 #[cfg(feature = "permslip")]
@@ -65,13 +69,14 @@ use crate::repl::Repl;
 use crate::tls;
 use crate::tunnel::{Tunnel, TunnelError};
 use crate::types::{Error as ApiError, SessionStartBody};
-use crate::{Client, Error as ClientError};
+use crate::{AuthzSigner, Client, Error as ClientError};
 
 // Names of environment variables for argument defaults
 // (to prevent mispellings).
 #[cfg(feature = "permslip")]
 pub const PERMSLIP_URL: &str = "PERMSLIP_URL";
 pub const SSH_AUTH_SOCK: &str = "SSH_AUTH_SOCK";
+pub const SUSH_CONFIG: &str = "SUSH_CONFIG";
 pub const SUSH_JOB_ID: &str = "SUSH_JOB_ID";
 pub const SUSH_KEY_ID: &str = "SUSH_KEY_ID";
 pub const SUSH_MAX_CPU: &str = "SUSH_MAX_CPU";
@@ -81,6 +86,7 @@ pub const SUSH_MAX_FSIZE: &str = "SUSH_MAX_FSIZE";
 pub const SUSH_PERMSLIP_KEY: &str = "SUSH_PERMSLIP_KEY";
 #[cfg(feature = "permslip")]
 pub const SUSH_PERMSLIP_SSH: &str = "SUSH_PERMSLIP_SSH";
+pub const SUSH_PROFILE: &str = "SUSH_PROFILE";
 pub const SUSH_OUTPUT_FORMAT: &str = "SUSH_OUTPUT_FORMAT";
 pub const SUSH_NEXUS: &str = "SUSH_NEXUS";
 pub const SUSH_NEXUS_RESOLVE: &str = "SUSH_NEXUS_RESOLVE";
@@ -101,8 +107,39 @@ const MAX_PARALLEL_CHUNKS: NonZeroU8 = NonZeroU8::new(64).unwrap();
 
 // Job polling and spinner update intervals.
 const JOB_STOP_RETRY_INTERVAL: Duration = Duration::from_millis(100);
+
 #[cfg(feature = "permslip")]
 const SIGNING_UPDATE_INTERVAL: Duration = Duration::from_millis(100);
+
+/// Properties of client commands.
+trait ClientCommandProperties {
+    /// Whether a command contacts the server.
+    fn is_online(&self) -> bool {
+        true
+    }
+
+    /// Whether a command handles SIGINT itself.
+    fn handles_sigint(&self) -> bool {
+        false
+    }
+}
+
+/// An omitted subcommand has the properties of its default.
+impl<T: ClientCommandProperties + Default> ClientCommandProperties for Option<T> {
+    fn is_online(&self) -> bool {
+        match self {
+            Some(command) => command.is_online(),
+            None => T::default().is_online(),
+        }
+    }
+
+    fn handles_sigint(&self) -> bool {
+        match self {
+            Some(command) => command.handles_sigint(),
+            None => T::default().handles_sigint(),
+        }
+    }
+}
 
 /// Process limits for job execution.
 #[derive(Clone, Debug, Parser)]
@@ -139,6 +176,16 @@ impl LimitArgs {
 /// Optional global arguments, i.e., ones that apply to every command.
 #[derive(Clone, Debug, Default, Parser)]
 pub struct GlobalArgs {
+    /// Configuration file, defaults to XDG config `sush/sush.toml`
+    #[arg(long, env = SUSH_CONFIG, value_name = "TOML")]
+    #[clap(global = true)]
+    pub config: Option<PathBuf>,
+
+    /// Configuration profile
+    #[arg(long, env = SUSH_PROFILE, value_name = "NAME")]
+    #[clap(global = true)]
+    pub profile: Option<String>,
+
     /// Output format
     #[arg(long,
           env = SUSH_OUTPUT_FORMAT,
@@ -149,12 +196,12 @@ pub struct GlobalArgs {
     pub output: Option<OutputFormat>,
 
     /// Shortcut for `--output=json`
-    #[arg(short, long, default_value_t = false, conflicts_with = "text")]
+    #[arg(short, long, default_value_t = false, conflicts_with_all = ["text", "output"])]
     #[clap(global = true)]
     pub json: bool,
 
     /// Shortcut for `--output=text`
-    #[arg(short, long, default_value_t = false, conflicts_with = "json")]
+    #[arg(short, long, default_value_t = false, conflicts_with_all = ["json", "output"])]
     #[clap(global = true)]
     pub text: bool,
 
@@ -164,8 +211,6 @@ pub struct GlobalArgs {
     pub url: Option<String>,
 
     /// Nexus URL to tunnel through instead of a tech port URL
-    // Not env OXIDE_HOST: clap applies conflict rules to env-sourced
-    // values, so the oxide CLI's variable would poison --url.
     #[arg(long, env = SUSH_NEXUS, conflicts_with_all = ["url", "offline"])]
     #[clap(global = true)]
     pub nexus: Option<String>,
@@ -219,6 +264,11 @@ pub struct GlobalArgs {
     #[arg(short, long, env = SUSH_KEY_ID)]
     #[clap(global = true)]
     pub ssh_key_id: Option<KeyId>,
+
+    /// Options explicitly supplied on the command line. For REPL
+    /// bookkeeping only.
+    #[arg(skip)]
+    pub supplied: SuppliedOptions,
 }
 
 impl GlobalArgs {
@@ -242,153 +292,30 @@ pub struct ClientArgs {
     globals: GlobalArgs,
 
     #[clap(subcommand)]
-    command: ClientCommand,
+    command: Option<ClientCommand>,
 }
 
 impl ClientArgs {
-    pub async fn execute(&mut self, ctx: &mut impl CommandContext) -> Result<(), CommandError> {
-        ctx.set_globals(self.globals.clone());
-        self.command.clone().execute(ctx).await
-    }
-}
-
-/// A rack-wide target can't combine with `--binary` or `--file`.
-#[tokio::test]
-async fn output_needs_target() {
-    use crate::cli::Cli;
-
-    let client =
-        Client::new_with_client("http://[::1]:1", reqwest::Client::new(), Default::default());
-    let output = JobOutput::try_parse_from([
-        "job-stdout",
-        "--binary",
-        "sea-say-sting-palm-tunnel-festival-pull-bid",
-    ])
-    .unwrap();
-    let err = job_output(
-        &mut Cli::default(),
-        &client,
-        &"*".parse::<TargetArg>().unwrap(),
-        Stdout,
-        output,
-    )
-    .await
-    .unwrap_err();
-    assert!(matches!(err, CommandError::OutputNeedsTarget));
-}
-
-/// The watch settles only after the sled set is stable and every sled
-/// is terminal for consecutive polls.
-#[test]
-fn watch_settling() {
-    use chrono::Utc;
-
-    fn sled(serial: &str) -> BaseboardId {
-        BaseboardId {
-            part_number: "913-0000019".to_owned(),
-            serial_number: serial.to_owned(),
+    /// Parse the process arguments, taking defaults from the
+    /// configuration file. Exits on a parse error, like clap.
+    pub fn parse_and_merge_config() -> Result<Self, CommandError> {
+        let command = Self::command();
+        match parse_and_merge_config(command.clone(), args_os()) {
+            Ok(matches) => {
+                let mut args =
+                    Self::from_arg_matches(&matches).unwrap_or_else(|error| error.exit());
+                args.globals.supplied = SuppliedOptions::from_matches(&command, &matches);
+                Ok(args)
+            }
+            Err(CommandError::Clap(error)) => error.exit(),
+            Err(error) => Err(error),
         }
     }
-    let job_id: JobId = "sea-say-sting-palm-tunnel-festival-pull-bid"
-        .parse()
-        .unwrap();
-    let terminal = JobStatus::Cancelled {
-        job_id,
-        time_cancelled: Utc::now(),
-        actor: KeyId::random(),
-    };
-    let running = JobStatus::Started {
-        job_id,
-        time_started: Utc::now(),
-    };
 
-    let all = Target::All;
-    let mut settling = Settling::default();
-    let mut status = JobStatusMap::new();
-    assert!(!settling.done(&all, None, &status), "empty never settles");
-
-    status.insert(sled("A"), terminal.clone());
-    assert!(!settling.done(&all, None, &status), "new sled resets");
-    assert!(!settling.done(&all, None, &status), "first quiet poll");
-    assert!(
-        !settling.done(&all, None, &status),
-        "quiet but too young for gossip"
-    );
-    assert!(settling.done(&all, None, &status), "old enough, quiet");
-
-    let mut settling = Settling::default();
-    status.insert(sled("B"), running.clone());
-    assert!(!settling.done(&all, None, &status), "running sled holds");
-    status.insert(sled("B"), terminal.clone());
-    assert!(
-        !settling.done(&all, Some(2), &status),
-        "the rack count must hold"
-    );
-    assert!(
-        settling.done(&all, Some(2), &status),
-        "the rack count held twice"
-    );
-
-    let named: Target = format!("{},{}", sled("A"), sled("B")).parse().unwrap();
-    let mut settling = Settling::default();
-    assert!(
-        settling.done(&named, None, &status),
-        "named sleds settle on the first terminal poll"
-    );
-    let duplicates: Target = format!("{},{}", sled("A"), sled("A")).parse().unwrap();
-    let mut settling = Settling::default();
-    assert!(
-        settling.done(&duplicates, None, &status),
-        "duplicate baseboards collapse"
-    );
-    status.insert(sled("B"), running);
-    assert!(
-        !settling.done(&named, None, &status),
-        "a running named sled holds"
-    );
-    status.insert(sled("B"), terminal);
-    let missing: Target = format!("{},{}", sled("A"), sled("C")).parse().unwrap();
-    let mut settling = Settling::default();
-    assert!(
-        !settling.done(&missing, None, &status),
-        "a missing named sled holds"
-    );
-}
-
-/// Anything the target grammar accepts stays a target.
-#[test]
-fn target_arg() {
-    assert!(matches!("*".parse(), Ok(TargetArg::Target(_))));
-    assert!(matches!("14".parse(), Ok(TargetArg::Target(_))));
-    assert!(matches!(
-        "913-0000019:BRM42220030".parse(),
-        Ok(TargetArg::Target(_))
-    ));
-    assert!(matches!(
-        "brm42220030".parse(),
-        Ok(TargetArg::Abbreviated(sleds))
-            if matches!(sleds.as_slice(), [SledArg::Serial(s)] if s == "brm42220030")
-    ));
-    assert!(matches!(
-        "14,brm42220030".parse(),
-        Ok(TargetArg::Abbreviated(sleds))
-            if matches!(sleds.as_slice(), [SledArg::Sled(SledId::Cubby(14)), SledArg::Serial(_)])
-    ));
-    assert!(matches!(
-        "913-0000019:BRM42220036,brm42220030".parse(),
-        Ok(TargetArg::Abbreviated(sleds))
-            if matches!(sleds.as_slice(), [SledArg::Sled(SledId::Baseboard(_)), SledArg::Serial(_)])
-    ));
-    assert!("n!ot,a:target".parse::<TargetArg>().is_err());
-    assert!("*,brm42220030".parse::<TargetArg>().is_err());
-}
-
-/// [`ClientArgs`] must satisfy Clap's internal consistency asserts
-/// (unique shorts per subcommand, valid references).
-#[test]
-fn client_args() {
-    use clap::CommandFactory as _;
-    ClientArgs::command().debug_assert();
+    pub async fn execute(&mut self, ctx: &mut impl CommandContext) -> Result<(), CommandError> {
+        ctx.set_globals(self.globals.clone());
+        self.command.clone().unwrap_or_default().execute(ctx).await
+    }
 }
 
 /// Arguments for `job-stdout` and `job-stderr`.
@@ -396,7 +323,7 @@ fn client_args() {
 pub struct JobOutput {
     /// The job whose output should be fetched.
     #[clap(env = SUSH_JOB_ID)]
-    job_id: JobId,
+    job_id: Option<JobId>,
 
     /// Job output is binary, not UTF-8 encoded text.
     #[arg(short, long, default_value_t = false, conflicts_with = "file")]
@@ -438,7 +365,7 @@ fn parallel_chunks(s: &str) -> Result<NonZeroU8, String> {
 }
 
 /// Support Shell job management command
-#[derive(Clone, Debug, Subcommand)]
+#[derive(Clone, Debug, Default, Subcommand)]
 pub enum ClientCommand {
     /// Job-signing certificate management.
     Cert {
@@ -451,10 +378,6 @@ pub enum ClientCommand {
     Iam {
         #[clap(subcommand)]
         command: Option<IdentityCommand>,
-
-        /// Shortcut for `iam available`
-        #[arg(short = 'l')]
-        available: bool,
     },
 
     /// Session management.
@@ -469,14 +392,25 @@ pub enum ClientCommand {
         command: JobCommand,
     },
 
-    /// Arguments for subsequent interactive commands.
+    /// Set options for later commands.
+    ///
+    /// Each option replaces any earlier or conflicting one. Also reload
+    /// the config file and show the current options.
     Set {
         #[clap(flatten)]
         args: GlobalArgs,
     },
 
-    /// Start an interactive REPL.
+    /// Unset options supplied earlier.
+    Unset {
+        /// The long names of the options to unset, without the leading `--`.
+        #[arg(required = true, value_name = "OPTION")]
+        options: Vec<String>,
+    },
+
+    /// Start an interactive REPL (the default).
     #[clap(alias = "repl")]
+    #[default]
     Shell,
 
     /// Report client and sled build versions.
@@ -500,10 +434,13 @@ pub enum CertCommand {
     },
 }
 
+impl ClientCommandProperties for CertCommand {}
+
 #[derive(Clone, Debug, Default, Subcommand)]
 pub enum IdentityCommand {
     /// List available local SSH agent identities.
     /// Does not communicate with the server.
+    #[command(short_flag = 'l')]
     Available,
 
     /// List SSH identities registered with the server.
@@ -512,6 +449,12 @@ pub enum IdentityCommand {
     /// Log in to the server as an SSH identity.
     #[default]
     Login,
+}
+
+impl ClientCommandProperties for IdentityCommand {
+    fn is_online(&self) -> bool {
+        !matches!(self, Self::Available)
+    }
 }
 
 #[derive(Clone, Debug, Subcommand)]
@@ -553,15 +496,19 @@ pub enum SessionCommand {
 
         /// Use `permslip` to sign sessions and jobs with this key name.
         #[arg(short, long, env = SUSH_PERMSLIP_KEY, value_name = "KEY_NAME")]
-        permslip: Option<String>,
+        permslip_key: Option<String>,
 
         /// The `permslip` server to contact for signing.
-        #[arg(long, env = PERMSLIP_URL, requires = "permslip", value_name = "URL")]
+        #[arg(long, env = PERMSLIP_URL, value_name = "URL")]
         permslip_url: Option<String>,
     },
 
     /// Get the parameters to send to the signer server to start a session.
-    StartParams,
+    StartParams {
+        /// Supersede an active session without asking.
+        #[arg(short, long)]
+        force: bool,
+    },
 
     /// Start a new support session.
     Start {
@@ -582,19 +529,21 @@ pub enum SessionCommand {
         /// Use `permslip` to sign sessions and jobs with this key name.
         #[cfg(feature = "permslip")]
         #[arg(short, long, env = SUSH_PERMSLIP_KEY, value_name = "KEY_NAME")]
-        permslip: Option<String>,
+        permslip_key: Option<String>,
 
         /// The `permslip` server to contact for signing.
         #[cfg(feature = "permslip")]
-        #[arg(long, env = PERMSLIP_URL, requires = "permslip", value_name = "URL")]
+        #[arg(long, env = PERMSLIP_URL, value_name = "URL")]
         permslip_url: Option<String>,
 
-        /// Wait for the session to become active.
+        /// Supersede an active session without asking.
         #[arg(short, long)]
-        wait: bool,
+        force: bool,
     },
 
     /// Stop a support session.
+    ///
+    /// Queued jobs are skipped. Running jobs are not affected.
     Stop {
         /// The session to stop.
         session_id: Option<SessionId>,
@@ -610,6 +559,8 @@ impl Default for SessionCommand {
     }
 }
 
+impl ClientCommandProperties for SessionCommand {}
+
 #[derive(Clone, Debug, Subcommand)]
 pub enum JobCommand {
     /// Sign and start a job.
@@ -623,21 +574,20 @@ pub enum JobCommand {
     Stop {
         /// The job to abort.
         #[clap(env = SUSH_JOB_ID)]
-        job_id: JobId,
+        job_id: Option<JobId>,
     },
 
-    /// Decline a job, burning its ID and advancing the session.
+    /// Decline to run a job, burning its ID and advancing the session.
     Skip {
-        /// The job to skip.
-        #[clap(env = SUSH_JOB_ID)]
-        job_id: JobId,
+        /// The job to skip. By default, the next job in the current session.
+        job_id: Option<JobId>,
     },
 
     /// Get the status of a started job.
     Status {
         /// The job whose status should be fetched.
         #[clap(env = SUSH_JOB_ID)]
-        job_id: JobId,
+        job_id: Option<JobId>,
 
         /// Show full per-sled status instead of one line per sled.
         #[arg(short, long)]
@@ -674,7 +624,7 @@ pub enum JobCommand {
     Attach {
         /// The interactive job to attach to.
         #[clap(env = SUSH_JOB_ID)]
-        job_id: JobId,
+        job_id: Option<JobId>,
 
         /// The sled to attach to.
         #[arg(short = 'T', long, default_value = "*")]
@@ -691,6 +641,12 @@ pub enum JobCommand {
         #[arg(short, long, default_value_t = 0)]
         offset: u32,
     },
+}
+
+impl ClientCommandProperties for JobCommand {
+    fn handles_sigint(&self) -> bool {
+        matches!(self, Self::Start { .. } | Self::Attach { .. })
+    }
 }
 
 #[derive(Clone, Debug, Parser)]
@@ -731,11 +687,11 @@ pub struct JobStartArgs {
     /// Use `permslip` to sign job requests with this key name.
     #[cfg(feature = "permslip")]
     #[arg(short, long, env = SUSH_PERMSLIP_KEY, value_name = "KEY_NAME")]
-    permslip: Option<String>,
+    permslip_key: Option<String>,
 
     /// The `permslip` server to contact for signing.
     #[cfg(feature = "permslip")]
-    #[arg(long, env = PERMSLIP_URL, requires = "permslip", value_name = "URL")]
+    #[arg(long, env = PERMSLIP_URL, value_name = "URL")]
     permslip_url: Option<String>,
 
     /// Terminal type for interactive jobs.
@@ -758,98 +714,75 @@ impl JobStartArgs {
     }
 }
 
-impl ClientCommand {
-    /// Interactive jobs forward SIGINT to the job, watches use it to
-    /// stop the job or end the watch, and the REPL turns it into a
-    /// fresh prompt.
-    fn handles_sigint(&self) -> bool {
-        matches!(
-            self,
-            Self::Shell
-                | Self::Job {
-                    command: JobCommand::Start { .. } | JobCommand::Attach { .. },
-                }
-        )
+impl ClientCommandProperties for ClientCommand {
+    fn is_online(&self) -> bool {
+        match self {
+            Self::Cert { command } => command.is_online(),
+            Self::Iam { command } => command.is_online(),
+            Self::Session { command } => command.is_online(),
+            Self::Job { command } => command.is_online(),
+            Self::Shell | Self::Version | Self::Set { .. } | Self::Unset { .. } | Self::Quit => {
+                false
+            }
+        }
     }
 
+    fn handles_sigint(&self) -> bool {
+        match self {
+            Self::Cert { command } => command.handles_sigint(),
+            Self::Iam { command } => command.handles_sigint(),
+            Self::Session { command } => command.handles_sigint(),
+            Self::Job { command } => command.handles_sigint(),
+            Self::Shell => true,
+            Self::Version | Self::Set { .. } | Self::Unset { .. } | Self::Quit => false,
+        }
+    }
+}
+
+/// Await `future`, or fail with [`CommandError::Canceled`] on ^C.
+async fn cancelable<T, E>(future: impl Future<Output = Result<T, E>>) -> Result<T, CommandError>
+where
+    CommandError: From<E>,
+{
+    select! {
+        result = future => Ok(result?),
+        _ = ctrl_c() => Err(CommandError::Canceled),
+    }
+}
+
+impl ClientCommand {
     /// Run the command, letting an interrupt cancel it unless the
     /// command handles SIGINT itself.
     #[async_recursion(?Send)]
     pub async fn execute(self, ctx: &mut impl CommandContext) -> Result<(), CommandError> {
         if self.handles_sigint() {
-            return self.run(ctx).await;
-        }
-        select! {
-            result = self.run(ctx) => result,
-            _ = ctrl_c() => Err(CommandError::Canceled),
+            self.run(ctx).await
+        } else {
+            cancelable(self.run(ctx)).await
         }
     }
 
     async fn run(self, ctx: &mut impl CommandContext) -> Result<(), CommandError> {
-        let mut args = ctx.get_globals().to_owned();
+        let args = ctx.get_globals();
         if let Some(output) = args.output_format() {
             ctx.set_output_format(output);
         }
 
-        // The tunnel stands in for the proxy until the command ends.
-        let _tunnel = match args.nexus.as_ref() {
-            Some(nexus) => {
-                let rack = args.rack.as_ref().ok_or(CommandError::MissingRack)?;
-                let token = args
-                    .nexus_token
-                    .as_ref()
-                    .ok_or(CommandError::MissingNexusToken)?;
-                let tunnel =
-                    Tunnel::start(nexus, rack, token, &args.nexus_roots, args.nexus_resolve)
-                        .await?;
-                args.url = Some(tunnel.url.clone());
-                // The repl re-enters run per command; commands must
-                // reuse this tunnel, not build their own.
-                args.nexus = None;
-                Some(tunnel)
-            }
-            None => None,
+        let handle = match self.is_online() {
+            true => ctx.client_handle(&args).await?,
+            false => None,
         };
-
-        let client = match args.url.as_ref() {
-            Some(url) => {
-                let roots = if args.proxy_roots.is_empty() {
-                    tls::platform_roots()?
-                } else {
-                    let mut roots = Vec::new();
-                    for path in &args.proxy_roots {
-                        let pem = read(path).map_err(|err| CommandError::io(path, err))?;
-                        roots.push(Certificate::from_pem(&pem)?);
-                    }
-                    roots
-                };
-                {
-                    let (url, resolve) = tls::descope_url(url)?;
-                    Some(Client::new_with_client(
-                        &url,
-                        tls::client(roots, resolve)?,
-                        ctx.authz_signer(),
-                    ))
-                }
-            }
-            None => None,
-        };
+        let client = handle.as_ref().map(|handle| handle.client.clone());
         match (self, client) {
             (ClientCommand::Cert { command }, Some(client)) => cert(ctx, &client, command).await,
 
-            (ClientCommand::Iam { command, available }, Some(client)) => {
+            (ClientCommand::Iam { command }, client) => {
                 iam(
                     ctx,
-                    &client,
+                    client.as_ref(),
                     &args.ssh_auth_sock,
                     &args.ssh_key_id,
-                    command.unwrap_or_else(|| {
-                        if available {
-                            IdentityCommand::Available
-                        } else {
-                            IdentityCommand::default()
-                        }
-                    }),
+                    command.unwrap_or_default(),
                 )
                 .await
             }
@@ -860,18 +793,21 @@ impl ClientCommand {
 
             (ClientCommand::Job { command }, client) => job(ctx, &client, command).await,
 
-            (ClientCommand::Set { args }, _) => {
-                ctx.set_globals(args);
+            (ClientCommand::Set { args }, _) => ctx.set_options(args.supplied),
+
+            (ClientCommand::Unset { options }, _) => ctx.unset_options(&options),
+
+            (ClientCommand::Shell, _) => {
+                Repl::default().run(args.clone()).await?;
                 Ok(())
             }
 
-            (ClientCommand::Shell, client) => {
-                Repl::default().run(args.clone(), client).await?;
-                Ok(())
-            }
-
-            (ClientCommand::Version, client) => {
-                let (server, sleds) = match client {
+            (ClientCommand::Version, _) => {
+                let handle = ctx.client_handle(&args).await.unwrap_or_else(|error| {
+                    ctx.command_error(&error);
+                    None
+                });
+                let (server, sleds) = match handle.as_ref().map(|handle| &handle.client) {
                     Some(client) => (
                         Some(client.version().send().await?.into_inner()),
                         client
@@ -894,10 +830,59 @@ impl ClientCommand {
     }
 }
 
+/// A client and the tunnel it goes through, if any.
+/// Dropping the handle closes the tunnel.
+#[derive(Debug)]
+pub struct ClientHandle {
+    pub client: Client,
+    _tunnel: Option<Tunnel>,
+}
+
+impl ClientHandle {
+    /// Make a client and maybe a tunnel, or nothing if offline.
+    pub async fn from_args(
+        args: &GlobalArgs,
+        signer: AuthzSigner,
+    ) -> Result<Option<Self>, CommandError> {
+        let (url, tunnel) = match &args.nexus {
+            Some(nexus) => {
+                let rack = args.rack.as_ref().ok_or(CommandError::MissingRack)?;
+                let token = args
+                    .nexus_token
+                    .as_ref()
+                    .ok_or(CommandError::MissingNexusToken)?;
+                let tunnel =
+                    Tunnel::start(nexus, rack, token, &args.nexus_roots, args.nexus_resolve)
+                        .await?;
+                (Some(tunnel.url.clone()), Some(tunnel))
+            }
+            None => (args.url.clone(), None),
+        };
+        let Some(url) = url else {
+            return Ok(None);
+        };
+        let roots = if args.proxy_roots.is_empty() {
+            tls::platform_roots()?
+        } else {
+            let mut roots = Vec::new();
+            for path in &args.proxy_roots {
+                let pem = read(path).map_err(|err| CommandError::io(path, err))?;
+                roots.push(Certificate::from_pem(&pem)?);
+            }
+            roots
+        };
+        let (url, resolve) = tls::descope_url(&url)?;
+        let client = Client::new_with_client(&url, tls::client(roots, resolve)?, signer);
+        Ok(Some(Self {
+            client,
+            _tunnel: tunnel,
+        }))
+    }
+}
+
 async fn authenticate<E>(
     ctx: &mut impl CommandContext,
     client: &Client,
-    via: Option<&BaseboardId>,
     response: ResponseValue<E>,
 ) -> Result<(Identity, Authz), CommandError> {
     let mut ssh_agent = if let Some(ssh_auth_sock) = &ctx.get_globals().ssh_auth_sock {
@@ -918,19 +903,13 @@ async fn authenticate<E>(
     let key = RequestKey::new();
     let response = ChallengeResponse::new(challenge, key.verifier());
     ctx.please_touch(&public_key)?;
-    let signed = select! {
-        s = ssh_agent.sign(response) => s?,
-        _ = ctrl_c() => return Err(CommandError::Canceled),
-    };
+    let signed = cancelable(ssh_agent.sign(response)).await?;
     let verified = signed.verify_with_ssh_public_key(&public_key)?;
     let credentials = Credentials::new(verified);
-    let mut request = client
+    let request = client
         .iam()
         .authorization(credentials.to_string())
         .body(public_key.to_string());
-    if let Some(via) = via {
-        request = request.via(via.to_string());
-    }
     let identity = match request.send().await {
         Ok(identity) => identity.into_inner(),
         Err(error) if error.status() == Some(StatusCode::UNAUTHORIZED) => {
@@ -940,6 +919,24 @@ async fn authenticate<E>(
         Err(error) => return Err(error.into()),
     };
     Ok((identity, Authz::new(credentials, key)))
+}
+
+/// Record the agent's key ID, so that requests made before logging
+/// in claim it. A server with no proxy in front needs nothing more.
+/// If the agent has no key to offer, record nothing, and let the
+/// login report why.
+async fn claim_key(ctx: &impl CommandContext, signer: &AuthzSigner) {
+    if signer.get().is_some() || signer.claim().is_some() {
+        return;
+    }
+    let globals = ctx.get_globals();
+    if let Some(ssh_auth_sock) = &globals.ssh_auth_sock
+        && let Ok(mut ssh_agent) = SshAgentConnection::connect(ssh_auth_sock).await
+        && let Ok(public_key) = ssh_agent.identity(globals.ssh_key_id.as_ref()).await
+        && let Ok(key_id) = public_key.key_id()
+    {
+        signer.set_claim(key_id);
+    }
 }
 
 /// A refused login usually indicates build skew rather than a bad key.
@@ -959,42 +956,36 @@ fn login_refused(server: Option<VersionInfo>, error: CommandError) -> CommandErr
 async fn with_login<T, E, Req>(
     ctx: &mut impl CommandContext,
     client: &Client,
-    make_request: Req,
-) -> Result<T, CommandError>
-where
-    Req: AsyncFnMut() -> Result<T, ClientError<E>>,
-    CommandError: From<ClientError<E>>,
-{
-    with_login_via(ctx, client, None, make_request).await
-}
-
-/// Like [`with_login`], for requests a proxy routes to a particular
-/// sled. Identities live on one sled, so the login must go where the
-/// request it retries went.
-async fn with_login_via<T, E, Req>(
-    ctx: &mut impl CommandContext,
-    client: &Client,
-    via: Option<&BaseboardId>,
     mut make_request: Req,
 ) -> Result<T, CommandError>
 where
     Req: AsyncFnMut() -> Result<T, ClientError<E>>,
     CommandError: From<ClientError<E>>,
 {
-    match make_request().await {
-        Err(ClientError::ErrorResponse(err)) if err.status() == StatusCode::UNAUTHORIZED => {
-            let (_identity, authz) = authenticate(ctx, client, via, err).await?;
-            ctx.set_credentials(Some(authz));
-            Ok(make_request().await?)
+    let signer = ctx.authz_signer();
+    claim_key(ctx, &signer).await;
+    let mut generation = signer.generation();
+    let mut logged_in = false;
+    loop {
+        match make_request().await {
+            Err(ClientError::ErrorResponse(err))
+                if err.status() == StatusCode::UNAUTHORIZED && !logged_in =>
+            {
+                if let Some(_login) = signer.login_needed(generation).await {
+                    let (_identity, authz) = authenticate(ctx, client, err).await?;
+                    ctx.set_credentials(Some(authz));
+                    logged_in = true;
+                }
+                generation = signer.generation();
+            }
+            result => return Ok(result?),
         }
-        Err(err) => Err(err.into()),
-        Ok(res) => Ok(res),
     }
 }
 
 async fn iam(
     ctx: &mut impl CommandContext,
-    client: &Client,
+    client: Option<&Client>,
     ssh_auth_sock: &Option<String>,
     ssh_key_id: &Option<KeyId>,
     command: IdentityCommand,
@@ -1019,6 +1010,7 @@ async fn iam(
         }
 
         IdentityCommand::List => {
+            let client = client.ok_or(CommandError::Offline)?;
             let identities = with_login(ctx, client, async || client.identities().send().await)
                 .await?
                 .into_inner();
@@ -1029,6 +1021,7 @@ async fn iam(
         }
 
         IdentityCommand::Login => {
+            let client = client.ok_or(CommandError::Offline)?;
             let identity = with_login(ctx, client, async || client.iam().body(None).send().await)
                 .await?
                 .into_inner();
@@ -1082,7 +1075,7 @@ async fn session(
                 return Err(CommandError::MissingSession);
             }
             // The server's session state is authoritative.
-            ctx.session_started(session, true);
+            ctx.session_joined(session, true);
             Ok(())
         }
 
@@ -1093,11 +1086,13 @@ async fn session(
             },
             None,
         ) => {
-            ctx.session_started(Session::new(session_id), force);
+            ctx.session_joined(Session::new(session_id), force);
             Ok(())
         }
 
-        (SessionCommand::StartParams, Some(client)) => session_start_params(ctx, client).await,
+        (SessionCommand::StartParams { force }, Some(client)) => {
+            session_start_params(ctx, client, force).await
+        }
 
         #[cfg(feature = "permslip")]
         (
@@ -1106,9 +1101,9 @@ async fn session(
                 nonce,
                 seq,
                 client_nonce,
-                permslip,
+                permslip_key,
                 permslip_url,
-                wait,
+                force,
             },
             Some(client),
         ) => {
@@ -1131,11 +1126,12 @@ async fn session(
                     )
                 } else {
                     let Some(permslip_url) = permslip_url else {
-                        return session_start_params(ctx, client).await;
+                        return session_start_params(ctx, client, force).await;
                     };
-                    let Some(permslip_key) = permslip else {
+                    let Some(permslip_key) = permslip_key else {
                         return Err(CommandError::MissingKeyName);
                     };
+                    really_supersede(ctx, client, force).await?;
                     let (baseboard_id, nonce) = with_login(ctx, client, async || {
                         Ok((
                             client.target().send().await?.into_inner(),
@@ -1159,7 +1155,7 @@ async fn session(
                         false,
                     )
                 };
-            session_start(ctx, client, session_id, body, wait, show).await
+            session_start(ctx, client, session_id, body, show).await
         }
 
         #[cfg(feature = "permslip")]
@@ -1167,7 +1163,7 @@ async fn session(
             SessionCommand::Create {
                 baseboard_id,
                 nonce,
-                permslip,
+                permslip_key,
                 permslip_url,
             },
             _,
@@ -1175,7 +1171,7 @@ async fn session(
             let Some(permslip_url) = permslip_url else {
                 return Err(CommandError::MissingPermslipUrl);
             };
-            let Some(permslip_key) = permslip else {
+            let Some(permslip_key) = permslip_key else {
                 return Err(CommandError::MissingKeyName);
             };
             let (session_id, nonce, seq) =
@@ -1191,14 +1187,14 @@ async fn session(
                 nonce,
                 seq,
                 client_nonce,
-                wait,
+                force,
             },
             Some(client),
         ) => {
             // A build that cannot sign is always in the relay flow: a
             // bare start means the start parameters.
             let (Some(session_id), Some(signer_nonce), Some(seq)) = (session_id, nonce, seq) else {
-                return session_start_params(ctx, client).await;
+                return session_start_params(ctx, client, force).await;
             };
             let client_nonce = client_nonce
                 .or_else(|| ctx.pending_client_nonce())
@@ -1212,7 +1208,6 @@ async fn session(
                     signer_nonce,
                     seq,
                 },
-                wait,
                 true,
             )
             .await
@@ -1313,7 +1308,7 @@ async fn job(
             },
             client,
         ) => {
-            let request = job_start_request(ctx, client.as_ref(), start_args).await?;
+            let request = cancelable(job_start_request(ctx, client.as_ref(), start_args)).await?;
             ctx.job_start_params(&request);
             Ok(())
         }
@@ -1330,7 +1325,7 @@ async fn job(
             },
             client,
         ) => {
-            let request = job_start_request(ctx, client.as_ref(), start_args).await?;
+            let request = cancelable(job_start_request(ctx, client.as_ref(), start_args)).await?;
             ctx.job_start_params(&request);
             Ok(())
         }
@@ -1338,7 +1333,10 @@ async fn job(
         #[cfg(feature = "permslip")]
         (
             JobCommand::Start {
-                start_args: JobStartArgs { permslip: None, .. },
+                start_args:
+                    JobStartArgs {
+                        permslip_key: None, ..
+                    },
                 ..
             },
             Some(_),
@@ -1349,16 +1347,16 @@ async fn job(
             JobCommand::Start {
                 start_args:
                     ref start_args @ JobStartArgs {
-                        permslip: Some(ref key_name),
+                        permslip_key: Some(ref key_name),
                         permslip_url: Some(ref permslip_url),
                         ..
                     },
             },
             client,
         ) => {
-            let request = job_start_request(ctx, client.as_ref(), start_args).await?;
+            let request = cancelable(job_start_request(ctx, client.as_ref(), start_args)).await?;
             let job_id = request.job_id;
-            let mut signer = permslip_signer(ctx, key_name, permslip_url).await?;
+            let mut signer = cancelable(permslip_signer(ctx, key_name, permslip_url)).await?;
             let mut interval = interval(SIGNING_UPDATE_INTERVAL);
             interval.set_missed_tick_behavior(MissedTickBehavior::Skip);
             let sign = signer.sign_job_request(request);
@@ -1368,27 +1366,37 @@ async fn job(
             let job = loop {
                 select! {
                     job = &mut sign => {
-                        ctx.job_signing_finished(&job_id);
+                        ctx.job_signing_finished(&job_id, job.is_ok());
                         break job?;
                     }
                     _ = interval.tick() => ctx.job_signing_update(&job_id),
                     _ = sigint.recv() => {
-                        ctx.job_signing_finished(&job_id);
+                        ctx.job_signing_finished(&job_id, false);
                         return Err(CommandError::Canceled);
                     }
                 }
             };
             if let Some(client) = client {
                 ctx.job_signed(&job, false);
-                job_start(ctx, client, job, start_args.to_owned()).await
+                let job_id = *job.job_id();
+                match job_start(ctx, client, job, start_args.to_owned()).await {
+                    Err(error)
+                        if !matches!(error, CommandError::Session(_))
+                            && ctx.next_job_id().ok() == Some(job_id) =>
+                    {
+                        Err(CommandError::JobNotStarted(job_id, Box::new(error)))
+                    }
+                    result => result,
+                }
             } else {
                 ctx.job_signed(&job, true);
-                ctx.job_started(&job, false);
+                ctx.job_started(&job, None, StartedDisplay::None);
                 Ok(())
             }
         }
 
         (JobCommand::Stop { job_id }, Some(client)) => {
+            let job_id = job_id_or_last(ctx, job_id)?;
             job_stop(ctx, client, &job_id, None).await?;
             ctx.job_stopped(&job_id);
             Ok(())
@@ -1399,6 +1407,10 @@ async fn job(
         (JobCommand::Skip { job_id }, client) => {
             let Some(session_id) = ctx.session_id() else {
                 return Err(CommandError::MissingSession);
+            };
+            let job_id = match job_id {
+                Some(job_id) => job_id,
+                None => ctx.next_job_id()?,
             };
             if let Some(client) = client {
                 with_login(ctx, client, async || {
@@ -1419,13 +1431,14 @@ async fn job(
         }
 
         (JobCommand::Status { job_id, full, wait }, Some(client)) => {
+            let job_id = job_id_or_last(ctx, job_id)?;
             let style = if full {
                 StatusDisplayStyle::Full
             } else {
-                StatusDisplayStyle::Short
+                StatusDisplayStyle::Medium
             };
             if wait {
-                let status = job_watch(ctx, client, &job_id, &Target::All).await?;
+                let status = job_watch(ctx, client, &job_id, None).await?;
                 ctx.job_status(&job_id, &status, style);
                 Ok(())
             } else {
@@ -1442,6 +1455,7 @@ async fn job(
         }
 
         (JobCommand::Attach { job_id, target }, Some(client)) => {
+            let job_id = job_id_or_last(ctx, job_id)?;
             let target = match &target {
                 TargetArg::Abbreviated(sleds) => match sleds.as_slice() {
                     [SledArg::Serial(serial)] => {
@@ -1454,8 +1468,14 @@ async fn job(
                 },
                 TargetArg::Target(target) => resolve_target(client, target).await?,
             };
-            job_attach(ctx, client, &job_id, &target).await?;
-            Ok(())
+            match job_attach(ctx, client, &job_id, &target).await {
+                Err(CommandError::NotFound(_)) => {
+                    let error = attach_refused(ctx, client, &job_id, &target).await;
+                    ctx.command_error(&error);
+                    Ok(())
+                }
+                result => result,
+            }
         }
 
         (JobCommand::History { limit, offset }, Some(client)) => {
@@ -1473,7 +1493,7 @@ async fn job(
                 let status = job_status_try_from_json_map(job)
                     .map_err(CommandError::BaseboardIdParseError)?;
                 if let Some(s) = status.values().next() {
-                    ctx.job_status(s.job_id(), &status, StatusDisplayStyle::Short);
+                    ctx.job_status(s.job_id(), &status, StatusDisplayStyle::Medium);
                 }
             }
             Ok(())
@@ -1491,7 +1511,7 @@ async fn job_start(
 ) -> Result<(), CommandError> {
     // Resolve the signed request's target to one sled to watch and
     // fetch output from.
-    let target = resolve_target(client, job.payload().target()).await?;
+    let target = cancelable(resolve_target(client, job.payload().target())).await?;
 
     // Set up the job request and parameters.
     let job_id = job.job_id().to_owned();
@@ -1506,10 +1526,9 @@ async fn job_start(
     } = start_args;
     let interactive = job.payload().is_interactive();
     let streaming = matches!(job.payload().mode, JobMode::StreamOutput);
-    let wait = if interactive || streaming {
+    let watch = wait;
+    let wait = if interactive || streaming || watch {
         JobWait::Start
-    } else if wait {
-        JobWait::Stop
     } else {
         JobWait::None
     };
@@ -1519,7 +1538,7 @@ async fn job_start(
         max_fsize,
     } = limits.as_limits();
     let mut start_ctx = ctx.clone();
-    let start = with_login_via(&mut start_ctx, client, Some(&target), async || {
+    let start = with_login(&mut start_ctx, client, async || {
         let mut start = client
             .job_start()
             .job_id(job.job_id())
@@ -1542,14 +1561,29 @@ async fn job_start(
 
     // Start the job.
     if interactive {
-        start.await?;
-        ctx.job_started(&job, true);
+        let sleds = cancelable(start).await?.into_inner().sleds;
+        ctx.job_started(&job, Some(&sleds), StartedDisplay::Note);
         match job_attach(ctx, client, &job_id, &target).await {
-            Ok(()) | Err(CommandError::NotFound(_)) => {
-                job_status(ctx, client, &job_id, StatusDisplayStyle::Short).await?
+            Ok(()) => (),
+            Err(CommandError::NotFound(_)) => {
+                let output = JobOutput {
+                    job_id: Some(job_id),
+                    binary: true,
+                    file: None,
+                    force: false,
+                    chunk_size: DEFAULT_CHUNK_SIZE,
+                    parallel: PARALLEL_CHUNKS,
+                };
+                if let Err(error) = job_output_from(ctx, client, &target, Stdout, output).await
+                    && !error.is_unfinished_job()
+                {
+                    ctx.command_error(&error);
+                }
             }
             Err(error) => return Err(error),
         }
+        let status = job_status_map(ctx, client, &job_id, Some(&target)).await?;
+        ctx.job_status(&job_id, &status, StatusDisplayStyle::Medium);
     } else if streaming {
         let Some(path) = file else {
             return Err(CommandError::StreamingNeedsFile);
@@ -1564,10 +1598,10 @@ async fn job_start(
         let file = options
             .open(&path)
             .map_err(|error| CommandError::io(&path, error))?;
-        start.await?;
-        ctx.job_started(&job, true);
+        let sleds = cancelable(start).await?.into_inner().sleds;
+        ctx.job_started(&job, Some(&sleds), StartedDisplay::Note);
         let hasher = job_stream(ctx, client, &job_id, &target, &path, file).await?;
-        let status = job_watch(ctx, client, &job_id, &target.clone().into()).await?;
+        let status = job_watch(ctx, client, &job_id, Some(sleds)).await?;
         ctx.job_status(&job_id, &status, StatusDisplayStyle::Short);
         let Some(JobStatus::Stopped {
             result: Ok(0),
@@ -1595,25 +1629,48 @@ async fn job_start(
                 received,
             });
         }
-    } else if wait.is_some() {
+    } else if watch {
         // Watch the whole rack while the start request runs, and keep
         // watching until the job settles everywhere.
         ctx.job_watch_started(&job_id);
-        let job_target = job.payload().target().clone();
+        let mut sleds = None;
         let mut ticker = interval(WATCH_INTERVAL);
         ticker.set_missed_tick_behavior(MissedTickBehavior::Skip);
         let mut last = JobStatusMap::new();
         let mut settling = Settling::default();
         let mut started = false;
         let mut stalled = false;
+        let mut stopping = false;
         let mut stopped = false;
         let mut sigint = signal(SignalKind::interrupt())?;
+        let mut stop_ctx = ctx.clone();
+        let via = job.payload().target().is_single().then_some(&target);
+        let stop = async {
+            // A stop can race the start, so retry it a few times.
+            for _ in 0..3 {
+                match job_stop(&mut stop_ctx, client, &job_id, via).await {
+                    Err(CommandError::NotFound(_)) => sleep(JOB_STOP_RETRY_INTERVAL).await,
+                    result => return result.map(|()| true),
+                }
+            }
+            Ok(false)
+        };
+        pin!(stop);
+        let poll = Fuse::terminated();
+        pin!(poll);
         let status = loop {
             select! {
                 // Wait for the start request to finish.
                 start_result = &mut start, if !started => {
                     match start_result {
-                        Ok(_) | Err(CommandError::TimedOut) => ctx.job_started(&job, true),
+                        Ok(response) => {
+                            let started = response.into_inner().sleds;
+                            ctx.job_started(&job, Some(&started), StartedDisplay::Note);
+                            sleds = Some(started);
+                        }
+                        Err(CommandError::TimedOut) => {
+                            ctx.job_started(&job, None, StartedDisplay::Note)
+                        }
                         Err(error) => {
                             ctx.job_watch_finished(&job_id);
                             return Err(error);
@@ -1623,10 +1680,18 @@ async fn job_start(
                     ticker.reset_immediately();
                 }
 
-                _ = ticker.tick() => {
-                    last = match job_status_map(ctx, client, &job_id, job_target.single_baseboard()).await {
+                _ = ticker.tick(), if poll.is_terminated() => {
+                    let mut poll_ctx = ctx.clone();
+                    let job_id = &job_id;
+                    poll.set(
+                        async move { job_status_map(&mut poll_ctx, client, job_id, via).await }
+                            .fuse(),
+                    );
+                }
+
+                status = &mut poll, if !poll.is_terminated() => {
+                    last = match status {
                         Ok(status) => status,
-                        // The job may not be visible anywhere yet.
                         Err(CommandError::NotFound(_)) => JobStatusMap::new(),
                         Err(error) => {
                             ctx.job_watch_finished(&job_id);
@@ -1634,8 +1699,11 @@ async fn job_start(
                         }
                     };
                     ctx.job_watch_update(&last);
-                    let rack = rack_sleds(client, &job_target).await;
-                    if settling.done(&job_target, rack, &last) && started {
+                    let rack = match sleds {
+                        Some(_) => None,
+                        None => rack_sleds(client).await,
+                    };
+                    if settling.done(sleds.as_ref(), rack, &last) && started {
                         break last;
                     }
                     if !stalled && last.is_empty() && settling.polls >= WATCH_STALL_POLLS {
@@ -1644,32 +1712,28 @@ async fn job_start(
                     }
                 }
 
-                // While the job runs, an interrupt stops it but keeps
-                // watching: the start future must still resolve, and the
-                // stops are worth seeing. There is a race with the start,
-                // so retry the stop a few times if needed. Once the job
-                // has stopped, or after a first interrupt, an interrupt
-                // just ends the watch.
+                // While the job runs, a first interrupt stops it and keeps
+                // watching; a second ends the watch.
                 _ = sigint.recv() => {
-                    if started || stopped {
+                    let finished = started
+                        && !last.is_empty()
+                        && last.values().all(JobStatus::is_terminal);
+                    if finished || stopping {
                         break last;
                     }
-                    for _ in 0..3 {
-                        match job_stop(ctx, client, &job_id, job_target.single_baseboard()).await {
-                            Ok(_) => {
-                                ctx.job_stopped(&job_id);
-                                stopped = true;
-                                break;
-                            }
-                            Err(CommandError::NotFound(_)) => {
-                                sleep(JOB_STOP_RETRY_INTERVAL).await;
-                            }
-                            Err(error) => {
-                                ctx.job_watch_finished(&job_id);
-                                return Err(error);
-                            }
+                    stopping = true;
+                }
+
+                stop_result = &mut stop, if stopping && !stopped => {
+                    match stop_result {
+                        Ok(true) => ctx.job_stopped(&job_id),
+                        Ok(false) => (),
+                        Err(error) => {
+                            ctx.job_watch_finished(&job_id);
+                            return Err(error);
                         }
                     }
+                    stopped = true;
                 }
             }
         };
@@ -1688,11 +1752,8 @@ async fn job_start(
         // Show the output of every sled the job ran on.
         let multiple = status.len() > 1;
         for baseboard in status.keys() {
-            if multiple {
-                ctx.job_output_target(baseboard);
-            }
             for stream in [Stdout, Stderr] {
-                match with_login_via(ctx, client, Some(baseboard), async || {
+                match with_login(ctx, client, async || {
                     client
                         .job_output()
                         .job_id(job_id)
@@ -1705,18 +1766,16 @@ async fn job_start(
                 {
                     Ok(byte_stream) => {
                         let output = byte_stream_to_vec(byte_stream.into_inner()).await?;
-                        ctx.job_output(&job_id, stream, &output, binary);
+                        ctx.job_output(&job_id, baseboard, stream, &output, binary);
                     }
-                    Err(error) if multiple => {
-                        let _ = ctx.job_error(error);
-                    }
+                    Err(error) if multiple => ctx.command_error(&error),
                     Err(error) => return Err(error),
                 }
             }
         }
     } else {
-        start.await?;
-        ctx.job_started(&job, true);
+        let sleds = cancelable(start).await?.into_inner().sleds;
+        ctx.job_started(&job, Some(&sleds), StartedDisplay::Full);
     }
     Ok(())
 }
@@ -1753,13 +1812,30 @@ async fn permslip_signer<C: CommandContext>(
     Ok(PermslipSigner::connect(ctx.clone(), key_name, permslip_url, authn).await?)
 }
 
+async fn really_supersede(
+    ctx: &mut impl CommandContext,
+    client: &Client,
+    force: bool,
+) -> Result<(), CommandError> {
+    if force {
+        return Ok(());
+    }
+    match with_login(ctx, client, async || client.session().send().await).await {
+        Ok(session) => ctx.really_supersede(&session.into_inner()),
+        Err(CommandError::Session(_)) => Ok(()),
+        Err(error) => Err(error),
+    }
+}
+
 /// Fetch the ceremony inputs from the rack and print the parameters
 /// to relay to the signer, stashing the client nonce for the
 /// eventual start.
 async fn session_start_params(
     ctx: &mut impl CommandContext,
     client: &Client,
+    force: bool,
 ) -> Result<(), CommandError> {
+    really_supersede(ctx, client, force).await?;
     let (baseboard_id, nonce) = with_login(ctx, client, async || {
         Ok((
             client.target().send().await?.into_inner(),
@@ -1774,9 +1850,9 @@ async fn session_start_params(
     Ok(())
 }
 
-/// Assemble the request a job start submits for signing: the
-/// session's next job id, the resolved target, and the mode the
-/// flags name.
+/// Perform preflight checks and assemble the job request,
+/// ready for signing. Unless the session changes first,
+/// the rack should accept the job once it's signed.
 async fn job_start_request(
     ctx: &mut impl CommandContext,
     client: Option<&Client>,
@@ -1785,11 +1861,30 @@ async fn job_start_request(
     let Some(command) = &start_args.command else {
         return Err(CommandError::MissingCommand);
     };
+    let mode = if start_args.interactive {
+        JobMode::Interactive
+    } else if start_args.streaming {
+        let Some(path) = &start_args.file else {
+            return Err(CommandError::StreamingNeedsFile);
+        };
+        if !start_args.force && path.exists() {
+            return Err(CommandError::io(path, ErrorKind::AlreadyExists.into()));
+        }
+        JobMode::StreamOutput
+    } else {
+        JobMode::Batch
+    };
+
     let Some(session_id) = ctx.session_id() else {
         return Err(CommandError::MissingSession);
     };
-    let job_id = ctx.next_job_id()?;
-    let (interactive, streaming) = (start_args.interactive, start_args.streaming);
+    if let Some(client) = client {
+        with_login(ctx, client, async || {
+            client.session_check().session_id(session_id).send().await
+        })
+        .await?;
+    }
+
     let target = match &start_args.target {
         TargetArg::Target(target) => target.clone(),
         abbreviated => {
@@ -1799,37 +1894,24 @@ async fn job_start_request(
             resolve_target_arg(client, abbreviated).await?
         }
     };
-    // An interactive or streaming job binds to the single sled its
-    // attachment will land on.
-    let target = if (interactive || streaming) && target.single_baseboard().is_none() {
-        let Some(client) = client else {
-            return Err(CommandError::InteractiveTarget);
+    let target =
+        if (mode.is_interactive() || mode.is_streaming()) && target.single_baseboard().is_none() {
+            let Some(client) = client else {
+                return Err(CommandError::InteractiveTarget);
+            };
+            Target::from(resolve_target(client, &target).await?)
+        } else if let Some(client) = client {
+            preflight_target(ctx, client, target).await?
+        } else {
+            target
         };
-        Target::from(resolve_target(client, &target).await?)
-    } else {
-        target
-    };
-    // Catch output file problems before anything is signed.
-    if streaming {
-        let Some(path) = &start_args.file else {
-            return Err(CommandError::StreamingNeedsFile);
-        };
-        if !start_args.force && path.exists() {
-            return Err(CommandError::io(path, ErrorKind::AlreadyExists.into()));
-        }
-    }
-    if let Some(client) = client {
-        preflight_target(ctx, client, &target).await?;
-    }
-    let mode = if interactive {
-        JobMode::Interactive
-    } else if streaming {
-        JobMode::StreamOutput
-    } else {
-        JobMode::Batch
-    };
+
     Ok(JobStartRequest::new(
-        job_id, session_id, command, mode, target,
+        ctx.next_job_id()?,
+        session_id,
+        command,
+        mode,
+        target,
     ))
 }
 
@@ -1852,7 +1934,6 @@ async fn session_start(
     client: &Client,
     session_id: SessionId,
     body: SessionStartBody,
-    wait: bool,
     show: bool,
 ) -> Result<(), CommandError> {
     let session = Session::new(session_id);
@@ -1860,7 +1941,6 @@ async fn session_start(
         client
             .session_start()
             .session_id(session.session_id())
-            .wait(wait)
             .body(body.clone())
             .send()
             .await
@@ -1879,7 +1959,7 @@ async fn job_stop(
     job_id: &JobId,
     via: Option<&BaseboardId>,
 ) -> Result<(), CommandError> {
-    with_login_via(ctx, client, via, async || {
+    with_login(ctx, client, async || {
         let mut request = client.job_stop().job_id(job_id).wait(JobWait::Stop);
         if let Some(via) = via {
             request = request.via(via.to_string());
@@ -1910,7 +1990,7 @@ async fn job_status_map(
     job_id: &JobId,
     via: Option<&BaseboardId>,
 ) -> Result<JobStatusMap, CommandError> {
-    let status = with_login_via(ctx, client, via, async || {
+    let status = with_login(ctx, client, async || {
         let mut request = client.job_status().job_id(job_id);
         if let Some(via) = via {
             request = request.via(via.to_string());
@@ -1927,17 +2007,22 @@ const WATCH_INTERVAL: Duration = Duration::from_secs(1);
 
 /// Watch a job's status across the rack, one live line per sled, until
 /// it settles or the user interrupts. Returns the last status map.
+/// `sleds`, if known, are the sleds the job runs on.
 async fn job_watch(
     ctx: &mut impl CommandContext,
     client: &Client,
     job_id: &JobId,
-    target: &Target,
+    sleds: Option<BTreeSet<BaseboardId>>,
 ) -> Result<JobStatusMap, CommandError> {
     ctx.job_watch_started(job_id);
+    let via = sleds
+        .as_ref()
+        .filter(|sleds| sleds.len() == 1)
+        .and_then(BTreeSet::first);
     let mut settling = Settling::default();
     let mut sigint = signal(SignalKind::interrupt())?;
     let status = loop {
-        let status = match job_status_map(ctx, client, job_id, target.single_baseboard()).await {
+        let status = match job_status_map(ctx, client, job_id, via).await {
             Ok(status) => status,
             Err(error) => {
                 ctx.job_watch_finished(job_id);
@@ -1945,8 +2030,11 @@ async fn job_watch(
             }
         };
         ctx.job_watch_update(&status);
-        let rack = rack_sleds(client, target).await;
-        if settling.done(target, rack, &status) {
+        let rack = match sleds {
+            Some(_) => None,
+            None => rack_sleds(client).await,
+        };
+        if settling.done(sleds.as_ref(), rack, &status) {
             break status;
         }
         select! {
@@ -1978,12 +2066,17 @@ struct Settling {
 
 impl Settling {
     /// A watched job has settled once every sled it runs on reports a
-    /// terminal status. A target naming only baseboards is settled as
-    /// soon as they all report. Against the rack inventory, the count
+    /// terminal status. When those `sleds` are known, the job is settled
+    /// as soon as they all report. Against the rack inventory, the count
     /// must match on consecutive polls. Either way, the watch is done
     /// once it is old enough for gossip to have named every sled and
     /// the set of sleds has been stable for a couple of polls.
-    fn done(&mut self, target: &Target, rack: Option<usize>, status: &JobStatusMap) -> bool {
+    fn done(
+        &mut self,
+        sleds: Option<&BTreeSet<BaseboardId>>,
+        rack: Option<usize>,
+        status: &JobStatusMap,
+    ) -> bool {
         self.polls += 1;
         let terminal = !status.is_empty() && status.values().all(JobStatus::is_terminal);
         if terminal && status.len() == self.sleds {
@@ -1997,9 +2090,9 @@ impl Settling {
         } else {
             self.met = 0;
         }
-        if let Some(named) = target.named_baseboards()
-            && named
-                .into_iter()
+        if let Some(sleds) = sleds
+            && sleds
+                .iter()
                 .all(|sled| status.get(sled).is_some_and(JobStatus::is_terminal))
         {
             return true;
@@ -2009,11 +2102,7 @@ impl Settling {
 }
 
 /// The number of sleds in the rack's own inventory, where available.
-/// Skips the fetch for targets whose sleds are named.
-async fn rack_sleds(client: &Client, target: &Target) -> Option<usize> {
-    if target.named_baseboards().is_some() {
-        return None;
-    }
+async fn rack_sleds(client: &Client) -> Option<usize> {
     let sleds = client.versions().send().await.ok()?.into_inner().len();
     (sleds > 0).then_some(sleds)
 }
@@ -2050,6 +2139,13 @@ struct Chunk(Range, ByteStream);
 /// A promise of some bytes for a range of output.
 type FutureChunk<'a> = dyn Future<Output = Result<Chunk, CommandError>> + Send + 'a;
 
+/// Take `job_id`, or else the last job `ctx` knows of.
+fn job_id_or_last(ctx: &impl CommandContext, job_id: Option<JobId>) -> Result<JobId, CommandError> {
+    job_id
+        .or_else(|| ctx.last_job_id())
+        .ok_or(CommandError::MissingJobId)
+}
+
 /// Download job output.
 async fn job_output(
     ctx: &mut impl CommandContext,
@@ -2058,11 +2154,12 @@ async fn job_output(
     stream: JobOutputStream,
     args: JobOutput,
 ) -> Result<(), CommandError> {
+    let job_id = job_id_or_last(ctx, args.job_id)?;
     let target = match target {
         TargetArg::Target(target) => target.clone(),
         TargetArg::Abbreviated(sleds) => {
             if let [SledArg::Serial(serial)] = sleds.as_slice() {
-                let baseboard = resolve_serial(ctx, client, &args.job_id, serial).await?;
+                let baseboard = resolve_serial(ctx, client, &job_id, serial).await?;
                 return job_output_from(ctx, client, &baseboard, stream, args).await;
             }
             resolve_target_arg(client, target).await?
@@ -2077,17 +2174,13 @@ async fn job_output(
     }
 
     // Fetch output from every sled with a recorded status.
-    let status = job_status_map(ctx, client, &args.job_id, None).await?;
+    let status = job_status_map(ctx, client, &job_id, None).await?;
     if status.is_empty() {
-        return Err(CommandError::NotFound(format!(
-            "Job `{}` not found",
-            args.job_id
-        )));
+        return Err(CommandError::NotFound(format!("Job `{job_id}` not found")));
     }
     for baseboard in status.keys() {
-        ctx.job_output_target(baseboard);
         if let Err(error) = job_output_from(ctx, client, baseboard, stream, args.clone()).await {
-            let _ = ctx.job_error(error);
+            ctx.command_error(&error);
         }
     }
     Ok(())
@@ -2107,6 +2200,8 @@ async fn job_output_from(
         parallel,
     }: JobOutput,
 ) -> Result<(), CommandError> {
+    let job_id = job_id_or_last(ctx, job_id)?;
+
     // Fetch job status for output length and hash.
     let status = job_status_map(ctx, client, &job_id, Some(target)).await?;
 
@@ -2212,7 +2307,7 @@ async fn job_output_from(
     } else {
         // Download and print the output all at once. If hash verification
         // fails here, do not print any output.
-        let byte_stream = with_login_via(ctx, client, Some(target), {
+        let byte_stream = with_login(ctx, client, {
             async || {
                 client
                     .job_output()
@@ -2227,7 +2322,7 @@ async fn job_output_from(
         .into_inner();
         let bytes = byte_stream_to_vec(byte_stream).await?;
         check_hash!(hash(&bytes), None)?;
-        ctx.job_output(&job_id, stream, &bytes, binary);
+        ctx.job_output(&job_id, target, stream, &bytes, binary);
         Ok(())
     }
 }
@@ -2295,6 +2390,30 @@ async fn byte_stream_to_file(
     }
 }
 
+/// Explain, from the job's status on `target`, why an attach to
+/// `job_id` there found nothing to attach to.
+async fn attach_refused(
+    ctx: &mut impl CommandContext,
+    client: &Client,
+    job_id: &JobId,
+    target: &BaseboardId,
+) -> CommandError {
+    let status = match job_status_map(ctx, client, job_id, Some(target)).await {
+        Ok(status) => status,
+        Err(error) => return error,
+    };
+    match status.get(target) {
+        None => CommandError::JobNotOnSled(*job_id, target.clone()),
+        Some(JobStatus::Queued { .. }) => CommandError::JobNotYetRunning(*job_id),
+        Some(JobStatus::Started { .. }) => CommandError::JobStartingOrStopping(*job_id),
+        Some(JobStatus::Cancelled { .. }) => CommandError::JobCancelled(*job_id),
+        Some(JobStatus::Skipped { reason, .. }) => CommandError::JobSkipped(*job_id, *reason),
+        Some(JobStatus::Stopped { .. } | JobStatus::Error { .. }) => {
+            CommandError::JobFinished(*job_id)
+        }
+    }
+}
+
 /// Connect via WebSockets to a running interactive job.
 async fn job_attach(
     ctx: &mut impl CommandContext,
@@ -2302,7 +2421,7 @@ async fn job_attach(
     job_id: &JobId,
     target: &BaseboardId,
 ) -> Result<(), CommandError> {
-    match with_login_via(ctx, client, Some(target), async || {
+    match with_login(ctx, client, async || {
         client
             .job_attach()
             .job_id(job_id)
@@ -2337,7 +2456,7 @@ async fn job_stream(
     mut file: File,
 ) -> Result<Hasher, CommandError> {
     let io_error = |error| CommandError::io(path, error);
-    let socket = with_login_via(ctx, client, Some(target), async || {
+    let socket = with_login(ctx, client, async || {
         client
             .job_attach()
             .job_id(job_id)
@@ -2451,13 +2570,13 @@ impl FromStr for TargetArg {
 async fn preflight_target(
     ctx: &mut impl CommandContext,
     client: &Client,
-    target: &Target,
-) -> Result<(), CommandError> {
-    let Target::Sleds(sleds) = target else {
-        return Ok(());
+    target: Target,
+) -> Result<Target, CommandError> {
+    let Target::Sleds(sleds) = &target else {
+        return Ok(target);
     };
     let Ok(inventory) = client.versions().send().await else {
-        return Ok(());
+        return Ok(target);
     };
     let inventory = inventory.into_inner();
     for sled in sleds {
@@ -2469,7 +2588,7 @@ async fn preflight_target(
             ctx.really_target(sled)?;
         }
     }
-    Ok(())
+    Ok(target)
 }
 
 /// Resolve a target argument to a target, matching bare serial
@@ -2528,153 +2647,173 @@ async fn resolve_serial(
 /// What went wrong parsing, preparing, or executing a client command.
 #[derive(Debug, Error)]
 pub enum CommandError {
-    #[error("❌ Serial `{0}` matches more than one sled, use a full baseboard ID")]
+    #[error("Serial `{0}` matches more than one sled, use a full baseboard ID")]
     AmbiguousSerial(String),
-    #[error("❌ Authentication error")]
+    #[error("Authentication error")]
     Authn(#[from] AuthnError),
     #[error(
-        "❌ Authentication failed, client and server are different builds\n   \
-            Client: {client}\n   \
-            Server: {server}"
+        "Authentication failed, client and server are different builds\n   \
+         Client: {client}\n   \
+         Server: {server}"
     )]
     AuthnBuildMismatch {
         client: VersionInfo,
         server: VersionInfo,
     },
-    #[error("❌ Canceled")]
+    #[error("Canceled")]
     Canceled,
-    #[error("❌ Certificate for `{0}` is outside its validity window")]
+    #[error("Certificate for `{0}` is outside its validity window")]
     CertExpired(String),
-    #[error("❌ Chunk size must be positive")]
+    #[error("Chunk size must be positive")]
     ChunkSizeZero,
-    #[error("❓ {0}")]
+    #[error("{0}")]
     Clap(#[from] clap::Error),
-    #[error("❌ {0}")]
+    #[error("{0}")]
     Client(String),
-    #[error("❌ {0}")]
+    #[error("Configuration error: {0}")]
+    Config(#[from] ConfigError),
+    #[error("{0}")]
     Der(#[from] x509_cert::der::Error),
-    #[error("❌ {0}")]
+    #[error("{0}")]
     DurationOutOfRange(#[from] chrono::OutOfRangeError),
-    #[error("❌ Empty certificate chain")]
+    #[error("Empty certificate chain")]
     EmptyCertChain,
-    #[error("❌ Identity error: {0}")]
+    #[error("Identity error: {0}")]
     Identity(#[from] IdentityError),
     #[error(
-        "❌ Identity mismatch,  tried to start an interactive job\n   \
-            for `{interactive}`\n    \
-             as `{key_id}`"
+        "Identity mismatch,  tried to start an interactive job\n   \
+         for `{interactive}`\n    \
+          as `{key_id}`"
     )]
     IdentityMismatch { interactive: KeyId, key_id: KeyId },
-    #[error("❌ Interactive job error: {0}")]
+    #[error("Interactive job error: {0}")]
     Interactive(#[from] InteractiveJobError),
-    #[error("❌ Interactive jobs must target exactly one sled")]
+    #[error("Interactive jobs must target exactly one sled")]
     InteractiveTarget,
-    #[error("❌ Local I/O error accessing `{path}`: {error}")]
+    #[error("Local I/O error accessing `{path}`: {error}")]
     Io {
         path: PathBuf,
         error: std::io::Error,
     },
-    #[error("❌ Signal handling error: {0}")]
+    #[error("Signal handling error: {0}")]
     Signal(#[from] std::io::Error),
-    #[error("❌ Unauthorized, try `iam`")]
+    #[error("Unauthorized, try `iam`")]
     InvalidAuthorization,
-    #[error("❌ Leaf certificate does not match key `{0}`")]
+    #[error("Leaf certificate does not match key `{0}`")]
     InvalidLeafCert(KeyId),
-    #[error("❌ Root certificate is not self-signed")]
+    #[error("Root certificate is not self-signed")]
     InvalidRootCert,
-    #[error("❌ Job `{0}` was cancelled before it started")]
+    #[error("Job `{0}` was cancelled before it started")]
     JobCancelled(JobId),
-    #[error("❌ Job `{0}` did not run")]
+    #[error("Job `{0}` did not run")]
     JobDidNotRun(JobId),
-    #[error("❌ Job `{0}` is not yet running")]
+    #[error("Job `{0}` has finished, try `job status` or `job output`")]
+    JobFinished(JobId),
+    #[error("Job `{0}` not found on sled `{1}`")]
+    JobNotOnSled(JobId, BaseboardId),
+    #[error("Job `{0}` was signed but not started, try `job skip`")]
+    JobNotStarted(JobId, Box<CommandError>),
+    #[error("Job `{0}` is not yet running")]
     JobNotYetRunning(JobId),
-    #[error("⏩ Job `{0}` was skipped on this sled: {1}")]
+    #[error("Job `{0}` was skipped on this sled: {1}")]
     JobSkipped(JobId, SkipReason),
-    #[error("❌ Job `{0}` is still running")]
+    #[error("Job `{0}` is starting or stopping, try again")]
+    JobStartingOrStopping(JobId),
+    #[error("Job `{0}` is still running")]
     JobStillRunning(JobId),
-    #[error("❌ JSON error: {0}")]
+    #[error("JSON error: {0}")]
     Json(#[from] serde_json::Error),
-    #[error("❌ Key error: {0}")]
+    #[error("Key error: {0}")]
     Key(#[from] KeyError),
-    #[error("❌ Length mismatch: expected {expected} bytes, received {received}")]
+    #[error("Length mismatch: expected {expected} bytes, received {received}")]
     LengthMismatch { expected: u64, received: u64 },
-    #[error("❌ Missing client nonce: run `session start-params` first, or pass one")]
+    #[error("Missing client nonce: run `session start-params` first, or pass one")]
     MissingClientNonce,
-    #[error("❌ Missing job command, try `--help`")]
+    #[error("Missing job command, try `--help`")]
     MissingCommand,
+    #[error("`{0}` only works in the REPL, try `sush repl`")]
+    ReplOnly(&'static str),
+    #[error("Unknown option `{0}`, try `set --help`")]
+    UnknownOption(String),
+    #[error("Option `{0}` was not set in the REPL")]
+    OptionNotSet(String),
+    #[error("Missing job ID, try passing one or setting `SUSH_JOB_ID`")]
+    MissingJobId,
     #[cfg(feature = "permslip")]
-    #[error("❌ Missing signing key name, try `--permslip`")]
+    #[error("Missing signing key name, try `--permslip-key`")]
     MissingKeyName,
     #[cfg(feature = "permslip")]
-    #[error("❌ Missing permslip URL, try `--permslip-url` or setting `PERMSLIP_URL`")]
+    #[error("Missing permslip URL, try `--permslip-url` or setting `PERMSLIP_URL`")]
     MissingPermslipUrl,
-    #[error("❌ Missing rack ID, try `--rack` (IDs from `oxide system hardware rack list`)")]
+    #[error("Missing rack ID, try `--rack` (IDs from `oxide system hardware rack list`)")]
     MissingRack,
-    #[error("❌ Missing Nexus token, try `--nexus-token` or setting `SUSH_NEXUS_TOKEN`")]
+    #[error("Missing Nexus token, try `--nexus-token` or setting `SUSH_NEXUS_TOKEN`")]
     MissingNexusToken,
-    #[error("❌ Missing session, try `session start`")]
+    #[error("Missing session, try `session start`")]
     MissingSession,
-    #[error("❌ Missing SSH agent socket, try `--ssh-auth-sock`")]
+    #[error("Missing SSH agent socket, try `--ssh-auth-sock`")]
     MissingSshAuthSock,
-    #[error("❌ {0}")]
+    #[error("{0}")]
     NotFound(String),
-    #[error("❌ Job `{0}` is not the session's next job")]
+    #[error("Job `{0}` is not the session's next job")]
     NotNextJob(JobId),
-    #[error("❌ Command not supported in offline mode, try `--url`")]
+    #[error("Command not supported in offline mode, try `--url`")]
     Offline,
     #[error(
-        "❌ Hash mismatch, output may be truncated or corrupted\n   \
-            Expected: {expected}\n   \
-            Received: {received}"
+        "Hash mismatch, output may be truncated or corrupted\n   \
+         Expected: {expected}\n   \
+         Received: {received}"
     )]
     OutputHashMismatch {
         expected: JobOutputHash,
         received: JobOutputHash,
     },
-    #[error("❌ `--binary` and `--file` need a specific `--target`")]
+    #[error("`--binary` and `--file` need a specific `--target`")]
     OutputNeedsTarget,
     #[cfg(feature = "permslip")]
-    #[error("❌ permslip error: {0}")]
+    #[error("permslip error: {0}")]
     Permslip(#[from] PermslipError),
-    #[error("❌ Job process error: {0}")]
+    #[error("Job process error: {0}")]
     Process(#[from] sush_common::jobs::ProcessError),
-    #[error("❌ Proxy TLS error: {0}")]
+    #[error("Proxy TLS error: {0}")]
     ProxyTls(#[from] tls::ProxyTlsError),
-    #[error("👋 Goodbye!")]
+    #[error("Goodbye!")]
     Quit,
-    #[error("❌ {0}")]
+    #[error("{0}")]
     Readline(#[from] rustyline::error::ReadlineError),
     #[error(transparent)]
     Recursive(#[from] Box<Self>),
-    #[error("❌ Reqwest error: {0}")]
+    #[error("Reqwest error: {0}")]
     Reqwest(#[from] reqwest::Error),
-    #[error("❌ SSH signature error on key ID `{0}`")]
+    #[error("{0}")]
+    Session(String),
+    #[error("SSH signature error on key ID `{0}`")]
     Signature(KeyId),
-    #[error("❌ Streaming jobs need `--file`")]
+    #[error("Streaming jobs need `--file`")]
     StreamingNeedsFile,
-    #[error("❌ Job `{0}` did not exit cleanly, streamed output is unverified")]
+    #[error("Job `{0}` did not exit cleanly, streamed output is unverified")]
     StreamUnverified(JobId),
-    #[error("❌ Can't parse target baseboard ID: {0}")]
+    #[error("Can't parse target baseboard ID: {0}")]
     BaseboardIdParseError(sled_hardware_types::BaseboardIdParseError),
-    #[error("❌ SSH key error: {0}")]
+    #[error("SSH key error: {0}")]
     SshKey(#[from] ssh_key::Error),
-    #[error("❌ Timed out waiting for job")]
+    #[error("Timed out waiting for job")]
     TimedOut,
-    #[error("❌ Too much output to display on terminal, try `--file`")]
+    #[error("Too much output to display on terminal, try `--file`")]
     TooMuchOutput,
-    #[error("❌ Tunnel error: {0}")]
+    #[error("Tunnel error: {0}")]
     Tunnel(#[from] TunnelError),
-    #[error("❌ No sled with serial `{serial}` has a status for job `{job_id}`")]
+    #[error("No sled with serial `{serial}` has a status for job `{job_id}`")]
     UnknownSerial { serial: String, job_id: JobId },
-    #[error("❌ Serial `{0}` matches no sled in the rack inventory")]
+    #[error("Serial `{0}` matches no sled in the rack inventory")]
     UnknownRackSerial(String),
-    #[error("❌ Chain root does not match any supplied root certificate")]
+    #[error("Chain root does not match any supplied root certificate")]
     UntrustedRoot,
-    #[error("❌ Can't start interactive session: {0}")]
+    #[error("Can't start interactive session: {0}")]
     Upgrade(String),
-    #[error("❌ UTF-8 error: {0}")]
+    #[error("UTF-8 error: {0}")]
     Utf8(#[from] std::string::FromUtf8Error),
-    #[error("❌ WebSocket error: {0}")]
+    #[error("WebSocket error: {0}")]
     WebSocket(#[from] WebSocketError),
 }
 
@@ -2684,6 +2823,35 @@ impl CommandError {
         Self::Io {
             path: path.as_ref().to_owned(),
             error,
+        }
+    }
+
+    /// Whether this error says the job has not yet finished.
+    pub fn is_unfinished_job(&self) -> bool {
+        matches!(self, Self::JobNotYetRunning(_) | Self::JobStillRunning(_))
+    }
+
+    fn icon(&self) -> &'static str {
+        match self {
+            Self::Clap(_) => "❓",
+            Self::JobNotStarted(..) => "❗",
+            Self::JobSkipped(..) => "⏩",
+            Self::Quit => "👋",
+            Self::Recursive(error) => error.icon(),
+            _ => "❌",
+        }
+    }
+
+    /// The icon and message of each error in this one, inner first.
+    pub fn errors(&self) -> Vec<(&'static str, String)> {
+        match self {
+            Self::JobNotStarted(_, error) => {
+                let mut errors = error.errors();
+                errors.push((self.icon(), self.to_string()));
+                errors
+            }
+            Self::Recursive(error) => error.errors(),
+            _ => vec![(self.icon(), self.to_string())],
         }
     }
 }
@@ -2696,6 +2864,14 @@ impl From<ClientError<ApiError>> for CommandError {
             CommunicationError(e) if e.is_timeout() => CommandError::TimedOut,
             CommunicationError(e) => CommandError::Client(format!("Communication error: {e}")),
             InvalidUpgrade(e) => CommandError::Client(e.to_string()),
+            ErrorResponse(e)
+                if matches!(
+                    e.error_code.as_deref().map(str::parse),
+                    Some(Ok(ErrorCode::NoSession | ErrorCode::SessionNotCurrent))
+                ) =>
+            {
+                CommandError::Session(e.message.to_owned())
+            }
             ErrorResponse(e) if e.status() == StatusCode::NOT_FOUND => {
                 CommandError::NotFound(e.message.to_owned())
             }
@@ -2745,7 +2921,174 @@ impl From<ClientError<Upgraded>> for CommandError {
 
 #[cfg(test)]
 mod tests {
+    use std::iter::once;
+
+    use chrono::Utc;
+
     use super::*;
+    use crate::cli::Cli;
+
+    /// A rack-wide target can't combine with `--binary` or `--file`.
+    #[tokio::test]
+    async fn output_needs_target() {
+        let client =
+            Client::new_with_client("http://[::1]:1", reqwest::Client::new(), Default::default());
+        let output = JobOutput::try_parse_from([
+            "job-stdout",
+            "--binary",
+            "sea-say-sting-palm-tunnel-festival-pull-bid",
+        ])
+        .unwrap();
+        let err = job_output(
+            &mut Cli::default(),
+            &client,
+            &"*".parse::<TargetArg>().unwrap(),
+            Stdout,
+            output,
+        )
+        .await
+        .unwrap_err();
+        assert!(matches!(err, CommandError::OutputNeedsTarget));
+    }
+
+    /// The watch settles only after the sled set is stable and every sled
+    /// is terminal for consecutive polls.
+    #[test]
+    fn watch_settling() {
+        fn sled(serial: &str) -> BaseboardId {
+            BaseboardId {
+                part_number: "913-0000019".to_owned(),
+                serial_number: serial.to_owned(),
+            }
+        }
+        let job_id: JobId = "sea-say-sting-palm-tunnel-festival-pull-bid"
+            .parse()
+            .unwrap();
+        let terminal = JobStatus::Cancelled {
+            job_id,
+            time_cancelled: Utc::now(),
+            actor: KeyId::random(),
+        };
+        let running = JobStatus::Started {
+            job_id,
+            time_started: Utc::now(),
+        };
+
+        let mut settling = Settling::default();
+        let mut status = JobStatusMap::new();
+        assert!(!settling.done(None, None, &status), "empty never settles");
+
+        status.insert(sled("A"), terminal.clone());
+        assert!(!settling.done(None, None, &status), "new sled resets");
+        assert!(!settling.done(None, None, &status), "first quiet poll");
+        assert!(
+            !settling.done(None, None, &status),
+            "quiet but too young for gossip"
+        );
+        assert!(settling.done(None, None, &status), "old enough, quiet");
+
+        let mut settling = Settling::default();
+        status.insert(sled("B"), running.clone());
+        assert!(!settling.done(None, None, &status), "running sled holds");
+        status.insert(sled("B"), terminal.clone());
+        assert!(
+            !settling.done(None, Some(2), &status),
+            "the rack count must hold"
+        );
+        assert!(
+            settling.done(None, Some(2), &status),
+            "the rack count held twice"
+        );
+
+        let known = BTreeSet::from([sled("A"), sled("B")]);
+        let mut settling = Settling::default();
+        assert!(
+            settling.done(Some(&known), None, &status),
+            "known sleds settle on the first terminal poll"
+        );
+        status.insert(sled("B"), running);
+        assert!(
+            !settling.done(Some(&known), None, &status),
+            "a running known sled holds"
+        );
+        status.insert(sled("B"), terminal);
+        let missing = BTreeSet::from([sled("A"), sled("C")]);
+        let mut settling = Settling::default();
+        assert!(
+            !settling.done(Some(&missing), None, &status),
+            "a missing known sled holds"
+        );
+    }
+
+    /// Anything the target grammar accepts stays a target.
+    #[test]
+    fn target_arg() {
+        assert!(matches!("*".parse(), Ok(TargetArg::Target(_))));
+        assert!(matches!("14".parse(), Ok(TargetArg::Target(_))));
+        assert!(matches!(
+            "913-0000019:BRM42220030".parse(),
+            Ok(TargetArg::Target(_))
+        ));
+        assert!(matches!(
+            "brm42220030".parse(),
+            Ok(TargetArg::Abbreviated(sleds))
+                if matches!(sleds.as_slice(), [SledArg::Serial(s)] if s == "brm42220030")
+        ));
+        assert!(matches!(
+            "14,brm42220030".parse(),
+            Ok(TargetArg::Abbreviated(sleds))
+                if matches!(sleds.as_slice(), [SledArg::Sled(SledId::Cubby(14)), SledArg::Serial(_)])
+        ));
+        assert!(matches!(
+            "913-0000019:BRM42220036,brm42220030".parse(),
+            Ok(TargetArg::Abbreviated(sleds))
+                if matches!(sleds.as_slice(), [SledArg::Sled(SledId::Baseboard(_)), SledArg::Serial(_)])
+        ));
+        assert!("n!ot,a:target".parse::<TargetArg>().is_err());
+        assert!("*,brm42220030".parse::<TargetArg>().is_err());
+    }
+
+    /// [`ClientArgs`] must satisfy Clap's internal consistency asserts
+    /// (unique shorts per subcommand, valid references).
+    #[test]
+    fn client_args() {
+        ClientArgs::command().debug_assert();
+    }
+
+    /// Only commands that contact the server are online, and only the
+    /// REPL, `job start`, and `job attach` handle SIGINT. `sush` with no
+    /// command starts the REPL.
+    #[test]
+    fn command_properties() {
+        let command = |words: &str| {
+            let words = once("sush").chain(words.split_whitespace());
+            let args = ClientArgs::try_parse_from(words).unwrap();
+            args.command.unwrap_or_default()
+        };
+        for words in ["iam", "iam list", "job status"] {
+            assert!(command(words).is_online(), "`{words}` is online");
+        }
+        for words in [
+            "",
+            "iam -l",
+            "iam available",
+            "set --rack r",
+            "unset rack",
+            "version",
+            "quit",
+        ] {
+            assert!(!command(words).is_online(), "`{words}` is offline");
+        }
+        for words in ["", "job start uptime", "job attach"] {
+            assert!(command(words).handles_sigint(), "`{words}` handles SIGINT");
+        }
+        for words in ["job status", "iam", "session", "version"] {
+            assert!(
+                !command(words).handles_sigint(),
+                "`{words}` leaves SIGINT alone"
+            );
+        }
+    }
 
     #[test]
     fn login_refused_blames_build_skew() {

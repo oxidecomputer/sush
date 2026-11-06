@@ -40,10 +40,8 @@ pub trait Versioned: Sized {
 }
 
 /// A [`Locker`](crate::locker::Locker) tenant's record format.
-/// New versions will not compile without a conversion from their
-/// predecessors. The conversion may fail, because the caller can
-/// quarantine a record that will not convert; the boundary store,
-/// for example, stays untrusted.
+/// New versions will not compile without a fallible conversion
+/// from their predecessors.
 pub trait Record: Versioned + Serialize + DeserializeOwned {
     /// The format this one supersedes.
     type Previous: Record + TryInto<Self, Error: Display>;

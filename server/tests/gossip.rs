@@ -18,9 +18,9 @@ use tokio::sync::watch;
 use tokio_util::sync::CancellationToken;
 
 use sush_common::jobs::BaseboardId;
-use sush_server::bookmark::SushBookmark;
 use sush_server::gossip::{LinkedBaseboards, Seed, Universe, spawn_gossip};
 use sush_server::locker::Locker;
+use sush_server::locker::bookmark::SushBookmark;
 
 use common::{
     baseboard, corpus, eventually, gossip_config, localhost, pki, sprockets_config, test_logger,

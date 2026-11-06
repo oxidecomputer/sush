@@ -4,15 +4,33 @@
 
 //! Job server errors.
 
+use std::ffi::c_int;
+use std::fmt::Display;
+use std::io;
 use std::path::{Path, PathBuf};
 
 use dropshot::{ClientErrorStatusCode, HttpError};
 use thiserror::Error;
 
-use sush_common::authn::{Challenge, Nonce};
+use sush_api::ErrorCode;
 use sush_common::interactive::InteractiveJobError;
 use sush_common::jobs::{ExecutionError, JobId, JobOutputHash, SessionId};
 use sush_common::keys::{KeyError, KeyId};
+
+/// Prefix an I/O error with `what` we were doing.
+pub fn io_context(what: impl Display, error: io::Error) -> io::Error {
+    io::Error::new(error.kind(), format!("{what}: {error}"))
+}
+
+/// Check the result of a C function that returns an error number rather
+/// than setting the global `errno`, as libcontract and posix_spawn(3C) do.
+pub fn check_errno(what: impl Display, errno: c_int) -> io::Result<()> {
+    if errno == 0 {
+        Ok(())
+    } else {
+        Err(io_context(what, io::Error::from_raw_os_error(errno)))
+    }
+}
 
 /// What went wrong processing a client job request.
 #[derive(Debug, Error)]
@@ -50,13 +68,17 @@ pub enum JobError {
     Key(#[from] KeyError),
     #[error("Only one session may be running at a time")]
     MultipleSessions,
-    #[error("No current session")]
+    #[error("No sled this job targets is reachable")]
+    NoReachableTarget,
+    #[error("Requests must include an identity, is `SSH_AUTH_SOCK` set?")]
+    NoRequester,
+    #[error("No current session, try `session start`")]
     NoSession,
     #[error("Job `{0}` is not the session's next job")]
     NotNextJob(JobId),
     #[error("Only the session starter may manage the session")]
     NotSessionStarter,
-    #[error("Session `{0}` is no longer current")]
+    #[error("Session `{0}` is no longer current, try `session attach` or `session start`")]
     SessionNotCurrent(SessionId),
     #[error("Job output hash mismatch, file may be corrupt")]
     OutputHashMismatch(JobId, JobOutputHash),
@@ -68,6 +90,8 @@ pub enum JobError {
     PublicKeyMismatch(KeyId),
     #[error("Public key `{0}` not found")]
     PublicKeyNotFound(KeyId),
+    #[error("Only available at proxy servers")]
+    ProxyOnly,
     #[error(transparent)]
     Slice(#[from] std::array::TryFromSliceError),
     #[error(transparent)]
@@ -76,21 +100,19 @@ pub enum JobError {
     Timeout,
     #[error("Too many simultaneous output requests ({0})")]
     TooManyOutputRequests(usize),
-    #[error("Unauthorized request")]
-    Unauthorized(Nonce),
+    #[error("Which sled is in cubby {0} has not yet been reported")]
+    UnknownCubby(u8),
     #[error("Unable to wait for job end")]
     Wait,
     #[error("The provided session ID is invalid")]
     InvalidSessionId,
+    #[error("Job signature verification failed: {0}")]
+    UnverifiedJob(KeyError),
 }
 
 impl JobError {
     pub fn closed<E>(_err: E) -> Self {
         Self::ChannelClosed
-    }
-
-    pub fn unauthorized(nonce: Nonce) -> Self {
-        Self::Unauthorized(nonce)
     }
 
     /// Report I/O errors with the corresponding stream name.
@@ -160,27 +182,29 @@ impl From<JobError> for HttpError {
                 ClientErrorStatusCode::TOO_MANY_REQUESTS,
                 error.to_string(),
             ),
-            Unauthorized(nonce) => {
-                let mut err = HttpError::for_client_error(
-                    None,
-                    ClientErrorStatusCode::UNAUTHORIZED,
-                    String::from("Authentication required, try `iam`"),
-                );
-                let challenge = Challenge::new(nonce);
-                err.add_header("WWW-Authenticate", challenge)
-                    .expect("should be able to add WWW-Authenticate header");
-                err
-            }
             AttachDenied | NotSessionStarter => {
                 HttpError::for_client_error(None, ClientErrorStatusCode::FORBIDDEN, message)
             }
-            IdentityNotFound(_) | JobNotFound(_) | NoSession | OutputFileMissing(_)
-            | SessionNotCurrent(_) => {
+            IdentityNotFound(_) | JobNotFound(_) | OutputFileMissing(_) => {
                 HttpError::for_client_error(None, ClientErrorStatusCode::NOT_FOUND, message)
             }
+            NoSession => HttpError::for_client_error(
+                Some(ErrorCode::NoSession.to_string()),
+                ClientErrorStatusCode::NOT_FOUND,
+                message,
+            ),
+            SessionNotCurrent(_) => HttpError::for_client_error(
+                Some(ErrorCode::SessionNotCurrent.to_string()),
+                ClientErrorStatusCode::GONE,
+                message,
+            ),
             DuplicateJobId(_) | InteractiveTarget | InvalidCommand | Json(_) | MultipleSessions
-            | InvalidSessionId => {
+            | InvalidSessionId | NoReachableTarget | NoRequester | UnknownCubby(_)
+            | UnverifiedJob(_) => {
                 HttpError::for_client_error(None, ClientErrorStatusCode::BAD_REQUEST, message)
+            }
+            ProxyOnly => {
+                HttpError::for_client_error(None, ClientErrorStatusCode::NOT_FOUND, message)
             }
             NotNextJob(_) => {
                 HttpError::for_client_error(None, ClientErrorStatusCode::CONFLICT, message)

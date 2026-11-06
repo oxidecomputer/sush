@@ -1,5 +1,5 @@
 [workspace]
-members = ["api", "client", "common", "server", "tests", "xtask"]
+members = ["api", "client", "common", "proxy", "server", "tests", "xtask"]
 resolver = "2"
 
 [workspace.package]
@@ -22,7 +22,7 @@ chrono = { version = "0.4", features = ["serde"] }
 ciborium = "0.2"
 clap = { version = "4", features = ["derive", "env", "wrap_help"] }
 crypto-bigint = "0.5"
-dropshot = "0.17"
+dropshot = "0.18"
 ed25519-dalek = { version = "2", features = ["pkcs8", "rand_core"] }
 function_name = "0.3"
 futures = "0.3"
@@ -35,6 +35,7 @@ hyper = { version = "1", features = ["client", "http1", "server"] }
 hyper-util = { version = "0.1", features = ["tokio"] }
 indicatif = "0.18"
 libc = "0.2"
+libcontract-sys = "1"
 lru = "0.18"
 memmap2 = "0.9"
 p256 = { version = "0.13", features = ["ecdsa", "pkcs8"] }
@@ -42,8 +43,8 @@ pem-rfc7468 = { version = "0.7", features = ["std"] }
 percent-encoding = "2"
 permission-slip-client = { git = "https://github.com/oxidecomputer/permission-slip", rev = "e1ac78d5ddf1e02b977d6c5d1c1147cb08dac1ca", features = ["sush-types"] }
 pki-playground = { git = "https://github.com/oxidecomputer/pki-playground", rev = "7600756029ce046a02c6234aa84ce230cc5eaa04" }
-progenitor = "0.14"
-progenitor-client = "0.14"
+progenitor = "0.15"
+progenitor-client = "0.15"
 pwd = "1"
 rand = "0.8"
 rand_core = "0.6"
@@ -52,6 +53,7 @@ rlimit = "0.10"
 rumors = { git = "https://github.com/oxidecomputer/rumors", rev = "bf2ba264e2360eab1ba5f06148ea3ef3050825c8" }
 rustix = { version = "1", features = ["fs", "process", "pty", "termios"] }
 rustls = "0.23"
+rusty-fork = "0.3"
 rustyline = { git = "https://github.com/kkawakam/rustyline", rev = "5ab22f2f8d65e85f0b925360437ece8eeeb6db92", features = ["signal-hook", "termios"] }
 schemars = { version = "0.8", features = ["chrono"] }
 serde = "1"
@@ -63,17 +65,19 @@ signature = "2"
 sled-hardware-types = { git = "https://github.com/oxidecomputer/omicron", tag = "rel/v21/rc1" }
 slog = "2"
 slog-term = "2"
-sprockets-tls = { git = "https://github.com/oxidecomputer/sprockets.git", rev = "98615b86d51f74ce220198eb16c57932fd24e7cb", default-features = false }
-sprockets-tls-test-utils = { git = "https://github.com/oxidecomputer/sprockets.git", rev = "98615b86d51f74ce220198eb16c57932fd24e7cb" }
+sprockets-tls = { git = "https://github.com/oxidecomputer/sprockets.git", rev = "02c7e5414d97c0c85d629cb76d1f6beab73d960e", default-features = false }
+sprockets-tls-test-utils = { git = "https://github.com/oxidecomputer/sprockets.git", rev = "02c7e5414d97c0c85d629cb76d1f6beab73d960e" }
 ssh-key = { version = "0.6", features = ["ed25519", "p256", "serde"] }
+strum = { version = "0.27", features = ["derive"] }
 tempfile = "3"
 thiserror = "1"
-tokio = { version = "1", features = ["macros", "process", "rt", "sync", "time"] }
+tokio = { version = "1", features = ["macros", "process", "rt", "signal", "sync", "time"] }
 tokio-rustls = "0.26"
 tokio-stream = "0.1"
 tokio-fd = "0.3"
 tokio-tungstenite = "0.28"
 tokio-util = "0.7"
+toml = "1"
 webbrowser = "1"
 x509-cert = { version = "0.2", features = ["pem", "std"] }
 xdg = "3"

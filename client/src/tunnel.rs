@@ -81,6 +81,7 @@ struct Target {
 
 /// A running tunnel. Dropping it closes the listener and every
 /// connection in flight.
+#[derive(Debug)]
 pub struct Tunnel {
     /// The loopback URL standing in for the sush proxy.
     pub url: String,

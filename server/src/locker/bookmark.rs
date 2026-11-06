@@ -154,6 +154,8 @@ mod test {
     use tempfile::TempDir;
     use tokio::io::AsyncReadExt as _;
 
+    use sush_common::jobs::BaseboardId;
+
     /// Two slot directories, like two M.2s.
     fn slots(dir: &TempDir) -> Vec<Utf8PathBuf> {
         ["m2a", "m2b"]
@@ -171,7 +173,14 @@ mod test {
     }
 
     fn source(slots: Vec<Utf8PathBuf>) -> BookmarkSource {
-        BookmarkSource::new(&test_log(), &Locker::new(&test_log(), slots).unwrap())
+        let baseboard = BaseboardId {
+            part_number: "913".to_string(),
+            serial_number: "test".to_string(),
+        };
+        BookmarkSource::new(
+            &test_log(),
+            &Locker::new(&test_log(), baseboard, slots).unwrap(),
+        )
     }
 
     async fn read_back(handle: &SushBookmark) -> Option<Vec<u8>> {

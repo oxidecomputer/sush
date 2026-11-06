@@ -4,6 +4,7 @@
 
 //! Job manager tests.
 
+use std::collections::BTreeSet;
 use std::mem::MaybeUninit;
 use std::os::unix::fs::PermissionsExt as _;
 use std::path::Path;
@@ -23,26 +24,24 @@ use tokio_util::sync::CancellationToken;
 use x509_cert::time::Validity;
 
 use sush_api::{JobStartParams, JobStopParams, JobWait};
-use sush_client::context::Authz;
-use sush_common::authn::{Challenge, ChallengeResponse, Credentials, Identity, Nonce, RequestKey};
 use sush_common::jobs::{
     Access, JobId, JobLimits, JobMode, JobOutputState, JobOutputStream::*, JobStartRequest,
     JobStatus, ProcessError, Session, SessionId, SessionPreimage, SessionSeq, SessionSignerNonce,
     SignedJob, SkipReason,
 };
-use sush_common::keys::{EphemeralKey, KeyError, KeyType, Signer as _, pem_cert_chain};
+use sush_common::keys::{EphemeralKey, KeyError, KeyId, KeyType, Signer as _, pem_cert_chain};
 use sush_common::targets::{Cubbies, Target};
 use sush_server::gossip::{LinkedBaseboards, Universe};
 use sush_server::io::BATCH_OUTPUT_BUFFER_SIZE;
 use sush_server::locker::Locker;
-use sush_server::messages::v0::{IdentityRequest, Message, Request, SessionRequest};
+use sush_server::messages::v0::{Message, Request, SessionRequest};
 use sush_server::output::{JobOutputDir, OutputDirs};
 use sush_server::{JobError, JobManager};
 
 use crate::test_utils::{
-    IntoBytes as _, SessionCeremony, SignJobRequest as _, ephemeral_test_root,
-    ephemeral_test_subject, fake_identity, manager_and_test_root, manager_test_root_and_peer,
-    no_cubbies, null_gossip, session_ceremony, test_baseboard_id, test_logger,
+    IntoBytes as _, SessionCeremony, SignJobRequest as _, confirm_start, ephemeral_test_root,
+    ephemeral_test_subject, manager_and_test_root, manager_test_root_and_peer, no_cubbies,
+    null_gossip, requester, session_ceremony, test_baseboard_id, test_logger,
 };
 use sush_server::executor::PathIsolation;
 
@@ -101,7 +100,7 @@ async fn jobs() {
     let log = test_logger(function_name!());
     let (mgr, mut root, dir, _shutdown) = manager_and_test_root(log).await;
     let baseboard_id = mgr.own_baseboard();
-    let authn = fake_identity(&mut root).await;
+    let authn = requester(&root);
     let SessionCeremony {
         session_id,
         client_nonce,
@@ -110,7 +109,7 @@ async fn jobs() {
         ..
     } = session_ceremony(&mgr, 1);
     let mut session = Session::new(session_id);
-    mgr.session_start(&authn, session_id, client_nonce, signer_nonce, seq, true)
+    mgr.session_start(&authn, session_id, client_nonce, signer_nonce, seq)
         .await
         .unwrap();
 
@@ -270,6 +269,261 @@ async fn jobs() {
     );
 }
 
+/// A job runs in a contract of its own, labeled with its job ID.
+#[cfg(target_os = "illumos")]
+#[named]
+#[tokio::test]
+async fn job_contract() {
+    let log = test_logger(function_name!());
+    let (mgr, mut root, _dir, _shutdown) = manager_and_test_root(log).await;
+    let authn = requester(&root);
+    let SessionCeremony {
+        session_id,
+        client_nonce,
+        signer_nonce,
+        seq,
+        ..
+    } = session_ceremony(&mgr, 1);
+    let session = Session::new(session_id);
+    mgr.session_start(&authn, session_id, client_nonce, signer_nonce, seq)
+        .await
+        .unwrap();
+
+    let job_id = session.next_job_id();
+    // We abandon the contract after the spawn returns, so the job may
+    // see it held at first.
+    let command = r#"
+        ctid=$(ps -o ctid= -p $$)
+        fail() { echo "$1" >&2; ctstat -v -i $ctid >&2; exit 1; }
+        test $ctid != $(ps -o ctid= -p $PPID) ||
+            fail "job shares contract $ctid with its parent"
+        for i in 1 2 3 4 5; do
+            state=$(ctstat -i $ctid | awk 'NR == 2 { print $4 }')
+            test "$state" = orphan && break
+            sleep 1
+        done
+        test "$state" = orphan || fail "contract $ctid is $state, not orphan"
+        status=$(ctstat -v -i $ctid | sed 's/^[[:space:]]*//; s/:[[:space:]]*/: /')
+        for field in \
+            "critical event set: none" \
+            "informative event set: none" \
+            "fatal event set: hwerr" \
+            "parameter set: pgrponly" \
+            "aux: sush job $SUSH_JOB_ID"
+        do
+            echo "$status" | grep -Fqx "$field" ||
+                fail "contract $ctid lacks \"$field\""
+        done"#;
+    let job = root
+        .sign_job_request(job_id, session_id, command, false)
+        .await;
+    mgr.job_start(
+        &authn,
+        job.into_signed(),
+        JobStartParams {
+            wait: JobWait::Stop,
+            ..Default::default()
+        },
+    )
+    .await
+    .unwrap();
+    let baseboard_id = mgr.own_baseboard();
+    let stderr = mgr
+        .job_output(&authn, &job_id, baseboard_id, Stderr, None)
+        .await
+        .unwrap()
+        .into_bytes()
+        .await;
+    assert!(stderr.is_empty(), "{}", String::from_utf8_lossy(&stderr));
+    let status = mgr.job_status(&authn, &job_id).await.unwrap()[baseboard_id].clone();
+    check_status_stopped(status, &job_id, Ok(0), None, None);
+}
+
+/// Stopping a job kills every process in its contract, including one
+/// in a process group of its own.
+#[cfg(target_os = "illumos")]
+#[named]
+#[tokio::test]
+async fn job_stop_reaches_contract() {
+    let log = test_logger(function_name!());
+    let (mgr, mut root, _dir, _shutdown) = manager_and_test_root(log).await;
+    let authn = requester(&root);
+    let SessionCeremony {
+        session_id,
+        client_nonce,
+        signer_nonce,
+        seq,
+        ..
+    } = session_ceremony(&mgr, 1);
+    let session = Session::new(session_id);
+    mgr.session_start(&authn, session_id, client_nonce, signer_nonce, seq)
+        .await
+        .unwrap();
+
+    // With job control on, bash runs `sleep` in its own process group.
+    let job_id = session.next_job_id();
+    let command = "set -m; sleep 1000 & echo $!; wait";
+    let job = root
+        .sign_job_request(job_id, session_id, command, false)
+        .await;
+    mgr.job_start(
+        &authn,
+        job.into_signed(),
+        JobStartParams {
+            wait: JobWait::Start,
+            ..Default::default()
+        },
+    )
+    .await
+    .unwrap();
+    let baseboard_id = mgr.own_baseboard();
+    let pid: i32 = timeout(Duration::from_secs(10), async {
+        loop {
+            let stdout = mgr
+                .job_output(&authn, &job_id, baseboard_id, Stdout, None)
+                .await
+                .unwrap()
+                .into_bytes()
+                .await;
+            if let Ok(pid) = String::from_utf8_lossy(&stdout).trim().parse() {
+                break pid;
+            }
+            sleep(Duration::from_millis(50)).await;
+        }
+    })
+    .await
+    .expect("job never reported its sleep's pid");
+
+    mgr.job_stop(
+        &authn,
+        &job_id,
+        JobStopParams {
+            wait: JobWait::Stop,
+            ..Default::default()
+        },
+    )
+    .await
+    .unwrap();
+    timeout(Duration::from_secs(10), async {
+        while unsafe { libc::kill(pid, 0) } == 0 {
+            sleep(Duration::from_millis(50)).await;
+        }
+    })
+    .await
+    .expect("sleep outside the job's process group survived the stop");
+}
+
+/// A job's bash sees the job's limits as soft limits, and sees
+/// `SSH_CLIENT` set.
+#[named]
+#[tokio::test]
+async fn job_limits_and_environment() {
+    let log = test_logger(function_name!());
+    let (mgr, mut root, _dir, _shutdown) = manager_and_test_root(log).await;
+    let authn = requester(&root);
+    let SessionCeremony {
+        session_id,
+        client_nonce,
+        signer_nonce,
+        seq,
+        ..
+    } = session_ceremony(&mgr, 1);
+    let session = Session::new(session_id);
+    mgr.session_start(&authn, session_id, client_nonce, signer_nonce, seq)
+        .await
+        .unwrap();
+
+    let job_id = session.next_job_id();
+    let command = r#"echo "$(ulimit -S -t) $(ulimit -S -v) $(ulimit -S -f) $SSH_CLIENT""#;
+    let job = root
+        .sign_job_request(job_id, session_id, command, false)
+        .await;
+    mgr.job_start(
+        &authn,
+        job.into_signed(),
+        JobStartParams {
+            wait: JobWait::Stop,
+            ..Default::default()
+        },
+    )
+    .await
+    .unwrap();
+    let baseboard_id = mgr.own_baseboard();
+    let stdout = mgr
+        .job_output(&authn, &job_id, baseboard_id, Stdout, None)
+        .await
+        .unwrap()
+        .into_bytes()
+        .await;
+    let JobLimits {
+        max_cpu,
+        max_mem,
+        max_fsize,
+    } = JobLimits::default().clamp().unwrap();
+    assert_eq!(
+        String::from_utf8_lossy(&stdout),
+        format!(
+            "{max_cpu} {} {} sush\n",
+            max_mem.div_ceil(1024),
+            max_fsize.div_ceil(1024)
+        )
+    );
+}
+
+/// An interactive job leads its own session, with its pseudoterminal
+/// as its controlling terminal.
+#[named]
+#[tokio::test]
+async fn interactive_job_session() {
+    let log = test_logger(function_name!());
+    let (mgr, mut root, _dir, _shutdown) = manager_and_test_root(log).await;
+    let authn = requester(&root);
+    let SessionCeremony {
+        session_id,
+        client_nonce,
+        signer_nonce,
+        seq,
+        ..
+    } = session_ceremony(&mgr, 1);
+    let session = Session::new(session_id);
+    mgr.session_start(&authn, session_id, client_nonce, signer_nonce, seq)
+        .await
+        .unwrap();
+
+    let job_id = session.next_job_id();
+    let command = r#"
+        test $(ps -o sid= -p $$) -eq $$ || echo "not a session leader"
+        { : </dev/tty; } 2>/dev/null || echo "no controlling terminal"
+        test "$(tty)" = "$SUSH_TTY" || echo "stdin is not the job's terminal""#;
+    let job = root
+        .sign_job_request_for(
+            job_id,
+            session_id,
+            command,
+            true,
+            test_baseboard_id().into(),
+        )
+        .await;
+    mgr.job_start(
+        &authn,
+        job.into_signed(),
+        JobStartParams {
+            wait: JobWait::Stop,
+            ..Default::default()
+        },
+    )
+    .await
+    .unwrap();
+    let baseboard_id = mgr.own_baseboard();
+    let stdout = mgr
+        .job_output(&authn, &job_id, baseboard_id, Stdout, None)
+        .await
+        .unwrap()
+        .into_bytes()
+        .await;
+    assert!(stdout.is_empty(), "{}", String::from_utf8_lossy(&stdout));
+}
+
 /// A job signed for anything but the active session is refused with
 /// an error status, not silently discarded.
 #[named]
@@ -277,7 +531,7 @@ async fn jobs() {
 async fn job_session_enforced() {
     let log = test_logger(function_name!());
     let (mgr, mut root, _dir, _shutdown) = manager_and_test_root(log).await;
-    let authn = fake_identity(&mut root).await;
+    let authn = requester(&root);
 
     // With no active session, submission fails at the front door.
     let ghost = Session::new(SessionId::random());
@@ -298,9 +552,10 @@ async fn job_session_enforced() {
         seq,
         ..
     } = session_ceremony(&mgr, 1);
-    mgr.session_start(&authn, session_id, client_nonce, signer_nonce, seq, true)
+    mgr.session_start(&authn, session_id, client_nonce, signer_nonce, seq)
         .await
         .unwrap();
+    confirm_start(&mgr, &authn, &mut root, &mut Session::new(session_id)).await;
     assert!(matches!(
         mgr.job_start(&authn, job.into_signed(), JobStartParams::default())
             .await,
@@ -314,8 +569,8 @@ async fn job_session_enforced() {
 #[tokio::test]
 async fn fetch_rotates_server_nonce() {
     let log = test_logger(function_name!());
-    let (mgr, mut root, _dir, _shutdown) = manager_and_test_root(log).await;
-    let authn = fake_identity(&mut root).await;
+    let (mgr, root, _dir, _shutdown) = manager_and_test_root(log).await;
+    let authn = requester(&root);
 
     let ceremony = session_ceremony(&mgr, 1);
     let bogus = SessionId::random();
@@ -326,7 +581,6 @@ async fn fetch_rotates_server_nonce() {
             ceremony.client_nonce,
             ceremony.signer_nonce,
             ceremony.seq,
-            true,
         )
         .await,
         Err(JobError::InvalidSessionId)
@@ -340,7 +594,6 @@ async fn fetch_rotates_server_nonce() {
         ceremony.client_nonce,
         ceremony.signer_nonce,
         ceremony.seq,
-        true,
     )
     .await
     .unwrap();
@@ -359,7 +612,6 @@ async fn fetch_rotates_server_nonce() {
         ceremony.client_nonce,
         second.signer_nonce,
         second.seq,
-        true,
     )
     .await
     .unwrap();
@@ -379,7 +631,6 @@ async fn fetch_rotates_server_nonce() {
             ceremony.client_nonce,
             stale.signer_nonce,
             stale.seq,
-            true,
         )
         .await,
         Err(JobError::InvalidSessionId)
@@ -392,7 +643,7 @@ async fn job_stop() {
     let log = test_logger(function_name!());
     let (mgr, mut root, _dir, _shutdown) = manager_and_test_root(log).await;
     let baseboard_id = mgr.own_baseboard();
-    let authn = fake_identity(&mut root).await;
+    let authn = requester(&root);
     let SessionCeremony {
         session_id,
         client_nonce,
@@ -401,34 +652,44 @@ async fn job_stop() {
         ..
     } = session_ceremony(&mgr, 1);
     let mut session = Session::new(session_id);
-    mgr.session_start(&authn, session_id, client_nonce, signer_nonce, seq, true)
+    mgr.session_start(&authn, session_id, client_nonce, signer_nonce, seq)
         .await
         .unwrap();
+    confirm_start(&mgr, &authn, &mut root, &mut session).await;
 
-    // Stopping a nonexistent job should mark it cancelled, and so succeed
-    // immediately.
+    // A job a server hasn't seen can't be stopped.
     let job_id = session.next_job_id();
-    mgr.job_stop(
-        &authn,
-        &job_id,
-        JobStopParams {
-            wait: JobWait::Stop,
-            ..Default::default()
-        },
-    )
-    .await
-    .expect("should be able to stop a nonexistent job");
-
     assert!(matches!(
-        &mgr.job_status(&authn, &job_id).await.unwrap()[baseboard_id],
-        JobStatus::Cancelled { job_id: jid, time_cancelled, .. } if *jid == job_id && *time_cancelled <= Utc::now()
+        mgr.job_stop(&authn, &job_id, JobStopParams::default())
+            .await,
+        Err(JobError::JobNotFound(_))
+    ));
+    assert!(matches!(
+        mgr.job_status(&authn, &job_id).await,
+        Err(JobError::JobNotFound(_))
     ));
 
-    // Skip the cancelled job.
+    // Skipping it is the starter's prerogative.
     session.skip_job(job_id);
     mgr.session_skip_job(&authn, session_id, job_id)
         .await
-        .expect("should be able to skip cancelled job");
+        .expect("should be able to skip a job");
+    timeout(Duration::from_secs(30), async {
+        loop {
+            if let Ok(status) = mgr.job_status(&authn, &job_id).await
+                && matches!(
+                    &status[baseboard_id],
+                    JobStatus::Cancelled { job_id: jid, time_cancelled, .. }
+                        if *jid == job_id && *time_cancelled <= Utc::now()
+                )
+            {
+                break;
+            }
+            sleep(Duration::from_millis(50)).await;
+        }
+    })
+    .await
+    .expect("skip never cancelled the job");
 
     // Start a new (potentially) long-running job.
     let command = "sleep 10";
@@ -487,7 +748,7 @@ async fn job_stop() {
 async fn queue_job_behind_hole(
     mgr: &JobManager,
     root: &mut EphemeralKey,
-    authn: &Identity,
+    authn: &KeyId,
     session: &mut Session,
 ) -> JobId {
     let session_id = session.session_id();
@@ -513,7 +774,7 @@ async fn queue_job_behind_hole(
 async fn cancel_queued_job() {
     let log = test_logger(function_name!());
     let (mgr, mut root, _dir, _shutdown) = manager_and_test_root(log).await;
-    let authn = fake_identity(&mut root).await;
+    let authn = requester(&root);
     let SessionCeremony {
         session_id,
         client_nonce,
@@ -522,7 +783,7 @@ async fn cancel_queued_job() {
         ..
     } = session_ceremony(&mgr, 1);
     let mut session = Session::new(session_id);
-    mgr.session_start(&authn, session_id, client_nonce, signer_nonce, seq, true)
+    mgr.session_start(&authn, session_id, client_nonce, signer_nonce, seq)
         .await
         .unwrap();
 
@@ -579,7 +840,7 @@ async fn cancel_queued_job() {
     .expect("should be able to stop job A");
 }
 
-async fn wait_for_session_ended_skip(mgr: &JobManager, authn: &Identity, job_id: &JobId) {
+async fn wait_for_session_ended_skip(mgr: &JobManager, authn: &KeyId, job_id: &JobId) {
     timeout(Duration::from_secs(30), async {
         loop {
             if let Ok(map) = mgr.job_status(authn, job_id).await
@@ -605,7 +866,7 @@ async fn wait_for_session_ended_skip(mgr: &JobManager, authn: &Identity, job_id:
 async fn session_stop_skips_queued_jobs() {
     let log = test_logger(function_name!());
     let (mgr, mut root, _dir, _shutdown) = manager_and_test_root(log).await;
-    let authn = fake_identity(&mut root).await;
+    let authn = requester(&root);
     let SessionCeremony {
         session_id,
         client_nonce,
@@ -614,7 +875,7 @@ async fn session_stop_skips_queued_jobs() {
         ..
     } = session_ceremony(&mgr, 1);
     let mut session = Session::new(session_id);
-    mgr.session_start(&authn, session_id, client_nonce, signer_nonce, seq, true)
+    mgr.session_start(&authn, session_id, client_nonce, signer_nonce, seq)
         .await
         .unwrap();
 
@@ -646,16 +907,12 @@ async fn session_stop_skips_queued_jobs() {
         JobStatus::Started { .. }
     ));
 
-    mgr.job_stop(
-        &authn,
-        &job_id_a,
-        JobStopParams {
-            wait: JobWait::Stop,
-            ..Default::default()
-        },
-    )
-    .await
-    .expect("should be able to stop job A");
+    // The job outlives its session.
+    assert!(matches!(
+        mgr.job_stop(&authn, &job_id_a, JobStopParams::default())
+            .await,
+        Err(JobError::NoSession)
+    ));
 }
 
 #[named]
@@ -663,7 +920,7 @@ async fn session_stop_skips_queued_jobs() {
 async fn superseding_session_skips_queued_jobs() {
     let log = test_logger(function_name!());
     let (mgr, mut root, _dir, _shutdown) = manager_and_test_root(log).await;
-    let authn = fake_identity(&mut root).await;
+    let authn = requester(&root);
     let SessionCeremony {
         session_id,
         client_nonce,
@@ -672,9 +929,10 @@ async fn superseding_session_skips_queued_jobs() {
         ..
     } = session_ceremony(&mgr, 1);
     let mut session = Session::new(session_id);
-    mgr.session_start(&authn, session_id, client_nonce, signer_nonce, seq, true)
+    mgr.session_start(&authn, session_id, client_nonce, signer_nonce, seq)
         .await
         .unwrap();
+    confirm_start(&mgr, &authn, &mut root, &mut session).await;
 
     let job_id = queue_job_behind_hole(&mgr, &mut root, &authn, &mut session).await;
 
@@ -691,10 +949,10 @@ async fn superseding_session_skips_queued_jobs() {
         new_client_nonce,
         new_signer_nonce,
         new_seq,
-        true,
     )
     .await
     .expect("should be able to start a superseding session");
+    confirm_start(&mgr, &authn, &mut root, &mut Session::new(new_session_id)).await;
     wait_for_session_ended_skip(&mgr, &authn, &job_id).await;
 }
 
@@ -705,7 +963,7 @@ async fn job_output_perms() {
     let (mgr, mut root, dir, _shutdown) = manager_and_test_root(log).await;
     let dir_perms = metadata(&dir).await.unwrap().permissions();
     let baseboard_id = mgr.own_baseboard();
-    let authn = fake_identity(&mut root).await;
+    let authn = requester(&root);
     let SessionCeremony {
         session_id,
         client_nonce,
@@ -714,7 +972,7 @@ async fn job_output_perms() {
         ..
     } = session_ceremony(&mgr, 1);
     let session = Session::new(session_id);
-    mgr.session_start(&authn, session_id, client_nonce, signer_nonce, seq, true)
+    mgr.session_start(&authn, session_id, client_nonce, signer_nonce, seq)
         .await
         .unwrap();
 
@@ -755,10 +1013,11 @@ async fn job_output_perms() {
     assert_eq!(mode(&out.job_output_path(&job_id, Stderr)).await, 0o600);
 }
 
+/// A cubby resolves through the rack's cubby map when a job is
+/// accepted.
 #[named]
 #[tokio::test]
 async fn cubby_targets() {
-    // A cubby target only matches through the rack's cubby map.
     let log = test_logger(function_name!());
     let dir = TempDir::with_prefix("sush-").unwrap();
     let mut root = ephemeral_test_root();
@@ -777,7 +1036,7 @@ async fn cubby_targets() {
     )
     .await
     .unwrap();
-    let authn = fake_identity(&mut root).await;
+    let authn = requester(&root);
     let SessionCeremony {
         session_id,
         client_nonce,
@@ -786,78 +1045,44 @@ async fn cubby_targets() {
         ..
     } = session_ceremony(&mgr, 1);
     let mut session = Session::new(session_id);
-    mgr.session_start(&authn, session_id, client_nonce, signer_nonce, seq, true)
+    mgr.session_start(&authn, session_id, client_nonce, signer_nonce, seq)
         .await
         .unwrap();
     let target: Target = "14".parse().unwrap();
-
-    // With the map empty, a cubby-targeted job records no status here.
-    // The all-target job behind it in the session's job chain proves
-    // it was processed, not merely still queued.
-    let skipped_id = session.next_job_id();
-    let job = root
-        .sign_job_request_for(skipped_id, session_id, "true", false, target.clone())
-        .await;
-    mgr.job_start(&authn, job.clone().into_signed(), JobStartParams::default())
-        .await
-        .unwrap();
-    session.job_started(job.into_signed());
-    let job_id = session.next_job_id();
-    let job = root
-        .sign_job_request(job_id, session_id, "true", false)
-        .await;
-    mgr.job_start(
-        &authn,
-        job.clone().into_signed(),
-        JobStartParams {
-            wait: JobWait::Stop,
-            ..Default::default()
-        },
-    )
-    .await
-    .unwrap();
-    session.job_started(job.into_signed());
-    assert!(matches!(
-        mgr.job_status(&authn, &skipped_id).await.unwrap_err(),
-        JobError::JobNotFound(jid) if jid == skipped_id
-    ));
-
-    // Name this baseboard in the map. The update lands whenever the
-    // state task gets to it, so probe with fresh jobs until one takes.
-    cubbies
-        .send(Cubbies::from([(14, test_baseboard_id())]))
-        .unwrap();
-    loop {
-        let job_id = session.next_job_id();
-        let job = root
-            .sign_job_request_for(job_id, session_id, "true", false, target.clone())
-            .await;
-        mgr.job_start(&authn, job.clone().into_signed(), JobStartParams::default())
-            .await
-            .unwrap();
-        session.job_started(job.into_signed());
-        sleep(Duration::from_millis(50)).await;
-        if mgr.job_status(&authn, &job_id).await.is_ok() {
-            break;
-        }
-    }
-
-    // Now cubby-targeted jobs run here.
     let job_id = session.next_job_id();
     let job = root
         .sign_job_request_for(job_id, session_id, "true", false, target)
         .await;
-    mgr.job_start(
-        &authn,
-        job.clone().into_signed(),
-        JobStartParams {
-            wait: JobWait::Stop,
-            ..Default::default()
-        },
-    )
-    .await
-    .unwrap();
+    let wait = JobStartParams {
+        wait: JobWait::Stop,
+        ..Default::default()
+    };
+
+    // With the map empty, no known sled occupies the cubby, so the
+    // job is refused.
+    assert!(matches!(
+        mgr.job_start(&authn, job.clone().into_signed(), wait.clone())
+            .await,
+        Err(JobError::UnknownCubby(14)),
+    ));
+
+    // Name this baseboard in the map. The update lands whenever the
+    // state task gets to it, so retry the job until it is accepted.
+    cubbies
+        .send(Cubbies::from([(14, test_baseboard_id())]))
+        .unwrap();
+    let sleds = loop {
+        match mgr
+            .job_start(&authn, job.clone().into_signed(), wait.clone())
+            .await
+        {
+            Ok(sleds) => break sleds,
+            Err(JobError::UnknownCubby(14)) => sleep(Duration::from_millis(50)).await,
+            Err(error) => panic!("job start failed: {error}"),
+        }
+    };
     session.job_started(job.into_signed());
+    assert_eq!(sleds, BTreeSet::from([test_baseboard_id()]));
     let status = mgr.job_status(&authn, &job_id).await.unwrap()[mgr.own_baseboard()].clone();
     check_status_stopped(status, &job_id, Ok(0), Some(0), Some(0));
 }
@@ -890,7 +1115,7 @@ async fn root_certs_from_files() {
     .unwrap();
 
     // A job signed by the configured root runs.
-    let authn = fake_identity(&mut root).await;
+    let authn = requester(&root);
     let SessionCeremony {
         session_id,
         client_nonce,
@@ -899,7 +1124,7 @@ async fn root_certs_from_files() {
         ..
     } = session_ceremony(&mgr, 1);
     let session = Session::new(session_id);
-    mgr.session_start(&authn, session_id, client_nonce, signer_nonce, seq, true)
+    mgr.session_start(&authn, session_id, client_nonce, signer_nonce, seq)
         .await
         .unwrap();
     let job_id = session.next_job_id();
@@ -977,7 +1202,7 @@ async fn job_output_dir_moves() {
     .await
     .unwrap();
     let baseboard_id = mgr.own_baseboard();
-    let authn = fake_identity(&mut root).await;
+    let authn = requester(&root);
     let SessionCeremony {
         session_id,
         client_nonce,
@@ -986,7 +1211,7 @@ async fn job_output_dir_moves() {
         ..
     } = session_ceremony(&mgr, 1);
     let mut session = Session::new(session_id);
-    mgr.session_start(&authn, session_id, client_nonce, signer_nonce, seq, true)
+    mgr.session_start(&authn, session_id, client_nonce, signer_nonce, seq)
         .await
         .unwrap();
 
@@ -1082,14 +1307,9 @@ async fn universe_swap() {
     )
     .await
     .unwrap();
-    let authn = fake_identity(&mut root).await;
+    let authn = requester(&root);
 
-    async fn run_job(
-        mgr: &JobManager,
-        root: &mut EphemeralKey,
-        authn: &Identity,
-        seq: u64,
-    ) -> JobId {
+    async fn run_job(mgr: &JobManager, root: &mut EphemeralKey, authn: &KeyId, seq: u64) -> JobId {
         let SessionCeremony {
             session_id,
             client_nonce,
@@ -1098,7 +1318,7 @@ async fn universe_swap() {
             ..
         } = session_ceremony(mgr, seq);
         let session = Session::new(session_id);
-        mgr.session_start(authn, session_id, client_nonce, signer_nonce, seq, true)
+        mgr.session_start(authn, session_id, client_nonce, signer_nonce, seq)
             .await
             .unwrap();
         let job_id = session.next_job_id();
@@ -1169,7 +1389,7 @@ async fn universe_swap() {
 async fn shutdown() {
     let log = test_logger(function_name!());
     let (mut mgr, mut root, _dir, shutdown) = manager_and_test_root(log).await;
-    let authn = fake_identity(&mut root).await;
+    let authn = requester(&root);
     let SessionCeremony {
         session_id,
         client_nonce,
@@ -1178,7 +1398,7 @@ async fn shutdown() {
         ..
     } = session_ceremony(&mgr, 1);
     let session = Session::new(session_id);
-    mgr.session_start(&authn, session_id, client_nonce, signer_nonce, seq, true)
+    mgr.session_start(&authn, session_id, client_nonce, signer_nonce, seq)
         .await
         .unwrap();
 
@@ -1221,8 +1441,8 @@ async fn shutdown() {
 #[tokio::test]
 async fn cert_chain() {
     let log = test_logger(function_name!());
-    let (mgr, mut root, _dir, _shutdown) = manager_and_test_root(log).await;
-    let authn = fake_identity(&mut root).await;
+    let (mgr, root, _dir, _shutdown) = manager_and_test_root(log).await;
+    let authn = requester(&root);
     assert_eq!(
         mgr.cert_chain(&authn, root.key_id()).unwrap(),
         vec![root.cert().clone()]
@@ -1246,7 +1466,7 @@ async fn cert_chain() {
 async fn attribution() {
     let log = test_logger(function_name!());
     let (mgr, mut root, _dir, _shutdown) = manager_and_test_root(log).await;
-    let authn = fake_identity(&mut root).await;
+    let authn = requester(&root);
     let SessionCeremony {
         session_id,
         client_nonce,
@@ -1255,17 +1475,14 @@ async fn attribution() {
         ..
     } = session_ceremony(&mgr, 1);
     let mut session = Session::new(session_id);
-    mgr.session_start(&authn, session_id, client_nonce, signer_nonce, seq, true)
+    mgr.session_start(&authn, session_id, client_nonce, signer_nonce, seq)
         .await
         .unwrap();
-    assert_eq!(
-        mgr.session(&authn).unwrap().started_by(),
-        Some(&authn.key_id)
-    );
 
-    // Job B queues behind a hole in the job chain, attributed. The
-    // executor only runs the job whose id the chain expects next, and
-    // it never sees this one, so B stays queued until cancelled.
+    // Job A confirms the session, which names its starter. Job B
+    // queues behind a hole in the job chain, attributed. The executor
+    // only runs the job whose id the chain expects next, and it never
+    // sees B, so B stays queued until cancelled.
     let job_id_a = session.next_job_id();
     let job_a = root
         .sign_job_request(job_id_a, session_id, "sleep 60", false)
@@ -1281,6 +1498,7 @@ async fn attribution() {
     .await
     .unwrap();
     session.job_started(job_a.into_signed());
+    assert_eq!(mgr.session(&authn).unwrap().started_by(), Some(&authn));
     let hole_id = session.next_job_id();
     let hole = root
         .sign_job_request(hole_id, session_id, "true", false)
@@ -1301,7 +1519,7 @@ async fn attribution() {
     mgr.wait_for_job_status(&job_id_b).await.unwrap();
     let status = mgr.job_status(&authn, &job_id_b).await.unwrap()[mgr.own_baseboard()].clone();
     assert!(
-        matches!(&status, JobStatus::Queued { actor, .. } if *actor == authn.key_id),
+        matches!(&status, JobStatus::Queued { actor, .. } if *actor == authn),
         "expected job B queued by us, got {status:?}"
     );
 
@@ -1318,7 +1536,7 @@ async fn attribution() {
     .unwrap();
     let status = mgr.job_status(&authn, &job_id_b).await.unwrap()[mgr.own_baseboard()].clone();
     assert!(
-        matches!(&status, JobStatus::Cancelled { actor, .. } if *actor == authn.key_id),
+        matches!(&status, JobStatus::Cancelled { actor, .. } if *actor == authn),
         "expected job B cancelled by us, got {status:?}"
     );
     mgr.job_stop(
@@ -1333,15 +1551,15 @@ async fn attribution() {
     .unwrap();
 }
 
-/// A job runs only on the sleds its signed target names. Jobs naming
-/// another baseboard, or a cubby while no mapping is known, are
-/// processed but never run here, and the causal chain moves on.
+/// A job runs only on the sleds its target names that the accepting
+/// sled can reach. A job left with none, because it names only an
+/// unreachable baseboard or an unknown cubby, is refused.
 #[named]
 #[tokio::test]
 async fn job_targets() {
     let log = test_logger(function_name!());
     let (mgr, mut root, _dir, _shutdown) = manager_and_test_root(log).await;
-    let authn = fake_identity(&mut root).await;
+    let authn = requester(&root);
     let SessionCeremony {
         session_id,
         client_nonce,
@@ -1350,7 +1568,7 @@ async fn job_targets() {
         ..
     } = session_ceremony(&mgr, 1);
     let mut session = Session::new(session_id);
-    mgr.session_start(&authn, session_id, client_nonce, signer_nonce, seq, true)
+    mgr.session_start(&authn, session_id, client_nonce, signer_nonce, seq)
         .await
         .unwrap();
 
@@ -1369,100 +1587,30 @@ async fn job_targets() {
             .unwrap()
             .verify_with_cert(root.cert())
             .unwrap();
-        mgr.job_start(&authn, job.clone().into_signed(), JobStartParams::default())
-            .await
-            .unwrap();
+        let sleds = mgr
+            .job_start(&authn, job.clone().into_signed(), JobStartParams::default())
+            .await?;
         session.job_started(job.into_signed());
-        job_id
+        Ok::<_, JobError>((job_id, sleds))
     };
 
-    let elsewhere = start("true", "913-0000019:BRM00000000").await;
-    let by_cubby = start("true", "14").await;
-    let here = start("true", &test_baseboard_id().to_string()).await;
-
-    // The targeted job runs, which proves the untargeted ones were
-    // already processed and skipped.
+    let elsewhere = "913-0000019:BRM00000000";
+    assert!(matches!(
+        start("true", elsewhere).await,
+        Err(JobError::NoReachableTarget),
+    ));
+    assert!(matches!(
+        start("true", "14").await,
+        Err(JobError::UnknownCubby(14)),
+    ));
+    let (here, sleds) = start("true", &format!("{elsewhere},{}", test_baseboard_id()))
+        .await
+        .unwrap();
+    assert_eq!(sleds, BTreeSet::from([test_baseboard_id()]));
     timeout(Duration::from_secs(30), mgr.wait_for_job_status(&here))
         .await
         .expect("timed out waiting for targeted job")
         .unwrap();
-    for skipped in [elsewhere, by_cubby] {
-        assert!(matches!(
-            mgr.job_status(&authn, &skipped).await,
-            Err(JobError::JobNotFound(_)),
-        ));
-    }
-}
-
-/// A login gossips as evidence every sled verifies for itself: real
-/// evidence authorizes bound requests with no local login, and
-/// fabricated evidence registers nothing.
-#[named]
-#[tokio::test]
-async fn gossiped_identities() {
-    let log = test_logger(function_name!());
-    let (mgr, mut root, peer, _dir, _shutdown) = manager_test_root_and_peer(log).await;
-    let mut liar = ephemeral_test_root();
-    let root_pk = root.ssh_public_key();
-    let root_key_id = root_pk.key_id().unwrap();
-
-    // A liar claims root's key with evidence signed by their own.
-    let bogus_key = RequestKey::new();
-    let bogus = ChallengeResponse::new(Challenge::new(Nonce::random()), bogus_key.verifier());
-    let signed_by_liar = liar.sign(bogus).await.unwrap();
-    let bogus_verified = signed_by_liar
-        .clone()
-        .verify_with_ssh_public_key(&liar.ssh_public_key())
-        .unwrap();
-    let mut bogus_credentials = Credentials::new(bogus_verified);
-    bogus_credentials.key_id = root_key_id.clone();
-    let bogus_authz = Authz::new(bogus_credentials, bogus_key);
-    peer.send(
-        Message::Request(Request::identity(
-            root_key_id.clone(),
-            IdentityRequest::Login(root_pk.to_openssh().unwrap(), signed_by_liar),
-        ))
-        .into(),
-    )
-    .unwrap();
-
-    // Real evidence authorizes here without ever logging in here.
-    let request_key = RequestKey::new();
-    let response = ChallengeResponse::new(Challenge::new(Nonce::random()), request_key.verifier());
-    let signed = root.sign(response).await.unwrap();
-    let verified = signed.clone().verify_with_ssh_public_key(&root_pk).unwrap();
-    let mut credentials = Credentials::new(verified);
-    credentials.key_id = root_key_id.clone();
-    peer.send(
-        Message::Request(Request::identity(
-            root_key_id.clone(),
-            IdentityRequest::Login(root_pk.to_openssh().unwrap(), signed),
-        ))
-        .into(),
-    )
-    .unwrap();
-    let authz = Authz::new(credentials, request_key);
-    let authn = timeout(Duration::from_secs(30), async {
-        loop {
-            let header = authz.header("GET", "/sessions");
-            match mgr.iam(Some(header), None, ("GET", "/sessions")).await {
-                Ok(authn) => break authn,
-                Err(_) => sleep(Duration::from_millis(50)).await,
-            }
-        }
-    })
-    .await
-    .expect("gossiped login never registered");
-    assert_eq!(authn.key_id, root_key_id);
-
-    // The fabricated login was processed before the real one on the
-    // same handle, and registered nothing.
-    let header = bogus_authz.header("GET", "/sessions");
-    assert!(
-        mgr.iam(Some(header), None, ("GET", "/sessions"))
-            .await
-            .is_err()
-    );
 }
 
 /// Attach access: strangers are refused, the starter grants and
@@ -1473,11 +1621,11 @@ async fn gossiped_identities() {
 async fn attach_grants() {
     let log = test_logger(function_name!());
     let (mgr, mut root, peer, _dir, _shutdown) = manager_test_root_and_peer(log).await;
-    let owner = fake_identity(&mut root).await;
+    let owner = requester(&root);
     let validity = Validity::from_now(Duration::from_secs(60)).unwrap();
-    let mut guest_key =
+    let guest_key =
         EphemeralKey::new_root(KeyType::P256, ephemeral_test_subject(), validity).unwrap();
-    let guest = fake_identity(&mut guest_key).await;
+    let guest = requester(&guest_key);
 
     let SessionCeremony {
         session_id,
@@ -1487,7 +1635,7 @@ async fn attach_grants() {
         ..
     } = session_ceremony(&mgr, 1);
     let session = Session::new(session_id);
-    mgr.session_start(&owner, session_id, client_nonce, signer_nonce, seq, true)
+    mgr.session_start(&owner, session_id, client_nonce, signer_nonce, seq)
         .await
         .unwrap();
     let job_id = session.next_job_id();
@@ -1508,7 +1656,7 @@ async fn attach_grants() {
     // The starter attaches read-write; a stranger not at all; a guest
     // may not grant.
     let target = mgr.own_baseboard().clone();
-    let attach = async |authn: Identity| mgr.job_attachment(&authn, &job_id, &target).await;
+    let attach = async |authn: KeyId| mgr.job_attachment(&authn, &job_id, &target).await;
     assert!(matches!(
         attach(owner.clone()).await,
         Ok((_, Access::ReadWrite))
@@ -1518,14 +1666,14 @@ async fn attach_grants() {
         Err(JobError::AttachDenied)
     ));
     assert!(matches!(
-        mgr.session_allow_attach(&guest, session_id, owner.key_id.clone(), Access::ReadOnly)
+        mgr.session_allow_attach(&guest, session_id, owner.clone(), Access::ReadOnly)
             .await,
         Err(JobError::NotSessionStarter)
     ));
 
     // The starter grants read-only, upgrades to read-write, then
     // withdraws, all mid-session.
-    let granted = async |authn: Identity, want: Option<Access>| {
+    let granted = async |authn: KeyId, want: Option<Access>| {
         timeout(Duration::from_secs(30), async {
             loop {
                 let access = match attach(authn.clone()).await {
@@ -1542,15 +1690,15 @@ async fn attach_grants() {
         .await
         .expect("grant never took effect")
     };
-    mgr.session_allow_attach(&owner, session_id, guest.key_id.clone(), Access::ReadOnly)
+    mgr.session_allow_attach(&owner, session_id, guest.clone(), Access::ReadOnly)
         .await
         .unwrap();
     granted(guest.clone(), Some(Access::ReadOnly)).await;
-    mgr.session_allow_attach(&owner, session_id, guest.key_id.clone(), Access::ReadWrite)
+    mgr.session_allow_attach(&owner, session_id, guest.clone(), Access::ReadWrite)
         .await
         .unwrap();
     granted(guest.clone(), Some(Access::ReadWrite)).await;
-    mgr.session_deny_attach(&owner, session_id, guest.key_id.clone())
+    mgr.session_deny_attach(&owner, session_id, guest.clone())
         .await
         .unwrap();
     granted(guest.clone(), None).await;
@@ -1558,21 +1706,21 @@ async fn attach_grants() {
     // A grant whose actor is not the starter is ignored. The starter's
     // grant of a third key, sent after it on the same handle, marks it
     // processed.
-    let mut third_key =
+    let third_key =
         EphemeralKey::new_root(KeyType::P256, ephemeral_test_subject(), validity).unwrap();
-    let third = fake_identity(&mut third_key).await;
+    let third = requester(&third_key);
     peer.send(
         Message::Request(Request::session(
-            guest.key_id.clone(),
-            SessionRequest::AllowAttach(session_id, guest.key_id.clone(), Access::ReadWrite),
+            guest.clone(),
+            SessionRequest::AllowAttach(session_id, guest.clone(), Access::ReadWrite),
         ))
         .into(),
     )
     .unwrap();
     peer.send(
         Message::Request(Request::session(
-            owner.key_id.clone(),
-            SessionRequest::AllowAttach(session_id, third.key_id.clone(), Access::ReadOnly),
+            owner.clone(),
+            SessionRequest::AllowAttach(session_id, third.clone(), Access::ReadOnly),
         ))
         .into(),
     )
@@ -1603,11 +1751,11 @@ async fn attach_grants() {
 async fn skip_and_stop_are_starter_only() {
     let log = test_logger(function_name!());
     let (mgr, mut root, peer, _dir, _shutdown) = manager_test_root_and_peer(log).await;
-    let owner = fake_identity(&mut root).await;
+    let owner = requester(&root);
     let validity = Validity::from_now(Duration::from_secs(60)).unwrap();
-    let mut guest_key =
+    let guest_key =
         EphemeralKey::new_root(KeyType::P256, ephemeral_test_subject(), validity).unwrap();
-    let guest = fake_identity(&mut guest_key).await;
+    let guest = requester(&guest_key);
 
     let SessionCeremony {
         session_id,
@@ -1616,10 +1764,12 @@ async fn skip_and_stop_are_starter_only() {
         seq,
         ..
     } = session_ceremony(&mgr, 1);
-    let job_id = Session::new(session_id).next_job_id();
-    mgr.session_start(&owner, session_id, client_nonce, signer_nonce, seq, true)
+    let mut session = Session::new(session_id);
+    mgr.session_start(&owner, session_id, client_nonce, signer_nonce, seq)
         .await
         .unwrap();
+    confirm_start(&mgr, &owner, &mut root, &mut session).await;
+    let job_id = session.next_job_id();
 
     assert!(matches!(
         mgr.session_skip_job(&guest, session_id, job_id).await,
@@ -1627,6 +1777,11 @@ async fn skip_and_stop_are_starter_only() {
     ));
     assert!(matches!(
         mgr.session_stop(&guest, session_id).await,
+        Err(JobError::NotSessionStarter)
+    ));
+    assert!(matches!(
+        mgr.job_stop(&guest, &job_id, JobStopParams::default())
+            .await,
         Err(JobError::NotSessionStarter)
     ));
     assert!(matches!(
@@ -1646,13 +1801,12 @@ async fn skip_and_stop_are_starter_only() {
         Err(JobError::SessionNotCurrent(_))
     ));
     assert!(matches!(
-        mgr.session_allow_attach(&owner, stale, guest.key_id.clone(), Access::ReadOnly)
+        mgr.session_allow_attach(&owner, stale, guest.clone(), Access::ReadOnly)
             .await,
         Err(JobError::SessionNotCurrent(_))
     ));
     assert!(matches!(
-        mgr.session_deny_attach(&owner, stale, guest.key_id.clone())
-            .await,
+        mgr.session_deny_attach(&owner, stale, guest.clone()).await,
         Err(JobError::SessionNotCurrent(_))
     ));
 
@@ -1662,7 +1816,7 @@ async fn skip_and_stop_are_starter_only() {
     // stop, and the cancellation actor proves whose skip applied.
     peer.send(
         Message::Request(Request::session(
-            guest.key_id.clone(),
+            guest.clone(),
             SessionRequest::Stop(session_id),
         ))
         .into(),
@@ -1670,7 +1824,7 @@ async fn skip_and_stop_are_starter_only() {
     .unwrap();
     peer.send(
         Message::Request(Request::session(
-            guest.key_id.clone(),
+            guest.clone(),
             SessionRequest::Skip(session_id, job_id),
         ))
         .into(),
@@ -1678,7 +1832,7 @@ async fn skip_and_stop_are_starter_only() {
     .unwrap();
     peer.send(
         Message::Request(Request::session(
-            owner.key_id.clone(),
+            owner.clone(),
             SessionRequest::Skip(session_id, job_id),
         ))
         .into(),
@@ -1699,7 +1853,7 @@ async fn skip_and_stop_are_starter_only() {
     let status = mgr.job_status(&owner, &job_id).await.unwrap()[mgr.own_baseboard()].clone();
     assert!(matches!(
         status,
-        JobStatus::Cancelled { actor, .. } if actor == owner.key_id
+        JobStatus::Cancelled { actor, .. } if actor == owner
     ));
 
     assert!(matches!(
@@ -1718,7 +1872,7 @@ async fn skip_and_stop_are_starter_only() {
 async fn skip_racing_start_converges() {
     let log = test_logger(function_name!());
     let (mgr, mut root, peer, _dir, _shutdown) = manager_test_root_and_peer(log).await;
-    let owner = fake_identity(&mut root).await;
+    let owner = requester(&root);
 
     let SessionCeremony {
         session_id,
@@ -1729,7 +1883,7 @@ async fn skip_racing_start_converges() {
     } = session_ceremony(&mgr, 1);
     let mut mirror = Session::new(session_id);
     let job_id = mirror.next_job_id();
-    mgr.session_start(&owner, session_id, client_nonce, signer_nonce, seq, true)
+    mgr.session_start(&owner, session_id, client_nonce, signer_nonce, seq)
         .await
         .unwrap();
 
@@ -1753,7 +1907,7 @@ async fn skip_racing_start_converges() {
 
     peer.send(
         Message::Request(Request::session(
-            owner.key_id.clone(),
+            owner.clone(),
             SessionRequest::Skip(session_id, job_id),
         ))
         .into(),
@@ -1782,7 +1936,7 @@ async fn skip_racing_start_converges() {
 async fn too_much_cpu() {
     let log = test_logger(function_name!());
     let (mgr, mut root, _dir, _shutdown) = manager_and_test_root(log).await;
-    let authn = fake_identity(&mut root).await;
+    let authn = requester(&root);
     let SessionCeremony {
         session_id,
         client_nonce,
@@ -1791,7 +1945,7 @@ async fn too_much_cpu() {
         ..
     } = session_ceremony(&mgr, 1);
     let session = Session::new(session_id);
-    mgr.session_start(&authn, session_id, client_nonce, signer_nonce, seq, true)
+    mgr.session_start(&authn, session_id, client_nonce, signer_nonce, seq)
         .await
         .unwrap();
     let job_id = session.next_job_id();
@@ -1839,7 +1993,7 @@ async fn too_much_cpu() {
 async fn too_much_output() {
     let log = test_logger(function_name!());
     let (mgr, mut root, _dir, _shutdown) = manager_and_test_root(log).await;
-    let authn = fake_identity(&mut root).await;
+    let authn = requester(&root);
     let SessionCeremony {
         session_id,
         client_nonce,
@@ -1848,7 +2002,7 @@ async fn too_much_output() {
         ..
     } = session_ceremony(&mgr, 1);
     let mut session = Session::new(session_id);
-    mgr.session_start(&authn, session_id, client_nonce, signer_nonce, seq, true)
+    mgr.session_start(&authn, session_id, client_nonce, signer_nonce, seq)
         .await
         .unwrap();
 
@@ -1941,7 +2095,7 @@ async fn output_ranges() {
     let log = test_logger(function_name!());
     let (mgr, mut root, _dir, _shutdown) = manager_and_test_root(log).await;
     let baseboard_id = mgr.own_baseboard();
-    let authn = fake_identity(&mut root).await;
+    let authn = requester(&root);
     let SessionCeremony {
         session_id,
         client_nonce,
@@ -1950,7 +2104,7 @@ async fn output_ranges() {
         ..
     } = session_ceremony(&mgr, 1);
     let session = Session::new(session_id);
-    mgr.session_start(&authn, session_id, client_nonce, signer_nonce, seq, true)
+    mgr.session_start(&authn, session_id, client_nonce, signer_nonce, seq)
         .await
         .unwrap();
     let job_id = session.next_job_id();
@@ -2151,83 +2305,6 @@ async fn output_ranges() {
     }
 }
 
-#[named]
-#[tokio::test]
-async fn iam() {
-    let log = test_logger(function_name!());
-    let (mgr, mut root, _dir, _shutdown) = manager_and_test_root(log).await;
-    let JobError::Unauthorized(nonce) = mgr.iam(None, None, ("POST", "/iam")).await.unwrap_err()
-    else {
-        panic!("should not be authorized yet");
-    };
-
-    // Construct credentials.
-    let challenge = Challenge::new(nonce.clone());
-    let request_key = RequestKey::new();
-    let response = ChallengeResponse::new(challenge, request_key.verifier());
-    let signed = root.sign(response).await.unwrap();
-    let verified = signed.verify_with_cert(root.cert()).unwrap();
-    let mut credentials = Credentials::new(verified);
-    let public_key = root.ssh_public_key();
-    let key_id = public_key.key_id().unwrap();
-    credentials.key_id = key_id.clone(); // override cert key ID
-
-    // Register our identity. Initial credentials work only at `iam`.
-    assert!(
-        mgr.iam(
-            Some(credentials.to_string()),
-            Some(public_key.clone()),
-            ("GET", "/sessions"),
-        )
-        .await
-        .is_err()
-    );
-    let identity = mgr
-        .iam(
-            Some(credentials.to_string()),
-            Some(public_key.clone()),
-            ("POST", "/iam"),
-        )
-        .await
-        .unwrap();
-    let Identity {
-        key_id: iam_key_id,
-        public_key: iam_public_key,
-        nonce: iam_nonce,
-        time_authenticated: iam_authenticated,
-    } = identity.clone();
-    assert_eq!(iam_key_id, key_id);
-    assert_eq!(iam_public_key, public_key);
-    assert_eq!(iam_nonce, credentials.nonce);
-    assert!(iam_authenticated <= Utc::now());
-
-    // A bound request authorizes; replaying its header does not, nor
-    // does presenting it against a different request line.
-    let authz = Authz::new(credentials.clone(), request_key);
-    let header = authz.header("GET", "/sessions");
-    assert_eq!(
-        mgr.iam(Some(header.clone()), None, ("GET", "/sessions"))
-            .await
-            .unwrap()
-            .key_id,
-        key_id,
-    );
-    assert!(
-        mgr.iam(Some(header), None, ("GET", "/sessions"))
-            .await
-            .is_err()
-    );
-    let header = authz.header("GET", "/sessions");
-    assert!(mgr.iam(Some(header), None, ("GET", "/jobs")).await.is_err());
-
-    // Replayed initial credentials are rejected: the nonce is spent.
-    assert!(
-        mgr.iam(Some(credentials.to_string()), None, ("POST", "/iam"))
-            .await
-            .is_err()
-    );
-}
-
 /// Jobs must not inherit ignored signal dispositions. The embedding
 /// process may ignore SIGINT, and a shell cannot trap a signal that
 /// was ignored at entry, which turns ^C into a no-op in every job.
@@ -2245,7 +2322,7 @@ async fn job_signal_dispositions() {
     let log = test_logger(function_name!());
     let (mgr, mut root, _dir, _shutdown) = manager_and_test_root(log).await;
     let baseboard_id = mgr.own_baseboard();
-    let authn = fake_identity(&mut root).await;
+    let authn = requester(&root);
     let SessionCeremony {
         session_id,
         client_nonce,
@@ -2254,7 +2331,7 @@ async fn job_signal_dispositions() {
         ..
     } = session_ceremony(&mgr, 1);
     let mut session = Session::new(session_id);
-    mgr.session_start(&authn, session_id, client_nonce, signer_nonce, seq, true)
+    mgr.session_start(&authn, session_id, client_nonce, signer_nonce, seq)
         .await
         .unwrap();
 
@@ -2294,7 +2371,7 @@ async fn job_signal_dispositions() {
 async fn interactive_target_required() {
     let log = test_logger(function_name!());
     let (mgr, mut root, _dir, _shutdown) = manager_and_test_root(log).await;
-    let authn = fake_identity(&mut root).await;
+    let authn = requester(&root);
     let SessionCeremony {
         session_id,
         client_nonce,
@@ -2303,7 +2380,7 @@ async fn interactive_target_required() {
         ..
     } = session_ceremony(&mgr, 1);
     let session = Session::new(session_id);
-    mgr.session_start(&authn, session_id, client_nonce, signer_nonce, seq, true)
+    mgr.session_start(&authn, session_id, client_nonce, signer_nonce, seq)
         .await
         .unwrap();
 
@@ -2324,7 +2401,7 @@ async fn interactive_target_required() {
 async fn job_json() {
     let log = test_logger(function_name!());
     let (mgr, mut root, dir, _shutdown) = manager_and_test_root(log).await;
-    let authn = fake_identity(&mut root).await;
+    let authn = requester(&root);
     let SessionCeremony {
         session_id,
         client_nonce,
@@ -2333,7 +2410,7 @@ async fn job_json() {
         ..
     } = session_ceremony(&mgr, 1);
     let mut session = Session::new(session_id);
-    mgr.session_start(&authn, session_id, client_nonce, signer_nonce, seq, true)
+    mgr.session_start(&authn, session_id, client_nonce, signer_nonce, seq)
         .await
         .unwrap();
 
@@ -2367,7 +2444,7 @@ async fn job_json() {
 async fn streaming_validation() {
     let log = test_logger(function_name!());
     let (mgr, mut root, _dir, _shutdown) = manager_and_test_root(log).await;
-    let authn = fake_identity(&mut root).await;
+    let authn = requester(&root);
     let SessionCeremony {
         session_id,
         client_nonce,
@@ -2376,7 +2453,7 @@ async fn streaming_validation() {
         ..
     } = session_ceremony(&mgr, 1);
     let mut session = Session::new(session_id);
-    mgr.session_start(&authn, session_id, client_nonce, signer_nonce, seq, true)
+    mgr.session_start(&authn, session_id, client_nonce, signer_nonce, seq)
         .await
         .unwrap();
 
@@ -2403,7 +2480,9 @@ async fn streaming_validation() {
     expect_invalid(JobMode::StreamOutput, Target::All).await;
     expect_invalid(
         JobMode::StreamOutput,
-        format!("{},14", test_baseboard_id()).parse().unwrap(),
+        format!("{},913-0000019:BRM00000000", test_baseboard_id())
+            .parse()
+            .unwrap(),
     )
     .await;
     expect_invalid(JobMode::StreamInput, test_baseboard_id().into()).await;
