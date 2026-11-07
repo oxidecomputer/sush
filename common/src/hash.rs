@@ -16,7 +16,7 @@ use crate::wire::ExactBytes;
 pub const OUT_LEN: usize = 32;
 
 /// A SHA3-256 digest.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Copy, Eq, PartialEq)]
 pub struct Hash([u8; OUT_LEN]);
 
 impl Hash {
@@ -40,6 +40,14 @@ impl From<[u8; OUT_LEN]> for Hash {
 impl fmt::Display for Hash {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.write_str(&hex::encode(self.0))
+    }
+}
+
+impl fmt::Debug for Hash {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_tuple("Hash")
+            .field(&format_args!("{self}"))
+            .finish()
     }
 }
 
