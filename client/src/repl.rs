@@ -25,7 +25,7 @@ use sush_common::jobs::{
     SessionId, SessionSeq, SessionSignerNonce, SessionSushNonce, SignedJob,
 };
 use sush_common::keys::{KeyId, SshPublicKey};
-use sush_common::targets::{SledId, SledVersion};
+use sush_common::targets::SledVersion;
 use sush_common::version::VersionInfo;
 
 use crate::cli::Cli;
@@ -465,9 +465,5 @@ impl CommandContext for Repl {
     #[cfg(feature = "permslip")]
     fn please_authn(&mut self, url: &str) {
         self.cli.please_authn(url)
-    }
-
-    fn really_target(&mut self, sled: &SledId) -> Result<(), CommandError> {
-        self.cli.really_target(sled)
     }
 }

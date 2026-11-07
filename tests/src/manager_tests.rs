@@ -1553,7 +1553,8 @@ async fn attribution() {
 
 /// A job runs only on the sleds its target names that the accepting
 /// sled can reach. A job left with none, because it names only an
-/// unreachable baseboard or an unknown cubby, is refused.
+/// unreachable baseboard or an unknown cubby, is refused, and the
+/// preflight refuses it too.
 #[named]
 #[tokio::test]
 async fn job_targets() {
@@ -1595,6 +1596,16 @@ async fn job_targets() {
     };
 
     let elsewhere = "913-0000019:BRM00000000";
+    let preflight = |target: &str| mgr.job_preflight(session_id, &target.parse().unwrap());
+    assert!(matches!(
+        preflight(elsewhere),
+        Err(JobError::NoReachableTarget)
+    ));
+    assert!(matches!(preflight("14"), Err(JobError::UnknownCubby(14))));
+    assert_eq!(
+        preflight(&format!("{elsewhere},{}", test_baseboard_id())).unwrap(),
+        BTreeSet::from([test_baseboard_id()]),
+    );
     assert!(matches!(
         start("true", elsewhere).await,
         Err(JobError::NoReachableTarget),

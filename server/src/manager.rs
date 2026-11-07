@@ -435,13 +435,12 @@ impl JobManager {
 
         // Check the session and target.
         let payload = job.payload();
-        self.session_check(payload.session_id())?;
         if !payload.target_matches_mode() {
             return Err(JobError::InteractiveTarget);
         }
+        let sleds = self.job_preflight(payload.session_id(), payload.target())?;
 
         // Submit the job for execution.
-        let sleds = self.reachable_targets(payload.target())?;
         let wait = params.wait.to_owned();
         self.job_request(authn, JobRequest::Start(job, params, sleds.clone()))
             .await?;
@@ -449,8 +448,18 @@ impl JobManager {
         Ok(sleds)
     }
 
-    /// The sleds `target` names that this sled can reach: itself and
-    /// the sleds it holds live gossip links to.
+    /// Check that this sled would accept a job in `session_id` for `target`.
+    pub fn job_preflight(
+        &self,
+        session_id: SessionId,
+        target: &Target,
+    ) -> Result<BTreeSet<BaseboardId>, JobError> {
+        self.session_check(session_id)?;
+        self.reachable_targets(target)
+    }
+
+    /// Return the sleds in `target` that match either this sled or any of
+    /// its live gossip peers.
     fn reachable_targets(&self, target: &Target) -> Result<BTreeSet<BaseboardId>, JobError> {
         let mut reachable = self.linked.borrow().clone();
         reachable.insert(self.own_baseboard.clone());

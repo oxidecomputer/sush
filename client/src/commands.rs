@@ -1906,13 +1906,6 @@ async fn job_start_request(
     let Some(session_id) = ctx.session_id() else {
         return Err(CommandError::MissingSession);
     };
-    if let Some(client) = client {
-        with_login(ctx, client, async || {
-            client.session_check().session_id(session_id).send().await
-        })
-        .await?;
-    }
-
     let target = match &start_args.target {
         TargetArg::Target(target) => target.clone(),
         abbreviated => {
@@ -1928,11 +1921,21 @@ async fn job_start_request(
                 return Err(CommandError::InteractiveTarget);
             };
             Target::from(resolve_target(client, &target).await?)
-        } else if let Some(client) = client {
-            preflight_target(ctx, client, target).await?
         } else {
             target
         };
+
+    if let Some(client) = client {
+        with_login(ctx, client, async || {
+            client
+                .job_preflight()
+                .session_id(session_id)
+                .target(target.to_string())
+                .send()
+                .await
+        })
+        .await?;
+    }
 
     Ok(JobStartRequest::new(
         ctx.next_job_id()?,
@@ -2657,31 +2660,6 @@ impl FromStr for TargetArg {
         }
         Ok(Self::Abbreviated(sleds))
     }
-}
-
-/// Confirm before signing a job for a sled that doesn't appear in inventory.
-async fn preflight_target(
-    ctx: &mut impl CommandContext,
-    client: &Client,
-    target: Target,
-) -> Result<Target, CommandError> {
-    let Target::Sleds(sleds) = &target else {
-        return Ok(target);
-    };
-    let Ok(inventory) = client.versions().send().await else {
-        return Ok(target);
-    };
-    let inventory = inventory.into_inner();
-    for sled in sleds {
-        let known = match sled {
-            SledId::Baseboard(baseboard) => inventory.iter().any(|s| &s.baseboard == baseboard),
-            SledId::Cubby(cubby) => inventory.iter().any(|s| s.cubby == Some(*cubby)),
-        };
-        if !known {
-            ctx.really_target(sled)?;
-        }
-    }
-    Ok(target)
 }
 
 /// Resolve a target argument to a target, matching bare serial

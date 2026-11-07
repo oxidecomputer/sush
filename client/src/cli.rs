@@ -1151,16 +1151,6 @@ impl CommandContext for Cli {
         Ok(())
     }
 
-    fn really_target(&mut self, sled: &SledId) -> Result<(), CommandError> {
-        if read_bool(&format!(
-            "❓ Sled `{sled}` is not in the rack inventory. Proceed (yes/no)? "
-        ))? {
-            Ok(())
-        } else {
-            Err(CommandError::Canceled)
-        }
-    }
-
     fn please_touch(&mut self, identity: &SshPublicKey) -> Result<(), CommandError> {
         if identity.is_sk_algorithm() {
             eprintln!(

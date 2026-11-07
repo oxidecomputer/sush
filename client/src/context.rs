@@ -19,7 +19,7 @@ use sush_common::jobs::{
     SessionId, SessionSeq, SessionSignerNonce, SessionSushNonce, SignedJob,
 };
 use sush_common::keys::{KeyId, SshPublicKey};
-use sush_common::targets::{SledId, SledVersion};
+use sush_common::targets::SledVersion;
 use sush_common::version::VersionInfo;
 
 use crate::AuthzSigner;
@@ -189,7 +189,6 @@ pub trait CommandContext: Clone + Send + Sync {
     ) -> Result<Certificate, CommandError>;
 
     // Job management
-    fn really_target(&mut self, sled: &SledId) -> Result<(), CommandError>;
     fn job_started(
         &mut self,
         job: &SignedJob,
