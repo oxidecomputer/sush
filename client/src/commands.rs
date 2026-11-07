@@ -7,6 +7,7 @@
 //! May be executed via either the main CLI or the interactive REPL.
 
 use std::collections::BTreeSet;
+use std::convert::Infallible;
 use std::env::args_os;
 use std::fs::{File, OpenOptions, read};
 use std::io::ErrorKind;
@@ -206,7 +207,7 @@ pub struct GlobalArgs {
     pub text: bool,
 
     /// Support Shell HTTP API address for online mode
-    #[arg(short, long, env = SUSH_URL)]
+    #[arg(short, long, env = SUSH_URL, value_parser = parse_url_arg)]
     #[clap(global = true)]
     pub url: Option<String>,
 
@@ -364,6 +365,12 @@ fn parallel_chunks(s: &str) -> Result<NonZeroU8, String> {
     Ok(n)
 }
 
+/// Parse a URL argument for clap, trimming whitespace and trailing
+/// slashes.
+fn parse_url_arg(s: &str) -> Result<String, Infallible> {
+    Ok(s.trim().trim_end_matches('/').to_string())
+}
+
 /// Support Shell job management command
 #[derive(Clone, Debug, Default, Subcommand)]
 pub enum ClientCommand {
@@ -499,7 +506,7 @@ pub enum SessionCommand {
         permslip_key: Option<String>,
 
         /// The `permslip` server to contact for signing.
-        #[arg(long, env = PERMSLIP_URL, value_name = "URL")]
+        #[arg(long, env = PERMSLIP_URL, value_name = "URL", value_parser = parse_url_arg)]
         permslip_url: Option<String>,
     },
 
@@ -533,7 +540,7 @@ pub enum SessionCommand {
 
         /// The `permslip` server to contact for signing.
         #[cfg(feature = "permslip")]
-        #[arg(long, env = PERMSLIP_URL, value_name = "URL")]
+        #[arg(long, env = PERMSLIP_URL, value_name = "URL", value_parser = parse_url_arg)]
         permslip_url: Option<String>,
 
         /// Supersede an active session without asking.
@@ -691,7 +698,7 @@ pub struct JobStartArgs {
 
     /// The `permslip` server to contact for signing.
     #[cfg(feature = "permslip")]
-    #[arg(long, env = PERMSLIP_URL, value_name = "URL")]
+    #[arg(long, env = PERMSLIP_URL, value_name = "URL", value_parser = parse_url_arg)]
     permslip_url: Option<String>,
 
     /// Terminal type for interactive jobs.
@@ -3088,6 +3095,26 @@ mod tests {
                 "`{words}` leaves SIGINT alone"
             );
         }
+    }
+
+    /// URL arguments lose surrounding whitespace and trailing slashes.
+    #[test]
+    fn url_args() {
+        let url = |url: &str| {
+            ClientArgs::try_parse_from(["sush", "--url", url])
+                .ok()
+                .and_then(|args| args.globals.url)
+        };
+        assert_eq!(
+            url("https://[fe80::1%3]:12352"),
+            Some("https://[fe80::1%3]:12352".into())
+        );
+        assert_eq!(
+            url(" https://[fe80::1%3]:12352// "),
+            Some("https://[fe80::1%3]:12352".into())
+        );
+        assert_eq!(url("/"), Some("".into()));
+        assert_eq!(url(" "), Some("".into()));
     }
 
     #[test]
