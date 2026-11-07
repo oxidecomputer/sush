@@ -1132,7 +1132,7 @@ impl CommandContext for Cli {
                     .collect::<Result<Vec<_>, CommandError>>()?;
                 qprintln!("{}", json!({"identities": identities}));
             }
-            OutputFormat::Text if keys.is_empty() => self.note("❌ No SSH identities found"),
+            OutputFormat::Text if keys.is_empty() => self.note("❗ No SSH identities found"),
             OutputFormat::Text => {
                 for key in keys {
                     let key_id = key.key_id()?;
