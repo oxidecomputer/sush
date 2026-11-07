@@ -10,8 +10,7 @@ use std::collections::BTreeSet;
 use std::convert::Infallible;
 use std::env::args_os;
 use std::fs::{File, OpenOptions, read};
-use std::io::ErrorKind;
-use std::io::{Seek as _, SeekFrom, Write as _, stdin};
+use std::io::{self, Seek as _, SeekFrom, Write as _, stdin};
 use std::net::SocketAddr;
 use std::num::{NonZeroU8, NonZeroU64};
 use std::path::{Path, PathBuf};
@@ -52,8 +51,8 @@ use sush_common::interactive::{InteractiveJobError, InteractiveJobMessage};
 use sush_common::jobs::JobOutputStream::{self, Stderr, Stdout};
 use sush_common::jobs::{
     Access, JobId, JobLimits, JobMode, JobOutputHash, JobOutputState, JobStartRequest, JobStatus,
-    JobStatusMap, Session, SessionClientNonce, SessionId, SessionSeq, SessionSignerNonce,
-    SessionSushNonce, SignedJob, SkipReason, job_status_try_from_json_map,
+    JobStatusMap, ProcessError, Session, SessionClientNonce, SessionId, SessionSeq,
+    SessionSignerNonce, SessionSushNonce, SignedJob, SkipReason, job_status_try_from_json_map,
 };
 use sush_common::keys::{KeyError, KeyId, Signer as _};
 use sush_common::targets::{SledId, Target};
@@ -1746,39 +1745,61 @@ async fn job_start(
         };
         ctx.job_watch_finished(&job_id);
         ctx.job_status(&job_id, &status, StatusDisplayStyle::Short);
-        if !status
-            .values()
-            .any(|s| matches!(s, JobStatus::Stopped { .. }))
-        {
+
+        // Show the job output from every sled it ran on.
+        let ran: Vec<(&BaseboardId, &JobStatus)> = status
+            .iter()
+            .filter(|(_, s)| matches!(s, JobStatus::Stopped { .. } | JobStatus::Error { .. }))
+            .collect();
+        if ran.is_empty() {
             return Err(if status.values().all(JobStatus::is_terminal) {
                 CommandError::JobDidNotRun(job_id)
             } else {
                 CommandError::JobStillRunning(job_id)
             });
         }
-        // Show the output of every sled the job ran on.
-        let multiple = status.len() > 1;
-        for baseboard in status.keys() {
-            for stream in [Stdout, Stderr] {
-                match with_login(ctx, client, async || {
-                    client
-                        .job_output()
-                        .job_id(job_id)
-                        .target(baseboard.to_string())
-                        .stream(stream)
-                        .send()
-                        .await
-                })
-                .await
-                {
-                    Ok(byte_stream) => {
-                        let output = byte_stream_to_vec(byte_stream.into_inner()).await?;
-                        ctx.job_output(&job_id, baseboard, stream, &output, binary);
+        let args = JobOutput {
+            job_id: Some(job_id),
+            binary,
+            file: None,
+            force: false,
+            chunk_size: DEFAULT_CHUNK_SIZE,
+            parallel: PARALLEL_CHUNKS,
+        };
+        let streams = [Stdout, Stderr];
+        let mut errors = Vec::new();
+        for (baseboard, sled_status) in ran {
+            if let JobStatus::Error { error, .. } = sled_status {
+                match failed_job_output(ctx, client, job_id, baseboard, error, streams).await {
+                    Ok(outputs) => {
+                        for (stream, output) in streams.into_iter().zip(outputs) {
+                            ctx.job_output(&job_id, baseboard, stream, &output, binary);
+                        }
                     }
-                    Err(error) if multiple => ctx.command_error(&error),
-                    Err(error) => return Err(error),
+                    Err(error) => errors.push(error),
+                }
+            } else {
+                for stream in streams {
+                    let output = job_output_with_status(
+                        ctx,
+                        client,
+                        job_id,
+                        baseboard,
+                        Some(sled_status),
+                        stream,
+                        args.clone(),
+                    );
+                    if let Err(error) = output.await {
+                        errors.push(error);
+                    }
                 }
             }
+        }
+        if let Some(last) = errors.pop() {
+            for error in &errors {
+                ctx.command_error(error);
+            }
+            return Err(last);
         }
     } else {
         let sleds = cancelable(start).await?.into_inner().sleds;
@@ -1875,7 +1896,7 @@ async fn job_start_request(
             return Err(CommandError::StreamingNeedsFile);
         };
         if !start_args.force && path.exists() {
-            return Err(CommandError::io(path, ErrorKind::AlreadyExists.into()));
+            return Err(CommandError::io(path, io::ErrorKind::AlreadyExists.into()));
         }
         JobMode::StreamOutput
     } else {
@@ -2198,47 +2219,74 @@ async fn job_output_from(
     client: &Client,
     target: &BaseboardId,
     stream: JobOutputStream,
-    JobOutput {
+    args: JobOutput,
+) -> Result<(), CommandError> {
+    let job_id = job_id_or_last(ctx, args.job_id)?;
+    let status = job_status_map(ctx, client, &job_id, Some(target)).await?;
+    job_output_with_status(
+        ctx,
+        client,
         job_id,
+        target,
+        status.get(target),
+        stream,
+        args,
+    )
+    .await
+}
+
+/// Download one stream of a job's output from `target`, where the job
+/// has `status`.
+async fn job_output_with_status(
+    ctx: &mut impl CommandContext,
+    client: &Client,
+    job_id: JobId,
+    target: &BaseboardId,
+    status: Option<&JobStatus>,
+    stream: JobOutputStream,
+    JobOutput {
         binary,
         file,
         force,
         chunk_size,
         parallel,
+        ..
     }: JobOutput,
 ) -> Result<(), CommandError> {
-    let job_id = job_id_or_last(ctx, job_id)?;
-
-    // Fetch job status for output length and hash.
-    let status = job_status_map(ctx, client, &job_id, Some(target)).await?;
-
     let JobOutputState {
         stdout_len,
         stderr_len,
         stdout_hash,
         stderr_hash,
-    } = match status.get(target) {
+    } = match status {
         None => {
             return Err(CommandError::NotFound(format!(
                 "Job `{job_id}` not found on sled `{target}`"
             )));
         }
-        Some(JobStatus::Cancelled { .. }) => {
-            return Err(CommandError::JobCancelled(job_id.to_owned()));
-        }
-        Some(JobStatus::Queued { job_id, .. }) => {
-            return Err(CommandError::JobNotYetRunning(job_id.to_owned()));
-        }
-        Some(JobStatus::Error { error, .. }) => {
-            return Err(CommandError::Process(error.to_owned()));
-        }
-        Some(JobStatus::Started { job_id, .. }) => {
-            return Err(CommandError::JobStillRunning(job_id.to_owned()));
-        }
-        Some(JobStatus::Skipped { job_id, reason, .. }) => {
-            return Err(CommandError::JobSkipped(job_id.to_owned(), *reason));
-        }
         Some(JobStatus::Stopped { output, .. }) => output,
+        Some(JobStatus::Started { .. }) => return Err(CommandError::JobStillRunning(job_id)),
+        Some(JobStatus::Skipped { reason, .. }) => {
+            return Err(CommandError::JobSkipped(job_id, *reason));
+        }
+        Some(JobStatus::Cancelled { .. }) => return Err(CommandError::JobCancelled(job_id)),
+        Some(JobStatus::Queued { .. }) => return Err(CommandError::JobNotYetRunning(job_id)),
+        Some(JobStatus::Error { error, .. }) => {
+            // A failed job's status has no hash or length, so we can't verify it
+            // or download it in chunks. Dump its output with a warning.
+            let [bytes] = failed_job_output(ctx, client, job_id, target, error, [stream]).await?;
+            match file {
+                Some(path) => {
+                    let io_error = |error| CommandError::io(&path, error);
+                    let mut file = open_output_file(&path, force).map_err(io_error)?;
+                    file.write_all(&bytes)
+                        .and_then(|()| file.flush())
+                        .map_err(io_error)?;
+                }
+                None => ctx.job_output(&job_id, target, stream, &bytes, binary),
+            }
+            return Ok(());
+        }
     };
     let len = match stream {
         Stdout => stdout_len,
@@ -2271,14 +2319,7 @@ async fn job_output_from(
 
         // Open the output file.
         let io_error = |error| CommandError::io(&path, error);
-        let mut options = OpenOptions::new();
-        options.read(true).write(true);
-        if force {
-            options.create(true).truncate(true);
-        } else {
-            options.create_new(true);
-        }
-        let mut file = options.open(&path).map_err(io_error)?;
+        let mut file = open_output_file(&path, force).map_err(io_error)?;
 
         // Download and write the output in parallel (unordered) chunks.
         ctx.job_output_started(&job_id, stream, "Downloading", *len);
@@ -2314,24 +2355,69 @@ async fn job_output_from(
     } else {
         // Download and print the output all at once. If hash verification
         // fails here, do not print any output.
-        let byte_stream = with_login(ctx, client, {
-            async || {
-                client
-                    .job_output()
-                    .job_id(job_id)
-                    .target(target.to_string())
-                    .stream(stream)
-                    .send()
-                    .await
-            }
-        })
-        .await?
-        .into_inner();
-        let bytes = byte_stream_to_vec(byte_stream).await?;
+        let bytes = fetch_job_output(ctx, client, &job_id, target, stream).await?;
         check_hash!(hash(&bytes), None)?;
         ctx.job_output(&job_id, target, stream, &bytes, binary);
         Ok(())
     }
+}
+
+/// Fetch `streams` of a failed job's output from `target`, unverified,
+/// warning once that it may be partial. If any stream is missing,
+/// report the job's own `error` instead.
+async fn failed_job_output<const N: usize>(
+    ctx: &mut impl CommandContext,
+    client: &Client,
+    job_id: JobId,
+    target: &BaseboardId,
+    error: &ProcessError,
+    streams: [JobOutputStream; N],
+) -> Result<[Vec<u8>; N], CommandError> {
+    let mut outputs = [const { Vec::new() }; N];
+    for (output, stream) in outputs.iter_mut().zip(streams) {
+        *output = match fetch_job_output(ctx, client, &job_id, target, stream).await {
+            Ok(bytes) => bytes,
+            Err(CommandError::NotFound(_)) => return Err(CommandError::Process(error.to_owned())),
+            Err(other) => return Err(other),
+        };
+    }
+    ctx.command_error(&CommandError::PartialOutput(job_id, error.to_owned()));
+    Ok(outputs)
+}
+
+/// Open `path` to save job output in, replacing an existing file only
+/// if `force` is set.
+fn open_output_file(path: &Path, force: bool) -> io::Result<File> {
+    let mut options = OpenOptions::new();
+    options.read(true).write(true);
+    if force {
+        options.create(true).truncate(true);
+    } else {
+        options.create_new(true);
+    }
+    options.open(path)
+}
+
+/// Download one stream of a job's output in a single request.
+async fn fetch_job_output(
+    ctx: &mut impl CommandContext,
+    client: &Client,
+    job_id: &JobId,
+    target: &BaseboardId,
+    stream: JobOutputStream,
+) -> Result<Vec<u8>, CommandError> {
+    let byte_stream = with_login(ctx, client, async || {
+        client
+            .job_output()
+            .job_id(job_id)
+            .target(target.to_string())
+            .stream(stream)
+            .send()
+            .await
+    })
+    .await?
+    .into_inner();
+    byte_stream_to_vec(byte_stream).await
 }
 
 /// Prepare a vector of futures that fetch chunks of output.
@@ -2698,12 +2784,9 @@ pub enum CommandError {
     #[error("Interactive jobs must target exactly one sled")]
     InteractiveTarget,
     #[error("Local I/O error accessing `{path}`: {error}")]
-    Io {
-        path: PathBuf,
-        error: std::io::Error,
-    },
+    Io { path: PathBuf, error: io::Error },
     #[error("Signal handling error: {0}")]
-    Signal(#[from] std::io::Error),
+    Signal(#[from] io::Error),
     #[error("Unauthorized, try `iam`")]
     InvalidAuthorization,
     #[error("Leaf certificate does not match key `{0}`")]
@@ -2781,7 +2864,9 @@ pub enum CommandError {
     #[error("permslip error: {0}")]
     Permslip(#[from] PermslipError),
     #[error("Job process error: {0}")]
-    Process(#[from] sush_common::jobs::ProcessError),
+    Process(#[from] ProcessError),
+    #[error("Job `{0}` did not exit cleanly, output is unverified:\n   {1}")]
+    PartialOutput(JobId, ProcessError),
     #[error("Proxy TLS error: {0}")]
     ProxyTls(#[from] tls::ProxyTlsError),
     #[error("Goodbye!")]
@@ -2798,7 +2883,7 @@ pub enum CommandError {
     Signature(KeyId),
     #[error("Streaming jobs need `--file`")]
     StreamingNeedsFile,
-    #[error("Job `{0}` did not exit cleanly, streamed output is unverified")]
+    #[error("Job `{0}` did not exit cleanly, output is unverified")]
     StreamUnverified(JobId),
     #[error("Can't parse target baseboard ID: {0}")]
     BaseboardIdParseError(sled_hardware_types::BaseboardIdParseError),
@@ -2826,7 +2911,7 @@ pub enum CommandError {
 
 impl CommandError {
     /// Report I/O errors with the corresponding path or stream name.
-    pub fn io(path: impl AsRef<Path>, error: std::io::Error) -> Self {
+    pub fn io(path: impl AsRef<Path>, error: io::Error) -> Self {
         Self::Io {
             path: path.as_ref().to_owned(),
             error,
@@ -2841,7 +2926,7 @@ impl CommandError {
     fn icon(&self) -> &'static str {
         match self {
             Self::Clap(_) => "❓",
-            Self::JobNotStarted(..) => "❗",
+            Self::JobNotStarted(..) | Self::PartialOutput(..) => "❗",
             Self::JobSkipped(..) => "⏩",
             Self::Quit => "👋",
             Self::Recursive(error) => error.icon(),
