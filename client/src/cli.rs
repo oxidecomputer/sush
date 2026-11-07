@@ -1132,7 +1132,7 @@ impl CommandContext for Cli {
                     .collect::<Result<Vec<_>, CommandError>>()?;
                 qprintln!("{}", json!({"identities": identities}));
             }
-            OutputFormat::Text if keys.is_empty() => self.note("❌ No SSH identities found"),
+            OutputFormat::Text if keys.is_empty() => self.note("❗ No SSH identities found"),
             OutputFormat::Text => {
                 for key in keys {
                     let key_id = key.key_id()?;
@@ -1149,16 +1149,6 @@ impl CommandContext for Cli {
             }
         }
         Ok(())
-    }
-
-    fn really_target(&mut self, sled: &SledId) -> Result<(), CommandError> {
-        if read_bool(&format!(
-            "❓ Sled `{sled}` is not in the rack inventory. Proceed (yes/no)? "
-        ))? {
-            Ok(())
-        } else {
-            Err(CommandError::Canceled)
-        }
     }
 
     fn please_touch(&mut self, identity: &SshPublicKey) -> Result<(), CommandError> {

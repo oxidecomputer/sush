@@ -75,14 +75,15 @@ pub trait SushApi {
         headers: Header<Authorization>,
     ) -> Result<HttpResponseOk<Session>, HttpError>;
 
-    /// Check that this server would accept a job in a session.
+    /// Check that this server would accept a job in a session for a target.
     ///
-    /// Succeeds if the session is active or its start is pending.
-    #[endpoint { method = GET, path = "/sessions/{session_id}/check" }]
-    async fn session_check(
+    /// Succeeds if the session is active or its start is pending, and
+    /// the target resolves to at least one sled this server can reach.
+    #[endpoint { method = GET, path = "/sessions/{session_id}/preflight/{target}" }]
+    async fn job_preflight(
         ctx: RequestContext<Self::Context>,
         headers: Header<Authorization>,
-        params: PathParams<SessionIdParam>,
+        params: PathParams<SessionTargetParams>,
     ) -> Result<HttpResponseUpdatedNoContent, HttpError>;
 
     /// Get a fresh server nonce for the session ceremony.
@@ -256,6 +257,12 @@ pub struct KeyIdParam {
 #[derive(Deserialize, JsonSchema)]
 pub struct SessionIdParam {
     pub session_id: SessionId,
+}
+
+#[derive(Deserialize, JsonSchema)]
+pub struct SessionTargetParams {
+    pub session_id: SessionId,
+    pub target: String,
 }
 
 #[derive(Deserialize, JsonSchema)]

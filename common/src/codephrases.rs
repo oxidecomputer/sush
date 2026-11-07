@@ -125,7 +125,9 @@ impl fmt::Display for Codephrase {
 
 impl fmt::Debug for Codephrase {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "Codephrase({self})")
+        f.debug_tuple("Codephrase")
+            .field(&format_args!("{self}"))
+            .finish()
     }
 }
 

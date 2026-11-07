@@ -24,14 +24,15 @@ use tokio_tungstenite::tungstenite::protocol::{Role, WebSocketConfig};
 use sush_api::{
     AccessParam, Authorization, AuthorizedRangeRequest, JobHistoryParams, JobIdParam,
     JobOutputParams, JobStartParams, JobStarted, JobStopParams, JobTargetParams, KeyIdParam,
-    RoutingParam, SessionAndJobIds, SessionAndKeyIds, SessionIdParam, SessionStartBody, SushApi,
+    RoutingParam, SessionAndJobIds, SessionAndKeyIds, SessionIdParam, SessionStartBody,
+    SessionTargetParams, SushApi,
 };
 use sush_common::authn::{Authn, Identity};
 use sush_common::jobs::{
     JsonJobStatusMap, Session, SessionServerNonce, SignedJob, job_status_to_json_map,
 };
 use sush_common::keys::{KeyId, SshPublicKey, pem_cert_chain};
-use sush_common::targets::SledVersion;
+use sush_common::targets::{SledVersion, Target};
 use sush_common::version::VersionInfo;
 
 use crate::error::JobError;
@@ -104,16 +105,19 @@ impl SushApi for ApiServer {
         }
     }
 
-    async fn session_check(
+    async fn job_preflight(
         ctx: RequestContext<Self::Context>,
         headers: Header<Authorization>,
-        params: PathParams<SessionIdParam>,
+        params: PathParams<SessionTargetParams>,
     ) -> Result<HttpResponseUpdatedNoContent, HttpError> {
         let mgr = ctx.context();
         let Authorization { authorization } = headers.into_inner();
         let _authn = requester(authorization)?;
-        let SessionIdParam { session_id } = params.into_inner();
-        mgr.session_check(session_id)?;
+        let SessionTargetParams { session_id, target } = params.into_inner();
+        let target = target.parse::<Target>().map_err(|error| {
+            HttpError::for_client_error(None, ClientErrorStatusCode::BAD_REQUEST, error.to_string())
+        })?;
+        mgr.job_preflight(session_id, &target)?;
         Ok(HttpResponseUpdatedNoContent())
     }
 
