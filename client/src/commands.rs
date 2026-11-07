@@ -320,7 +320,7 @@ impl ClientArgs {
 
 /// Arguments for `job-stdout` and `job-stderr`.
 #[derive(Clone, Debug, Parser)]
-pub struct JobOutput {
+pub struct JobOutputArgs {
     /// The job whose output should be fetched.
     #[clap(env = SUSH_JOB_ID)]
     job_id: Option<JobId>,
@@ -612,7 +612,7 @@ pub enum JobCommand {
         target: TargetArg,
 
         #[clap(flatten)]
-        output: JobOutput,
+        output: JobOutputArgs,
     },
 
     /// Get the standard error of a job.
@@ -623,7 +623,7 @@ pub enum JobCommand {
         target: TargetArg,
 
         #[clap(flatten)]
-        output: JobOutput,
+        output: JobOutputArgs,
     },
 
     /// Attach to an interactive job.
@@ -1572,7 +1572,7 @@ async fn job_start(
         match job_attach(ctx, client, &job_id, &target).await {
             Ok(()) => (),
             Err(CommandError::NotFound(_)) => {
-                let output = JobOutput {
+                let output = JobOutputArgs {
                     job_id: Some(job_id),
                     binary: true,
                     file: None,
@@ -1758,7 +1758,7 @@ async fn job_start(
                 CommandError::JobStillRunning(job_id)
             });
         }
-        let args = JobOutput {
+        let args = JobOutputArgs {
             job_id: Some(job_id),
             binary,
             file: None,
@@ -2180,7 +2180,7 @@ async fn job_output(
     client: &Client,
     target: &TargetArg,
     stream: JobOutputStream,
-    args: JobOutput,
+    args: JobOutputArgs,
 ) -> Result<(), CommandError> {
     let job_id = job_id_or_last(ctx, args.job_id)?;
     let target = match target {
@@ -2219,7 +2219,7 @@ async fn job_output_from(
     client: &Client,
     target: &BaseboardId,
     stream: JobOutputStream,
-    args: JobOutput,
+    args: JobOutputArgs,
 ) -> Result<(), CommandError> {
     let job_id = job_id_or_last(ctx, args.job_id)?;
     let status = job_status_map(ctx, client, &job_id, Some(target)).await?;
@@ -2244,14 +2244,14 @@ async fn job_output_with_status(
     target: &BaseboardId,
     status: Option<&JobStatus>,
     stream: JobOutputStream,
-    JobOutput {
+    JobOutputArgs {
         binary,
         file,
         force,
         chunk_size,
         parallel,
         ..
-    }: JobOutput,
+    }: JobOutputArgs,
 ) -> Result<(), CommandError> {
     let JobOutputState {
         stdout_len,
@@ -3025,7 +3025,7 @@ mod tests {
     async fn output_needs_target() {
         let client =
             Client::new_with_client("http://[::1]:1", reqwest::Client::new(), Default::default());
-        let output = JobOutput::try_parse_from([
+        let output = JobOutputArgs::try_parse_from([
             "job-stdout",
             "--binary",
             "sea-say-sting-palm-tunnel-festival-pull-bid",
