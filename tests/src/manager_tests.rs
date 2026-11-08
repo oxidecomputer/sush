@@ -861,9 +861,31 @@ async fn wait_for_session_ended_skip(mgr: &JobManager, authn: &KeyId, job_id: &J
     .expect("job skipped for ended session");
 }
 
+async fn wait_for_session_ended_kill(mgr: &JobManager, authn: &KeyId, job_id: &JobId) {
+    timeout(Duration::from_secs(30), async {
+        loop {
+            if let Ok(map) = mgr.job_status(authn, job_id).await
+                && matches!(
+                    map.get(mgr.own_baseboard()),
+                    Some(JobStatus::Stopped {
+                        result: Err(ProcessError::Killed(SIGTERM)),
+                        ..
+                    })
+                )
+            {
+                break;
+            }
+            sleep(Duration::from_millis(50)).await;
+        }
+    })
+    .await
+    .expect("job killed for ended session");
+}
+
+/// Ending a session skips its queued jobs and stops its running ones.
 #[named]
 #[tokio::test]
-async fn session_stop_skips_queued_jobs() {
+async fn session_stop_ends_jobs() {
     let log = test_logger(function_name!());
     let (mgr, mut root, _dir, _shutdown) = manager_and_test_root(log).await;
     let authn = requester(&root);
@@ -901,23 +923,15 @@ async fn session_stop_skips_queued_jobs() {
         .await
         .expect("should be able to stop the session");
     wait_for_session_ended_skip(&mgr, &authn, &job_id_b).await;
-
-    assert!(matches!(
-        &mgr.job_status(&authn, &job_id_a).await.unwrap()[mgr.own_baseboard()],
-        JobStatus::Started { .. }
-    ));
-
-    // The job outlives its session.
-    assert!(matches!(
-        mgr.job_stop(&authn, &job_id_a, JobStopParams::default())
-            .await,
-        Err(JobError::NoSession)
-    ));
+    wait_for_session_ended_kill(&mgr, &authn, &job_id_a).await;
 }
 
+/// A superseding session skips the old session's queued jobs and
+/// stops its running ones, so its starter inherits nothing to attach
+/// to or stop.
 #[named]
 #[tokio::test]
-async fn superseding_session_skips_queued_jobs() {
+async fn superseding_session_ends_jobs() {
     let log = test_logger(function_name!());
     let (mgr, mut root, _dir, _shutdown) = manager_and_test_root(log).await;
     let authn = requester(&root);
@@ -934,8 +948,33 @@ async fn superseding_session_skips_queued_jobs() {
         .unwrap();
     confirm_start(&mgr, &authn, &mut root, &mut session).await;
 
+    let target = mgr.own_baseboard().clone();
+    let running_id = session.next_job_id();
+    let running = root
+        .sign_job_request(running_id, session_id, "sleep 10", false)
+        .await;
+    mgr.job_start(
+        &authn,
+        running.clone().into_signed(),
+        JobStartParams {
+            wait: JobWait::Start,
+            ..Default::default()
+        },
+    )
+    .await
+    .expect("should be able to start the running job");
+    session.job_started(running.into_signed());
+    assert!(matches!(
+        mgr.job_attachment(&authn, &running_id, &target).await,
+        Ok((_, Access::ReadWrite))
+    ));
     let job_id = queue_job_behind_hole(&mgr, &mut root, &authn, &mut session).await;
 
+    // Another key starts the superseding session.
+    let validity = Validity::from_now(Duration::from_secs(60)).unwrap();
+    let other_key =
+        EphemeralKey::new_root(KeyType::P256, ephemeral_test_subject(), validity).unwrap();
+    let other = requester(&other_key);
     let SessionCeremony {
         session_id: new_session_id,
         client_nonce: new_client_nonce,
@@ -944,7 +983,7 @@ async fn superseding_session_skips_queued_jobs() {
         ..
     } = session_ceremony(&mgr, 2);
     mgr.session_start(
-        &authn,
+        &other,
         new_session_id,
         new_client_nonce,
         new_signer_nonce,
@@ -952,8 +991,13 @@ async fn superseding_session_skips_queued_jobs() {
     )
     .await
     .expect("should be able to start a superseding session");
-    confirm_start(&mgr, &authn, &mut root, &mut Session::new(new_session_id)).await;
+    confirm_start(&mgr, &other, &mut root, &mut Session::new(new_session_id)).await;
     wait_for_session_ended_skip(&mgr, &authn, &job_id).await;
+    wait_for_session_ended_kill(&mgr, &authn, &running_id).await;
+    assert!(matches!(
+        mgr.job_attachment(&other, &running_id, &target).await,
+        Err(JobError::JobNotFound(_))
+    ));
 }
 
 #[named]
