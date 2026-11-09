@@ -666,7 +666,7 @@ pub struct JobStartArgs {
     command: Option<String>,
 
     /// Job output is binary, not UTF-8 encoded text.
-    #[arg(short, long, default_value_t = false, requires = "wait")]
+    #[arg(short, long, default_value_t = false, conflicts_with = "no_wait")]
     binary: bool,
 
     /// Run the job with a pseudoterminal and allow attaching to it.
@@ -704,9 +704,10 @@ pub struct JobStartArgs {
     #[arg(long, env = "TERM")]
     term: Option<String>,
 
-    /// Wait for job start/stop and then attach/show output.
-    #[arg(short, long, default_value_if("interactive", "true", "true"))]
-    wait: bool,
+    /// Return as soon as the job starts, instead of waiting for it to stop
+    /// and showing its output.
+    #[arg(short, long, conflicts_with_all = ["interactive", "streaming"])]
+    no_wait: bool,
 }
 
 impl JobStartArgs {
@@ -1525,14 +1526,14 @@ async fn job_start(
         binary,
         limits,
         term,
-        wait,
+        no_wait,
         file,
         force,
         ..
     } = start_args;
     let interactive = job.payload().is_interactive();
     let streaming = matches!(job.payload().mode, JobMode::StreamOutput);
-    let watch = wait;
+    let watch = !no_wait;
     let wait = if interactive || streaming || watch {
         JobWait::Start
     } else {
