@@ -549,7 +549,7 @@ pub enum SessionCommand {
 
     /// Stop a support session.
     ///
-    /// Queued jobs are skipped. Running jobs are not affected.
+    /// Queued jobs are skipped and running jobs are stopped.
     Stop {
         /// The session to stop.
         session_id: Option<SessionId>,

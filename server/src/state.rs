@@ -393,7 +393,8 @@ impl State {
                 .is_some_and(|queued| queued.contains_key(job_id))
     }
 
-    fn skip_queued_jobs(&self, now: DateTime<Utc>) -> Vec<Output> {
+    /// When a session ends, skip queued jobs and stop running ones.
+    fn end_session_jobs(&self, now: DateTime<Utc>) -> Vec<Output> {
         let mut outputs = Vec::new();
         for (job_id, queued) in self.session.queued_jobs().into_iter().flatten() {
             if !queued.replayed && queued.sleds.contains(self.rack.own_baseboard()) {
@@ -403,6 +404,7 @@ impl State {
                 ));
             }
         }
+        outputs.extend(self.own_running_jobs().into_iter().map(Output::Stop));
         outputs
     }
 
@@ -644,7 +646,7 @@ impl State {
                             log, "session stopped";
                             "session_id" => %session_id, "actor" => %actor,
                         );
-                        outputs.extend(self.skip_queued_jobs(now));
+                        outputs.extend(self.end_session_jobs(now));
                         self.session = Inactive;
                     }
                 }
@@ -769,7 +771,7 @@ impl State {
             );
             session.resume_at(boundary.successor);
         }
-        let outputs = self.skip_queued_jobs(now);
+        let outputs = self.end_session_jobs(now);
         self.session = SessionState::Active {
             seq: start.preimage.seq,
             live: start.live,
