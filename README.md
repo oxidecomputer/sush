@@ -33,7 +33,7 @@ components are encoded as human-readable codephrases.
 Here is a simple job running across a four-sled racklette:
 
 ```
-sush# job start -w hostname
+sush# job start hostname
 👋 Please confirm user presence to sign with key `federal-worth-fee-seed-skin-interest-road-luggage`
 ✅ Session is now `front-edit-bless-suggest-defy-bacon-retire-person`
 ✅ Signed request for job `kingdom-owner-dilemma-craft-soda-hungry-lumber-festival`
@@ -110,7 +110,7 @@ environment variables for job processes, so as a simple test try
 running the command `echo $SUSH_JOB_ID`:
 
 ```
-sush# job start --wait "echo $SUSH_JOB_ID"
+sush# job start "echo $SUSH_JOB_ID"
 ✅ Signed request for job `install-there-mutual-warfare-sound-live-order-man`
 ✅ Started job `install-there-mutual-warfare-sound-live-order-man`
    a part:0001  Stopped, exit 0 (68ms 190us 114ns), 50 B out, 0 B err
@@ -118,9 +118,9 @@ sush# job start --wait "echo $SUSH_JOB_ID"
 install-there-mutual-warfare-sound-live-order-man
 ```
 
-The `--wait` (`-w`) flag tells `sush` to wait for the job to stop before
-returning, showing a live status line per sled while it runs; the default
-behavior is to start the job and immediately return. You can check the
+By default, `sush` waits for the job to stop before returning, showing a
+live status line per sled while it runs; the `--no-wait` (`-n`) flag
+starts the job and returns immediately. You can check the
 status of a (running) job with `job status`, watch it the same way with
 `job status --wait`, or see the complete job status with
 `job status --full`.
