@@ -31,7 +31,7 @@ use sush_common::jobs::{
 };
 use sush_common::keys::{EphemeralKey, KeyError, KeyId, KeyType, Signer as _, pem_cert_chain};
 use sush_common::targets::{Cubbies, Target};
-use sush_server::gossip::{LinkedBaseboards, Universe};
+use sush_server::gossip::ConnectedBaseboards;
 use sush_server::io::BATCH_OUTPUT_BUFFER_SIZE;
 use sush_server::locker::Locker;
 use sush_server::messages::v0::{Message, Request, SessionRequest};
@@ -41,7 +41,7 @@ use sush_server::{JobError, JobManager};
 use crate::test_utils::{
     IntoBytes as _, SessionCeremony, SignJobRequest as _, confirm_start, ephemeral_test_root,
     ephemeral_test_subject, manager_and_test_root, manager_test_root_and_peer, no_cubbies,
-    null_gossip, requester, session_ceremony, test_baseboard_id, test_logger,
+    null_gossip, null_seed, requester, session_ceremony, test_baseboard_id, test_logger,
 };
 use sush_server::executor::PathIsolation;
 
@@ -1072,8 +1072,8 @@ async fn cubby_targets() {
         JobOutputDir::fixed(dir.path()),
         test_baseboard_id(),
         cubbies_rx,
-        Universe::isolated(null_gossip().await),
-        LinkedBaseboards::lonely(),
+        null_seed().await.without_gossip(),
+        ConnectedBaseboards::empty(),
         &Locker::null(),
         &[root.cert().to_owned()],
         CancellationToken::new(),
@@ -1149,8 +1149,8 @@ async fn root_certs_from_files() {
         JobOutputDir::fixed(dir.path()),
         test_baseboard_id(),
         no_cubbies(),
-        Universe::isolated(null_gossip().await),
-        LinkedBaseboards::lonely(),
+        null_seed().await.without_gossip(),
+        ConnectedBaseboards::empty(),
         &Locker::null(),
         &[path],
         CancellationToken::new(),
@@ -1205,8 +1205,8 @@ async fn bad_root_cert_files() {
                 JobOutputDir::fixed(dir.path()),
                 test_baseboard_id(),
                 no_cubbies(),
-                Universe::isolated(null_gossip().await),
-                LinkedBaseboards::lonely(),
+                null_seed().await.without_gossip(),
+                ConnectedBaseboards::empty(),
                 &Locker::null(),
                 &[path],
                 CancellationToken::new(),
@@ -1237,8 +1237,8 @@ async fn job_output_dir_moves() {
         JobOutputDir::new(rx_dirs),
         test_baseboard_id(),
         no_cubbies(),
-        Universe::isolated(null_gossip().await),
-        LinkedBaseboards::lonely(),
+        null_seed().await.without_gossip(),
+        ConnectedBaseboards::empty(),
         &Locker::null(),
         &[root.cert().to_owned()],
         CancellationToken::new(),
@@ -1329,22 +1329,22 @@ async fn job_output_dir_moves() {
 
 #[named]
 #[tokio::test]
-async fn universe_swap() {
-    // A universe migration resets the state machine. Sessions,
-    // history, and in-flight jobs die with the old universe, nothing
+async fn network_swap() {
+    // A network migration resets the state machine. Sessions,
+    // history, and in-flight jobs die with the old network, nothing
     // about them reaches the new one, and the manager keeps serving.
     let log = test_logger(function_name!());
     let dir = TempDir::with_prefix("sush-").unwrap();
     let mut root = ephemeral_test_root();
-    let (universe, universe_rx) = watch::channel(Universe::genesis(null_gossip().await));
+    let (network, network_rx) = watch::channel(null_gossip().await);
     let mgr = JobManager::with_trust_anchors(
         log,
         PathIsolation::InsecureDisable,
         JobOutputDir::fixed(dir.path()),
         test_baseboard_id(),
         no_cubbies(),
-        universe_rx,
-        LinkedBaseboards::lonely(),
+        network_rx,
+        ConnectedBaseboards::empty(),
         &Locker::null(),
         &[root.cert().to_owned()],
         CancellationToken::new(),
@@ -1382,7 +1382,7 @@ async fn universe_swap() {
         job_id
     }
 
-    // Run a job to completion in the first universe, and leave a
+    // Run a job to completion in the first network, and leave a
     // second one running at the swap.
     let job_id = run_job(&mgr, &mut root, &authn, 1).await;
     assert!(mgr.job_status(&authn, &job_id).await.is_ok());
@@ -1402,10 +1402,8 @@ async fn universe_swap() {
     .await
     .unwrap();
 
-    // Migrate. The session and the jobs die with the old universe.
-    universe
-        .send(Universe::genesis(null_gossip().await))
-        .unwrap();
+    // Migrate. The session and the jobs die with the old network.
+    network.send(null_gossip().await).unwrap();
     timeout(Duration::from_secs(30), async {
         while mgr.session(&authn).is_some() {
             sleep(Duration::from_millis(50)).await;
@@ -1414,11 +1412,11 @@ async fn universe_swap() {
     .await
     .expect("state reset");
 
-    // The manager serves the new universe. Running a fresh job also
+    // The manager serves the new network. Running a fresh job also
     // orders this check after the swap has fully settled.
     run_job(&mgr, &mut root, &authn, 2).await;
 
-    // Nothing about the old universe's jobs crossed over: not the
+    // Nothing about the old network's jobs crossed over: not the
     // completed job's history, and not the killed job's ending.
     for old in [job_id, lingering] {
         assert!(matches!(

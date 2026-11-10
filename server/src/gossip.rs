@@ -2,57 +2,52 @@
 // License, v. 2.0. If a copy of the MPL was not distributed with this
 // file, You can obtain one at https://mozilla.org/MPL/2.0/.
 
-//! Converge a peer address set into one gossip universe.
+//! Drive a set of peers to converge into one gossip network.
 //!
-//! Every peer seeds its own universe at startup, so peers meet across
-//! unrelated universes and their sessions fail with
-//! [`Error::NetworkMismatch`]. That error carries everything both sides need
-//! to agree on which universe survives, without coordination: the greater
-//! minimum event count wins, and the lesser network id breaks ties. rumors
-//! documents the rule under `Peer`, "Bootstrapping without consensus". The
-//! losing side abandons its universe by bootstrap-joining the winner's
-//! through a fresh link to the peer that beat it, and the process repeats
-//! until one universe remains.
-//!
-//! The manager publishes its current [`Universe`] (the [`Rumors`] handle
-//! and the causal frontier we joined it at) on a watch channel. A
-//! migration replaces the handle entirely; consumers must re-subscribe,
-//! and everything the old universe carried is gone.
+//! Each peer seeds its own network at startup, so peers in different
+//! networks meet with [`Mismatch::Network`]. Both sides apply the same
+//! rule to that error to pick which survives (see `remote_dominates`),
+//! and the loser joins the winner's network. The process repeats until
+//! only one network remains.
 
 use std::cmp::Ordering;
 use std::collections::{BTreeSet, HashMap, HashSet};
 use std::future::pending;
 use std::io;
-use std::net::{SocketAddr, SocketAddrV6};
+use std::net::SocketAddrV6;
 use std::time::Duration;
 
 use futures::StreamExt as _;
+use futures::stream::{self, Stream};
 use rumors::error::Mismatch;
-use rumors::{Count, Error, Joined, Network, Peer, Rumors};
+use rumors::{
+    Changes, Connection, Count, Error, Gossip, Joined, Network, NoBookmark, Peer, Rumors,
+};
 use serde::Serialize;
 use serde::de::DeserializeOwned;
 use sled_hardware_types::BaseboardId;
 use slog::{Logger, debug, info, o, warn};
 use sprockets_tls::keys::SprocketsConfig;
+use tokio::io::{BufReader, ReadHalf, WriteHalf, split};
 use tokio::sync::watch;
-use tokio::task::{AbortHandle, JoinSet};
-use tokio::time::{MissedTickBehavior, interval, timeout};
+use tokio::time::{Instant, MissedTickBehavior, interval, interval_at, sleep};
 use tokio::{select, spawn};
+use tokio_stream::wrappers::IntervalStream;
 use tokio_util::sync::CancellationToken;
+use tokio_util::task::JoinMap;
 
-use rumors::link::routed::Endpoint;
-
-use crate::link::{AttestedBaseboards, CorpusSource, SprocketsDial, SprocketsLink, Transport};
 use crate::locker::Locker;
 use crate::locker::bookmark::{BookmarkSource, SushBookmark};
+use crate::sprockets::{AttestedPeerConnection, CorpusSource, Dialer, Listener};
 
 /// The attested baseboards of our live gossip peers.
 #[derive(Clone, Debug)]
-pub struct LinkedBaseboards(watch::Receiver<BTreeSet<BaseboardId>>);
+pub struct ConnectedBaseboards(watch::Receiver<BTreeSet<BaseboardId>>);
 
-impl LinkedBaseboards {
-    /// A set that is forever empty, to accompany [`Universe::isolated`].
-    pub fn lonely() -> Self {
+impl ConnectedBaseboards {
+    /// An empty set that never changes, for a server that does not gossip
+    /// (see [`Seed::without_gossip`]).
+    pub fn empty() -> Self {
         let (_tx, rx) = watch::channel(BTreeSet::new());
         Self(rx)
     }
@@ -74,70 +69,50 @@ impl LinkedBaseboards {
     }
 }
 
-/// Manager timing. The defaults suit a rack, tests shrink them.
+/// Gossip manager timing.
 #[derive(Clone, Debug)]
 pub struct GossipConfig {
-    /// How often absent links are re-established.
     pub reconnect: Duration,
-    /// Ceiling on establishing one link, and on each data-stream dial
-    /// inside a live one.
-    pub connect_timeout: Duration,
-    /// Ceiling on one bootstrap join.
-    pub join_timeout: Duration,
+    pub handshake_timeout: Duration,
+    pub heartbeat: Duration,
+    pub session_deadline: Duration,
 }
 
 impl Default for GossipConfig {
+    /// These defaults suit a rack; tests should shrink them.
     fn default() -> Self {
         Self {
             reconnect: Duration::from_secs(5),
-            connect_timeout: Duration::from_secs(30),
-            join_timeout: Duration::from_secs(60),
+            handshake_timeout: Duration::from_secs(30),
+            heartbeat: Duration::from_secs(30),
+            session_deadline: Duration::from_secs(60),
         }
     }
 }
 
-/// A gossip universe.
-#[derive(Clone, Debug)]
-pub struct Universe<T: Send + Sync + 'static> {
-    /// The gossiped set.
-    pub rumors: Rumors<T, SushBookmark>,
+/// A driver initiates a gossip session on every local change,
+/// and on every `heartbeat` whether or not anything changed.
+fn policy<T: Send + Sync + 'static>(
+    changes: Changes<T>,
+    heartbeat: Duration,
+) -> impl Stream<Item = Gossip> + Send + 'static {
+    let mut heartbeats = interval_at(Instant::now() + heartbeat, heartbeat);
+    heartbeats.set_missed_tick_behavior(MissedTickBehavior::Delay);
+    stream::select(
+        changes.map(Gossip::from),
+        IntervalStream::new(heartbeats).map(|_| Gossip::Unconditionally),
+    )
 }
 
-impl<T: Send + Sync + 'static> Universe<T> {
-    pub fn genesis(rumors: Rumors<T, SushBookmark>) -> Self {
-        Self { rumors }
-    }
-
-    /// A single-peer universe that never changes. The standalone server
-    /// uses this, as does a sled that cannot gossip. The receiver
-    /// outlives its sender.
-    pub fn isolated(seed: Rumors<T, SushBookmark>) -> watch::Receiver<Self> {
-        let (_tx, rx) = watch::channel(Universe::genesis(seed));
-        rx
-    }
-}
-
-/// A seeded network paired with the source persisting its identity.
-/// [`Seed::grow`] is the only constructor and [`spawn_gossip`] consumes
-/// the pair whole, so a seed can never gossip against a source other
-/// than its own.
+/// A seeded network and its persistent identity.
 #[derive(Debug)]
 pub struct Seed<T: Send + Sync + 'static> {
-    rumors: Rumors<T, SushBookmark>,
+    peer: Peer<T, SushBookmark>,
     bookmarks: BookmarkSource,
 }
 
 impl<T: Send + Sync + 'static> Seed<T> {
-    /// Seed a fresh universe with this server as its only peer, over
-    /// `locker`'s storage, making the locker's one [`BookmarkSource`].
-    ///
-    /// The probe runs first because broken storage would otherwise
-    /// wedge gossip: rumors stores the bookmark at the start of every
-    /// session, a failed store aborts the session, and a peer that can
-    /// never hold a session can never join another universe. When the
-    /// probe fails we gossip with a shed handle instead, which
-    /// persists nothing; each restart then strands an identity, which
-    /// is harmless.
+    /// Seed a fresh network with this server as its only peer.
     pub async fn grow(log: &Logger, locker: &Locker) -> Self
     where
         T: DeserializeOwned + Serialize + Eq + Send + Sync + 'static,
@@ -147,28 +122,46 @@ impl<T: Send + Sync + 'static> Seed<T> {
             Ok(()) => bookmarks.handle(),
             Err(_) => bookmarks.shed_handle(),
         };
-        let rumors = match Peer::seed().bookmark(handle).await {
-            Ok(peer) => peer.into_rumors(),
-            Err(unbookmarked) => match unbookmarked.peer.bookmark(bookmarks.shed_handle()).await {
-                Ok(peer) => peer.into_rumors(),
-                Err(_) => unreachable!("a shed bookmark never touches storage"),
-            },
+        let peer = match Peer::seed().bookmark(handle).await {
+            Ok(peer) => peer,
+            Err(unbookmarked) => shed(&bookmarks, unbookmarked.peer).await,
         };
-        Self { rumors, bookmarks }
+        Self { peer, bookmarks }
     }
 
-    pub fn rumors(&self) -> &Rumors<T, SushBookmark> {
-        &self.rumors
+    /// Return the network that this seed started.
+    pub fn network(&self) -> Network {
+        self.peer.network()
     }
 
-    /// The network alone, for a seed that will never gossip
-    /// (see [`Universe::isolated`]).
+    /// Convert this seed into a gossip network handle.
     pub fn into_rumors(self) -> Rumors<T, SushBookmark> {
-        self.rumors
+        self.peer.into_rumors()
+    }
+
+    /// Convert this seed into a trivial, unchanging network for an
+    /// isolated server.
+    pub fn without_gossip(self) -> watch::Receiver<Rumors<T, SushBookmark>> {
+        let (_tx, rx) = watch::channel(self.into_rumors());
+        rx
     }
 }
 
-/// Whether the peer's universe dominates ours, by rumors' documented rule.
+/// Attach a bookmark handle to `peer` that doesn't write anything.
+async fn shed<T>(bookmarks: &BookmarkSource, peer: Peer<T, NoBookmark>) -> Peer<T, SushBookmark>
+where
+    T: DeserializeOwned + Serialize + Eq + Send + Sync + 'static,
+{
+    match peer.bookmark(bookmarks.shed_handle()).await {
+        Ok(peer) => peer,
+        Err(_) => unreachable!("shed bookmarks do not touch storage, so cannot fail"),
+    }
+}
+
+/// Whether the peer's network dominates ours, by the rule in rumors'
+/// [Bootstrapping without consensus](Peer#bootstrapping-without-consensus).
+/// Any total order on networks breaks ties, as long as both sides use
+/// the same one.
 fn remote_dominates(
     local_events: &Count,
     remote_events: &Count,
@@ -178,16 +171,17 @@ fn remote_dominates(
     match remote_events.cmp(local_events) {
         Ordering::Greater => true,
         Ordering::Less => false,
-        // Any total order serves, as long as both sides use the same one.
         Ordering::Equal => remote_network < local_network,
     }
 }
 
-/// Bind a sprockets transport on `listen_addr` and run a gossip manager
-/// over it until `shutdown`. Returns the address the listener bound, the
-/// channel following the current universe, and the channel following the
-/// baseboards we hold live links to. A caller that cannot bind may fall
-/// back to [`Universe::isolated`].
+/// Listen for sprockets connections on `listen_addr` and run a gossip
+/// manager until `shutdown`. The manager connects to the addresses on
+/// `peers`, drives gossip on every connection, and resolves network
+/// collisions. Returns the address the listener bound, the channel
+/// following the current network (starting at `seed`), and the channel
+/// following the baseboards we hold live connections to. A caller that
+/// cannot bind may fall back to a new seed's [`Seed::without_gossip`].
 #[allow(clippy::too_many_arguments)]
 pub async fn spawn_gossip<T>(
     log: &Logger,
@@ -198,96 +192,92 @@ pub async fn spawn_gossip<T>(
     peers: watch::Receiver<BTreeSet<SocketAddrV6>>,
     seed: Seed<T>,
     shutdown: CancellationToken,
-) -> io::Result<(SocketAddrV6, watch::Receiver<Universe<T>>, LinkedBaseboards)>
+) -> io::Result<(
+    SocketAddrV6,
+    watch::Receiver<Rumors<T, SushBookmark>>,
+    ConnectedBaseboards,
+)>
 where
     T: DeserializeOwned + Serialize + Eq + Send + Sync + 'static,
 {
-    let transport = Transport::new(
+    let listener = Listener::bind(
         log,
-        sprockets,
-        corpus,
+        sprockets.clone(),
+        corpus.clone(),
         listen_addr,
-        config.connect_timeout,
+        config.handshake_timeout,
         shutdown.clone(),
     )
     .await?;
-    let bound = transport.bound();
-    let (universe, linked) = spawn_gossip_manager(log, config, transport, peers, seed, shutdown);
-    Ok((bound, universe, linked))
-}
-
-/// Run a gossip manager until `shutdown`. Establishes and serves links for
-/// the addresses on `peers`, drives gossip on every link, and resolves
-/// universe collisions. The returned channels follow the current universe,
-/// starting at `seed`, and the baseboards we hold live links to.
-#[allow(clippy::too_many_arguments)]
-pub fn spawn_gossip_manager<T>(
-    log: &Logger,
-    config: GossipConfig,
-    transport: Transport,
-    peers: watch::Receiver<BTreeSet<SocketAddrV6>>,
-    seed: Seed<T>,
-    shutdown: CancellationToken,
-) -> (watch::Receiver<Universe<T>>, LinkedBaseboards)
-where
-    T: DeserializeOwned + Serialize + Eq + Send + Sync + 'static,
-{
-    let Seed {
-        rumors: seed,
-        bookmarks,
-    } = seed;
-    let (publish, subscribe) = watch::channel(Universe::genesis(seed.clone()));
-    let (linked, subscribe_linked) = watch::channel(BTreeSet::new());
+    let local_addr = listener.local_addr();
+    let dialer = Dialer::new(log, sprockets, corpus, config.handshake_timeout);
+    let Seed { peer, bookmarks } = seed;
+    let heartbeat = config.heartbeat;
+    let deadline = config.session_deadline;
+    let rumors = peer
+        .gossip_when(move |changes| policy(changes, heartbeat))
+        .session_deadline(move || sleep(deadline))
+        .into_rumors();
+    let (publish, subscribe) = watch::channel(rumors.clone());
+    let (connected, subscribe_connected) = watch::channel(BTreeSet::new());
     let manager = Manager {
         log: log.new(o!("component" => "gossip manager")),
         config,
-        endpoint: transport.endpoint(),
-        attested: transport.baseboards().watch(),
-        transport,
+        dialer,
+        listener,
         peers,
-        rumors: seed,
+        rumors,
         bookmarks,
         publish,
-        linked,
-        drivers: JoinSet::new(),
-        live: HashMap::new(),
-        dials: JoinSet::new(),
-        dialing: HashMap::new(),
-        joins: HashSet::new(),
+        connected,
+        dialing: JoinMap::new(),
+        last_dialed_addrs: HashMap::new(),
+        drivers: JoinMap::new(),
+        winners: HashSet::new(),
         shutdown,
     };
     spawn(manager.run());
-    (subscribe, LinkedBaseboards(subscribe_linked))
+    Ok((
+        local_addr,
+        subscribe,
+        ConnectedBaseboards(subscribe_connected),
+    ))
 }
 
-/// A link establishment that finished, and the peer it was aimed at.
-type Established = (SocketAddr, Result<SprocketsLink, String>);
+/// The buffered read half a session reads from.
+type Reader = BufReader<ReadHalf<AttestedPeerConnection>>;
 
-/// Why a link's driver stopped.
+/// The write half a session writes to.
+type Writer = WriteHalf<AttestedPeerConnection>;
+
+/// A connection's halves, ready for sessions.
+fn halves(conn: AttestedPeerConnection) -> (Reader, Writer) {
+    let (read, write) = split(conn);
+    (BufReader::new(read), write)
+}
+
+/// Why a connection's driver stopped.
 enum Stopped {
-    /// Its session found a universe that dominates ours; we must join it.
+    /// Its session found a network that dominates ours; we must join it.
     Dominated,
-    /// The link failed, or was poisoned by a session.
+    /// The connection failed, or a failed session left it unusable.
     Failed,
 }
 
 struct Manager<T: Send + Sync + 'static> {
     log: Logger,
     config: GossipConfig,
-    endpoint: Endpoint<SprocketsDial>,
-    transport: Transport,
+    dialer: Dialer,
+    listener: Listener,
     peers: watch::Receiver<BTreeSet<SocketAddrV6>>,
     rumors: Rumors<T, SushBookmark>,
     bookmarks: BookmarkSource,
-    publish: watch::Sender<Universe<T>>,
-    attested: watch::Receiver<AttestedBaseboards>,
-    linked: watch::Sender<BTreeSet<BaseboardId>>,
-    drivers: JoinSet<(SocketAddr, Stopped)>,
-    live: HashMap<SocketAddr, AbortHandle>,
-    dials: JoinSet<Established>,
-    dialing: HashMap<SocketAddr, AbortHandle>,
-    /// Peers whose universes beat ours, to be joined through.
-    joins: HashSet<SocketAddr>,
+    publish: watch::Sender<Rumors<T, SushBookmark>>,
+    connected: watch::Sender<BTreeSet<BaseboardId>>,
+    dialing: JoinMap<SocketAddrV6, io::Result<AttestedPeerConnection>>,
+    last_dialed_addrs: HashMap<BaseboardId, SocketAddrV6>,
+    drivers: JoinMap<BaseboardId, Stopped>,
+    winners: HashSet<BaseboardId>,
     shutdown: CancellationToken,
 }
 
@@ -301,237 +291,163 @@ where
         loop {
             select! {
                 _ = self.shutdown.cancelled() => break,
-                _ = tick.tick() => self.link_absent(),
-                Ok(()) = self.peers.changed() => {
-                    self.prune();
-                    self.link_absent();
-                }
-                // A late attestation names a link that is already live.
-                Ok(()) = self.attested.changed() => {}
-                Some((peer, link)) = self.transport.accept() => {
-                    self.on_link(peer, link).await;
-                }
-                Some(done) = self.dials.join_next_with_id() => {
-                    match done {
-                        // A dial may finish after its peer was pruned. Only
-                        // the dial still on the books may act on its result.
-                        Ok((id, (peer, result))) => {
-                            if self.dialing.get(&peer).is_some_and(|dial| dial.id() == id) {
-                                self.dialing.remove(&peer);
-                                match result {
-                                    Ok(link) => self.on_link(peer, link).await,
-                                    Err(err) => {
-                                        debug!(
-                                            self.log, "link failed";
-                                            "peer" => %peer, "error" => err,
-                                        );
-                                    }
-                                }
-                            }
+                _ = tick.tick() => self.dial_unconnected_peers(),
+                Ok(()) = self.peers.changed() => self.dial_unconnected_peers(),
+                Some(conn) = self.listener.accept() => self.on_connection(conn).await,
+                Some((addr, dialed)) = self.dialing.join_next() => {
+                    match dialed.map_err(io::Error::other).flatten() {
+                        Ok(conn) => {
+                            self.last_dialed_addrs.insert(conn.peer().clone(), addr);
+                            self.on_connection(conn).await;
                         }
-                        Err(err) => self.dialing.retain(|_, dial| dial.id() != err.id()),
+                        Err(err) => {
+                            debug!(self.log, "dial failed"; "addr" => %addr, "error" => %err);
+                        }
                     }
                 }
-                Some(done) = self.drivers.join_next_with_id() => {
-                    match done {
-                        Ok((id, (peer, stopped))) => {
-                            debug!(
-                                self.log, "link driver stopped";
-                                "peer" => %peer,
-                                "dominated" => matches!(stopped, Stopped::Dominated),
-                            );
-                            // A driver may die after a fresh link to its peer
-                            // has replaced it. Only the living driver's death
-                            // may take the peer out of the live set.
-                            if self.live.get(&peer).is_some_and(|live| live.id() == id) {
-                                self.live.remove(&peer);
-                                if matches!(stopped, Stopped::Dominated) {
-                                    self.joins.insert(peer);
-                                }
-                            }
+                Some((peer, stopped)) = self.drivers.join_next() => {
+                    match stopped {
+                        Ok(Stopped::Dominated) => {
+                            self.winners.insert(peer);
                         }
-                        // A panicked driver reports nothing, and its peer
-                        // would never be re-linked.
+                        Ok(Stopped::Failed) => {
+                            debug!(self.log, "connection driver stopped"; "peer" => %peer);
+                        }
                         Err(err) => {
                             if err.is_panic() {
-                                warn!(self.log, "link driver panicked"; "error" => %err);
+                                warn!(
+                                    self.log, "connection driver panicked";
+                                    "peer" => %peer, "error" => %err,
+                                );
                             }
-                            self.live.retain(|_, live| live.id() != err.id());
                         }
                     }
+                    // Redial now instead of waiting for the next tick.
+                    self.dial_unconnected_peers();
                 }
             }
-            self.publish_linked();
+            self.publish_connected();
         }
     }
 
-    /// Publish the attested baseboards of the peers with live links.
-    fn publish_linked(&self) {
-        let attested = self.attested.borrow();
-        let linked: BTreeSet<BaseboardId> = self
-            .live
-            .keys()
-            .filter_map(|addr| attested.resolve(addr))
-            .collect();
-        if *self.linked.borrow() != linked {
-            debug!(
-                self.log, "linked baseboards changed";
-                "linked" => ?linked,
-                "live" => ?self.live.keys().collect::<Vec<_>>(),
-            );
-            self.linked.send_replace(linked);
+    /// Publish the baseboards of the peers with live connections.
+    fn publish_connected(&self) {
+        let connected: BTreeSet<BaseboardId> = self.drivers.keys().cloned().collect();
+        if *self.connected.borrow() != connected {
+            debug!(self.log, "connected baseboards changed"; "connected" => ?connected);
+            self.connected.send_replace(connected);
         }
     }
 
-    /// The addresses the dial tiebreak makes ours to establish, so that a
-    /// pair of peers ends up with one link rather than two.
-    fn wanted(&self) -> BTreeSet<SocketAddr> {
-        let ours = *self.endpoint.local_addr();
-        self.peers
-            .borrow()
-            .iter()
-            .map(|addr| SocketAddr::V6(*addr))
-            .filter(|addr| *addr < ours)
-            .collect()
-    }
-
-    /// Establish a link to every wanted peer without one already.
-    fn link_absent(&mut self) {
-        for peer in self.wanted() {
-            if self.live.contains_key(&peer) || self.dialing.contains_key(&peer) {
+    /// Dial every peer with a lower address than ours that we are neither
+    /// connected to nor already dialing. Only the peer with the higher
+    /// address dials, so each pair ends up with one connection.
+    fn dial_unconnected_peers(&mut self) {
+        let ours = self.listener.local_addr();
+        for &addr in self.peers.borrow().iter().filter(|addr| **addr < ours) {
+            let connected = self
+                .drivers
+                .keys()
+                .any(|peer| self.last_dialed_addrs.get(peer) == Some(&addr));
+            if connected || self.dialing.contains_key(&addr) {
                 continue;
             }
-            let deadline = self.config.connect_timeout;
-            let endpoint = self.endpoint.clone();
-            let handle = self.dials.spawn(async move {
-                let result = match timeout(deadline, endpoint.link(peer)).await {
-                    Ok(Ok((_, link))) => Ok(link),
-                    Ok(Err(err)) => Err(err.to_string()),
-                    Err(_) => Err("link establishment timed out".to_string()),
-                };
-                (peer, result)
-            });
-            self.dialing.insert(peer, handle);
+            let dialer = self.dialer.clone();
+            self.dialing
+                .spawn(addr, async move { dialer.dial(addr).await });
         }
     }
 
-    /// Tear down links, dials, and connection pools for peers no longer
-    /// in the peer set, and forgive any debt owed to them.
-    fn prune(&mut self) {
-        let want: BTreeSet<_> = self
-            .peers
-            .borrow()
-            .iter()
-            .map(|addr| SocketAddr::V6(*addr))
-            .collect();
-        let cull = |peer: &SocketAddr, handle: &mut AbortHandle| {
-            if want.contains(peer) {
-                return true;
-            }
-            handle.abort();
-            false
-        };
-        self.live.retain(cull);
-        self.dialing.retain(cull);
-        self.joins.retain(|peer| want.contains(peer));
-        self.transport.retain_peers(&self.peers.borrow());
-    }
-
-    /// Gossip on a fresh link, or use it to join a universe that beat ours.
-    async fn on_link(&mut self, peer: SocketAddr, link: SprocketsLink) {
-        if self.joins.contains(&peer) {
-            self.migrate(peer, link).await;
+    /// Gossip on a fresh connection, or use it to join a network that
+    /// beat ours.
+    async fn on_connection(&mut self, conn: AttestedPeerConnection) {
+        let peer = conn.peer().clone();
+        let (read, write) = halves(conn);
+        if self.winners.contains(&peer) {
+            self.migrate(peer, read, write).await;
         } else {
-            self.drive(peer, link);
+            self.drive(peer, read, write);
         }
     }
 
-    /// Spawn a session driver owning `link`: push our changes, and serve
-    /// whatever the peer initiates, until the link fails.
-    fn drive(&mut self, peer: SocketAddr, link: SprocketsLink) {
-        debug!(self.log, "driving link"; "peer" => %peer);
-        let rumors = self.rumors.clone();
+    /// Spawn a driver owning a connection.
+    fn drive(&mut self, peer: BaseboardId, read: Reader, write: Writer) {
+        debug!(self.log, "driving gossip connection"; "peer" => %peer);
         let log = self.log.clone();
-        let handle = self
-            .drivers
-            .spawn(async move { (peer, sessions(&rumors, link, &log).await) });
-        if let Some(stale) = self.live.insert(peer, handle) {
-            stale.abort();
-        }
+        let rumors = self.rumors.clone();
+        self.drivers
+            .spawn(peer, async move { drive(&log, &rumors, read, write).await });
     }
 
-    /// Abandon our universe for the one `peer` belongs to, joining over the
-    /// fresh link to it. Every driver stops first: none may gossip across
-    /// the swap. On failure our universe is intact and the debt stands, so
-    /// the next link retries; either way all links are rebuilt, since the
-    /// old ones belong to the universe we are leaving.
-    ///
-    /// The new peer gets its own handle on the same bookmark storage.
-    /// That is safe because rumors persists a bookmark only when a
-    /// session starts, and aborting the drivers above ends every
-    /// session before the handle exists: the abandoned peer can never
-    /// store again. A store it already had in flight either loses to
-    /// the locker's sequence guard, or records a session that was
-    /// aborted before it sent anything, so nothing on the wire
-    /// outruns the record. If the received identity cannot be
-    /// persisted, we keep gossiping with a shed handle rather than
-    /// take the sled out of gossip; a stranded identity is harmless,
-    /// unlike a support shell that cannot reach a degraded rack.
-    async fn migrate(&mut self, peer: SocketAddr, mut link: SprocketsLink) {
-        self.drivers.abort_all();
-        self.live.clear();
-        info!(
-            self.log, "joining the universe that beat ours";
-            "peer" => %peer, "ours" => %self.rumors.network(),
+    /// Abandon our network and join the one `peer` belongs to.
+    /// Our new local rumors peer gets a fresh identity and bookmark
+    /// handle; all other peers are dropped.
+    async fn migrate(&mut self, peer: BaseboardId, read: Reader, write: Writer) {
+        self.drivers.shutdown().await;
+        debug!(
+            self.log, "joining dominating network";
+            "peer" => %peer,
+            "ours" => %self.rumors.network(),
         );
-        let bootstrap = Peer::bootstrap().bookmark(self.bookmarks.handle());
-        match timeout(self.config.join_timeout, bootstrap.join(&mut link)).await {
-            Ok(Joined::Joined { peer }) => self.adopt(peer),
-            Ok(Joined::Unbookmarked(unbookmarked)) => {
-                warn!(
-                    self.log, "cannot persist our identity, gossiping unbookmarked";
-                    "error" => %unbookmarked.error,
-                );
-                let peer = match unbookmarked
-                    .peer
-                    .bookmark(self.bookmarks.shed_handle())
-                    .await
-                {
-                    Ok(peer) => peer,
-                    Err(_) => unreachable!("a shed bookmark never touches storage"),
-                };
-                self.adopt(peer);
+        let heartbeat = self.config.heartbeat;
+        let deadline = self.config.session_deadline;
+        let bootstrap = Peer::bootstrap()
+            .gossip_when(move |changes| policy(changes, heartbeat))
+            .session_deadline(move || sleep(deadline))
+            .bookmark(self.bookmarks.handle());
+        let connection = match bootstrap.join(read, write).await {
+            Joined::Joined { peer, connection } => {
+                self.joined(peer);
+                Some(connection)
             }
-            Ok(Joined::Bailed { .. }) => warn!(self.log, "mutual bootstrap, retrying"),
-            Ok(Joined::Failed { error, .. }) => warn!(self.log, "join failed"; "error" => %error),
-            Err(_) => warn!(self.log, "join timed out"),
+            Joined::Unbookmarked {
+                unbookmarked,
+                connection,
+            } => {
+                warn!(self.log, "gossiping without a bookmark"; "error" => %unbookmarked.error);
+                let peer = shed(&self.bookmarks, unbookmarked.peer).await;
+                self.joined(peer);
+                Some(connection)
+            }
+            Joined::Bailed { .. } => {
+                warn!(self.log, "mutual bootstrap, retrying");
+                None
+            }
+            Joined::Failed { error, .. } => {
+                warn!(self.log, "unable to join gossip network"; "error" => %error);
+                None
+            }
+        };
+        match connection {
+            Some(Connection::Reusable { read, write }) => self.drive(peer, read, write),
+            Some(Connection::Lost { error }) => {
+                debug!(self.log, "joined, but lost the connection"; "error" => %error);
+            }
+            None => {}
         }
-        drop(link);
-        self.link_absent();
+        self.dial_unconnected_peers();
     }
 
-    /// Follow the joined peer into its universe.
-    fn adopt(&mut self, peer: Peer<T, SushBookmark>) {
+    fn joined(&mut self, peer: Peer<T, SushBookmark>) {
         self.rumors = peer.into_rumors();
-        let _ = self.publish.send(Universe {
-            rumors: self.rumors.clone(),
-        });
-        self.joins.clear();
-        info!(self.log, "migrated"; "network" => %self.rumors.network());
+        let _ = self.publish.send(self.rumors.clone());
+        self.winners.clear();
+        info!(self.log, "migrated to new gossip network"; "network" => %self.rumors.network());
     }
 }
 
-/// Drive sessions on one link until it fails, reporting why.
-async fn sessions<T>(
-    rumors: &Rumors<T, SushBookmark>,
-    mut link: SprocketsLink,
+/// Drive gossip sessions until one fails, reporting why.
+async fn drive<T>(
     log: &Logger,
+    rumors: &Rumors<T, SushBookmark>,
+    read: Reader,
+    write: Writer,
 ) -> Stopped
 where
     T: DeserializeOwned + Serialize + Eq + Send + Sync + 'static,
 {
     let ours = rumors.network();
-    let mut driver = rumors.gossip(&mut link);
+    let mut driver = rumors.gossip(read, write);
     while let Some(session) = driver.next().await {
         match session {
             Ok(_) => {}
@@ -544,7 +460,7 @@ where
                 let dominated =
                     remote_dominates(&local_min_events, &remote_min_events, ours, remote_network);
                 debug!(
-                    log, "universe mismatch";
+                    log, "network mismatch";
                     "ours" => %ours, "theirs" => %remote_network,
                     "our_events" => %local_min_events,
                     "their_events" => %remote_min_events,
@@ -556,15 +472,12 @@ where
                     Stopped::Failed
                 };
             }
-            // A bookmark failure also stops every later session at the
-            // persist gate, so it deserves a warning where routine
-            // link churn does not.
             Err(Error::Bookmark(error)) => {
-                warn!(log, "bookmark failure stops gossip"; "error" => %error);
+                warn!(log, "bookmark failed, unable to gossip"; "error" => %error);
                 return Stopped::Failed;
             }
             Err(err) => {
-                debug!(log, "session failed"; "error" => %err);
+                debug!(log, "gossip session failed"; "error" => %err);
                 return Stopped::Failed;
             }
         }

@@ -21,7 +21,7 @@ use x509_cert::der::DecodePem as _;
 use sush_api::sush_api_mod::api_description;
 use sush_common::targets::Cubbies;
 use sush_server::executor::PathIsolation;
-use sush_server::gossip::{LinkedBaseboards, Universe};
+use sush_server::gossip::ConnectedBaseboards;
 use sush_server::locker::Locker;
 use sush_server::manager::JobManager;
 use sush_server::output::JobOutputDir;
@@ -97,8 +97,7 @@ async fn main() -> Result<(), String> {
         serial_number: "23333333".to_string(),
     };
 
-    // TODO: get/seed Rumors network
-    let gossip = Universe::isolated(seed_gossip(&log, &Locker::null()).await.into_rumors());
+    let gossip = seed_gossip(&log, &Locker::null()).await.without_gossip();
 
     #[cfg(feature = "test-support")]
     let anchors = overridable_trust_anchors(&trust_anchors).await?;
@@ -114,7 +113,7 @@ async fn main() -> Result<(), String> {
         baseboard,
         cubbies,
         gossip,
-        LinkedBaseboards::lonely(),
+        ConnectedBaseboards::empty(),
         &Locker::null(),
         &anchors,
         shutdown.clone(),

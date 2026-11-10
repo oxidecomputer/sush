@@ -14,7 +14,7 @@
 //! We use a [`Tenant`] of a [`Locker`] to store it on disk(s);
 //! if a load fails or the slots disagree, we assume a new identity
 //! rather than risk resuming with a stale one. The record keeps every
-//! universe's identities, so a lost write costs at most a stranded
+//! network's identities, so a lost write costs at most a stranded
 //! identity, never a stale one.
 
 use std::io::Cursor;
@@ -36,7 +36,7 @@ pub const BOOKMARK: TenantSpec = TenantSpec {
 struct BookmarkRecord(#[serde(with = "format::cbor_bytes")] Vec<u8>);
 
 impl Versioned for BookmarkRecord {
-    const VERSION: u16 = 0;
+    const VERSION: u16 = 1;
 }
 
 impl Record for BookmarkRecord {

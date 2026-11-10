@@ -34,7 +34,7 @@ use sush_common::version::VersionInfo;
 
 use crate::certs::Certificates;
 use crate::executor::{Executor, PathIsolation};
-use crate::gossip::{Seed, Universe};
+use crate::gossip::Seed;
 use crate::history::JobHistory;
 use crate::job::SocketSender;
 use crate::locker::Locker;
@@ -48,7 +48,6 @@ use crate::rack::Rack;
 pub type AttachmentPoints = BTreeMap<JobId, watch::Receiver<Option<SocketSender>>>;
 pub type GossipNetwork = Rumors<VersionedMessage, SushBookmark>;
 pub type GossipSeed = Seed<VersionedMessage>;
-pub type GossipUniverse = Universe<VersionedMessage>;
 pub type QueuedJobs = BTreeMap<JobId, QueuedJob>;
 
 /// Maximum number of jobs a session may have queued (submitted, but not
@@ -162,12 +161,12 @@ enum Admission {
 }
 
 /// This incarnation's relationship to its own past: where it entered
-/// the universe, what a previous life committed to, and what it left
+/// the network, what a previous life committed to, and what it left
 /// running.
 #[derive(Debug)]
 pub struct Past {
     /// The version of this life's first send: our announcement that
-    /// we joined this universe. A message whose causal history
+    /// we joined this network. A message whose causal history
     /// includes the announcement is live, and so is the announcement
     /// itself. Every other message, prior to or concurrent with the
     /// announcement, is replayed. A replayed event from our own
@@ -180,7 +179,7 @@ pub struct Past {
     /// or the record was lost and abandoned.
     committed: Option<Box<Boundary>>,
 
-    /// The gossip universe this life entered.
+    /// The gossip network this life entered.
     network: Network,
 
     /// Jobs whose replayed start events say a previous life ran them.
@@ -230,7 +229,7 @@ impl Past {
         }
     }
 
-    /// Return the current boundary record for this universe.
+    /// Return the current boundary record for this network.
     fn boundary(&self) -> Option<&Boundary> {
         self.committed
             .as_deref()
@@ -450,9 +449,9 @@ impl State {
     /// none was recorded. No status means its fate never left this
     /// sled, and no other sled can ever report it; a replayed start
     /// makes it a zombie instead, and a replayed end settles it.
-    /// The ruling goes only to the universe the job started in. Any
-    /// other universe never saw the job and hears nothing, and
-    /// re-entering the job's own universe replays the earlier ruling
+    /// The ruling goes only to the network the job started in. Any
+    /// other network never saw the job and hears nothing, and
+    /// re-entering the job's own network replays the earlier ruling
     /// as a status, which stops a second announcement.
     fn adjudicate_boundary(&mut self, log: &Logger, now: DateTime<Utc>) -> Vec<Output> {
         let Some(boundary) = self.past.boundary() else {
@@ -1124,7 +1123,7 @@ impl State {
             return outputs;
         };
 
-        // If there's no universe, just drain the queue and advance the chain.
+        // If there's no network, just drain the queue and advance the chain.
         let Some(network) = network else {
             let mut n = 0;
             while let Some(queued) = queued_jobs.remove(&session.next_job_id()) {
@@ -1290,9 +1289,9 @@ fn drain_ready(
     }
 }
 
-/// Enter a universe: judge the boundary record, announce this build,
+/// Enter a network: judge the boundary record, announce this build,
 /// and mark the birth at the announce's version.
-fn enter_universe(
+fn enter_network(
     own_baseboard: BaseboardId,
     anchors: &[Certificate],
     store: &BoundaryStore,
@@ -1346,10 +1345,10 @@ impl StateManager {
     /// `State` that will be asynchronously updated in response to
     /// messages and events.
     ///
-    /// `universe` follows the gossip network we belong to. When it changes,
-    /// everything resets. Versions do not compare across universes, so no
+    /// `network` follows the gossip network we belong to. When it changes,
+    /// everything resets. Versions do not compare across networks, so no
     /// session or history bookkeeping can survive a migration; running
-    /// jobs are killed, and the new universe hears nothing about them.
+    /// jobs are killed, and the new network hears nothing about them.
     ///
     /// `cubbies` follows the rack's cubby map, which survives migrations.
     #[allow(clippy::too_many_arguments)]
@@ -1360,7 +1359,7 @@ impl StateManager {
         own_baseboard: BaseboardId,
         mut requests: R,
         mut cubbies: watch::Receiver<Cubbies>,
-        mut universe: watch::Receiver<GossipUniverse>,
+        mut network: watch::Receiver<GossipNetwork>,
         anchors: &[Certificate],
         store: Arc<BoundaryStore>,
         shutdown: CancellationToken,
@@ -1376,7 +1375,7 @@ impl StateManager {
         // in the face of arbitrary *causal* reorderings.
         // `borrow_and_update` marks the value seen, so a migration
         // that landed before we subscribed does not replay as a swap.
-        let Universe { rumors: initial } = universe.borrow_and_update().clone();
+        let initial = network.borrow_and_update().clone();
         let mut causal_messages = initial.causal_messages();
 
         // Decisions read a snapshot of the boundary, never the live
@@ -1409,22 +1408,22 @@ impl StateManager {
         );
 
         // We will drop this once we want to drain the remaining messages.
-        // The watch channel behind `universe` stores its own copy of the
+        // The watch channel behind `network` stores its own copy of the
         // network, so holding the receiver would keep the network from
         // draining while we wait for exactly that.
-        let mut network = Some((initial, universe));
+        let mut active = Some((initial, network));
 
         Ok((
             rx_state,
             spawn(async move {
                 info!(log, "managing state");
 
-                // Enter the initial universe before any message is
+                // Enter the initial network before any message is
                 // processed, so the birth mark splits this life's
                 // traffic from replayed history.
-                if let Some((rumors, _)) = &network {
+                if let Some((rumors, _)) = &active {
                     let entered =
-                        enter_universe(own_baseboard.clone(), &anchors, &boundary_store, rumors)
+                        enter_network(own_baseboard.clone(), &anchors, &boundary_store, rumors)
                             .expect("trust anchors validated at startup");
                     tx_state.send_modify(|state| {
                         *state = entered;
@@ -1440,34 +1439,34 @@ impl StateManager {
 
                 // These flip both to `true` once our two input streams (local
                 // requests and local events from the executor) terminate or
-                // we're shutting down. At this point, we must drop `network`
+                // we're shutting down. At this point, we must drop `active`
                 // and thereby permit its own `unordered_messages` stream to
                 // eventually be drained; we do this so that we fully update
                 // the local state until nothing more is left to do.
                 let mut requests_empty = false;
                 let mut events_empty = false;
 
-                // Jobs killed at a universe swap. Their terminal
+                // Jobs killed at a network swap. Their terminal
                 // events still arrive from the executor, and belong
-                // to a universe we have left: drop them instead of
+                // to a network we have left: drop them instead of
                 // gossiping them.
                 let mut doomed: BTreeSet<JobId> = BTreeSet::new();
 
                 loop {
                     let message = causal_messages.next();
 
-                    // Once we drain the requests and events, we drop `network` so
+                    // Once we drain the requests and events, we drop `active` so
                     // that if there are no outstanding copies elsewhere, we will
                     // drain it and then break.
                     //
                     // If there are still gossip sessions happening, those will
                     // complete and we will process their messages into the state.
                     if requests_empty && events_empty {
-                        network = None;
+                        active = None;
                     }
 
                     // Applied after the select, once `message` and the
-                    // universe future have released their borrows.
+                    // network future have released their borrows.
                     let mut swap = false;
 
                     select! {
@@ -1479,7 +1478,7 @@ impl StateManager {
                             // we need to let all spawned tasks by the executor
                             // quiesce, updating the state all the way.
                             None => requests_empty = true,
-                            Some(request) => if let Some((rumors, _)) = &network {
+                            Some(request) => if let Some((rumors, _)) = &active {
                                 debug!(log, "forwarding request to gossip network"; "kind" => request.kind());
                                 gossip(rumors, Message::Request(request).into());
                             },
@@ -1492,12 +1491,12 @@ impl StateManager {
                                 if let Event::Job(job_event) = &event
                                     && doomed.contains(job_event.job_id())
                                 {
-                                    debug!(log, "dropping event for a job killed at a universe swap"; "event" => ?event);
+                                    debug!(log, "dropping event for a job killed at a network swap"; "event" => ?event);
                                     if matches!(job_event, JobEvent::Stop(..) | JobEvent::Error(..)) {
                                         let job_id = *job_event.job_id();
                                         doomed.remove(&job_id);
                                     }
-                                } else if let Some((rumors, _)) = &network {
+                                } else if let Some((rumors, _)) = &active {
                                     debug!(log, "forwarding event to gossip network"; "event" => ?event);
                                     gossip(
                                         rumors,
@@ -1521,15 +1520,15 @@ impl StateManager {
                                     &log,
                                     &tx_state,
                                     &mut executor,
-                                    network.as_ref().map(|(rumors, _)| rumors),
+                                    active.as_ref().map(|(rumors, _)| rumors),
                                     &boundary_store,
                                     Input::Gossip(version, message),
                                 );
                                 // Settle only after replayed traffic:
                                 // replay is what reveals zombies, and a
-                                // sled that settles before its universe
+                                // sled that settles before its network
                                 // has history adjudicates into a lonely
-                                // universe, whose extra events can win
+                                // network, whose extra events can win
                                 // the merge and erase rack history.
                                 if !live {
                                     drain_ready(
@@ -1537,14 +1536,14 @@ impl StateManager {
                                         &mut causal_messages,
                                         &tx_state,
                                         &mut executor,
-                                        network.as_ref().map(|(rumors, _)| rumors),
+                                        active.as_ref().map(|(rumors, _)| rumors),
                                         &boundary_store,
                                     );
                                     apply(
                                         &log,
                                         &tx_state,
                                         &mut executor,
-                                        network.as_ref().map(|(rumors, _)| rumors),
+                                        active.as_ref().map(|(rumors, _)| rumors),
                                         &boundary_store,
                                         Input::Drained,
                                     );
@@ -1558,17 +1557,17 @@ impl StateManager {
                                 &log,
                                 &tx_state,
                                 &mut executor,
-                                network.as_ref().map(|(rumors, _)| rumors),
+                                active.as_ref().map(|(rumors, _)| rumors),
                                 &boundary_store,
                                 Input::Cubbies(cubbies.borrow_and_update().clone()),
                             );
                         },
 
-                        // Follow the gossip manager to a new universe,
+                        // Follow the gossip manager to a new network,
                         // unless we're already draining.
                         Ok(()) = async {
-                            match network.as_mut() {
-                                Some((_, universe)) => universe.changed().await,
+                            match active.as_mut() {
+                                Some((_, network)) => network.changed().await,
                                 None => std::future::pending().await,
                             }
                         } => swap = true,
@@ -1580,28 +1579,24 @@ impl StateManager {
                     }
 
                     if swap {
-                        let (rumors, universe) =
-                            network.as_mut().expect("network present when it changes");
-                        let fresh = universe.borrow_and_update().clone();
-                        info!(log, "gossip universe changed, resetting state"; "network" => %fresh.rumors.network());
-                        causal_messages = fresh.rumors.causal_messages();
-                        *rumors = fresh.rumors;
-                        // Jobs do not cross universes: kill whatever
+                        let (rumors, network) =
+                            active.as_mut().expect("active when the network changes");
+                        let fresh = network.borrow_and_update().clone();
+                        info!(log, "gossip network changed, resetting state"; "network" => %fresh.network());
+                        causal_messages = fresh.causal_messages();
+                        *rumors = fresh;
+                        // Jobs do not cross networks: kill whatever
                         // is in flight, and report nothing about it.
-                        // The new universe never saw these jobs, and
+                        // The new network never saw these jobs, and
                         // the old one is out of reach.
                         for job_id in executor.in_flight() {
-                            info!(log, "killing job at universe swap"; "job_id" => %job_id);
+                            info!(log, "killing job at network swap"; "job_id" => %job_id);
                             executor.job_stop(&job_id);
                             doomed.insert(job_id);
                         }
-                        let entered = enter_universe(
-                            own_baseboard.clone(),
-                            &anchors,
-                            &boundary_store,
-                            rumors,
-                        )
-                        .expect("trust anchors validated at startup");
+                        let entered =
+                            enter_network(own_baseboard.clone(), &anchors, &boundary_store, rumors)
+                                .expect("trust anchors validated at startup");
                         tx_state.send_modify(|state| {
                             *state = entered;
                             state.rack.set_cubbies(cubbies.borrow().clone());
@@ -1757,7 +1752,7 @@ mod test {
 
     /// The admission rules: the committed session resumes even from
     /// replay, a session above the committed sequence number admits,
-    /// and everything at or below it refuses, in any universe.
+    /// and everything at or below it refuses, in any network.
     #[test]
     fn admission_rules() {
         let session = SessionId::random();
@@ -1821,14 +1816,14 @@ mod test {
 
     /// A committed job that replay left without a status is
     /// adjudicated as interrupted, exactly once, and only in the
-    /// universe the job started in. Any other universe never saw the
+    /// network the job started in. Any other network never saw the
     /// job and hears nothing.
     #[test]
-    fn adjudication_rules_only_in_the_jobs_universe() {
+    fn adjudication_rules_only_in_the_jobs_network() {
         let log = discard();
         let now = Utc::now();
         let job = JobId::random();
-        // A sled that entered another universe never saw the job.
+        // A sled that entered another network never saw the job.
         let mut elsewhere = state(past(Some(committed_boundary(job))));
         elsewhere.past.network = network(2);
         assert!(elsewhere.settle(&log, now, Some(network(2))).is_empty());
@@ -1868,7 +1863,7 @@ mod test {
 
     impl Sim {
         /// Grow a fresh gossip set, send `history` (a previous life's
-        /// traffic), then enter the universe exactly as the driver
+        /// traffic), then enter the network exactly as the driver
         /// does. With an empty history, every later send is live.
         async fn new(anchors: &[Certificate], history: Vec<Message>) -> Sim {
             let log = discard();
@@ -1878,7 +1873,7 @@ mod test {
             }
             let store = BoundaryStore::new(&log, &Locker::null());
             store.load().await;
-            let state = enter_universe(baseboard(), anchors, &store, &rumors).unwrap();
+            let state = enter_network(baseboard(), anchors, &store, &rumors).unwrap();
             let messages = rumors.causal_messages();
             Sim {
                 log,
@@ -1890,13 +1885,13 @@ mod test {
             }
         }
 
-        /// Swap into a fresh universe, as the driver does on a
-        /// universe change.
+        /// Swap into a fresh network, as the driver does on a
+        /// network change.
         async fn swap(&mut self) {
             let rumors: GossipNetwork = Seed::grow(&self.log, &Locker::null()).await.into_rumors();
             let store = BoundaryStore::new(&self.log, &Locker::null());
             store.load().await;
-            self.state = enter_universe(baseboard(), &self.anchors, &store, &rumors).unwrap();
+            self.state = enter_network(baseboard(), &self.anchors, &store, &rumors).unwrap();
             self.messages = rumors.causal_messages();
             self.rumors = rumors;
         }
@@ -1950,7 +1945,7 @@ mod test {
         }
     }
 
-    /// A fresh universe with a pending session start, which the first
+    /// A fresh network with a pending session start, which the first
     /// verified job of the session confirms.
     async fn sim_with_session() -> (EphemeralKey, Sim, SessionId, Session) {
         let root = root();
@@ -2284,6 +2279,50 @@ mod test {
         assert!(skipped(&outputs, next_id));
     }
 
+    /// A session whose sequence number is lower than the active
+    /// session's never becomes active, even when a job for it arrives.
+    /// Checked both for a start that arrives after the higher session
+    /// became active, and for one that was already pending then.
+    #[tokio::test]
+    async fn lower_start_never_supersedes() {
+        for pending_beside in [false, true] {
+            let mut root = root();
+            let anchors = vec![root.cert().clone()];
+            let actor = root.key_id().clone();
+            let mut sim = Sim::new(&anchors, Vec::new()).await;
+            let high = preimage(2);
+            let high_id = high.session_id();
+            let low = preimage(1);
+            let low_id = low.session_id();
+
+            sim.request(Request::session(actor.clone(), SessionRequest::Start(high)));
+            if pending_beside {
+                sim.request(Request::session(
+                    actor.clone(),
+                    SessionRequest::Start(low.clone()),
+                ));
+            }
+            let job_id = Session::new(high_id).next_job_id();
+            let signed = signed_job(&mut root, job_id, high_id, "true").await;
+            sim.request(Request::job(actor.clone(), start(signed)));
+            if !pending_beside {
+                sim.request(Request::session(actor.clone(), SessionRequest::Start(low)));
+            }
+
+            let job_id = Session::new(low_id).next_job_id();
+            let signed = signed_job(&mut root, job_id, low_id, "true").await;
+            let outputs = sim.request(Request::job(actor, start(signed)));
+            assert!(!outputs.iter().any(|o| matches!(o, Output::Run(_))));
+            assert!(
+                sim.state
+                    .session
+                    .session()
+                    .is_some_and(|s| s.session_id() == high_id),
+                "pending_beside: {pending_beside}"
+            );
+        }
+    }
+
     /// Without a network to commit through, a ready job is not
     /// launched; its chain position still advances so the session is
     /// not wedged.
@@ -2359,11 +2398,11 @@ mod test {
         assert!(sim.drained().is_empty());
     }
 
-    /// The boundary verdict goes only to the universe the job started
-    /// in. After a swap, the new universe never saw the job and hears
+    /// The boundary verdict goes only to the network the job started
+    /// in. After a swap, the new network never saw the job and hears
     /// nothing about it.
     #[tokio::test]
-    async fn swapped_universe_hears_no_ruling() {
+    async fn swapped_network_hears_no_ruling() {
         let root = root();
         let anchors = vec![root.cert().clone()];
         let mut sim = Sim::new(&anchors, Vec::new()).await;
@@ -2381,7 +2420,7 @@ mod test {
         assert!(interrupted(&outputs[0], job));
         assert!(sim.drained().is_empty());
 
-        // The new universe replaces the commitment from the record on
+        // The new network replaces the commitment from the record on
         // disk, which the null store cannot supply; restore it by hand.
         sim.swap().await;
         commit(&mut sim);

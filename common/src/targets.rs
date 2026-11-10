@@ -40,16 +40,11 @@ pub struct SledVersion {
     pub health: Option<SledHealth>,
 }
 
-/// One sled's gossip link health, as the answering sled sees it. A
-/// silent death can lag `Linked` at TCP's pace.
 #[derive(Clone, Copy, Debug, Deserialize, Eq, JsonSchema, PartialEq, Serialize)]
 #[serde(rename_all = "lowercase")]
 pub enum SledHealth {
-    /// Attested, holding a live gossip link.
-    Linked,
-    /// Known by version or cubby, but no live link.
-    Unlinked,
-    /// A state from a build newer than this one.
+    Connected,
+    Disconnected,
     #[serde(other)]
     Unknown,
 }

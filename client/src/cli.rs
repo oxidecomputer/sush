@@ -1297,15 +1297,15 @@ fn rack_cell(sled: Option<&SledVersion>) -> String {
     }
 }
 
-/// Green gossips with the answering sled, yellow was once known but is
-/// out of contact, and red is in the cubby map with no other sign of
-/// life. Sleds without health (an old server, a newer state than this
-/// build knows) stay unstyled, which renders as nothing.
+/// Green: connected. Yellow: disconnected, but its version is known.
+/// Red: known only from the cubby map. Sleds without health (an old
+/// server, a newer state than this build knows) stay unstyled, which
+/// renders as nothing.
 fn health_style(sled: &SledVersion) -> Style {
     match sled.health {
-        Some(SledHealth::Linked) => AnsiColor::Green.on_default(),
-        Some(SledHealth::Unlinked) if sled.version.is_some() => AnsiColor::Yellow.on_default(),
-        Some(SledHealth::Unlinked) => AnsiColor::Red.on_default(),
+        Some(SledHealth::Connected) => AnsiColor::Green.on_default(),
+        Some(SledHealth::Disconnected) if sled.version.is_some() => AnsiColor::Yellow.on_default(),
+        Some(SledHealth::Disconnected) => AnsiColor::Red.on_default(),
         Some(SledHealth::Unknown) | None => Style::new(),
     }
 }
@@ -1397,9 +1397,9 @@ mod rack {
             sled(15, "BRM42220036"),
             sled(16, "2CN2M459"),
         ];
-        sleds[0].health = Some(SledHealth::Linked);
-        sleds[1].health = Some(SledHealth::Unlinked);
-        sleds[2].health = Some(SledHealth::Unlinked);
+        sleds[0].health = Some(SledHealth::Connected);
+        sleds[1].health = Some(SledHealth::Disconnected);
+        sleds[2].health = Some(SledHealth::Disconnected);
         sleds[2].version = None;
         check(&draw_rack(&sleds), "tests/output/rack-health.txt");
     }

@@ -54,7 +54,7 @@ tempfile.workspace = true
 thiserror.workspace = true
 tokio.workspace = true
 tokio-stream.workspace = true
-tokio-util.workspace = true
+tokio-util = { workspace = true, features = ["join-map"] }
 tokio-tungstenite.workspace = true
 x509-cert.workspace = true
 

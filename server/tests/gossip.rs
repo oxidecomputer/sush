@@ -18,7 +18,7 @@ use tokio::sync::watch;
 use tokio_util::sync::CancellationToken;
 
 use sush_common::jobs::BaseboardId;
-use sush_server::gossip::{LinkedBaseboards, Seed, Universe, spawn_gossip};
+use sush_server::gossip::{ConnectedBaseboards, Seed, spawn_gossip};
 use sush_server::locker::Locker;
 use sush_server::locker::bookmark::SushBookmark;
 
@@ -30,8 +30,8 @@ struct Node {
     addr: SocketAddrV6,
     initial: Network,
     peers: watch::Sender<BTreeSet<SocketAddrV6>>,
-    universe: watch::Receiver<Universe<String>>,
-    linked: LinkedBaseboards,
+    network: watch::Receiver<Rumors<String, SushBookmark>>,
+    connected: ConnectedBaseboards,
     shutdown: CancellationToken,
 }
 
@@ -39,9 +39,9 @@ impl Node {
     async fn start(log: &Logger, dir: &Utf8PathBuf, identity: usize) -> Node {
         let shutdown = CancellationToken::new();
         let seed: Seed<String> = Seed::grow(log, &Locker::null()).await;
-        let initial = seed.rumors().network();
+        let initial = seed.network();
         let (peers, peers_rx) = watch::channel(BTreeSet::new());
-        let (addr, universe, linked) = spawn_gossip(
+        let (addr, network, connected) = spawn_gossip(
             log,
             gossip_config(),
             sprockets_config(dir, identity),
@@ -57,18 +57,18 @@ impl Node {
             addr,
             initial,
             peers,
-            universe,
-            linked,
+            network,
+            connected,
             shutdown,
         }
     }
 
     fn network(&self) -> Network {
-        self.universe.borrow().rumors.network()
+        self.network.borrow().network()
     }
 
     fn rumors(&self) -> Rumors<String, SushBookmark> {
-        self.universe.borrow().rumors.clone()
+        self.network.borrow().clone()
     }
 
     fn contains(&self, message: &str) -> bool {
@@ -78,8 +78,8 @@ impl Node {
             .any(|(_, m)| m.as_str() == message)
     }
 
-    fn linked(&self) -> BTreeSet<BaseboardId> {
-        self.linked.borrow().clone()
+    fn connected(&self) -> BTreeSet<BaseboardId> {
+        self.connected.borrow().clone()
     }
 }
 
@@ -117,7 +117,7 @@ async fn cold_start_converges() {
     let min = nodes.iter().map(|n| n.initial).min().unwrap();
     mesh(&nodes);
 
-    eventually("universe convergence", 120, async || {
+    eventually("network convergence", 120, async || {
         converged(&nodes) == Some(min)
     })
     .await;
@@ -146,7 +146,7 @@ async fn staggered_start_converges() {
     let nodes = [&a, &b, &c];
     mesh(&nodes);
     let min = nodes.iter().map(|n| n.initial).min().unwrap();
-    eventually("universe convergence", 120, async || {
+    eventually("network convergence", 120, async || {
         converged(&nodes) == Some(min)
     })
     .await;
@@ -190,21 +190,25 @@ async fn node_replacement_reconverges() {
 
 #[named]
 #[tokio::test]
-async fn linked_follows_live_links() {
+async fn connected_follows_live_connections() {
     let (_tmp, dir) = pki("sush-gossip-", 2);
     let log = test_logger(function_name!());
     let a = Node::start(&log, &dir, 1).await;
     let b = Node::start(&log, &dir, 2).await;
-    assert!(a.linked().is_empty());
+    assert!(a.connected().is_empty());
     mesh(&[&a, &b]);
 
     // Both sides resolving proves the dialed and the accepted paths.
-    eventually("mutual attested links", 120, async || {
-        a.linked() == BTreeSet::from([baseboard(2)]) && b.linked() == BTreeSet::from([baseboard(1)])
+    eventually("mutual attested connections", 120, async || {
+        a.connected() == BTreeSet::from([baseboard(2)])
+            && b.connected() == BTreeSet::from([baseboard(1)])
     })
     .await;
 
     b.shutdown.cancel();
     drop(b);
-    eventually("dead peer unlinked", 120, async || a.linked().is_empty()).await;
+    eventually("dead peer disconnected", 120, async || {
+        a.connected().is_empty()
+    })
+    .await;
 }
