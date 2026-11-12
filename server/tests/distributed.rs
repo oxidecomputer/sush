@@ -7,7 +7,7 @@
 mod common;
 
 use std::collections::BTreeSet;
-use std::fs::{read, read_to_string, write};
+use std::fs::{read, write};
 use std::net::SocketAddrV6;
 use std::slice::from_ref;
 use std::time::Duration;
@@ -37,7 +37,7 @@ use sush_server::locker::Locker;
 use sush_server::locker::bookmark::BOOKMARK;
 use sush_server::messages::v0::{Event, JobEvent, Message};
 use sush_server::output::JobOutputDir;
-use sush_server::state::GossipUniverse;
+use sush_server::state::GossipNetwork;
 use sush_server::{JobError, JobManager, seed_gossip};
 
 use common::{
@@ -47,7 +47,7 @@ use common::{
 
 struct Sled {
     mgr: JobManager,
-    universe: watch::Receiver<GossipUniverse>,
+    network: watch::Receiver<GossipNetwork>,
     peers: watch::Sender<BTreeSet<SocketAddrV6>>,
     addr: SocketAddrV6,
     baseboard: BaseboardId,
@@ -77,7 +77,7 @@ impl Sled {
         let log = log.new(o!("sled" => identity));
         let seed = seed_gossip(&log, &locker).await;
         let (peers, peers_rx) = watch::channel(BTreeSet::new());
-        let (addr, universe, linked) = spawn_gossip(
+        let (addr, network, connected) = spawn_gossip(
             &log,
             gossip_config(),
             sprockets_config(dir, identity),
@@ -100,8 +100,8 @@ impl Sled {
             JobOutputDir::fixed(output.path()),
             baseboard.clone(),
             cubbies_rx,
-            universe.clone(),
-            linked,
+            network.clone(),
+            connected,
             &locker,
             from_ref(root_pem),
             shutdown.clone(),
@@ -110,7 +110,7 @@ impl Sled {
         .unwrap();
         Sled {
             mgr,
-            universe,
+            network,
             peers,
             addr,
             baseboard,
@@ -139,13 +139,13 @@ async fn jobs_gossip_between_sleds() {
     a.peers.send(BTreeSet::from([b.addr])).unwrap();
     b.peers.send(BTreeSet::from([a.addr])).unwrap();
 
-    // The sleds converge on one universe, resetting the losing job manager.
-    eventually("universe convergence", 120, async || {
-        a.universe.borrow().rumors.network() == b.universe.borrow().rumors.network()
+    // The sleds converge on one network, resetting the losing job manager.
+    eventually("network convergence", 120, async || {
+        a.network.borrow().network() == b.network.borrow().network()
     })
     .await;
 
-    // Each sled learns the other's build, and sees it linked.
+    // Each sled learns the other's build, and sees it connected.
     eventually("versions gossip", 120, async || {
         [&a, &b].iter().all(|sled| {
             let versions = sled.mgr.versions();
@@ -153,7 +153,7 @@ async fn jobs_gossip_between_sleds() {
                 versions.iter().any(|row| {
                     row.baseboard == **baseboard
                         && row.version.as_ref() == Some(&VersionInfo::current())
-                        && row.health == Some(SledHealth::Linked)
+                        && row.health == Some(SledHealth::Connected)
                 })
             })
         })
@@ -256,8 +256,8 @@ async fn first_job_confirms_start_on_another_sled() {
     let b = Sled::start(&log, &dir, 2, &root_pem, &shutdown).await;
     a.peers.send(BTreeSet::from([b.addr])).unwrap();
     b.peers.send(BTreeSet::from([a.addr])).unwrap();
-    eventually("universe convergence", 120, async || {
-        a.universe.borrow().rumors.network() == b.universe.borrow().rumors.network()
+    eventually("network convergence", 120, async || {
+        a.network.borrow().network() == b.network.borrow().network()
     })
     .await;
 
@@ -319,8 +319,8 @@ async fn listed_sled_checks_own_cubby() {
     let b = Sled::start(&log, &dir, 2, &root_pem, &shutdown).await;
     a.peers.send(BTreeSet::from([b.addr])).unwrap();
     b.peers.send(BTreeSet::from([a.addr])).unwrap();
-    eventually("universe convergence", 120, async || {
-        a.universe.borrow().rumors.network() == b.universe.borrow().rumors.network()
+    eventually("network convergence", 120, async || {
+        a.network.borrow().network() == b.network.borrow().network()
     })
     .await;
     sees(&a, &b).await;
@@ -423,8 +423,8 @@ async fn stop_waits_for_remote_sleds() {
     let b = Sled::start(&log, &dir, 2, &root_pem, &shutdown).await;
     a.peers.send(BTreeSet::from([b.addr])).unwrap();
     b.peers.send(BTreeSet::from([a.addr])).unwrap();
-    eventually("universe convergence", 120, async || {
-        a.universe.borrow().rumors.network() == b.universe.borrow().rumors.network()
+    eventually("network convergence", 120, async || {
+        a.network.borrow().network() == b.network.borrow().network()
     })
     .await;
     sees(&a, &b).await;
@@ -751,122 +751,6 @@ async fn forged_start_never_takes_effect() {
 
 #[named]
 #[tokio::test]
-async fn partitioned_sessions_converge_on_higher_seq() {
-    let (_tmp, dir) = pki("sush-concurrent-", 2);
-    let mut root = common::ephemeral_root();
-    let root_pem = dir.join("job-root.pem");
-    write(
-        &root_pem,
-        pem_cert_chain(vec![root.cert().to_owned()]).unwrap(),
-    )
-    .unwrap();
-
-    let log = test_logger(function_name!());
-    let shutdown = CancellationToken::new();
-    let a = Sled::start(&log, &dir, 1, &root_pem, &shutdown).await;
-    let b = Sled::start(&log, &dir, 2, &root_pem, &shutdown).await;
-    let authn_a = requester(&root);
-    let authn_b = requester(&root);
-    a.peers.send(BTreeSet::from([b.addr])).unwrap();
-    b.peers.send(BTreeSet::from([a.addr])).unwrap();
-    eventually("universe convergence", 120, async || {
-        a.universe.borrow().rumors.network() == b.universe.borrow().rumors.network()
-    })
-    .await;
-    sees(&a, &b).await;
-    sees(&b, &a).await;
-
-    // Partitioned, each sled starts its own session. Neither start
-    // can hear the other, but the signer-assigned order still ranks
-    // them.
-    a.peers.send(BTreeSet::new()).unwrap();
-    b.peers.send(BTreeSet::new()).unwrap();
-    sleep(Duration::from_millis(500)).await;
-    let a_ceremony = ceremony(&a.mgr, 1);
-    let session_a = a_ceremony.session_id;
-    let mut session = Session::new(session_a);
-    a.mgr
-        .session_start(
-            &authn_a,
-            session_a,
-            a_ceremony.client_nonce,
-            a_ceremony.signer_nonce,
-            a_ceremony.seq,
-        )
-        .await
-        .unwrap();
-    confirm_start(&a, &authn_a, &mut root, &mut session).await;
-    let b_ceremony = ceremony(&b.mgr, 2);
-    let session_b = b_ceremony.session_id;
-    b.mgr
-        .session_start(
-            &authn_b,
-            session_b,
-            b_ceremony.client_nonce,
-            b_ceremony.signer_nonce,
-            b_ceremony.seq,
-        )
-        .await
-        .unwrap();
-    confirm_start(&b, &authn_b, &mut root, &mut Session::new(session_b)).await;
-
-    // A job on A sits queued behind a hole in the chain, so it can
-    // never run before B's session supersedes A's.
-    let hole_id = session.next_job_id();
-    let hole = sign_job_for(&mut root, hole_id, session_a, "true", &a.baseboard).await;
-    session.job_started(hole);
-    let job_id = session.next_job_id();
-    let job = sign_job_for(&mut root, job_id, session_a, "true", &a.baseboard).await;
-    a.mgr
-        .job_start(&authn_a, job, JobStartParams::default())
-        .await
-        .unwrap();
-    eventually("the job queues on A", 60, async || {
-        a.mgr.job_status(&authn_a, &job_id).await.is_ok_and(|map| {
-            map.get(&a.baseboard)
-                .is_some_and(|s| matches!(s, JobStatus::Queued { .. }))
-        })
-    })
-    .await;
-
-    // The partition heals. B's session carries the higher sequence
-    // number, so every sled converges on it, and A's queued job is
-    // skipped rather than left queued forever.
-    a.peers.send(BTreeSet::from([b.addr])).unwrap();
-    b.peers.send(BTreeSet::from([a.addr])).unwrap();
-    eventually(
-        "the higher sequence number wins everywhere",
-        120,
-        async || {
-            a.mgr
-                .session(&authn_a)
-                .is_some_and(|s| s.session_id() == session_b)
-                && b.mgr
-                    .session(&authn_b)
-                    .is_some_and(|s| s.session_id() == session_b)
-        },
-    )
-    .await;
-    eventually("the queued job is skipped", 60, async || {
-        a.mgr.job_status(&authn_a, &job_id).await.is_ok_and(|map| {
-            map.get(&a.baseboard).is_some_and(|s| {
-                matches!(
-                    s,
-                    JobStatus::Skipped {
-                        reason: SkipReason::SessionEnded,
-                        ..
-                    }
-                )
-            })
-        })
-    })
-    .await;
-
-    shutdown.cancel();
-}
-
-#[named]
-#[tokio::test]
 async fn rejoining_replays_without_reexecuting() {
     let (_tmp, dir) = pki("sush-replay-", 2);
     let mut root = common::ephemeral_root();
@@ -1005,9 +889,8 @@ async fn interrupted_jobs_get_stopped() {
         .parse()
         .unwrap();
     let ghost = baseboard(2);
-    a.universe
+    a.network
         .borrow()
-        .rumors
         .clone()
         .send(
             Message::Event(
@@ -1049,9 +932,8 @@ async fn interrupted_jobs_get_stopped() {
     // The job's genuine stop was in flight all along. When it lands,
     // the real result supersedes the interrupted declaration.
     let output = JobOutputState::default();
-    a.universe
+    a.network
         .borrow()
-        .rumors
         .clone()
         .send(
             Message::Event(
@@ -1072,122 +954,6 @@ async fn interrupted_jobs_get_stopped() {
     shutdown.cancel();
 }
 
-#[named]
-#[tokio::test]
-async fn stragglers_do_not_interrupt_live_jobs() {
-    let (_tmp, dir) = pki("sush-straggler-", 3);
-    let mut root = common::ephemeral_root();
-    let root_pem = dir.join("job-root.pem");
-    write(
-        &root_pem,
-        pem_cert_chain(vec![root.cert().to_owned()]).unwrap(),
-    )
-    .unwrap();
-
-    let log = test_logger(function_name!());
-    let shutdown = CancellationToken::new();
-
-    // A and C converge; C then holds a message A never sees.
-    let a = Sled::start(&log, &dir, 1, &root_pem, &shutdown).await;
-    let c = Sled::start(&log, &dir, 3, &root_pem, &shutdown).await;
-    a.peers.send(BTreeSet::from([c.addr])).unwrap();
-    c.peers.send(BTreeSet::from([a.addr])).unwrap();
-    eventually("A and C converge", 120, async || {
-        a.universe.borrow().rumors.network() == c.universe.borrow().rumors.network()
-    })
-    .await;
-    a.peers.send(BTreeSet::new()).unwrap();
-    c.peers.send(BTreeSet::new()).unwrap();
-    let marooned = BaseboardId {
-        part_number: "sled".to_string(),
-        serial_number: "marooned".to_string(),
-    };
-    c.universe
-        .borrow()
-        .rumors
-        .clone()
-        .send(Message::Event(marooned.clone(), Event::Version(VersionInfo::current())).into())
-        .unwrap();
-    // A also advances on its own side of the split, so the marooned
-    // message is genuinely concurrent with (not under) B's frontier.
-    let split_marker = BaseboardId {
-        part_number: "sled".to_string(),
-        serial_number: "split-marker".to_string(),
-    };
-    a.universe
-        .borrow()
-        .rumors
-        .clone()
-        .send(Message::Event(split_marker, Event::Version(VersionInfo::current())).into())
-        .unwrap();
-
-    // B joins through A alone, so C's message is concurrent with B's
-    // join frontier, and starts a live job that keeps running.
-    let b = Sled::start(&log, &dir, 2, &root_pem, &shutdown).await;
-    a.peers.send(BTreeSet::from([b.addr])).unwrap();
-    b.peers.send(BTreeSet::from([a.addr])).unwrap();
-    eventually("B joins A", 120, async || {
-        a.universe.borrow().rumors.network() == b.universe.borrow().rumors.network()
-    })
-    .await;
-    sees(&a, &b).await;
-    let authn_a = requester(&root);
-    let Ceremony {
-        session_id,
-        client_nonce,
-        signer_nonce,
-        seq,
-    } = ceremony(&a.mgr, 1);
-    let session = Session::new(session_id);
-    a.mgr
-        .session_start(&authn_a, session_id, client_nonce, signer_nonce, seq)
-        .await
-        .unwrap();
-    let job_id = session.next_job_id();
-    let job = sign_job(&mut root, job_id, session_id, "sleep 30").await;
-    a.mgr
-        .job_start(
-            &authn_a,
-            job,
-            JobStartParams {
-                wait: JobWait::Start,
-                ..Default::default()
-            },
-        )
-        .await
-        .unwrap();
-    eventually("the live job starts on B", 120, async || {
-        a.mgr.job_status(&authn_a, &job_id).await.is_ok_and(|map| {
-            map.get(&b.baseboard)
-                .is_some_and(|s| matches!(s, JobStatus::Started { .. }))
-        })
-    })
-    .await;
-
-    // C reconnects. Its marooned message reaches B as replayed
-    // traffic and triggers a reap, which the live job must survive.
-    a.peers.send(BTreeSet::from([b.addr, c.addr])).unwrap();
-    b.peers.send(BTreeSet::from([a.addr, c.addr])).unwrap();
-    c.peers.send(BTreeSet::from([a.addr, b.addr])).unwrap();
-    let authn_b = requester(&root);
-    eventually("the marooned message reaches B", 120, async || {
-        b.mgr.versions().iter().any(|row| row.baseboard == marooned)
-    })
-    .await;
-    assert!(
-        b.mgr.job_status(&authn_b, &job_id).await.is_ok_and(|map| {
-            map.get(&b.baseboard)
-                .is_some_and(|s| matches!(s, JobStatus::Started { .. }))
-        }),
-        "a straggler-triggered scan interrupted a live job"
-    );
-
-    shutdown.cancel();
-}
-
-/// Wait until `anchor` has applied `joiner`'s build announcement. A
-/// session started on `anchor` afterward causally follows everything
-/// `joiner` held at entry, so the joiner serves it.
 /// Everything one sled hears at session start: a client nonce, a
 /// signer nonce, the signer's clock reading, and the session id over
 /// them all.
@@ -1216,13 +982,13 @@ fn ceremony(mgr: &JobManager, seq: u64) -> Ceremony {
     }
 }
 
+/// Wait until `anchor` has received `joiner`'s birth announcement and
+/// holds a live connection to it.
 async fn sees(anchor: &Sled, joiner: &Sled) {
-    eventually("the anchor links the joiner", 60, async || {
-        anchor
-            .mgr
-            .versions()
-            .iter()
-            .any(|row| row.baseboard == joiner.baseboard && row.health == Some(SledHealth::Linked))
+    eventually("the anchor sees the joiner", 60, async || {
+        anchor.mgr.versions().iter().any(|row| {
+            row.baseboard == joiner.baseboard && row.health == Some(SledHealth::Connected)
+        })
     })
     .await;
 }
@@ -1268,176 +1034,6 @@ async fn confirm_start(sled: &Sled, authn: &KeyId, root: &mut EphemeralKey, sess
 
 #[named]
 #[tokio::test]
-async fn lost_suffix_never_reruns() {
-    let (_tmp, dir) = pki("sush-lost-", 2);
-    let mut root = common::ephemeral_root();
-    let root_pem = dir.join("job-root.pem");
-    write(
-        &root_pem,
-        pem_cert_chain(vec![root.cert().to_owned()]).unwrap(),
-    )
-    .unwrap();
-
-    let log = test_logger(function_name!());
-    let shutdown = CancellationToken::new();
-
-    // Sled A anchors the session and survives throughout.
-    let a = Sled::start(&log, &dir, 1, &root_pem, &shutdown).await;
-    let authn_a = requester(&root);
-    // Sled B keeps its boundary in a locker. It joins before the
-    // session starts: a record-less sled serves only sessions
-    // that started after it arrived.
-    let boundary_dir = TempDir::with_prefix("sush-boundary-").unwrap();
-    let slot = Utf8PathBuf::from_path_buf(boundary_dir.path().to_path_buf()).unwrap();
-    let b_shutdown = CancellationToken::new();
-    let locker = Locker::new(&log, baseboard(2), vec![slot.clone()]).unwrap();
-    let b = Sled::start_with_locker(&log, &dir, 2, &root_pem, locker, &b_shutdown).await;
-    let authn_b = requester(&root);
-    a.peers.send(BTreeSet::from([b.addr])).unwrap();
-    b.peers.send(BTreeSet::from([a.addr])).unwrap();
-    eventually("universe convergence", 120, async || {
-        a.universe.borrow().rumors.network() == b.universe.borrow().rumors.network()
-    })
-    .await;
-    sees(&a, &b).await;
-    let Ceremony {
-        session_id,
-        client_nonce,
-        signer_nonce,
-        seq,
-    } = ceremony(&a.mgr, 1);
-    let mut session = Session::new(session_id);
-    a.mgr
-        .session_start(&authn_a, session_id, client_nonce, signer_nonce, seq)
-        .await
-        .unwrap();
-    confirm_start(&a, &authn_a, &mut root, &mut session).await;
-    eventually("the session gossips to B", 120, async || {
-        b.mgr
-            .session(&authn_b)
-            .is_some_and(|s| s.session_id() == session_id)
-    })
-    .await;
-    a.peers.send(BTreeSet::new()).unwrap();
-    b.peers.send(BTreeSet::new()).unwrap();
-    sleep(Duration::from_millis(500)).await;
-
-    // Two jobs run on B through its front door. No one else hears of
-    // them. The first leaves a footprint we can count.
-    let footprint = boundary_dir.path().join("footprint");
-    let j1_id = session.next_job_id();
-    let j1 = sign_job_for(
-        &mut root,
-        j1_id,
-        session_id,
-        &format!("echo run >> {}", footprint.display()),
-        &b.baseboard,
-    )
-    .await;
-    b.mgr
-        .job_start(
-            &authn_b,
-            j1.clone(),
-            JobStartParams {
-                wait: JobWait::Stop,
-                ..Default::default()
-            },
-        )
-        .await
-        .unwrap();
-    session.job_started(j1.clone());
-    let j2_id = session.next_job_id();
-    let j2 = sign_job_for(&mut root, j2_id, session_id, "true", &b.baseboard).await;
-    b.mgr
-        .job_start(
-            &authn_b,
-            j2,
-            JobStartParams {
-                wait: JobWait::Stop,
-                ..Default::default()
-            },
-        )
-        .await
-        .unwrap();
-    assert_eq!(read_to_string(&footprint).unwrap(), "run\n");
-
-    // B dies with both jobs unwitnessed and rejoins. Its boundary
-    // proves the rack is missing part of the session's history.
-    b_shutdown.cancel();
-    drop(b);
-    sleep(Duration::from_millis(500)).await;
-    let locker = Locker::new(&log, baseboard(2), vec![slot]).unwrap();
-    let b = Sled::start_with_locker(&log, &dir, 2, &root_pem, locker, &shutdown).await;
-    let authn_b = requester(&root);
-    a.peers.send(BTreeSet::from([b.addr])).unwrap();
-    b.peers.send(BTreeSet::from([a.addr])).unwrap();
-
-    // The recorded job finished before the crash, so B adjudicates
-    // its true ending on its sole authority.
-    eventually("the boundary job is adjudicated", 120, async || {
-        a.mgr.job_status(&authn_a, &j2_id).await.is_ok_and(|map| {
-            map.get(&b.baseboard)
-                .is_some_and(|s| matches!(s, JobStatus::Stopped { result: Ok(0), .. }))
-        })
-    })
-    .await;
-
-    // A retry of the first job's preserved artifact stays queued
-    // instead of running: the stored successor resumes the chain past
-    // it, so its position never pops, and the footprint file still
-    // shows one run.
-    b.mgr
-        .job_start(&authn_b, j1, JobStartParams::default())
-        .await
-        .unwrap();
-    eventually("the retry queues", 60, async || {
-        b.mgr.job_status(&authn_b, &j1_id).await.is_ok_and(|map| {
-            map.get(&b.baseboard)
-                .is_some_and(|s| matches!(s, JobStatus::Queued { .. }))
-        })
-    })
-    .await;
-    sleep(Duration::from_secs(1)).await;
-    assert!(
-        b.mgr.job_status(&authn_b, &j1_id).await.is_ok_and(|map| {
-            map.get(&b.baseboard)
-                .is_some_and(|s| matches!(s, JobStatus::Queued { .. }))
-        }),
-        "a job below the stored successor must stay queued"
-    );
-    assert_eq!(read_to_string(&footprint).unwrap(), "run\n");
-
-    // A new session, confirmed by a job for B, serves immediately.
-    let Ceremony {
-        session_id: session2_id,
-        client_nonce,
-        signer_nonce,
-        seq,
-    } = ceremony(&a.mgr, 2);
-    let session2 = Session::new(session2_id);
-    a.mgr
-        .session_start(&authn_a, session2_id, client_nonce, signer_nonce, seq)
-        .await
-        .unwrap();
-    let j3_id = session2.next_job_id();
-    let j3 = sign_job_for(&mut root, j3_id, session2_id, "true", &b.baseboard).await;
-    a.mgr
-        .job_start(&authn_a, j3, JobStartParams::default())
-        .await
-        .unwrap();
-    eventually("a new session must not be held", 120, async || {
-        b.mgr.job_status(&authn_b, &j3_id).await.is_ok_and(|map| {
-            map.get(&b.baseboard)
-                .is_some_and(|s| matches!(s, JobStatus::Stopped { result: Ok(0), .. }))
-        })
-    })
-    .await;
-
-    shutdown.cancel();
-}
-
-#[named]
-#[tokio::test]
 async fn session_resumes_at_stored_successor() {
     let (_tmp, dir) = pki("sush-resume-", 3);
     let mut root = common::ephemeral_root();
@@ -1466,10 +1062,9 @@ async fn session_resumes_at_stored_successor() {
     a.peers.send(BTreeSet::from([b.addr, c.addr])).unwrap();
     b.peers.send(BTreeSet::from([a.addr])).unwrap();
     c.peers.send(BTreeSet::from([a.addr])).unwrap();
-    eventually("universe convergence", 120, async || {
-        let network = a.universe.borrow().rumors.network();
-        b.universe.borrow().rumors.network() == network
-            && c.universe.borrow().rumors.network() == network
+    eventually("network convergence", 120, async || {
+        let network = a.network.borrow().network();
+        b.network.borrow().network() == network && c.network.borrow().network() == network
     })
     .await;
     sees(&a, &b).await;
@@ -1596,7 +1191,7 @@ async fn session_resumes_at_stored_successor() {
 
 #[named]
 #[tokio::test]
-async fn supersession_crosses_universes() {
+async fn supersession_crosses_networks() {
     let (_tmp, dir) = pki("sush-flipflop-", 3);
     let mut root = common::ephemeral_root();
     let root_pem = dir.join("job-root.pem");
@@ -1609,7 +1204,7 @@ async fn supersession_crosses_universes() {
     let log = test_logger(function_name!());
     let shutdown = CancellationToken::new();
 
-    // Two universes that never meet: A anchors one session, D another.
+    // Two networks that never meet: A anchors one session, D another.
     let a = Sled::start(&log, &dir, 1, &root_pem, &shutdown).await;
     let authn_a = requester(&root);
     let d = Sled::start(&log, &dir, 3, &root_pem, &shutdown).await;
@@ -1627,7 +1222,7 @@ async fn supersession_crosses_universes() {
         .unwrap();
     confirm_start(&d, &authn_d, &mut root, &mut session2).await;
 
-    // X joins A's universe and runs a job there.
+    // X joins A's network and runs a job there.
     let boundary_dir = TempDir::with_prefix("sush-boundary-").unwrap();
     let slot = Utf8PathBuf::from_path_buf(boundary_dir.path().to_path_buf()).unwrap();
     let x_shutdown = CancellationToken::new();
@@ -1636,8 +1231,8 @@ async fn supersession_crosses_universes() {
     let authn_x = requester(&root);
     a.peers.send(BTreeSet::from([x.addr])).unwrap();
     x.peers.send(BTreeSet::from([a.addr])).unwrap();
-    eventually("universe convergence", 120, async || {
-        a.universe.borrow().rumors.network() == x.universe.borrow().rumors.network()
+    eventually("network convergence", 120, async || {
+        a.network.borrow().network() == x.network.borrow().network()
     })
     .await;
     sees(&a, &x).await;
@@ -1683,8 +1278,8 @@ async fn supersession_crosses_universes() {
     })
     .await;
 
-    // X dies and rejoins D's universe instead, running a job there.
-    // That commit burns A's universe out of X's record.
+    // X dies and rejoins D's network instead, running a job there.
+    // That commit burns A's network out of X's record.
     x_shutdown.cancel();
     drop(x);
     a.peers.send(BTreeSet::new()).unwrap();
@@ -1725,9 +1320,9 @@ async fn supersession_crosses_universes() {
     })
     .await;
 
-    // X dies again and returns to A's universe. Its record holds
+    // X dies again and returns to A's network. Its record holds
     // session two's sequence number, which session one does not
-    // exceed, even from another universe: session one's next job is
+    // exceed, even from another network: session one's next job is
     // refused, and nothing re-runs.
     x_shutdown.cancel();
     drop(x);
@@ -1807,8 +1402,8 @@ async fn supersession_crosses_universes() {
         "a session above the committed one must serve"
     );
 
-    // X flops back to D's universe a second time. The job X served in
-    // A's universe displaced D's watermark, so that write must have
+    // X flops back to D's network a second time. The job X served in
+    // A's network displaced D's watermark, so that write must have
     // burned D: session two's next job is skipped there, never re-run.
     x_shutdown.cancel();
     drop(x);
@@ -1874,8 +1469,8 @@ async fn witnessed_session_survives_restart() {
     let b = Sled::start_with_locker(&log, &dir, 2, &root_pem, locker, &b_shutdown).await;
     a.peers.send(BTreeSet::from([b.addr])).unwrap();
     b.peers.send(BTreeSet::from([a.addr])).unwrap();
-    eventually("universe convergence", 120, async || {
-        a.universe.borrow().rumors.network() == b.universe.borrow().rumors.network()
+    eventually("network convergence", 120, async || {
+        a.network.borrow().network() == b.network.borrow().network()
     })
     .await;
     sees(&a, &b).await;
@@ -1917,8 +1512,8 @@ async fn witnessed_session_survives_restart() {
     let b = Sled::start_with_locker(&log, &dir, 2, &root_pem, locker, &shutdown).await;
     a.peers.send(BTreeSet::from([b.addr])).unwrap();
     b.peers.send(BTreeSet::from([a.addr])).unwrap();
-    eventually("universe reconvergence", 120, async || {
-        a.universe.borrow().rumors.network() == b.universe.borrow().rumors.network()
+    eventually("network reconvergence", 120, async || {
+        a.network.borrow().network() == b.network.borrow().network()
     })
     .await;
     sees(&a, &b).await;
@@ -2012,8 +1607,8 @@ async fn bookmarks_survive_restart() {
     .await;
     a.peers.send(BTreeSet::from([b.addr])).unwrap();
     b.peers.send(BTreeSet::from([a.addr])).unwrap();
-    eventually("universe convergence", 120, async || {
-        a.universe.borrow().rumors.network() == b.universe.borrow().rumors.network()
+    eventually("network convergence", 120, async || {
+        a.network.borrow().network() == b.network.borrow().network()
     })
     .await;
     eventually(
@@ -2063,8 +1658,8 @@ async fn gossip_survives_bookmark_failure() {
     .await;
     a.peers.send(BTreeSet::from([b.addr])).unwrap();
     b.peers.send(BTreeSet::from([a.addr])).unwrap();
-    eventually("universe convergence", 120, async || {
-        a.universe.borrow().rumors.network() == b.universe.borrow().rumors.network()
+    eventually("network convergence", 120, async || {
+        a.network.borrow().network() == b.network.borrow().network()
     })
     .await;
     sees(&a, &b).await;

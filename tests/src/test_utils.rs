@@ -39,10 +39,10 @@ use sush_common::jobs::{
 use sush_common::keys::{EphemeralKey, KeyId, KeyType, Signer, pem_cert_chain};
 use sush_common::targets::{Cubbies, Target};
 use sush_server::executor::PathIsolation;
-use sush_server::gossip::{LinkedBaseboards, Universe};
+use sush_server::gossip::ConnectedBaseboards;
 use sush_server::locker::Locker;
 use sush_server::output::{JobOutputDir, JobOutputFileStream};
-use sush_server::state::GossipNetwork;
+use sush_server::state::{GossipNetwork, GossipSeed};
 use sush_server::{JobManager, seed_gossip};
 
 static TEST_BASEBOARD_ID: OnceLock<BaseboardId> = OnceLock::new();
@@ -329,9 +329,8 @@ pub async fn manager_test_root_and_peer(
     CancellationToken,
 ) {
     let dir = TempDir::with_prefix("sush-").unwrap();
-    let seed = null_gossip().await;
-    let peer = seed.clone();
-    let gossip = Universe::isolated(seed);
+    let gossip = null_seed().await.without_gossip();
+    let peer = gossip.borrow().clone();
     let shutdown = CancellationToken::new();
     let root = ephemeral_test_root();
     let mgr = JobManager::with_trust_anchors(
@@ -341,7 +340,7 @@ pub async fn manager_test_root_and_peer(
         test_baseboard_id(),
         no_cubbies(),
         gossip,
-        LinkedBaseboards::lonely(),
+        ConnectedBaseboards::empty(),
         &Locker::null(),
         &[root.cert().to_owned()],
         shutdown.clone(),
@@ -357,9 +356,14 @@ pub fn no_cubbies() -> watch::Receiver<Cubbies> {
 }
 
 /// A seed over storage that persists nothing, silently.
-pub async fn null_gossip() -> GossipNetwork {
+pub async fn null_seed() -> GossipSeed {
     let log = Logger::root(slog::Discard, slog::o!());
-    seed_gossip(&log, &Locker::null()).await.into_rumors()
+    seed_gossip(&log, &Locker::null()).await
+}
+
+/// The network of a [`null_seed`].
+pub async fn null_gossip() -> GossipNetwork {
+    null_seed().await.into_rumors()
 }
 
 pub async fn authz<E>(

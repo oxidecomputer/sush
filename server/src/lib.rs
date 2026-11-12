@@ -20,7 +20,6 @@ pub mod gossip;
 pub mod history;
 pub mod io;
 pub mod job;
-pub mod link;
 pub mod locker;
 pub mod manager;
 pub mod messages;
@@ -30,6 +29,7 @@ pub mod pty;
 pub mod rack;
 pub mod server;
 pub mod spawn;
+pub mod sprockets;
 pub mod state;
 
 pub use error::JobError;

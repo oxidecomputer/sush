@@ -29,7 +29,7 @@ use sush_common::jobs::{BaseboardId, JobId, JobMode, JobStartRequest, SessionId,
 use sush_common::keys::{EphemeralKey, KeyId, KeyType, Signer as _};
 use sush_common::targets::Target;
 use sush_server::gossip::GossipConfig;
-use sush_server::link::CorpusSource;
+use sush_server::sprockets::{CorpusSource, platform_id_to_baseboard_id};
 use tempfile::TempDir;
 use tokio::time::{Instant, sleep};
 use x509_cert::time::Validity;
@@ -99,12 +99,7 @@ pub fn corpus(dir: &Utf8PathBuf) -> CorpusSource {
 
 /// The baseboard the test PKI attests for `node`.
 pub fn baseboard(node: usize) -> BaseboardId {
-    let id = platform_id(node);
-    let mut fields = id.split(':');
-    BaseboardId {
-        part_number: fields.nth(1).unwrap().to_string(),
-        serial_number: fields.nth(1).unwrap().to_string(),
-    }
+    platform_id_to_baseboard_id(&platform_id(node)).unwrap()
 }
 
 /// Dial ceiling for localhost handshakes.
@@ -116,8 +111,9 @@ pub fn dial_timeout() -> Duration {
 pub fn gossip_config() -> GossipConfig {
     GossipConfig {
         reconnect: Duration::from_millis(250),
-        connect_timeout: Duration::from_secs(10),
-        join_timeout: Duration::from_secs(30),
+        handshake_timeout: Duration::from_secs(10),
+        heartbeat: Duration::from_secs(1),
+        session_deadline: Duration::from_secs(30),
     }
 }
 

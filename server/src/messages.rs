@@ -37,7 +37,7 @@ use crate::format::{NoFormat, Versioned, Wire};
 /// Updates go sled by sled, so mixed gossip networks exist for
 /// the whole rollout. A message from a newer peer decodes as
 /// [`Unknown`](Self::Unknown), and is ignored rather than poisoning
-/// the link. Rumors relays its original bytes, so old sleds still
+/// the connection. Rumors relays its original bytes, so old sleds still
 /// retain and spread messages they cannot read.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum VersionedMessage {

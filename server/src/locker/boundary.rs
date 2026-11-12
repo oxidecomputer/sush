@@ -7,7 +7,7 @@
 //!
 //! A singleton boundary record is written before each job execution.
 //! It includes the job ID, session ID and sequence number, the chain
-//! position after the job, the universe they belong to, and the job's
+//! position after the job, the network they belong to, and the job's
 //! status (once it has one).
 //!
 //! After a restart, replayed gossip rebuilds the sessions. When the
@@ -47,7 +47,7 @@ pub const BOUNDARY: TenantSpec = TenantSpec {
 };
 
 /// The execution boundary: the last job this sled committed to
-/// running, in which universe, and how far it got. The committed
+/// running, in which network, and how far it got. The committed
 /// session supersedes every session at or below its sequence number.
 ///
 /// We also store the chain position *after* `job`, computed from the

@@ -35,13 +35,13 @@ use sush_common::version::LONG_VERSION;
 
 use crate::error::JobError;
 use crate::executor::PathIsolation;
-use crate::gossip::LinkedBaseboards;
+use crate::gossip::ConnectedBaseboards;
 use crate::job::SocketSender;
 use crate::locker::Locker;
 use crate::locker::boundary::BoundaryStore;
 use crate::messages::v0::{JobRequest, Request, SessionRequest};
 use crate::output::{JobOutputDir, JobOutputFileStream};
-use crate::state::{GossipUniverse, State, StateManager};
+use crate::state::{GossipNetwork, State, StateManager};
 
 /// Maximum amount of time we're willing to wait for job start or stop.
 const WAIT_TIMEOUT: Duration = Duration::from_secs(600);
@@ -52,7 +52,7 @@ pub struct JobManager {
     session_server_nonce: Arc<SyncMutex<SessionServerNonce>>,
     output_dir: JobOutputDir,
     own_baseboard: BaseboardId,
-    linked: LinkedBaseboards,
+    connected: ConnectedBaseboards,
     state: watch::Receiver<State>, // from the state manager
     tx_req: mpsc::Sender<Request>, // to the state manager
     join_state: Option<JoinHandle<()>>,
@@ -68,8 +68,8 @@ impl JobManager {
         output_dir: JobOutputDir,
         own_baseboard: BaseboardId,
         cubbies: watch::Receiver<Cubbies>,
-        universe: watch::Receiver<GossipUniverse>,
-        linked: LinkedBaseboards,
+        network: watch::Receiver<GossipNetwork>,
+        connected: ConnectedBaseboards,
         locker: &Locker,
         anchors: &[impl AsRef<Path>],
         shutdown: CancellationToken,
@@ -81,8 +81,8 @@ impl JobManager {
             output_dir,
             own_baseboard,
             cubbies,
-            universe,
-            linked,
+            network,
+            connected,
             locker,
             &anchors,
             shutdown,
@@ -97,8 +97,8 @@ impl JobManager {
         output_dir: JobOutputDir,
         own_baseboard: BaseboardId,
         cubbies: watch::Receiver<Cubbies>,
-        universe: watch::Receiver<GossipUniverse>,
-        linked: LinkedBaseboards,
+        network: watch::Receiver<GossipNetwork>,
+        connected: ConnectedBaseboards,
         locker: &Locker,
         anchors: &[Certificate],
         shutdown: CancellationToken,
@@ -116,7 +116,7 @@ impl JobManager {
             own_baseboard.clone(),
             requests,
             cubbies,
-            universe,
+            network,
             anchors,
             boundary,
             shutdown,
@@ -125,7 +125,7 @@ impl JobManager {
             log: log.new(o!("component" => "job manager")),
             session_server_nonce,
             own_baseboard,
-            linked,
+            connected,
             output_dir,
             state: rx_state,
             tx_req,
@@ -140,7 +140,7 @@ impl JobManager {
     /// Every sled known by cubby or by build, sorted by cubby first.
     pub fn versions(&self) -> Vec<SledVersion> {
         let state = self.state.borrow();
-        let linked = self.linked.borrow();
+        let connected = self.connected.borrow();
         let mut sleds: BTreeSet<&BaseboardId> = state.rack().versions().keys().collect();
         sleds.extend(state.rack().cubbies().values());
         let mut rows: Vec<SledVersion> = sleds
@@ -154,10 +154,10 @@ impl JobManager {
                 baseboard: baseboard.clone(),
                 version: state.rack().versions().get(baseboard).cloned(),
                 health: Some(
-                    if *baseboard == self.own_baseboard || linked.contains(baseboard) {
-                        SledHealth::Linked
+                    if *baseboard == self.own_baseboard || connected.contains(baseboard) {
+                        SledHealth::Connected
                     } else {
-                        SledHealth::Unlinked
+                        SledHealth::Disconnected
                     },
                 ),
             })
@@ -197,7 +197,7 @@ impl JobManager {
     }
 
     /// Wait until the job's status matches `wait` on each of `sleds`
-    /// that this sled still links to.
+    /// that this sled is still connected to.
     async fn wait_for_job(
         &self,
         job_id: &JobId,
@@ -207,22 +207,22 @@ impl JobManager {
         if !wait.is_some() {
             return Ok(());
         }
-        let settled = |state: &State, linked: &BTreeSet<BaseboardId>| {
+        let settled = |state: &State, connected: &BTreeSet<BaseboardId>| {
             let statuses = state.get_job_status(job_id);
             sleds.iter().all(|sled| {
-                let gone = *sled != self.own_baseboard && !linked.contains(sled);
+                let gone = *sled != self.own_baseboard && !connected.contains(sled);
                 gone || statuses
                     .and_then(|map| map.get(sled))
                     .is_some_and(|status| wait.matches_status(status))
             })
         };
         let mut state = self.state.clone();
-        let mut linked = self.linked.clone();
+        let mut connected = self.connected.clone();
         timeout(WAIT_TIMEOUT, async {
-            while !settled(&state.borrow_and_update(), &linked.borrow_and_update()) {
+            while !settled(&state.borrow_and_update(), &connected.borrow_and_update()) {
                 select! {
                     changed = state.changed() => changed.map_err(JobError::closed)?,
-                    () = linked.changed() => (),
+                    () = connected.changed() => (),
                 }
             }
             Ok(())
@@ -461,7 +461,7 @@ impl JobManager {
     /// Return the sleds in `target` that match either this sled or any of
     /// its live gossip peers.
     fn reachable_targets(&self, target: &Target) -> Result<BTreeSet<BaseboardId>, JobError> {
-        let mut reachable = self.linked.borrow().clone();
+        let mut reachable = self.connected.borrow().clone();
         reachable.insert(self.own_baseboard.clone());
         let sleds = target
             .resolve(&reachable, self.state.borrow().rack().cubbies())
