@@ -186,11 +186,11 @@ fn short_status_row(status: &JobStatus) -> String {
             time_cancelled,
             actor,
             ..
-        } => format!("Cancelled at {time_cancelled} by {actor}"),
+        } => format!("cancelled at {time_cancelled} by {actor}"),
         JobStatus::Queued {
             time_queued, actor, ..
-        } => format!("Queued at {time_queued} by {actor}"),
-        JobStatus::Started { time_started, .. } => format!("Started at {time_started}"),
+        } => format!("queued at {time_queued} by {actor}"),
+        JobStatus::Started { time_started, .. } => format!("started at {time_started}"),
         JobStatus::Stopped { result, output, .. } => {
             let duration = format_elapsed_duration(status.time_elapsed());
             let stdout_len = byte_size(output.stdout_len);
@@ -199,16 +199,16 @@ fn short_status_row(status: &JobStatus) -> String {
                 Ok(exit_status) => format!("exit {exit_status}"),
                 Err(err) => err.to_string(),
             };
-            format!("Stopped, {result} ({duration}), {stdout_len} out, {stderr_len} err")
+            format!("stopped, {result} ({duration}), {stdout_len} out, {stderr_len} err")
         }
         JobStatus::Error {
             time_error, error, ..
-        } => format!("Error at {time_error}: {error}"),
+        } => format!("error at {time_error}: {error}"),
         JobStatus::Skipped {
             time_skipped,
             reason,
             ..
-        } => format!("Skipped at {time_skipped}: {reason}"),
+        } => format!("skipped at {time_skipped}: {reason}"),
     }
 }
 
@@ -812,7 +812,7 @@ impl CommandContext for Cli {
             if !watch.bars.contains_key(baseboard_id) {
                 let index = watch.bars.range(..baseboard_id).count();
                 let bar = watch.multi.insert(index, ProgressBar::new_spinner());
-                bar.set_style(ProgressStyle::with_template("{spinner}  {prefix}  {msg}").unwrap());
+                bar.set_style(ProgressStyle::with_template("{spinner}  {prefix} {msg}").unwrap());
                 bar.set_prefix(format!("{:<width$}", baseboard_id.to_string()));
                 bar.enable_steady_tick(Duration::from_millis(100));
                 watch.bars.insert(baseboard_id.to_owned(), bar);
@@ -948,7 +948,7 @@ impl CommandContext for Cli {
                     .unwrap_or(0);
                 for (baseboard_id, status) in status {
                     let id = baseboard_id.to_string();
-                    qprintln!("   {id:<width$}  {}", short_status_row(status));
+                    qprintln!("   {id:<width$} {}", short_status_row(status));
                 }
             }
             OutputFormat::Text => {
