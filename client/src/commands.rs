@@ -746,14 +746,14 @@ impl ClientCommandProperties for ClientCommand {
     }
 }
 
-/// Await `future`, or fail with [`CommandError::Canceled`] on ^C.
+/// Await `future`, or fail with [`CommandError::Cancelled`] on ^C.
 async fn cancelable<T, E>(future: impl Future<Output = Result<T, E>>) -> Result<T, CommandError>
 where
     CommandError: From<E>,
 {
     select! {
         result = future => Ok(result?),
-        _ = ctrl_c() => Err(CommandError::Canceled),
+        _ = ctrl_c() => Err(CommandError::Cancelled),
     }
 }
 
@@ -1379,7 +1379,7 @@ async fn job(
                     _ = interval.tick() => ctx.job_signing_update(&job_id),
                     _ = sigint.recv() => {
                         ctx.job_signing_finished(&job_id, false);
-                        return Err(CommandError::Canceled);
+                        return Err(CommandError::Cancelled);
                     }
                 }
             };
@@ -2589,7 +2589,7 @@ async fn job_stream(
                     Err(error) => break Err(error.into()),
                 }
             }
-            _ = sigint.recv() => break Err(CommandError::Canceled),
+            _ = sigint.recv() => break Err(CommandError::Cancelled),
         }
     };
     match result {
@@ -2732,8 +2732,8 @@ pub enum CommandError {
         client: VersionInfo,
         server: VersionInfo,
     },
-    #[error("Canceled")]
-    Canceled,
+    #[error("Cancelled")]
+    Cancelled,
     #[error("Certificate for `{0}` is outside its validity window")]
     CertExpired(String),
     #[error("Chunk size must be positive")]

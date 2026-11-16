@@ -502,7 +502,7 @@ impl CommandContext for Cli {
         ))? {
             Ok(())
         } else {
-            Err(CommandError::Canceled)
+            Err(CommandError::Cancelled)
         }
     }
 
