@@ -526,7 +526,7 @@ pub enum SessionCommand {
         #[arg(requires = "seq")]
         nonce: Option<SessionSignerNonce>,
 
-        /// The session sequence number assigned by the signer.
+        /// The session sequence number assigned by the signing server.
         seq: Option<SessionSeq>,
 
         /// Override the client nonce generated and stashed by `session start-params`.
