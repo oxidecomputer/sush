@@ -2721,7 +2721,7 @@ async fn resolve_serial(
 pub enum CommandError {
     #[error("Serial `{0}` matches more than one sled, use a full baseboard ID")]
     AmbiguousSerial(String),
-    #[error("Authentication error")]
+    #[error("Authentication error: {0}")]
     Authn(#[from] AuthnError),
     #[error(
         "Authentication failed, client and server are different builds\n   \
@@ -2753,7 +2753,7 @@ pub enum CommandError {
     #[error("Identity error: {0}")]
     Identity(#[from] IdentityError),
     #[error(
-        "Identity mismatch,  tried to start an interactive job\n   \
+        "Identity mismatch: tried to start an interactive job\n   \
          for `{interactive}`\n    \
           as `{key_id}`"
     )]
@@ -2840,7 +2840,7 @@ pub enum CommandError {
     #[error("`--binary` and `--file` need a specific `--target`")]
     OutputNeedsTarget,
     #[cfg(feature = "permslip")]
-    #[error("permslip error: {0}")]
+    #[error("Permission Slip error: {0}")]
     Permslip(#[from] PermslipError),
     #[error("Job process error: {0}")]
     Process(#[from] ProcessError),
@@ -2961,7 +2961,11 @@ impl From<ClientError<ApiError>> for CommandError {
                     CommandError::Client(format!("Got {}", e.status()))
                 }
             }
-            UnexpectedResponse(e) => CommandError::Client(format!("Unexpected response: {e:?}")),
+            UnexpectedResponse(e) => CommandError::Client(format!(
+                "Unexpected response {} from {}",
+                e.status(),
+                e.url()
+            )),
             Custom(e) => CommandError::Client(e.to_string()),
         }
     }
