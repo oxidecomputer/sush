@@ -488,7 +488,7 @@ checksum = "2af50177e190e07a26ab74f8b1efbfe2ef87da2116221318cb1c2e82baf7de06"
 [[package]]
 name = "before"
 version = "0.1.0"
-source = "git+https://github.com/oxidecomputer/rumors?rev=8a635ddf45e9c116669ad6e99d83fe25dd0c1c1c#8a635ddf45e9c116669ad6e99d83fe25dd0c1c1c"
+source = "git+https://github.com/oxidecomputer/rumors?rev=1cc9bc6c97ac774ed6e33b3a924e03b1251f445d#1cc9bc6c97ac774ed6e33b3a924e03b1251f445d"
 dependencies = [
  "bytes",
  "dsi-bitstream",
@@ -4152,7 +4152,7 @@ dependencies = [
 [[package]]
 name = "rumors"
 version = "0.1.0"
-source = "git+https://github.com/oxidecomputer/rumors?rev=8a635ddf45e9c116669ad6e99d83fe25dd0c1c1c#8a635ddf45e9c116669ad6e99d83fe25dd0c1c1c"
+source = "git+https://github.com/oxidecomputer/rumors?rev=1cc9bc6c97ac774ed6e33b3a924e03b1251f445d#1cc9bc6c97ac774ed6e33b3a924e03b1251f445d"
 dependencies = [
  "aes-gcm",
  "async-stream",
@@ -4173,6 +4173,7 @@ dependencies = [
  "sha2 0.11.1",
  "sha3 0.12.0",
  "smallvec 1.16.5",
+ "strum_macros 0.28.0",
  "thiserror 2.0.20",
  "tinyvec",
  "tokio",
@@ -5182,9 +5183,21 @@ dependencies = [
 ]
 
 [[package]]
+name = "strum_macros"
+version = "0.28.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "ab85eea0270ee17587ed4156089e10b9e6880ee688791d45a905f5b1ca36f664"
+dependencies = [
+ "heck 0.5.0",
+ "proc-macro2",
+ "quote",
+ "syn 2.0.119",
+]
+
+[[package]]
 name = "suanpan"
 version = "0.1.0"
-source = "git+https://github.com/oxidecomputer/rumors?rev=8a635ddf45e9c116669ad6e99d83fe25dd0c1c1c#8a635ddf45e9c116669ad6e99d83fe25dd0c1c1c"
+source = "git+https://github.com/oxidecomputer/rumors?rev=1cc9bc6c97ac774ed6e33b3a924e03b1251f445d#1cc9bc6c97ac774ed6e33b3a924e03b1251f445d"
 dependencies = [
  "num-bigint",
 ]

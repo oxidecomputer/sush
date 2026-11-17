@@ -9,14 +9,13 @@ mod common;
 
 use std::time::Duration;
 
-use futures::StreamExt as _;
 use futures::stream;
 use tokio::io::{BufReader, split};
 use tokio::time::timeout;
 use tokio::{join, spawn};
 use tokio_util::sync::CancellationToken;
 
-use rumors::{Connection, Gossip, Joined, Peer, Rumors};
+use rumors::{Connection, Gossip, Join, Peer, Rumors};
 use sush_server::sprockets::{AttestedPeerConnection, Dialer, Listener};
 
 use common::{baseboard, corpus, dial_timeout, localhost, pki, sprockets_config, test_logger};
@@ -75,10 +74,10 @@ async fn gossip_convergence() {
         let alice = alice.clone();
         async move {
             let (read, write) = split(accepted);
-            let mut driver = alice.gossip(BufReader::new(read), write);
-            while let Some(session) = driver.next().await {
-                session.expect("serving gossip session");
-            }
+            alice
+                .gossip(BufReader::new(read), write)
+                .await
+                .expect("serving gossip session");
         }
     });
 
@@ -86,16 +85,16 @@ async fn gossip_convergence() {
     let (read, write) = split(dialed);
     let joined = timeout(
         Duration::from_secs(60),
-        Peer::<String>::bootstrap().join(BufReader::new(read), write),
+        Peer::<String>::join(BufReader::new(read), write),
     )
     .await
-    .expect("bootstrap timed out");
-    let Joined::Joined {
+    .expect("join timed out");
+    let Join::Connected {
         peer,
         connection: Connection::Reusable { read, write },
     } = joined
     else {
-        panic!("bootstrap failed: {joined:?}");
+        panic!("join failed: {joined:?}");
     };
     let bob = peer.into_rumors();
     assert_eq!(bob.network(), alice.network());
