@@ -1,8 +1,8 @@
 # Oxide Support Shell
 
-The Oxide Support Shell (`sush`) is a tool that runs jobs on an
-Oxide rack. Jobs must be authorized by Oxide support, but support
-personnel need not have direct access to the rack;
+The Oxide Support Shell (`sush`, rhymes with "hush") is a tool that
+runs jobs on an Oxide rack. Jobs must be authorized by Oxide support,
+but support personnel need not have direct access to the rack;
 see [RFD 620](https://rfd.shared.oxide.computer/rfd/620)
 for requirements, design constraints, and intended use cases.
 
@@ -38,10 +38,10 @@ sush# job start hostname
 ✅ Session is now `front-edit-bless-suggest-defy-bacon-retire-person`
 ✅ Signed request for job `kingdom-owner-dilemma-craft-soda-hungry-lumber-festival`
 ✅ Started job `kingdom-owner-dilemma-craft-soda-hungry-lumber-festival`
-   913-0000019:BRM23230010  Stopped, exit 0 (5ms 545us 307ns), 12 B out, 0 B err
-   913-0000019:BRM23230018  Stopped, exit 0 (6ms 165us 887ns), 12 B out, 0 B err
-   913-0000019:BRM27230037  Stopped, exit 0 (5ms 927us 316ns), 12 B out, 0 B err
-   913-0000023:2F8JEXDK     Stopped, exit 0 (5ms 282us 774ns), 9 B out, 0 B err
+   913-0000019:BRM23230010 stopped, exit 0 (5ms 545us 307ns), 12 B out, 0 B err
+   913-0000019:BRM23230018 stopped, exit 0 (6ms 165us 887ns), 12 B out, 0 B err
+   913-0000019:BRM27230037 stopped, exit 0 (5ms 927us 316ns), 12 B out, 0 B err
+   913-0000023:2F8JEXDK    stopped, exit 0 (5ms 282us 774ns), 9 B out, 0 B err
  » 913-0000019:BRM23230010 stdout «
 BRM23230010
  » 913-0000019:BRM23230018 stdout «
@@ -113,7 +113,7 @@ running the command `echo $SUSH_JOB_ID`:
 sush# job start "echo $SUSH_JOB_ID"
 ✅ Signed request for job `install-there-mutual-warfare-sound-live-order-man`
 ✅ Started job `install-there-mutual-warfare-sound-live-order-man`
-   a part:0001  Stopped, exit 0 (68ms 190us 114ns), 50 B out, 0 B err
+   a part:0001 stopped, exit 0 (68ms 190us 114ns), 50 B out, 0 B err
  » a part:0001 stdout «
 install-there-mutual-warfare-sound-live-order-man
 ```

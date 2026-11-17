@@ -901,7 +901,7 @@
     "/target": {
       "get": {
         "summary": "Get the baseboard ID of the sled handling this request.",
-        "description": "Unauthenticated: discovery must work before anyone can log in, and this reveals only the sled's baseboard. Routed through a proxy, this resolves a target expression to a baseboard.",
+        "description": "A client may resolve a target (e.g., a cubby number) to a baseboard ID by passing it as the `via` parameter when this request is routed through a proxy. The proxy will forward the request using its own cubby map.\n\nUnauthenticated because the proxy probes servers using this endpoint, and lacks an identity to authenticate with.",
         "operationId": "target",
         "parameters": [
           {
@@ -1110,7 +1110,7 @@
         ]
       },
       "JobId": {
-        "description": "A globally unique identifier for a job within a session.",
+        "description": "A globally unique identifier for a job.",
         "type": "string"
       },
       "JobMode": {
@@ -1180,7 +1180,6 @@
             "$ref": "#/components/schemas/SessionId"
           },
           "target": {
-            "description": "The sleds this job runs on.",
             "type": "string"
           }
         },
@@ -1208,6 +1207,7 @@
         ]
       },
       "JobStatus": {
+        "description": "The state of a job.",
         "oneOf": [
           {
             "type": "object",
@@ -1216,12 +1216,7 @@
                 "type": "object",
                 "properties": {
                   "actor": {
-                    "description": "The key that requested the cancellation.",
-                    "allOf": [
-                      {
-                        "$ref": "#/components/schemas/KeyId"
-                      }
-                    ]
+                    "$ref": "#/components/schemas/KeyId"
                   },
                   "job_id": {
                     "$ref": "#/components/schemas/JobId"
@@ -1250,12 +1245,7 @@
                 "type": "object",
                 "properties": {
                   "actor": {
-                    "description": "The key that submitted the job.",
-                    "allOf": [
-                      {
-                        "$ref": "#/components/schemas/KeyId"
-                      }
-                    ]
+                    "$ref": "#/components/schemas/KeyId"
                   },
                   "job_id": {
                     "$ref": "#/components/schemas/JobId"
@@ -1370,7 +1360,6 @@
             "additionalProperties": false
           },
           {
-            "description": "The reporting sled decided it will never run this job. A skip is a decision, not a failure: the job may have run on other sleds, and the operator decides whether to resubmit.",
             "type": "object",
             "properties": {
               "Skipped": {
@@ -1456,7 +1445,7 @@
         "type": "string"
       },
       "ProcessError": {
-        "description": "What went wrong running a job's process or interactive session.\n\nWe currently squash inner errors into strings to avoid excessive derivation requirements, but may come to regret that decision.",
+        "description": "What went wrong running a job's process or interactive session.",
         "oneOf": [
           {
             "type": "string",
@@ -1595,6 +1584,7 @@
         ]
       },
       "Session": {
+        "description": "The hash chain of the jobs within a session, and the actor that started it.",
         "type": "object",
         "properties": {
           "last_job": {
@@ -1605,7 +1595,6 @@
           },
           "started_by": {
             "nullable": true,
-            "description": "The key that started the session, where known. Client-side trackers leave it `None`. Servers record the verified starter.",
             "allOf": [
               {
                 "$ref": "#/components/schemas/KeyId"
@@ -1627,7 +1616,7 @@
         "type": "string"
       },
       "SessionSeq": {
-        "description": "The session's place in the signer-assigned order of sessions. Taken as whole milliseconds since the Unix epoch according to the *signer's* wall clock; the server's clock can't be trusted, so the server never interprets a sequence number as a time, only as an order. Sessions authorized in the same millisecond share a sequence number and tie-break by ID. Encoded as four codephrase words: 2048⁴ = 2⁴⁴ values, good through the year 2527.",
+        "description": "The session sequence number, assigned by the signing server. Currently whole milliseconds since the Unix epoch, but never interpreted as such. Encoded as four codephrase words, so 2048⁴ = 2⁴⁴ values, good through the year 2527. Ties are broken by session ID.",
         "type": "string"
       },
       "SessionServerNonce": {
@@ -1758,7 +1747,7 @@
         ]
       },
       "Access": {
-        "description": "Attach access to a session's interactive jobs. The session starter always has read-write access. Guests have what they were granted. Read-write means co-driving a shell the job signature authorized, so who deserves it is deployment policy. Recorded output is not gated: it is the customer's data, readable by any authenticated key.",
+        "description": "The actor that starts a session may always attach to interactive jobs in that session. By default, other actors may not, but they may be granted read-only or read-write access via `session allow`.",
         "type": "string",
         "enum": [
           "read-only",

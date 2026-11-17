@@ -22,13 +22,12 @@
       "$ref": "#/definitions/SessionId"
     },
     "target": {
-      "description": "The sleds this job runs on.",
       "type": "string"
     }
   },
   "definitions": {
     "JobId": {
-      "description": "A globally unique identifier for a job within a session.",
+      "description": "A globally unique identifier for a job.",
       "type": "string"
     },
     "JobMode": {

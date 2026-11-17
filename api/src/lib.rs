@@ -214,9 +214,13 @@ pub trait SushApi {
 
     /// Get the baseboard ID of the sled handling this request.
     ///
-    /// Unauthenticated: discovery must work before anyone can log in,
-    /// and this reveals only the sled's baseboard. Routed through a
-    /// proxy, this resolves a target expression to a baseboard.
+    /// A client may resolve a target (e.g., a cubby number) to
+    /// a baseboard ID by passing it as the `via` parameter when
+    /// this request is routed through a proxy. The proxy will
+    /// forward the request using its own cubby map.
+    ///
+    /// Unauthenticated because the proxy probes servers using
+    /// this endpoint, and lacks an identity to authenticate with.
     #[endpoint { method = GET, path = "/target" }]
     async fn target(
         ctx: RequestContext<Self::Context>,

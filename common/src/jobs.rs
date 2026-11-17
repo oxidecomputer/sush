@@ -2,7 +2,7 @@
 // License, v. 2.0. If a copy of the MPL was not distributed with this
 // file, You can obtain one at https://mozilla.org/MPL/2.0/.
 
-//! Signed job requests.
+//! Sessions and signed job requests per RFD 620.
 
 use std::collections::{BTreeMap, HashMap};
 use std::fmt;
@@ -27,7 +27,7 @@ use crate::keys::{KeyId, Signed, ToBeSigned, ToBeSignedFields, Verified};
 use crate::targets::Target;
 
 codephrase_newtype! {
-    /// A globally unique identifier for a job within a session.
+    /// A globally unique identifier for a job.
     #[derive(
         Copy,
         Clone,
@@ -78,10 +78,18 @@ codephrase_newtype! {
     pub struct SessionId = Truncated;
 }
 
-/// The material a session ID hashes over, and the only source
-/// of one. The `SessionRequest::Start` message gossips this
-/// preimage to prevent a malicious or corrupted server from
-/// poisoning the session.
+impl SessionId {
+    pub fn next_job_id(&self, last_job: &LastJob) -> JobId {
+        JobId::from_hash(match last_job {
+            LastJob::None => hash(&[b"None", self.0.to_be_bytes().as_slice()].concat()),
+            LastJob::Some(job) => hash(&[b"Some", job.to_be_signed().as_slice()].concat()),
+            LastJob::Burned(job_id) => hash(&[b"Burned", job_id.to_be_bytes().as_slice()].concat()),
+            LastJob::Resumed(next) => return *next,
+        })
+    }
+}
+
+/// Material needed to derive a session ID.
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 pub struct SessionPreimage {
     pub baseboard: BaseboardId,
@@ -114,17 +122,6 @@ impl SessionPreimage {
         hasher.update_with_len(b"seq");
         hasher.update_with_len(&seq.to_be_bytes());
         SessionId::from_hash(hasher.finalize())
-    }
-}
-
-impl SessionId {
-    pub fn next_job_id(&self, last_job: &LastJob) -> JobId {
-        JobId::from_hash(match last_job {
-            LastJob::None => hash(&[b"None", self.0.to_be_bytes().as_slice()].concat()),
-            LastJob::Some(job) => hash(&[b"Some", job.to_be_signed().as_slice()].concat()),
-            LastJob::Burned(job_id) => hash(&[b"Burned", job_id.to_be_bytes().as_slice()].concat()),
-            LastJob::Resumed(next) => return *next,
-        })
     }
 }
 
@@ -183,13 +180,9 @@ codephrase_newtype! {
 }
 
 impl SessionSushNonce {
-    /// Hash the client and server nonces together. The server nonce
-    /// alone could carry anything the rack chose to hide in it, but
-    /// the hash of the pair carries nothing the rack could steer,
-    /// because the rack committed to its nonce before the client
-    /// chose its. An operator in a secure facility should therefore
-    /// be able to export the result based on the strength of their
-    /// own machine's nonce.
+    /// Hash the client and server nonces together. Since the server
+    /// must choose its nonce before seeing the client's, it cannot
+    /// grind hashes to steer this value.
     pub fn compute(client: SessionClientNonce, server: SessionServerNonce) -> Self {
         let mut hasher = Hasher::new();
         hasher.update_with_len(b"SUSH_SESSION_NONCE_V2");
@@ -219,14 +212,11 @@ codephrase_newtype! {
 }
 
 codephrase_newtype! {
-    /// The session's place in the signer-assigned order of sessions.
-    /// Taken as whole milliseconds since the Unix epoch according to
-    /// the *signer's* wall clock; the server's clock can't be trusted,
-    /// so the server never interprets a sequence number as a time,
-    /// only as an order. Sessions authorized in the same millisecond
-    /// share a sequence number and tie-break by ID. Encoded as four
-    /// codephrase words: 2048⁴ = 2⁴⁴ values, good through the year
-    /// 2527.
+    /// The session sequence number, assigned by the signing server.
+    /// Currently whole milliseconds since the Unix epoch, but never
+    /// interpreted as such. Encoded as four codephrase words, so
+    /// 2048⁴ = 2⁴⁴ values, good through the year 2527. Ties are broken
+    /// by session ID.
     #[derive(
         Copy,
         Clone,
@@ -278,12 +268,12 @@ pub enum LastJob {
     Resumed(JobId),
 }
 
+/// The hash chain of the jobs within a session, and the actor that
+/// started it.
 #[derive(Clone, Debug, Deserialize, Eq, JsonSchema, PartialEq, Serialize)]
 pub struct Session {
     session_id: SessionId,
     last_job: LastJob,
-    /// The key that started the session, where known. Client-side
-    /// trackers leave it `None`. Servers record the verified starter.
     started_by: Option<KeyId>,
 }
 
@@ -324,13 +314,12 @@ impl Session {
         self.last_job = LastJob::Some(job)
     }
 
-    /// Burn `job_id` when it is the session's next job or the job at
-    /// the chain head. Burning the next job skips it before it runs.
-    /// Burning the head rewrites the chain to continue from the burn:
-    /// a signer unwinds a job it signed that never ran, and a server
-    /// converges with that signer when a skip request arrives after
-    /// the start of the job it names. An execution already in history
-    /// stays there. Returns whether the chain moved.
+    pub fn next_job_id(&self) -> JobId {
+        self.session_id.next_job_id(&self.last_job)
+    }
+
+    /// Burn `job_id` when it is the session's next job or the head
+    /// of the chain. Returns whether the chain moved.
     pub fn skip_job(&mut self, job_id: JobId) -> bool {
         if job_id == self.next_job_id()
             || matches!(&self.last_job, LastJob::Some(job) if *job.job_id() == job_id)
@@ -342,14 +331,8 @@ impl Session {
         }
     }
 
-    pub fn next_job_id(&self) -> JobId {
-        self.session_id.next_job_id(&self.last_job)
-    }
-
     /// Resume the chain at `successor`, the position a boundary
-    /// record stored at its last commitment. Every position before
-    /// `successor` was already handled by the sled that stored the
-    /// record.
+    /// record stored at its last commitment.
     pub fn resume_at(&mut self, successor: JobId) {
         self.last_job = LastJob::Resumed(successor);
     }
@@ -397,7 +380,6 @@ pub struct JobStartRequest {
     pub command: String,
     #[serde(default, skip_serializing_if = "JobMode::is_batch")]
     pub mode: JobMode,
-    /// The sleds this job runs on.
     #[serde(default, skip_serializing_if = "Target::is_all")]
     pub target: Target,
 }
@@ -473,18 +455,17 @@ impl ToBeSigned for JobStartRequest {
 pub type SignedJob = Signed<JobStartRequest>;
 pub type VerifiedJob = Verified<JobStartRequest>;
 
+/// The state of a job.
 #[derive(Clone, Debug, Deserialize, JsonSchema, Serialize)]
 pub enum JobStatus {
     Cancelled {
         job_id: JobId,
         time_cancelled: DateTime<Utc>,
-        /// The key that requested the cancellation.
         actor: KeyId,
     },
     Queued {
         job_id: JobId,
         time_queued: DateTime<Utc>,
-        /// The key that submitted the job.
         actor: KeyId,
     },
     Error {
@@ -503,14 +484,62 @@ pub enum JobStatus {
         result: Result<i32, ProcessError>,
         output: JobOutputState,
     },
-    /// The reporting sled decided it will never run this job. A skip
-    /// is a decision, not a failure: the job may have run on other
-    /// sleds, and the operator decides whether to resubmit.
     Skipped {
         job_id: JobId,
         time_skipped: DateTime<Utc>,
         reason: SkipReason,
     },
+}
+
+impl JobStatus {
+    /// Which job this state describes.
+    pub fn job_id(&self) -> &JobId {
+        match self {
+            Self::Cancelled { job_id, .. }
+            | Self::Queued { job_id, .. }
+            | Self::Error { job_id, .. }
+            | Self::Started { job_id, .. }
+            | Self::Stopped { job_id, .. }
+            | Self::Skipped { job_id, .. } => job_id,
+        }
+    }
+
+    /// Whether this status can ever change again.
+    pub fn is_terminal(&self) -> bool {
+        matches!(
+            self,
+            Self::Cancelled { .. }
+                | Self::Error { .. }
+                | Self::Stopped { .. }
+                | Self::Skipped { .. }
+        )
+    }
+
+    /// The most recent timestamp recorded for this status.
+    pub fn time(&self) -> DateTime<Utc> {
+        match self {
+            Self::Cancelled { time_cancelled, .. } => *time_cancelled,
+            Self::Queued { time_queued, .. } => *time_queued,
+            Self::Error { time_error, .. } => *time_error,
+            Self::Started { time_started, .. } => *time_started,
+            Self::Stopped { time_stopped, .. } => *time_stopped,
+            Self::Skipped { time_skipped, .. } => *time_skipped,
+        }
+    }
+
+    /// How long it spent or has been in this state.
+    pub fn time_elapsed(&self) -> TimeDelta {
+        match self {
+            Self::Cancelled { .. } | Self::Error { .. } | Self::Skipped { .. } => TimeDelta::zero(),
+            Self::Queued { time_queued, .. } => Utc::now() - time_queued,
+            Self::Started { time_started, .. } => Utc::now() - time_started,
+            Self::Stopped {
+                time_started,
+                time_stopped,
+                ..
+            } => *time_stopped - time_started,
+        }
+    }
 }
 
 /// Why a sled will never run a job.
@@ -558,9 +587,8 @@ pub fn job_status_to_json_map(status_map: JobStatusMap) -> JsonJobStatusMap {
 }
 
 /// What went wrong running a job's process or interactive session.
-///
-/// We currently squash inner errors into strings to avoid excessive
-/// derivation requirements, but may come to regret that decision.
+// We currently squash inner errors into strings to avoid excessive
+// derivation requirements, but may come to regret that decision.
 #[derive(Clone, Debug, Deserialize, Eq, Error, JsonSchema, PartialEq, Serialize)]
 pub enum ProcessError {
     #[error("The fate of the process is unknown")]
@@ -625,59 +653,6 @@ impl ExecutionError {
 
     pub fn error(&self) -> ProcessError {
         self.error.clone()
-    }
-}
-
-impl JobStatus {
-    /// Whether this status can ever change again.
-    pub fn is_terminal(&self) -> bool {
-        matches!(
-            self,
-            Self::Cancelled { .. }
-                | Self::Error { .. }
-                | Self::Stopped { .. }
-                | Self::Skipped { .. }
-        )
-    }
-
-    /// The most recent timestamp recorded for this status.
-    pub fn time(&self) -> DateTime<Utc> {
-        match self {
-            Self::Cancelled { time_cancelled, .. } => *time_cancelled,
-            Self::Queued { time_queued, .. } => *time_queued,
-            Self::Error { time_error, .. } => *time_error,
-            Self::Started { time_started, .. } => *time_started,
-            Self::Stopped { time_stopped, .. } => *time_stopped,
-            Self::Skipped { time_skipped, .. } => *time_skipped,
-        }
-    }
-
-    pub fn time_elapsed(&self) -> TimeDelta {
-        match self {
-            Self::Cancelled { .. } | Self::Error { .. } | Self::Skipped { .. } => TimeDelta::zero(),
-            Self::Queued { time_queued, .. } => Utc::now() - time_queued,
-            Self::Started { time_started, .. } => Utc::now() - time_started,
-            Self::Stopped {
-                time_started,
-                time_stopped,
-                ..
-            } => *time_stopped - time_started,
-        }
-    }
-
-    pub fn job_id(&self) -> &JobId {
-        match self {
-            Self::Cancelled { job_id, .. }
-            | Self::Queued { job_id, .. }
-            | Self::Error { job_id, .. }
-            | Self::Started { job_id, .. }
-            | Self::Stopped { job_id, .. }
-            | Self::Skipped { job_id, .. } => job_id,
-        }
-    }
-
-    pub fn is_active(&self) -> bool {
-        matches!(self, Self::Started { .. })
     }
 }
 
@@ -767,11 +742,9 @@ impl Default for JobLimits {
     }
 }
 
-/// Attach access to a session's interactive jobs. The session starter
-/// always has read-write access. Guests have what they were granted.
-/// Read-write means co-driving a shell the job signature authorized,
-/// so who deserves it is deployment policy. Recorded output is not
-/// gated: it is the customer's data, readable by any authenticated key.
+/// The actor that starts a session may always attach to interactive
+/// jobs in that session. By default, other actors may not, but they
+/// may be granted read-only or read-write access via `session allow`.
 #[derive(Clone, Copy, Debug, Default, Deserialize, Eq, JsonSchema, PartialEq, Serialize)]
 #[serde(rename_all = "kebab-case")]
 pub enum Access {

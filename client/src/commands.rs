@@ -526,7 +526,7 @@ pub enum SessionCommand {
         #[arg(requires = "seq")]
         nonce: Option<SessionSignerNonce>,
 
-        /// The session sequence number assigned by the signer.
+        /// The session sequence number assigned by the signing server.
         seq: Option<SessionSeq>,
 
         /// Override the client nonce generated and stashed by `session start-params`.
@@ -746,14 +746,14 @@ impl ClientCommandProperties for ClientCommand {
     }
 }
 
-/// Await `future`, or fail with [`CommandError::Canceled`] on ^C.
+/// Await `future`, or fail with [`CommandError::Cancelled`] on ^C.
 async fn cancelable<T, E>(future: impl Future<Output = Result<T, E>>) -> Result<T, CommandError>
 where
     CommandError: From<E>,
 {
     select! {
         result = future => Ok(result?),
-        _ = ctrl_c() => Err(CommandError::Canceled),
+        _ = ctrl_c() => Err(CommandError::Cancelled),
     }
 }
 
@@ -1379,7 +1379,7 @@ async fn job(
                     _ = interval.tick() => ctx.job_signing_update(&job_id),
                     _ = sigint.recv() => {
                         ctx.job_signing_finished(&job_id, false);
-                        return Err(CommandError::Canceled);
+                        return Err(CommandError::Cancelled);
                     }
                 }
             };
@@ -2589,7 +2589,7 @@ async fn job_stream(
                     Err(error) => break Err(error.into()),
                 }
             }
-            _ = sigint.recv() => break Err(CommandError::Canceled),
+            _ = sigint.recv() => break Err(CommandError::Cancelled),
         }
     };
     match result {
@@ -2721,7 +2721,7 @@ async fn resolve_serial(
 pub enum CommandError {
     #[error("Serial `{0}` matches more than one sled, use a full baseboard ID")]
     AmbiguousSerial(String),
-    #[error("Authentication error")]
+    #[error("Authentication error: {0}")]
     Authn(#[from] AuthnError),
     #[error(
         "Authentication failed, client and server are different builds\n   \
@@ -2732,8 +2732,8 @@ pub enum CommandError {
         client: VersionInfo,
         server: VersionInfo,
     },
-    #[error("Canceled")]
-    Canceled,
+    #[error("Cancelled")]
+    Cancelled,
     #[error("Certificate for `{0}` is outside its validity window")]
     CertExpired(String),
     #[error("Chunk size must be positive")]
@@ -2753,7 +2753,7 @@ pub enum CommandError {
     #[error("Identity error: {0}")]
     Identity(#[from] IdentityError),
     #[error(
-        "Identity mismatch,  tried to start an interactive job\n   \
+        "Identity mismatch: tried to start an interactive job\n   \
          for `{interactive}`\n    \
           as `{key_id}`"
     )]
@@ -2840,7 +2840,7 @@ pub enum CommandError {
     #[error("`--binary` and `--file` need a specific `--target`")]
     OutputNeedsTarget,
     #[cfg(feature = "permslip")]
-    #[error("permslip error: {0}")]
+    #[error("Permission Slip error: {0}")]
     Permslip(#[from] PermslipError),
     #[error("Job process error: {0}")]
     Process(#[from] ProcessError),
@@ -2961,7 +2961,11 @@ impl From<ClientError<ApiError>> for CommandError {
                     CommandError::Client(format!("Got {}", e.status()))
                 }
             }
-            UnexpectedResponse(e) => CommandError::Client(format!("Unexpected response: {e:?}")),
+            UnexpectedResponse(e) => CommandError::Client(format!(
+                "Unexpected response {} from {}",
+                e.status(),
+                e.url()
+            )),
             Custom(e) => CommandError::Client(e.to_string()),
         }
     }
