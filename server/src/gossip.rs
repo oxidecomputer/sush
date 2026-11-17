@@ -20,9 +20,7 @@ use std::time::Duration;
 use futures::StreamExt as _;
 use futures::stream::{self, Stream};
 use rumors::error::Mismatch;
-use rumors::{
-    Changes, Connection, Count, Error, Gossip, Joined, Network, NoBookmark, Peer, Rumors,
-};
+use rumors::{Changes, Connection, Count, Error, Gossip, Join, Network, NoBookmark, Peer, Rumors};
 use serde::Serialize;
 use serde::de::DeserializeOwned;
 use sled_hardware_types::BaseboardId;
@@ -74,8 +72,8 @@ impl ConnectedBaseboards {
 pub struct GossipConfig {
     pub reconnect: Duration,
     pub handshake_timeout: Duration,
+    pub gossip_timeout: Duration,
     pub heartbeat: Duration,
-    pub session_deadline: Duration,
 }
 
 impl Default for GossipConfig {
@@ -84,8 +82,8 @@ impl Default for GossipConfig {
         Self {
             reconnect: Duration::from_secs(5),
             handshake_timeout: Duration::from_secs(30),
+            gossip_timeout: Duration::from_secs(60),
             heartbeat: Duration::from_secs(30),
-            session_deadline: Duration::from_secs(60),
         }
     }
 }
@@ -159,7 +157,7 @@ where
 }
 
 /// Whether the peer's network dominates ours, by the rule in rumors'
-/// [Bootstrapping without consensus](Peer#bootstrapping-without-consensus).
+/// [Bootstrapping a network without consensus](Peer#bootstrapping-a-network-without-consensus).
 /// Any total order on networks breaks ties, as long as both sides use
 /// the same one.
 fn remote_dominates(
@@ -213,10 +211,10 @@ where
     let dialer = Dialer::new(log, sprockets, corpus, config.handshake_timeout);
     let Seed { peer, bookmarks } = seed;
     let heartbeat = config.heartbeat;
-    let deadline = config.session_deadline;
+    let timeout = config.gossip_timeout;
     let rumors = peer
         .gossip_when(move |changes| policy(changes, heartbeat))
-        .session_deadline(move || sleep(deadline))
+        .gossip_timeout(move || sleep(timeout))
         .into_rumors();
     let (publish, subscribe) = watch::channel(rumors.clone());
     let (connected, subscribe_connected) = watch::channel(BTreeSet::new());
@@ -390,17 +388,17 @@ where
             "ours" => %self.rumors.network(),
         );
         let heartbeat = self.config.heartbeat;
-        let deadline = self.config.session_deadline;
-        let bootstrap = Peer::bootstrap()
+        let timeout = self.config.gossip_timeout;
+        let joining = Peer::joining()
             .gossip_when(move |changes| policy(changes, heartbeat))
-            .session_deadline(move || sleep(deadline))
+            .gossip_timeout(move || sleep(timeout))
             .bookmark(self.bookmarks.handle());
-        let connection = match bootstrap.join(read, write).await {
-            Joined::Joined { peer, connection } => {
+        let connection = match joining.join(read, write).await {
+            Join::Connected { peer, connection } => {
                 self.joined(peer);
                 Some(connection)
             }
-            Joined::Unbookmarked {
+            Join::Unbookmarked {
                 unbookmarked,
                 connection,
             } => {
@@ -409,11 +407,11 @@ where
                 self.joined(peer);
                 Some(connection)
             }
-            Joined::Bailed { .. } => {
-                warn!(self.log, "mutual bootstrap, retrying");
+            Join::Bounced { .. } => {
+                warn!(self.log, "mutual join, retrying");
                 None
             }
-            Joined::Failed { error, .. } => {
+            Join::Failed { error, .. } => {
                 warn!(self.log, "unable to join gossip network"; "error" => %error);
                 None
             }
@@ -447,40 +445,36 @@ where
     T: DeserializeOwned + Serialize + Eq + Send + Sync + 'static,
 {
     let ours = rumors.network();
-    let mut driver = rumors.gossip(read, write);
-    while let Some(session) = driver.next().await {
-        match session {
-            Ok(_) => {}
-            Err(Error::Mismatch(Mismatch::Network {
-                remote_network,
-                remote_min_events,
-                local_min_events,
-                ..
-            })) => {
-                let dominated =
-                    remote_dominates(&local_min_events, &remote_min_events, ours, remote_network);
-                debug!(
-                    log, "network mismatch";
-                    "ours" => %ours, "theirs" => %remote_network,
-                    "our_events" => %local_min_events,
-                    "their_events" => %remote_min_events,
-                    "we_lose" => dominated,
-                );
-                return if dominated {
-                    Stopped::Dominated
-                } else {
-                    Stopped::Failed
-                };
-            }
-            Err(Error::Bookmark(error)) => {
-                warn!(log, "bookmark failed, unable to gossip"; "error" => %error);
-                return Stopped::Failed;
-            }
-            Err(err) => {
-                debug!(log, "gossip session failed"; "error" => %err);
-                return Stopped::Failed;
+    match rumors.gossip(read, write).await {
+        Ok(()) => Stopped::Failed,
+        Err(Error::Mismatch(Mismatch::Network {
+            remote_network,
+            remote_min_events,
+            local_min_events,
+            ..
+        })) => {
+            let dominated =
+                remote_dominates(&local_min_events, &remote_min_events, ours, remote_network);
+            debug!(
+                log, "network mismatch";
+                "ours" => %ours, "theirs" => %remote_network,
+                "our_events" => %local_min_events,
+                "their_events" => %remote_min_events,
+                "we_lose" => dominated,
+            );
+            if dominated {
+                Stopped::Dominated
+            } else {
+                Stopped::Failed
             }
         }
+        Err(Error::Bookmark(error)) => {
+            warn!(log, "bookmark failed, unable to gossip"; "error" => %error);
+            Stopped::Failed
+        }
+        Err(err) => {
+            debug!(log, "gossip session failed"; "error" => %err);
+            Stopped::Failed
+        }
     }
-    Stopped::Failed
 }

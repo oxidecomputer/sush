@@ -112,8 +112,8 @@ pub fn gossip_config() -> GossipConfig {
     GossipConfig {
         reconnect: Duration::from_millis(250),
         handshake_timeout: Duration::from_secs(10),
+        gossip_timeout: Duration::from_secs(30),
         heartbeat: Duration::from_secs(1),
-        session_deadline: Duration::from_secs(30),
     }
 }
 
