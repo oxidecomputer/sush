@@ -52,7 +52,195 @@ BRM27230037
 2F8JEXDK
 ```
 
-## Local Testing Quickstart
+## Quickstart
+
+`sush` should be enabled and available by default in all Omicron builds
+past `ecc38a1041c9f5c4bd90b178bfae655380d55bf3`. To use it, you will need
+three things: a client binary, a configuration that describes how jobs
+should be signed and how to reach the rack, and an SSH identity.
+
+### Client
+
+On shared lab systems, there's usually a reasonably current illumos client
+in `~alex/bin/sush` that you're welcome to use or copy. If you'd rather
+fetch the client yourself, buildomat publishes Helios and Linux clients
+on each commit:
+
+```
+https://buildomat.eng.oxide.computer/public/file/oxidecomputer/sush/linux/<commit>/sush
+https://buildomat.eng.oxide.computer/public/file/oxidecomputer/sush/helios/<commit>/sush
+```
+
+You may also build it yourself from a repository checkout with
+`cargo build --features permslip`.
+
+### Client configuration
+
+You can use a configuration file, environment variables, or command line
+arguments to configure `sush` options. Options cascade in that order; e.g.,
+the command line overrides the environment, which overrides a configuration
+file. Config files are found via standard XDG path search; the usual
+per-user location is `~/.config/sush/sush.toml`.
+
+The basic options to configure are the Permission Slip address and key
+used to authorize jobs, and the address of a technician port on the rack
+(`sush` can also be used via a Nexus tunnel, but that takes a little more
+setup and will be covered in a future document). Oxide engineers should
+use a "Lab" key that will enable jobs to be run on staging-signed systems
+(e.g., racklettes and other lab machines), while support personnel will
+use a "Production" key that allows jobs to run on production-signed
+(e.g., customer) systems.
+
+Multiple racks and per-rack options may be configured via _profiles_
+(named groups or "tables") in a config file, like this:
+
+```
+permslip-url = "https://signer-us-west.corp.oxide.computer"
+permslip-key = "Support Shell Lab A1"
+profile = "dublin"
+
+[dublin]
+url = "https://[fe80::aa40:25ff:fe05:2202%dublin_sw0tp0]:12352"
+
+[madrid]
+url = "https://[fe80::aa40:25ff:fe05:102%madrid_sw0tp0]:12352"
+```
+
+The default profile is set here as the global `profile` key;
+you can also switch profiles with the `SUSH_PROFILE` environment
+variable or the `--profile` argument.
+
+Other racks or alternate switch addresses may be added by examining
+the technician port addresses with `pilot tp ls`. On illumos especially,
+it's important to also include the interface as a zone identifier
+prefixed by `%` (per RFC 9844), since otherwise the kernel must guess
+which interface to use, and usually guesses wrong. The port number
+`12352` is assigned as `SUSH_PROXY_PORT` in Omicron's common address
+list.
+
+### SSH identity
+
+`sush` uses an _attributive only_ authentication scheme. The
+_authorization_ for a job comes exclusively from its signature;
+separately, there is also an _authentication_ process that identifies
+the actor that starts a session, runs a job, etc. These identities
+are established by proving to the proxy that the user has current
+possession of an SSH key via `ssh-agent`, and are managed in `sush`
+using the `iam` command.
+
+Any kind of Ed25519 or ECDSA SSH key will do, but we recommend using one
+backed by a hardware token such as a YubiKey (but note that it does *not*
+need to be one of the designated "Support YubiKeys"). See `ssh-add(1)`
+for adding identities to your agent; `ssh-add -l` or `sush iam -l` will
+show which identities are currently available. It may also be useful to
+forward agent connections if you're logging in remotely (e.g., to Castle).
+
+Since new SSH keys may be trivially created, authentication does not by
+itself grant any particular permissions. But it does, for instance, prevent
+someone from stopping or attaching to jobs that they did not start, unless
+access is explicitly granted by the identity that started the session.
+
+Customers worried about locking down access to their racks via the tech
+port may have concerns about this. We can address such concerns in two
+ways: first, we can assure them that _no new jobs may be run_ via `sush`
+without obtaining a signed job request; only job output and history may
+be fetched via an arbitrary identity (and only with technician port access).
+Second, we can do a bit of follow-up work to use the forthcoming Nexus-managed
+list of authorized keys to restrict who may even talk to the `sush` proxies.
+
+### Client commands
+
+The `sush` client has a couple of modes and a variety of sub-commands.
+You can use it in batch mode by specifying the sub-command as an argument,
+or in interactive mode by starting it with no arguments or with the `shell`
+(alias `repl`) sub-command; you can also script it with JSON output using
+the `-j` option. You can exit the interactive shell with `quit` or Ctrl-D.
+
+A good first sub-command is `version`, which reports the version, status,
+and cubby numbers of the `sush` servers running on each sled, as seen by the
+server that answers. Green sleds are connected to that server over the
+internal gossip network; yellow sleds are not connected, but their versions
+are known; and red sleds are known only from the cubby map, which usually
+means that no server is running there.
+
+### Starting a session
+
+Jobs exist within a _session_, and (except for exceptional circumstances)
+only one session may be present on a given rack at once. So to run a job,
+you must first start or attach to an existing session. Use `session start`
+to start a new one; the client will prompt for confirmation before replacing
+an existing session if there is one. That command requires authenticating
+both to `sush` via your SSH identity, and also to the signing server via
+Google OAuth:
+
+```sh
+sush# session start
+👋 Please confirm user presence to sign with key `excite-cabbage-reject-wave-learn-police-that-glad`
+🔑 Open this URL in your browser to authenticate to the signing service:
+https://signer-us-west.corp.oxide.computer/google/fe38f0cb8fd621b15806bec086ee395a
+✅ Created session
+   Session ID:      story-diesel-fault-three-empty-legend-thought-laptop
+   Signer nonce:    core-join-panel-ecology-mammal-abstract-alley-chaos
+   Sequence number: borrow-regular-follow-bitter
+```
+
+### Running jobs
+
+Once you've got a session, you can obtain and run signed jobs with `job start`:
+
+```sh
+sush# job start "zpool status -x"
+✅ Signed request for job `script-tooth-raven-clump-grape-broken-meat-seminar`
+✅ Started job `script-tooth-raven-clump-grape-broken-meat-seminar`
+   913-0000019:BRM42220004 stopped, exit 0 (19ms 55us 427ns), 22 B out, 0 B err
+   913-0000019:BRM42220007 stopped, exit 0 (19ms 375us 607ns), 22 B out, 0 B err
+   913-0000019:BRM42220046 stopped, exit 0 (19ms 906us 956ns), 22 B out, 0 B err
+   913-0000019:BRM42220081 stopped, exit 0 (21ms 879us 664ns), 22 B out, 0 B err
+ » 913-0000019:BRM42220004 stdout «
+all pools are healthy
+ » 913-0000019:BRM42220007 stdout «
+all pools are healthy
+ » 913-0000019:BRM42220046 stdout «
+all pools are healthy
+ » 913-0000019:BRM42220081 stdout «
+all pools are healthy
+```
+
+The default for `job start` is to run the job in batch mode across all
+available servers. You can target specific sleds for a job using `job
+start -T <targets>`, where `<targets>` is a comma-separated list of full
+baseboard IDs, unambiguous serial numbers, or cubby numbers; `*` denotes
+the default of all sleds.
+
+You can also run interactive jobs (with a pseudoterminal) by supplying
+the `-i` (`--interactive`) option. Interactive jobs only run on a single
+target; the default is the scrimlet you're talking to:
+
+```sh
+sush# job start -i bash
+✅ Signed request for job `door-west-sponsor-tuna-security-together-pact-answer`
+✅ Started job `door-west-sponsor-tuna-security-together-pact-answer`
+✅ Attached to job `door-west-sponsor-tuna-security-together-pact-answer`, detach with `^]`
+BRM23230018 # 
+```
+
+Try running various interactive programs, detaching, re-attaching,
+and using `session allow <key_id>` (from their `iam`) to invite your
+friends along for the ride.
+
+The last job mode is _streaming_, which you can select with `-S`.
+Streaming jobs also run on a single target, with the same default,
+and you must supply an output destination with `-f`:
+
+```sh
+sush# job start -S -T 16 -f messages.log "cat /var/adm/messages"
+```
+
+Completed jobs may be examined via `job status` and `job output`; note
+especially `job status --full`. A list of jobs run so far (from the last
+cold-boot of the rack) is available with `job history`.
+
+## Local Testing
 
 In the following, the local shell (`bash`) prompt is `$ `
 and the Support Shell prompt is `sush# `.
@@ -82,107 +270,3 @@ $ cargo run --bin=sush --features permslip
 ✅ ssh-auth-sock = /run/user/1000/ssh-agent.sock (environment)
 sush# 
 ```
-
-With no command, `sush` starts its interactive REPL (aka shell).
-Try `help` for a list of commands, or any `sush` sub-command,
-such as `session`, `job`, etc. The REPL offers some convenient
-features for running multiple jobs, such as transparent use of
-the previous job ID, Nexus tunnel reuse, command history, etc.
-Exit the REPL with `quit` or Ctrl-D.
-
-You can begin a session with `session start`. You may be prompted
-to touch your authentication token (e.g., YubiKey) and to authenticate
-to the signing service:
-
-```
-sush# session start
-👋 Please confirm user presence to sign with key `excite-cabbage-reject-wave-learn-police-that-glad`
-🔑 Open this URL in your browser to authenticate to the signing service:
-https://your-permslip-server.example/google/07c339c687e9ac919af7ab2ac5025881
-✅ Created session
-   Session ID:      slush-olympic-universe-ill-total-risk-host-suggest
-   Signer nonce:    private-else-nut-erosion-trend-tube-token-man
-   Sequence number: borrow-session-iron-author
-```
-
-Now you're ready to run a job. The server automatically sets some
-environment variables for job processes, so as a simple test try
-running the command `echo $SUSH_JOB_ID`:
-
-```
-sush# job start "echo $SUSH_JOB_ID"
-✅ Signed request for job `install-there-mutual-warfare-sound-live-order-man`
-✅ Started job `install-there-mutual-warfare-sound-live-order-man`
-   a part:0001 stopped, exit 0 (68ms 190us 114ns), 50 B out, 0 B err
- » a part:0001 stdout «
-install-there-mutual-warfare-sound-live-order-man
-```
-
-By default, `sush` waits for the job to stop before returning, showing a
-live status line per sled while it runs; the `--no-wait` (`-n`) flag
-starts the job and returns immediately. You can check the
-status of a (running) job with `job status`, watch it the same way with
-`job status --wait`, or see the complete job status with
-`job status --full`.
-
-To run an interactive job with a pseudoterminal, you can use `job start
---interactive` (`-i`):
-
-```
-sush# job start --interactive bash
-✅ Signed request for job `drop-fatigue-pink-spirit-eight-entry-praise-skill`
-✅ Attached to interactive job `drop-fatigue-pink-spirit-eight-entry-praise-skill`, detach with `^]`
-$ echo $SUSH_JOB_ID
-drop-fatigue-pink-spirit-eight-entry-praise-skill
-$ 
-```
-
-Job output may also be streamed using the `--streaming` flag, which
-skips recording the job's standard output so that large core files
-and other artifacts can leave the rack without exhausting output
-storage (which may be on a ramdisk). Streamed output is written to
-a local file (`--file` is required) and verified against the recorded
-length and hash.
-
-Jobs of any type take a `--target` option naming the sleds to run on.
-The default target is `*`, meaning every sled. Comma-separated lists
-of cubby numbers, serial numbers, and full baseboard IDs are also
-accepted. Interactive and streaming jobs must target exactly one sled,
-which defaults to the sled they are talking to.
-
-The `version` command shows which versions of `sush` are running on
-which sleds, as well as a visual indication of their health. Green means
-the `sush` server is running and connected to the internal gossip network;
-yellow means the server couldn't connect to the gossip network; and red
-means that no `sush` server is running there at all.
-
-## Configuration files and the options system
-
-The `sush` client reads a configuration file in TOML format from the
-standard XDG directories, e.g., `~/.config/sush/sush.toml`, or wherever
-you point `--config` to. In such files, the keys are long option names,
-and the values provide defaults for those options.
-
-Top-level options provide global defaults, while tables in the config file
-let you organize sets of options into named *profiles*, e.g., for different
-environments. You can choose a profile via a top-level `profile` key, or
-the `SUSH_PROFILE` environment variable, or the `--profile` global option:
-
-```toml
-permslip-url = "https://your-permslip-server.example"
-permslip-key = "Your Signing Key"
-profile = "local"
-
-[local]
-url = "http://localhost:44444"
-permslip-key = "Local Signing Key"
-
-[remote]
-url = "https://somewhere-else.example"
-```
-
-Configuration files provide defaults for options in such a way that
-environment variables override them, and explicit command line options
-override those. You can see which options support environment variables
-with `--help`; any of those may also be set in the config file, except
-for ones whose values are secrets, such as `SUSH_NEXUS_TOKEN`.
