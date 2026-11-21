@@ -577,7 +577,11 @@ impl JobManager {
             .history()
             .iter()
             .skip(offset as usize)
-            .take(limit as usize)
+            .take(if limit == 0 {
+                usize::MAX
+            } else {
+                limit as usize
+            })
             .map(|(request, status)| JobRecord {
                 request: request.cloned().map(Verified::into_signed),
                 status: status.to_owned(),

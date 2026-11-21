@@ -226,7 +226,7 @@ async fn v1_status_maps() {
         serde_json::from_str(&v1(&format!("/jobs/{job_id}/status")).await)
             .expect("v1 status should be a bare status map");
     assert_eq!(status.len(), 1);
-    let history: Vec<JsonJobStatusMap> = serde_json::from_str(&v1("/jobs?limit=10").await)
+    let history: Vec<JsonJobStatusMap> = serde_json::from_str(&v1("/jobs?limit=0").await)
         .expect("v1 history should be a list of bare status maps");
     assert_eq!(history.len(), 1);
     assert_eq!(
