@@ -559,8 +559,8 @@
     },
     "/server-nonce": {
       "get": {
-        "summary": "Get a fresh server nonce for the session ceremony.",
-        "description": "The client mixes its own nonce with this one to form the sush nonce it submits to the signer. Fetching replaces the previous server nonce, so only the latest ceremony can complete.",
+        "summary": "Get this server's nonce for the session ceremony.",
+        "description": "The client mixes its own nonce with this one to form the sush nonce it submits to the signer. Each identity gets its own nonce, which stays the same until the next session starts.",
         "operationId": "server_nonce",
         "parameters": [
           {

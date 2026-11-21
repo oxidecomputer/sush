@@ -20,6 +20,7 @@ pub use sled_hardware_types::BaseboardId;
 use sled_hardware_types::BaseboardIdParseError;
 use thiserror::Error;
 
+use crate::authn::Nonce;
 use crate::codephrases::Codephrase;
 use crate::hash::{Hash, Hasher, hash};
 use crate::interactive::InteractiveJobError;
@@ -159,6 +160,25 @@ codephrase_newtype! {
         Hash,
     )]
     pub struct SessionServerNonce = Truncated;
+}
+
+impl SessionServerNonce {
+    /// Derive a server nonce from the server's secret, the actor's
+    /// identity, and the latest session ID. This scheme ensures that
+    /// no identity can invalidate another's nonce, and also that a
+    /// session start invalidates every nonce issued before it.
+    pub fn compute(secret: &Nonce, key_id: &KeyId, latest_session: Option<SessionId>) -> Self {
+        let mut hasher = Hasher::new();
+        hasher.update_with_len(b"SUSH_SERVER_NONCE_V1");
+        hasher.update_with_len(&secret.to_be_bytes());
+        hasher.update_with_len(&key_id.to_be_bytes());
+        hasher.update_with_len(
+            &latest_session
+                .map(|id| id.to_be_bytes().to_vec())
+                .unwrap_or_default(),
+        );
+        Self::from_hash(hasher.finalize())
+    }
 }
 
 codephrase_newtype! {

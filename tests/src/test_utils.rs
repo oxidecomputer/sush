@@ -247,12 +247,10 @@ pub struct SessionCeremony {
     pub seq: SessionSeq,
 }
 
-/// Build a [`SessionCeremony`] against `mgr`. Fetches a fresh server
-/// nonce, as `GET /session-nonce` would, so earlier ceremonies
-/// against `mgr` go stale.
-pub fn session_ceremony(mgr: &JobManager, seq: u64) -> SessionCeremony {
+/// Build a [`SessionCeremony`] against `mgr` for `authn`.
+pub fn session_ceremony(mgr: &JobManager, authn: &KeyId, seq: u64) -> SessionCeremony {
     let client_nonce = SessionClientNonce::random();
-    let sush_nonce = SessionSushNonce::compute(client_nonce, mgr.fresh_server_nonce());
+    let sush_nonce = SessionSushNonce::compute(client_nonce, mgr.server_nonce(authn));
     let preimage = SessionPreimage {
         baseboard: mgr.own_baseboard().clone(),
         sush_nonce,

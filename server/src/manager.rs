@@ -7,7 +7,7 @@
 
 use std::collections::BTreeSet;
 use std::path::Path;
-use std::sync::{Arc, Mutex as SyncMutex};
+use std::sync::Arc;
 use std::time::Duration;
 
 use http_range_header::SyntacticallyCorrectRange as Range;
@@ -24,6 +24,7 @@ use x509_cert::Certificate;
 use x509_cert::der::DecodePem as _;
 
 use sush_api::{JobStartParams, JobStopParams, JobWait};
+use sush_common::authn::Nonce;
 use sush_common::jobs::{
     Access, JobId, JobOutputStream, JobRecord, JobStatusMap, Session, SessionClientNonce,
     SessionId, SessionPreimage, SessionSeq, SessionServerNonce, SessionSignerNonce,
@@ -49,7 +50,7 @@ const WAIT_TIMEOUT: Duration = Duration::from_secs(600);
 #[derive(Debug)]
 pub struct JobManager {
     log: Logger,
-    session_server_nonce: Arc<SyncMutex<SessionServerNonce>>,
+    secret: Nonce,
     output_dir: JobOutputDir,
     own_baseboard: BaseboardId,
     connected: ConnectedBaseboards,
@@ -106,7 +107,7 @@ impl JobManager {
         info!(log, "starting sush"; "version" => LONG_VERSION);
         let (tx_req, rx_req) = mpsc::channel(16);
         let requests = ReceiverStream::new(rx_req);
-        let session_server_nonce = Arc::new(SyncMutex::new(SessionServerNonce::random()));
+        let secret = Nonce::random();
         let boundary = Arc::new(BoundaryStore::new(&log, locker));
         boundary.load().await;
         let (rx_state, join_state) = StateManager::run(
@@ -123,7 +124,7 @@ impl JobManager {
         )?;
         Ok(Self {
             log: log.new(o!("component" => "job manager")),
-            session_server_nonce,
+            secret,
             own_baseboard,
             connected,
             output_dir,
@@ -285,13 +286,9 @@ impl JobManager {
         Ok(session.into_session_id())
     }
 
-    /// Replace the current server nonce with a fresh one and return
-    /// it. A fetch is the only rotation, so a client must finish its
-    /// ceremony before the next fetch.
-    pub fn fresh_server_nonce(&self) -> SessionServerNonce {
-        let nonce = SessionServerNonce::random();
-        *self.session_server_nonce.lock().unwrap() = nonce;
-        nonce
+    pub fn server_nonce(&self, authn: &KeyId) -> SessionServerNonce {
+        let latest = self.state.borrow().history().latest_session();
+        SessionServerNonce::compute(&self.secret, authn, latest)
     }
 
     pub async fn session_start(
@@ -303,7 +300,7 @@ impl JobManager {
         seq: SessionSeq,
     ) -> Result<(), JobError> {
         // Verify the session ID provided by the client.
-        let server_nonce = *self.session_server_nonce.lock().unwrap();
+        let server_nonce = self.server_nonce(authn);
         let preimage = SessionPreimage {
             baseboard: self.own_baseboard().clone(),
             sush_nonce: SessionSushNonce::compute(client_nonce, server_nonce),

@@ -116,6 +116,10 @@ impl JobHistory {
         self.latest_session = Some(session_id);
     }
 
+    pub fn latest_session(&self) -> Option<SessionId> {
+        self.latest_session
+    }
+
     pub fn session_access(&self, session_id: &SessionId) -> Option<&SessionAccess> {
         self.session_access.get(session_id)
     }

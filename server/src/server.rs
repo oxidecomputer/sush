@@ -125,8 +125,8 @@ impl SushApi for ApiServer {
     ) -> Result<HttpResponseOk<SessionServerNonce>, HttpError> {
         let mgr = ctx.context();
         let Authorization { authorization } = headers.into_inner();
-        let _authn = requester(authorization)?;
-        Ok(HttpResponseOk(mgr.fresh_server_nonce()))
+        let authn = requester(authorization)?;
+        Ok(HttpResponseOk(mgr.server_nonce(&authn)))
     }
 
     async fn session_start(

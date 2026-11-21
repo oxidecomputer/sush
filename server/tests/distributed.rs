@@ -169,7 +169,7 @@ async fn jobs_gossip_between_sleds() {
         client_nonce,
         signer_nonce,
         seq,
-    } = ceremony(&a.mgr, 1);
+    } = ceremony(&a.mgr, &authn_a, 1);
     let session = Session::new(session_id);
     a.mgr
         .session_start(&authn_a, session_id, client_nonce, signer_nonce, seq)
@@ -220,7 +220,7 @@ async fn jobs_gossip_between_sleds() {
         client_nonce,
         signer_nonce,
         seq,
-    } = ceremony(&b.mgr, 2);
+    } = ceremony(&b.mgr, &authn_b, 2);
     b.mgr
         .session_start(&authn_b, successor, client_nonce, signer_nonce, seq)
         .await
@@ -269,7 +269,7 @@ async fn first_job_confirms_start_on_another_sled() {
         client_nonce,
         signer_nonce,
         seq,
-    } = ceremony(&a.mgr, 1);
+    } = ceremony(&a.mgr, &authn_a, 1);
     a.mgr
         .session_start(&authn_a, session_id, client_nonce, signer_nonce, seq)
         .await
@@ -331,7 +331,7 @@ async fn listed_sled_checks_own_cubby() {
         client_nonce,
         signer_nonce,
         seq,
-    } = ceremony(&a.mgr, 1);
+    } = ceremony(&a.mgr, &authn, 1);
     a.mgr
         .session_start(&authn, session_id, client_nonce, signer_nonce, seq)
         .await
@@ -435,7 +435,7 @@ async fn stop_waits_for_remote_sleds() {
         client_nonce,
         signer_nonce,
         seq,
-    } = ceremony(&a.mgr, 1);
+    } = ceremony(&a.mgr, &authn, 1);
     a.mgr
         .session_start(&authn, session_id, client_nonce, signer_nonce, seq)
         .await
@@ -498,7 +498,7 @@ async fn unverified_job_is_refused() {
         client_nonce,
         signer_nonce,
         seq,
-    } = ceremony(&a.mgr, 1);
+    } = ceremony(&a.mgr, &authn, 1);
     a.mgr
         .session_start(&authn, session_id, client_nonce, signer_nonce, seq)
         .await
@@ -567,7 +567,7 @@ async fn session_check_passes_with_pending_start() {
         client_nonce,
         signer_nonce,
         seq,
-    } = ceremony(&a.mgr, 1);
+    } = ceremony(&a.mgr, &authn, 1);
     assert!(matches!(
         a.mgr.session_check(session_id),
         Err(JobError::NoSession)
@@ -589,7 +589,7 @@ async fn session_check_passes_with_pending_start() {
         client_nonce,
         signer_nonce,
         seq,
-    } = ceremony(&a.mgr, 2);
+    } = ceremony(&a.mgr, &authn, 2);
     a.mgr
         .session_start(&authn, successor, client_nonce, signer_nonce, seq)
         .await
@@ -632,7 +632,7 @@ async fn forged_start_never_takes_effect() {
         client_nonce,
         signer_nonce,
         seq,
-    } = ceremony(&a.mgr, 2);
+    } = ceremony(&a.mgr, &authn, 2);
     let mut session = Session::new(session_id);
     a.mgr
         .session_start(&authn, session_id, client_nonce, signer_nonce, seq)
@@ -646,7 +646,7 @@ async fn forged_start_never_takes_effect() {
     );
 
     // A forged start changes nothing.
-    let forged = ceremony(&a.mgr, SessionSeq::MAX_MILLIS);
+    let forged = ceremony(&a.mgr, &authn_forger, SessionSeq::MAX_MILLIS);
     a.mgr
         .session_start(
             &authn_forger,
@@ -669,7 +669,7 @@ async fn forged_start_never_takes_effect() {
         client_nonce,
         signer_nonce,
         seq,
-    } = ceremony(&a.mgr, 3);
+    } = ceremony(&a.mgr, &authn, 3);
     let mut next = Session::new(next_id);
     a.mgr
         .session_start(&authn, next_id, client_nonce, signer_nonce, seq)
@@ -689,7 +689,7 @@ async fn forged_start_never_takes_effect() {
         client_nonce,
         signer_nonce,
         seq,
-    } = ceremony(&a.mgr, 1);
+    } = ceremony(&a.mgr, &authn, 1);
     a.mgr
         .session_start(&authn, stale_id, client_nonce, signer_nonce, seq)
         .await
@@ -708,7 +708,7 @@ async fn forged_start_never_takes_effect() {
         client_nonce,
         signer_nonce,
         seq,
-    } = ceremony(&a.mgr, 4);
+    } = ceremony(&a.mgr, &authn, 4);
     a.mgr
         .session_start(&authn, last_id, client_nonce, signer_nonce, seq)
         .await
@@ -772,7 +772,7 @@ async fn rejoining_replays_without_reexecuting() {
         client_nonce,
         signer_nonce,
         seq,
-    } = ceremony(&a.mgr, 1);
+    } = ceremony(&a.mgr, &authn_a, 1);
     let session = Session::new(session_id);
     a.mgr
         .session_start(&authn_a, session_id, client_nonce, signer_nonce, seq)
@@ -822,7 +822,7 @@ async fn rejoining_replays_without_reexecuting() {
         client_nonce,
         signer_nonce: successor_nonce,
         seq,
-    } = ceremony(&a.mgr, 2);
+    } = ceremony(&a.mgr, &authn_a, 2);
     let fresh = Session::new(successor);
     a.mgr
         .session_start(&authn_a, successor, client_nonce, successor_nonce, seq)
@@ -891,7 +891,7 @@ async fn interrupted_jobs_get_stopped() {
         client_nonce,
         signer_nonce,
         seq,
-    } = ceremony(&a.mgr, 1);
+    } = ceremony(&a.mgr, &authn_a, 1);
     a.mgr
         .session_start(&authn_a, session_id, client_nonce, signer_nonce, seq)
         .await
@@ -989,13 +989,12 @@ struct Ceremony {
     seq: SessionSeq,
 }
 
-/// Build a [`Ceremony`] against one sled. Fetches a fresh server
-/// nonce, so earlier ceremonies against that sled go stale.
-fn ceremony(mgr: &JobManager, seq: u64) -> Ceremony {
+/// Build a [`Ceremony`] against one sled for `authn`.
+fn ceremony(mgr: &JobManager, authn: &KeyId, seq: u64) -> Ceremony {
     let client_nonce = SessionClientNonce::random();
     let preimage = SessionPreimage {
         baseboard: mgr.own_baseboard().clone(),
-        sush_nonce: SessionSushNonce::compute(client_nonce, mgr.fresh_server_nonce()),
+        sush_nonce: SessionSushNonce::compute(client_nonce, mgr.server_nonce(authn)),
         signer_nonce: SessionSignerNonce::random(),
         seq: SessionSeq::from_unix_millis(seq).unwrap(),
     };
@@ -1099,7 +1098,7 @@ async fn session_resumes_at_stored_successor() {
         client_nonce,
         signer_nonce,
         seq,
-    } = ceremony(&a.mgr, 1);
+    } = ceremony(&a.mgr, &authn_a, 1);
     let mut session = Session::new(session_id);
     a.mgr
         .session_start(&authn_a, session_id, client_nonce, signer_nonce, seq)
@@ -1239,7 +1238,7 @@ async fn supersession_crosses_networks() {
         client_nonce,
         signer_nonce,
         seq,
-    } = ceremony(&d.mgr, 2);
+    } = ceremony(&d.mgr, &authn_d, 2);
     let mut session2 = Session::new(session2_id);
     d.mgr
         .session_start(&authn_d, session2_id, client_nonce, signer_nonce, seq)
@@ -1266,7 +1265,7 @@ async fn supersession_crosses_networks() {
         client_nonce,
         signer_nonce,
         seq,
-    } = ceremony(&a.mgr, 1);
+    } = ceremony(&a.mgr, &authn_a, 1);
     let mut session1 = Session::new(session1_id);
     a.mgr
         .session_start(&authn_a, session1_id, client_nonce, signer_nonce, seq)
@@ -1393,7 +1392,7 @@ async fn supersession_crosses_networks() {
         client_nonce,
         signer_nonce,
         seq,
-    } = ceremony(&a.mgr, 3);
+    } = ceremony(&a.mgr, &authn_a, 3);
     let mut session3 = Session::new(session3_id);
     a.mgr
         .session_start(&authn_a, session3_id, client_nonce, signer_nonce, seq)
@@ -1504,7 +1503,7 @@ async fn witnessed_session_survives_restart() {
         client_nonce,
         signer_nonce,
         seq,
-    } = ceremony(&a.mgr, 1);
+    } = ceremony(&a.mgr, &authn_a, 1);
     let mut session = Session::new(session_id);
     a.mgr
         .session_start(&authn_a, session_id, client_nonce, signer_nonce, seq)
@@ -1584,7 +1583,7 @@ async fn bookmarks_survive_restart() {
         client_nonce,
         signer_nonce,
         seq,
-    } = ceremony(&a.mgr, 1);
+    } = ceremony(&a.mgr, &authn_a, 1);
     a.mgr
         .session_start(&authn_a, session_id, client_nonce, signer_nonce, seq)
         .await
@@ -1693,7 +1692,7 @@ async fn gossip_survives_bookmark_failure() {
         client_nonce,
         signer_nonce,
         seq,
-    } = ceremony(&a.mgr, 1);
+    } = ceremony(&a.mgr, &authn_a, 1);
     let session = Session::new(session_id);
     a.mgr
         .session_start(&authn_a, session_id, client_nonce, signer_nonce, seq)

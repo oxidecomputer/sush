@@ -129,11 +129,11 @@ pub trait SushApi {
         params: PathParams<SessionTargetParams>,
     ) -> Result<HttpResponseUpdatedNoContent, HttpError>;
 
-    /// Get a fresh server nonce for the session ceremony.
+    /// Get this server's nonce for the session ceremony.
     ///
     /// The client mixes its own nonce with this one to form the sush
-    /// nonce it submits to the signer. Fetching replaces the previous
-    /// server nonce, so only the latest ceremony can complete.
+    /// nonce it submits to the signer. Each identity gets its own
+    /// nonce, which stays the same until the next session starts.
     #[endpoint { method = GET, path = "/server-nonce" }]
     async fn server_nonce(
         ctx: RequestContext<Self::Context>,
