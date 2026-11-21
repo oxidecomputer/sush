@@ -314,6 +314,53 @@ async fn job_records_keep_requests() {
     );
 }
 
+#[named]
+#[tokio::test]
+async fn grants_outlive_sessions() {
+    let log = test_logger(function_name!());
+    let (mgr, mut root, _dir, _shutdown) = manager_and_test_root(log).await;
+    let owner = requester(&root);
+    let guest = requester(&ephemeral_test_root());
+    let SessionCeremony {
+        session_id,
+        client_nonce,
+        signer_nonce,
+        seq,
+        ..
+    } = session_ceremony(&mgr, 1);
+    let session = Session::new(session_id);
+    mgr.session_start(&owner, session_id, client_nonce, signer_nonce, seq)
+        .await
+        .unwrap();
+    let job_id = session.next_job_id();
+    let job = root
+        .sign_job_request(job_id, session_id, "true", false)
+        .await;
+    mgr.job_start(
+        &owner,
+        job.into_signed(),
+        JobStartParams {
+            wait: JobWait::Stop,
+            ..Default::default()
+        },
+    )
+    .await
+    .unwrap();
+    mgr.session_stop(&owner, session_id).await.unwrap();
+
+    assert!(matches!(
+        mgr.session_allow(&guest, session_id, guest.clone(), Access::ReadOnly)
+            .await,
+        Err(JobError::NotSessionStarter)
+    ));
+    mgr.session_allow(&owner, session_id, guest.clone(), Access::ReadOnly)
+        .await
+        .unwrap();
+    mgr.session_deny(&owner, session_id, guest.clone())
+        .await
+        .unwrap();
+}
+
 /// A job runs in a contract of its own, labeled with its job ID.
 #[cfg(target_os = "illumos")]
 #[named]
@@ -1764,7 +1811,7 @@ async fn attach_grants() {
         Err(JobError::AttachDenied)
     ));
     assert!(matches!(
-        mgr.session_allow_attach(&guest, session_id, owner.clone(), Access::ReadOnly)
+        mgr.session_allow(&guest, session_id, owner.clone(), Access::ReadOnly)
             .await,
         Err(JobError::NotSessionStarter)
     ));
@@ -1788,15 +1835,15 @@ async fn attach_grants() {
         .await
         .expect("grant never took effect")
     };
-    mgr.session_allow_attach(&owner, session_id, guest.clone(), Access::ReadOnly)
+    mgr.session_allow(&owner, session_id, guest.clone(), Access::ReadOnly)
         .await
         .unwrap();
     granted(guest.clone(), Some(Access::ReadOnly)).await;
-    mgr.session_allow_attach(&owner, session_id, guest.clone(), Access::ReadWrite)
+    mgr.session_allow(&owner, session_id, guest.clone(), Access::ReadWrite)
         .await
         .unwrap();
     granted(guest.clone(), Some(Access::ReadWrite)).await;
-    mgr.session_deny_attach(&owner, session_id, guest.clone())
+    mgr.session_deny(&owner, session_id, guest.clone())
         .await
         .unwrap();
     granted(guest.clone(), None).await;
@@ -1810,7 +1857,7 @@ async fn attach_grants() {
     peer.send(
         Message::Request(Request::session(
             guest.clone(),
-            SessionRequest::AllowAttach(session_id, guest.clone(), Access::ReadWrite),
+            SessionRequest::Allow(session_id, guest.clone(), Access::ReadWrite),
         ))
         .into(),
     )
@@ -1818,7 +1865,7 @@ async fn attach_grants() {
     peer.send(
         Message::Request(Request::session(
             owner.clone(),
-            SessionRequest::AllowAttach(session_id, third.clone(), Access::ReadOnly),
+            SessionRequest::Allow(session_id, third.clone(), Access::ReadOnly),
         ))
         .into(),
     )
@@ -1866,6 +1913,7 @@ async fn skip_and_stop_are_starter_only() {
     mgr.session_start(&owner, session_id, client_nonce, signer_nonce, seq)
         .await
         .unwrap();
+    let confirmed = session.next_job_id();
     confirm_start(&mgr, &owner, &mut root, &mut session).await;
     let job_id = session.next_job_id();
 
@@ -1878,7 +1926,7 @@ async fn skip_and_stop_are_starter_only() {
         Err(JobError::NotSessionStarter)
     ));
     assert!(matches!(
-        mgr.job_stop(&guest, &job_id, JobStopParams::default())
+        mgr.job_stop(&guest, &confirmed, JobStopParams::default())
             .await,
         Err(JobError::NotSessionStarter)
     ));
@@ -1899,13 +1947,13 @@ async fn skip_and_stop_are_starter_only() {
         Err(JobError::SessionNotCurrent(_))
     ));
     assert!(matches!(
-        mgr.session_allow_attach(&owner, stale, guest.clone(), Access::ReadOnly)
+        mgr.session_allow(&owner, stale, guest.clone(), Access::ReadOnly)
             .await,
-        Err(JobError::SessionNotCurrent(_))
+        Err(JobError::SessionNotFound(_))
     ));
     assert!(matches!(
-        mgr.session_deny_attach(&owner, stale, guest.clone()).await,
-        Err(JobError::SessionNotCurrent(_))
+        mgr.session_deny(&owner, stale, guest.clone()).await,
+        Err(JobError::SessionNotFound(_))
     ));
 
     // A stop and a skip from a non-starter over gossip are ignored.

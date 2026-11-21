@@ -99,9 +99,6 @@ pub enum SessionState {
 
         /// Jobs waiting to run in this session.
         queued_jobs: QueuedJobs,
-
-        /// Keys the starter has granted attach access, and how much.
-        attach_grants: BTreeMap<KeyId, Access>,
     },
 }
 
@@ -112,24 +109,6 @@ impl SessionState {
             Inactive => None,
             Active { session, .. } => Some(session),
         }
-    }
-
-    /// The attach access `key_id` has to this session's interactive
-    /// jobs, if any.
-    pub fn attach_access(&self, key_id: &KeyId) -> Option<Access> {
-        use SessionState::*;
-        let Active {
-            session,
-            attach_grants,
-            ..
-        } = self
-        else {
-            return None;
-        };
-        if session.started_by() == Some(key_id) {
-            return Some(Access::ReadWrite);
-        }
-        attach_grants.get(key_id).copied()
     }
 
     /// Where an active session stands in the total order of sessions
@@ -336,8 +315,13 @@ impl State {
             .map(|start| (start.preimage.seq, session_id))
     }
 
+    /// The attach access `key_id` has to this session's interactive
+    /// jobs, if any.
     pub fn attach_access(&self, key_id: &KeyId) -> Option<Access> {
-        self.session.attach_access(key_id)
+        self.session
+            .session()
+            .and_then(|session| self.history.session_access(&session.session_id()))
+            .and_then(|access| access.access(key_id))
     }
 
     pub fn rack(&self) -> &Rack {
@@ -639,7 +623,7 @@ impl State {
                 if let Active { session, .. } = &self.session
                     && session.session_id() == *session_id
                 {
-                    if session.started_by() != Some(actor) {
+                    if !self.history.is_starter(session_id, actor) {
                         warn!(
                             log, "ignoring session stop from non-starter";
                             "session_id" => %session_id, "actor" => %actor,
@@ -654,48 +638,43 @@ impl State {
                     }
                 }
             }
-            SessionRequest::AllowAttach(session_id, key_id, access) => {
-                if let Active {
-                    session,
-                    attach_grants,
-                    ..
-                } = &mut self.session
-                    && session.session_id() == *session_id
-                {
-                    if session.started_by() == Some(actor) {
-                        attach_grants.insert(key_id.clone(), *access);
+            SessionRequest::Allow(session_id, key_id, access) => {
+                match self.history.session_access_mut(session_id) {
+                    Some(session_access) if session_access.started_by() == actor => {
+                        session_access.allow(key_id, *access);
                         info!(
-                            log, "attach allowed";
-                            "key_id" => %key_id, "access" => ?access, "actor" => %actor,
-                        );
-                    } else {
-                        warn!(
-                            log, "ignoring attach grant from non-starter";
-                            "key_id" => %key_id, "actor" => %actor,
+                            log, "access allowed";
+                            "session_id" => %session_id, "key_id" => %key_id,
+                            "access" => ?access, "actor" => %actor,
                         );
                     }
+                    Some(_) => warn!(
+                        log, "ignoring grant from non-starter";
+                        "session_id" => %session_id, "key_id" => %key_id, "actor" => %actor,
+                    ),
+                    None => info!(
+                        log, "ignoring grant for unknown session";
+                        "session_id" => %session_id, "key_id" => %key_id, "actor" => %actor,
+                    ),
                 }
             }
-            SessionRequest::DenyAttach(session_id, key_id) => {
-                if let Active {
-                    session,
-                    attach_grants,
-                    ..
-                } = &mut self.session
-                    && session.session_id() == *session_id
-                {
-                    if session.started_by() == Some(actor) {
-                        attach_grants.remove(key_id);
+            SessionRequest::Deny(session_id, key_id) => {
+                match self.history.session_access_mut(session_id) {
+                    Some(session_access) if session_access.started_by() == actor => {
+                        session_access.deny(key_id);
                         info!(
-                            log, "attach denied";
-                            "key_id" => %key_id, "actor" => %actor,
-                        );
-                    } else {
-                        warn!(
-                            log, "ignoring attach denial from non-starter";
-                            "key_id" => %key_id, "actor" => %actor,
+                            log, "access denied";
+                            "session_id" => %session_id, "key_id" => %key_id, "actor" => %actor,
                         );
                     }
+                    Some(_) => warn!(
+                        log, "ignoring denial from non-starter";
+                        "session_id" => %session_id, "key_id" => %key_id, "actor" => %actor,
+                    ),
+                    None => info!(
+                        log, "ignoring denial for unknown session";
+                        "session_id" => %session_id, "key_id" => %key_id, "actor" => %actor,
+                    ),
                 }
             }
             SessionRequest::Skip(session_id, job_id) => {
@@ -705,7 +684,7 @@ impl State {
                     _ => None,
                 } && session.session_id() == *session_id
                 {
-                    if session.started_by() != Some(actor) {
+                    if !self.history.is_starter(session_id, actor) {
                         warn!(
                             log, "ignoring job skip from non-starter";
                             "job_id" => %job_id, "actor" => %actor,
@@ -715,6 +694,7 @@ impl State {
                             log, "job skipped";
                             "job_id" => %job_id, "actor" => %actor,
                         );
+                        self.history.set_skipped(job_id, *session_id);
                         self.cancel_job(now, job_id, actor, replayed);
                         outputs.extend(self.release_ready_jobs(log, now, network));
                     } else {
@@ -761,6 +741,7 @@ impl State {
             log, "session started";
             "session_id" => %session_id, "actor" => %start.actor,
         );
+        self.history.start_session(session_id, &start.actor);
         let mut session = Session::started(session_id, start.actor);
         if let Some(boundary) = self
             .past
@@ -780,7 +761,6 @@ impl State {
             live: start.live,
             session: Box::new(session),
             queued_jobs: QueuedJobs::new(),
-            attach_grants: BTreeMap::new(),
         };
         outputs
     }
@@ -855,7 +835,11 @@ impl State {
                 }
             }
             JobRequest::Stop(job_id) => {
-                if self.session.session().and_then(Session::started_by) != Some(actor) {
+                if !self
+                    .history
+                    .job_session(job_id)
+                    .is_some_and(|session_id| self.history.is_starter(&session_id, actor))
+                {
                     warn!(
                         log, "ignoring job stop from non-starter";
                         "job_id" => %job_id, "actor" => %actor,

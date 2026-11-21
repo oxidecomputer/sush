@@ -324,8 +324,8 @@ impl JobManager {
     }
 
     pub async fn session_stop(&self, authn: &KeyId, session_id: SessionId) -> Result<(), JobError> {
-        self.starter_check(authn)?;
         self.currency_check(session_id)?;
+        self.starter_check(authn, session_id)?;
         self.session_request(authn, SessionRequest::Stop(session_id))
             .await
     }
@@ -338,8 +338,8 @@ impl JobManager {
         session_id: SessionId,
         job_id: JobId,
     ) -> Result<(), JobError> {
-        self.starter_check(authn)?;
         self.currency_check(session_id)?;
+        self.starter_check(authn, session_id)?;
         if let Some(session) = self.session(authn)
             && session.next_job_id() != job_id
         {
@@ -361,13 +361,13 @@ impl JobManager {
         }
     }
 
-    /// Only the session starter may stop the session, skip its jobs,
-    /// or grant and deny attach access. The authoritative check is in
-    /// the state machine. This one fails fast.
-    fn starter_check(&self, authn: &KeyId) -> Result<(), JobError> {
-        match self.state.borrow().session() {
-            None => Err(JobError::NoSession),
-            Some(session) if session.started_by() == Some(authn) => Ok(()),
+    /// Only the identity that started a session may stop it, skip or stop
+    /// its jobs, or grant and deny access to it. The authoritative check
+    /// is in the state machine; this one fails fast.
+    fn starter_check(&self, authn: &KeyId, session_id: SessionId) -> Result<(), JobError> {
+        match self.state.borrow().history().session_access(&session_id) {
+            None => Err(JobError::SessionNotFound(session_id)),
+            Some(access) if access.started_by() == authn => Ok(()),
             Some(_) => Err(JobError::NotSessionStarter),
         }
     }
@@ -381,31 +381,26 @@ impl JobManager {
         }
     }
 
-    pub async fn session_allow_attach(
+    pub async fn session_allow(
         &self,
         authn: &KeyId,
         session_id: SessionId,
         key_id: KeyId,
         access: Access,
     ) -> Result<(), JobError> {
-        self.starter_check(authn)?;
-        self.currency_check(session_id)?;
-        self.session_request(
-            authn,
-            SessionRequest::AllowAttach(session_id, key_id, access),
-        )
-        .await
+        self.starter_check(authn, session_id)?;
+        self.session_request(authn, SessionRequest::Allow(session_id, key_id, access))
+            .await
     }
 
-    pub async fn session_deny_attach(
+    pub async fn session_deny(
         &self,
         authn: &KeyId,
         session_id: SessionId,
         key_id: KeyId,
     ) -> Result<(), JobError> {
-        self.starter_check(authn)?;
-        self.currency_check(session_id)?;
-        self.session_request(authn, SessionRequest::DenyAttach(session_id, key_id))
+        self.starter_check(authn, session_id)?;
+        self.session_request(authn, SessionRequest::Deny(session_id, key_id))
             .await
     }
 
@@ -478,8 +473,14 @@ impl JobManager {
         job_id: &JobId,
         JobStopParams { wait, .. }: JobStopParams,
     ) -> Result<(), JobError> {
-        self.starter_check(authn)?;
         self.known_job_check(job_id)?;
+        let session_id = self
+            .state
+            .borrow()
+            .history()
+            .job_session(job_id)
+            .ok_or_else(|| JobError::JobNotFound(job_id.to_owned()))?;
+        self.starter_check(authn, session_id)?;
         self.job_request(authn, JobRequest::Stop(job_id.to_owned()))
             .await?;
         let sleds = self

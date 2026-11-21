@@ -11,7 +11,8 @@ use chrono::{DateTime, Utc};
 use rumors::before::Rank;
 use sled_hardware_types::BaseboardId;
 
-use sush_common::jobs::{JobId, JobStatus, JobStatusMap, VerifiedJob};
+use sush_common::jobs::{Access, JobId, JobStatus, JobStatusMap, SessionId, VerifiedJob};
+use sush_common::keys::KeyId;
 
 use crate::state::QueuedJobs;
 
@@ -40,6 +41,43 @@ pub struct JobHistory {
     /// may arrive before the request, after it, or instead of it (e.g.,
     /// for a skipped job).
     requests: BTreeMap<JobId, VerifiedJob>,
+
+    /// Map skipped jobs to their sessions (since they don't have a request).
+    skipped: BTreeMap<JobId, SessionId>,
+
+    /// Access control for known sessions.
+    session_access: BTreeMap<SessionId, SessionAccess>,
+
+    /// The most recently started session.
+    latest_session: Option<SessionId>,
+}
+
+#[derive(Clone, Debug)]
+pub struct SessionAccess {
+    started_by: KeyId,
+    grants: BTreeMap<KeyId, Access>,
+}
+
+impl SessionAccess {
+    pub fn started_by(&self) -> &KeyId {
+        &self.started_by
+    }
+
+    pub fn access(&self, key_id: &KeyId) -> Option<Access> {
+        if *key_id == self.started_by {
+            Some(Access::ReadWrite)
+        } else {
+            self.grants.get(key_id).copied()
+        }
+    }
+
+    pub fn allow(&mut self, key_id: &KeyId, access: Access) {
+        self.grants.insert(key_id.clone(), access);
+    }
+
+    pub fn deny(&mut self, key_id: &KeyId) {
+        self.grants.remove(key_id);
+    }
 }
 
 impl JobHistory {
@@ -62,6 +100,47 @@ impl JobHistory {
             .entry(*request.job_id())
             .or_insert_with(|| request.to_owned());
         self.gc(queued);
+    }
+
+    pub fn set_skipped(&mut self, job_id: &JobId, session_id: SessionId) {
+        self.skipped.entry(*job_id).or_insert(session_id);
+    }
+
+    pub fn start_session(&mut self, session_id: SessionId, started_by: &KeyId) {
+        self.session_access
+            .entry(session_id)
+            .or_insert_with(|| SessionAccess {
+                started_by: started_by.clone(),
+                grants: BTreeMap::new(),
+            });
+        self.latest_session = Some(session_id);
+    }
+
+    pub fn session_access(&self, session_id: &SessionId) -> Option<&SessionAccess> {
+        self.session_access.get(session_id)
+    }
+
+    pub fn session_access_mut(&mut self, session_id: &SessionId) -> Option<&mut SessionAccess> {
+        self.session_access.get_mut(session_id)
+    }
+
+    pub fn is_starter(&self, session_id: &SessionId, key_id: &KeyId) -> bool {
+        self.session_access
+            .get(session_id)
+            .is_some_and(|access| access.started_by() == key_id)
+    }
+
+    pub fn job_session(&self, job_id: &JobId) -> Option<SessionId> {
+        self.requests
+            .get(job_id)
+            .map(|request| request.payload().session_id())
+            .or_else(|| self.skipped.get(job_id).copied())
+    }
+
+    pub fn job_access(&self, job_id: &JobId, key_id: &KeyId) -> Option<Access> {
+        self.job_session(job_id)
+            .and_then(|session_id| self.session_access.get(&session_id))
+            .and_then(|access| access.access(key_id))
     }
 
     /// Set the (causal) status of a job.
@@ -166,13 +245,27 @@ impl JobHistory {
         {
             self.job_status.remove(&job_id);
             self.requests.remove(&job_id);
+            self.skipped.remove(&job_id);
             self.causal_jobs.retain(|(_, id, _)| id != &job_id);
         }
         if self.requests.len() > low_water_mark {
             let job_status = &self.job_status;
             self.requests
                 .retain(|id, _| job_status.contains_key(id) || ineligible.contains(id));
+            self.skipped
+                .retain(|id, _| job_status.contains_key(id) || ineligible.contains(id));
         }
+
+        // Drop access for now-empty sessions.
+        let referenced = self
+            .requests
+            .values()
+            .map(|request| request.payload().session_id())
+            .chain(self.skipped.values().copied())
+            .collect::<BTreeSet<_>>();
+        let latest = self.latest_session;
+        self.session_access
+            .retain(|id, _| referenced.contains(id) || Some(*id) == latest);
     }
 
     /// Iterate job status maps, one per job, acausal (locally generated)
@@ -213,7 +306,7 @@ mod tests {
 
     use super::*;
 
-    async fn request(job_id: JobId) -> VerifiedJob {
+    async fn request(job_id: JobId, session_id: SessionId) -> VerifiedJob {
         let mut root = EphemeralKey::new_root(
             KeyType::P256,
             "CN=Test Root,O=Oxide Computer Company,C=US"
@@ -225,7 +318,7 @@ mod tests {
         let cert = root.cert().clone();
         root.sign(JobStartRequest::new(
             job_id,
-            SessionId::random(),
+            session_id,
             "true",
             JobMode::Batch,
             Target::All,
@@ -311,7 +404,7 @@ mod tests {
         let job = JobId::random();
         history.set_job_status(&job, &baseboard(1), started(job), None, None);
         assert!(history.get_job_request(&job).is_none());
-        history.set_job_request(&request(job).await, None);
+        history.set_job_request(&request(job, SessionId::random()).await, None);
         assert!(history.get_job_request(&job).is_some());
     }
 
@@ -319,9 +412,75 @@ mod tests {
     async fn request_alone_is_not_history() {
         let mut history = JobHistory::default();
         let job = JobId::random();
-        history.set_job_request(&request(job).await, None);
+        history.set_job_request(&request(job, SessionId::random()).await, None);
         assert!(!history.contains(&job));
         assert_eq!(history.iter().count(), 0);
+    }
+
+    #[tokio::test]
+    async fn job_access_follows_session() {
+        let mut history = JobHistory::default();
+        let session = SessionId::random();
+        let starter = KeyId::random();
+        let grantee = KeyId::random();
+        let stranger = KeyId::random();
+        let job = JobId::random();
+        history.set_job_request(&request(job, session).await, None);
+        assert_eq!(history.job_access(&job, &starter), None);
+        history.start_session(session, &starter);
+        history
+            .session_access_mut(&session)
+            .unwrap()
+            .allow(&grantee, Access::ReadOnly);
+        assert_eq!(history.job_access(&job, &starter), Some(Access::ReadWrite));
+        assert_eq!(history.job_access(&job, &grantee), Some(Access::ReadOnly));
+        assert_eq!(history.job_access(&job, &stranger), None);
+        history.session_access_mut(&session).unwrap().deny(&grantee);
+        assert_eq!(history.job_access(&job, &grantee), None);
+    }
+
+    #[test]
+    fn skipped_job_follows_session() {
+        let mut history = JobHistory::default();
+        let session = SessionId::random();
+        let starter = KeyId::random();
+        let job = JobId::random();
+        history.start_session(session, &starter);
+        history.set_skipped(&job, session);
+        assert_eq!(history.job_access(&job, &starter), Some(Access::ReadWrite));
+    }
+
+    #[test]
+    fn restarted_session_keeps_starter() {
+        let mut history = JobHistory::default();
+        let session = SessionId::random();
+        let starter = KeyId::random();
+        history.start_session(session, &starter);
+        history.start_session(session, &KeyId::random());
+        assert_eq!(
+            history.session_access(&session).unwrap().access(&starter),
+            Some(Access::ReadWrite)
+        );
+    }
+
+    #[test]
+    fn eviction_drops_sessions_without_jobs() {
+        let mut history = JobHistory::default();
+        let sled = baseboard(1);
+        let old_session = SessionId::random();
+        let old_job = JobId::random();
+        history.start_session(old_session, &KeyId::random());
+        history.set_skipped(&old_job, old_session);
+        history.set_job_status(&old_job, &sled, error(old_job), None, None);
+        let latest_session = SessionId::random();
+        history.start_session(latest_session, &KeyId::random());
+        for _ in 0..=MAX_HISTORY {
+            let job = JobId::random();
+            history.set_job_status(&job, &sled, started(job), None, None);
+        }
+        assert!(!history.contains(&old_job));
+        assert!(history.session_access(&old_session).is_none());
+        assert!(history.session_access(&latest_session).is_some());
     }
 
     #[test]

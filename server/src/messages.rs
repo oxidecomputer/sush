@@ -192,8 +192,8 @@ pub mod v0 {
                     SessionRequest::Start(..) => "session start",
                     SessionRequest::Stop(_) => "session stop",
                     SessionRequest::Skip(..) => "session skip",
-                    SessionRequest::AllowAttach(..) => "session allow",
-                    SessionRequest::DenyAttach(..) => "session deny",
+                    SessionRequest::Allow(..) => "session allow",
+                    SessionRequest::Deny(..) => "session deny",
                 },
                 Self::Job(r) => match r.request {
                     JobRequest::Start(..) => "job start",
@@ -208,8 +208,8 @@ pub mod v0 {
         Start(SessionPreimage),
         Stop(SessionId),
         Skip(SessionId, JobId),
-        AllowAttach(SessionId, KeyId, Access),
-        DenyAttach(SessionId, KeyId),
+        Allow(SessionId, KeyId, Access),
+        Deny(SessionId, KeyId),
     }
 
     #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -310,8 +310,8 @@ mod wire_format {
                 SessionRequest::Start(..) => "session-start-request",
                 SessionRequest::Stop(_) => "session-stop-request",
                 SessionRequest::Skip(..) => "session-skip-request",
-                SessionRequest::AllowAttach(..) => "session-allow-attach-request",
-                SessionRequest::DenyAttach(..) => "session-deny-attach-request",
+                SessionRequest::Allow(..) => "session-allow-request",
+                SessionRequest::Deny(..) => "session-deny-request",
             },
             Message::Request(Request::Job(r)) => match &r.request {
                 JobRequest::Start(_, params, _) if params.term.is_some() => {
@@ -420,11 +420,11 @@ mod wire_format {
             )),
             Message::Request(Request::session(
                 actor(),
-                SessionRequest::AllowAttach(session, attach.clone(), Access::ReadWrite),
+                SessionRequest::Allow(session, attach.clone(), Access::ReadWrite),
             )),
             Message::Request(Request::session(
                 actor(),
-                SessionRequest::DenyAttach(session, attach),
+                SessionRequest::Deny(session, attach),
             )),
             Message::Request(Request::job(
                 actor(),

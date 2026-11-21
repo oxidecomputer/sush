@@ -186,7 +186,7 @@ impl SushApi for ApiServer {
         let authn = requester(authorization)?;
         let SessionAndKeyIds { session_id, key_id } = params.into_inner();
         let AccessParam { access } = query.into_inner();
-        mgr.session_allow_attach(&authn, session_id, key_id, access)
+        mgr.session_allow(&authn, session_id, key_id, access)
             .await?;
         Ok(HttpResponseUpdatedNoContent())
     }
@@ -200,7 +200,7 @@ impl SushApi for ApiServer {
         let Authorization { authorization } = headers.into_inner();
         let authn = requester(authorization)?;
         let SessionAndKeyIds { session_id, key_id } = params.into_inner();
-        mgr.session_deny_attach(&authn, session_id, key_id).await?;
+        mgr.session_deny(&authn, session_id, key_id).await?;
         Ok(HttpResponseUpdatedNoContent())
     }
 

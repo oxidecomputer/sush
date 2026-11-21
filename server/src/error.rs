@@ -80,6 +80,8 @@ pub enum JobError {
     NotSessionStarter,
     #[error("Session `{0}` is no longer current, try `session attach` or `session start`")]
     SessionNotCurrent(SessionId),
+    #[error("Session `{0}` not found")]
+    SessionNotFound(SessionId),
     #[error("Job output hash mismatch, file may be corrupt")]
     OutputHashMismatch(JobId, JobOutputHash),
     #[error("Job output file missing or unavailable")]
@@ -185,7 +187,7 @@ impl From<JobError> for HttpError {
             AttachDenied | NotSessionStarter => {
                 HttpError::for_client_error(None, ClientErrorStatusCode::FORBIDDEN, message)
             }
-            IdentityNotFound(_) | JobNotFound(_) | OutputFileMissing(_) => {
+            IdentityNotFound(_) | JobNotFound(_) | OutputFileMissing(_) | SessionNotFound(_) => {
                 HttpError::for_client_error(None, ClientErrorStatusCode::NOT_FOUND, message)
             }
             NoSession => HttpError::for_client_error(
