@@ -31,7 +31,7 @@ use x509_cert::Certificate;
 use x509_cert::der::DecodePem as _;
 
 use sush_api::sush_api_mod::api_description;
-use sush_api::{JobWait, version_policy};
+use sush_api::{JobWait, VERSION_HEADER, VERSION_INITIAL, version_policy};
 use sush_client::tls::client as tls_client;
 use sush_client::tunnel::{Tunnel, pipe};
 use sush_client::{AuthzSigner, Client, Error as ClientError};
@@ -39,8 +39,7 @@ use sush_common::authn::BoundCredentials;
 use sush_common::hash::hash;
 use sush_common::interactive::{InteractiveJobControl, InteractiveJobMessage};
 use sush_common::jobs::{
-    Access, JobLimits, JobOutputState, JobOutputStream, JobStatus, Session,
-    job_status_try_from_json_map,
+    Access, JobLimits, JobOutputState, JobOutputStream, JobStatus, JsonJobStatusMap, Session,
 };
 use sush_common::targets::Cubbies;
 use sush_proxy::{ProxyServer, Targets, platform_tls};
@@ -138,6 +137,101 @@ async fn client_server() {
             .expect("can't get next output item")
             .expect("can't get output bytes"),
         job_id.to_string().as_bytes()
+    );
+
+    let record = client
+        .job_status()
+        .job_id(job_id)
+        .send()
+        .await
+        .expect("can't get job record")
+        .into_inner();
+    assert_eq!(
+        record
+            .request
+            .expect("record should hold the request")
+            .payload()
+            .command(),
+        "echo -n $SUSH_JOB_ID"
+    );
+    assert_eq!(record.status.len(), 1);
+}
+
+#[named]
+#[test]
+async fn v1_status_maps() {
+    let log = test_logger(function_name!());
+    let (mgr, mut root, _dir, _shutdown) = manager_and_test_root(log.clone()).await;
+    let api = api_description::<ApiServer>().unwrap();
+    let server = ServerBuilder::new(api, Arc::new(mgr), log)
+        .config(ConfigDropshot {
+            bind_address: local_addr(),
+            ..Default::default()
+        })
+        .version_policy(version_policy())
+        .start()
+        .expect("failed to start server");
+    let addr = server.local_addr();
+    let signer = AuthzSigner::default();
+    signer.set_claim(requester(&root));
+    let client = Client::new(&format!("http://{addr}"), signer);
+
+    let (session_id, body) = http_session_ceremony(&client, 1).await;
+    let session = Session::new(session_id);
+    client
+        .session_start()
+        .session_id(session.session_id())
+        .body(body)
+        .send()
+        .await
+        .expect("can't start session");
+    let job_id = session.next_job_id();
+    let job = root
+        .sign_job_request(job_id, session_id, "true", false)
+        .await;
+    let JobLimits {
+        max_cpu,
+        max_mem,
+        max_fsize,
+    } = JobLimits::default();
+    client
+        .job_start()
+        .job_id(job_id)
+        .target("*")
+        .max_cpu(max_cpu)
+        .max_mem(max_mem)
+        .max_fsize(max_fsize)
+        .wait(JobWait::Stop)
+        .body(job.into_signed())
+        .send()
+        .await
+        .expect("can't start job");
+
+    let claim = BoundCredentials::claim(requester(&root)).to_string();
+    let v1 = async |path: &str| {
+        reqwest::Client::new()
+            .get(format!("http://{addr}{path}"))
+            .header(VERSION_HEADER, VERSION_INITIAL.to_string())
+            .header("authorization", &claim)
+            .send()
+            .await
+            .expect("can't send v1 request")
+            .error_for_status()
+            .expect("v1 request failed")
+            .text()
+            .await
+            .expect("can't read v1 response")
+    };
+    let status: JsonJobStatusMap =
+        serde_json::from_str(&v1(&format!("/jobs/{job_id}/status")).await)
+            .expect("v1 status should be a bare status map");
+    assert_eq!(status.len(), 1);
+    let history: Vec<JsonJobStatusMap> = serde_json::from_str(&v1("/jobs?limit=10").await)
+        .expect("v1 history should be a list of bare status maps");
+    assert_eq!(history.len(), 1);
+    assert_eq!(
+        history[0].keys().collect::<Vec<_>>(),
+        status.keys().collect::<Vec<_>>()
     );
 }
 
@@ -728,16 +822,14 @@ async fn streaming_job() {
     // The status records the length and hash of the unrecorded stream.
     let status = timeout(TIMEOUT, async {
         loop {
-            let status = job_status_try_from_json_map(
-                client
-                    .job_status()
-                    .job_id(job_id)
-                    .send()
-                    .await
-                    .expect("can't get job status")
-                    .into_inner(),
-            )
-            .expect("can't parse job status")[&test_baseboard_id()]
+            let status = client
+                .job_status()
+                .job_id(job_id)
+                .send()
+                .await
+                .expect("can't get job status")
+                .into_inner()
+                .status[&test_baseboard_id()]
                 .clone();
             if status.is_terminal() {
                 break status;
@@ -868,16 +960,14 @@ async fn streaming_job_linger() {
     // The status records the length and hash of the unrecorded stream.
     let status = timeout(TIMEOUT, async {
         loop {
-            let status = job_status_try_from_json_map(
-                client
-                    .job_status()
-                    .job_id(job_id)
-                    .send()
-                    .await
-                    .expect("can't get job status")
-                    .into_inner(),
-            )
-            .expect("can't parse job status")[&test_baseboard_id()]
+            let status = client
+                .job_status()
+                .job_id(job_id)
+                .send()
+                .await
+                .expect("can't get job status")
+                .into_inner()
+                .status[&test_baseboard_id()]
                 .clone();
             if status.is_terminal() {
                 break status;

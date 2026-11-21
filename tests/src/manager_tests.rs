@@ -269,6 +269,51 @@ async fn jobs() {
     );
 }
 
+#[named]
+#[tokio::test]
+async fn job_records_keep_requests() {
+    let log = test_logger(function_name!());
+    let (mgr, mut root, _dir, _shutdown) = manager_and_test_root(log).await;
+    let authn = requester(&root);
+    let SessionCeremony {
+        session_id,
+        client_nonce,
+        signer_nonce,
+        seq,
+        ..
+    } = session_ceremony(&mgr, 1);
+    let session = Session::new(session_id);
+    mgr.session_start(&authn, session_id, client_nonce, signer_nonce, seq)
+        .await
+        .unwrap();
+
+    let job_id = session.next_job_id();
+    let job = root
+        .sign_job_request(job_id, session_id, "echo recorded", false)
+        .await;
+    mgr.job_start(
+        &authn,
+        job.clone().into_signed(),
+        JobStartParams {
+            wait: JobWait::Stop,
+            ..Default::default()
+        },
+    )
+    .await
+    .unwrap();
+
+    let record = mgr.job_record(&authn, &job_id).await.unwrap();
+    assert_eq!(record.request.unwrap().payload().command(), "echo recorded");
+    let history = mgr.job_history(&authn, 10, 0).await.unwrap();
+    let [record] = history.as_slice() else {
+        panic!("expected one job in history, got {history:?}");
+    };
+    assert_eq!(
+        record.request.as_ref().unwrap().payload().command(),
+        "echo recorded"
+    );
+}
+
 /// A job runs in a contract of its own, labeled with its job ID.
 #[cfg(target_os = "illumos")]
 #[named]

@@ -25,11 +25,11 @@ use x509_cert::der::DecodePem as _;
 
 use sush_api::{JobStartParams, JobStopParams, JobWait};
 use sush_common::jobs::{
-    Access, JobId, JobOutputStream, JobStatusMap, Session, SessionClientNonce, SessionId,
-    SessionPreimage, SessionSeq, SessionServerNonce, SessionSignerNonce, SessionSushNonce,
-    SignedJob,
+    Access, JobId, JobOutputStream, JobRecord, JobStatusMap, Session, SessionClientNonce,
+    SessionId, SessionPreimage, SessionSeq, SessionServerNonce, SessionSignerNonce,
+    SessionSushNonce, SignedJob,
 };
-use sush_common::keys::{KeyError, KeyId};
+use sush_common::keys::{KeyError, KeyId, Verified};
 use sush_common::targets::{Cubbies, SledHealth, SledVersion, Target, UnknownCubby};
 use sush_common::version::LONG_VERSION;
 
@@ -503,6 +503,20 @@ impl JobManager {
         }
     }
 
+    pub async fn job_record(&self, _authn: &KeyId, job_id: &JobId) -> Result<JobRecord, JobError> {
+        let state = self.state.borrow();
+        let status = state
+            .get_job_status(job_id)
+            .ok_or_else(|| JobError::JobNotFound(job_id.to_owned()))?;
+        Ok(JobRecord {
+            request: state
+                .get_job_request(job_id)
+                .cloned()
+                .map(Verified::into_signed),
+            status: status.to_owned(),
+        })
+    }
+
     pub async fn job_output(
         &self,
         authn: &KeyId,
@@ -556,7 +570,7 @@ impl JobManager {
         _authn: &KeyId,
         limit: u32,
         offset: u32,
-    ) -> Result<Vec<JobStatusMap>, JobError> {
+    ) -> Result<Vec<JobRecord>, JobError> {
         Ok(self
             .state
             .borrow()
@@ -564,7 +578,10 @@ impl JobManager {
             .iter()
             .skip(offset as usize)
             .take(limit as usize)
-            .cloned()
+            .map(|(request, status)| JobRecord {
+                request: request.cloned().map(Verified::into_signed),
+                status: status.to_owned(),
+            })
             .collect())
     }
 }
