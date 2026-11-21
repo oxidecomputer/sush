@@ -315,13 +315,10 @@ impl State {
             .map(|start| (start.preimage.seq, session_id))
     }
 
-    /// The attach access `key_id` has to this session's interactive
-    /// jobs, if any.
-    pub fn attach_access(&self, key_id: &KeyId) -> Option<Access> {
-        self.session
-            .session()
-            .and_then(|session| self.history.session_access(&session.session_id()))
-            .and_then(|access| access.access(key_id))
+    pub fn pending_starter(&self, session_id: SessionId) -> Option<&KeyId> {
+        self.pending_starts
+            .peek(&session_id)
+            .map(|start| &start.actor)
     }
 
     pub fn rack(&self) -> &Rack {
@@ -684,9 +681,14 @@ impl State {
                     _ => None,
                 } && session.session_id() == *session_id
                 {
-                    if !self.history.is_starter(session_id, actor) {
+                    if self
+                        .history
+                        .session_access(session_id)
+                        .and_then(|access| access.access(actor))
+                        != Some(Access::ReadWrite)
+                    {
                         warn!(
-                            log, "ignoring job skip from non-starter";
+                            log, "ignoring job skip without write access";
                             "job_id" => %job_id, "actor" => %actor,
                         );
                     } else if session.skip_job(*job_id) {
@@ -803,6 +805,20 @@ impl State {
                 let live = self.is_live(incoming_version);
                 outputs.extend(self.confirm_start(log, now, session_id));
                 if self
+                    .history
+                    .session_access(&session_id)
+                    .and_then(|access| access.access(actor))
+                    != Some(Access::ReadWrite)
+                {
+                    warn!(
+                        log, "ignoring job start without write access";
+                        "job_id" => %signed.job_id(),
+                        "session_id" => %session_id,
+                        "actor" => %actor,
+                    );
+                    return outputs;
+                }
+                if self
                     .session
                     .session()
                     .is_some_and(|s| s.session_id() == session_id)
@@ -835,13 +851,9 @@ impl State {
                 }
             }
             JobRequest::Stop(job_id) => {
-                if !self
-                    .history
-                    .job_session(job_id)
-                    .is_some_and(|session_id| self.history.is_starter(&session_id, actor))
-                {
+                if self.history.job_access(job_id, actor) != Some(Access::ReadWrite) {
                     warn!(
-                        log, "ignoring job stop from non-starter";
+                        log, "ignoring job stop without write access";
                         "job_id" => %job_id, "actor" => %actor,
                     );
                     return outputs;

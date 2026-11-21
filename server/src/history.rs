@@ -268,9 +268,10 @@ impl JobHistory {
             .retain(|id, _| referenced.contains(id) || Some(*id) == latest);
     }
 
-    /// Iterate job status maps, one per job, acausal (locally generated)
-    /// first by "wall clock time", then causally newest to oldest.
-    pub fn iter(&self) -> impl Iterator<Item = (Option<&VerifiedJob>, &JobStatusMap)> {
+    /// Iterate over each job's ID, request, and status map, acausal
+    /// (locally generated) first by "wall clock time", then causally
+    /// newest to oldest.
+    pub fn iter(&self) -> impl Iterator<Item = (&JobId, Option<&VerifiedJob>, &JobStatusMap)> {
         let causal = BTreeSet::from_iter(self.causal_jobs.iter().map(|(_, id, _)| id));
         let mut acausal = self
             .job_status
@@ -290,7 +291,7 @@ impl JobHistory {
             .filter_map(|id| {
                 self.job_status
                     .get(id)
-                    .map(|status| (self.requests.get(id), status))
+                    .map(|status| (id, self.requests.get(id), status))
             })
     }
 }

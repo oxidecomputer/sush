@@ -319,16 +319,16 @@ impl CommandContext for Repl {
         self.cli.session_stopped(session_id)
     }
 
-    fn really_supersede(&mut self, session: &Session) -> Result<(), CommandError> {
-        self.cli.really_supersede(session)
+    fn really_supersede(&mut self, session_id: SessionId) -> Result<(), CommandError> {
+        self.cli.really_supersede(session_id)
     }
 
-    fn attach_allowed(&mut self, key_id: &KeyId, access: Access) {
-        self.cli.attach_allowed(key_id, access)
+    fn access_allowed(&mut self, key_id: &KeyId, access: Access) {
+        self.cli.access_allowed(key_id, access)
     }
 
-    fn attach_denied(&mut self, key_id: &KeyId) {
-        self.cli.attach_denied(key_id)
+    fn access_denied(&mut self, key_id: &KeyId) {
+        self.cli.access_denied(key_id)
     }
 
     // Job signing certificates

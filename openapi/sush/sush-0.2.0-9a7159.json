@@ -51,8 +51,7 @@
     },
     "/iam": {
       "get": {
-        "summary": "List cached identities.",
-        "description": "May include duplicate identities with different nonces.",
+        "summary": "Return the caller's identity.",
         "operationId": "identities",
         "parameters": [
           {
@@ -629,8 +628,8 @@
     },
     "/sessions/{session_id}/allow/{key_id}": {
       "post": {
-        "summary": "Grant a key attach access to this session's interactive jobs.",
-        "description": "Only the key that started the session may grant access.",
+        "summary": "Grant an identity access to a session.",
+        "description": "Only the identity that started the session may grant access.",
         "operationId": "session_allow_attach",
         "parameters": [
           {
@@ -681,8 +680,8 @@
     },
     "/sessions/{session_id}/deny/{key_id}": {
       "post": {
-        "summary": "Withdraw a key's attach access.",
-        "description": "Only the key that started the session may withdraw access. Already-attached connections keep the access they attached with.",
+        "summary": "Withdraw access to a session.",
+        "description": "Only the identity that started the session may withdraw access. Already attached connections are not affected.",
         "operationId": "session_deny_attach",
         "parameters": [
           {

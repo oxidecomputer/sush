@@ -367,7 +367,7 @@ async fn check_login(logins: &Logins, request: Request<Incoming>) -> Checked {
         }
         (&Method::GET, "/iam") => {
             Checked::Answer(match logins.authorize(authz, (method, target)).await {
-                Ok(_) => json_response(&logins.identities().await),
+                Ok(identity) => json_response(&[identity]),
                 Err(err) => login_refused(err),
             })
         }

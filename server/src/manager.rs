@@ -27,7 +27,7 @@ use sush_api::{JobStartParams, JobStopParams, JobWait};
 use sush_common::jobs::{
     Access, JobId, JobOutputStream, JobRecord, JobStatusMap, Session, SessionClientNonce,
     SessionId, SessionPreimage, SessionSeq, SessionServerNonce, SessionSignerNonce,
-    SessionSushNonce, SignedJob,
+    SessionSushNonce, SessionView, SignedJob,
 };
 use sush_common::keys::{KeyError, KeyId, Verified};
 use sush_common::targets::{Cubbies, SledHealth, SledVersion, Target, UnknownCubby};
@@ -260,6 +260,24 @@ impl JobManager {
         self.state.borrow().session().cloned()
     }
 
+    pub fn session_view(&self, authn: &KeyId) -> Option<SessionView> {
+        let state = self.state.borrow();
+        let session = state.session()?;
+        let session_id = session.session_id();
+        Some(
+            if state
+                .history()
+                .session_access(&session_id)
+                .and_then(|access| access.access(authn))
+                .is_some()
+            {
+                SessionView::Visible(Box::new(session.clone()))
+            } else {
+                SessionView::Hidden(session_id)
+            },
+        )
+    }
+
     pub async fn session_id(&self, authn: &KeyId) -> Result<SessionId, JobError> {
         let Some(session) = self.session(authn) else {
             return Err(JobError::NoSession);
@@ -339,7 +357,7 @@ impl JobManager {
         job_id: JobId,
     ) -> Result<(), JobError> {
         self.currency_check(session_id)?;
-        self.starter_check(authn, session_id)?;
+        self.write_check(authn, session_id)?;
         if let Some(session) = self.session(authn)
             && session.next_job_id() != job_id
         {
@@ -378,6 +396,28 @@ impl JobManager {
             Ok(())
         } else {
             Err(JobError::JobNotFound(job_id.to_owned()))
+        }
+    }
+
+    /// Check that an identity has at least read-only access to a job.
+    fn read_check(&self, authn: &KeyId, job_id: &JobId) -> Result<Access, JobError> {
+        self.state
+            .borrow()
+            .history()
+            .job_access(job_id, authn)
+            .ok_or_else(|| JobError::JobNotFound(job_id.to_owned()))
+    }
+
+    /// Check that an identity has full read-write access to a session.
+    fn write_check(&self, authn: &KeyId, session_id: SessionId) -> Result<(), JobError> {
+        let state = self.state.borrow();
+        let access = match state.history().session_access(&session_id) {
+            Some(access) => access.access(authn),
+            None => (state.pending_starter(session_id) == Some(authn)).then_some(Access::ReadWrite),
+        };
+        match access {
+            Some(Access::ReadWrite) => Ok(()),
+            _ => Err(JobError::NoWriteAccess),
         }
     }
 
@@ -433,7 +473,7 @@ impl JobManager {
         if !payload.target_matches_mode() {
             return Err(JobError::InteractiveTarget);
         }
-        let sleds = self.job_preflight(payload.session_id(), payload.target())?;
+        let sleds = self.job_preflight(authn, payload.session_id(), payload.target())?;
 
         // Submit the job for execution.
         let wait = params.wait.to_owned();
@@ -446,10 +486,12 @@ impl JobManager {
     /// Check that this sled would accept a job in `session_id` for `target`.
     pub fn job_preflight(
         &self,
+        authn: &KeyId,
         session_id: SessionId,
         target: &Target,
     ) -> Result<BTreeSet<BaseboardId>, JobError> {
         self.session_check(session_id)?;
+        self.write_check(authn, session_id)?;
         self.reachable_targets(target)
     }
 
@@ -480,7 +522,7 @@ impl JobManager {
             .history()
             .job_session(job_id)
             .ok_or_else(|| JobError::JobNotFound(job_id.to_owned()))?;
-        self.starter_check(authn, session_id)?;
+        self.write_check(authn, session_id)?;
         self.job_request(authn, JobRequest::Stop(job_id.to_owned()))
             .await?;
         let sleds = self
@@ -494,9 +536,10 @@ impl JobManager {
 
     pub async fn job_status(
         &self,
-        _authn: &KeyId,
+        authn: &KeyId,
         job_id: &JobId,
     ) -> Result<JobStatusMap, JobError> {
+        self.read_check(authn, job_id)?;
         if let Some(status) = self.state.borrow().get_job_status(job_id) {
             Ok(status.to_owned())
         } else {
@@ -504,7 +547,8 @@ impl JobManager {
         }
     }
 
-    pub async fn job_record(&self, _authn: &KeyId, job_id: &JobId) -> Result<JobRecord, JobError> {
+    pub async fn job_record(&self, authn: &KeyId, job_id: &JobId) -> Result<JobRecord, JobError> {
+        self.read_check(authn, job_id)?;
         let state = self.state.borrow();
         let status = state
             .get_job_status(job_id)
@@ -526,6 +570,7 @@ impl JobManager {
         stream: JobOutputStream,
         range: Option<Range>,
     ) -> Result<JobOutputFileStream, JobError> {
+        self.read_check(authn, job_id)?;
         if self.own_baseboard() == target
             && self
                 .state
@@ -550,9 +595,7 @@ impl JobManager {
         job_id: &JobId,
         target: &BaseboardId,
     ) -> Result<(SocketSender, Access), JobError> {
-        let Some(access) = self.state.borrow().attach_access(authn) else {
-            return Err(JobError::AttachDenied);
-        };
+        let access = self.read_check(authn, job_id)?;
         if self.own_baseboard() == target
             && let Some(attachment) = self.state.borrow().get_attachment(job_id)
         {
@@ -568,22 +611,22 @@ impl JobManager {
 
     pub async fn job_history(
         &self,
-        _authn: &KeyId,
+        authn: &KeyId,
         limit: u32,
         offset: u32,
     ) -> Result<Vec<JobRecord>, JobError> {
-        Ok(self
-            .state
-            .borrow()
-            .history()
+        let state = self.state.borrow();
+        let history = state.history();
+        Ok(history
             .iter()
+            .filter(|(job_id, ..)| history.job_access(job_id, authn).is_some())
             .skip(offset as usize)
             .take(if limit == 0 {
                 usize::MAX
             } else {
                 limit as usize
             })
-            .map(|(request, status)| JobRecord {
+            .map(|(_, request, status)| JobRecord {
                 request: request.cloned().map(Verified::into_signed),
                 status: status.to_owned(),
             })

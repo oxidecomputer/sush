@@ -494,11 +494,10 @@ impl CommandContext for Cli {
         }
     }
 
-    fn really_supersede(&mut self, session: &Session) -> Result<(), CommandError> {
+    fn really_supersede(&mut self, session_id: SessionId) -> Result<(), CommandError> {
         if read_bool(&format!(
-            "❓ Session `{}` is active.\n   \
+            "❓ Session `{session_id}` is active.\n   \
                 Stop it and start a new session (yes/no)? ",
-            session.session_id(),
         ))? {
             Ok(())
         } else {
@@ -506,13 +505,13 @@ impl CommandContext for Cli {
         }
     }
 
-    fn attach_allowed(&mut self, key_id: &KeyId, access: Access) {
+    fn access_allowed(&mut self, key_id: &KeyId, access: Access) {
         match self.get_output_format() {
             OutputFormat::Json => {
                 qprintln!(
                     "{}",
                     json!({
-                        "attach_allowed": {
+                        "access_allowed": {
                             "key_id": key_id,
                             "access": access,
                         }
@@ -520,16 +519,16 @@ impl CommandContext for Cli {
                 )
             }
             OutputFormat::Text => self.note(format!(
-                "✅ Allowed {} attach for `{key_id}`",
+                "✅ Allowed {} access for `{key_id}`",
                 access.as_str()
             )),
         }
     }
 
-    fn attach_denied(&mut self, key_id: &KeyId) {
+    fn access_denied(&mut self, key_id: &KeyId) {
         match self.get_output_format() {
-            OutputFormat::Json => qprintln!("{}", json!({"attach_denied": key_id})),
-            OutputFormat::Text => self.note(format!("✅ Denied attach for `{key_id}`")),
+            OutputFormat::Json => qprintln!("{}", json!({"access_denied": key_id})),
+            OutputFormat::Text => self.note(format!("✅ Denied access for `{key_id}`")),
         }
     }
 

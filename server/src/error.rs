@@ -35,8 +35,6 @@ pub fn check_errno(what: impl Display, errno: c_int) -> io::Result<()> {
 /// What went wrong processing a client job request.
 #[derive(Debug, Error)]
 pub enum JobError {
-    #[error("Attach access to this session's jobs has not been granted")]
-    AttachDenied,
     #[error("Internal communications channel was unexpectedly closed")]
     ChannelClosed,
     #[error("Duplicate job ID `{0}`")]
@@ -78,6 +76,8 @@ pub enum JobError {
     NotNextJob(JobId),
     #[error("Only the session starter may manage the session")]
     NotSessionStarter,
+    #[error("Requested operation requires read-write session access")]
+    NoWriteAccess,
     #[error("Session `{0}` is no longer current, try `session attach` or `session start`")]
     SessionNotCurrent(SessionId),
     #[error("Session `{0}` not found")]
@@ -184,7 +184,7 @@ impl From<JobError> for HttpError {
                 ClientErrorStatusCode::TOO_MANY_REQUESTS,
                 error.to_string(),
             ),
-            AttachDenied | NotSessionStarter => {
+            NoWriteAccess | NotSessionStarter => {
                 HttpError::for_client_error(None, ClientErrorStatusCode::FORBIDDEN, message)
             }
             IdentityNotFound(_) | JobNotFound(_) | OutputFileMissing(_) | SessionNotFound(_) => {
