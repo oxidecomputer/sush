@@ -10,7 +10,7 @@ test *FILTER:
     cargo nextest run --workspace {{FILTER}}
 
 openapi:
-    cargo xtask openapi
+    cargo xtask openapi generate
 
 ci:
     cargo fmt --check
@@ -19,7 +19,7 @@ ci:
     cargo build --locked
     cargo nextest run --run-ignored all
     cargo test --doc
-    cargo xtask openapi && git diff --exit-code sush.json
+    cargo xtask openapi check
 
 ci-client:
     cargo clippy --package sush-client --features permslip -- --no-deps --deny warnings

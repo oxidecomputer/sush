@@ -8,12 +8,14 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
 
 use dropshot::{
-    Body, ClientErrorStatusCode, Header, HttpError, HttpResponseOk, HttpResponseUpdatedNoContent,
-    Path as PathParams, Query as QueryParams, RequestContext, TypedBody, WebsocketEndpointResult,
-    WebsocketUpgrade, api_description,
+    Body, ClientErrorStatusCode, ClientSpecifiesVersionInHeader, Header, HttpError, HttpResponseOk,
+    HttpResponseUpdatedNoContent, Path as PathParams, Query as QueryParams, RequestContext,
+    TypedBody, VersionPolicy, WebsocketEndpointResult, WebsocketUpgrade, api_description,
 };
+use dropshot_api_manager_types::api_versions_picky;
 use http_range_header::{SyntacticallyCorrectRange as Range, parse_range_header};
 use hyper::Response;
+use hyper::header::HeaderName;
 use schemars::JsonSchema;
 use serde::de::{Deserializer, Error as DeserializeError, IntoDeserializer, MapAccess, Visitor};
 use serde::{Deserialize, Serialize};
@@ -28,6 +30,20 @@ use sush_common::jobs::{
 use sush_common::keys::{KeyId, SshPublicKey};
 use sush_common::targets::SledVersion;
 use sush_common::version::VersionInfo;
+
+#[rustfmt::skip]
+api_versions_picky!([
+    (0, 1, 0, INITIAL),
+]);
+
+pub const VERSION_HEADER: HeaderName = HeaderName::from_static("api-version");
+
+pub fn version_policy() -> VersionPolicy {
+    VersionPolicy::Dynamic(Box::new(
+        ClientSpecifiesVersionInHeader::new(VERSION_HEADER, latest_version())
+            .min_version(oldest_version()),
+    ))
+}
 
 /// Oxide Support Shell API
 #[api_description]

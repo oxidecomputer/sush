@@ -27,6 +27,7 @@ use x509_cert::Certificate;
 use x509_cert::der::DecodePem as _;
 
 use sush_api::sush_api_mod::api_description;
+use sush_api::version_policy;
 use sush_client::tls::client as tls_client;
 use sush_client::{AuthzSigner, Client, Error as ClientError};
 use sush_common::keys::EphemeralKey;
@@ -64,6 +65,7 @@ impl ProxiedServer {
                 bind_address: local_addr(),
                 ..Default::default()
             })
+            .version_policy(version_policy())
             .start()
             .expect("failed to start server");
         let tls = platform_tls(key_path, chain_path).expect("can't build TLS config");

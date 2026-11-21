@@ -30,8 +30,8 @@ use sprockets_tls_test_utils::{cert_path, root_prefix};
 use x509_cert::Certificate;
 use x509_cert::der::DecodePem as _;
 
-use sush_api::JobWait;
 use sush_api::sush_api_mod::api_description;
+use sush_api::{JobWait, version_policy};
 use sush_client::tls::client as tls_client;
 use sush_client::tunnel::{Tunnel, pipe};
 use sush_client::{AuthzSigner, Client, Error as ClientError};
@@ -69,6 +69,7 @@ async fn client_server() {
             bind_address: local_addr(),
             ..Default::default()
         })
+        .version_policy(version_policy())
         .start()
         .expect("failed to start server");
 
@@ -152,6 +153,7 @@ async fn client_proxy_server() {
             bind_address: local_addr(),
             ..Default::default()
         })
+        .version_policy(version_policy())
         .start()
         .expect("failed to start server");
     let server_addr = server.local_addr();
@@ -367,6 +369,7 @@ async fn interactive_job() {
             bind_address: local_addr(),
             ..Default::default()
         })
+        .version_policy(version_policy())
         .start()
         .expect("failed to start server");
 
@@ -649,6 +652,7 @@ async fn streaming_job() {
             bind_address: local_addr(),
             ..Default::default()
         })
+        .version_policy(version_policy())
         .start()
         .expect("failed to start server");
 
@@ -788,6 +792,7 @@ async fn streaming_job_linger() {
             bind_address: local_addr(),
             ..Default::default()
         })
+        .version_policy(version_policy())
         .start()
         .expect("failed to start server");
 
@@ -916,6 +921,7 @@ async fn client_tunnels_through_nexus() {
             bind_address: local_addr(),
             ..Default::default()
         })
+        .version_policy(version_policy())
         .start()
         .expect("failed to start server");
     let (_pki_dir, pki) = test_pki("sush-tunnel-");

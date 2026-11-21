@@ -18,6 +18,9 @@ jobs:
 
     - name: Checkout
       uses: actions/checkout@v6
+      with:
+        # OpenAPI check needs history
+        fetch-depth: 0
 
     # Cargo fetches every git dependency at resolution time, enabled
     # or not. So even feature-less builds need to fetch permission-slip.

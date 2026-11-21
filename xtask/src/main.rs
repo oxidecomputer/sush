@@ -4,13 +4,16 @@
 
 //! Tasks for developing or building the Oxide Support Shell
 
-use std::fs::OpenOptions;
-use std::path::PathBuf;
 use std::process::ExitCode;
 
+use anyhow::Result;
+use camino::Utf8PathBuf;
 use clap::{Parser, Subcommand};
+use dropshot_api_manager::{App, Environment, ManagedApi, ManagedApiConfig, ManagedApis};
+use dropshot_api_manager_types::{ManagedApiMetadata, Versions};
+use sush_api::supported_versions;
 use sush_api::sush_api_mod::stub_api_description;
-use sush_common::{OPENAPI_DOCUMENT, OPENAPI_TITLE, OPENAPI_VERSION};
+use sush_common::OPENAPI_TITLE;
 
 #[derive(Debug, Parser)]
 struct Args {
@@ -20,41 +23,30 @@ struct Args {
 
 #[derive(Debug, Subcommand)]
 enum XTask {
-    /// Generate an OpenAPI document from the Support Shell Dropshot API.
-    Openapi {
-        /// Where to put the generated OpenAPI JSON file.
-        #[clap(default_value = OPENAPI_DOCUMENT)]
-        path: PathBuf,
-    },
+    /// Manage the OpenAPI documents for the Support Shell Dropshot API.
+    Openapi(App),
 }
 
-impl XTask {
-    fn execute(self) -> Result<(), String> {
-        match self {
-            Self::Openapi { path } => {
-                eprint!("Generating OpenAPI document `{}`... ", path.display());
-                let api = stub_api_description().map_err(|e| e.to_string())?;
-                let openapi = api.openapi(OPENAPI_TITLE, OPENAPI_VERSION.parse().unwrap());
-                let mut file = OpenOptions::new()
-                    .create(true)
-                    .write(true)
-                    .truncate(true)
-                    .open(&path)
-                    .map_err(|e| e.to_string())?;
-                openapi.write(&mut file).map_err(|e| e.to_string())?;
-                eprintln!("done!");
-                Ok(())
-            }
-        }
-    }
+fn environment() -> Result<Environment> {
+    let workspace_root = Utf8PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .parent()
+        .expect("xtask should be in the workspace")
+        .to_path_buf();
+    Environment::new("cargo xtask openapi", workspace_root, "openapi")
 }
 
-fn main() -> ExitCode {
-    match Args::parse().task.execute() {
-        Ok(()) => ExitCode::SUCCESS,
-        Err(error) => {
-            eprintln!("{error}");
-            ExitCode::FAILURE
-        }
+fn apis() -> Result<ManagedApis> {
+    ManagedApis::new(vec![ManagedApi::from(ManagedApiConfig {
+        ident: "sush",
+        versions: Versions::new_versioned(supported_versions()),
+        title: OPENAPI_TITLE,
+        metadata: ManagedApiMetadata::default(),
+        api_description: stub_api_description,
+    })])
+}
+
+fn main() -> Result<ExitCode> {
+    match Args::parse().task {
+        XTask::Openapi(app) => Ok(app.exec(&environment()?, &apis()?)),
     }
 }
