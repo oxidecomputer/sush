@@ -566,6 +566,40 @@ impl fmt::Display for SkipReason {
 pub type JobStatusMap = BTreeMap<BaseboardId, JobStatus>;
 pub type JsonJobStatusMap = HashMap<String, JobStatus>;
 
+/// What's known about a job.
+#[derive(Clone, Debug, Deserialize, JsonSchema, Serialize)]
+pub struct JobRecord {
+    /// The signed job request, or `None` if it is unknown (e.g., the job was skipped).
+    pub request: Option<SignedJob>,
+
+    /// The fate of the job, as much as is known via gossip.
+    #[serde(with = "status_map")]
+    #[schemars(with = "JsonJobStatusMap")]
+    pub status: JobStatusMap,
+}
+
+/// Helper to de/serialize JSON job status maps.
+mod status_map {
+    use serde::de::Error as _;
+    use serde::{Deserialize, Deserializer, Serializer};
+
+    use super::{JobStatusMap, JsonJobStatusMap, job_status_try_from_json_map};
+
+    pub fn serialize<S: Serializer>(map: &JobStatusMap, serializer: S) -> Result<S::Ok, S::Error> {
+        serializer.collect_map(
+            map.iter()
+                .map(|(baseboard, status)| (baseboard.to_string(), status)),
+        )
+    }
+
+    pub fn deserialize<'de, D: Deserializer<'de>>(
+        deserializer: D,
+    ) -> Result<JobStatusMap, D::Error> {
+        job_status_try_from_json_map(JsonJobStatusMap::deserialize(deserializer)?)
+            .map_err(D::Error::custom)
+    }
+}
+
 /// This helper fallibly decodes a job status map from a JSON (string-keyed) map.
 pub fn job_status_try_from_json_map(
     json_map: JsonJobStatusMap,

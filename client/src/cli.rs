@@ -914,13 +914,23 @@ impl CommandContext for Cli {
         }
     }
 
-    fn job_status(&mut self, job_id: &JobId, status: &JobStatusMap, style: StatusDisplayStyle) {
+    fn job_status(
+        &mut self,
+        job_id: &JobId,
+        request: Option<&SignedJob>,
+        status: &JobStatusMap,
+        style: StatusDisplayStyle,
+    ) {
+        let command = request
+            .map(|request| format!("\n   Command:\t{}", request.payload().command()))
+            .unwrap_or_default();
         match self.get_output_format() {
             OutputFormat::Json => qprintln!(
                 "{}",
                 json!({
                     "job_status": {
                         "job_id": job_id,
+                        "request": request,
                         "sleds": job_status_to_json_map(status.clone()),
                     }
                 })
@@ -939,7 +949,7 @@ impl CommandContext for Cli {
                     } else {
                         "✅"
                     };
-                    qprintln!("{icon} Job ID:\t{job_id}");
+                    qprintln!("{icon} Job ID:\t{job_id}{command}");
                 }
                 let width = status
                     .keys()
@@ -961,7 +971,7 @@ impl CommandContext for Cli {
                         } => {
                             qprintln!(
                                 "❌ Job ID:\t{job_id}\n   \
-                                    Target:\t{baseboard_id}\n   \
+                                    Target:\t{baseboard_id}{command}\n   \
                                     Job status:\tCancelled\n   \
                                     Cancelled at:\t{time_cancelled}\n   \
                                     Cancelled by:\t{actor}"
@@ -974,7 +984,7 @@ impl CommandContext for Cli {
                         } => {
                             qprintln!(
                                 "⏳ Job ID:\t{job_id}\n   \
-                                    Target:\t{baseboard_id}\n   \
+                                    Target:\t{baseboard_id}{command}\n   \
                                     Job status:\tQueued\n   \
                                     Queued at:\t{time_queued}\n   \
                                     Queued by:\t{actor}"
@@ -986,7 +996,7 @@ impl CommandContext for Cli {
                         } => {
                             qprintln!(
                                 "✅ Job ID:\t{job_id}\n   \
-                                    Target:\t{baseboard_id}\n   \
+                                    Target:\t{baseboard_id}{command}\n   \
                                     Job status:\tStarted\n   \
                                     Started at:\t{time_started}"
                             )
@@ -1009,7 +1019,7 @@ impl CommandContext for Cli {
                             let stderr_len = byte_size(*stderr_len);
                             qprintln!(
                                 "✅ Job ID:\t{job_id}\n   \
-                                    Target:\t{baseboard_id}\n   \
+                                    Target:\t{baseboard_id}{command}\n   \
                                     Job status:\tStopped\n   \
                                     Started at:\t{time_started}\n   \
                                     Stopped at:\t{time_stopped} ({duration})\n   \
@@ -1038,7 +1048,7 @@ impl CommandContext for Cli {
                             let stderr_len = byte_size(*stderr_len);
                             qprintln!(
                                 "✅ Job ID:\t{job_id}\n   \
-                                    Target:\t{baseboard_id}\n   \
+                                    Target:\t{baseboard_id}{command}\n   \
                                     Job status:\t{err}\n   \
                                     Started at:\t{time_started}\n   \
                                     Stopped at:\t{time_stopped} ({duration})\n   \
@@ -1055,7 +1065,7 @@ impl CommandContext for Cli {
                         } => {
                             qprintln!(
                                 "❌ Job ID:\t{job_id}\n   \
-                                    Target:\t{baseboard_id}\n   \
+                                    Target:\t{baseboard_id}{command}\n   \
                                     Job status:\tError\n   \
                                     Error at:\t{time_error}\n   \
                                     Error:\t{error}"
@@ -1068,7 +1078,7 @@ impl CommandContext for Cli {
                         } => {
                             qprintln!(
                                 "⏩ Job ID:\t{job_id}\n   \
-                                    Target:\t{baseboard_id}\n   \
+                                    Target:\t{baseboard_id}{command}\n   \
                                     Job status:\tSkipped\n   \
                                     Skipped at:\t{time_skipped}\n   \
                                     Reason:\t{reason}"

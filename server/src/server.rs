@@ -28,9 +28,7 @@ use sush_api::{
     SessionTargetParams, SushApi,
 };
 use sush_common::authn::{Authn, Identity};
-use sush_common::jobs::{
-    JsonJobStatusMap, Session, SessionServerNonce, SignedJob, job_status_to_json_map,
-};
+use sush_common::jobs::{JobRecord, Session, SessionServerNonce, SignedJob};
 use sush_common::keys::{KeyId, SshPublicKey, pem_cert_chain};
 use sush_common::targets::{SledVersion, Target};
 use sush_common::version::VersionInfo;
@@ -250,14 +248,12 @@ impl SushApi for ApiServer {
         headers: Header<Authorization>,
         params: PathParams<JobIdParam>,
         _query: QueryParams<RoutingParam>,
-    ) -> Result<HttpResponseOk<JsonJobStatusMap>, HttpError> {
+    ) -> Result<HttpResponseOk<JobRecord>, HttpError> {
         let mgr = ctx.context();
         let Authorization { authorization } = headers.into_inner();
         let authn = requester(authorization)?;
         let JobIdParam { job_id } = params.into_inner();
-        Ok(HttpResponseOk(job_status_to_json_map(
-            mgr.job_status(&authn, &job_id).await?,
-        )))
+        Ok(HttpResponseOk(mgr.job_record(&authn, &job_id).await?))
     }
 
     async fn job_output(
@@ -339,17 +335,13 @@ impl SushApi for ApiServer {
         ctx: RequestContext<Self::Context>,
         headers: Header<Authorization>,
         query: QueryParams<JobHistoryParams>,
-    ) -> Result<HttpResponseOk<Vec<JsonJobStatusMap>>, HttpError> {
+    ) -> Result<HttpResponseOk<Vec<JobRecord>>, HttpError> {
         let mgr = ctx.context();
         let Authorization { authorization } = headers.into_inner();
         let authn = requester(authorization)?;
         let JobHistoryParams { limit, offset } = query.into_inner();
         Ok(HttpResponseOk(
-            mgr.job_history(&authn, limit, offset)
-                .await?
-                .into_iter()
-                .map(job_status_to_json_map)
-                .collect(),
+            mgr.job_history(&authn, limit, offset).await?,
         ))
     }
 

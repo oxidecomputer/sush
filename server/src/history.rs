@@ -11,7 +11,7 @@ use chrono::{DateTime, Utc};
 use rumors::before::Rank;
 use sled_hardware_types::BaseboardId;
 
-use sush_common::jobs::{JobId, JobStatus, JobStatusMap};
+use sush_common::jobs::{JobId, JobStatus, JobStatusMap, VerifiedJob};
 
 use crate::state::QueuedJobs;
 
@@ -33,8 +33,13 @@ pub struct JobHistory {
     /// it's possible to ask "what's the status of this job across the rack?"
     job_status: BTreeMap<JobId, JobStatusMap>,
 
-    /// The set of running jobs everywhere, tagged by start wall-clock time.
+    /// The set of running jobs *everywhere*, tagged by start wall-clock time.
     running: BTreeMap<(JobId, BaseboardId), DateTime<Utc>>,
+
+    /// Lookup table for all *locally* verified job requests. Job status
+    /// may arrive before the request, after it, or instead of it (e.g.,
+    /// for a skipped job).
+    requests: BTreeMap<JobId, VerifiedJob>,
 }
 
 impl JobHistory {
@@ -46,6 +51,17 @@ impl JobHistory {
     /// Get the last known status of a job.
     pub fn get_job_status(&self, job_id: &JobId) -> Option<&JobStatusMap> {
         self.job_status.get(job_id)
+    }
+
+    pub fn get_job_request(&self, job_id: &JobId) -> Option<&VerifiedJob> {
+        self.requests.get(job_id)
+    }
+
+    pub fn set_job_request(&mut self, request: &VerifiedJob, queued: Option<&QueuedJobs>) {
+        self.requests
+            .entry(*request.job_id())
+            .or_insert_with(|| request.to_owned());
+        self.gc(queued);
     }
 
     /// Set the (causal) status of a job.
@@ -111,7 +127,7 @@ impl JobHistory {
     /// or queued locally.
     fn gc(&mut self, queued: Option<&QueuedJobs>) {
         // Do nothing if we've still got room.
-        if self.job_status.len() <= MAX_HISTORY {
+        if self.job_status.len() <= MAX_HISTORY && self.requests.len() <= MAX_HISTORY {
             return;
         }
 
@@ -149,13 +165,19 @@ impl JobHistory {
                 })
         {
             self.job_status.remove(&job_id);
+            self.requests.remove(&job_id);
             self.causal_jobs.retain(|(_, id, _)| id != &job_id);
+        }
+        if self.requests.len() > low_water_mark {
+            let job_status = &self.job_status;
+            self.requests
+                .retain(|id, _| job_status.contains_key(id) || ineligible.contains(id));
         }
     }
 
     /// Iterate job status maps, one per job, acausal (locally generated)
     /// first by "wall clock time", then causally newest to oldest.
-    pub fn iter(&self) -> impl Iterator<Item = &JobStatusMap> {
+    pub fn iter(&self) -> impl Iterator<Item = (Option<&VerifiedJob>, &JobStatusMap)> {
         let causal = BTreeSet::from_iter(self.causal_jobs.iter().map(|(_, id, _)| id));
         let mut acausal = self
             .job_status
@@ -172,15 +194,47 @@ impl JobHistory {
                     .rev()
                     .filter_map(move |(_, id, _)| seen.insert(id).then_some(id)),
             )
-            .filter_map(|id| self.job_status.get(id))
+            .filter_map(|id| {
+                self.job_status
+                    .get(id)
+                    .map(|status| (self.requests.get(id), status))
+            })
     }
 }
 
 #[cfg(test)]
 mod tests {
-    use sush_common::jobs::{ProcessError, SkipReason};
+    use std::time::Duration;
+
+    use sush_common::jobs::{JobMode, JobStartRequest, ProcessError, SessionId, SkipReason};
+    use sush_common::keys::{EphemeralKey, KeyType, Signer as _};
+    use sush_common::targets::Target;
+    use x509_cert::time::Validity;
 
     use super::*;
+
+    async fn request(job_id: JobId) -> VerifiedJob {
+        let mut root = EphemeralKey::new_root(
+            KeyType::P256,
+            "CN=Test Root,O=Oxide Computer Company,C=US"
+                .parse()
+                .unwrap(),
+            Validity::from_now(Duration::from_secs(60)).unwrap(),
+        )
+        .unwrap();
+        let cert = root.cert().clone();
+        root.sign(JobStartRequest::new(
+            job_id,
+            SessionId::random(),
+            "true",
+            JobMode::Batch,
+            Target::All,
+        ))
+        .await
+        .unwrap()
+        .verify_with_cert(&cert)
+        .unwrap()
+    }
 
     fn baseboard(n: u32) -> BaseboardId {
         BaseboardId {
@@ -249,6 +303,25 @@ mod tests {
             Some(JobStatus::Skipped { .. })
         ));
         assert!(history.running_jobs().is_empty());
+    }
+
+    #[tokio::test]
+    async fn request_may_follow_status() {
+        let mut history = JobHistory::default();
+        let job = JobId::random();
+        history.set_job_status(&job, &baseboard(1), started(job), None, None);
+        assert!(history.get_job_request(&job).is_none());
+        history.set_job_request(&request(job).await, None);
+        assert!(history.get_job_request(&job).is_some());
+    }
+
+    #[tokio::test]
+    async fn request_alone_is_not_history() {
+        let mut history = JobHistory::default();
+        let job = JobId::random();
+        history.set_job_request(&request(job).await, None);
+        assert!(!history.contains(&job));
+        assert_eq!(history.iter().count(), 0);
     }
 
     #[test]

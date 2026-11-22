@@ -439,9 +439,15 @@ impl CommandContext for Repl {
         self.cli.job_watch_finished(job_id)
     }
 
-    fn job_status(&mut self, job_id: &JobId, status: &JobStatusMap, style: StatusDisplayStyle) {
+    fn job_status(
+        &mut self,
+        job_id: &JobId,
+        request: Option<&SignedJob>,
+        status: &JobStatusMap,
+        style: StatusDisplayStyle,
+    ) {
         self.last_job_id = Some(*job_id);
-        self.cli.job_status(job_id, status, style);
+        self.cli.job_status(job_id, request, status, style);
     }
 
     fn read_signed_job(&mut self) -> Result<SignedJob, CommandError> {

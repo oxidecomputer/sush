@@ -224,7 +224,13 @@ pub trait CommandContext: Clone + Send + Sync {
     fn job_signing_update(&mut self, id: &JobId);
     fn job_signing_finished(&mut self, id: &JobId, signed: bool);
     fn job_signed(&mut self, job: &SignedJob, show: bool);
-    fn job_status(&mut self, id: &JobId, status: &JobStatusMap, style: StatusDisplayStyle);
+    fn job_status(
+        &mut self,
+        id: &JobId,
+        request: Option<&SignedJob>,
+        status: &JobStatusMap,
+        style: StatusDisplayStyle,
+    );
     fn read_signed_job(&mut self) -> Result<SignedJob, CommandError>;
 
     // SSH agent and identity

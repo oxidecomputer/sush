@@ -50,9 +50,9 @@ use sush_common::authn::{
 use sush_common::interactive::{InteractiveJobError, InteractiveJobMessage};
 use sush_common::jobs::JobOutputStream::{self, Stderr, Stdout};
 use sush_common::jobs::{
-    Access, JobId, JobLimits, JobMode, JobOutputHash, JobOutputState, JobStartRequest, JobStatus,
-    JobStatusMap, ProcessError, Session, SessionClientNonce, SessionId, SessionSeq,
-    SessionSignerNonce, SessionSushNonce, SignedJob, SkipReason, job_status_try_from_json_map,
+    Access, JobId, JobLimits, JobMode, JobOutputHash, JobOutputState, JobRecord, JobStartRequest,
+    JobStatus, JobStatusMap, ProcessError, Session, SessionClientNonce, SessionId, SessionSeq,
+    SessionSignerNonce, SessionSushNonce, SignedJob, SkipReason,
 };
 use sush_common::keys::{KeyError, KeyId, Signer as _};
 use sush_common::targets::{SledId, Target};
@@ -1446,7 +1446,8 @@ async fn job(
             };
             if wait {
                 let status = job_watch(ctx, client, &job_id, None).await?;
-                ctx.job_status(&job_id, &status, style);
+                let JobRecord { request, .. } = job_record(ctx, client, &job_id, None).await?;
+                ctx.job_status(&job_id, request.as_ref(), &status, style);
                 Ok(())
             } else {
                 job_status(ctx, client, &job_id, style).await
@@ -1496,11 +1497,14 @@ async fn job(
             })
             .await?
             .into_inner();
-            for job in history {
-                let status = job_status_try_from_json_map(job)
-                    .map_err(CommandError::BaseboardIdParseError)?;
+            for JobRecord { request, status } in history {
                 if let Some(s) = status.values().next() {
-                    ctx.job_status(s.job_id(), &status, StatusDisplayStyle::Medium);
+                    ctx.job_status(
+                        s.job_id(),
+                        request.as_ref(),
+                        &status,
+                        StatusDisplayStyle::Medium,
+                    );
                 }
             }
             Ok(())
@@ -1590,7 +1594,7 @@ async fn job_start(
             Err(error) => return Err(error),
         }
         let status = job_status_map(ctx, client, &job_id, Some(&target)).await?;
-        ctx.job_status(&job_id, &status, StatusDisplayStyle::Medium);
+        ctx.job_status(&job_id, Some(&job), &status, StatusDisplayStyle::Medium);
     } else if streaming {
         let Some(path) = file else {
             return Err(CommandError::StreamingNeedsFile);
@@ -1609,7 +1613,7 @@ async fn job_start(
         ctx.job_started(&job, Some(&sleds), StartedDisplay::Note);
         let hasher = job_stream(ctx, client, &job_id, &target, &path, file).await?;
         let status = job_watch(ctx, client, &job_id, Some(sleds)).await?;
-        ctx.job_status(&job_id, &status, StatusDisplayStyle::Short);
+        ctx.job_status(&job_id, Some(&job), &status, StatusDisplayStyle::Short);
         let Some(JobStatus::Stopped {
             result: Ok(0),
             output:
@@ -1745,7 +1749,7 @@ async fn job_start(
             }
         };
         ctx.job_watch_finished(&job_id);
-        ctx.job_status(&job_id, &status, StatusDisplayStyle::Short);
+        ctx.job_status(&job_id, Some(&job), &status, StatusDisplayStyle::Short);
 
         // Show the job output from every sled it ran on.
         let ran: Vec<(&BaseboardId, &JobStatus)> = status
@@ -2008,8 +2012,8 @@ async fn job_status(
     job_id: &JobId,
     style: StatusDisplayStyle,
 ) -> Result<(), CommandError> {
-    let status = job_status_map(ctx, client, job_id, None).await?;
-    ctx.job_status(job_id, &status, style);
+    let JobRecord { request, status } = job_record(ctx, client, job_id, None).await?;
+    ctx.job_status(job_id, request.as_ref(), &status, style);
     Ok(())
 }
 
@@ -2022,7 +2026,16 @@ async fn job_status_map(
     job_id: &JobId,
     via: Option<&BaseboardId>,
 ) -> Result<JobStatusMap, CommandError> {
-    let status = with_login(ctx, client, async || {
+    Ok(job_record(ctx, client, job_id, via).await?.status)
+}
+
+async fn job_record(
+    ctx: &mut impl CommandContext,
+    client: &Client,
+    job_id: &JobId,
+    via: Option<&BaseboardId>,
+) -> Result<JobRecord, CommandError> {
+    Ok(with_login(ctx, client, async || {
         let mut request = client.job_status().job_id(job_id);
         if let Some(via) = via {
             request = request.via(via.to_string());
@@ -2030,8 +2043,7 @@ async fn job_status_map(
         request.send().await
     })
     .await?
-    .into_inner();
-    job_status_try_from_json_map(status).map_err(CommandError::BaseboardIdParseError)
+    .into_inner())
 }
 
 /// How often a watched job's status is refreshed.

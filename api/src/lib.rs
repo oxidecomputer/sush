@@ -24,8 +24,9 @@ use strum::{Display, EnumString};
 
 use sush_common::authn::Identity;
 use sush_common::jobs::{
-    Access, JobId, JobLimits, JobOutputStream, JobStatus, JsonJobStatusMap, Session,
+    Access, JobId, JobLimits, JobOutputStream, JobRecord, JobStatus, JsonJobStatusMap, Session,
     SessionClientNonce, SessionId, SessionSeq, SessionServerNonce, SessionSignerNonce, SignedJob,
+    job_status_to_json_map,
 };
 use sush_common::keys::{KeyId, SshPublicKey};
 use sush_common::targets::SledVersion;
@@ -33,6 +34,7 @@ use sush_common::version::VersionInfo;
 
 #[rustfmt::skip]
 api_versions_picky!([
+    (0, 2, 0, JOB_RECORDS),
     (0, 1, 0, INITIAL),
 ]);
 
@@ -187,13 +189,34 @@ pub trait SushApi {
     ) -> Result<HttpResponseUpdatedNoContent, HttpError>;
 
     /// Get the status of a job across the rack.
-    #[endpoint { method = GET, path = "/jobs/{job_id}/status" }]
+    #[endpoint {
+        method = GET,
+        path = "/jobs/{job_id}/status",
+        versions = VERSION_JOB_RECORDS..,
+    }]
     async fn job_status(
         ctx: RequestContext<Self::Context>,
         headers: Header<Authorization>,
         params: PathParams<JobIdParam>,
         query: QueryParams<RoutingParam>,
-    ) -> Result<HttpResponseOk<JsonJobStatusMap>, HttpError>;
+    ) -> Result<HttpResponseOk<JobRecord>, HttpError>;
+
+    /// Get the status of a job across the rack.
+    #[endpoint {
+        operation_id = "job_status",
+        method = GET,
+        path = "/jobs/{job_id}/status",
+        versions = ..VERSION_JOB_RECORDS,
+    }]
+    async fn job_status_v0_1(
+        ctx: RequestContext<Self::Context>,
+        headers: Header<Authorization>,
+        params: PathParams<JobIdParam>,
+        query: QueryParams<RoutingParam>,
+    ) -> Result<HttpResponseOk<JsonJobStatusMap>, HttpError> {
+        let HttpResponseOk(record) = Self::job_status(ctx, headers, params, query).await?;
+        Ok(HttpResponseOk(job_status_to_json_map(record.status)))
+    }
 
     /// Get (a subset of) the standard output or standard error of a job.
     #[endpoint { method = GET, path = "/jobs/{job_id}/output/{target}/{stream}" }]
@@ -221,12 +244,40 @@ pub trait SushApi {
     ///
     /// Offsets may shift under concurrent eviction, so pagination
     /// is currently best-effort.
-    #[endpoint { method = GET, path = "/jobs" }]
+    #[endpoint {
+        method = GET,
+        path = "/jobs",
+        versions = VERSION_JOB_RECORDS..,
+    }]
     async fn job_history(
         ctx: RequestContext<Self::Context>,
         headers: Header<Authorization>,
         query: QueryParams<JobHistoryParams>,
-    ) -> Result<HttpResponseOk<Vec<JsonJobStatusMap>>, HttpError>;
+    ) -> Result<HttpResponseOk<Vec<JobRecord>>, HttpError>;
+
+    /// List known jobs sorted by start time, most recent first.
+    ///
+    /// Offsets may shift under concurrent eviction, so pagination
+    /// is currently best-effort.
+    #[endpoint {
+        operation_id = "job_history",
+        method = GET,
+        path = "/jobs",
+        versions = ..VERSION_JOB_RECORDS,
+    }]
+    async fn job_history_v0_1(
+        ctx: RequestContext<Self::Context>,
+        headers: Header<Authorization>,
+        query: QueryParams<JobHistoryParams>,
+    ) -> Result<HttpResponseOk<Vec<JsonJobStatusMap>>, HttpError> {
+        let HttpResponseOk(records) = Self::job_history(ctx, headers, query).await?;
+        Ok(HttpResponseOk(
+            records
+                .into_iter()
+                .map(|record| job_status_to_json_map(record.status))
+                .collect(),
+        ))
+    }
 
     /// Get the baseboard ID of the sled handling this request.
     ///

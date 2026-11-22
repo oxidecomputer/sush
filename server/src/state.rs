@@ -384,6 +384,10 @@ impl State {
         self.history.get_job_status(job_id)
     }
 
+    pub fn get_job_request(&self, job_id: &JobId) -> Option<&VerifiedJob> {
+        self.history.get_job_request(job_id)
+    }
+
     pub fn is_job_known(&self, job_id: &JobId) -> bool {
         self.history.contains(job_id)
             || self
@@ -806,6 +810,8 @@ impl State {
                         return outputs;
                     }
                 };
+                self.history
+                    .set_job_request(&job, self.session.queued_jobs());
 
                 // A verified job confirms its session's pending start.
                 // The job then joins the queue only if its session is
