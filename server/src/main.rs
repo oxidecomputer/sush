@@ -19,6 +19,7 @@ use x509_cert::Certificate;
 use x509_cert::der::DecodePem as _;
 
 use sush_api::sush_api_mod::api_description;
+use sush_api::version_policy;
 use sush_common::targets::Cubbies;
 use sush_server::executor::PathIsolation;
 use sush_server::gossip::ConnectedBaseboards;
@@ -132,6 +133,7 @@ async fn main() -> Result<(), String> {
             log_headers: vec![],
             compression: Default::default(),
         })
+        .version_policy(version_policy())
         .start()
         .map_err(|error| format!("failed to start server: {error}"))?;
 

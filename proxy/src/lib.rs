@@ -569,8 +569,9 @@ fn error_response(status: StatusCode, message: impl Into<String>) -> Response<Pr
 mod test {
     use std::collections::BTreeSet;
 
+    use sush_api::latest_version;
     use sush_api::sush_api_mod::stub_api_description;
-    use sush_common::{OPENAPI_TITLE, OPENAPI_VERSION};
+    use sush_common::OPENAPI_TITLE;
 
     use super::*;
 
@@ -579,10 +580,7 @@ mod test {
     #[test]
     fn unauthenticated_endpoints() {
         let api = stub_api_description().unwrap();
-        let openapi = api
-            .openapi(OPENAPI_TITLE, OPENAPI_VERSION.parse().unwrap())
-            .json()
-            .unwrap();
+        let openapi = api.openapi(OPENAPI_TITLE, latest_version()).json().unwrap();
         let mut unauthenticated = BTreeSet::new();
         for (path, item) in openapi["paths"].as_object().unwrap() {
             for (method, operation) in item.as_object().unwrap() {

@@ -7,6 +7,10 @@ repository = "https://github.com/oxidecomputer/sush"
 publish = false
 
 [dependencies]
+anyhow.workspace = true
+camino.workspace = true
 clap.workspace = true
+dropshot-api-manager.workspace = true
+dropshot-api-manager-types.workspace = true
 sush-api = { path = "../api" }
 sush-common = { path = "../common" }

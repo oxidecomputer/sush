@@ -163,7 +163,7 @@ fn request_target(url: &reqwest::Url) -> String {
 }
 
 progenitor::generate_api!(
-    spec = "../sush.json", // must match `sush_common::OPENAPI_DOCUMENT`
+    spec = "../openapi/sush/sush-latest.json",
     interface = Builder,
     inner_type = crate::AuthzSigner,
     pre_hook_async = crate::sign_request,

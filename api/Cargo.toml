@@ -10,6 +10,7 @@ publish = false
 [dependencies]
 chrono.workspace = true
 dropshot.workspace = true
+dropshot-api-manager-types.workspace = true
 http-range-header.workspace = true
 hyper.workspace = true
 schemars.workspace = true
