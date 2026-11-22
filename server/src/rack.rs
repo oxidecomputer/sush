@@ -75,6 +75,10 @@ impl Rack {
         self.cubbies = cubbies;
     }
 
+    pub fn knows(&self, baseboard: &BaseboardId) -> bool {
+        *baseboard == self.own_baseboard || self.versions.contains_key(baseboard)
+    }
+
     pub fn versions(&self) -> &VersionMap {
         &self.versions
     }

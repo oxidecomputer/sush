@@ -189,7 +189,6 @@ pub mod v0 {
         pub fn kind(&self) -> &'static str {
             match self {
                 Self::Session(r) => match r.request {
-                    SessionRequest::Start(..) => "session start",
                     SessionRequest::Stop(_) => "session stop",
                     SessionRequest::Skip(..) => "session skip",
                     SessionRequest::Allow(..) => "session allow",
@@ -205,7 +204,6 @@ pub mod v0 {
 
     #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
     pub enum SessionRequest {
-        Start(SessionPreimage),
         Stop(SessionId),
         Skip(SessionId, JobId),
         Allow(SessionId, KeyId, Access),
@@ -215,7 +213,12 @@ pub mod v0 {
     #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
     #[allow(clippy::large_enum_variant)]
     pub enum JobRequest {
-        Start(SignedJob, JobStartParams, BTreeSet<BaseboardId>),
+        Start(
+            SignedJob,
+            JobStartParams,
+            BTreeSet<BaseboardId>,
+            Option<SessionPreimage>,
+        ),
         Stop(JobId),
     }
 
@@ -306,18 +309,18 @@ mod wire_format {
     /// representatively instead.
     fn snapshot_name(message: &Message) -> &'static str {
         match message {
-            Message::Request(Request::Session(r)) => match r.request {
-                SessionRequest::Start(..) => "session-start-request",
+            Message::Request(Request::Session(r)) => match &r.request {
                 SessionRequest::Stop(_) => "session-stop-request",
                 SessionRequest::Skip(..) => "session-skip-request",
                 SessionRequest::Allow(..) => "session-allow-request",
                 SessionRequest::Deny(..) => "session-deny-request",
             },
             Message::Request(Request::Job(r)) => match &r.request {
-                JobRequest::Start(_, params, _) if params.term.is_some() => {
+                JobRequest::Start(_, _, _, Some(_)) => "job-start-first-request",
+                JobRequest::Start(_, params, _, None) if params.term.is_some() => {
                     "job-start-interactive-request"
                 }
-                JobRequest::Start(..) => "job-start-request",
+                JobRequest::Start(_, _, _, None) => "job-start-request",
                 JobRequest::Stop(_) => "job-stop-request",
             },
             Message::Event(_, event) => match event {
@@ -402,17 +405,14 @@ mod wire_format {
             stdout_hash: hash(b"all pools are healthy\n").into(),
             stderr_hash: hash(b"").into(),
         };
+        let preimage = SessionPreimage {
+            baseboard: baseboard.clone(),
+            sush_nonce: SessionSushNonce::from_be_bytes([0x11; 32]),
+            signer_nonce: SessionSignerNonce::from_be_bytes([0x22; 32]),
+            seq: SessionSeq::from_unix_millis(1_760_000_000_000).unwrap(),
+        };
 
         vec![
-            Message::Request(Request::session(
-                actor(),
-                SessionRequest::Start(SessionPreimage {
-                    baseboard: baseboard.clone(),
-                    sush_nonce: SessionSushNonce::from_be_bytes([0x11; 32]),
-                    signer_nonce: SessionSignerNonce::from_be_bytes([0x22; 32]),
-                    seq: SessionSeq::from_unix_millis(1_760_000_000_000).unwrap(),
-                }),
-            )),
             Message::Request(Request::session(actor(), SessionRequest::Stop(session))),
             Message::Request(Request::session(
                 actor(),
@@ -429,9 +429,19 @@ mod wire_format {
             Message::Request(Request::job(
                 actor(),
                 JobRequest::Start(
+                    batch.clone(),
+                    JobStartParams::default(),
+                    BTreeSet::from([baseboard.clone(), other.clone()]),
+                    None,
+                ),
+            )),
+            Message::Request(Request::job(
+                actor(),
+                JobRequest::Start(
                     batch,
                     JobStartParams::default(),
                     BTreeSet::from([baseboard.clone(), other.clone()]),
+                    Some(preimage),
                 ),
             )),
             Message::Request(Request::job(
@@ -440,6 +450,7 @@ mod wire_format {
                     interactive,
                     interactive_params,
                     BTreeSet::from([baseboard.clone()]),
+                    None,
                 ),
             )),
             Message::Request(Request::job(actor(), JobRequest::Stop(long_job))),

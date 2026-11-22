@@ -180,6 +180,8 @@ progenitor::generate_api!(
         JobOutputStream = sush_common::jobs::JobOutputStream,
         JobRecord = sush_common::jobs::JobRecord,
         JobStarted = sush_api::JobStarted,
+        JobStartBody = sush_api::JobStartBody,
+        SessionDetails = sush_api::SessionDetails,
         JobStatus = sush_common::jobs::JobStatus,
         JobWait = sush_api::JobWait,
         KeyId = sush_common::keys::KeyId,

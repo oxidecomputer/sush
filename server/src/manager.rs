@@ -23,12 +23,11 @@ use tokio_util::sync::CancellationToken;
 use x509_cert::Certificate;
 use x509_cert::der::DecodePem as _;
 
-use sush_api::{JobStartParams, JobStopParams, JobWait};
+use sush_api::{JobStartParams, JobStopParams, JobWait, SessionDetails};
 use sush_common::authn::Nonce;
 use sush_common::jobs::{
-    Access, JobId, JobOutputStream, JobRecord, JobStatusMap, Session, SessionClientNonce,
-    SessionId, SessionPreimage, SessionSeq, SessionServerNonce, SessionSignerNonce,
-    SessionSushNonce, SessionView, SignedJob,
+    Access, JobId, JobOutputStream, JobRecord, JobStatusMap, Session, SessionId, SessionPreimage,
+    SessionServerNonce, SessionSushNonce, SessionView, SignedJob,
 };
 use sush_common::keys::{KeyError, KeyId, Verified};
 use sush_common::targets::{Cubbies, SledHealth, SledVersion, Target, UnknownCubby};
@@ -291,44 +290,56 @@ impl JobManager {
         SessionServerNonce::compute(&self.secret, authn, latest)
     }
 
-    pub async fn session_start(
+    fn session_preimage(
         &self,
         authn: &KeyId,
         session_id: SessionId,
-        client_nonce: SessionClientNonce,
-        signer_nonce: SessionSignerNonce,
-        seq: SessionSeq,
-    ) -> Result<(), JobError> {
-        // Verify the session ID provided by the client.
-        let server_nonce = self.server_nonce(authn);
-        let preimage = SessionPreimage {
-            baseboard: self.own_baseboard().clone(),
-            sush_nonce: SessionSushNonce::compute(client_nonce, server_nonce),
+        details: Option<&SessionDetails>,
+    ) -> Result<Option<SessionPreimage>, JobError> {
+        let Some(SessionDetails {
+            baseboard,
+            client_nonce,
             signer_nonce,
             seq,
+        }) = details
+        else {
+            return Ok(None);
+        };
+        if self
+            .state
+            .borrow()
+            .session()
+            .is_some_and(|session| session.session_id() == session_id)
+        {
+            return Ok(None);
+        }
+        if baseboard != self.own_baseboard() {
+            return Err(JobError::OtherSled(session_id, baseboard.clone()));
+        }
+        let preimage = SessionPreimage {
+            baseboard: baseboard.clone(),
+            sush_nonce: SessionSushNonce::compute(*client_nonce, self.server_nonce(authn)),
+            signer_nonce: *signer_nonce,
+            seq: *seq,
         };
         if preimage.session_id() != session_id {
-            return Err(JobError::InvalidSessionId);
+            return Err(JobError::StaleNonce(session_id));
         }
-
-        // Every sled keeps the start pending until a verified job of the
-        // session confirms it. Wait until it is pending here, or a session
-        // that outranks it is active, so that a job sent next finds it.
-        let rank = Some((seq, session_id));
-        self.session_request(authn, SessionRequest::Start(preimage))
-            .await?;
-        self.wait_for(move |state| state.pending_rank(session_id).is_some() || state.rank() >= rank)
-            .await
+        Ok(Some(preimage))
     }
 
     /// This sled accepts a job only if the job's session is active here,
-    /// or if the session's start is pending here for the job to confirm.
+    /// or if the job carries its session's details to begin it.
     /// The state machine makes the final decision; this check fails fast.
-    pub fn session_check(&self, session_id: SessionId) -> Result<(), JobError> {
+    pub fn session_check(
+        &self,
+        session_id: SessionId,
+        preimage: Option<&SessionPreimage>,
+    ) -> Result<(), JobError> {
         let state = self.state.borrow();
         let rank = state.rank();
         if rank.is_some_and(|(_, active)| active == session_id)
-            || state.pending_rank(session_id) > rank
+            || preimage.is_some_and(|preimage| Some((preimage.seq, session_id)) > rank)
         {
             return Ok(());
         }
@@ -354,7 +365,7 @@ impl JobManager {
         job_id: JobId,
     ) -> Result<(), JobError> {
         self.currency_check(session_id)?;
-        self.write_check(authn, session_id)?;
+        self.write_check(authn, session_id, None)?;
         if let Some(session) = self.session(authn)
             && session.next_job_id() != job_id
         {
@@ -406,11 +417,16 @@ impl JobManager {
     }
 
     /// Check that an identity has full read-write access to a session.
-    fn write_check(&self, authn: &KeyId, session_id: SessionId) -> Result<(), JobError> {
+    fn write_check(
+        &self,
+        authn: &KeyId,
+        session_id: SessionId,
+        preimage: Option<&SessionPreimage>,
+    ) -> Result<(), JobError> {
         let state = self.state.borrow();
         let access = match state.history().session_access(&session_id) {
             Some(access) => access.access(authn),
-            None => (state.pending_starter(session_id) == Some(authn)).then_some(Access::ReadWrite),
+            None => preimage.is_some().then_some(Access::ReadWrite),
         };
         match access {
             Some(Access::ReadWrite) => Ok(()),
@@ -451,6 +467,7 @@ impl JobManager {
         authn: &KeyId,
         job: SignedJob,
         params: JobStartParams,
+        details: Option<&SessionDetails>,
     ) -> Result<BTreeSet<BaseboardId>, JobError> {
         // Check the job signature.
         self.state
@@ -470,12 +487,25 @@ impl JobManager {
         if !payload.target_matches_mode() {
             return Err(JobError::InteractiveTarget);
         }
-        let sleds = self.job_preflight(authn, payload.session_id(), payload.target())?;
+        let session_id = payload.session_id();
+        let preimage = self.session_preimage(authn, session_id, details)?;
+        let sleds = self.preflight(authn, session_id, payload.target(), preimage.as_ref())?;
 
         // Submit the job for execution.
         let wait = params.wait.to_owned();
-        self.job_request(authn, JobRequest::Start(job, params, sleds.clone()))
+        let params = JobStartParams {
+            via: None,
+            ..params
+        };
+        let rank = preimage.as_ref().map(|preimage| (preimage.seq, session_id));
+        let request = JobRequest::Start(job, params, sleds.clone(), preimage);
+        self.job_request(authn, request).await?;
+        if let Some(rank) = rank {
+            self.wait_for(|state| {
+                state.history().session_access(&session_id).is_some() || state.rank() > Some(rank)
+            })
             .await?;
+        }
         self.wait_for_job(&job_id, wait, sleds.clone()).await?;
         Ok(sleds)
     }
@@ -486,9 +516,21 @@ impl JobManager {
         authn: &KeyId,
         session_id: SessionId,
         target: &Target,
+        details: Option<&SessionDetails>,
     ) -> Result<BTreeSet<BaseboardId>, JobError> {
-        self.session_check(session_id)?;
-        self.write_check(authn, session_id)?;
+        let preimage = self.session_preimage(authn, session_id, details)?;
+        self.preflight(authn, session_id, target, preimage.as_ref())
+    }
+
+    fn preflight(
+        &self,
+        authn: &KeyId,
+        session_id: SessionId,
+        target: &Target,
+        preimage: Option<&SessionPreimage>,
+    ) -> Result<BTreeSet<BaseboardId>, JobError> {
+        self.session_check(session_id, preimage)?;
+        self.write_check(authn, session_id, preimage)?;
         self.reachable_targets(target)
     }
 
@@ -519,7 +561,7 @@ impl JobManager {
             .history()
             .job_session(job_id)
             .ok_or_else(|| JobError::JobNotFound(job_id.to_owned()))?;
-        self.write_check(authn, session_id)?;
+        self.write_check(authn, session_id, None)?;
         self.job_request(authn, JobRequest::Stop(job_id.to_owned()))
             .await?;
         let sleds = self

@@ -23,9 +23,9 @@ use tokio_tungstenite::tungstenite::protocol::{Role, WebSocketConfig};
 
 use sush_api::{
     AccessParam, Authorization, AuthorizedRangeRequest, JobHistoryParams, JobIdParam,
-    JobOutputParams, JobStartParams, JobStarted, JobStopParams, JobTargetParams, KeyIdParam,
-    RoutingParam, SessionAndJobIds, SessionAndKeyIds, SessionIdParam, SessionStartBody,
-    SessionTargetParams, SushApi,
+    JobOutputParams, JobStartBody, JobStartParams, JobStarted, JobStopParams, JobTargetParams,
+    KeyIdParam, RoutingParam, SessionAndJobIds, SessionAndKeyIds, SessionDetails,
+    SessionDetailsQuery, SessionIdParam, SessionTargetParams, SushApi, v0_1,
 };
 use sush_common::authn::{Authn, Identity};
 use sush_common::jobs::{JobRecord, SessionServerNonce, SessionView, SignedJob};
@@ -48,6 +48,44 @@ fn requester(authorization: Option<String>) -> Result<KeyId, JobError> {
         .and_then(|authorization| authorization.parse::<Authn>().ok())
         .map(|authn| authn.key_id().clone())
         .ok_or(JobError::NoRequester)
+}
+
+fn preflight(
+    mgr: &JobManager,
+    headers: Header<Authorization>,
+    params: PathParams<SessionTargetParams>,
+    details: Option<SessionDetails>,
+) -> Result<HttpResponseUpdatedNoContent, HttpError> {
+    let Authorization { authorization } = headers.into_inner();
+    let authn = requester(authorization)?;
+    let SessionTargetParams { session_id, target } = params.into_inner();
+    let target = target.parse::<Target>().map_err(|error| {
+        HttpError::for_client_error(None, ClientErrorStatusCode::BAD_REQUEST, error.to_string())
+    })?;
+    mgr.job_preflight(&authn, session_id, &target, details.as_ref())?;
+    Ok(HttpResponseUpdatedNoContent())
+}
+
+async fn start(
+    mgr: &JobManager,
+    headers: Header<Authorization>,
+    path: PathParams<JobTargetParams>,
+    params: JobStartParams,
+    job: SignedJob,
+    details: Option<SessionDetails>,
+) -> Result<HttpResponseOk<JobStarted>, HttpError> {
+    let Authorization { authorization } = headers.into_inner();
+    let authn = requester(authorization)?;
+    let JobTargetParams { job_id, target: _ } = path.into_inner();
+    if *job.job_id() != job_id {
+        return Err(HttpError::for_client_error(
+            None,
+            ClientErrorStatusCode::BAD_REQUEST,
+            String::from("Path parameter job ID does not match body"),
+        ));
+    }
+    let sleds = mgr.job_start(&authn, job, params, details.as_ref()).await?;
+    Ok(HttpResponseOk(JobStarted { sleds }))
 }
 
 impl SushApi for ApiServer {
@@ -107,16 +145,20 @@ impl SushApi for ApiServer {
         ctx: RequestContext<Self::Context>,
         headers: Header<Authorization>,
         params: PathParams<SessionTargetParams>,
+        query: QueryParams<SessionDetailsQuery>,
     ) -> Result<HttpResponseUpdatedNoContent, HttpError> {
-        let mgr = ctx.context();
-        let Authorization { authorization } = headers.into_inner();
-        let authn = requester(authorization)?;
-        let SessionTargetParams { session_id, target } = params.into_inner();
-        let target = target.parse::<Target>().map_err(|error| {
+        let details = query.into_inner().into_details().map_err(|error| {
             HttpError::for_client_error(None, ClientErrorStatusCode::BAD_REQUEST, error.to_string())
         })?;
-        mgr.job_preflight(&authn, session_id, &target)?;
-        Ok(HttpResponseUpdatedNoContent())
+        preflight(ctx.context(), headers, params, details)
+    }
+
+    async fn job_preflight_v0_1(
+        ctx: RequestContext<Self::Context>,
+        headers: Header<Authorization>,
+        params: PathParams<SessionTargetParams>,
+    ) -> Result<HttpResponseUpdatedNoContent, HttpError> {
+        preflight(ctx.context(), headers, params, None)
     }
 
     async fn server_nonce(
@@ -130,23 +172,14 @@ impl SushApi for ApiServer {
     }
 
     async fn session_start(
-        ctx: RequestContext<Self::Context>,
+        _ctx: RequestContext<Self::Context>,
         headers: Header<Authorization>,
-        params: PathParams<SessionIdParam>,
-        body: TypedBody<SessionStartBody>,
+        _params: PathParams<SessionIdParam>,
+        _body: TypedBody<v0_1::SessionStartBody>,
     ) -> Result<HttpResponseUpdatedNoContent, HttpError> {
-        let mgr = ctx.context();
         let Authorization { authorization } = headers.into_inner();
-        let authn = requester(authorization)?;
-        let SessionIdParam { session_id } = params.into_inner();
-        let SessionStartBody {
-            client_nonce,
-            signer_nonce,
-            seq,
-        } = body.into_inner();
-        mgr.session_start(&authn, session_id, client_nonce, signer_nonce, seq)
-            .await?;
-        Ok(HttpResponseUpdatedNoContent())
+        requester(authorization)?;
+        Err(JobError::ClientTooOld.into())
     }
 
     async fn session_stop(
@@ -209,24 +242,38 @@ impl SushApi for ApiServer {
     async fn job_start(
         ctx: RequestContext<Self::Context>,
         headers: Header<Authorization>,
-        params: PathParams<JobTargetParams>,
+        path: PathParams<JobTargetParams>,
         query: QueryParams<JobStartParams>,
+        body: TypedBody<JobStartBody>,
+    ) -> Result<HttpResponseOk<JobStarted>, HttpError> {
+        let JobStartBody { job, session } = body.into_inner();
+        start(
+            ctx.context(),
+            headers,
+            path,
+            query.into_inner(),
+            job,
+            session,
+        )
+        .await
+    }
+
+    async fn job_start_v0_1(
+        ctx: RequestContext<Self::Context>,
+        headers: Header<Authorization>,
+        path: PathParams<JobTargetParams>,
+        query: QueryParams<v0_1::JobStartParams>,
         body: TypedBody<SignedJob>,
     ) -> Result<HttpResponseOk<JobStarted>, HttpError> {
-        let mgr = ctx.context();
-        let Authorization { authorization } = headers.into_inner();
-        let authn = requester(authorization)?;
-        let JobTargetParams { job_id, target: _ } = params.into_inner();
-        let job = body.into_inner();
-        if *job.job_id() != job_id {
-            return Err(HttpError::for_client_error(
-                None,
-                ClientErrorStatusCode::BAD_REQUEST,
-                String::from("Path parameter job ID does not match body"),
-            ));
-        }
-        let sleds = mgr.job_start(&authn, job, query.into_inner()).await?;
-        Ok(HttpResponseOk(JobStarted { sleds }))
+        start(
+            ctx.context(),
+            headers,
+            path,
+            query.into_inner().into(),
+            body.into_inner(),
+            None,
+        )
+        .await
     }
 
     async fn job_stop(

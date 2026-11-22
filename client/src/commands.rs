@@ -43,7 +43,7 @@ use tokio_tungstenite::tungstenite::protocol::Role;
 use x509_cert::Certificate;
 use x509_cert::der::DecodePem as _;
 
-use sush_api::{ErrorCode, JobWait};
+use sush_api::{ErrorCode, JobStartBody, JobWait, SessionDetails};
 use sush_common::authn::{
     AuthnError, Challenge, ChallengeResponse, Credentials, Identity, RequestKey,
 };
@@ -68,7 +68,7 @@ use crate::permslip::{PermslipAuthn, PermslipError, PermslipSigner};
 use crate::repl::Repl;
 use crate::tls;
 use crate::tunnel::{Tunnel, TunnelError};
-use crate::types::{Error as ApiError, SessionStartBody};
+use crate::types::Error as ApiError;
 use crate::{AuthzSigner, Client, Error as ClientError};
 
 // Names of environment variables for argument defaults
@@ -536,9 +536,6 @@ pub enum SessionCommand {
 
         /// The session sequence number assigned by the signing server.
         seq: Option<SessionSeq>,
-
-        /// Override the client nonce generated and stashed by `session start-params`.
-        client_nonce: Option<SessionClientNonce>,
 
         /// Use `permslip` to sign sessions and jobs with this key name.
         #[cfg(feature = "permslip")]
@@ -1081,10 +1078,23 @@ async fn session(
             },
             Some(client),
         ) => {
-            let session = match with_login(ctx, client, async || client.session().send().await)
+            let view = with_login(ctx, client, async || client.session().send().await)
                 .await?
-                .into_inner()
+                .into_inner();
+            if session_id.is_none()
+                && ctx.session_details().is_some()
+                && let Some(pending) = ctx.session_id()
             {
+                let current = match &view {
+                    SessionView::Visible(session) => session.session_id(),
+                    SessionView::Hidden(session_id) => *session_id,
+                };
+                if current != pending {
+                    ctx.session_pending(current, pending);
+                    return Ok(());
+                }
+            }
+            let session = match view {
                 SessionView::Visible(session) => *session,
                 SessionView::Hidden(session_id) => {
                     return Err(CommandError::SessionHidden(session_id));
@@ -1121,7 +1131,6 @@ async fn session(
                 session_id,
                 nonce,
                 seq,
-                client_nonce,
                 permslip_key,
                 permslip_url,
                 force,
@@ -1130,15 +1139,16 @@ async fn session(
         ) => {
             // Creation already announces the session; don't echo it
             // when the start succeeds.
-            let (session_id, body, show) =
+            let (session_id, details, show) =
                 if let (Some(session_id), Some(signer_nonce), Some(seq)) = (session_id, nonce, seq)
                 {
-                    let client_nonce = client_nonce
-                        .or_else(|| ctx.pending_client_nonce())
+                    let (baseboard, client_nonce) = ctx
+                        .pending_ceremony()
                         .ok_or(CommandError::MissingClientNonce)?;
                     (
                         session_id,
-                        SessionStartBody {
+                        SessionDetails {
+                            baseboard,
                             client_nonce,
                             signer_nonce,
                             seq,
@@ -1168,7 +1178,8 @@ async fn session(
                     ctx.session_created(Session::new(session_id), signer_nonce, seq);
                     (
                         session_id,
-                        SessionStartBody {
+                        SessionDetails {
+                            baseboard: baseboard_id,
                             client_nonce,
                             signer_nonce,
                             seq,
@@ -1176,7 +1187,8 @@ async fn session(
                         false,
                     )
                 };
-            session_start(ctx, client, session_id, body, show).await
+            ctx.session_started(Session::new(session_id), details, show);
+            Ok(())
         }
 
         #[cfg(feature = "permslip")]
@@ -1207,7 +1219,6 @@ async fn session(
                 session_id,
                 nonce,
                 seq,
-                client_nonce,
                 force,
             },
             Some(client),
@@ -1217,21 +1228,17 @@ async fn session(
             let (Some(session_id), Some(signer_nonce), Some(seq)) = (session_id, nonce, seq) else {
                 return session_start_params(ctx, client, force).await;
             };
-            let client_nonce = client_nonce
-                .or_else(|| ctx.pending_client_nonce())
+            let (baseboard, client_nonce) = ctx
+                .pending_ceremony()
                 .ok_or(CommandError::MissingClientNonce)?;
-            session_start(
-                ctx,
-                client,
-                session_id,
-                SessionStartBody {
-                    client_nonce,
-                    signer_nonce,
-                    seq,
-                },
-                true,
-            )
-            .await
+            let details = SessionDetails {
+                baseboard,
+                client_nonce,
+                signer_nonce,
+                seq,
+            };
+            ctx.session_started(Session::new(session_id), details, true);
+            Ok(())
         }
 
         (
@@ -1412,7 +1419,12 @@ async fn job(
                         if !matches!(error, CommandError::Session(_))
                             && ctx.next_job_id().ok() == Some(job_id) =>
                     {
-                        Err(CommandError::JobNotStarted(job_id, Box::new(error)))
+                        let error = Box::new(error);
+                        Err(if ctx.session_details().is_some() {
+                            CommandError::FirstJobNotStarted(job_id, error)
+                        } else {
+                            CommandError::JobNotStarted(job_id, error)
+                        })
                     }
                     result => result,
                 }
@@ -1436,6 +1448,9 @@ async fn job(
             let Some(session_id) = ctx.session_id() else {
                 return Err(CommandError::MissingSession);
             };
+            if ctx.session_details().is_some() {
+                return Err(CommandError::FirstJobSkip);
+            }
             let job_id = match job_id {
                 Some(job_id) => job_id,
                 None => ctx.next_job_id()?,
@@ -1569,26 +1584,42 @@ async fn job_start(
         max_mem,
         max_fsize,
     } = limits.as_limits();
+    let details = ctx
+        .session_details()
+        .filter(|_| ctx.session_id() == Some(job.payload().session_id()));
     let mut start_ctx = ctx.clone();
-    let start = with_login(&mut start_ctx, client, async || {
-        let mut start = client
-            .job_start()
-            .job_id(job.job_id())
-            .target(target.to_string())
-            .max_cpu(max_cpu)
-            .max_mem(max_mem)
-            .max_fsize(max_fsize)
-            .wait(wait)
-            .body(job.clone());
-        if let Some(term) = term.as_ref() {
-            start = start.term(term);
+    let start = async {
+        let response = with_login(&mut start_ctx, client, async || {
+            let mut start = client
+                .job_start()
+                .job_id(job.job_id())
+                .target(target.to_string())
+                .max_cpu(max_cpu)
+                .max_mem(max_mem)
+                .max_fsize(max_fsize)
+                .wait(wait)
+                .body(JobStartBody {
+                    job: job.clone(),
+                    session: details.clone(),
+                });
+            if let Some(details) = &details {
+                start = start.via(details.baseboard.to_string());
+            }
+            if let Some(term) = term.as_ref() {
+                start = start.term(term);
+            }
+            if let Ok(winsize) = tcgetwinsize(stdin()) {
+                start = start.rows(winsize.ws_row);
+                start = start.cols(winsize.ws_col);
+            }
+            start.send().await
+        })
+        .await;
+        if response.is_ok() && details.is_some() {
+            start_ctx.first_job_started();
         }
-        if let Ok(winsize) = tcgetwinsize(stdin()) {
-            start = start.rows(winsize.ws_row);
-            start = start.cols(winsize.ws_col);
-        }
-        start.send().await
-    });
+        response
+    };
     pin!(start);
 
     // Start the job.
@@ -1899,8 +1930,8 @@ async fn session_start_params(
     .await?;
     let client_nonce = SessionClientNonce::random();
     let sush_nonce = SessionSushNonce::compute(client_nonce, nonce);
-    ctx.save_client_nonce(client_nonce);
-    ctx.session_start_params(baseboard_id, client_nonce, sush_nonce);
+    ctx.save_ceremony(&baseboard_id, client_nonce);
+    ctx.session_start_params(baseboard_id, sush_nonce);
     Ok(())
 }
 
@@ -1952,13 +1983,22 @@ async fn job_start_request(
         };
 
     if let Some(client) = client {
+        let details = ctx.session_details();
         with_login(ctx, client, async || {
-            client
+            let mut preflight = client
                 .job_preflight()
                 .session_id(session_id)
-                .target(target.to_string())
-                .send()
-                .await
+                .target(target.to_string());
+            if let Some(details) = &details {
+                let baseboard = details.baseboard.to_string();
+                preflight = preflight
+                    .baseboard(&baseboard)
+                    .client_nonce(details.client_nonce)
+                    .signer_nonce(details.signer_nonce)
+                    .seq(details.seq)
+                    .via(baseboard);
+            }
+            preflight.send().await
         })
         .await?;
     }
@@ -1984,30 +2024,6 @@ async fn session_create(
     let mut signer = permslip_signer(ctx, &permslip_key, &permslip_url).await?;
     let created = signer.create_session(baseboard_id, nonce).await?;
     Ok((created.session_id, created.signer_nonce, created.seq))
-}
-
-async fn session_start(
-    ctx: &mut impl CommandContext,
-    client: &Client,
-    session_id: SessionId,
-    body: SessionStartBody,
-    show: bool,
-) -> Result<(), CommandError> {
-    let session = Session::new(session_id);
-    with_login(ctx, client, async || {
-        client
-            .session_start()
-            .session_id(session.session_id())
-            .body(body.clone())
-            .send()
-            .await
-    })
-    .await?
-    .into_inner();
-    if show {
-        ctx.session_started(session, true);
-    }
-    Ok(())
 }
 
 async fn job_stop(
@@ -2815,6 +2831,10 @@ pub enum CommandError {
     JobNotOnSled(JobId, BaseboardId),
     #[error("Job `{0}` was signed but not started, try `job skip`")]
     JobNotStarted(JobId, Box<CommandError>),
+    #[error("Job `{0}` was the session's first, but was not started; try `session start`")]
+    FirstJobNotStarted(JobId, Box<CommandError>),
+    #[error("The session begins on the rack with its first job, which can't be skipped")]
+    FirstJobSkip,
     #[error("Job `{0}` is not yet running")]
     JobNotYetRunning(JobId),
     #[error("Job `{0}` was skipped on this sled: {1}")]
@@ -2829,7 +2849,7 @@ pub enum CommandError {
     Key(#[from] KeyError),
     #[error("Length mismatch: expected {expected} bytes, received {received}")]
     LengthMismatch { expected: u64, received: u64 },
-    #[error("Missing client nonce: run `session start-params` first, or pass one")]
+    #[error("Missing client nonce: run `session start-params` first")]
     MissingClientNonce,
     #[error("Missing job command, try `--help`")]
     MissingCommand,
@@ -2943,7 +2963,9 @@ impl CommandError {
     fn icon(&self) -> &'static str {
         match self {
             Self::Clap(_) => "❓",
-            Self::JobNotStarted(..) | Self::PartialOutput(..) => "❗",
+            Self::JobNotStarted(..) | Self::FirstJobNotStarted(..) | Self::PartialOutput(..) => {
+                "❗"
+            }
             Self::JobSkipped(..) => "⏩",
             Self::Quit => "👋",
             Self::Recursive(error) => error.icon(),
@@ -2954,7 +2976,7 @@ impl CommandError {
     /// The icon and message of each error in this one, inner first.
     pub fn errors(&self) -> Vec<(&'static str, String)> {
         match self {
-            Self::JobNotStarted(_, error) => {
+            Self::JobNotStarted(_, error) | Self::FirstJobNotStarted(_, error) => {
                 let mut errors = error.errors();
                 errors.push((self.icon(), self.to_string()));
                 errors

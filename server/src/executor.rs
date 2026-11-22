@@ -264,6 +264,7 @@ async fn job_spawn(launch: Launch) {
         rows,
         cols,
         wait: _,
+        via: _,
     } = params;
     let mut limits = match requested.clone().clamp() {
         Ok(limits) => limits,

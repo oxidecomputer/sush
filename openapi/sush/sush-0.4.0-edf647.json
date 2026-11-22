@@ -1,0 +1,1842 @@
+{
+  "openapi": "3.0.3",
+  "info": {
+    "title": "Oxide Support Shell",
+    "version": "0.4.0"
+  },
+  "paths": {
+    "/certs/{key_id}": {
+      "get": {
+        "summary": "Get the certificate chain that validates a key.",
+        "description": "Certificates are in root-to-leaf order, PEM encoded and newline separated.",
+        "operationId": "cert_chain",
+        "parameters": [
+          {
+            "in": "header",
+            "name": "authorization",
+            "description": "Authorization to access some resource, such as a signature.\n\nSee: <https://developer.mozilla.org/en-US/docs/Web/HTTP/Reference/Headers/Authorization>",
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "in": "path",
+            "name": "key_id",
+            "required": true,
+            "schema": {
+              "$ref": "#/components/schemas/KeyId"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "successful operation",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "title": "String",
+                  "type": "string"
+                }
+              }
+            }
+          },
+          "4XX": {
+            "$ref": "#/components/responses/Error"
+          },
+          "5XX": {
+            "$ref": "#/components/responses/Error"
+          }
+        }
+      }
+    },
+    "/iam": {
+      "get": {
+        "summary": "Return the caller's identity.",
+        "operationId": "identities",
+        "parameters": [
+          {
+            "in": "header",
+            "name": "authorization",
+            "description": "Authorization to access some resource, such as a signature.\n\nSee: <https://developer.mozilla.org/en-US/docs/Web/HTTP/Reference/Headers/Authorization>",
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "successful operation",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "title": "Array_of_Identity",
+                  "type": "array",
+                  "items": {
+                    "$ref": "#/components/schemas/Identity"
+                  }
+                }
+              }
+            }
+          },
+          "4XX": {
+            "$ref": "#/components/responses/Error"
+          },
+          "5XX": {
+            "$ref": "#/components/responses/Error"
+          }
+        }
+      },
+      "post": {
+        "summary": "Prove and register identity.",
+        "operationId": "iam",
+        "parameters": [
+          {
+            "in": "header",
+            "name": "authorization",
+            "description": "Authorization to access some resource, such as a signature.\n\nSee: <https://developer.mozilla.org/en-US/docs/Web/HTTP/Reference/Headers/Authorization>",
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "in": "query",
+            "name": "via",
+            "description": "Where a proxy should route this request.",
+            "schema": {
+              "nullable": true,
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "nullable": true,
+                "title": "Nullable_String",
+                "type": "string"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "description": "successful operation",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Identity"
+                }
+              }
+            }
+          },
+          "4XX": {
+            "$ref": "#/components/responses/Error"
+          },
+          "5XX": {
+            "$ref": "#/components/responses/Error"
+          }
+        }
+      }
+    },
+    "/jobs": {
+      "get": {
+        "summary": "List known jobs sorted by start time, most recent first.",
+        "description": "Offsets may shift under concurrent eviction, so pagination is currently best-effort.",
+        "operationId": "job_history",
+        "parameters": [
+          {
+            "in": "header",
+            "name": "authorization",
+            "description": "Authorization to access some resource, such as a signature.\n\nSee: <https://developer.mozilla.org/en-US/docs/Web/HTTP/Reference/Headers/Authorization>",
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "in": "query",
+            "name": "limit",
+            "description": "limit=0 means all jobs",
+            "schema": {
+              "type": "integer",
+              "format": "uint32",
+              "minimum": 0
+            }
+          },
+          {
+            "in": "query",
+            "name": "offset",
+            "schema": {
+              "type": "integer",
+              "format": "uint32",
+              "minimum": 0
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "successful operation",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "title": "Array_of_JobRecord",
+                  "type": "array",
+                  "items": {
+                    "$ref": "#/components/schemas/JobRecord"
+                  }
+                }
+              }
+            }
+          },
+          "4XX": {
+            "$ref": "#/components/responses/Error"
+          },
+          "5XX": {
+            "$ref": "#/components/responses/Error"
+          }
+        }
+      }
+    },
+    "/jobs/{job_id}/attach/{target}": {
+      "get": {
+        "summary": "Attach to an interactive job.",
+        "operationId": "job_attach",
+        "parameters": [
+          {
+            "in": "header",
+            "name": "authorization",
+            "description": "Authorization to access some resource, such as a signature.\n\nSee: <https://developer.mozilla.org/en-US/docs/Web/HTTP/Reference/Headers/Authorization>",
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "in": "path",
+            "name": "job_id",
+            "description": "Which job to act on.",
+            "required": true,
+            "schema": {
+              "$ref": "#/components/schemas/JobId"
+            }
+          },
+          {
+            "in": "path",
+            "name": "target",
+            "description": "Used by proxies for routing.",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "in": "query",
+            "name": "via",
+            "description": "Where a proxy should route this request.",
+            "schema": {
+              "nullable": true,
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "101": {
+            "description": "Negotiating protocol upgrade from HTTP/1.1 to WebSocket"
+          },
+          "4XX": {
+            "$ref": "#/components/responses/Error"
+          },
+          "5XX": {
+            "$ref": "#/components/responses/Error"
+          }
+        },
+        "x-dropshot-websocket": {}
+      }
+    },
+    "/jobs/{job_id}/output/{target}/{stream}": {
+      "get": {
+        "summary": "Get (a subset of) the standard output or standard error of a job.",
+        "operationId": "job_output",
+        "parameters": [
+          {
+            "in": "header",
+            "name": "authorization",
+            "description": "Authorization to access the range.\n\nSee: <https://developer.mozilla.org/en-US/docs/Web/HTTP/Reference/Headers/Authorization>",
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "in": "header",
+            "name": "range",
+            "description": "A request to access a portion of the resource, such as `bytes=0-499`\n\nSee: <https://developer.mozilla.org/en-US/docs/Web/HTTP/Reference/Headers/Range>",
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "in": "path",
+            "name": "job_id",
+            "required": true,
+            "schema": {
+              "$ref": "#/components/schemas/JobId"
+            }
+          },
+          {
+            "in": "path",
+            "name": "stream",
+            "required": true,
+            "schema": {
+              "$ref": "#/components/schemas/JobOutputStream"
+            }
+          },
+          {
+            "in": "path",
+            "name": "target",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "in": "query",
+            "name": "via",
+            "description": "Where a proxy should route this request.",
+            "schema": {
+              "nullable": true,
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "default": {
+            "description": "",
+            "content": {
+              "*/*": {
+                "schema": {}
+              }
+            }
+          }
+        }
+      }
+    },
+    "/jobs/{job_id}/start/{target}": {
+      "post": {
+        "summary": "Start an authorized job.",
+        "description": "If session details are provided, also start a new session.",
+        "operationId": "job_start",
+        "parameters": [
+          {
+            "in": "header",
+            "name": "authorization",
+            "description": "Authorization to access some resource, such as a signature.\n\nSee: <https://developer.mozilla.org/en-US/docs/Web/HTTP/Reference/Headers/Authorization>",
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "in": "path",
+            "name": "job_id",
+            "description": "Which job to act on.",
+            "required": true,
+            "schema": {
+              "$ref": "#/components/schemas/JobId"
+            }
+          },
+          {
+            "in": "path",
+            "name": "target",
+            "description": "Used by proxies for routing.",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "in": "query",
+            "name": "cols",
+            "description": "Terminal window width for interactive jobs.",
+            "schema": {
+              "nullable": true,
+              "type": "integer",
+              "format": "uint16",
+              "minimum": 0
+            }
+          },
+          {
+            "in": "query",
+            "name": "max_cpu",
+            "description": "Maximum CPU use in seconds.",
+            "required": true,
+            "schema": {
+              "type": "integer",
+              "format": "uint64",
+              "minimum": 0
+            }
+          },
+          {
+            "in": "query",
+            "name": "max_fsize",
+            "description": "Maximum file size in bytes.",
+            "required": true,
+            "schema": {
+              "type": "integer",
+              "format": "uint64",
+              "minimum": 0
+            }
+          },
+          {
+            "in": "query",
+            "name": "max_mem",
+            "description": "Maximum size of address space in bytes.",
+            "required": true,
+            "schema": {
+              "type": "integer",
+              "format": "uint64",
+              "minimum": 0
+            }
+          },
+          {
+            "in": "query",
+            "name": "rows",
+            "description": "Terminal window height for interactive jobs.",
+            "schema": {
+              "nullable": true,
+              "type": "integer",
+              "format": "uint16",
+              "minimum": 0
+            }
+          },
+          {
+            "in": "query",
+            "name": "term",
+            "description": "Terminal type for interactive jobs.",
+            "schema": {
+              "nullable": true,
+              "type": "string"
+            }
+          },
+          {
+            "in": "query",
+            "name": "via",
+            "description": "Where a proxy should route the job request.",
+            "schema": {
+              "nullable": true,
+              "type": "string"
+            }
+          },
+          {
+            "in": "query",
+            "name": "wait",
+            "description": "Wait for the job to start or stop.",
+            "schema": {
+              "$ref": "#/components/schemas/JobWait"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/JobStartBody"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "description": "successful operation",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/JobStarted"
+                }
+              }
+            }
+          },
+          "4XX": {
+            "$ref": "#/components/responses/Error"
+          },
+          "5XX": {
+            "$ref": "#/components/responses/Error"
+          }
+        }
+      }
+    },
+    "/jobs/{job_id}/status": {
+      "get": {
+        "summary": "Get the status of a job across the rack.",
+        "operationId": "job_status",
+        "parameters": [
+          {
+            "in": "header",
+            "name": "authorization",
+            "description": "Authorization to access some resource, such as a signature.\n\nSee: <https://developer.mozilla.org/en-US/docs/Web/HTTP/Reference/Headers/Authorization>",
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "in": "path",
+            "name": "job_id",
+            "required": true,
+            "schema": {
+              "$ref": "#/components/schemas/JobId"
+            }
+          },
+          {
+            "in": "query",
+            "name": "via",
+            "description": "Where a proxy should route this request.",
+            "schema": {
+              "nullable": true,
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "successful operation",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/JobRecord"
+                }
+              }
+            }
+          },
+          "4XX": {
+            "$ref": "#/components/responses/Error"
+          },
+          "5XX": {
+            "$ref": "#/components/responses/Error"
+          }
+        }
+      }
+    },
+    "/jobs/{job_id}/stop": {
+      "post": {
+        "summary": "Stop a (running) job.",
+        "operationId": "job_stop",
+        "parameters": [
+          {
+            "in": "header",
+            "name": "authorization",
+            "description": "Authorization to access some resource, such as a signature.\n\nSee: <https://developer.mozilla.org/en-US/docs/Web/HTTP/Reference/Headers/Authorization>",
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "in": "path",
+            "name": "job_id",
+            "required": true,
+            "schema": {
+              "$ref": "#/components/schemas/JobId"
+            }
+          },
+          {
+            "in": "query",
+            "name": "via",
+            "description": "Where a proxy should route this request. Sleds ignore it.",
+            "schema": {
+              "nullable": true,
+              "type": "string"
+            }
+          },
+          {
+            "in": "query",
+            "name": "wait",
+            "description": "Wait for the job process to end.",
+            "schema": {
+              "$ref": "#/components/schemas/JobWait"
+            }
+          }
+        ],
+        "responses": {
+          "204": {
+            "description": "resource updated"
+          },
+          "4XX": {
+            "$ref": "#/components/responses/Error"
+          },
+          "5XX": {
+            "$ref": "#/components/responses/Error"
+          }
+        }
+      }
+    },
+    "/server-nonce": {
+      "get": {
+        "summary": "Get this server's nonce for the session ceremony.",
+        "description": "The client mixes its own nonce with this one to form the sush nonce it submits to the signer. Each identity gets its own nonce, which stays the same until the next session starts.",
+        "operationId": "server_nonce",
+        "parameters": [
+          {
+            "in": "header",
+            "name": "authorization",
+            "description": "Authorization to access some resource, such as a signature.\n\nSee: <https://developer.mozilla.org/en-US/docs/Web/HTTP/Reference/Headers/Authorization>",
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "successful operation",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/SessionServerNonce"
+                }
+              }
+            }
+          },
+          "4XX": {
+            "$ref": "#/components/responses/Error"
+          },
+          "5XX": {
+            "$ref": "#/components/responses/Error"
+          }
+        }
+      }
+    },
+    "/session": {
+      "get": {
+        "summary": "Get the current session from this server's point of view.",
+        "description": "Full information about a session (who started it, its last job, etc) is available only to the identity that started it and identities to whom they have granted access.",
+        "operationId": "session",
+        "parameters": [
+          {
+            "in": "header",
+            "name": "authorization",
+            "description": "Authorization to access some resource, such as a signature.\n\nSee: <https://developer.mozilla.org/en-US/docs/Web/HTTP/Reference/Headers/Authorization>",
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "successful operation",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/SessionView"
+                }
+              }
+            }
+          },
+          "4XX": {
+            "$ref": "#/components/responses/Error"
+          },
+          "5XX": {
+            "$ref": "#/components/responses/Error"
+          }
+        }
+      }
+    },
+    "/sessions/{session_id}/allow/{key_id}": {
+      "post": {
+        "summary": "Grant an identity access to a session.",
+        "description": "Only the identity that started the session may grant access.",
+        "operationId": "session_allow",
+        "parameters": [
+          {
+            "in": "header",
+            "name": "authorization",
+            "description": "Authorization to access some resource, such as a signature.\n\nSee: <https://developer.mozilla.org/en-US/docs/Web/HTTP/Reference/Headers/Authorization>",
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "in": "path",
+            "name": "key_id",
+            "required": true,
+            "schema": {
+              "$ref": "#/components/schemas/KeyId"
+            }
+          },
+          {
+            "in": "path",
+            "name": "session_id",
+            "required": true,
+            "schema": {
+              "$ref": "#/components/schemas/SessionId"
+            }
+          },
+          {
+            "in": "query",
+            "name": "access",
+            "description": "How much access to grant. Read-only if omitted.",
+            "schema": {
+              "$ref": "#/components/schemas/Access"
+            }
+          }
+        ],
+        "responses": {
+          "204": {
+            "description": "resource updated"
+          },
+          "4XX": {
+            "$ref": "#/components/responses/Error"
+          },
+          "5XX": {
+            "$ref": "#/components/responses/Error"
+          }
+        }
+      }
+    },
+    "/sessions/{session_id}/deny/{key_id}": {
+      "post": {
+        "summary": "Withdraw access to a session.",
+        "description": "Only the identity that started the session may withdraw access. Already attached connections are not affected.",
+        "operationId": "session_deny",
+        "parameters": [
+          {
+            "in": "header",
+            "name": "authorization",
+            "description": "Authorization to access some resource, such as a signature.\n\nSee: <https://developer.mozilla.org/en-US/docs/Web/HTTP/Reference/Headers/Authorization>",
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "in": "path",
+            "name": "key_id",
+            "required": true,
+            "schema": {
+              "$ref": "#/components/schemas/KeyId"
+            }
+          },
+          {
+            "in": "path",
+            "name": "session_id",
+            "required": true,
+            "schema": {
+              "$ref": "#/components/schemas/SessionId"
+            }
+          }
+        ],
+        "responses": {
+          "204": {
+            "description": "resource updated"
+          },
+          "4XX": {
+            "$ref": "#/components/responses/Error"
+          },
+          "5XX": {
+            "$ref": "#/components/responses/Error"
+          }
+        }
+      }
+    },
+    "/sessions/{session_id}/preflight/{target}": {
+      "get": {
+        "summary": "Check that this server would accept a job in a session for a target.",
+        "description": "Succeeds if the authenticated identity has read-write access to the current session, or can supply a valid session ID derivation for a session that would supersede it. The target must also resolve to at least one sled this server can reach.",
+        "operationId": "job_preflight",
+        "parameters": [
+          {
+            "in": "header",
+            "name": "authorization",
+            "description": "Authorization to access some resource, such as a signature.\n\nSee: <https://developer.mozilla.org/en-US/docs/Web/HTTP/Reference/Headers/Authorization>",
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "in": "path",
+            "name": "session_id",
+            "required": true,
+            "schema": {
+              "$ref": "#/components/schemas/SessionId"
+            }
+          },
+          {
+            "in": "path",
+            "name": "target",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "in": "query",
+            "name": "baseboard",
+            "schema": {
+              "nullable": true,
+              "type": "string"
+            }
+          },
+          {
+            "in": "query",
+            "name": "client_nonce",
+            "schema": {
+              "$ref": "#/components/schemas/SessionClientNonce"
+            }
+          },
+          {
+            "in": "query",
+            "name": "seq",
+            "schema": {
+              "$ref": "#/components/schemas/SessionSeq"
+            }
+          },
+          {
+            "in": "query",
+            "name": "signer_nonce",
+            "schema": {
+              "$ref": "#/components/schemas/SessionSignerNonce"
+            }
+          },
+          {
+            "in": "query",
+            "name": "via",
+            "schema": {
+              "nullable": true,
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "204": {
+            "description": "resource updated"
+          },
+          "4XX": {
+            "$ref": "#/components/responses/Error"
+          },
+          "5XX": {
+            "$ref": "#/components/responses/Error"
+          }
+        }
+      }
+    },
+    "/sessions/{session_id}/skip/{job_id}": {
+      "post": {
+        "summary": "Burn a job ID in the current session.",
+        "operationId": "session_skip_job",
+        "parameters": [
+          {
+            "in": "header",
+            "name": "authorization",
+            "description": "Authorization to access some resource, such as a signature.\n\nSee: <https://developer.mozilla.org/en-US/docs/Web/HTTP/Reference/Headers/Authorization>",
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "in": "path",
+            "name": "job_id",
+            "required": true,
+            "schema": {
+              "$ref": "#/components/schemas/JobId"
+            }
+          },
+          {
+            "in": "path",
+            "name": "session_id",
+            "required": true,
+            "schema": {
+              "$ref": "#/components/schemas/SessionId"
+            }
+          }
+        ],
+        "responses": {
+          "204": {
+            "description": "resource updated"
+          },
+          "4XX": {
+            "$ref": "#/components/responses/Error"
+          },
+          "5XX": {
+            "$ref": "#/components/responses/Error"
+          }
+        }
+      }
+    },
+    "/sessions/{session_id}/stop": {
+      "post": {
+        "summary": "End a support session.",
+        "operationId": "session_stop",
+        "parameters": [
+          {
+            "in": "header",
+            "name": "authorization",
+            "description": "Authorization to access some resource, such as a signature.\n\nSee: <https://developer.mozilla.org/en-US/docs/Web/HTTP/Reference/Headers/Authorization>",
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "in": "path",
+            "name": "session_id",
+            "required": true,
+            "schema": {
+              "$ref": "#/components/schemas/SessionId"
+            }
+          }
+        ],
+        "responses": {
+          "204": {
+            "description": "resource updated"
+          },
+          "4XX": {
+            "$ref": "#/components/responses/Error"
+          },
+          "5XX": {
+            "$ref": "#/components/responses/Error"
+          }
+        }
+      }
+    },
+    "/target": {
+      "get": {
+        "summary": "Get the baseboard ID of the sled handling this request.",
+        "description": "A client may resolve a target (e.g., a cubby number) to a baseboard ID by passing it as the `via` parameter when this request is routed through a proxy. The proxy will forward the request using its own cubby map.\n\nUnauthenticated because the proxy probes servers using this endpoint, and lacks an identity to authenticate with.",
+        "operationId": "target",
+        "parameters": [
+          {
+            "in": "query",
+            "name": "via",
+            "description": "Where a proxy should route this request.",
+            "schema": {
+              "nullable": true,
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "successful operation",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/BaseboardId"
+                }
+              }
+            }
+          },
+          "4XX": {
+            "$ref": "#/components/responses/Error"
+          },
+          "5XX": {
+            "$ref": "#/components/responses/Error"
+          }
+        }
+      }
+    },
+    "/version": {
+      "get": {
+        "summary": "Get the version and git commit of the server's build.",
+        "description": "Unauthenticated, like `/target`.",
+        "operationId": "version",
+        "parameters": [
+          {
+            "in": "query",
+            "name": "via",
+            "description": "Where a proxy should route this request.",
+            "schema": {
+              "nullable": true,
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "successful operation",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/VersionInfo"
+                }
+              }
+            }
+          },
+          "4XX": {
+            "$ref": "#/components/responses/Error"
+          },
+          "5XX": {
+            "$ref": "#/components/responses/Error"
+          }
+        }
+      }
+    },
+    "/versions": {
+      "get": {
+        "summary": "Get the cubby, baseboard, and build of every known sled.",
+        "description": "Unauthenticated, like `/target`.",
+        "operationId": "versions",
+        "parameters": [
+          {
+            "in": "query",
+            "name": "via",
+            "description": "Where a proxy should route this request.",
+            "schema": {
+              "nullable": true,
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "successful operation",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "title": "Array_of_SledVersion",
+                  "type": "array",
+                  "items": {
+                    "$ref": "#/components/schemas/SledVersion"
+                  }
+                }
+              }
+            }
+          },
+          "4XX": {
+            "$ref": "#/components/responses/Error"
+          },
+          "5XX": {
+            "$ref": "#/components/responses/Error"
+          }
+        }
+      }
+    }
+  },
+  "components": {
+    "schemas": {
+      "BaseboardId": {
+        "description": "A representation of a Baseboard ID as used in the inventory subsystem.\n\nThis type is essentially the same as a `Baseboard` except it doesn't have a revision or HW type (Gimlet, PC, Unknown).",
+        "type": "object",
+        "properties": {
+          "part_number": {
+            "description": "Oxide Part Number",
+            "type": "string"
+          },
+          "serial_number": {
+            "description": "Serial number (unique for a given part number)",
+            "type": "string"
+          }
+        },
+        "required": [
+          "part_number",
+          "serial_number"
+        ]
+      },
+      "EccR": {
+        "description": "The first half of a 256 bit elliptic-curve signature: the scalar `r` of an ECDSA pair, or the encoded point `R` of an Ed25519 signature. It is carried as an opaque 256 bit value to which only the signature algorithm assigns meaning.",
+        "type": "string"
+      },
+      "EccS": {
+        "description": "The second half of a 256 bit elliptic-curve signature: the scalar `s` of an ECDSA pair, or the little-endian scalar `S` of an Ed25519 signature. It is carried as an opaque 256 bit value like [`EccR`].",
+        "type": "string"
+      },
+      "EncodedSignature": {
+        "description": "Code phrase encoded signature.\n\nThe decoded phrases `r` and `s` together comprise a signature _(r, s)_ over a 256 bit elliptic curve.\n\nThe `flags` and `counter` parameters are for the [`SK-*` family of SSH public keys](https://cvsweb.openbsd.org/src/usr.bin/ssh/PROTOCOL.u2f?annotate=HEAD). They should be set to 0 for other key types.",
+        "type": "object",
+        "properties": {
+          "counter": {
+            "type": "integer",
+            "format": "uint32",
+            "minimum": 0
+          },
+          "flags": {
+            "type": "integer",
+            "format": "uint8",
+            "minimum": 0
+          },
+          "r": {
+            "$ref": "#/components/schemas/EccR"
+          },
+          "s": {
+            "$ref": "#/components/schemas/EccS"
+          }
+        },
+        "required": [
+          "r",
+          "s"
+        ]
+      },
+      "Error": {
+        "description": "Error information from a response.",
+        "type": "object",
+        "properties": {
+          "error_code": {
+            "type": "string"
+          },
+          "message": {
+            "type": "string"
+          },
+          "request_id": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "message",
+          "request_id"
+        ]
+      },
+      "Identity": {
+        "description": "An authenticated identity.",
+        "type": "object",
+        "properties": {
+          "key_id": {
+            "$ref": "#/components/schemas/KeyId"
+          },
+          "nonce": {
+            "$ref": "#/components/schemas/Nonce"
+          },
+          "public_key": {
+            "type": "string"
+          },
+          "time_authenticated": {
+            "type": "string",
+            "format": "date-time"
+          }
+        },
+        "required": [
+          "key_id",
+          "nonce",
+          "public_key",
+          "time_authenticated"
+        ]
+      },
+      "JobId": {
+        "description": "A globally unique identifier for a job.",
+        "type": "string"
+      },
+      "JobMode": {
+        "description": "How a job runs. The streaming modes allow **unrecorded** I/O.",
+        "type": "string",
+        "enum": [
+          "batch",
+          "interactive",
+          "stream-input",
+          "stream-output"
+        ]
+      },
+      "JobOutputHash": {
+        "description": "SHA3-256 hash of job output, used as a checksum.",
+        "type": "string",
+        "format": "hex encoded hash (32 bytes)"
+      },
+      "JobOutputState": {
+        "type": "object",
+        "properties": {
+          "stderr_hash": {
+            "$ref": "#/components/schemas/JobOutputHash"
+          },
+          "stderr_len": {
+            "type": "integer",
+            "format": "uint64",
+            "minimum": 0
+          },
+          "stdout_hash": {
+            "$ref": "#/components/schemas/JobOutputHash"
+          },
+          "stdout_len": {
+            "type": "integer",
+            "format": "uint64",
+            "minimum": 0
+          }
+        },
+        "required": [
+          "stderr_hash",
+          "stderr_len",
+          "stdout_hash",
+          "stdout_len"
+        ]
+      },
+      "JobOutputStream": {
+        "description": "Either the standard output or standard error of a job.",
+        "type": "string",
+        "enum": [
+          "stdout",
+          "stderr"
+        ]
+      },
+      "JobRecord": {
+        "description": "What's known about a job.",
+        "type": "object",
+        "properties": {
+          "request": {
+            "nullable": true,
+            "description": "The signed job request, or `None` if it is unknown (e.g., the job was skipped).",
+            "allOf": [
+              {
+                "$ref": "#/components/schemas/Signed_for_JobStartRequest"
+              }
+            ]
+          },
+          "status": {
+            "description": "The fate of the job, as much as is known via gossip.",
+            "type": "object",
+            "additionalProperties": {
+              "$ref": "#/components/schemas/JobStatus"
+            }
+          }
+        },
+        "required": [
+          "status"
+        ]
+      },
+      "JobStartBody": {
+        "type": "object",
+        "properties": {
+          "job": {
+            "$ref": "#/components/schemas/Signed_for_JobStartRequest"
+          },
+          "session": {
+            "nullable": true,
+            "allOf": [
+              {
+                "$ref": "#/components/schemas/SessionDetails"
+              }
+            ]
+          }
+        },
+        "required": [
+          "job"
+        ]
+      },
+      "JobStartRequest": {
+        "description": "A request to run the given `command` as `job_id`.",
+        "type": "object",
+        "properties": {
+          "command": {
+            "type": "string"
+          },
+          "job_id": {
+            "$ref": "#/components/schemas/JobId"
+          },
+          "mode": {
+            "$ref": "#/components/schemas/JobMode"
+          },
+          "session_id": {
+            "$ref": "#/components/schemas/SessionId"
+          },
+          "target": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "command",
+          "job_id",
+          "session_id"
+        ]
+      },
+      "JobStarted": {
+        "description": "Acknowledgement that a job was accepted.",
+        "type": "object",
+        "properties": {
+          "sleds": {
+            "description": "Which sleds the job will run on.",
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/BaseboardId"
+            },
+            "uniqueItems": true
+          }
+        },
+        "required": [
+          "sleds"
+        ]
+      },
+      "JobStatus": {
+        "description": "The state of a job.",
+        "oneOf": [
+          {
+            "type": "object",
+            "properties": {
+              "Cancelled": {
+                "type": "object",
+                "properties": {
+                  "actor": {
+                    "$ref": "#/components/schemas/KeyId"
+                  },
+                  "job_id": {
+                    "$ref": "#/components/schemas/JobId"
+                  },
+                  "time_cancelled": {
+                    "type": "string",
+                    "format": "date-time"
+                  }
+                },
+                "required": [
+                  "actor",
+                  "job_id",
+                  "time_cancelled"
+                ]
+              }
+            },
+            "required": [
+              "Cancelled"
+            ],
+            "additionalProperties": false
+          },
+          {
+            "type": "object",
+            "properties": {
+              "Queued": {
+                "type": "object",
+                "properties": {
+                  "actor": {
+                    "$ref": "#/components/schemas/KeyId"
+                  },
+                  "job_id": {
+                    "$ref": "#/components/schemas/JobId"
+                  },
+                  "time_queued": {
+                    "type": "string",
+                    "format": "date-time"
+                  }
+                },
+                "required": [
+                  "actor",
+                  "job_id",
+                  "time_queued"
+                ]
+              }
+            },
+            "required": [
+              "Queued"
+            ],
+            "additionalProperties": false
+          },
+          {
+            "type": "object",
+            "properties": {
+              "Error": {
+                "type": "object",
+                "properties": {
+                  "error": {
+                    "$ref": "#/components/schemas/ProcessError"
+                  },
+                  "job_id": {
+                    "$ref": "#/components/schemas/JobId"
+                  },
+                  "time_error": {
+                    "type": "string",
+                    "format": "date-time"
+                  }
+                },
+                "required": [
+                  "error",
+                  "job_id",
+                  "time_error"
+                ]
+              }
+            },
+            "required": [
+              "Error"
+            ],
+            "additionalProperties": false
+          },
+          {
+            "type": "object",
+            "properties": {
+              "Started": {
+                "type": "object",
+                "properties": {
+                  "job_id": {
+                    "$ref": "#/components/schemas/JobId"
+                  },
+                  "time_started": {
+                    "type": "string",
+                    "format": "date-time"
+                  }
+                },
+                "required": [
+                  "job_id",
+                  "time_started"
+                ]
+              }
+            },
+            "required": [
+              "Started"
+            ],
+            "additionalProperties": false
+          },
+          {
+            "type": "object",
+            "properties": {
+              "Stopped": {
+                "type": "object",
+                "properties": {
+                  "job_id": {
+                    "$ref": "#/components/schemas/JobId"
+                  },
+                  "output": {
+                    "$ref": "#/components/schemas/JobOutputState"
+                  },
+                  "result": {
+                    "$ref": "#/components/schemas/Result_of_int32_or_ProcessError"
+                  },
+                  "time_started": {
+                    "type": "string",
+                    "format": "date-time"
+                  },
+                  "time_stopped": {
+                    "type": "string",
+                    "format": "date-time"
+                  }
+                },
+                "required": [
+                  "job_id",
+                  "output",
+                  "result",
+                  "time_started",
+                  "time_stopped"
+                ]
+              }
+            },
+            "required": [
+              "Stopped"
+            ],
+            "additionalProperties": false
+          },
+          {
+            "type": "object",
+            "properties": {
+              "Skipped": {
+                "type": "object",
+                "properties": {
+                  "job_id": {
+                    "$ref": "#/components/schemas/JobId"
+                  },
+                  "reason": {
+                    "$ref": "#/components/schemas/SkipReason"
+                  },
+                  "time_skipped": {
+                    "type": "string",
+                    "format": "date-time"
+                  }
+                },
+                "required": [
+                  "job_id",
+                  "reason",
+                  "time_skipped"
+                ]
+              }
+            },
+            "required": [
+              "Skipped"
+            ],
+            "additionalProperties": false
+          }
+        ]
+      },
+      "KeyId": {
+        "description": "SHA-256 of a certificate subject or an identity public key, encoded as a pseudorandom code phrase for storage & transport.",
+        "type": "string"
+      },
+      "LastJob": {
+        "oneOf": [
+          {
+            "type": "string",
+            "enum": [
+              "None"
+            ]
+          },
+          {
+            "type": "object",
+            "properties": {
+              "Some": {
+                "$ref": "#/components/schemas/Signed_for_JobStartRequest"
+              }
+            },
+            "required": [
+              "Some"
+            ],
+            "additionalProperties": false
+          },
+          {
+            "type": "object",
+            "properties": {
+              "Burned": {
+                "$ref": "#/components/schemas/JobId"
+              }
+            },
+            "required": [
+              "Burned"
+            ],
+            "additionalProperties": false
+          },
+          {
+            "type": "object",
+            "properties": {
+              "Resumed": {
+                "$ref": "#/components/schemas/JobId"
+              }
+            },
+            "required": [
+              "Resumed"
+            ],
+            "additionalProperties": false
+          }
+        ]
+      },
+      "Nonce": {
+        "description": "A unique random string. Authentication credentials have two of these: one generated by the server, and one by the client. This structure is agnostic to the syntax of the string.",
+        "type": "string"
+      },
+      "ProcessError": {
+        "description": "What went wrong running a job's process or interactive session.",
+        "oneOf": [
+          {
+            "type": "string",
+            "enum": [
+              "Unknown",
+              "InvalidCommand",
+              "Interrupted"
+            ]
+          },
+          {
+            "type": "object",
+            "properties": {
+              "Killed": {
+                "type": "integer",
+                "format": "int32"
+              }
+            },
+            "required": [
+              "Killed"
+            ],
+            "additionalProperties": false
+          },
+          {
+            "type": "object",
+            "properties": {
+              "Interactive": {
+                "type": "string"
+              }
+            },
+            "required": [
+              "Interactive"
+            ],
+            "additionalProperties": false
+          },
+          {
+            "type": "object",
+            "properties": {
+              "InvalidJob": {
+                "type": "string"
+              }
+            },
+            "required": [
+              "InvalidJob"
+            ],
+            "additionalProperties": false
+          },
+          {
+            "type": "object",
+            "properties": {
+              "Io": {
+                "type": "object",
+                "properties": {
+                  "error": {
+                    "type": "string"
+                  },
+                  "what": {
+                    "type": "string"
+                  }
+                },
+                "required": [
+                  "error",
+                  "what"
+                ]
+              }
+            },
+            "required": [
+              "Io"
+            ],
+            "additionalProperties": false
+          },
+          {
+            "type": "object",
+            "properties": {
+              "OutputLimitExceeded": {
+                "type": "object",
+                "properties": {
+                  "limit": {
+                    "type": "integer",
+                    "format": "uint64",
+                    "minimum": 0
+                  },
+                  "stream": {
+                    "$ref": "#/components/schemas/JobOutputStream"
+                  }
+                },
+                "required": [
+                  "limit",
+                  "stream"
+                ]
+              }
+            },
+            "required": [
+              "OutputLimitExceeded"
+            ],
+            "additionalProperties": false
+          },
+          {
+            "type": "object",
+            "properties": {
+              "Join": {
+                "type": "string"
+              }
+            },
+            "required": [
+              "Join"
+            ],
+            "additionalProperties": false
+          }
+        ]
+      },
+      "Result_of_int32_or_ProcessError": {
+        "oneOf": [
+          {
+            "type": "object",
+            "properties": {
+              "Ok": {
+                "type": "integer",
+                "format": "int32"
+              }
+            },
+            "required": [
+              "Ok"
+            ]
+          },
+          {
+            "type": "object",
+            "properties": {
+              "Err": {
+                "$ref": "#/components/schemas/ProcessError"
+              }
+            },
+            "required": [
+              "Err"
+            ]
+          }
+        ]
+      },
+      "Session": {
+        "description": "The hash chain of the jobs within a session, and the actor that started it.",
+        "type": "object",
+        "properties": {
+          "last_job": {
+            "$ref": "#/components/schemas/LastJob"
+          },
+          "session_id": {
+            "$ref": "#/components/schemas/SessionId"
+          },
+          "started_by": {
+            "nullable": true,
+            "allOf": [
+              {
+                "$ref": "#/components/schemas/KeyId"
+              }
+            ]
+          }
+        },
+        "required": [
+          "last_job",
+          "session_id"
+        ]
+      },
+      "SessionClientNonce": {
+        "description": "The session nonce component generated by the sush client (on the operator's machine).",
+        "type": "string"
+      },
+      "SessionDetails": {
+        "type": "object",
+        "properties": {
+          "baseboard": {
+            "$ref": "#/components/schemas/BaseboardId"
+          },
+          "client_nonce": {
+            "$ref": "#/components/schemas/SessionClientNonce"
+          },
+          "seq": {
+            "$ref": "#/components/schemas/SessionSeq"
+          },
+          "signer_nonce": {
+            "$ref": "#/components/schemas/SessionSignerNonce"
+          }
+        },
+        "required": [
+          "baseboard",
+          "client_nonce",
+          "seq",
+          "signer_nonce"
+        ]
+      },
+      "SessionId": {
+        "description": "A globally unique identifier for a session. Constructed only from a `SessionPreimage`.",
+        "type": "string"
+      },
+      "SessionSeq": {
+        "description": "The session sequence number, assigned by the signing server. Currently whole milliseconds since the Unix epoch, but never interpreted as such. Encoded as four codephrase words, so 2048⁴ = 2⁴⁴ values, good through the year 2527. Ties are broken by session ID.",
+        "type": "string"
+      },
+      "SessionServerNonce": {
+        "description": "The session nonce component generated by the sush server (on the rack).",
+        "type": "string"
+      },
+      "SessionSignerNonce": {
+        "description": "The component of the hashed Session ID generated by the signing server.",
+        "type": "string"
+      },
+      "SessionView": {
+        "description": "A possibly-restricted view of a session.",
+        "oneOf": [
+          {
+            "type": "object",
+            "properties": {
+              "visible": {
+                "$ref": "#/components/schemas/Session"
+              }
+            },
+            "required": [
+              "visible"
+            ],
+            "additionalProperties": false
+          },
+          {
+            "type": "object",
+            "properties": {
+              "hidden": {
+                "$ref": "#/components/schemas/SessionId"
+              }
+            },
+            "required": [
+              "hidden"
+            ],
+            "additionalProperties": false
+          }
+        ]
+      },
+      "Signed_for_JobStartRequest": {
+        "description": "A signed envelope around some data.",
+        "type": "object",
+        "properties": {
+          "key_id": {
+            "$ref": "#/components/schemas/KeyId"
+          },
+          "payload": {
+            "$ref": "#/components/schemas/JobStartRequest"
+          },
+          "signature": {
+            "$ref": "#/components/schemas/EncodedSignature"
+          }
+        },
+        "required": [
+          "key_id",
+          "payload",
+          "signature"
+        ]
+      },
+      "SkipReason": {
+        "description": "Why a sled will never run a job.",
+        "type": "string",
+        "enum": [
+          "session-superseded",
+          "session-ended",
+          "not-targeted",
+          "cubby-unknown"
+        ]
+      },
+      "SledHealth": {
+        "type": "string",
+        "enum": [
+          "connected",
+          "disconnected",
+          "unknown"
+        ]
+      },
+      "SledVersion": {
+        "description": "One sled's location, build, and health.",
+        "type": "object",
+        "properties": {
+          "baseboard": {
+            "$ref": "#/components/schemas/BaseboardId"
+          },
+          "cubby": {
+            "nullable": true,
+            "type": "integer",
+            "format": "uint8",
+            "minimum": 0
+          },
+          "health": {
+            "nullable": true,
+            "default": null,
+            "allOf": [
+              {
+                "$ref": "#/components/schemas/SledHealth"
+              }
+            ]
+          },
+          "version": {
+            "nullable": true,
+            "allOf": [
+              {
+                "$ref": "#/components/schemas/VersionInfo"
+              }
+            ]
+          }
+        },
+        "required": [
+          "baseboard"
+        ]
+      },
+      "VersionInfo": {
+        "description": "One build's version and commit.",
+        "type": "object",
+        "properties": {
+          "commit": {
+            "description": "The git commit, \"-dirty\" suffixed for an unclean tree.",
+            "type": "string"
+          },
+          "version": {
+            "description": "The package version.",
+            "type": "string"
+          }
+        },
+        "required": [
+          "commit",
+          "version"
+        ]
+      },
+      "JobWait": {
+        "description": "Whether and until what state is reached to wait for a job start/stop request.",
+        "type": "string",
+        "enum": [
+          "none",
+          "start",
+          "stop"
+        ]
+      },
+      "Access": {
+        "description": "The actor that starts a session may always attach to interactive jobs in that session. By default, other actors may not, but they may be granted read-only or read-write access via `session allow`.",
+        "type": "string",
+        "enum": [
+          "read-only",
+          "read-write"
+        ]
+      }
+    },
+    "responses": {
+      "Error": {
+        "description": "Error",
+        "content": {
+          "application/json": {
+            "schema": {
+              "$ref": "#/components/schemas/Error"
+            }
+          }
+        }
+      }
+    }
+  }
+}
