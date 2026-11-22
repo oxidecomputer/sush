@@ -587,13 +587,13 @@ async fn interactive_job() {
     };
     let denied = guest_attach().await.unwrap_err();
     assert!(
-        matches!(denied.status(), Some(status) if status.as_u16() == 403),
-        "expected 403 Forbidden, got {denied:?}"
+        matches!(denied.status(), Some(status) if status.as_u16() == 404),
+        "expected 404 Not Found, got {denied:?}"
     );
 
     // Grant the guest read-only access and attach.
     client
-        .session_allow_attach()
+        .session_allow()
         .session_id(session.session_id())
         .key_id(guest.clone())
         .access(Access::ReadOnly)
@@ -641,7 +641,7 @@ async fn interactive_job() {
     // Withdraw the grant, so that the next successful attach can only
     // mean the read-write grant that follows.
     client
-        .session_deny_attach()
+        .session_deny()
         .session_id(session.session_id())
         .key_id(guest.clone())
         .send()
@@ -658,7 +658,7 @@ async fn interactive_job() {
     // Granted read-write, the guest's input echoes everywhere, and the
     // old read-only socket keeps the access it attached with.
     client
-        .session_allow_attach()
+        .session_allow()
         .session_id(session.session_id())
         .key_id(guest.clone())
         .access(Access::ReadWrite)

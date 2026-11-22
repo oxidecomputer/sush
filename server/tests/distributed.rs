@@ -35,7 +35,7 @@ use sush_server::executor::PathIsolation;
 use sush_server::gossip::spawn_gossip;
 use sush_server::locker::Locker;
 use sush_server::locker::bookmark::BOOKMARK;
-use sush_server::messages::v0::{Event, JobEvent, Message};
+use sush_server::messages::v0::{Event, JobEvent, JobRequest, Message, Request};
 use sush_server::output::JobOutputDir;
 use sush_server::state::GossipNetwork;
 use sush_server::{JobError, JobManager, seed_gossip};
@@ -870,7 +870,7 @@ async fn rejoining_replays_without_reexecuting() {
 #[tokio::test]
 async fn interrupted_jobs_get_stopped() {
     let (_tmp, dir) = pki("sush-interrupted-", 2);
-    let root = common::ephemeral_root();
+    let mut root = common::ephemeral_root();
     let root_pem = dir.join("job-root.pem");
     write(
         &root_pem,
@@ -883,12 +883,37 @@ async fn interrupted_jobs_get_stopped() {
     let a = Sled::start(&log, &dir, 1, &root_pem, &shutdown).await;
     let authn_a = requester(&root);
 
-    // A previous life of sled 2 started a job and died before stopping
-    // it: the rack's history shows it running forever.
-    let job_id: JobId = "abandon-abandon-abandon-abandon-abandon-abandon-abandon-ability"
-        .parse()
+    // A previous life of sled 2 accepted a job that runs only there,
+    // started it, and died before stopping it: the rack's history
+    // shows it running forever.
+    let Ceremony {
+        session_id,
+        client_nonce,
+        signer_nonce,
+        seq,
+    } = ceremony(&a.mgr, 1);
+    a.mgr
+        .session_start(&authn_a, session_id, client_nonce, signer_nonce, seq)
+        .await
         .unwrap();
     let ghost = baseboard(2);
+    let job_id = Session::new(session_id).next_job_id();
+    let job = sign_job_for(&mut root, job_id, session_id, "true", &ghost).await;
+    a.network
+        .borrow()
+        .clone()
+        .send(
+            Message::Request(Request::job(
+                authn_a.clone(),
+                JobRequest::Start(
+                    job,
+                    JobStartParams::default(),
+                    BTreeSet::from([ghost.clone()]),
+                ),
+            ))
+            .into(),
+        )
+        .unwrap();
     a.network
         .borrow()
         .clone()

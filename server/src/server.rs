@@ -28,7 +28,7 @@ use sush_api::{
     SessionTargetParams, SushApi,
 };
 use sush_common::authn::{Authn, Identity};
-use sush_common::jobs::{JobRecord, Session, SessionServerNonce, SignedJob};
+use sush_common::jobs::{JobRecord, SessionServerNonce, SessionView, SignedJob};
 use sush_common::keys::{KeyId, SshPublicKey, pem_cert_chain};
 use sush_common::targets::{SledVersion, Target};
 use sush_common::version::VersionInfo;
@@ -92,12 +92,12 @@ impl SushApi for ApiServer {
     async fn session(
         ctx: RequestContext<Self::Context>,
         headers: Header<Authorization>,
-    ) -> Result<HttpResponseOk<Session>, HttpError> {
+    ) -> Result<HttpResponseOk<SessionView>, HttpError> {
         let mgr = ctx.context();
         let Authorization { authorization } = headers.into_inner();
         let authn = requester(authorization)?;
-        if let Some(session) = mgr.session(&authn) {
-            Ok(HttpResponseOk(session))
+        if let Some(view) = mgr.session_view(&authn) {
+            Ok(HttpResponseOk(view))
         } else {
             Err(JobError::NoSession.into())
         }
@@ -110,12 +110,12 @@ impl SushApi for ApiServer {
     ) -> Result<HttpResponseUpdatedNoContent, HttpError> {
         let mgr = ctx.context();
         let Authorization { authorization } = headers.into_inner();
-        let _authn = requester(authorization)?;
+        let authn = requester(authorization)?;
         let SessionTargetParams { session_id, target } = params.into_inner();
         let target = target.parse::<Target>().map_err(|error| {
             HttpError::for_client_error(None, ClientErrorStatusCode::BAD_REQUEST, error.to_string())
         })?;
-        mgr.job_preflight(session_id, &target)?;
+        mgr.job_preflight(&authn, session_id, &target)?;
         Ok(HttpResponseUpdatedNoContent())
     }
 
@@ -175,7 +175,7 @@ impl SushApi for ApiServer {
         Ok(HttpResponseUpdatedNoContent())
     }
 
-    async fn session_allow_attach(
+    async fn session_allow(
         ctx: RequestContext<Self::Context>,
         headers: Header<Authorization>,
         params: PathParams<SessionAndKeyIds>,
@@ -186,12 +186,12 @@ impl SushApi for ApiServer {
         let authn = requester(authorization)?;
         let SessionAndKeyIds { session_id, key_id } = params.into_inner();
         let AccessParam { access } = query.into_inner();
-        mgr.session_allow_attach(&authn, session_id, key_id, access)
+        mgr.session_allow(&authn, session_id, key_id, access)
             .await?;
         Ok(HttpResponseUpdatedNoContent())
     }
 
-    async fn session_deny_attach(
+    async fn session_deny(
         ctx: RequestContext<Self::Context>,
         headers: Header<Authorization>,
         params: PathParams<SessionAndKeyIds>,
@@ -200,7 +200,7 @@ impl SushApi for ApiServer {
         let Authorization { authorization } = headers.into_inner();
         let authn = requester(authorization)?;
         let SessionAndKeyIds { session_id, key_id } = params.into_inner();
-        mgr.session_deny_attach(&authn, session_id, key_id).await?;
+        mgr.session_deny(&authn, session_id, key_id).await?;
         Ok(HttpResponseUpdatedNoContent())
     }
 

@@ -173,6 +173,7 @@ progenitor::generate_api!(
         Identity = sush_common::authn::Identity,
         Session = sush_common::jobs::Session,
         SessionId = sush_common::jobs::SessionId,
+        SessionView = sush_common::jobs::SessionView,
         JobId = sush_common::jobs::JobId,
         JobLimits = sush_common::jobs::JobLimits,
         JobOutputHash = sush_common::jobs::JobOutputHash,

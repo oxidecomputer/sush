@@ -167,7 +167,7 @@ pub trait CommandContext: Clone + Send + Sync {
         sush_nonce: SessionSushNonce,
     );
     fn job_start_params(&self, request: &JobStartRequest);
-    fn really_supersede(&mut self, session: &Session) -> Result<(), CommandError>;
+    fn really_supersede(&mut self, session_id: SessionId) -> Result<(), CommandError>;
     fn session_created(
         &mut self,
         session: Session,
@@ -177,8 +177,8 @@ pub trait CommandContext: Clone + Send + Sync {
     fn session_started(&mut self, session: Session, force: bool);
     fn session_joined(&mut self, session: Session, force: bool);
     fn session_stopped(&mut self, session_id: &SessionId);
-    fn attach_allowed(&mut self, key_id: &KeyId, access: Access);
-    fn attach_denied(&mut self, key_id: &KeyId);
+    fn access_allowed(&mut self, key_id: &KeyId, access: Access);
+    fn access_denied(&mut self, key_id: &KeyId);
 
     // Job signing certificates
     fn cert_chain(

@@ -27,7 +27,7 @@ use sush_api::{JobStartParams, JobStopParams, JobWait};
 use sush_common::jobs::{
     Access, JobId, JobLimits, JobMode, JobOutputState, JobOutputStream::*, JobStartRequest,
     JobStatus, ProcessError, Session, SessionId, SessionPreimage, SessionSeq, SessionSignerNonce,
-    SignedJob, SkipReason,
+    SessionView, SignedJob, SkipReason,
 };
 use sush_common::keys::{EphemeralKey, KeyError, KeyId, KeyType, Signer as _, pem_cert_chain};
 use sush_common::targets::{Cubbies, Target};
@@ -312,6 +312,139 @@ async fn job_records_keep_requests() {
         record.request.as_ref().unwrap().payload().command(),
         "echo recorded"
     );
+}
+
+#[named]
+#[tokio::test]
+async fn grants_outlive_sessions() {
+    let log = test_logger(function_name!());
+    let (mgr, mut root, _dir, _shutdown) = manager_and_test_root(log).await;
+    let owner = requester(&root);
+    let guest = requester(&ephemeral_test_root());
+    let SessionCeremony {
+        session_id,
+        client_nonce,
+        signer_nonce,
+        seq,
+        ..
+    } = session_ceremony(&mgr, 1);
+    let session = Session::new(session_id);
+    mgr.session_start(&owner, session_id, client_nonce, signer_nonce, seq)
+        .await
+        .unwrap();
+    let job_id = session.next_job_id();
+    let job = root
+        .sign_job_request(job_id, session_id, "true", false)
+        .await;
+    mgr.job_start(
+        &owner,
+        job.into_signed(),
+        JobStartParams {
+            wait: JobWait::Stop,
+            ..Default::default()
+        },
+    )
+    .await
+    .unwrap();
+    mgr.session_stop(&owner, session_id).await.unwrap();
+
+    let readable = async |want: bool| {
+        timeout(Duration::from_secs(30), async {
+            while mgr.job_record(&guest, &job_id).await.is_ok() != want {
+                sleep(Duration::from_millis(50)).await;
+            }
+        })
+        .await
+        .expect("grant never took effect")
+    };
+    assert!(matches!(
+        mgr.job_record(&guest, &job_id).await,
+        Err(JobError::JobNotFound(_))
+    ));
+    assert!(matches!(
+        mgr.session_allow(&guest, session_id, guest.clone(), Access::ReadOnly)
+            .await,
+        Err(JobError::NotSessionStarter)
+    ));
+    mgr.session_allow(&owner, session_id, guest.clone(), Access::ReadOnly)
+        .await
+        .unwrap();
+    readable(true).await;
+    mgr.session_deny(&owner, session_id, guest.clone())
+        .await
+        .unwrap();
+    readable(false).await;
+}
+
+#[named]
+#[tokio::test]
+async fn stranger_danger() {
+    let log = test_logger(function_name!());
+    let (mgr, mut root, _dir, _shutdown) = manager_and_test_root(log).await;
+    let owner = requester(&root);
+    let reader = requester(&ephemeral_test_root());
+    let stranger = requester(&ephemeral_test_root());
+    let SessionCeremony {
+        session_id,
+        client_nonce,
+        signer_nonce,
+        seq,
+        ..
+    } = session_ceremony(&mgr, 1);
+    let mut session = Session::new(session_id);
+    mgr.session_start(&owner, session_id, client_nonce, signer_nonce, seq)
+        .await
+        .unwrap();
+    let job_id = session.next_job_id();
+    confirm_start(&mgr, &owner, &mut root, &mut session).await;
+    mgr.session_allow(&owner, session_id, reader.clone(), Access::ReadOnly)
+        .await
+        .unwrap();
+    timeout(Duration::from_secs(30), async {
+        while mgr.job_record(&reader, &job_id).await.is_err() {
+            sleep(Duration::from_millis(50)).await;
+        }
+    })
+    .await
+    .expect("grant never took effect");
+
+    let target = mgr.own_baseboard().clone();
+    assert!(
+        mgr.job_output(&reader, &job_id, &target, Stdout, None)
+            .await
+            .is_ok()
+    );
+    assert_eq!(mgr.job_history(&reader, 0, 0).await.unwrap().len(), 1);
+    assert!(matches!(
+        mgr.session_view(&reader),
+        Some(SessionView::Visible(_))
+    ));
+
+    assert!(matches!(
+        mgr.job_record(&stranger, &job_id).await,
+        Err(JobError::JobNotFound(_))
+    ));
+    assert!(matches!(
+        mgr.job_output(&stranger, &job_id, &target, Stdout, None)
+            .await,
+        Err(JobError::JobNotFound(_))
+    ));
+    assert!(mgr.job_history(&stranger, 0, 0).await.unwrap().is_empty());
+    assert_eq!(
+        mgr.session_view(&stranger),
+        Some(SessionView::Hidden(session_id))
+    );
+
+    let next = root
+        .sign_job_request(session.next_job_id(), session_id, "true", false)
+        .await;
+    for key in [&reader, &stranger] {
+        assert!(matches!(
+            mgr.job_start(key, next.clone().into_signed(), JobStartParams::default())
+                .await,
+            Err(JobError::NoWriteAccess)
+        ));
+    }
 }
 
 /// A job runs in a contract of its own, labeled with its job ID.
@@ -1683,7 +1816,7 @@ async fn job_targets() {
     };
 
     let elsewhere = "913-0000019:BRM00000000";
-    let preflight = |target: &str| mgr.job_preflight(session_id, &target.parse().unwrap());
+    let preflight = |target: &str| mgr.job_preflight(&authn, session_id, &target.parse().unwrap());
     assert!(matches!(
         preflight(elsewhere),
         Err(JobError::NoReachableTarget)
@@ -1761,10 +1894,10 @@ async fn attach_grants() {
     ));
     assert!(matches!(
         attach(guest.clone()).await,
-        Err(JobError::AttachDenied)
+        Err(JobError::JobNotFound(_))
     ));
     assert!(matches!(
-        mgr.session_allow_attach(&guest, session_id, owner.clone(), Access::ReadOnly)
+        mgr.session_allow(&guest, session_id, owner.clone(), Access::ReadOnly)
             .await,
         Err(JobError::NotSessionStarter)
     ));
@@ -1776,7 +1909,7 @@ async fn attach_grants() {
             loop {
                 let access = match attach(authn.clone()).await {
                     Ok((_, access)) => Some(access),
-                    Err(JobError::AttachDenied) => None,
+                    Err(JobError::JobNotFound(_)) => None,
                     Err(err) => panic!("unexpected attach error: {err}"),
                 };
                 if access == want {
@@ -1788,15 +1921,15 @@ async fn attach_grants() {
         .await
         .expect("grant never took effect")
     };
-    mgr.session_allow_attach(&owner, session_id, guest.clone(), Access::ReadOnly)
+    mgr.session_allow(&owner, session_id, guest.clone(), Access::ReadOnly)
         .await
         .unwrap();
     granted(guest.clone(), Some(Access::ReadOnly)).await;
-    mgr.session_allow_attach(&owner, session_id, guest.clone(), Access::ReadWrite)
+    mgr.session_allow(&owner, session_id, guest.clone(), Access::ReadWrite)
         .await
         .unwrap();
     granted(guest.clone(), Some(Access::ReadWrite)).await;
-    mgr.session_deny_attach(&owner, session_id, guest.clone())
+    mgr.session_deny(&owner, session_id, guest.clone())
         .await
         .unwrap();
     granted(guest.clone(), None).await;
@@ -1810,7 +1943,7 @@ async fn attach_grants() {
     peer.send(
         Message::Request(Request::session(
             guest.clone(),
-            SessionRequest::AllowAttach(session_id, guest.clone(), Access::ReadWrite),
+            SessionRequest::Allow(session_id, guest.clone(), Access::ReadWrite),
         ))
         .into(),
     )
@@ -1818,7 +1951,7 @@ async fn attach_grants() {
     peer.send(
         Message::Request(Request::session(
             owner.clone(),
-            SessionRequest::AllowAttach(session_id, third.clone(), Access::ReadOnly),
+            SessionRequest::Allow(session_id, third.clone(), Access::ReadOnly),
         ))
         .into(),
     )
@@ -1826,7 +1959,7 @@ async fn attach_grants() {
     granted(third.clone(), Some(Access::ReadOnly)).await;
     assert!(matches!(
         attach(guest.clone()).await,
-        Err(JobError::AttachDenied)
+        Err(JobError::JobNotFound(_))
     ));
 
     mgr.job_stop(
@@ -1841,12 +1974,12 @@ async fn attach_grants() {
     .unwrap();
 }
 
-/// Only the session starter may skip or stop a session, a skip must
-/// name the session's next job, and non-starter requests over gossip
-/// are ignored.
+/// Only the session starter may stop a session, only identities with
+/// read-write access may skip or stop its jobs, a skip must name the
+/// session's next job, and other requests over gossip are ignored.
 #[named]
 #[tokio::test]
-async fn skip_and_stop_are_starter_only() {
+async fn skip_and_stop_need_write_access() {
     let log = test_logger(function_name!());
     let (mgr, mut root, peer, _dir, _shutdown) = manager_test_root_and_peer(log).await;
     let owner = requester(&root);
@@ -1854,6 +1987,8 @@ async fn skip_and_stop_are_starter_only() {
     let guest_key =
         EphemeralKey::new_root(KeyType::P256, ephemeral_test_subject(), validity).unwrap();
     let guest = requester(&guest_key);
+    let reader = requester(&ephemeral_test_root());
+    let writer = requester(&ephemeral_test_root());
 
     let SessionCeremony {
         session_id,
@@ -1866,22 +2001,45 @@ async fn skip_and_stop_are_starter_only() {
     mgr.session_start(&owner, session_id, client_nonce, signer_nonce, seq)
         .await
         .unwrap();
+    let confirmed = session.next_job_id();
     confirm_start(&mgr, &owner, &mut root, &mut session).await;
     let job_id = session.next_job_id();
+    mgr.session_allow(&owner, session_id, reader.clone(), Access::ReadOnly)
+        .await
+        .unwrap();
+    mgr.session_allow(&owner, session_id, writer.clone(), Access::ReadWrite)
+        .await
+        .unwrap();
+    timeout(Duration::from_secs(30), async {
+        while mgr.job_record(&reader, &confirmed).await.is_err()
+            || mgr.job_record(&writer, &confirmed).await.is_err()
+        {
+            sleep(Duration::from_millis(50)).await;
+        }
+    })
+    .await
+    .expect("grants never took effect");
 
-    assert!(matches!(
-        mgr.session_skip_job(&guest, session_id, job_id).await,
-        Err(JobError::NotSessionStarter)
-    ));
-    assert!(matches!(
-        mgr.session_stop(&guest, session_id).await,
-        Err(JobError::NotSessionStarter)
-    ));
-    assert!(matches!(
-        mgr.job_stop(&guest, &job_id, JobStopParams::default())
-            .await,
-        Err(JobError::NotSessionStarter)
-    ));
+    for key in [&guest, &reader] {
+        assert!(matches!(
+            mgr.session_skip_job(key, session_id, job_id).await,
+            Err(JobError::NoWriteAccess)
+        ));
+        assert!(matches!(
+            mgr.job_stop(key, &confirmed, JobStopParams::default())
+                .await,
+            Err(JobError::NoWriteAccess)
+        ));
+    }
+    for key in [&guest, &reader, &writer] {
+        assert!(matches!(
+            mgr.session_stop(key, session_id).await,
+            Err(JobError::NotSessionStarter)
+        ));
+    }
+    mgr.job_stop(&writer, &confirmed, JobStopParams::default())
+        .await
+        .unwrap();
     assert!(matches!(
         mgr.session_skip_job(&owner, session_id, JobId::random())
             .await,
@@ -1899,19 +2057,19 @@ async fn skip_and_stop_are_starter_only() {
         Err(JobError::SessionNotCurrent(_))
     ));
     assert!(matches!(
-        mgr.session_allow_attach(&owner, stale, guest.clone(), Access::ReadOnly)
+        mgr.session_allow(&owner, stale, guest.clone(), Access::ReadOnly)
             .await,
-        Err(JobError::SessionNotCurrent(_))
+        Err(JobError::SessionNotFound(_))
     ));
     assert!(matches!(
-        mgr.session_deny_attach(&owner, stale, guest.clone()).await,
-        Err(JobError::SessionNotCurrent(_))
+        mgr.session_deny(&owner, stale, guest.clone()).await,
+        Err(JobError::SessionNotFound(_))
     ));
 
-    // A stop and a skip from a non-starter over gossip are ignored.
-    // The starter's skip, sent after them on the same handle, marks
-    // them processed. Convergence proves the session outlived the
-    // stop, and the cancellation actor proves whose skip applied.
+    // A stranger's stop and skip over gossip are ignored. The writer's
+    // skip, sent after them on the same handle, is processed after them.
+    // The surviving session shows the stop was ignored, and the
+    // cancellation's actor shows whose skip applied.
     peer.send(
         Message::Request(Request::session(
             guest.clone(),
@@ -1930,7 +2088,7 @@ async fn skip_and_stop_are_starter_only() {
     .unwrap();
     peer.send(
         Message::Request(Request::session(
-            owner.clone(),
+            writer.clone(),
             SessionRequest::Skip(session_id, job_id),
         ))
         .into(),
@@ -1951,7 +2109,7 @@ async fn skip_and_stop_are_starter_only() {
     let status = mgr.job_status(&owner, &job_id).await.unwrap()[mgr.own_baseboard()].clone();
     assert!(matches!(
         status,
-        JobStatus::Cancelled { actor, .. } if actor == owner
+        JobStatus::Cancelled { actor, .. } if actor == writer
     ));
 
     assert!(matches!(

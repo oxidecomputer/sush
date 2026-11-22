@@ -338,6 +338,23 @@ impl Session {
     }
 }
 
+/// A possibly-restricted view of a session.
+#[derive(Clone, Debug, Deserialize, Eq, JsonSchema, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SessionView {
+    Visible(Box<Session>),
+    Hidden(SessionId),
+}
+
+impl SessionView {
+    pub fn session_id(&self) -> SessionId {
+        match self {
+            Self::Visible(session) => session.session_id(),
+            Self::Hidden(session_id) => *session_id,
+        }
+    }
+}
+
 /// How a job runs. The streaming modes allow **unrecorded** I/O.
 #[derive(Clone, Copy, Debug, Default, Deserialize, Eq, JsonSchema, PartialEq, Serialize)]
 #[serde(rename_all = "kebab-case")]

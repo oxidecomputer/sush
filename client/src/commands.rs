@@ -52,7 +52,7 @@ use sush_common::jobs::JobOutputStream::{self, Stderr, Stdout};
 use sush_common::jobs::{
     Access, JobId, JobLimits, JobMode, JobOutputHash, JobOutputState, JobRecord, JobStartRequest,
     JobStatus, JobStatusMap, ProcessError, Session, SessionClientNonce, SessionId, SessionSeq,
-    SessionSignerNonce, SessionSushNonce, SignedJob, SkipReason,
+    SessionSignerNonce, SessionSushNonce, SessionView, SignedJob, SkipReason,
 };
 use sush_common::keys::{KeyError, KeyId, Signer as _};
 use sush_common::targets::{SledId, Target};
@@ -465,12 +465,16 @@ impl ClientCommandProperties for IdentityCommand {
 
 #[derive(Clone, Debug, Subcommand)]
 pub enum SessionCommand {
-    /// Grant a key attach access to this session's interactive jobs.
+    /// Grant an identity access to a session.
     Allow {
-        /// The key to grant access to (try `iam` for your own).
+        /// The identity to grant access to (try `iam` for your own).
         key_id: KeyId,
 
-        /// Grant read-write access instead of read-only.
+        /// The session to grant access to. Defaults to the current session.
+        #[arg(long)]
+        session: Option<SessionId>,
+
+        /// Grant read-write access (start/stop jobs and type into interactive jobs).
         #[arg(short, long)]
         write: bool,
     },
@@ -484,10 +488,14 @@ pub enum SessionCommand {
         force: bool,
     },
 
-    /// Withdraw a key's attach access.
+    /// Withdraw access to a session.
     Deny {
-        /// The key to withdraw access from.
+        /// The identity to withdraw access from.
         key_id: KeyId,
+
+        /// The session to withdraw access to. Defaults to the current session.
+        #[arg(long)]
+        session: Option<SessionId>,
     },
 
     /// Create a session with the signing service from `session start-params`.
@@ -1073,9 +1081,15 @@ async fn session(
             },
             Some(client),
         ) => {
-            let session = with_login(ctx, client, async || client.session().send().await)
+            let session = match with_login(ctx, client, async || client.session().send().await)
                 .await?
-                .into_inner();
+                .into_inner()
+            {
+                SessionView::Visible(session) => *session,
+                SessionView::Hidden(session_id) => {
+                    return Err(CommandError::SessionHidden(session_id));
+                }
+            };
             if let Some(session_id) = session_id
                 && session.session_id() != session_id
             {
@@ -1220,8 +1234,15 @@ async fn session(
             .await
         }
 
-        (SessionCommand::Allow { key_id, write }, Some(client)) => {
-            let Some(session_id) = ctx.session_id() else {
+        (
+            SessionCommand::Allow {
+                key_id,
+                session,
+                write,
+            },
+            Some(client),
+        ) => {
+            let Some(session_id) = session.or(ctx.session_id()) else {
                 return Err(CommandError::MissingSession);
             };
             let access = if write {
@@ -1231,7 +1252,7 @@ async fn session(
             };
             with_login(ctx, client, async || {
                 client
-                    .session_allow_attach()
+                    .session_allow()
                     .session_id(session_id)
                     .key_id(key_id.clone())
                     .access(access)
@@ -1239,24 +1260,24 @@ async fn session(
                     .await
             })
             .await?;
-            ctx.attach_allowed(&key_id, access);
+            ctx.access_allowed(&key_id, access);
             Ok(())
         }
 
-        (SessionCommand::Deny { key_id }, Some(client)) => {
-            let Some(session_id) = ctx.session_id() else {
+        (SessionCommand::Deny { key_id, session }, Some(client)) => {
+            let Some(session_id) = session.or(ctx.session_id()) else {
                 return Err(CommandError::MissingSession);
             };
             with_login(ctx, client, async || {
                 client
-                    .session_deny_attach()
+                    .session_deny()
                     .session_id(session_id)
                     .key_id(key_id.clone())
                     .send()
                     .await
             })
             .await?;
-            ctx.attach_denied(&key_id);
+            ctx.access_denied(&key_id);
             Ok(())
         }
 
@@ -1854,7 +1875,7 @@ async fn really_supersede(
         return Ok(());
     }
     match with_login(ctx, client, async || client.session().send().await).await {
-        Ok(session) => ctx.really_supersede(&session.into_inner()),
+        Ok(view) => ctx.really_supersede(view.into_inner().session_id()),
         Err(CommandError::Session(_)) => Ok(()),
         Err(error) => Err(error),
     }
@@ -2832,6 +2853,11 @@ pub enum CommandError {
     MissingNexusToken,
     #[error("Missing session, try `session start`")]
     MissingSession,
+    #[error(
+        "Session `{0}` is active, but you have not been granted access to it;\n   \
+         please ask whoever started it to try `session allow`"
+    )]
+    SessionHidden(SessionId),
     #[error("Missing SSH agent socket, try `--ssh-auth-sock`")]
     MissingSshAuthSock,
     #[error("{0}")]

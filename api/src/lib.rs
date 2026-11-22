@@ -25,8 +25,8 @@ use strum::{Display, EnumString};
 use sush_common::authn::Identity;
 use sush_common::jobs::{
     Access, JobId, JobLimits, JobOutputStream, JobRecord, JobStatus, JsonJobStatusMap, Session,
-    SessionClientNonce, SessionId, SessionSeq, SessionServerNonce, SessionSignerNonce, SignedJob,
-    job_status_to_json_map,
+    SessionClientNonce, SessionId, SessionSeq, SessionServerNonce, SessionSignerNonce, SessionView,
+    SignedJob, job_status_to_json_map,
 };
 use sush_common::keys::{KeyId, SshPublicKey};
 use sush_common::targets::SledVersion;
@@ -34,6 +34,7 @@ use sush_common::version::VersionInfo;
 
 #[rustfmt::skip]
 api_versions_picky!([
+    (0, 3, 0, SESSION_ACCESS),
     (0, 2, 0, JOB_RECORDS),
     (0, 1, 0, INITIAL),
 ]);
@@ -75,9 +76,7 @@ pub trait SushApi {
         body: TypedBody<Option<SshPublicKey>>,
     ) -> Result<HttpResponseOk<Identity>, HttpError>;
 
-    /// List cached identities.
-    ///
-    /// May include duplicate identities with different nonces.
+    /// Return the caller's identity.
     #[endpoint { method = GET, path = "/iam" }]
     async fn identities(
         ctx: RequestContext<Self::Context>,
@@ -87,11 +86,37 @@ pub trait SushApi {
     // Session management.
 
     /// Get the current session from this server's point of view.
-    #[endpoint { method = GET, path = "/sessions" }]
+    ///
+    /// Full information about a session (who started it, its last
+    /// job, etc) is available only to the identity that started it
+    /// and identities to whom they have granted access.
+    #[endpoint {
+        method = GET,
+        path = "/session",
+        versions = VERSION_SESSION_ACCESS..,
+    }]
     async fn session(
         ctx: RequestContext<Self::Context>,
         headers: Header<Authorization>,
-    ) -> Result<HttpResponseOk<Session>, HttpError>;
+    ) -> Result<HttpResponseOk<SessionView>, HttpError>;
+
+    /// Get the current session from this server's point of view.
+    #[endpoint {
+        operation_id = "session",
+        method = GET,
+        path = "/sessions",
+        versions = ..VERSION_SESSION_ACCESS,
+    }]
+    async fn session_v0_1(
+        ctx: RequestContext<Self::Context>,
+        headers: Header<Authorization>,
+    ) -> Result<HttpResponseOk<Session>, HttpError> {
+        let HttpResponseOk(view) = Self::session(ctx, headers).await?;
+        Ok(HttpResponseOk(match view {
+            SessionView::Visible(session) => *session,
+            SessionView::Hidden(session_id) => Session::new(session_id),
+        }))
+    }
 
     /// Check that this server would accept a job in a session for a target.
     ///
@@ -145,27 +170,71 @@ pub trait SushApi {
         params: PathParams<SessionAndJobIds>,
     ) -> Result<HttpResponseUpdatedNoContent, HttpError>;
 
-    /// Grant a key attach access to this session's interactive jobs.
+    /// Grant an identity access to a session.
     ///
-    /// Only the key that started the session may grant access.
-    #[endpoint { method = POST, path = "/sessions/{session_id}/allow/{key_id}" }]
-    async fn session_allow_attach(
+    /// Only the identity that started the session may grant access.
+    #[endpoint {
+        method = POST,
+        path = "/sessions/{session_id}/allow/{key_id}",
+        versions = VERSION_SESSION_ACCESS..,
+    }]
+    async fn session_allow(
         ctx: RequestContext<Self::Context>,
         headers: Header<Authorization>,
         params: PathParams<SessionAndKeyIds>,
         query: QueryParams<AccessParam>,
     ) -> Result<HttpResponseUpdatedNoContent, HttpError>;
 
-    /// Withdraw a key's attach access.
+    /// Grant an identity access to a session.
     ///
-    /// Only the key that started the session may withdraw access.
-    /// Already-attached connections keep the access they attached with.
-    #[endpoint { method = POST, path = "/sessions/{session_id}/deny/{key_id}" }]
-    async fn session_deny_attach(
+    /// Only the identity that started the session may grant access.
+    #[endpoint {
+        operation_id = "session_allow_attach",
+        method = POST,
+        path = "/sessions/{session_id}/allow/{key_id}",
+        versions = ..VERSION_SESSION_ACCESS,
+    }]
+    async fn session_allow_attach(
+        ctx: RequestContext<Self::Context>,
+        headers: Header<Authorization>,
+        params: PathParams<SessionAndKeyIds>,
+        query: QueryParams<AccessParam>,
+    ) -> Result<HttpResponseUpdatedNoContent, HttpError> {
+        Self::session_allow(ctx, headers, params, query).await
+    }
+
+    /// Withdraw access to a session.
+    ///
+    /// Only the identity that started the session may withdraw access.
+    /// Already attached connections are not affected.
+    #[endpoint {
+        method = POST,
+        path = "/sessions/{session_id}/deny/{key_id}",
+        versions = VERSION_SESSION_ACCESS..,
+    }]
+    async fn session_deny(
         ctx: RequestContext<Self::Context>,
         headers: Header<Authorization>,
         params: PathParams<SessionAndKeyIds>,
     ) -> Result<HttpResponseUpdatedNoContent, HttpError>;
+
+    /// Withdraw access to a session.
+    ///
+    /// Only the identity that started the session may withdraw access.
+    /// Already attached connections are not affected.
+    #[endpoint {
+        operation_id = "session_deny_attach",
+        method = POST,
+        path = "/sessions/{session_id}/deny/{key_id}",
+        versions = ..VERSION_SESSION_ACCESS,
+    }]
+    async fn session_deny_attach(
+        ctx: RequestContext<Self::Context>,
+        headers: Header<Authorization>,
+        params: PathParams<SessionAndKeyIds>,
+    ) -> Result<HttpResponseUpdatedNoContent, HttpError> {
+        Self::session_deny(ctx, headers, params).await
+    }
 
     // Job management.
 

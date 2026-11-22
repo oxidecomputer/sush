@@ -213,17 +213,6 @@ impl Logins {
         debug!(self.log, "bound request authorized"; "key_id" => %key_id);
         Ok(cached.identity.clone())
     }
-
-    /// The identities whose logins have not expired.
-    pub async fn identities(&self) -> Vec<Identity> {
-        self.identities
-            .lock()
-            .await
-            .iter()
-            .filter(|(_, cached)| cached.is_still_valid())
-            .map(|(_, cached)| cached.identity.to_owned())
-            .collect()
-    }
 }
 
 #[cfg(test)]

@@ -135,18 +135,15 @@ for adding identities to your agent; `ssh-add -l` or `sush iam -l` will
 show which identities are currently available. It may also be useful to
 forward agent connections if you're logging in remotely (e.g., to Castle).
 
-Since new SSH keys may be trivially created, authentication does not by
-itself grant any particular permissions. But it does, for instance, prevent
-someone from stopping or attaching to jobs that they did not start, unless
-access is explicitly granted by the identity that started the session.
+By default, only the identity that started a session may view or control
+its jobs or their outputs. But `session allow <key_id>` may be used to
+grant access to a session and its jobs; `session deny` removes such grants.
 
-Customers worried about locking down access to their racks via the tech
-port may have concerns about this. We can address such concerns in two
-ways: first, we can assure them that _no new jobs may be run_ via `sush`
-without obtaining a signed job request; only job output and history may
-be fetched via an arbitrary identity (and only with technician port access).
-Second, we can do a bit of follow-up work to use the forthcoming Nexus-managed
-list of authorized keys to restrict who may even talk to the `sush` proxies.
+Fresh SSH identities cannot read jobs or their outputs, or who started a
+session, and cannot start sessions or jobs without authorization. The only
+data they can see is: each sled's baseboard ID, cubby number, and `sush`
+server version; the ID of the current session; and the (public)
+certificates of accepted job-signing keys.
 
 ### Client commands
 
