@@ -8,12 +8,10 @@
 //! messages via the gossip protocol.
 
 use std::collections::{BTreeMap, BTreeSet};
-use std::num::NonZeroUsize;
 use std::sync::Arc;
 
 use chrono::{DateTime, Utc};
 use futures::{FutureExt as _, Stream, StreamExt};
-use lru::LruCache;
 use rumors::{CausalMessages, Network, Rumors, Version};
 use sled_hardware_types::BaseboardId;
 use slog::{Logger, debug, error, info, o, warn};
@@ -64,18 +62,6 @@ pub struct QueuedJob {
     pub params: JobStartParams,
     pub sleds: BTreeSet<BaseboardId>,
     pub replayed: bool,
-}
-
-/// Maximum number of session starts pending on a sled. Each one
-/// comes from a session start ceremony, so this need not be large.
-const MAX_PENDING_STARTS: NonZeroUsize = NonZeroUsize::new(10).unwrap();
-
-/// A session start that no verified job has confirmed yet.
-#[derive(Debug)]
-struct PendingStart {
-    preimage: SessionPreimage,
-    actor: KeyId,
-    live: bool,
 }
 
 #[derive(Clone, Debug, Default)]
@@ -268,8 +254,6 @@ pub struct State {
     history: JobHistory,
     /// The current state of the active session, if any.
     session: SessionState,
-    /// Session starts awaiting a verified job, by session ID.
-    pending_starts: LruCache<SessionId, PendingStart>,
     /// Attachment points (socket senders) for interactive jobs.
     attachments: AttachmentPoints,
     /// Job request signing certificates.
@@ -288,7 +272,6 @@ impl State {
             rack: Rack::new(own_baseboard),
             history: Default::default(),
             session: Default::default(),
-            pending_starts: LruCache::new(MAX_PENDING_STARTS),
             attachments: Default::default(),
             certs: Certificates::new(trust_anchors)?,
             past,
@@ -305,20 +288,6 @@ impl State {
 
     pub fn rank(&self) -> Option<(SessionSeq, SessionId)> {
         self.session.rank()
-    }
-
-    /// Where a start of `session_id` would stand in the total order of
-    /// sessions, if one is pending on this sled.
-    pub fn pending_rank(&self, session_id: SessionId) -> Option<(SessionSeq, SessionId)> {
-        self.pending_starts
-            .peek(&session_id)
-            .map(|start| (start.preimage.seq, session_id))
-    }
-
-    pub fn pending_starter(&self, session_id: SessionId) -> Option<&KeyId> {
-        self.pending_starts
-            .peek(&session_id)
-            .map(|start| &start.actor)
     }
 
     pub fn rack(&self) -> &Rack {
@@ -558,54 +527,6 @@ impl State {
 
         let mut outputs = Vec::new();
         match request {
-            SessionRequest::Start(preimage) => {
-                let session_id = preimage.session_id();
-                match &self.session {
-                    // Re-announcement of the active session; ignore.
-                    Active { session, .. } if session.session_id() == session_id => {
-                        info!(log, "duplicate session start"; "session_id" => %session_id);
-                    }
-
-                    // This start does not outrank the active session;
-                    // ignore it.
-                    Active { seq, .. }
-                        if Some((preimage.seq, session_id)) <= self.session.rank() =>
-                    {
-                        info!(
-                            log, "stale session start";
-                            "session_id" => %session_id,
-                            "seq" => %preimage.seq,
-                            "active_seq" => %seq,
-                        );
-                    }
-
-                    // Ignore a resubmitted start, so its sender can't
-                    // become the starter.
-                    Inactive | Active { .. } if self.pending_starts.contains(&session_id) => {
-                        info!(
-                            log, "duplicate pending session start";
-                            "session_id" => %session_id, "actor" => %actor,
-                        );
-                    }
-
-                    // Keep an unsigned start pending until confirmed by
-                    // a verified job.
-                    Inactive | Active { .. } => {
-                        info!(
-                            log, "session start pending";
-                            "session_id" => %session_id, "actor" => %actor,
-                        );
-                        self.pending_starts.put(
-                            session_id,
-                            PendingStart {
-                                preimage: preimage.clone(),
-                                actor: actor.clone(),
-                                live: self.past.is_live(incoming_version),
-                            },
-                        );
-                    }
-                }
-            }
             SessionRequest::Stop(session_id) => {
                 // Any session stop request for a session that isn't
                 // ours is silently ignored. Even in the case of
@@ -717,34 +638,56 @@ impl State {
         outputs
     }
 
-    /// Confirm a pending start of `session_id`, if it still outranks
-    /// the active session. Every peer applies the same total order,
-    /// so they all converge on the same session.
+    /// Start the session `preimage` describes, if it outranks the
+    /// active session. Every peer applies the same total order, so
+    /// they all converge on the same session.
     #[must_use]
-    fn confirm_start(
+    fn begin_session(
         &mut self,
         log: &Logger,
         now: DateTime<Utc>,
-        session_id: SessionId,
+        expected: SessionId,
+        preimage: &SessionPreimage,
+        actor: &KeyId,
+        live: bool,
     ) -> Vec<Output> {
-        let Some(start) = self.pending_starts.pop(&session_id) else {
+        let session_id = preimage.session_id();
+        if session_id != expected {
+            warn!(
+                log, "ignoring session details for another session";
+                "session_id" => %session_id, "expected" => %expected,
+            );
             return Vec::new();
-        };
-        if Some((start.preimage.seq, session_id)) <= self.session.rank() {
+        }
+        if !self.rack.knows(&preimage.baseboard) {
+            warn!(
+                log, "ignoring session details from an unknown sled";
+                "session_id" => %session_id, "baseboard" => %preimage.baseboard,
+            );
+            return Vec::new();
+        }
+        if self
+            .session
+            .session()
+            .is_some_and(|session| session.session_id() == session_id)
+        {
+            return Vec::new();
+        }
+        if Some((preimage.seq, session_id)) <= self.session.rank() {
             info!(
                 log, "stale session start";
                 "session_id" => %session_id,
-                "seq" => %start.preimage.seq,
+                "seq" => %preimage.seq,
                 "active" => ?self.session.rank(),
             );
             return Vec::new();
         }
         info!(
             log, "session started";
-            "session_id" => %session_id, "actor" => %start.actor,
+            "session_id" => %session_id, "actor" => %actor,
         );
-        self.history.start_session(session_id, &start.actor);
-        let mut session = Session::started(session_id, start.actor);
+        self.history.start_session(session_id, actor);
+        let mut session = Session::started(session_id, actor.clone());
         if let Some(boundary) = self
             .past
             .boundary()
@@ -759,8 +702,8 @@ impl State {
         }
         let outputs = self.end_session_jobs(now);
         self.session = SessionState::Active {
-            seq: start.preimage.seq,
-            live: start.live,
+            seq: preimage.seq,
+            live,
             session: Box::new(session),
             queued_jobs: QueuedJobs::new(),
         };
@@ -779,9 +722,14 @@ impl State {
     ) -> Vec<Output> {
         let mut outputs = Vec::new();
         match request {
-            JobRequest::Start(signed, params, sleds) => {
+            JobRequest::Start(signed, params, sleds, preimage) => {
+                // Verify the job signature.
                 let job = match self.certs.verify(signed) {
-                    Ok(job) => job,
+                    Ok(job) => {
+                        self.history
+                            .set_job_request(&job, self.session.queued_jobs());
+                        job
+                    }
                     Err(error) => {
                         warn!(
                             log, "refusing unverified job";
@@ -792,37 +740,35 @@ impl State {
                         return outputs;
                     }
                 };
-                self.history
-                    .set_job_request(&job, self.session.queued_jobs());
 
-                // A verified job confirms its session's pending start.
-                // The job then joins the queue only if its session is
-                // active; any other session was stopped or superseded.
-                // A refused job that targets this sled gets a Skipped
-                // status here, which tells its submitter it will not
-                // run.
+                // Start a new session when a verified job includes a valid
+                // session preimage.
                 let session_id = signed.payload().session_id();
                 let live = self.is_live(incoming_version);
-                outputs.extend(self.confirm_start(log, now, session_id));
-                if self
-                    .history
-                    .session_access(&session_id)
-                    .and_then(|access| access.access(actor))
-                    != Some(Access::ReadWrite)
-                {
-                    warn!(
-                        log, "ignoring job start without write access";
-                        "job_id" => %signed.job_id(),
-                        "session_id" => %session_id,
-                        "actor" => %actor,
-                    );
-                    return outputs;
+                if let Some(preimage) = preimage {
+                    outputs.extend(self.begin_session(log, now, session_id, preimage, actor, live));
                 }
+
                 if self
                     .session
                     .session()
                     .is_some_and(|s| s.session_id() == session_id)
                 {
+                    // Check access.
+                    if self
+                        .history
+                        .session_access(&session_id)
+                        .and_then(|access| access.access(actor))
+                        != Some(Access::ReadWrite)
+                    {
+                        warn!(
+                            log, "ignoring job start without write access";
+                            "job_id" => %signed.job_id(),
+                            "session_id" => %session_id,
+                            "actor" => %actor,
+                        );
+                        return outputs;
+                    }
                     let queued = QueuedJob {
                         job,
                         params: params.clone(),
@@ -1691,6 +1637,18 @@ mod test {
             signed,
             JobStartParams::default(),
             BTreeSet::from([baseboard()]),
+            None,
+        )
+    }
+
+    /// A request to start `signed` on this test's sled, carrying the
+    /// preimage that begins its session.
+    fn start_first(signed: SignedJob, preimage: SessionPreimage) -> JobRequest {
+        JobRequest::Start(
+            signed,
+            JobStartParams::default(),
+            BTreeSet::from([baseboard()]),
+            Some(preimage),
         )
     }
 
@@ -1947,44 +1905,30 @@ mod test {
         }
     }
 
-    /// A fresh network with a pending session start, which the first
-    /// verified job of the session confirms.
-    async fn sim_with_session() -> (EphemeralKey, Sim, SessionId, Session) {
+    /// A fresh network and the preimage of a session that has not yet
+    /// begun; the session's first verified job carries the preimage.
+    async fn sim_with_session() -> (EphemeralKey, Sim, SessionPreimage, Session) {
         let root = root();
         let anchors = vec![root.cert().clone()];
-        let mut sim = Sim::new(&anchors, Vec::new()).await;
+        let sim = Sim::new(&anchors, Vec::new()).await;
         let preimage = preimage(1);
-        let session_id = preimage.session_id();
-        sim.request(Request::session(
-            root.key_id().clone(),
-            SessionRequest::Start(preimage),
-        ));
-        (root, sim, session_id, Session::new(session_id))
+        let session = Session::new(preimage.session_id());
+        (root, sim, preimage, session)
     }
 
-    /// The happy path through the step surface alone: a session start
-    /// waits, a signed job confirms it and is released to run, the
-    /// job's own events settle its status, and the session stops.
+    /// The happy path through the step surface alone: a signed first
+    /// job begins its session and is released to run, the job's own
+    /// events settle its status, and the session stops.
     #[tokio::test]
     async fn session_lifecycle_through_step() {
-        let mut root = root();
-        let anchors = vec![root.cert().clone()];
+        let (mut root, mut sim, preimage, session) = sim_with_session().await;
         let actor = root.key_id().clone();
-        let mut sim = Sim::new(&anchors, Vec::new()).await;
-
-        let preimage = preimage(1);
-        let session_id = preimage.session_id();
-        let session = Session::new(session_id);
-        sim.request(Request::session(
-            actor.clone(),
-            SessionRequest::Start(preimage),
-        ));
+        let session_id = session.session_id();
         assert!(sim.state.session.session().is_none());
-        assert!(sim.state.pending_rank(session_id).is_some());
 
         let job_id = session.next_job_id();
         let signed = signed_job(&mut root, job_id, session_id, "true").await;
-        let outputs = sim.request(Request::job(actor.clone(), start(signed)));
+        let outputs = sim.request(Request::job(actor.clone(), start_first(signed, preimage)));
         assert!(
             outputs
                 .iter()
@@ -2026,41 +1970,89 @@ mod test {
         assert!(sim.state.session.session().is_none());
     }
 
-    /// When a second start of a pending session arrives from another
-    /// identity, the first submitter remains the starter once a job
-    /// confirms the session.
+    /// When another identity's job carries the preimage of a session
+    /// that has already begun, the identity whose job began it remains
+    /// the starter.
     #[tokio::test]
-    async fn duplicate_start_keeps_first_actor() {
-        let mut root = root();
-        let anchors = vec![root.cert().clone()];
-        let mut sim = Sim::new(&anchors, Vec::new()).await;
+    async fn repeated_preimage_keeps_first_actor() {
+        let (mut root, mut sim, preimage, mut session) = sim_with_session().await;
+        let session_id = session.session_id();
         let starter = root.key_id().clone();
         let resubmitter = self::root().key_id().clone();
-        let preimage = preimage(1);
-        let session_id = preimage.session_id();
-        let session = Session::new(session_id);
-        for actor in [&starter, &resubmitter] {
-            sim.request(Request::session(
-                actor.clone(),
-                SessionRequest::Start(preimage.clone()),
-            ));
-        }
 
-        let job_id = session.next_job_id();
-        let signed = signed_job(&mut root, job_id, session_id, "true").await;
-        sim.request(Request::job(resubmitter, start(signed)));
+        let first = signed_job(&mut root, session.next_job_id(), session_id, "true").await;
+        session.job_started(first.clone());
+        sim.request(Request::job(
+            starter.clone(),
+            start_first(first, preimage.clone()),
+        ));
+        let second = signed_job(&mut root, session.next_job_id(), session_id, "true").await;
+        sim.request(Request::job(resubmitter, start_first(second, preimage)));
         assert_eq!(
             sim.state.session.session().and_then(Session::started_by),
             Some(&starter)
         );
     }
 
-    /// A forged job never joins the queue or confirms a start. The
-    /// history stays untouched, and the signed job it mimics confirms
-    /// the start and runs in its place.
+    /// A preimage begins no session when it names a sled outside the
+    /// rack, or when it derives an id other than the job's session.
+    #[tokio::test]
+    async fn foreign_preimage_never_begins_session() {
+        let (mut root, mut sim, preimage, session) = sim_with_session().await;
+        let actor = root.key_id().clone();
+        let session_id = session.session_id();
+        let job_id = session.next_job_id();
+        let signed = signed_job(&mut root, job_id, session_id, "true").await;
+
+        let unknown = SessionPreimage {
+            baseboard: BaseboardId {
+                part_number: "913-0000019".to_string(),
+                serial_number: "unknown".to_string(),
+            },
+            ..preimage
+        };
+        let outputs = sim.request(Request::job(
+            actor.clone(),
+            start_first(signed.clone(), unknown),
+        ));
+        assert!(!outputs.iter().any(|o| matches!(o, Output::Run(_))));
+        assert!(sim.state.session.session().is_none());
+
+        let outputs = sim.request(Request::job(actor, start_first(signed, self::preimage(2))));
+        assert!(!outputs.iter().any(|o| matches!(o, Output::Run(_))));
+        assert!(sim.state.session.session().is_none());
+    }
+
+    /// A skip of another session's first job leaves the active session
+    /// alone: only a signed job begins a session.
+    #[tokio::test]
+    async fn skip_never_begins_session() {
+        let (mut root, mut sim, preimage, session) = sim_with_session().await;
+        let alice = root.key_id().clone();
+        let session_id = session.session_id();
+        let signed = signed_job(&mut root, session.next_job_id(), session_id, "true").await;
+        sim.request(Request::job(alice, start_first(signed, preimage)));
+
+        let bob = self::root().key_id().clone();
+        let bobs = self::preimage(2).session_id();
+        let bobs_first = Session::new(bobs).next_job_id();
+        sim.request(Request::session(
+            bob,
+            SessionRequest::Skip(bobs, bobs_first),
+        ));
+        assert_eq!(
+            sim.state.session.session().unwrap().session_id(),
+            session_id
+        );
+    }
+
+    /// A forged job never joins the queue or begins its session. The
+    /// history stays untouched, and the signed job it mimics begins the
+    /// session and runs in its place.
     #[tokio::test]
     async fn unverified_job_does_not_advance_the_chain() {
-        let (mut root, mut sim, session_id, session) = sim_with_session().await;
+        let (mut root, mut sim, preimage, session) = sim_with_session().await;
+        let session_id = session.session_id();
         let actor = root.key_id().clone();
 
         let job_id = session.next_job_id();
@@ -2071,13 +2063,15 @@ mod test {
             signed.key_id().clone(),
             other.signature().clone(),
         );
-        let outputs = sim.request(Request::job(actor.clone(), start(forged)));
+        let outputs = sim.request(Request::job(
+            actor.clone(),
+            start_first(forged, preimage.clone()),
+        ));
         assert!(outputs.is_empty());
         assert!(sim.state.session.session().is_none());
-        assert!(sim.state.pending_rank(session_id).is_some());
         assert!(!sim.state.history.contains(&job_id));
 
-        let outputs = sim.request(Request::job(actor, start(signed)));
+        let outputs = sim.request(Request::job(actor, start_first(signed, preimage)));
         assert!(
             outputs
                 .iter()
@@ -2089,7 +2083,8 @@ mod test {
     /// signed job runs when it arrives.
     #[tokio::test]
     async fn stop_of_unknown_job_leaves_no_trace() {
-        let (mut root, mut sim, session_id, session) = sim_with_session().await;
+        let (mut root, mut sim, preimage, session) = sim_with_session().await;
+        let session_id = session.session_id();
         let actor = root.key_id().clone();
         let job_id = session.next_job_id();
 
@@ -2097,7 +2092,7 @@ mod test {
         assert!(!sim.state.history.contains(&job_id));
 
         let signed = signed_job(&mut root, job_id, session_id, "true").await;
-        let outputs = sim.request(Request::job(actor, start(signed)));
+        let outputs = sim.request(Request::job(actor, start_first(signed, preimage)));
         assert!(
             outputs
                 .iter()
@@ -2108,7 +2103,8 @@ mod test {
     /// A stop records no status on a sled the job doesn't target.
     #[tokio::test]
     async fn stop_leaves_untargeted_sled_alone() {
-        let (mut root, mut sim, session_id, session) = sim_with_session().await;
+        let (mut root, mut sim, preimage, session) = sim_with_session().await;
+        let session_id = session.session_id();
         let actor = root.key_id().clone();
         let other = BaseboardId {
             part_number: "913-0000019".to_string(),
@@ -2131,6 +2127,7 @@ mod test {
                 signed,
                 JobStartParams::default(),
                 BTreeSet::from([other.clone()]),
+                Some(preimage),
             ),
         ));
         sim.send(Message::Event(
@@ -2151,11 +2148,11 @@ mod test {
     /// Only the session starter may stop a job.
     #[tokio::test]
     async fn stop_from_non_starter_is_ignored() {
-        let (mut root, mut sim, session_id, session) = sim_with_session().await;
+        let (mut root, mut sim, preimage, session) = sim_with_session().await;
         let actor = root.key_id().clone();
         let job_id = session.next_job_id();
-        let signed = signed_job(&mut root, job_id, session_id, "true").await;
-        sim.request(Request::job(actor, start(signed)));
+        let signed = signed_job(&mut root, job_id, session.session_id(), "true").await;
+        sim.request(Request::job(actor, start_first(signed, preimage)));
 
         let guest = self::root().key_id().clone();
         let outputs = sim.request(Request::job(guest, JobRequest::Stop(job_id)));
@@ -2197,16 +2194,12 @@ mod test {
             status: None,
         }));
 
-        // The session's start arrives in this network.
-        sim.request(Request::session(
+        // If the committed job arrives again in this network, it begins
+        // the session but skips as superseded instead of running.
+        let outputs = sim.request(Request::job(
             actor.clone(),
-            SessionRequest::Start(committed_preimage),
+            start_first(job_a, committed_preimage),
         ));
-        assert!(sim.state.pending_rank(session_id).is_some());
-
-        // If the committed job arrives again, it confirms the start but
-        // skips as superseded instead of running.
-        let outputs = sim.request(Request::job(actor.clone(), start(job_a)));
         assert!(
             sim.state
                 .session
@@ -2230,10 +2223,9 @@ mod test {
         // A newer session outranks the committed one and runs.
         let next = preimage(committed_seq + 1);
         let next_id = next.session_id();
-        sim.request(Request::session(actor.clone(), SessionRequest::Start(next)));
         let job_c_id = Session::new(next_id).next_job_id();
         let job_c = signed_job(&mut root, job_c_id, next_id, "true").await;
-        let outputs = sim.request(Request::job(actor, start(job_c)));
+        let outputs = sim.request(Request::job(actor, start_first(job_c, next)));
         assert!(outputs.iter().any(|o| matches!(o, Output::Run(_))));
     }
 
@@ -2242,7 +2234,8 @@ mod test {
     /// chain still advances so the session is not wedged.
     #[tokio::test]
     async fn superseded_session_skips_through_step() {
-        let (mut root, mut sim, session_id, mut session) = sim_with_session().await;
+        let (mut root, mut sim, preimage, mut session) = sim_with_session().await;
+        let session_id = session.session_id();
         let actor = root.key_id().clone();
 
         // A committed boundary the active session, at sequence
@@ -2270,7 +2263,10 @@ mod test {
 
         let job_id = session.next_job_id();
         let signed = signed_job(&mut root, job_id, session_id, "true").await;
-        let outputs = sim.request(Request::job(actor.clone(), start(signed.clone())));
+        let outputs = sim.request(Request::job(
+            actor.clone(),
+            start_first(signed.clone(), preimage),
+        ));
         assert!(!outputs.iter().any(|o| matches!(o, Output::Run(_))));
         assert!(skipped(&outputs, job_id));
 
@@ -2282,47 +2278,41 @@ mod test {
     }
 
     /// A session whose sequence number is lower than the active
-    /// session's never becomes active, even when a job for it arrives.
-    /// Checked both for a start that arrives after the higher session
-    /// became active, and for one that was already pending then.
+    /// session's never becomes active, even when its first job arrives
+    /// with its preimage. The job is skipped, so its submitter learns
+    /// it will not run.
     #[tokio::test]
-    async fn lower_start_never_supersedes() {
-        for pending_beside in [false, true] {
-            let mut root = root();
-            let anchors = vec![root.cert().clone()];
-            let actor = root.key_id().clone();
-            let mut sim = Sim::new(&anchors, Vec::new()).await;
-            let high = preimage(2);
-            let high_id = high.session_id();
-            let low = preimage(1);
-            let low_id = low.session_id();
+    async fn lower_session_never_supersedes() {
+        let mut root = root();
+        let anchors = vec![root.cert().clone()];
+        let actor = root.key_id().clone();
+        let mut sim = Sim::new(&anchors, Vec::new()).await;
+        let high = preimage(2);
+        let high_id = high.session_id();
+        let low = preimage(1);
+        let low_id = low.session_id();
 
-            sim.request(Request::session(actor.clone(), SessionRequest::Start(high)));
-            if pending_beside {
-                sim.request(Request::session(
-                    actor.clone(),
-                    SessionRequest::Start(low.clone()),
-                ));
-            }
-            let job_id = Session::new(high_id).next_job_id();
-            let signed = signed_job(&mut root, job_id, high_id, "true").await;
-            sim.request(Request::job(actor.clone(), start(signed)));
-            if !pending_beside {
-                sim.request(Request::session(actor.clone(), SessionRequest::Start(low)));
-            }
+        let job_id = Session::new(high_id).next_job_id();
+        let signed = signed_job(&mut root, job_id, high_id, "true").await;
+        sim.request(Request::job(actor.clone(), start_first(signed, high)));
 
-            let job_id = Session::new(low_id).next_job_id();
-            let signed = signed_job(&mut root, job_id, low_id, "true").await;
-            let outputs = sim.request(Request::job(actor, start(signed)));
-            assert!(!outputs.iter().any(|o| matches!(o, Output::Run(_))));
-            assert!(
-                sim.state
-                    .session
-                    .session()
-                    .is_some_and(|s| s.session_id() == high_id),
-                "pending_beside: {pending_beside}"
-            );
-        }
+        let job_id = Session::new(low_id).next_job_id();
+        let signed = signed_job(&mut root, job_id, low_id, "true").await;
+        let outputs = sim.request(Request::job(actor, start_first(signed, low)));
+        assert!(!outputs.iter().any(|o| matches!(o, Output::Run(_))));
+        assert!(outputs.iter().any(|o| matches!(
+            o,
+            Output::Gossip(Message::Event(
+                _,
+                Event::Job(JobEvent::Skipped(id, _, SkipReason::SessionEnded)),
+            )) if *id == job_id
+        )));
+        assert!(
+            sim.state
+                .session
+                .session()
+                .is_some_and(|s| s.session_id() == high_id)
+        );
     }
 
     /// Without a network to commit through, a ready job is not
@@ -2330,12 +2320,15 @@ mod test {
     /// not wedged.
     #[tokio::test]
     async fn draining_launches_nothing() {
-        let (mut root, mut sim, session_id, mut session) = sim_with_session().await;
+        let (mut root, mut sim, preimage, mut session) = sim_with_session().await;
         let actor = root.key_id().clone();
 
         let job_id = session.next_job_id();
-        let signed = signed_job(&mut root, job_id, session_id, "true").await;
-        sim.send(Message::Request(Request::job(actor, start(signed.clone()))));
+        let signed = signed_job(&mut root, job_id, session.session_id(), "true").await;
+        sim.send(Message::Request(Request::job(
+            actor,
+            start_first(signed.clone(), preimage),
+        )));
         let outputs = sim.pump_draining();
         assert!(!outputs.iter().any(|o| matches!(o, Output::Run(_))));
 
@@ -2348,12 +2341,12 @@ mod test {
     /// with an invalid command error; the chain still advances.
     #[tokio::test]
     async fn invalid_command_is_refused_at_release() {
-        let (mut root, mut sim, session_id, mut session) = sim_with_session().await;
+        let (mut root, mut sim, preimage, mut session) = sim_with_session().await;
         let actor = root.key_id().clone();
 
         let job_id = session.next_job_id();
-        let signed = signed_job(&mut root, job_id, session_id, "-rf").await;
-        let outputs = sim.request(Request::job(actor, start(signed.clone())));
+        let signed = signed_job(&mut root, job_id, session.session_id(), "-rf").await;
+        let outputs = sim.request(Request::job(actor, start_first(signed.clone(), preimage)));
         assert!(!outputs.iter().any(|o| matches!(o, Output::Run(_))));
         assert!(outputs.iter().any(|o| matches!(
             o,
@@ -2382,11 +2375,7 @@ mod test {
         let job_id = session.next_job_id();
         let signed = signed_job(&mut root, job_id, session_id, "true").await;
         let history = vec![
-            Message::Request(Request::session(
-                actor.clone(),
-                SessionRequest::Start(preimage),
-            )),
-            Message::Request(Request::job(actor, start(signed))),
+            Message::Request(Request::job(actor, start_first(signed, preimage))),
             Message::Event(baseboard(), Event::Job(JobEvent::Start(job_id, Utc::now()))),
         ];
 

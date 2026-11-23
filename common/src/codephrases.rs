@@ -212,8 +212,17 @@ impl JsonSchema for Codephrase {
 macro_rules! codephrase_newtype {
     ($(#[$meta:meta])* $vis:vis struct $name:ident = $len:ident;) => {
         $(#[$meta])*
-        #[serde(try_from = "crate::codephrases::Codephrase")]
+        #[serde(
+            into = "crate::codephrases::Codephrase",
+            try_from = "crate::codephrases::Codephrase"
+        )]
         $vis struct $name($crate::codephrases::Codephrase);
+
+        impl From<$name> for $crate::codephrases::Codephrase {
+            fn from(value: $name) -> Self {
+                value.0
+            }
+        }
 
         /// Fail on values wider than the type allows, canonicalizing
         /// both parsed and deserialized values.

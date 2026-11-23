@@ -2,7 +2,7 @@
   "openapi": "3.0.3",
   "info": {
     "title": "Oxide Support Shell",
-    "version": "0.3.0"
+    "version": "0.4.0"
   },
   "paths": {
     "/certs/{key_id}": {
@@ -323,6 +323,7 @@
     "/jobs/{job_id}/start/{target}": {
       "post": {
         "summary": "Start an authorized job.",
+        "description": "If session details are provided, also start a new session.",
         "operationId": "job_start",
         "parameters": [
           {
@@ -417,6 +418,15 @@
           },
           {
             "in": "query",
+            "name": "via",
+            "description": "Where a proxy should route the job request.",
+            "schema": {
+              "nullable": true,
+              "type": "string"
+            }
+          },
+          {
+            "in": "query",
             "name": "wait",
             "description": "Wait for the job to start or stop.",
             "schema": {
@@ -428,7 +438,7 @@
           "content": {
             "application/json": {
               "schema": {
-                "$ref": "#/components/schemas/Signed_for_JobStartRequest"
+                "$ref": "#/components/schemas/JobStartBody"
               }
             }
           },
@@ -559,8 +569,8 @@
     },
     "/server-nonce": {
       "get": {
-        "summary": "Get a fresh server nonce for the session ceremony.",
-        "description": "The client mixes its own nonce with this one to form the sush nonce it submits to the signer. Fetching replaces the previous server nonce, so only the latest ceremony can complete.",
+        "summary": "Get this server's nonce for the session ceremony.",
+        "description": "The client mixes its own nonce with this one to form the sush nonce it submits to the signer. Each identity gets its own nonce, which stays the same until the next session starts.",
         "operationId": "server_nonce",
         "parameters": [
           {
@@ -726,7 +736,7 @@
     "/sessions/{session_id}/preflight/{target}": {
       "get": {
         "summary": "Check that this server would accept a job in a session for a target.",
-        "description": "Succeeds if the session is active or its start is pending, and the target resolves to at least one sled this server can reach.",
+        "description": "Succeeds if the authenticated identity has read-write access to the current session, or can supply a valid session ID derivation for a session that would supersede it. The target must also resolve to at least one sled this server can reach.",
         "operationId": "job_preflight",
         "parameters": [
           {
@@ -750,6 +760,43 @@
             "name": "target",
             "required": true,
             "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "in": "query",
+            "name": "baseboard",
+            "schema": {
+              "nullable": true,
+              "type": "string"
+            }
+          },
+          {
+            "in": "query",
+            "name": "client_nonce",
+            "schema": {
+              "$ref": "#/components/schemas/SessionClientNonce"
+            }
+          },
+          {
+            "in": "query",
+            "name": "seq",
+            "schema": {
+              "$ref": "#/components/schemas/SessionSeq"
+            }
+          },
+          {
+            "in": "query",
+            "name": "signer_nonce",
+            "schema": {
+              "$ref": "#/components/schemas/SessionSignerNonce"
+            }
+          },
+          {
+            "in": "query",
+            "name": "via",
+            "schema": {
+              "nullable": true,
               "type": "string"
             }
           }
@@ -797,52 +844,6 @@
             }
           }
         ],
-        "responses": {
-          "204": {
-            "description": "resource updated"
-          },
-          "4XX": {
-            "$ref": "#/components/responses/Error"
-          },
-          "5XX": {
-            "$ref": "#/components/responses/Error"
-          }
-        }
-      }
-    },
-    "/sessions/{session_id}/start": {
-      "post": {
-        "summary": "Start a new support session.",
-        "description": "A session start is not signed, so the rack acts on it only when it verifies a signed job for the session. The new session then supersedes the active one: the rack skips the old session's queued jobs but does not stop its running jobs.",
-        "operationId": "session_start",
-        "parameters": [
-          {
-            "in": "header",
-            "name": "authorization",
-            "description": "Authorization to access some resource, such as a signature.\n\nSee: <https://developer.mozilla.org/en-US/docs/Web/HTTP/Reference/Headers/Authorization>",
-            "schema": {
-              "type": "string"
-            }
-          },
-          {
-            "in": "path",
-            "name": "session_id",
-            "required": true,
-            "schema": {
-              "$ref": "#/components/schemas/SessionId"
-            }
-          }
-        ],
-        "requestBody": {
-          "content": {
-            "application/json": {
-              "schema": {
-                "$ref": "#/components/schemas/SessionStartBody"
-              }
-            }
-          },
-          "required": true
-        },
         "responses": {
           "204": {
             "description": "resource updated"
@@ -1179,6 +1180,25 @@
         },
         "required": [
           "status"
+        ]
+      },
+      "JobStartBody": {
+        "type": "object",
+        "properties": {
+          "job": {
+            "$ref": "#/components/schemas/Signed_for_JobStartRequest"
+          },
+          "session": {
+            "nullable": true,
+            "allOf": [
+              {
+                "$ref": "#/components/schemas/SessionDetails"
+              }
+            ]
+          }
+        },
+        "required": [
+          "job"
         ]
       },
       "JobStartRequest": {
@@ -1629,6 +1649,29 @@
         "description": "The session nonce component generated by the sush client (on the operator's machine).",
         "type": "string"
       },
+      "SessionDetails": {
+        "type": "object",
+        "properties": {
+          "baseboard": {
+            "$ref": "#/components/schemas/BaseboardId"
+          },
+          "client_nonce": {
+            "$ref": "#/components/schemas/SessionClientNonce"
+          },
+          "seq": {
+            "$ref": "#/components/schemas/SessionSeq"
+          },
+          "signer_nonce": {
+            "$ref": "#/components/schemas/SessionSignerNonce"
+          }
+        },
+        "required": [
+          "baseboard",
+          "client_nonce",
+          "seq",
+          "signer_nonce"
+        ]
+      },
       "SessionId": {
         "description": "A globally unique identifier for a session. Constructed only from a `SessionPreimage`.",
         "type": "string"
@@ -1644,25 +1687,6 @@
       "SessionSignerNonce": {
         "description": "The component of the hashed Session ID generated by the signing server.",
         "type": "string"
-      },
-      "SessionStartBody": {
-        "type": "object",
-        "properties": {
-          "client_nonce": {
-            "$ref": "#/components/schemas/SessionClientNonce"
-          },
-          "seq": {
-            "$ref": "#/components/schemas/SessionSeq"
-          },
-          "signer_nonce": {
-            "$ref": "#/components/schemas/SessionSignerNonce"
-          }
-        },
-        "required": [
-          "client_nonce",
-          "seq",
-          "signer_nonce"
-        ]
       },
       "SessionView": {
         "description": "A possibly-restricted view of a session.",

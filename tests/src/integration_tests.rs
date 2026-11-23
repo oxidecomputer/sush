@@ -31,7 +31,10 @@ use x509_cert::Certificate;
 use x509_cert::der::DecodePem as _;
 
 use sush_api::sush_api_mod::api_description;
-use sush_api::{JobWait, VERSION_HEADER, VERSION_INITIAL, version_policy};
+use sush_api::{
+    JobStartBody, JobWait, VERSION_HEADER, VERSION_INITIAL, VERSION_SESSION_ACCESS, v0_1,
+    version_policy,
+};
 use sush_client::tls::client as tls_client;
 use sush_client::tunnel::{Tunnel, pipe};
 use sush_client::{AuthzSigner, Client, Error as ClientError};
@@ -43,7 +46,7 @@ use sush_common::jobs::{
 };
 use sush_common::targets::Cubbies;
 use sush_proxy::{ProxyServer, Targets, platform_tls};
-use sush_server::ApiServer;
+use sush_server::{ApiServer, JobError};
 
 use crate::test_utils::{
     SignJobRequest as _, authz, ephemeral_test_root, http_session_ceremony, manager_and_test_root,
@@ -89,15 +92,19 @@ async fn client_server() {
     assert_eq!(login.status(), 404, "expected 404 Not Found");
 
     // Start a session and run a job.
-    let (session_id, body) = http_session_ceremony(&client, 1).await;
+    let (session_id, details) = http_session_ceremony(&client, 1).await;
     let session = Session::new(session_id);
     client
-        .session_start()
-        .session_id(session.session_id())
-        .body(body)
+        .job_preflight()
+        .session_id(session_id)
+        .target("*")
+        .baseboard(details.baseboard.to_string())
+        .client_nonce(details.client_nonce)
+        .signer_nonce(details.signer_nonce)
+        .seq(details.seq)
         .send()
         .await
-        .expect("can't start session");
+        .expect("can't preflight the first job");
     let job_id = session.next_job_id();
     let job = root
         .sign_job_request(job_id, session_id, "echo -n $SUSH_JOB_ID", false)
@@ -115,7 +122,10 @@ async fn client_server() {
         .max_mem(max_mem)
         .max_fsize(max_fsize)
         .wait(JobWait::Stop)
-        .body(job.into_signed())
+        .body(JobStartBody {
+            job: job.into_signed(),
+            session: Some(details),
+        })
         .send()
         .await
         .expect("can't start job");
@@ -176,15 +186,8 @@ async fn v1_status_maps() {
     signer.set_claim(requester(&root));
     let client = Client::new(&format!("http://{addr}"), signer);
 
-    let (session_id, body) = http_session_ceremony(&client, 1).await;
+    let (session_id, details) = http_session_ceremony(&client, 1).await;
     let session = Session::new(session_id);
-    client
-        .session_start()
-        .session_id(session.session_id())
-        .body(body)
-        .send()
-        .await
-        .expect("can't start session");
     let job_id = session.next_job_id();
     let job = root
         .sign_job_request(job_id, session_id, "true", false)
@@ -202,7 +205,10 @@ async fn v1_status_maps() {
         .max_mem(max_mem)
         .max_fsize(max_fsize)
         .wait(JobWait::Stop)
-        .body(job.into_signed())
+        .body(JobStartBody {
+            job: job.into_signed(),
+            session: Some(details),
+        })
         .send()
         .await
         .expect("can't start job");
@@ -233,6 +239,53 @@ async fn v1_status_maps() {
         history[0].keys().collect::<Vec<_>>(),
         status.keys().collect::<Vec<_>>()
     );
+}
+
+/// Clients from before sessions began with their first job ask the
+/// server to start a session, and are told to upgrade.
+#[named]
+#[test]
+async fn old_client_session_start_is_refused() {
+    let log = test_logger(function_name!());
+    let (mgr, root, _dir, _shutdown) = manager_and_test_root(log.clone()).await;
+    let api = api_description::<ApiServer>().unwrap();
+    let server = ServerBuilder::new(api, Arc::new(mgr), log)
+        .config(ConfigDropshot {
+            bind_address: local_addr(),
+            ..Default::default()
+        })
+        .version_policy(version_policy())
+        .start()
+        .expect("failed to start server");
+    let addr = server.local_addr();
+    let signer = AuthzSigner::default();
+    signer.set_claim(requester(&root));
+    let client = Client::new(&format!("http://{addr}"), signer);
+    let (session_id, details) = http_session_ceremony(&client, 1).await;
+    let body = v0_1::SessionStartBody {
+        client_nonce: details.client_nonce,
+        signer_nonce: details.signer_nonce,
+        seq: details.seq,
+    };
+
+    let claim = BoundCredentials::claim(requester(&root)).to_string();
+    for version in [VERSION_INITIAL, VERSION_SESSION_ACCESS] {
+        let response = reqwest::Client::new()
+            .post(format!("http://{addr}/sessions/{session_id}/start"))
+            .header(VERSION_HEADER, version.to_string())
+            .header("authorization", &claim)
+            .json(&body)
+            .send()
+            .await
+            .expect("can't send old session start");
+        assert_eq!(response.status(), 400, "version {version}");
+        let error: serde_json::Value = response.json().await.unwrap();
+        assert_eq!(
+            error["message"],
+            JobError::ClientTooOld.to_string(),
+            "version {version}"
+        );
+    }
 }
 
 #[named]
@@ -313,15 +366,8 @@ async fn client_proxy_server() {
 
     // Attach to an interactive job through the proxy, routed by the
     // target path segment, and echo bytes over the bridged upgrade.
-    let (session_id, body) = http_session_ceremony(&client, 1).await;
+    let (session_id, details) = http_session_ceremony(&client, 1).await;
     let session = Session::new(session_id);
-    client
-        .session_start()
-        .session_id(session.session_id())
-        .body(body)
-        .send()
-        .await
-        .expect("can't start session");
     let job_id = session.next_job_id();
     let job = root
         .sign_job_request_for(
@@ -347,7 +393,10 @@ async fn client_proxy_server() {
         .rows(24)
         .cols(80)
         .wait(JobWait::Start)
-        .body(job.into_signed())
+        .body(JobStartBody {
+            job: job.into_signed(),
+            session: Some(details),
+        })
         .send()
         .await
         .expect("can't start job");
@@ -474,15 +523,8 @@ async fn interactive_job() {
     let client = Client::new(&format!("http://{addr}"), signer.clone());
 
     // Start a session and run an interactive job.
-    let (session_id, body) = http_session_ceremony(&client, 1).await;
+    let (session_id, details) = http_session_ceremony(&client, 1).await;
     let session = Session::new(session_id);
-    client
-        .session_start()
-        .session_id(session.session_id())
-        .body(body)
-        .send()
-        .await
-        .expect("can't start session");
     let job_id = session.next_job_id();
     let job = root
         .sign_job_request_for(
@@ -508,7 +550,10 @@ async fn interactive_job() {
         .rows(ROWS)
         .cols(COLS)
         .wait(JobWait::Start)
-        .body(job.into_signed())
+        .body(JobStartBody {
+            job: job.into_signed(),
+            session: Some(details),
+        })
         .send()
         .await
         .expect("can't start job");
@@ -757,15 +802,8 @@ async fn streaming_job() {
     let client = Client::new(&format!("http://{addr}"), signer.clone());
 
     // Start a streaming job too big for its pipe, so it blocks until we attach.
-    let (session_id, body) = http_session_ceremony(&client, 1).await;
+    let (session_id, details) = http_session_ceremony(&client, 1).await;
     let session = Session::new(session_id);
-    client
-        .session_start()
-        .session_id(session.session_id())
-        .body(body)
-        .send()
-        .await
-        .expect("can't start session");
     let job_id = session.next_job_id();
     let job = root
         .sign_streaming_job_request(
@@ -788,7 +826,10 @@ async fn streaming_job() {
         .max_mem(max_mem)
         .max_fsize(max_fsize)
         .wait(JobWait::Start)
-        .body(job.into_signed())
+        .body(JobStartBody {
+            job: job.into_signed(),
+            session: Some(details),
+        })
         .send()
         .await
         .expect("can't start job");
@@ -895,15 +936,8 @@ async fn streaming_job_linger() {
     let client = Client::new(&format!("http://{addr}"), signer.clone());
 
     // Run a streaming job small enough to finish before anyone attaches.
-    let (session_id, body) = http_session_ceremony(&client, 1).await;
+    let (session_id, details) = http_session_ceremony(&client, 1).await;
     let session = Session::new(session_id);
-    client
-        .session_start()
-        .session_id(session.session_id())
-        .body(body)
-        .send()
-        .await
-        .expect("can't start session");
     let job_id = session.next_job_id();
     let job = root
         .sign_streaming_job_request(
@@ -926,7 +960,10 @@ async fn streaming_job_linger() {
         .max_mem(max_mem)
         .max_fsize(max_fsize)
         .wait(JobWait::Start)
-        .body(job.into_signed())
+        .body(JobStartBody {
+            job: job.into_signed(),
+            session: Some(details),
+        })
         .send()
         .await
         .expect("can't start job");

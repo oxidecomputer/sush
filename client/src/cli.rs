@@ -29,6 +29,7 @@ use sled_hardware_types::BaseboardId;
 use x509_cert::Certificate;
 use x509_cert::der::Encode as _;
 
+use sush_api::SessionDetails;
 use sush_common::authn::Identity;
 use sush_common::jobs::{
     Access, JobId, JobOutputState, JobOutputStream, JobStartRequest, JobStatus, JobStatusMap,
@@ -44,24 +45,32 @@ use crate::context::{CommandContext, OutputFormat, StartedDisplay, StatusDisplay
 use crate::{AuthzSigner, base_directories, quiet_write};
 
 const SESSION_FILE_NAME: &str = "session.json";
-const SESSION_FILE_VERSION: u32 = 1;
-const CLIENT_NONCE_FILE_NAME: &str = "client-nonce.json";
-const CLIENT_NONCE_FILE_VERSION: u32 = 1;
+const SESSION_FILE_VERSION: u32 = 2;
 
-/// The persisted session, versioned for future migrations.
+/// The persisted session state, versioned for future migrations.
 #[derive(Deserialize, Serialize)]
 struct SavedSession {
     version: u32,
-    session: Session,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    ceremony: Option<Ceremony>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    details: Option<SessionDetails>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    session: Option<Session>,
 }
 
-/// The persisted client nonce of the pending session ceremony,
-/// versioned for future migrations. One pending ceremony at a time,
-/// mirroring the rack's one server nonce slot: `session start-params`
-/// overwrites it just as the fetch it makes overwrites the slot.
-#[derive(Deserialize, Serialize)]
-struct SavedClientNonce {
-    version: u32,
+impl SavedSession {
+    fn is_empty(&self) -> bool {
+        self.ceremony.is_none() && self.details.is_none() && self.session.is_none()
+    }
+}
+
+/// The client nonce of the pending session ceremony, and the sled whose
+/// server nonce it pairs with. Only one ceremony at a time is allowed;
+/// `session start-params` overwrites it, and `session start` consumes it.
+#[derive(Clone, Deserialize, Serialize)]
+struct Ceremony {
+    baseboard: BaseboardId,
     client_nonce: SessionClientNonce,
 }
 
@@ -72,8 +81,8 @@ pub struct Cli {
     progress: Arc<Mutex<Option<ProgressBar>>>,
     watch: Arc<Mutex<Option<Watch>>>,
     session: Arc<Mutex<Option<Session>>>,
+    details: Arc<Mutex<Option<SessionDetails>>>,
     session_file: Option<PathBuf>,
-    client_nonce_file: Option<PathBuf>,
     credentials: AuthzSigner,
 }
 
@@ -92,9 +101,14 @@ impl Cli {
         match fs::read(&path) {
             Ok(json) => match serde_json::from_slice::<SavedSession>(&json) {
                 Ok(SavedSession {
-                    version: SESSION_FILE_VERSION,
+                    version: 1..=SESSION_FILE_VERSION,
                     session,
-                }) => *self.session.lock().unwrap() = Some(session),
+                    details,
+                    ..
+                }) => {
+                    *self.session.lock().unwrap() = session;
+                    *self.details.lock().unwrap() = details;
+                }
                 Ok(SavedSession { version, .. }) => {
                     eprintln!("❗ Ignoring a version {version} saved session")
                 }
@@ -104,10 +118,6 @@ impl Cli {
             Err(error) => eprintln!("❗ Ignoring the saved session: {error}"),
         }
         self.session_file = Some(path);
-        match base_directories().place_state_file(CLIENT_NONCE_FILE_NAME) {
-            Ok(path) => self.client_nonce_file = Some(path),
-            Err(error) => eprintln!("❗ The client nonce will not persist: {error}"),
-        }
     }
 
     fn note(&self, message: impl fmt::Display) {
@@ -127,27 +137,49 @@ impl Cli {
                 .as_ref()
                 .is_none_or(|s| s.session_id() != session_id)
         {
+            *self.details.lock().unwrap() = None;
             self.save_session(Some(&session));
             *session_guard = Some(session);
         }
         session_id
     }
 
+    fn saved_ceremony(&self) -> Option<Ceremony> {
+        let json = fs::read(self.session_file.as_ref()?).ok()?;
+        match serde_json::from_slice::<SavedSession>(&json) {
+            Ok(SavedSession {
+                version: SESSION_FILE_VERSION,
+                ceremony,
+                ..
+            }) => ceremony,
+            _ => None,
+        }
+    }
+
+    /// Rewrite the session file, preserving its ceremony.
     fn save_session(&self, session: Option<&Session>) {
+        self.save(session, self.saved_ceremony());
+    }
+
+    fn save(&self, session: Option<&Session>, ceremony: Option<Ceremony>) {
         let Some(path) = &self.session_file else {
             return;
         };
-        let result = match session {
-            Some(session) => serde_json::to_vec_pretty(&SavedSession {
-                version: SESSION_FILE_VERSION,
-                session: session.clone(),
-            })
-            .map_err(io::Error::other)
-            .and_then(|json| write_private(path, &json)),
-            None => match fs::remove_file(path) {
+        let saved = SavedSession {
+            version: SESSION_FILE_VERSION,
+            ceremony,
+            details: self.details.lock().unwrap().clone(),
+            session: session.cloned(),
+        };
+        let result = if saved.is_empty() {
+            match fs::remove_file(path) {
                 Err(error) if error.kind() != ErrorKind::NotFound => Err(error),
                 _ => Ok(()),
-            },
+            }
+        } else {
+            serde_json::to_vec_pretty(&saved)
+                .map_err(io::Error::other)
+                .and_then(|json| write_private(path, &json))
         };
         if let Err(error) = result {
             eprintln!("❗ The session was not saved: {error}");
@@ -339,30 +371,17 @@ impl CommandContext for Cli {
         self.credentials.clone()
     }
 
-    fn pending_client_nonce(&self) -> Option<SessionClientNonce> {
-        let json = fs::read(self.client_nonce_file.as_ref()?).ok()?;
-        match serde_json::from_slice::<SavedClientNonce>(&json) {
-            Ok(SavedClientNonce {
-                version: CLIENT_NONCE_FILE_VERSION,
-                client_nonce,
-            }) => Some(client_nonce),
-            _ => None,
-        }
+    fn pending_ceremony(&self) -> Option<(BaseboardId, SessionClientNonce)> {
+        self.saved_ceremony()
+            .map(|ceremony| (ceremony.baseboard, ceremony.client_nonce))
     }
 
-    fn save_client_nonce(&self, client_nonce: SessionClientNonce) {
-        let Some(path) = &self.client_nonce_file else {
-            return;
-        };
-        let result = serde_json::to_vec_pretty(&SavedClientNonce {
-            version: CLIENT_NONCE_FILE_VERSION,
+    fn save_ceremony(&self, baseboard: &BaseboardId, client_nonce: SessionClientNonce) {
+        let ceremony = Ceremony {
+            baseboard: baseboard.clone(),
             client_nonce,
-        })
-        .map_err(io::Error::other)
-        .and_then(|json| write_private(path, &json));
-        if let Err(error) = result {
-            eprintln!("❗ The client nonce was not saved: {error}");
-        }
+        };
+        self.save(self.session.lock().unwrap().as_ref(), Some(ceremony));
     }
 
     fn session_id(&self) -> Option<SessionId> {
@@ -381,19 +400,13 @@ impl CommandContext for Cli {
         }
     }
 
-    fn session_start_params(
-        &self,
-        baseboard_id: BaseboardId,
-        client_nonce: SessionClientNonce,
-        sush_nonce: SessionSushNonce,
-    ) {
+    fn session_start_params(&self, baseboard_id: BaseboardId, sush_nonce: SessionSushNonce) {
         match self.get_output_format() {
             OutputFormat::Json => qprintln!(
                 "{}",
                 json!({
                     "session_start_params": {
                         "baseboard_id": &baseboard_id.to_string(),
-                        "client_nonce": &client_nonce,
                         "sush_nonce": &sush_nonce,
                     }
                 })
@@ -458,14 +471,33 @@ impl CommandContext for Cli {
         }
     }
 
-    fn session_started(&mut self, session: Session, force: bool) {
-        let session_id = self.adopt_session(session, force);
+    fn session_details(&self) -> Option<SessionDetails> {
+        self.details.lock().unwrap().clone()
+    }
+
+    fn session_started(&mut self, session: Session, details: SessionDetails, show: bool) {
+        let session_id = session.session_id();
+        let mut session_guard = self.session.lock().unwrap();
+        *self.details.lock().unwrap() = Some(details);
+        self.save(Some(&session), None);
+        *session_guard = Some(session);
+        drop(session_guard);
+        if !show {
+            return;
+        }
         match self.get_output_format() {
             OutputFormat::Json => qprintln!("{}", json!({"session_started": session_id})),
             OutputFormat::Text => {
                 self.note("✅ Started session");
                 qprintln!("   Session ID: {session_id}");
             }
+        }
+    }
+
+    fn first_job_started(&mut self) {
+        let session_guard = self.session.lock().unwrap();
+        if self.details.lock().unwrap().take().is_some() {
+            self.save_session(session_guard.as_ref());
         }
     }
 
@@ -476,6 +508,20 @@ impl CommandContext for Cli {
             OutputFormat::Text => {
                 self.note("✅ Joined session");
                 qprintln!("   Session ID: {session_id}");
+            }
+        }
+    }
+
+    fn session_pending(&mut self, current: SessionId, pending: SessionId) {
+        match self.get_output_format() {
+            OutputFormat::Json => qprintln!(
+                "{}",
+                json!({"session_current": current, "session_pending": pending})
+            ),
+            OutputFormat::Text => {
+                self.note("✅ Current session");
+                qprintln!("   Session ID: {current}");
+                self.note(format!("❗ Session `{pending}` is pending, and will start with the next job"));
             }
         }
     }
@@ -497,7 +543,7 @@ impl CommandContext for Cli {
     fn really_supersede(&mut self, session_id: SessionId) -> Result<(), CommandError> {
         if read_bool(&format!(
             "❓ Session `{session_id}` is active.\n   \
-                Stop it and start a new session (yes/no)? ",
+                Create a new session to replace it with the next job (yes/no)? ",
         ))? {
             Ok(())
         } else {

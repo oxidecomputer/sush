@@ -259,27 +259,27 @@ impl Router {
     }
 }
 
-/// The target a request names, if any. A `*` path segment names no
-/// particular sled, so the `via` query parameter may still route.
+/// The target associated with a request path, or its `via` if present.
 fn named_target<B>(request: &Request<B>) -> Option<Result<Target, String>> {
     let uri = request.uri();
     let segments: Vec<&str> = uri.path().trim_start_matches('/').split('/').collect();
-    let named = match segments.as_slice() {
+    let via = uri.query().and_then(|query| {
+        query.split('&').find_map(|param| {
+            param
+                .split_once('=')
+                .filter(|(key, _)| *key == "via")
+                .map(|(_, value)| value)
+        })
+    });
+    let named = via.or(match segments.as_slice() {
         ["jobs", _, "attach" | "output" | "start", target, ..]
         | ["sessions", _, "preflight", target]
             if *target != "*" =>
         {
             Some(*target)
         }
-        _ => uri.query().and_then(|query| {
-            query.split('&').find_map(|param| {
-                param
-                    .split_once('=')
-                    .filter(|(key, _)| *key == "via")
-                    .map(|(_, value)| value)
-            })
-        }),
-    }?;
+        _ => None,
+    })?;
     let decoded = match percent_decode_str(named).decode_utf8() {
         Ok(decoded) => decoded,
         Err(_) => return Some(Err(named.to_string())),
@@ -692,6 +692,10 @@ mod test {
             Some(Ok(target("test part:0000"))),
         );
         assert_eq!(named_target(&request("/jobs/some-job/start/*")), None);
+        assert_eq!(
+            named_target(&request("/jobs/some-job/start/14?via=16")),
+            Some(Ok(target("16"))),
+        );
         assert_eq!(
             named_target(&request("/sessions/some-session/preflight/14")),
             Some(Ok(target("14"))),

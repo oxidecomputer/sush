@@ -10,6 +10,7 @@ use std::io;
 use std::path::{Path, PathBuf};
 
 use dropshot::{ClientErrorStatusCode, HttpError};
+use sled_hardware_types::BaseboardId;
 use thiserror::Error;
 
 use sush_api::ErrorCode;
@@ -106,8 +107,12 @@ pub enum JobError {
     UnknownCubby(u8),
     #[error("Unable to wait for job end")]
     Wait,
-    #[error("The provided session ID is invalid")]
-    InvalidSessionId,
+    #[error("Stale or invalid nonce for session `{0}`")]
+    StaleNonce(SessionId),
+    #[error("Session `{0}` was established on server `{1}`, and should have been routed there")]
+    OtherSled(SessionId, BaseboardId),
+    #[error("This client is too old, please upgrade")]
+    ClientTooOld,
     #[error("Job signature verification failed: {0}")]
     UnverifiedJob(KeyError),
 }
@@ -200,10 +205,13 @@ impl From<JobError> for HttpError {
                 ClientErrorStatusCode::GONE,
                 message,
             ),
-            DuplicateJobId(_) | InteractiveTarget | InvalidCommand | Json(_) | MultipleSessions
-            | InvalidSessionId | NoReachableTarget | NoRequester | UnknownCubby(_)
-            | UnverifiedJob(_) => {
+            ClientTooOld | DuplicateJobId(_) | InteractiveTarget | InvalidCommand | Json(_)
+            | MultipleSessions | NoReachableTarget | NoRequester | OtherSled(..)
+            | UnknownCubby(_) | UnverifiedJob(_) => {
                 HttpError::for_client_error(None, ClientErrorStatusCode::BAD_REQUEST, message)
+            }
+            StaleNonce(_) => {
+                HttpError::for_client_error(None, ClientErrorStatusCode::CONFLICT, message)
             }
             ProxyOnly => {
                 HttpError::for_client_error(None, ClientErrorStatusCode::NOT_FOUND, message)

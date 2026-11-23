@@ -27,7 +27,7 @@ use tokio_util::sync::CancellationToken;
 use x509_cert::name::Name;
 use x509_cert::time::Validity;
 
-use sush_api::{JobStartParams, JobWait};
+use sush_api::{JobStartParams, JobWait, SessionDetails};
 use sush_client::context::Authz;
 use sush_client::{Client, ResponseValue};
 use sush_common::authn::{Challenge, ChallengeResponse, Credentials, Identity, RequestKey};
@@ -236,23 +236,18 @@ pub async fn manager_and_test_root(
     (mgr, root, dir, shutdown)
 }
 
-/// Everything the rack hears at session start: a client nonce, a
-/// signer nonce, the signer's clock reading, and the session id over
-/// them all.
+/// Everything a session's first job carries to the rack: the session
+/// id, and the details that start the session.
 pub struct SessionCeremony {
     pub session_id: SessionId,
-    pub client_nonce: SessionClientNonce,
     pub sush_nonce: SessionSushNonce,
-    pub signer_nonce: SessionSignerNonce,
-    pub seq: SessionSeq,
+    pub details: SessionDetails,
 }
 
-/// Build a [`SessionCeremony`] against `mgr`. Fetches a fresh server
-/// nonce, as `GET /session-nonce` would, so earlier ceremonies
-/// against `mgr` go stale.
-pub fn session_ceremony(mgr: &JobManager, seq: u64) -> SessionCeremony {
+/// Build a [`SessionCeremony`] against `mgr` for `authn`.
+pub fn session_ceremony(mgr: &JobManager, authn: &KeyId, seq: u64) -> SessionCeremony {
     let client_nonce = SessionClientNonce::random();
-    let sush_nonce = SessionSushNonce::compute(client_nonce, mgr.fresh_server_nonce());
+    let sush_nonce = SessionSushNonce::compute(client_nonce, mgr.server_nonce(authn));
     let preimage = SessionPreimage {
         baseboard: mgr.own_baseboard().clone(),
         sush_nonce,
@@ -261,20 +256,24 @@ pub fn session_ceremony(mgr: &JobManager, seq: u64) -> SessionCeremony {
     };
     SessionCeremony {
         session_id: preimage.session_id(),
-        client_nonce,
         sush_nonce,
-        signer_nonce: preimage.signer_nonce,
-        seq: preimage.seq,
+        details: SessionDetails {
+            baseboard: preimage.baseboard.clone(),
+            client_nonce,
+            signer_nonce: preimage.signer_nonce,
+            seq: preimage.seq,
+        },
     }
 }
 
-/// Confirm the start pending on `mgr` with the session's first job,
-/// and advance `session` past it.
-pub async fn confirm_start(
+/// Start a session on `mgr` with a first job that runs `true`, and
+/// advance `session` past it.
+pub async fn start_session(
     mgr: &JobManager,
     authn: &KeyId,
     root: &mut EphemeralKey,
     session: &mut Session,
+    details: SessionDetails,
 ) {
     let job = root
         .sign_job_request(session.next_job_id(), session.session_id(), "true", false)
@@ -286,6 +285,7 @@ pub async fn confirm_start(
             wait: JobWait::Stop,
             ..Default::default()
         },
+        Some(&details),
     )
     .await
     .unwrap();
@@ -295,10 +295,7 @@ pub async fn confirm_start(
 /// Build a session id and the start body carrying its parts: like
 /// [`session_ceremony`], but the server nonce comes from `client`'s
 /// rack over HTTP.
-pub async fn http_session_ceremony(
-    client: &Client,
-    seq: u64,
-) -> (SessionId, sush_client::types::SessionStartBody) {
+pub async fn http_session_ceremony(client: &Client, seq: u64) -> (SessionId, SessionDetails) {
     let client_nonce = SessionClientNonce::random();
     let server_nonce = client.server_nonce().send().await.unwrap().into_inner();
     let preimage = SessionPreimage {
@@ -309,7 +306,8 @@ pub async fn http_session_ceremony(
     };
     (
         preimage.session_id(),
-        sush_client::types::SessionStartBody {
+        SessionDetails {
+            baseboard: preimage.baseboard.clone(),
             client_nonce,
             signer_nonce: preimage.signer_nonce,
             seq: preimage.seq,

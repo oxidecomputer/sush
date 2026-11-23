@@ -19,6 +19,7 @@ use shlex::split as split_command;
 use sled_hardware_types::BaseboardId;
 use x509_cert::Certificate;
 
+use sush_api::SessionDetails;
 use sush_common::authn::Identity;
 use sush_common::jobs::{
     Access, JobId, JobOutputStream, JobStartRequest, JobStatusMap, Session, SessionClientNonce,
@@ -276,22 +277,24 @@ impl CommandContext for Repl {
         self.cli.next_job_id()
     }
 
-    fn pending_client_nonce(&self) -> Option<SessionClientNonce> {
-        self.cli.pending_client_nonce()
+    fn pending_ceremony(&self) -> Option<(BaseboardId, SessionClientNonce)> {
+        self.cli.pending_ceremony()
     }
 
-    fn save_client_nonce(&self, client_nonce: SessionClientNonce) {
-        self.cli.save_client_nonce(client_nonce)
+    fn save_ceremony(&self, baseboard: &BaseboardId, client_nonce: SessionClientNonce) {
+        self.cli.save_ceremony(baseboard, client_nonce)
     }
 
-    fn session_start_params(
-        &self,
-        baseboard_id: BaseboardId,
-        client_nonce: SessionClientNonce,
-        sush_nonce: SessionSushNonce,
-    ) {
-        self.cli
-            .session_start_params(baseboard_id, client_nonce, sush_nonce)
+    fn session_details(&self) -> Option<SessionDetails> {
+        self.cli.session_details()
+    }
+
+    fn first_job_started(&mut self) {
+        self.cli.first_job_started()
+    }
+
+    fn session_start_params(&self, baseboard_id: BaseboardId, sush_nonce: SessionSushNonce) {
+        self.cli.session_start_params(baseboard_id, sush_nonce)
     }
 
     fn job_start_params(&self, request: &JobStartRequest) {
@@ -307,12 +310,16 @@ impl CommandContext for Repl {
         self.cli.session_created(session, signer_nonce, seq)
     }
 
-    fn session_started(&mut self, session: Session, force: bool) {
-        self.cli.session_started(session, force)
+    fn session_started(&mut self, session: Session, details: SessionDetails, show: bool) {
+        self.cli.session_started(session, details, show)
     }
 
     fn session_joined(&mut self, session: Session, force: bool) {
         self.cli.session_joined(session, force)
+    }
+
+    fn session_pending(&mut self, current: SessionId, pending: SessionId) {
+        self.cli.session_pending(current, pending)
     }
 
     fn session_stopped(&mut self, session_id: &SessionId) {

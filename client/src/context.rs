@@ -13,6 +13,7 @@ use clap::ValueEnum;
 use sled_hardware_types::BaseboardId;
 use x509_cert::Certificate;
 
+use sush_api::SessionDetails;
 use sush_common::authn::{BoundRequest, Credentials, Identity, RequestKey};
 use sush_common::jobs::{
     Access, JobId, JobOutputStream, JobStartRequest, JobStatusMap, Session, SessionClientNonce,
@@ -154,18 +155,17 @@ pub trait CommandContext: Clone + Send + Sync {
     fn set_credentials(&mut self, credentials: Option<Authz>) {
         self.authz_signer().set(credentials)
     }
-    fn pending_client_nonce(&self) -> Option<SessionClientNonce> {
+    fn pending_ceremony(&self) -> Option<(BaseboardId, SessionClientNonce)> {
         None
     }
-    fn save_client_nonce(&self, _client_nonce: SessionClientNonce) {}
+    fn save_ceremony(&self, _baseboard: &BaseboardId, _client_nonce: SessionClientNonce) {}
+    fn session_details(&self) -> Option<SessionDetails> {
+        None
+    }
+    fn first_job_started(&mut self) {}
     fn session_id(&self) -> Option<SessionId>;
     fn next_job_id(&self) -> Result<JobId, CommandError>;
-    fn session_start_params(
-        &self,
-        baseboard_id: BaseboardId,
-        client_nonce: SessionClientNonce,
-        sush_nonce: SessionSushNonce,
-    );
+    fn session_start_params(&self, baseboard_id: BaseboardId, sush_nonce: SessionSushNonce);
     fn job_start_params(&self, request: &JobStartRequest);
     fn really_supersede(&mut self, session_id: SessionId) -> Result<(), CommandError>;
     fn session_created(
@@ -174,8 +174,9 @@ pub trait CommandContext: Clone + Send + Sync {
         signer_nonce: SessionSignerNonce,
         seq: SessionSeq,
     );
-    fn session_started(&mut self, session: Session, force: bool);
+    fn session_started(&mut self, session: Session, details: SessionDetails, show: bool);
     fn session_joined(&mut self, session: Session, force: bool);
+    fn session_pending(&mut self, current: SessionId, pending: SessionId);
     fn session_stopped(&mut self, session_id: &SessionId);
     fn access_allowed(&mut self, key_id: &KeyId, access: Access);
     fn access_denied(&mut self, key_id: &KeyId);

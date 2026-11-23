@@ -19,7 +19,7 @@ use hyper::header::HeaderName;
 use schemars::JsonSchema;
 use serde::de::{Deserializer, Error as DeserializeError, IntoDeserializer, MapAccess, Visitor};
 use serde::{Deserialize, Serialize};
-use sled_hardware_types::BaseboardId;
+use sled_hardware_types::{BaseboardId, BaseboardIdParseError};
 use strum::{Display, EnumString};
 
 use sush_common::authn::Identity;
@@ -32,8 +32,11 @@ use sush_common::keys::{KeyId, SshPublicKey};
 use sush_common::targets::SledVersion;
 use sush_common::version::VersionInfo;
 
+pub mod v0_1;
+
 #[rustfmt::skip]
 api_versions_picky!([
+    (0, 4, 0, SESSION_SETUP),
     (0, 3, 0, SESSION_ACCESS),
     (0, 2, 0, JOB_RECORDS),
     (0, 1, 0, INITIAL),
@@ -120,20 +123,43 @@ pub trait SushApi {
 
     /// Check that this server would accept a job in a session for a target.
     ///
+    /// Succeeds if the authenticated identity has read-write access to the
+    /// current session, or can supply a valid session ID derivation for a
+    /// session that would supersede it. The target must also resolve to at
+    /// least one sled this server can reach.
+    #[endpoint {
+        method = GET,
+        path = "/sessions/{session_id}/preflight/{target}",
+        versions = VERSION_SESSION_SETUP..,
+    }]
+    async fn job_preflight(
+        ctx: RequestContext<Self::Context>,
+        headers: Header<Authorization>,
+        params: PathParams<SessionTargetParams>,
+        query: QueryParams<SessionDetailsQuery>,
+    ) -> Result<HttpResponseUpdatedNoContent, HttpError>;
+
+    /// Check that this server would accept a job in a session for a target.
+    ///
     /// Succeeds if the session is active or its start is pending, and
     /// the target resolves to at least one sled this server can reach.
-    #[endpoint { method = GET, path = "/sessions/{session_id}/preflight/{target}" }]
-    async fn job_preflight(
+    #[endpoint {
+        operation_id = "job_preflight",
+        method = GET,
+        path = "/sessions/{session_id}/preflight/{target}",
+        versions = ..VERSION_SESSION_SETUP,
+    }]
+    async fn job_preflight_v0_1(
         ctx: RequestContext<Self::Context>,
         headers: Header<Authorization>,
         params: PathParams<SessionTargetParams>,
     ) -> Result<HttpResponseUpdatedNoContent, HttpError>;
 
-    /// Get a fresh server nonce for the session ceremony.
+    /// Get this server's nonce for the session ceremony.
     ///
     /// The client mixes its own nonce with this one to form the sush
-    /// nonce it submits to the signer. Fetching replaces the previous
-    /// server nonce, so only the latest ceremony can complete.
+    /// nonce it submits to the signer. Each identity gets its own
+    /// nonce, which stays the same until the next session starts.
     #[endpoint { method = GET, path = "/server-nonce" }]
     async fn server_nonce(
         ctx: RequestContext<Self::Context>,
@@ -146,12 +172,16 @@ pub trait SushApi {
     /// when it verifies a signed job for the session. The new
     /// session then supersedes the active one: the rack skips the
     /// old session's queued jobs but does not stop its running jobs.
-    #[endpoint { method = POST, path = "/sessions/{session_id}/start" }]
+    #[endpoint {
+        method = POST,
+        path = "/sessions/{session_id}/start",
+        versions = ..VERSION_SESSION_SETUP,
+    }]
     async fn session_start(
         ctx: RequestContext<Self::Context>,
         headers: Header<Authorization>,
         params: PathParams<SessionIdParam>,
-        body: TypedBody<SessionStartBody>,
+        body: TypedBody<v0_1::SessionStartBody>,
     ) -> Result<HttpResponseUpdatedNoContent, HttpError>;
 
     /// End a support session.
@@ -239,12 +269,33 @@ pub trait SushApi {
     // Job management.
 
     /// Start an authorized job.
-    #[endpoint { method = POST, path = "/jobs/{job_id}/start/{target}" }]
+    ///
+    /// If session details are provided, also start a new session.
+    #[endpoint {
+        method = POST,
+        path = "/jobs/{job_id}/start/{target}",
+        versions = VERSION_SESSION_SETUP..,
+    }]
     async fn job_start(
         ctx: RequestContext<Self::Context>,
         headers: Header<Authorization>,
         params: PathParams<JobTargetParams>,
         query: QueryParams<JobStartParams>,
+        body: TypedBody<JobStartBody>,
+    ) -> Result<HttpResponseOk<JobStarted>, HttpError>;
+
+    /// Start an authorized job.
+    #[endpoint {
+        operation_id = "job_start",
+        method = POST,
+        path = "/jobs/{job_id}/start/{target}",
+        versions = ..VERSION_SESSION_SETUP,
+    }]
+    async fn job_start_v0_1(
+        ctx: RequestContext<Self::Context>,
+        headers: Header<Authorization>,
+        params: PathParams<JobTargetParams>,
+        query: QueryParams<v0_1::JobStartParams>,
         body: TypedBody<SignedJob>,
     ) -> Result<HttpResponseOk<JobStarted>, HttpError>;
 
@@ -438,11 +489,46 @@ pub struct JobTargetParams {
     pub target: String,
 }
 
-#[derive(Deserialize, JsonSchema)]
-pub struct SessionStartBody {
+#[derive(Clone, Debug, Deserialize, Eq, JsonSchema, PartialEq, Serialize)]
+pub struct SessionDetails {
+    pub baseboard: BaseboardId,
     pub client_nonce: SessionClientNonce,
     pub signer_nonce: SessionSignerNonce,
     pub seq: SessionSeq,
+}
+
+#[derive(Debug, Default, Deserialize, JsonSchema)]
+pub struct SessionDetailsQuery {
+    pub baseboard: Option<String>,
+    pub client_nonce: Option<SessionClientNonce>,
+    pub signer_nonce: Option<SessionSignerNonce>,
+    pub seq: Option<SessionSeq>,
+    pub via: Option<String>,
+}
+
+impl SessionDetailsQuery {
+    pub fn into_details(self) -> Result<Option<SessionDetails>, BaseboardIdParseError> {
+        let (Some(baseboard), Some(client_nonce), Some(signer_nonce), Some(seq)) = (
+            self.baseboard,
+            self.client_nonce,
+            self.signer_nonce,
+            self.seq,
+        ) else {
+            return Ok(None);
+        };
+        Ok(Some(SessionDetails {
+            baseboard: baseboard.parse()?,
+            client_nonce,
+            signer_nonce,
+            seq,
+        }))
+    }
+}
+
+#[derive(Clone, Debug, Deserialize, JsonSchema, Serialize)]
+pub struct JobStartBody {
+    pub job: SignedJob,
+    pub session: Option<SessionDetails>,
 }
 
 /// Acknowledgement that a job was accepted.
@@ -474,6 +560,10 @@ pub struct JobStartParams {
     /// Wait for the job to start or stop.
     #[serde(skip_serializing_if = "JobWait::is_none")]
     pub wait: JobWait,
+
+    /// Where a proxy should route the job request.
+    #[serde(skip_serializing)]
+    pub via: Option<String>,
 }
 
 /// Codes for the errors a client may act on. `Display` gives the
@@ -543,7 +633,7 @@ pub struct JobHistoryParams {
 /// [sush#3](https://github.com/oxidecomputer/sush/pull/3#discussion_r2613036692) and
 /// [serde#1183](https://github.com/serde-rs/serde/issues/1183#issuecomment-668315831).
 /// Luckily limits are homogeneous, so it's pretty simple.
-fn deserialize_job_limits<'de, D>(de: D) -> Result<JobLimits, D::Error>
+pub(crate) fn deserialize_job_limits<'de, D>(de: D) -> Result<JobLimits, D::Error>
 where
     D: Deserializer<'de>,
 {
